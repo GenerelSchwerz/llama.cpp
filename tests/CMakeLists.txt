@@ -300,3 +300,14 @@ if (TARGET gguf-model-data)
     target_link_libraries(export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# MoE expert cache test (CUDA only). Built when CUDA is enabled and the
+# backend is statically linked so the cache symbols are visible to the test.
+# When GGML_BACKEND_DL=ON the test is skipped — that path is week-2 work.
+if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda)
+    add_executable(test-moe-cache test-moe-cache.cu)
+    target_link_libraries(test-moe-cache PRIVATE ggml-cuda ggml-base)
+    target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+    add_test(NAME test-moe-cache COMMAND test-moe-cache)
+    set_property(TEST test-moe-cache PROPERTY LABELS "main")
+endif()
