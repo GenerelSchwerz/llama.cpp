@@ -2902,6 +2902,26 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 // implementation, preserving existing behavior bit-for-bit.
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+
+    // One-time debug log: whenever the moe-cache flag is on, log the buffer
+    // type of the FIRST mul_mat_id op we see, so we can confirm whether the
+    // cached buffer is reaching this dispatcher at all.
+    if (ggml_backend_cuda_moe_get_cache_slots() > 0) {
+        static std::once_flag once;
+        std::call_once(once, [&]() {
+            const char * buft_name = "(null)";
+            bool is_cached = false;
+            if (src0 && src0->buffer && src0->buffer->buft && src0->buffer->buft->iface.get_name) {
+                buft_name = src0->buffer->buft->iface.get_name(src0->buffer->buft);
+                is_cached = ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft);
+            }
+            GGML_LOG_INFO("moe-cache: first mul_mat_id  src0=%s  buft=%s  is_cached=%d\n",
+                          src0 ? src0->name : "(null)",
+                          buft_name,
+                          is_cached ? 1 : 0);
+        });
+    }
+
     if (src0 && src0->buffer && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
         ggml_cuda_mul_mat_id_cached(ctx, dst);
         return;
