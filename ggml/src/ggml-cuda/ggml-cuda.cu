@@ -2772,26 +2772,16 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 2. Get or lazy-create the per-device cache. If user disabled it
-    //    (slots == 0), fall through to staging. The model loader has
-    //    already observed every cached expert tensor's size, so we use
-    //    max(observed) as the initial slot size -- no grow_pool needed in
-    //    the common case. grow_pool stays as a safety net if a tensor
-    //    somehow slipped past the loader's observation.
+    // 2. Look up the per-(device, slot_size) cache for this op's expert
+    //    stride. Each unique slot size has its own pool with slots packed
+    //    at exactly expert_stride apart -- no padding inside slots, so the
+    //    synthetic src0 stays contiguous and kernels run unchanged.
     const size_t expert_stride = src0->nb[2];
     const int    requested_slots = ggml_backend_cuda_moe_get_cache_slots();
 
     ggml_cuda_moe_cache * cache = nullptr;
     if (requested_slots > 0) {
-        const size_t observed_max = ggml_backend_cuda_moe_get_max_expert_size();
-        const size_t initial_slot_size = std::max(expert_stride, observed_max);
-        cache = ggml_cuda_moe_cache_get_or_create(device, initial_slot_size, requested_slots);
-        if (cache && ggml_cuda_moe_cache_slot_size_bytes(cache) < expert_stride) {
-            if (!ggml_cuda_moe_cache_grow_pool(cache, expert_stride)) {
-                // Grow failed (likely OOM). Fall back to staging this op.
-                cache = nullptr;
-            }
-        }
+        cache = ggml_cuda_moe_cache_get_or_create(device, expert_stride, requested_slots);
     }
 
     if (cache == nullptr) {
@@ -2862,23 +2852,16 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                                ids_total_elems * sizeof(int32_t),
                                cudaMemcpyHostToDevice, stream));
 
-    // 5. Synthetic src0 points at the cache slot pool. ne[2] = n_slots so the
-    //    kernel's per-expert loop ranges over the whole pool (entries we
-    //    didn't acquire have stale contents but ids never references them).
-    //    nb[2] is set to the cache's slot_size, not the original expert_stride
-    //    -- when slot_size > expert_stride (e.g. q4 expert sitting in a slot
-    //    sized for q6) each slot has padding past the actual matrix data, but
-    //    the kernel reads via nb[0]/nb[1] which still cover only the matrix.
+    // 5. Synthetic src0 points at the cache slot pool. Slots in this pool
+    //    are tightly packed at expert_stride apart, so the original src0
+    //    nb[0]/nb[1]/nb[2] stay valid; only ne[2] (now n_slots) and the
+    //    base data pointer change. ggml_is_contiguous(src0_synth) holds.
     const int    n_slots         = ggml_cuda_moe_cache_n_slots(cache);
-    const size_t cache_slot_size = ggml_cuda_moe_cache_slot_size_bytes(cache);
     void *       pool_d          = ggml_cuda_moe_cache_slot_ptr(cache, 0); // base of slot 0
 
     ggml_tensor src0_synth = *src0;
     src0_synth.ne[2] = n_slots;
-    src0_synth.nb[2] = cache_slot_size;
-    // nb[3] follows ggml's convention: nb[i+1] = nb[i] * ne[i]. For a 3D
-    // tensor (ne[3]==1) this is the total slot-pool byte size.
-    src0_synth.nb[3] = cache_slot_size * (size_t)n_slots;
+    src0_synth.nb[3] = src0_synth.nb[2] * (size_t)n_slots;
     src0_synth.data  = pool_d;
 
     ggml_tensor ids_synth = *ids;

@@ -363,16 +363,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
-#ifdef GGML_USE_CUDA
-        // Eagerly allocate the MoE expert cache slot pool now that the loader
-        // has observed every expert tensor's size. The pool size logs as a
-        // "load_tensors:" line so it groups with the other model buffer
-        // allocations.
-        if (params.moe_expert_cache_slots > 0) {
-            ggml_backend_cuda_moe_preallocate_pool(/*device=*/0);
-        }
-#endif
-
+        // The MoE expert cache pools are now created lazily on first
+        // inference op (one pool per unique slot_size). The load_tensors:
+        // line for each pool fires when its first cached op runs.
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
