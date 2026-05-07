@@ -567,6 +567,61 @@ void ggml_backend_cuda_moe_preallocate_pools(int device) {
     }
 }
 
+extern "C"
+void ggml_backend_cuda_moe_prefetch_experts(
+    int             device,
+    const char *    tensor_name,
+    const int32_t * eids,
+    int             n_eids) {
+    if (!tensor_name || !eids || n_eids <= 0) return;
+
+    // 1. Look up the observed tensor (data ptr + stride) by name.
+    const observed_tensor * found = nullptr;
+    {
+        auto & st = get_observation_state();
+        std::lock_guard<std::mutex> lk(st.mu);
+        for (const auto & t : st.tensors) {
+            if (t.tensor_name == tensor_name) {
+                found = &t;
+                // Note: holding the reference past the lock is okay because
+                // the vector is only ever appended to during model load,
+                // never reallocated during inference. Still, copy locally
+                // before releasing.
+                break;
+            }
+        }
+        if (!found) return;
+    }
+
+    // Re-lookup outside the observation lock since we copied what we need.
+    const void * tensor_data    = found->tensor_data;
+    const size_t expert_stride  = found->per_expert_bytes;
+
+    // 2. Find the cache for this tensor.
+    auto & reg = get_registry();
+    ggml_cuda_moe_cache * cache = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(reg.mu);
+        moe_cache_key k{device, std::string(tensor_name)};
+        auto it = reg.by_key.find(k);
+        if (it == reg.by_key.end()) return; // cache not created yet
+        cache = it->second;
+    }
+
+    if (!cache) return;
+    cudaStream_t copy_stream = cache->copy_stream;
+    const char * src_base = (const char *)tensor_data;
+
+    // 3. Issue acquires for each expert id. Failures are silent -- this is
+    //    speculative; the real op will re-acquire if needed.
+    for (int i = 0; i < n_eids; ++i) {
+        int32_t eid = eids[i];
+        if (eid < 0) continue;
+        const void * host_ptr = src_base + (size_t)eid * expert_stride;
+        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream);
+    }
+}
+
 // Deprecated singular-pool entry point; superseded by preallocate_pools (plural).
 extern "C"
 void ggml_backend_cuda_moe_preallocate_pool(int device) {

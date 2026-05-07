@@ -67,6 +67,19 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
 // with the other model buffer allocations. Idempotent.
 GGML_BACKEND_API void ggml_backend_cuda_moe_preallocate_pools(int device);
 
+// Issue async H2D prefetches for the given expert ids into the cache for
+// `tensor_name`. Used by the dispatch hook to warm up sibling matrix
+// caches (e.g. when up's dispatch fires, prefetch gate and down's same
+// expert ids since the router picks the same set across all 3 matrices).
+// No-op if tensor_name has no observed data or no cache yet. Failures in
+// individual acquires are silently ignored; the regular dispatch path
+// will re-issue if needed.
+GGML_BACKEND_API void ggml_backend_cuda_moe_prefetch_experts(
+    int           device,
+    const char *  tensor_name,
+    const int32_t * eids,
+    int           n_eids);
+
 // Print cache hit/miss/eviction counters per device and reset them. Call at
 // end of a request (or on model unload) to surface telemetry. No-op if the
 // cache is uninitialized.

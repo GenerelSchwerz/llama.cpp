@@ -81,6 +81,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -2805,34 +2806,68 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const size_t  ids_nb1 = ids->nb[1];
     const size_t  ids_nb2 = ids->nb[2];
 
+    // Single dedup pass: build unique_eids with -2 sentinel for "seen".
+    // If we exceed the cache's slot count, fall back to staging.
+    const int slot_capacity = ggml_cuda_moe_cache_n_slots(cache);
     std::vector<int32_t> expert_to_slot(n_experts_total, -1);
-    int n_unique = 0;
-    for (int64_t i2 = 0; i2 < ids_ne2 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i2) {
-        for (int64_t i1 = 0; i1 < ids_ne1 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i1) {
-            for (int64_t i0 = 0; i0 < ids_ne0 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i0) {
+    std::vector<int32_t> unique_eids;
+    unique_eids.reserve(std::min<int64_t>(n_experts_total, 64));
+    bool overflow = false;
+    for (int64_t i2 = 0; i2 < ids_ne2 && !overflow; ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1 && !overflow; ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0 && !overflow; ++i0) {
                 const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
                     + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
                 GGML_ASSERT(eid >= 0 && eid < n_experts_total);
-                if (expert_to_slot[eid] == -2) continue; // already counted
-                expert_to_slot[eid] = -2; // sentinel: counted but not yet acquired
-                n_unique++;
+                if (expert_to_slot[eid] == -2) continue;
+                if ((int)unique_eids.size() >= slot_capacity) {
+                    overflow = true;
+                    break;
+                }
+                expert_to_slot[eid] = -2;
+                unique_eids.push_back(eid);
             }
         }
     }
 
-    if (n_unique > ggml_cuda_moe_cache_n_slots(cache)) {
-        // Too many unique experts to fit simultaneously in this cache. Stage
-        // them all into a fresh GPU pool buffer instead so no slot gets
-        // overwritten mid-op. Common for prompt processing on long batches.
+    if (overflow) {
+        // More unique experts than the cache can hold simultaneously.
+        // Stage so no slot gets overwritten mid-op.
         ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
         return;
     }
 
-    // 4. Second pass: acquire each unique expert. Reset sentinel values
-    //    back to -1 first so the map is clean. Acquires issue any H2D
-    //    copies on the cache's dedicated copy stream so they can pipeline
-    //    with the compute stream's previous-op kernel.
-    std::fill(expert_to_slot.begin(), expert_to_slot.end(), -1);
+    // 4. Same-layer sibling prefetch (Prefetch B). The router picks the same
+    //    expert ids for all of up/gate/down in one MoE FFN. Fire async H2D
+    //    on the OTHER two tensors' caches *now* so they're warm by the time
+    //    their dispatch arrives. Each sibling cache has its own copy stream,
+    //    so these run in parallel with our own acquires below.
+    if (src0->name && src0->name[0]) {
+        static const char * const kinds[3] = {"_up_", "_gate_", "_down_"};
+        const char * this_name = src0->name;
+        const char * this_kind = nullptr;
+        for (int k = 0; k < 3; ++k) {
+            if (strstr(this_name, kinds[k])) { this_kind = kinds[k]; break; }
+        }
+        if (this_kind) {
+            for (int k = 0; k < 3; ++k) {
+                if (kinds[k] == this_kind) continue;
+                std::string sibling(this_name);
+                size_t pos = sibling.find(this_kind);
+                if (pos != std::string::npos) {
+                    sibling.replace(pos, std::strlen(this_kind), kinds[k]);
+                    ggml_backend_cuda_moe_prefetch_experts(
+                        device, sibling.c_str(),
+                        unique_eids.data(), (int)unique_eids.size());
+                }
+            }
+        }
+    }
+
+    // 5. Reset sentinels and acquire each unique expert on this tensor's cache.
+    //    Acquires issue H2D on the cache's dedicated copy stream so they
+    //    pipeline with the compute stream's previous-op kernel.
+    for (int32_t eid : unique_eids) expert_to_slot[eid] = -1;
     const char * src_base = (const char *)src0->data;
     cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
     bool any_cache_failure = false;
