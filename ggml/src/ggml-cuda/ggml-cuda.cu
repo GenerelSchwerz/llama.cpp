@@ -2762,14 +2762,19 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // 2. Get or lazy-create the per-device cache. If user disabled it
-    //    (slots == 0), fall through to staging. If the cache exists but its
-    //    slot size is too small for this op's experts, grow the pool.
+    //    (slots == 0), fall through to staging. The model loader has
+    //    already observed every cached expert tensor's size, so we use
+    //    max(observed) as the initial slot size -- no grow_pool needed in
+    //    the common case. grow_pool stays as a safety net if a tensor
+    //    somehow slipped past the loader's observation.
     const size_t expert_stride = src0->nb[2];
     const int    requested_slots = ggml_backend_cuda_moe_get_cache_slots();
 
     ggml_cuda_moe_cache * cache = nullptr;
     if (requested_slots > 0) {
-        cache = ggml_cuda_moe_cache_get_or_create(device, expert_stride, requested_slots);
+        const size_t observed_max = ggml_backend_cuda_moe_get_max_expert_size();
+        const size_t initial_slot_size = std::max(expert_stride, observed_max);
+        cache = ggml_cuda_moe_cache_get_or_create(device, initial_slot_size, requested_slots);
         if (cache && ggml_cuda_moe_cache_slot_size_bytes(cache) < expert_stride) {
             if (!ggml_cuda_moe_cache_grow_pool(cache, expert_stride)) {
                 // Grow failed (likely OOM). Fall back to staging this op.

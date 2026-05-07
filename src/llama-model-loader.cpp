@@ -5,6 +5,10 @@
 #include "gguf.h"
 #include "llama-hparams.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -1170,6 +1174,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                     } else {
                         buft = overrides->buft;
                     }
+
+#ifdef GGML_USE_CUDA
+                    // For tensors going into the CUDA_MoE_Cached buffer
+                    // (--moe-expert-cache-size > 0), record the per-expert
+                    // byte stride so the cache can size its slot pool to
+                    // max(observed) on first use, avoiding a grow_pool
+                    // realloc when a later op has a larger expert.
+                    if (ggml_backend_buft_is_cuda_moe_cached(buft)) {
+                        const int n_dims = ggml_n_dims(t_meta);
+                        if (n_dims >= 3) {
+                            ggml_backend_cuda_moe_observe_expert_size(t_meta->nb[n_dims - 1]);
+                        } else {
+                            ggml_backend_cuda_moe_observe_expert_size(ggml_nbytes(t_meta));
+                        }
+                    }
+#endif
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
                             tensor_name.c_str(),

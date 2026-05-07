@@ -436,6 +436,31 @@ int ggml_backend_cuda_moe_get_cache_slots(void) {
     return g_moe_cache_slots.load(std::memory_order_relaxed);
 }
 
+// Max observed expert byte stride. Updated by the model loader; read by the
+// dispatch hook when sizing the cache for the first time.
+static std::atomic<size_t> g_max_expert_size{0};
+
+extern "C"
+void ggml_backend_cuda_moe_observe_expert_size(size_t per_expert_bytes) {
+    if (per_expert_bytes == 0) return;
+    size_t cur = g_max_expert_size.load(std::memory_order_relaxed);
+    while (per_expert_bytes > cur &&
+           !g_max_expert_size.compare_exchange_weak(cur, per_expert_bytes,
+                                                    std::memory_order_relaxed)) {
+        // retry on contention
+    }
+}
+
+extern "C"
+size_t ggml_backend_cuda_moe_get_max_expert_size(void) {
+    return g_max_expert_size.load(std::memory_order_relaxed);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_reset_expert_size_observation(void) {
+    g_max_expert_size.store(0, std::memory_order_relaxed);
+}
+
 extern "C"
 void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     auto & reg = get_registry();

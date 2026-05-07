@@ -2127,6 +2127,9 @@ void llama_model_free(llama_model * model) {
     if (model && ggml_backend_cuda_moe_get_cache_slots() > 0) {
         ggml_backend_cuda_moe_log_and_reset_stats();
     }
+    // Reset the observed-expert-size globals so a subsequent model load
+    // starts from a clean slate.
+    ggml_backend_cuda_moe_reset_expert_size_observation();
 #endif
     delete model;
 }
