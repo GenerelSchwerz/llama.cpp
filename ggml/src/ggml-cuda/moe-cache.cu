@@ -1,22 +1,32 @@
-// MoE expert cache — week-1 implementation.
+// MoE expert cache — week-1 implementation + buffer type registration.
 // See ../../../../DESIGN.md (project root) for the full design.
 //
-// Layout in this file:
-//   - struct ggml_cuda_moe_cache  : private state
-//   - init / free                 : slot-pool alloc, bookkeeping vectors
-//   - acquire                     : O(1) hit, O(n_slots) LRU pick on miss
-//   - slot_ptr / stats            : trivial accessors
+// This file owns:
+//   - struct ggml_cuda_moe_cache : the GPU slot pool + LRU bookkeeping
+//   - init / free / acquire / slot_ptr / stats : the cache C API
+//   - ggml_backend_cuda_moe_cached_buffer_type : a ggml buffer type that
+//     marks expert tensors (`ffn_*_exps`) as "live in CPU pinned memory and
+//     route GPU access through the cache". The implementation mirrors the
+//     existing CUDA host buffer type (same pinned-memory allocator) but
+//     uses a distinct name so the dispatch hook in ggml_cuda_mul_mat_id can
+//     distinguish them and divert to the cached path.
 //
 // Design choices for v1 (kept deliberately simple):
-//   * Single std::mutex around the metadata. Single-GPU only. Contention is
-//     bounded by token rate, so this isn't a bottleneck in practice.
-//   * Linear scan for LRU eviction. n_slots is typically 16-256, so an O(n)
-//     scan per miss is in the hundreds of ns.
+//   * Single std::mutex around the cache metadata. Single-GPU only.
+//   * Linear scan for LRU eviction. n_slots is typically 16-256, so the
+//     O(n) scan per miss is in the hundreds of ns.
 //   * acquire() hands back a slot_id; the caller is responsible for
 //     synchronizing the compute stream against the copy stream before
 //     touching the slab. The cache does not own the compute stream.
+//   * The cache itself is created lazily on first cached-buffer access in
+//     mul_mat_id_cached (forthcoming). The buffer type only flags tensors;
+//     it does not allocate GPU slot pool memory.
 
 #include "moe-cache.cuh"
+#include "common.cuh"
+
+#include "ggml-backend-impl.h"
+#include "ggml-cuda.h"
 
 #include <atomic>
 #include <cstdint>
@@ -204,4 +214,79 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
     cache->hits.store(0, std::memory_order_relaxed);
     cache->misses.store(0, std::memory_order_relaxed);
     cache->evictions.store(0, std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// ggml buffer type: CUDA_MoE_Cached
+//
+// Allocator and free hooks mirror ggml_backend_cuda_host_buffer_type --
+// pinned host memory via cudaMallocHost / cudaFreeHost. The only thing that
+// changes is the type's name (so the dispatch hook can identify it) and the
+// alignment carried over from the CPU buffer. The GPU slot pool is created
+// lazily by the dispatch hook on first cached-tensor access; the buffer type
+// itself stays cheap and stateless.
+// ---------------------------------------------------------------------------
+
+static const char * ggml_backend_cuda_moe_cached_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_CUDA_NAME "_MoE_Cached";
+}
+
+static void ggml_backend_cuda_moe_cached_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    CUDA_CHECK(cudaFreeHost(buffer->context));
+}
+
+static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+    void * ptr = nullptr;
+    cudaError_t err = cudaMallocHost((void **) &ptr, size);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n",
+                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    return ptr;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+
+    void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+
+    if (ptr == nullptr) {
+        // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
+        // PCIe bandwidth on cache miss but keeps the model loadable.
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft             = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_buffer_free_buffer;
+    return buffer;
+}
+
+extern "C"
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_moe_cached = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_moe_cached_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+    return &ggml_backend_cuda_buffer_type_moe_cached;
+}
+
+extern "C"
+bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr
+        && buft->iface.get_name == ggml_backend_cuda_moe_cached_buffer_type_name;
 }

@@ -36,6 +36,13 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_type(
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
 
+// MoE expert cache: tensors placed in this buffer type live in CPU pinned
+// memory. A GPU-side LRU cache pages slabs in/out on access; the cache slot
+// count is configured via llama_model_params::moe_expert_cache_slots.
+// See ggml/src/ggml-cuda/moe-cache.cu and DESIGN.md.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
+GGML_BACKEND_API bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
+
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
