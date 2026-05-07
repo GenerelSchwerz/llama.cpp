@@ -2325,6 +2325,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-size"}, "N",
+        "MoE expert cache: keep N expert slabs hot on GPU with LRU eviction; "
+        "cold experts live in CPU pinned memory. 0 disables (default). "
+        "Composes with --n-cpu-moe: those layers' experts go through the cache.",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.n_moe_expert_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
