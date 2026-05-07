@@ -88,11 +88,19 @@ void ggml_cuda_moe_cache_stats(
 
 void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
 
-// Per-device singleton. Returns the existing cache for this device, or creates
-// it on first call with the requested (slot_size_bytes, n_slots). On subsequent
-// calls the existing cache is returned regardless of the requested args; the
-// caller is expected to check ggml_cuda_moe_cache_slot_size_bytes() and fall
-// back to per-op staging when sizes don't match.
+// Per-tensor cache: returns the existing cache for this (device, tensor_data)
+// pair, or creates a fresh one on first call. Each MoE expert tensor has its
+// own pool of N slots dedicated to its experts only -- no cross-tensor or
+// cross-layer slot contention. tensor_name_for_log is used for the
+// "load_tensors:" log line on first creation; pass src0->name.
+struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
+    int          device,
+    const void * tensor_data,
+    size_t       slot_size_bytes,
+    int          n_slots,
+    const char * tensor_name_for_log);
+
+// Deprecated: keys solely by slot_size_bytes. Kept for compat; returns nullptr.
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     int    device,
     size_t slot_size_bytes,

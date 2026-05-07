@@ -376,29 +376,28 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
 // via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
 // ---------------------------------------------------------------------------
 
-// Multi-cache registry: one cache per (device, slot_size_bytes) pair.
+// Per-tensor cache registry: one cache per (device, tensor_data_ptr).
+// "Tensor" here means a model expert weight tensor like blk.0.ffn_up_exps.weight.
+// Each such tensor's data pointer is unique and identifies a (layer, matrix_kind)
+// pair. The N slots in that tensor's cache are dedicated to that tensor's
+// experts only -- no cross-layer competition for slots.
 //
-// We tried a single-pool approach with slot_size = max(observed) and smaller
-// experts padded inside their slots. Correctness fell apart: when cache_slot_size
-// > this op's expert_stride, the synthetic src0 has nb[2] != nb[1]*ne[1] which
-// makes ggml_is_contiguous return false. The CUDA matmul kernels' optimized
-// paths assume contiguous layout for stride/access calculations, so output came
-// out as garbage even at 88% hit rate.
+// User-facing N is now slots-per-tensor, not slots-total. For Qwen3.6 35B-A3B
+// with 40 layers × 3 matrices = 120 expert tensors and N=32 (--moe-expert-cache-size 32):
+//   total memory = 120 × 32 × ~0.82 MiB ≈ 3.1 GiB
+// vs N=2048 shared pool (~1.7 GiB). Higher per-token VRAM footprint, but hit
+// rate should be much better with no cross-layer churn.
 //
-// Per-(device, slot_size) buckets keep slots tightly packed at exactly the
-// expert stride for that bucket. nb[2] in the synthetic equals the original
-// expert_stride; ggml_is_contiguous is true; kernels run unchanged.
-//
-// Memory cost grows with slot-size cardinality (typically 1-3 distinct sizes
-// for real MoE models). Acceptable price for correctness.
+// Slot size per cache equals that tensor's expert_stride, so slots are tightly
+// packed; the synthetic src0 stays contiguous and kernels run unchanged.
 namespace {
 
 struct moe_cache_key {
-    int    device;
-    size_t slot_size_bytes;
+    int          device;
+    const void * tensor_data;   // src0->data of the cached expert tensor
     bool operator<(const moe_cache_key & o) const {
         if (device != o.device) return device < o.device;
-        return slot_size_bytes < o.slot_size_bytes;
+        return tensor_data < o.tensor_data;
     }
 };
 
@@ -415,15 +414,17 @@ static moe_cache_registry & get_registry() {
 } // namespace
 
 extern "C"
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
-    int    device,
-    size_t slot_size_bytes,
-    int    n_slots) {
+struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
+    int          device,
+    const void * tensor_data,
+    size_t       slot_size_bytes,
+    int          n_slots,
+    const char * tensor_name_for_log) {
 
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
-    moe_cache_key k{device, slot_size_bytes};
+    moe_cache_key k{device, tensor_data};
     auto it = reg.by_key.find(k);
     if (it != reg.by_key.end()) {
         return it->second;
@@ -435,11 +436,25 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     }
 
     reg.by_key.emplace(k, c);
-    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool model buffer size = %8.2f MiB  (slot_size=%.2f MiB, %d slots)\n",
+    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots × %.2f MiB)\n",
+                  tensor_name_for_log ? tensor_name_for_log : "?",
                   ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0,
-                  slot_size_bytes / 1024.0 / 1024.0,
-                  n_slots);
+                  n_slots,
+                  slot_size_bytes / 1024.0 / 1024.0);
     return c;
+}
+
+// Backward-compat wrapper: keys solely by slot_size. Kept so existing callers
+// don't break, but prefer the per-tensor variant.
+extern "C"
+struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
+    int    device,
+    size_t slot_size_bytes,
+    int    n_slots) {
+    GGML_UNUSED(slot_size_bytes);
+    GGML_UNUSED(n_slots);
+    GGML_UNUSED(device);
+    return nullptr; // dispatch hook now uses the per-tensor variant
 }
 
 extern "C"
@@ -515,18 +530,26 @@ extern "C"
 void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
+
+    // Aggregate across all per-tensor caches into one line per request.
+    // 120+ per-tensor lines would drown the timing output.
+    uint64_t total_hits = 0, total_misses = 0, total_evictions = 0;
+    int      n_caches = 0;
     for (auto & kv : reg.by_key) {
-        uint64_t hits = 0, misses = 0, evictions = 0;
-        ggml_cuda_moe_cache_stats(kv.second, &hits, &misses, &evictions);
-        const uint64_t total = hits + misses;
-        const double rate = total > 0 ? 100.0 * (double)hits / (double)total : 0.0;
-        GGML_LOG_INFO("moe-cache: device %d  slot_size=%.2f MiB  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
-                      kv.first.device,
-                      kv.first.slot_size_bytes / 1024.0 / 1024.0,
-                      (unsigned long long)hits,
-                      (unsigned long long)misses,
-                      (unsigned long long)evictions,
-                      rate);
+        uint64_t h = 0, m = 0, e = 0;
+        ggml_cuda_moe_cache_stats(kv.second, &h, &m, &e);
+        total_hits      += h;
+        total_misses    += m;
+        total_evictions += e;
+        n_caches++;
         ggml_cuda_moe_cache_reset_stats(kv.second);
     }
+    const uint64_t total = total_hits + total_misses;
+    const double rate = total > 0 ? 100.0 * (double)total_hits / (double)total : 0.0;
+    GGML_LOG_INFO("moe-cache: %d caches  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
+                  n_caches,
+                  (unsigned long long)total_hits,
+                  (unsigned long long)total_misses,
+                  (unsigned long long)total_evictions,
+                  rate);
 }

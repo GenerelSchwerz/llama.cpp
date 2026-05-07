@@ -2772,16 +2772,18 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 2. Look up the per-(device, slot_size) cache for this op's expert
-    //    stride. Each unique slot size has its own pool with slots packed
-    //    at exactly expert_stride apart -- no padding inside slots, so the
-    //    synthetic src0 stays contiguous and kernels run unchanged.
+    // 2. Look up the per-tensor cache. Each MoE expert tensor (one per
+    //    layer-and-matrix-kind) gets its own pool of N slots; only that
+    //    tensor's experts compete for those slots. Slot size = this tensor's
+    //    expert_stride, so slots are tightly packed and the synthetic src0
+    //    stays contiguous.
     const size_t expert_stride = src0->nb[2];
     const int    requested_slots = ggml_backend_cuda_moe_get_cache_slots();
 
     ggml_cuda_moe_cache * cache = nullptr;
     if (requested_slots > 0) {
-        cache = ggml_cuda_moe_cache_get_or_create(device, expert_stride, requested_slots);
+        cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
+            device, src0->data, expert_stride, requested_slots, src0->name);
     }
 
     if (cache == nullptr) {
