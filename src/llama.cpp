@@ -15,6 +15,10 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -270,8 +274,42 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
+        // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
+        // and CUDA is available, *prepend* a tensor_buft_override that routes
+        // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
+        // matters because the loader's match loop is first-match-wins -- we
+        // need the cache override to catch expert tensors before any earlier
+        // --cpu-moe / --n-cpu-moe overrides do. The vector owns the storage
+        // for the duration of this function, which outlives the loader's use
+        // of the pointer.
+        std::vector<llama_model_tensor_buft_override> effective_overrides;
+        const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
+#ifdef GGML_USE_CUDA
+        if (params.moe_expert_cache_slots > 0) {
+            // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
+            // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
+            static const char * MOE_EXPS_PATTERN =
+                "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+            effective_overrides.push_back({MOE_EXPS_PATTERN, ggml_backend_cuda_moe_cached_buffer_type()});
+
+            bool had_user_overrides = false;
+            if (params.tensor_buft_overrides) {
+                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                    effective_overrides.push_back(*o);
+                    had_user_overrides = true;
+                }
+            }
+            if (had_user_overrides) {
+                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
+                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+            }
+            effective_overrides.push_back({nullptr, nullptr});
+            effective_overrides_ptr = effective_overrides.data();
+        }
+#endif
+
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.use_mmap, params.use_direct_io,
-            params.check_tensors, params.no_alloc, params.kv_overrides, params.tensor_buft_overrides);
+            params.check_tensors, params.no_alloc, params.kv_overrides, effective_overrides_ptr);
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
