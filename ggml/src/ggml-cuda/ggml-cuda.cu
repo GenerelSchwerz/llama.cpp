@@ -2307,6 +2307,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    // Disable MoE FFN fusion when experts live in CUDA_MoE_Cached. The fused
+    // mul_mat_vec_{f,q} path bypasses ggml_cuda_mul_mat_id and would attempt
+    // to read CPU-pinned expert weights directly from the kernel (slow, and
+    // skips our LRU cache entirely). Forcing the unfused path routes each op
+    // through ggml_cuda_mul_mat_id, where the cached dispatch hook stages
+    // experts into the GPU slot pool.
+    if (ggml_backend_buft_is_cuda_moe_cached(ffn_up->src[0]->buffer->buft) ||
+        ggml_backend_buft_is_cuda_moe_cached(ffn_gate->src[0]->buffer->buft)) {
+        return false;
+    }
+
     return true;
 }
 
