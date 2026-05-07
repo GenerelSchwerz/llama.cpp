@@ -309,11 +309,24 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
 // via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
 // ---------------------------------------------------------------------------
 
+// Multi-cache registry: one cache per (device, slot_size_bytes) pair. Models
+// with mixed-quant expert matrices (e.g. Qwen3 with q4_K up/gate + q6_K down)
+// produce ops with multiple distinct slot sizes; each gets its own pool so
+// none of them fall back to the staging path.
 namespace {
+
+struct moe_cache_key {
+    int    device;
+    size_t slot_size_bytes;
+    bool operator<(const moe_cache_key & o) const {
+        if (device != o.device) return device < o.device;
+        return slot_size_bytes < o.slot_size_bytes;
+    }
+};
 
 struct moe_cache_registry {
     std::mutex mu;
-    std::map<int, ggml_cuda_moe_cache *> by_device;
+    std::map<moe_cache_key, ggml_cuda_moe_cache *> by_key;
 };
 
 static moe_cache_registry & get_registry() {
@@ -333,8 +346,9 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
-    auto it = reg.by_device.find(device);
-    if (it != reg.by_device.end()) {
+    moe_cache_key k{device, slot_size_bytes};
+    auto it = reg.by_key.find(k);
+    if (it != reg.by_key.end()) {
         return it->second;
     }
 
@@ -343,10 +357,11 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
         return nullptr;
     }
 
-    reg.by_device.emplace(device, c);
-    GGML_LOG_INFO("moe-cache: device %d  slots=%d  slot_size=%.2f MiB  pool=%.2f MiB\n",
-                  device, n_slots,
+    reg.by_key.emplace(k, c);
+    GGML_LOG_INFO("moe-cache: device %d  slot_size=%.2f MiB  slots=%d  pool=%.2f MiB\n",
+                  device,
                   slot_size_bytes / 1024.0 / 1024.0,
+                  n_slots,
                   ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0);
     return c;
 }
@@ -355,10 +370,10 @@ extern "C"
 void ggml_cuda_moe_cache_free_all(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
-    for (auto & kv : reg.by_device) {
+    for (auto & kv : reg.by_key) {
         ggml_cuda_moe_cache_free(kv.second);
     }
-    reg.by_device.clear();
+    reg.by_key.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -382,13 +397,14 @@ extern "C"
 void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
-    for (auto & kv : reg.by_device) {
+    for (auto & kv : reg.by_key) {
         uint64_t hits = 0, misses = 0, evictions = 0;
         ggml_cuda_moe_cache_stats(kv.second, &hits, &misses, &evictions);
         const uint64_t total = hits + misses;
         const double rate = total > 0 ? 100.0 * (double)hits / (double)total : 0.0;
-        GGML_LOG_INFO("moe-cache: device %d  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
-                      kv.first,
+        GGML_LOG_INFO("moe-cache: device %d  slot_size=%.2f MiB  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
+                      kv.first.device,
+                      kv.first.slot_size_bytes / 1024.0 / 1024.0,
                       (unsigned long long)hits,
                       (unsigned long long)misses,
                       (unsigned long long)evictions,
