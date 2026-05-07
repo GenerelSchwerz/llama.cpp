@@ -1,6 +1,11 @@
 #pragma once
 
-#include "common.cuh"
+// Pure host-side API: only depends on the CUDA runtime headers for
+// cudaStream_t. Do NOT include common.cuh here -- it is full of device-side
+// code (__device__, __shfl_*, threadIdx, ...) that only nvcc can compile,
+// which would prevent .cpp consumers (e.g. tests) from including this header.
+#include <cuda_runtime.h>
+#include <stdint.h>
 
 // MoE expert cache: keeps a fixed-size GPU slot pool of expert weight slabs
 // while cold experts live in CPU pinned memory. On routing miss the slab is
