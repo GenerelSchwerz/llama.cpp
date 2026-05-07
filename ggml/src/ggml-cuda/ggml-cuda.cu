@@ -2467,7 +2467,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
 }
 
-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+// Implementation body of mul_mat_id, factored out so the cached path can call
+// it after staging experts into a GPU scratch buffer. The thin dispatcher
+// `ggml_cuda_mul_mat_id` below routes cached-buffer tensors to
+// ggml_cuda_mul_mat_id_cached, which prepares a synthetic src0 backed by GPU
+// memory and then re-enters this impl.
+static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2623,6 +2628,148 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+}
+
+// Cached path for mul_mat_id when the experts tensor lives in CUDA_MoE_Cached
+// (CPU pinned) memory. Iteration 1 of the cache: per-op staging into a pool
+// scratch buffer, no persistent slot pool. Correctness first; the persistent
+// LRU slot pool comes in iteration 2 once this is verified.
+//
+// Steps:
+//   1. D2H the routing decision (ids tensor).
+//   2. Walk ids to determine the unique set of experts touched this op.
+//   3. Allocate a GPU scratch buffer and copy each unique expert's pinned
+//      host data slab into it (one cudaMemcpyAsync per expert).
+//   4. Build a remapped ids tensor where each entry is the expert's *position
+//      within the staged scratch* rather than its original expert id.
+//   5. Build synthetic src0 / ids tensors that point at the scratch buffers.
+//   6. Swap them into dst->src and call ggml_cuda_mul_mat_id_impl, which now
+//      sees a regular GPU-resident experts tensor of size n_unique and runs
+//      the existing matmul kernels.
+//   7. Restore dst->src and return. The pool buffers are freed by RAII.
+//
+// Memory cost per call: n_unique_experts * expert_slab_bytes of GPU scratch.
+// For Gemma 4 26B-A4B with top-8 routing per layer, n_unique <= 8 per layer
+// and expert slab is ~4 MiB at Q4_K_M, so ~32 MiB scratch per layer. This is
+// dwarfed by other transient buffers in the model's compute graph.
+static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];   // experts (CPU pinned, n_experts slabs)
+    ggml_tensor * ids  = dst->src[2];   // routing decision (n_tokens, top_k)
+
+    cudaStream_t stream = ctx.stream();
+
+    // 1. Read ids -> host. Tiny copy, blocking sync is fine here.
+    std::vector<char> ids_host_bytes(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    const int64_t n_experts_total = src0->ne[2];
+    const size_t  expert_stride   = src0->nb[2]; // bytes between experts in src0->data
+
+    // ids is laid out as [top_k, n_tokens, ...]; ne[0] = top_k, ne[1] = n_tokens.
+    // Read every (token, k) entry into a flat vector for quick lookup.
+    const int64_t ids_ne0 = ids->ne[0];
+    const int64_t ids_ne1 = ids->ne[1];
+    const int64_t ids_ne2 = ids->ne[2];
+    const size_t  ids_nb0 = ids->nb[0];
+    const size_t  ids_nb1 = ids->nb[1];
+    const size_t  ids_nb2 = ids->nb[2];
+
+    // 2. Build unique expert list and a remapping table (expert_id -> staged index).
+    std::vector<int32_t> expert_to_pos(n_experts_total, -1);
+    std::vector<int32_t> unique_experts;
+    unique_experts.reserve(std::min<int64_t>(n_experts_total, 64));
+
+    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                    + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
+                GGML_ASSERT(eid >= 0 && eid < n_experts_total);
+                if (expert_to_pos[eid] < 0) {
+                    expert_to_pos[eid] = (int32_t)unique_experts.size();
+                    unique_experts.push_back(eid);
+                }
+            }
+        }
+    }
+
+    const int n_unique = (int)unique_experts.size();
+    GGML_ASSERT(n_unique > 0 && "mul_mat_id_cached called with empty routing set");
+
+    // 3. Allocate scratch on the device's compute pool and stage each unique
+    //    expert from CPU pinned memory.
+    ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
+
+    const char * src_base = (const char *)src0->data;
+    char       * dst_base = (char *)scratch_experts.get();
+    for (int i = 0; i < n_unique; ++i) {
+        const int32_t eid = unique_experts[i];
+        CUDA_CHECK(cudaMemcpyAsync(
+            dst_base + (size_t)i * expert_stride,
+            src_base + (size_t)eid * expert_stride,
+            expert_stride,
+            cudaMemcpyHostToDevice, stream));
+    }
+
+    // 4. Build remapped ids on host and push them to a scratch GPU buffer.
+    const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
+    std::vector<int32_t> remapped_ids_host;
+    remapped_ids_host.reserve(ids_total_elems);
+    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                    + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
+                remapped_ids_host.push_back(expert_to_pos[eid]);
+            }
+        }
+    }
+
+    ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
+    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
+                               ids_total_elems * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    // 5. Build synthetic src0 and ids tensors. The synthetics carry the
+    //    original buffer pointers so ggml-cuda's buffer-type checks downstream
+    //    still find a non-split, non-null buffer. Only `data`, `ne[2]`, and
+    //    `nb` (for ids) need to change.
+    ggml_tensor src0_synth = *src0;
+    src0_synth.ne[2] = n_unique;
+    src0_synth.data  = scratch_experts.get();
+
+    // Synthetic ids: same shape, but tightly packed int32 in the scratch buffer.
+    ggml_tensor ids_synth = *ids;
+    ids_synth.data  = scratch_ids.get();
+    ids_synth.nb[0] = sizeof(int32_t);
+    ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
+    ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
+    ids_synth.nb[3] = ids_synth.nb[2];
+
+    // 6. Swap into dst, dispatch to impl, restore.
+    ggml_tensor * orig_src0 = dst->src[0];
+    ggml_tensor * orig_ids  = dst->src[2];
+    dst->src[0] = &src0_synth;
+    dst->src[2] = &ids_synth;
+
+    ggml_cuda_mul_mat_id_impl(ctx, dst);
+
+    dst->src[0] = orig_src0;
+    dst->src[2] = orig_ids;
+}
+
+// Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
+// through the staging path; everything else goes straight to the regular
+// implementation, preserving existing behavior bit-for-bit.
+static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    if (src0 && src0->buffer && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+        ggml_cuda_mul_mat_id_cached(ctx, dst);
+        return;
+    }
+    ggml_cuda_mul_mat_id_impl(ctx, dst);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
