@@ -2876,7 +2876,9 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     ggml_tensor src0_synth = *src0;
     src0_synth.ne[2] = n_slots;
     src0_synth.nb[2] = cache_slot_size;
-    src0_synth.nb[3] = cache_slot_size; // 4D stride collapses to nb[2] for ne[3]==1
+    // nb[3] follows ggml's convention: nb[i+1] = nb[i] * ne[i]. For a 3D
+    // tensor (ne[3]==1) this is the total slot-pool byte size.
+    src0_synth.nb[3] = cache_slot_size * (size_t)n_slots;
     src0_synth.data  = pool_d;
 
     ggml_tensor ids_synth = *ids;
