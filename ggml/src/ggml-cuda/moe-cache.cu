@@ -333,6 +333,17 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     return buffer;
 }
 
+// is_host MUST return false (or be NULL) for this buffer type, even though
+// the data is technically in pinned host memory. If is_host returns true,
+// ggml's scheduler treats tensors here as CPU-backend-resident and routes
+// mul_mat_id ops to the CPU backend, completely bypassing our dispatch hook.
+// We rely on CUDA reading the pinned mapping directly via cudaMemcpyAsync
+// for the H2D copy in the dispatch hook.
+static bool ggml_backend_cuda_moe_cached_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
+
 extern "C"
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
     static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_moe_cached = {
@@ -342,7 +353,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
-            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+            /* .is_host          = */ ggml_backend_cuda_moe_cached_buffer_type_is_host,
         },
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
         /* .context  = */ nullptr,
