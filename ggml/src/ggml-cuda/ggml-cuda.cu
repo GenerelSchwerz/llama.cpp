@@ -2791,9 +2791,12 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         return;
     }
 
-    // 3. For each unique expert in ids, acquire its slot. Build a map from
-    //    expert_id (used in the original ids tensor) to slot_id (used in the
-    //    remapped ids tensor).
+    // 3. First pass: count unique experts referenced by this op. If the
+    //    count exceeds the cache's slot count, eviction would happen
+    //    mid-op and orphan earlier acquires in our local map (we would
+    //    record expert E0 -> slot 0 but a later acquire of E18 evicts E0
+    //    from slot 0 to make room, leaving our map stale). Detect this
+    //    and stage instead so the kernel reads correct data.
     const int64_t n_experts_total = src0->ne[2];
     const int64_t ids_ne0 = ids->ne[0];
     const int64_t ids_ne1 = ids->ne[1];
@@ -2803,6 +2806,31 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const size_t  ids_nb2 = ids->nb[2];
 
     std::vector<int32_t> expert_to_slot(n_experts_total, -1);
+    int n_unique = 0;
+    for (int64_t i2 = 0; i2 < ids_ne2 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0 && n_unique <= ggml_cuda_moe_cache_n_slots(cache); ++i0) {
+                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                    + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
+                GGML_ASSERT(eid >= 0 && eid < n_experts_total);
+                if (expert_to_slot[eid] == -2) continue; // already counted
+                expert_to_slot[eid] = -2; // sentinel: counted but not yet acquired
+                n_unique++;
+            }
+        }
+    }
+
+    if (n_unique > ggml_cuda_moe_cache_n_slots(cache)) {
+        // Too many unique experts to fit simultaneously in this cache. Stage
+        // them all into a fresh GPU pool buffer instead so no slot gets
+        // overwritten mid-op. Common for prompt processing on long batches.
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        return;
+    }
+
+    // 4. Second pass: acquire each unique expert. Reset sentinel values
+    //    back to -1 first so the map is clean.
+    std::fill(expert_to_slot.begin(), expert_to_slot.end(), -1);
     const char * src_base = (const char *)src0->data;
     bool any_cache_failure = false;
 
@@ -2811,7 +2839,6 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
             for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
                 const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
                     + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
-                GGML_ASSERT(eid >= 0 && eid < n_experts_total);
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
