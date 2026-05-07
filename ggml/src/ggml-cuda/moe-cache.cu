@@ -126,13 +126,19 @@ extern "C"
 int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
+    size_t       byte_count,
     cudaStream_t copy_stream) {
 
-    if (!cache || host_src == nullptr) {
+    if (!cache || host_src == nullptr || byte_count == 0) {
         return -1;
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
+
+    if (byte_count > cache->slot_size_bytes) {
+        // Caller forgot to grow first. Bail rather than clobber the next slot.
+        return -1;
+    }
 
     // Hit path: O(1) hash lookup.
     auto it = cache->host_to_slot.find(host_src);
@@ -166,7 +172,7 @@ int ggml_cuda_moe_cache_acquire(
 
     void * dst = (char *)cache->slot_pool_d + (size_t)lru_slot * cache->slot_size_bytes;
     cudaError_t err = cudaMemcpyAsync(
-        dst, host_src, cache->slot_size_bytes,
+        dst, host_src, byte_count,
         cudaMemcpyHostToDevice, copy_stream);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaMemcpyAsync failed: %s\n",
@@ -178,6 +184,56 @@ int ggml_cuda_moe_cache_acquire(
     }
 
     return lru_slot;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_grow_pool(
+    struct ggml_cuda_moe_cache * cache,
+    size_t min_slot_size_bytes) {
+
+    if (!cache || min_slot_size_bytes == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+
+    if (min_slot_size_bytes <= cache->slot_size_bytes) {
+        return true; // already big enough
+    }
+
+    int prev_device = 0;
+    cudaGetDevice(&prev_device);
+    cudaSetDevice(cache->device);
+
+    void * new_pool = nullptr;
+    cudaError_t err = cudaMalloc(&new_pool, (size_t)cache->n_slots * min_slot_size_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: grow_pool cudaMalloc(%zu) failed: %s\n",
+                (size_t)cache->n_slots * min_slot_size_bytes, cudaGetErrorString(err));
+        cudaSetDevice(prev_device);
+        return false;
+    }
+
+    if (cache->slot_pool_d) {
+        cudaFree(cache->slot_pool_d);
+    }
+    cache->slot_pool_d     = new_pool;
+    cache->slot_size_bytes = min_slot_size_bytes;
+
+    // Existing cached state is invalidated by the realloc -- clear bookkeeping
+    // so the next acquires re-populate slots in the new (larger) pool.
+    std::fill(cache->slot_to_host.begin(), cache->slot_to_host.end(), nullptr);
+    std::fill(cache->last_used.begin(),    cache->last_used.end(),    0ull);
+    cache->host_to_slot.clear();
+    cache->access_counter = 0;
+
+    GGML_LOG_INFO("moe-cache: device %d  grew slot_size to %.2f MiB  pool=%.2f MiB\n",
+                  cache->device,
+                  min_slot_size_bytes / 1024.0 / 1024.0,
+                  ((double)cache->n_slots * min_slot_size_bytes) / 1024.0 / 1024.0);
+
+    cudaSetDevice(prev_device);
+    return true;
 }
 
 extern "C"
@@ -309,24 +365,13 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
 // via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
 // ---------------------------------------------------------------------------
 
-// Multi-cache registry: one cache per (device, slot_size_bytes) pair. Models
-// with mixed-quant expert matrices (e.g. Qwen3 with q4_K up/gate + q6_K down)
-// produce ops with multiple distinct slot sizes; each gets its own pool so
-// none of them fall back to the staging path.
+// Single-cache-per-device registry. The cache's slot_size grows on demand
+// (via grow_pool) when an op presents an expert larger than the current slot.
 namespace {
-
-struct moe_cache_key {
-    int    device;
-    size_t slot_size_bytes;
-    bool operator<(const moe_cache_key & o) const {
-        if (device != o.device) return device < o.device;
-        return slot_size_bytes < o.slot_size_bytes;
-    }
-};
 
 struct moe_cache_registry {
     std::mutex mu;
-    std::map<moe_cache_key, ggml_cuda_moe_cache *> by_key;
+    std::map<int, ggml_cuda_moe_cache *> by_device;
 };
 
 static moe_cache_registry & get_registry() {
@@ -346,9 +391,8 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
-    moe_cache_key k{device, slot_size_bytes};
-    auto it = reg.by_key.find(k);
-    if (it != reg.by_key.end()) {
+    auto it = reg.by_device.find(device);
+    if (it != reg.by_device.end()) {
         return it->second;
     }
 
@@ -357,11 +401,10 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
         return nullptr;
     }
 
-    reg.by_key.emplace(k, c);
-    GGML_LOG_INFO("moe-cache: device %d  slot_size=%.2f MiB  slots=%d  pool=%.2f MiB\n",
-                  device,
+    reg.by_device.emplace(device, c);
+    GGML_LOG_INFO("moe-cache: device %d  slots=%d  initial slot_size=%.2f MiB  pool=%.2f MiB\n",
+                  device, n_slots,
                   slot_size_bytes / 1024.0 / 1024.0,
-                  n_slots,
                   ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0);
     return c;
 }
@@ -370,10 +413,10 @@ extern "C"
 void ggml_cuda_moe_cache_free_all(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
-    for (auto & kv : reg.by_key) {
+    for (auto & kv : reg.by_device) {
         ggml_cuda_moe_cache_free(kv.second);
     }
-    reg.by_key.clear();
+    reg.by_device.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -397,14 +440,15 @@ extern "C"
 void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
-    for (auto & kv : reg.by_key) {
+    for (auto & kv : reg.by_device) {
         uint64_t hits = 0, misses = 0, evictions = 0;
         ggml_cuda_moe_cache_stats(kv.second, &hits, &misses, &evictions);
         const uint64_t total = hits + misses;
         const double rate = total > 0 ? 100.0 * (double)hits / (double)total : 0.0;
+        const size_t slot_size = ggml_cuda_moe_cache_slot_size_bytes(kv.second);
         GGML_LOG_INFO("moe-cache: device %d  slot_size=%.2f MiB  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
-                      kv.first.device,
-                      kv.first.slot_size_bytes / 1024.0 / 1024.0,
+                      kv.first,
+                      slot_size / 1024.0 / 1024.0,
                       (unsigned long long)hits,
                       (unsigned long long)misses,
                       (unsigned long long)evictions,

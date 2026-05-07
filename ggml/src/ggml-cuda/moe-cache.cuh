@@ -16,11 +16,15 @@
 //     pointer is the unique identifier of the slab (different layers/matrix
 //     types have different pointers because they live at different offsets in
 //     the cached buffer). This avoids any "global expert id" namespacing.
-//   - Slots are uniformly sized -- the slot size is fixed at init. The dispatch
-//     hook gets-or-creates a per-device cache the first time it sees a cached
-//     buffer and sizes it to that op's expert stride. Subsequent ops with the
-//     same stride hit the same cache; ops with a larger stride fall back to
-//     per-op staging (iteration 1's path).
+//   - Slots are uniformly sized within a cache pool, but slot_size grows on
+//     demand if a later op has experts larger than the current slot size. On
+//     grow, the existing pool is freed, a new pool is allocated with the
+//     larger slot size, and all bookkeeping is reset (existing cached entries
+//     are evicted). This converges quickly: after the first few ops the cache
+//     stabilizes at slot_size = max expert stride across the model.
+//   - acquire() takes the actual byte count to copy on miss, which can be
+//     less than slot_size_bytes. Smaller experts simply leave padding inside
+//     their slot.
 //
 // See ../../DESIGN.md for the full design.
 
@@ -42,13 +46,29 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache);
 
 // Returns the slot index that holds `host_src`'s contents after this call.
 // On hit, just bumps LRU; on miss, picks the LRU slot, evicts it, and issues
-// an async H2D copy of `slot_size_bytes` bytes from `host_src` on `copy_stream`.
+// an async H2D copy of `byte_count` bytes from `host_src` on `copy_stream`.
 // The caller must synchronize the compute stream against `copy_stream` before
 // reading the slab.
+//
+// `byte_count` MUST be <= ggml_cuda_moe_cache_slot_size_bytes(cache); the
+// caller is expected to ensure this via grow_pool() if the current slot_size
+// is too small. Returns -1 on bad args or a CUDA failure.
 int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
+    size_t       byte_count,
     cudaStream_t copy_stream);
+
+// Ensure the cache's slot size is at least `min_slot_size_bytes`. If the
+// current slot size already covers it, no-op. Otherwise the existing pool is
+// freed, a new pool is allocated with slot_size = min_slot_size_bytes, and
+// all bookkeeping is reset (every previously-cached slab becomes a miss next
+// access). Returns true on success, false if the new allocation fails (in
+// which case the cache is left untouched and acquire() will keep working with
+// the previous slot size).
+bool ggml_cuda_moe_cache_grow_pool(
+    struct ggml_cuda_moe_cache * cache,
+    size_t min_slot_size_bytes);
 
 // Returns device pointer to slot `slot_id`'s slab.
 void * ggml_cuda_moe_cache_slot_ptr(

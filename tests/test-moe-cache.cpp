@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
         int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
         const void * src = host_experts + (size_t)eid * N_FLOATS;
 
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
         CHECK(slot >= 0 && slot < N_SLOTS);
         trace.push_back(eid);
     }
@@ -133,7 +133,7 @@ int main(int argc, char ** argv) {
     int verified = 0;
     for (int eid = 0; eid < N_EXPERTS; ++eid) {
         const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
         CHECK(slot >= 0 && slot < N_SLOTS);
         CUDA_OK(cudaStreamSynchronize(copy_stream));
 

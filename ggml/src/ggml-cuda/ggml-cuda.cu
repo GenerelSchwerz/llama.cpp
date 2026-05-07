@@ -2761,18 +2761,20 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                                cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // 2. Get or lazy-create the per-device cache. If user disabled it (slots
-    //    == 0) or sizes don't match, fall through to staging for this op.
+    // 2. Get or lazy-create the per-device cache. If user disabled it
+    //    (slots == 0), fall through to staging. If the cache exists but its
+    //    slot size is too small for this op's experts, grow the pool.
     const size_t expert_stride = src0->nb[2];
     const int    requested_slots = ggml_backend_cuda_moe_get_cache_slots();
 
     ggml_cuda_moe_cache * cache = nullptr;
     if (requested_slots > 0) {
         cache = ggml_cuda_moe_cache_get_or_create(device, expert_stride, requested_slots);
-        if (cache && ggml_cuda_moe_cache_slot_size_bytes(cache) != expert_stride) {
-            // Existing cache was sized for a different matrix kind. Don't
-            // grow it; just stage this op out-of-cache.
-            cache = nullptr;
+        if (cache && ggml_cuda_moe_cache_slot_size_bytes(cache) < expert_stride) {
+            if (!ggml_cuda_moe_cache_grow_pool(cache, expert_stride)) {
+                // Grow failed (likely OOM). Fall back to staging this op.
+                cache = nullptr;
+            }
         }
     }
 
@@ -2805,7 +2807,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, stream);
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, stream);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
@@ -2847,11 +2849,18 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     // 5. Synthetic src0 points at the cache slot pool. ne[2] = n_slots so the
     //    kernel's per-expert loop ranges over the whole pool (entries we
     //    didn't acquire have stale contents but ids never references them).
-    const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-    void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0); // base of slot 0
+    //    nb[2] is set to the cache's slot_size, not the original expert_stride
+    //    -- when slot_size > expert_stride (e.g. q4 expert sitting in a slot
+    //    sized for q6) each slot has padding past the actual matrix data, but
+    //    the kernel reads via nb[0]/nb[1] which still cover only the matrix.
+    const int    n_slots         = ggml_cuda_moe_cache_n_slots(cache);
+    const size_t cache_slot_size = ggml_cuda_moe_cache_slot_size_bytes(cache);
+    void *       pool_d          = ggml_cuda_moe_cache_slot_ptr(cache, 0); // base of slot 0
 
     ggml_tensor src0_synth = *src0;
     src0_synth.ne[2] = n_slots;
+    src0_synth.nb[2] = cache_slot_size;
+    src0_synth.nb[3] = cache_slot_size; // 4D stride collapses to nb[2] for ne[3]==1
     src0_synth.data  = pool_d;
 
     ggml_tensor ids_synth = *ids;
