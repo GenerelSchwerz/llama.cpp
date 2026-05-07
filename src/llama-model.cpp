@@ -19,6 +19,10 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -2115,6 +2119,13 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
+#ifdef GGML_USE_CUDA
+    // If --moe-expert-cache-size was used, surface hit/miss stats before
+    // tearing down. No-op when the cache wasn't initialized.
+    if (model && model->params.moe_expert_cache_slots > 0) {
+        ggml_backend_cuda_moe_log_and_reset_stats();
+    }
+#endif
     delete model;
 }
 

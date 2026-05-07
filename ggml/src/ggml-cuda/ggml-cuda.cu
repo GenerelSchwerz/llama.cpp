@@ -49,6 +49,7 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/moe-cache.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -2630,45 +2631,19 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
         nb1, nb2, nb3, stream);
 }
 
-// Cached path for mul_mat_id when the experts tensor lives in CUDA_MoE_Cached
-// (CPU pinned) memory. Iteration 1 of the cache: per-op staging into a pool
-// scratch buffer, no persistent slot pool. Correctness first; the persistent
-// LRU slot pool comes in iteration 2 once this is verified.
-//
-// Steps:
-//   1. D2H the routing decision (ids tensor).
-//   2. Walk ids to determine the unique set of experts touched this op.
-//   3. Allocate a GPU scratch buffer and copy each unique expert's pinned
-//      host data slab into it (one cudaMemcpyAsync per expert).
-//   4. Build a remapped ids tensor where each entry is the expert's *position
-//      within the staged scratch* rather than its original expert id.
-//   5. Build synthetic src0 / ids tensors that point at the scratch buffers.
-//   6. Swap them into dst->src and call ggml_cuda_mul_mat_id_impl, which now
-//      sees a regular GPU-resident experts tensor of size n_unique and runs
-//      the existing matmul kernels.
-//   7. Restore dst->src and return. The pool buffers are freed by RAII.
-//
-// Memory cost per call: n_unique_experts * expert_slab_bytes of GPU scratch.
-// For Gemma 4 26B-A4B with top-8 routing per layer, n_unique <= 8 per layer
-// and expert slab is ~4 MiB at Q4_K_M, so ~32 MiB scratch per layer. This is
-// dwarfed by other transient buffers in the model's compute graph.
-static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    ggml_tensor * src0 = dst->src[0];   // experts (CPU pinned, n_experts slabs)
-    ggml_tensor * ids  = dst->src[2];   // routing decision (n_tokens, top_k)
-
-    cudaStream_t stream = ctx.stream();
-
-    // 1. Read ids -> host. Tiny copy, blocking sync is fine here.
-    std::vector<char> ids_host_bytes(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+// Per-op staging fallback for the cached path. Used when the persistent cache
+// either isn't initialized or its slot size doesn't match this op's expert
+// stride. Same approach as iteration 1: stage every unique expert touched by
+// this op into a pool scratch buffer, run the impl, free the scratch.
+static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                        const std::vector<char> & ids_host_bytes) {
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * ids  = dst->src[2];
+    cudaStream_t  stream = ctx.stream();
 
     const int64_t n_experts_total = src0->ne[2];
-    const size_t  expert_stride   = src0->nb[2]; // bytes between experts in src0->data
+    const size_t  expert_stride   = src0->nb[2];
 
-    // ids is laid out as [top_k, n_tokens, ...]; ne[0] = top_k, ne[1] = n_tokens.
-    // Read every (token, k) entry into a flat vector for quick lookup.
     const int64_t ids_ne0 = ids->ne[0];
     const int64_t ids_ne1 = ids->ne[1];
     const int64_t ids_ne2 = ids->ne[2];
@@ -2676,7 +2651,6 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const size_t  ids_nb1 = ids->nb[1];
     const size_t  ids_nb2 = ids->nb[2];
 
-    // 2. Build unique expert list and a remapping table (expert_id -> staged index).
     std::vector<int32_t> expert_to_pos(n_experts_total, -1);
     std::vector<int32_t> unique_experts;
     unique_experts.reserve(std::min<int64_t>(n_experts_total, 64));
@@ -2696,10 +2670,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     const int n_unique = (int)unique_experts.size();
-    GGML_ASSERT(n_unique > 0 && "mul_mat_id_cached called with empty routing set");
+    GGML_ASSERT(n_unique > 0);
 
-    // 3. Allocate scratch on the device's compute pool and stage each unique
-    //    expert from CPU pinned memory.
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
     const char * src_base = (const char *)src0->data;
@@ -2713,7 +2685,6 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
             cudaMemcpyHostToDevice, stream));
     }
 
-    // 4. Build remapped ids on host and push them to a scratch GPU buffer.
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
     std::vector<int32_t> remapped_ids_host;
     remapped_ids_host.reserve(ids_total_elems);
@@ -2732,15 +2703,10 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                                ids_total_elems * sizeof(int32_t),
                                cudaMemcpyHostToDevice, stream));
 
-    // 5. Build synthetic src0 and ids tensors. The synthetics carry the
-    //    original buffer pointers so ggml-cuda's buffer-type checks downstream
-    //    still find a non-split, non-null buffer. Only `data`, `ne[2]`, and
-    //    `nb` (for ids) need to change.
     ggml_tensor src0_synth = *src0;
     src0_synth.ne[2] = n_unique;
     src0_synth.data  = scratch_experts.get();
 
-    // Synthetic ids: same shape, but tightly packed int32 in the scratch buffer.
     ggml_tensor ids_synth = *ids;
     ids_synth.data  = scratch_ids.get();
     ids_synth.nb[0] = sizeof(int32_t);
@@ -2748,7 +2714,153 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
     ids_synth.nb[3] = ids_synth.nb[2];
 
-    // 6. Swap into dst, dispatch to impl, restore.
+    ggml_tensor * orig_src0 = dst->src[0];
+    ggml_tensor * orig_ids  = dst->src[2];
+    dst->src[0] = &src0_synth;
+    dst->src[2] = &ids_synth;
+
+    ggml_cuda_mul_mat_id_impl(ctx, dst);
+
+    dst->src[0] = orig_src0;
+    dst->src[2] = orig_ids;
+}
+
+// Cached path for mul_mat_id when experts live in CUDA_MoE_Cached (CPU pinned)
+// memory. Iteration 2: persistent per-device LRU slot pool. Hot experts stay
+// GPU-resident across calls so subsequent acquires of the same expert hit the
+// cache and skip the H2D copy.
+//
+// Steps:
+//   1. D2H the routing decision (ids tensor) -- small, blocking sync is OK.
+//   2. Get-or-create the per-device cache, slot_size = this op's expert stride.
+//      If a cache exists with a different slot size, fall back to per-op
+//      staging (the iteration-1 path) for this op.
+//   3. For each unique expert touched by ids, call acquire(host_ptr) ->
+//      slot_id. Hits return the existing slot (no copy); misses pick the LRU
+//      slot, copy this expert's slab from CPU pinned memory into it on the
+//      compute stream, and update bookkeeping. Build expert_id -> slot_id map.
+//   4. Build a remapped ids tensor where each entry is the expert's *slot
+//      index in the cache pool* rather than its original expert id.
+//   5. Build a synthetic src0 that points at the cache slot pool (so the
+//      kernel reads `slot_pool + slot_id * stride`, which is exactly the
+//      expert's resident copy).
+//   6. Swap synthetics into dst, call the impl, restore.
+//
+// Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
+// Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
+static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];   // experts in CPU pinned
+    ggml_tensor * ids  = dst->src[2];   // routing decision
+
+    cudaStream_t stream = ctx.stream();
+    const int    device = ggml_cuda_get_device();
+
+    // 1. Read ids -> host so we can drive acquire() per unique expert.
+    std::vector<char> ids_host_bytes(ggml_nbytes(ids));
+    CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
+                               cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    // 2. Get or lazy-create the per-device cache. If user disabled it (slots
+    //    == 0) or sizes don't match, fall through to staging for this op.
+    const size_t expert_stride = src0->nb[2];
+    const int    requested_slots = ggml_backend_cuda_moe_get_cache_slots();
+
+    ggml_cuda_moe_cache * cache = nullptr;
+    if (requested_slots > 0) {
+        cache = ggml_cuda_moe_cache_get_or_create(device, expert_stride, requested_slots);
+        if (cache && ggml_cuda_moe_cache_slot_size_bytes(cache) != expert_stride) {
+            // Existing cache was sized for a different matrix kind. Don't
+            // grow it; just stage this op out-of-cache.
+            cache = nullptr;
+        }
+    }
+
+    if (cache == nullptr) {
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        return;
+    }
+
+    // 3. For each unique expert in ids, acquire its slot. Build a map from
+    //    expert_id (used in the original ids tensor) to slot_id (used in the
+    //    remapped ids tensor).
+    const int64_t n_experts_total = src0->ne[2];
+    const int64_t ids_ne0 = ids->ne[0];
+    const int64_t ids_ne1 = ids->ne[1];
+    const int64_t ids_ne2 = ids->ne[2];
+    const size_t  ids_nb0 = ids->nb[0];
+    const size_t  ids_nb1 = ids->nb[1];
+    const size_t  ids_nb2 = ids->nb[2];
+
+    std::vector<int32_t> expert_to_slot(n_experts_total, -1);
+    const char * src_base = (const char *)src0->data;
+    bool any_cache_failure = false;
+
+    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                    + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
+                GGML_ASSERT(eid >= 0 && eid < n_experts_total);
+                if (expert_to_slot[eid] >= 0) continue;
+
+                const void * host_ptr = src_base + (size_t)eid * expert_stride;
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, stream);
+                if (slot < 0) {
+                    any_cache_failure = true;
+                    break;
+                }
+                expert_to_slot[eid] = slot;
+            }
+            if (any_cache_failure) break;
+        }
+        if (any_cache_failure) break;
+    }
+
+    if (any_cache_failure) {
+        // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
+        // Fall back so we still produce correct output.
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        return;
+    }
+
+    // 4. Build remapped ids on host and push to a scratch GPU buffer. Each
+    //    entry now points at slot_id within the cache pool.
+    const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
+    std::vector<int32_t> remapped_ids_host;
+    remapped_ids_host.reserve(ids_total_elems);
+    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                    + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
+                remapped_ids_host.push_back(expert_to_slot[eid]);
+            }
+        }
+    }
+
+    ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
+    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
+                               ids_total_elems * sizeof(int32_t),
+                               cudaMemcpyHostToDevice, stream));
+
+    // 5. Synthetic src0 points at the cache slot pool. ne[2] = n_slots so the
+    //    kernel's per-expert loop ranges over the whole pool (entries we
+    //    didn't acquire have stale contents but ids never references them).
+    const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
+    void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0); // base of slot 0
+
+    ggml_tensor src0_synth = *src0;
+    src0_synth.ne[2] = n_slots;
+    src0_synth.data  = pool_d;
+
+    ggml_tensor ids_synth = *ids;
+    ids_synth.data  = scratch_ids.get();
+    ids_synth.nb[0] = sizeof(int32_t);
+    ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
+    ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
+    ids_synth.nb[3] = ids_synth.nb[2];
+
     ggml_tensor * orig_src0 = dst->src[0];
     ggml_tensor * orig_ids  = dst->src[2];
     dst->src[0] = &src0_synth;

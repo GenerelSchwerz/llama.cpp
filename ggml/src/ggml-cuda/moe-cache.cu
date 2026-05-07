@@ -33,20 +33,24 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 struct ggml_cuda_moe_cache {
     int      device;
     size_t   slot_size_bytes;
     int      n_slots;
-    int      n_experts_total;
 
     void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
 
-    std::vector<int>      slot_to_expert;  // [n_slots],          -1 if empty
-    std::vector<uint64_t> last_used;       // [n_slots]
-    std::vector<int>      expert_to_slot;  // [n_experts_total], -1 if absent
+    // Per-slot state.
+    std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
+    std::vector<uint64_t>     last_used;     // [n_slots]
+
+    // host_ptr -> slot_id, O(1) lookup.
+    std::unordered_map<const void *, int> host_to_slot;
 
     uint64_t access_counter;
     std::mutex mu;
@@ -60,10 +64,9 @@ extern "C"
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     int    device,
     size_t slot_size_bytes,
-    int    n_slots,
-    int    n_experts_total) {
+    int    n_slots) {
 
-    if (slot_size_bytes == 0 || n_slots <= 0 || n_experts_total <= 0) {
+    if (slot_size_bytes == 0 || n_slots <= 0) {
         return nullptr;
     }
 
@@ -83,7 +86,6 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->device          = device;
     c->slot_size_bytes = slot_size_bytes;
     c->n_slots         = n_slots;
-    c->n_experts_total = n_experts_total;
     c->slot_pool_d     = nullptr;
     c->access_counter  = 0;
 
@@ -96,9 +98,9 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         return nullptr;
     }
 
-    c->slot_to_expert.assign(n_slots, -1);
-    c->last_used     .assign(n_slots, 0);
-    c->expert_to_slot.assign(n_experts_total, -1);
+    c->slot_to_host.assign(n_slots, nullptr);
+    c->last_used  .assign(n_slots, 0);
+    c->host_to_slot.reserve(n_slots * 2);
 
     cudaSetDevice(prev_device);
     return c;
@@ -123,26 +125,25 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
 extern "C"
 int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
-    int          expert_id,
     const void * host_src,
     cudaStream_t copy_stream) {
 
-    if (!cache || expert_id < 0 || expert_id >= cache->n_experts_total) {
+    if (!cache || host_src == nullptr) {
         return -1;
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
 
-    // Hit path.
-    int slot = cache->expert_to_slot[expert_id];
-    if (slot >= 0) {
+    // Hit path: O(1) hash lookup.
+    auto it = cache->host_to_slot.find(host_src);
+    if (it != cache->host_to_slot.end()) {
+        int slot = it->second;
         cache->last_used[slot] = ++cache->access_counter;
         cache->hits.fetch_add(1, std::memory_order_relaxed);
         return slot;
     }
 
-    // Miss: pick the LRU slot. Empty slots (last_used==0, slot_to_expert==-1)
-    // win automatically since 0 < any served counter.
+    // Miss: pick the LRU slot. Empty slots (last_used==0) win automatically.
     int      lru_slot = 0;
     uint64_t lru_t    = std::numeric_limits<uint64_t>::max();
     for (int i = 0; i < cache->n_slots; ++i) {
@@ -152,33 +153,41 @@ int ggml_cuda_moe_cache_acquire(
         }
     }
 
-    int evicted = cache->slot_to_expert[lru_slot];
-    if (evicted >= 0) {
-        cache->expert_to_slot[evicted] = -1;
+    const void * evicted = cache->slot_to_host[lru_slot];
+    if (evicted != nullptr) {
+        cache->host_to_slot.erase(evicted);
         cache->evictions.fetch_add(1, std::memory_order_relaxed);
     }
 
-    cache->slot_to_expert[lru_slot]  = expert_id;
-    cache->expert_to_slot[expert_id] = lru_slot;
-    cache->last_used[lru_slot]       = ++cache->access_counter;
+    cache->slot_to_host[lru_slot] = host_src;
+    cache->host_to_slot[host_src] = lru_slot;
+    cache->last_used[lru_slot]    = ++cache->access_counter;
     cache->misses.fetch_add(1, std::memory_order_relaxed);
 
-    if (host_src) {
-        void * dst = (char *)cache->slot_pool_d + (size_t)lru_slot * cache->slot_size_bytes;
-        cudaError_t err = cudaMemcpyAsync(
-            dst, host_src, cache->slot_size_bytes,
-            cudaMemcpyHostToDevice, copy_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "moe-cache: cudaMemcpyAsync failed: %s\n",
-                    cudaGetErrorString(err));
-            // Roll back the mapping so the next acquire retries cleanly.
-            cache->slot_to_expert[lru_slot]  = -1;
-            cache->expert_to_slot[expert_id] = -1;
-            return -1;
-        }
+    void * dst = (char *)cache->slot_pool_d + (size_t)lru_slot * cache->slot_size_bytes;
+    cudaError_t err = cudaMemcpyAsync(
+        dst, host_src, cache->slot_size_bytes,
+        cudaMemcpyHostToDevice, copy_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaMemcpyAsync failed: %s\n",
+                cudaGetErrorString(err));
+        // Roll back so the next acquire retries cleanly.
+        cache->slot_to_host[lru_slot] = nullptr;
+        cache->host_to_slot.erase(host_src);
+        return -1;
     }
 
     return lru_slot;
+}
+
+extern "C"
+size_t ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * cache) {
+    return cache ? cache->slot_size_bytes : 0;
+}
+
+extern "C"
+int ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache) {
+    return cache ? cache->n_slots : 0;
 }
 
 extern "C"
@@ -289,4 +298,101 @@ extern "C"
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
     return buft != nullptr
         && buft->iface.get_name == ggml_backend_cuda_moe_cached_buffer_type_name;
+}
+
+// ---------------------------------------------------------------------------
+// Per-device cache singleton
+//
+// The dispatch hook calls get_or_create on first cached op; subsequent ops
+// reuse the same cache. Slot size is set on first creation. If a later op
+// needs a different slot size, the caller is expected to detect the mismatch
+// via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct moe_cache_registry {
+    std::mutex mu;
+    std::map<int, ggml_cuda_moe_cache *> by_device;
+};
+
+moe_cache_registry & get_registry() {
+    // Function-local static, constructed on first use, destroyed at process exit.
+    static moe_cache_registry inst;
+    return inst;
+}
+
+} // namespace
+
+extern "C"
+struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
+    int    device,
+    size_t slot_size_bytes,
+    int    n_slots) {
+
+    auto & reg = get_registry();
+    std::lock_guard<std::mutex> lk(reg.mu);
+
+    auto it = reg.by_device.find(device);
+    if (it != reg.by_device.end()) {
+        return it->second;
+    }
+
+    ggml_cuda_moe_cache * c = ggml_cuda_moe_cache_init(device, slot_size_bytes, n_slots);
+    if (!c) {
+        return nullptr;
+    }
+
+    reg.by_device.emplace(device, c);
+    GGML_LOG_INFO("moe-cache: device %d  slots=%d  slot_size=%.2f MiB  pool=%.2f MiB\n",
+                  device, n_slots,
+                  slot_size_bytes / 1024.0 / 1024.0,
+                  ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0);
+    return c;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_free_all(void) {
+    auto & reg = get_registry();
+    std::lock_guard<std::mutex> lk(reg.mu);
+    for (auto & kv : reg.by_device) {
+        ggml_cuda_moe_cache_free(kv.second);
+    }
+    reg.by_device.clear();
+}
+
+// ---------------------------------------------------------------------------
+// User-facing slot count configuration (settable from llama_model_load)
+// ---------------------------------------------------------------------------
+
+static std::atomic<int> g_moe_cache_slots{0};
+
+extern "C"
+void ggml_backend_cuda_moe_set_cache_slots(int n_slots) {
+    if (n_slots < 0) n_slots = 0;
+    g_moe_cache_slots.store(n_slots, std::memory_order_relaxed);
+}
+
+extern "C"
+int ggml_backend_cuda_moe_get_cache_slots(void) {
+    return g_moe_cache_slots.load(std::memory_order_relaxed);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_log_and_reset_stats(void) {
+    auto & reg = get_registry();
+    std::lock_guard<std::mutex> lk(reg.mu);
+    for (auto & kv : reg.by_device) {
+        uint64_t hits = 0, misses = 0, evictions = 0;
+        ggml_cuda_moe_cache_stats(kv.second, &hits, &misses, &evictions);
+        const uint64_t total = hits + misses;
+        const double rate = total > 0 ? 100.0 * (double)hits / (double)total : 0.0;
+        GGML_LOG_INFO("moe-cache: device %d  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
+                      kv.first,
+                      (unsigned long long)hits,
+                      (unsigned long long)misses,
+                      (unsigned long long)evictions,
+                      rate);
+        ggml_cuda_moe_cache_reset_stats(kv.second);
+    }
 }

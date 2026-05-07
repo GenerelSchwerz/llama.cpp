@@ -90,7 +90,7 @@ int main(int argc, char ** argv) {
     cudaStream_t copy_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
 
-    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS, N_EXPERTS);
+    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS);
     CHECK(cache != nullptr);
 
     std::mt19937 rng(SEED);
@@ -100,7 +100,7 @@ int main(int argc, char ** argv) {
         int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
         const void * src = host_experts + (size_t)eid * N_FLOATS;
 
-        int slot = ggml_cuda_moe_cache_acquire(cache, eid, src, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, copy_stream);
         CHECK(slot >= 0 && slot < N_SLOTS);
         trace.push_back(eid);
     }
@@ -133,7 +133,7 @@ int main(int argc, char ** argv) {
     int verified = 0;
     for (int eid = 0; eid < N_EXPERTS; ++eid) {
         const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, eid, src, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, copy_stream);
         CHECK(slot >= 0 && slot < N_SLOTS);
         CUDA_OK(cudaStreamSynchronize(copy_stream));
 
