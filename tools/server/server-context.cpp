@@ -13,6 +13,10 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
+
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include "mtmd-helper.h"
 
 #include <algorithm>
@@ -512,6 +516,14 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec.get());
+
+#ifdef GGML_USE_CUDA
+        // If --moe-expert-cache-size is enabled, print and reset cache stats
+        // per request so each completion shows its own hit rate.
+        if (ggml_backend_cuda_moe_get_cache_slots() > 0) {
+            ggml_backend_cuda_moe_log_and_reset_stats();
+        }
+#endif
     }
 
     json to_json(bool only_metrics = false) const {
