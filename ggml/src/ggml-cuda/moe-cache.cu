@@ -402,10 +402,9 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     }
 
     reg.by_device.emplace(device, c);
-    GGML_LOG_INFO("moe-cache: device %d  slots=%d  initial slot_size=%.2f MiB  pool=%.2f MiB\n",
-                  device, n_slots,
-                  slot_size_bytes / 1024.0 / 1024.0,
-                  ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0);
+    // Note: we don't log here -- the eager preallocate path
+    // (ggml_backend_cuda_moe_preallocate_pool) emits an "load_tensors:"-style
+    // line with the same info, and we don't want to duplicate.
     return c;
 }
 
@@ -459,6 +458,23 @@ size_t ggml_backend_cuda_moe_get_max_expert_size(void) {
 extern "C"
 void ggml_backend_cuda_moe_reset_expert_size_observation(void) {
     g_max_expert_size.store(0, std::memory_order_relaxed);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_preallocate_pool(int device) {
+    const int    n_slots   = ggml_backend_cuda_moe_get_cache_slots();
+    const size_t slot_size = ggml_backend_cuda_moe_get_max_expert_size();
+    if (n_slots <= 0 || slot_size == 0) {
+        return; // feature off or no expert tensors observed
+    }
+    ggml_cuda_moe_cache * c = ggml_cuda_moe_cache_get_or_create(device, slot_size, n_slots);
+    if (!c) {
+        return; // alloc failed; init already logged the cause
+    }
+    // Match the "load_tensors:" prefix used elsewhere so the line groups
+    // visually with the other model buffer allocations.
+    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool model buffer size = %8.2f MiB\n",
+                  ((double)n_slots * slot_size) / 1024.0 / 1024.0);
 }
 
 extern "C"
