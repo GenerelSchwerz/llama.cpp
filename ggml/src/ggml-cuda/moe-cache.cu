@@ -46,6 +46,11 @@ struct ggml_cuda_moe_cache {
 
     void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
 
+    // Dedicated copy stream so H2D acquires can pipeline with the compute
+    // stream's kernel work. The dispatch hook records `copy_done` after all
+    // acquires for an op finish, then makes the compute stream wait on it.
+    cudaStream_t copy_stream;
+
     // Per-slot state.
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
     std::vector<uint64_t>     last_used;     // [n_slots]
@@ -88,12 +93,22 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->slot_size_bytes = slot_size_bytes;
     c->n_slots         = n_slots;
     c->slot_pool_d     = nullptr;
+    c->copy_stream     = nullptr;
     c->access_counter  = 0;
 
     err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
                 (size_t)n_slots * slot_size_bytes, cudaGetErrorString(err));
+        delete c;
+        cudaSetDevice(prev_device);
+        return nullptr;
+    }
+
+    err = cudaStreamCreateWithFlags(&c->copy_stream, cudaStreamNonBlocking);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaStreamCreate failed: %s\n", cudaGetErrorString(err));
+        cudaFree(c->slot_pool_d);
         delete c;
         cudaSetDevice(prev_device);
         return nullptr;
@@ -115,6 +130,9 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     cudaGetDevice(&prev_device);
     cudaSetDevice(cache->device);
 
+    if (cache->copy_stream) {
+        cudaStreamDestroy(cache->copy_stream);
+    }
     if (cache->slot_pool_d) {
         cudaFree(cache->slot_pool_d);
     }
@@ -245,6 +263,11 @@ size_t ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * ca
 extern "C"
 int ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache) {
     return cache ? cache->n_slots : 0;
+}
+
+extern "C"
+cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache) {
+    return cache ? cache->copy_stream : nullptr;
 }
 
 extern "C"

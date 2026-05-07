@@ -2829,9 +2829,12 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     // 4. Second pass: acquire each unique expert. Reset sentinel values
-    //    back to -1 first so the map is clean.
+    //    back to -1 first so the map is clean. Acquires issue any H2D
+    //    copies on the cache's dedicated copy stream so they can pipeline
+    //    with the compute stream's previous-op kernel.
     std::fill(expert_to_slot.begin(), expert_to_slot.end(), -1);
     const char * src_base = (const char *)src0->data;
+    cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
     bool any_cache_failure = false;
 
     for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
@@ -2842,7 +2845,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, stream);
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
@@ -2859,6 +2862,16 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         // Fall back so we still produce correct output.
         ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
         return;
+    }
+
+    // Compute stream must wait for all pending H2D copies on copy_stream
+    // before reading the slot pool. Use an event to express the dependency.
+    {
+        cudaEvent_t copy_done;
+        CUDA_CHECK(cudaEventCreateWithFlags(&copy_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventRecord(copy_done, copy_stream));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
+        CUDA_CHECK(cudaEventDestroy(copy_done));
     }
 
     // 4. Build remapped ids on host and push to a scratch GPU buffer. Each
