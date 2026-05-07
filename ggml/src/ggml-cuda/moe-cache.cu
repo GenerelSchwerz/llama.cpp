@@ -316,7 +316,7 @@ struct moe_cache_registry {
     std::map<int, ggml_cuda_moe_cache *> by_device;
 };
 
-moe_cache_registry & get_registry() {
+static moe_cache_registry & get_registry() {
     // Function-local static, constructed on first use, destroyed at process exit.
     static moe_cache_registry inst;
     return inst;
