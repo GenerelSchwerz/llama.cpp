@@ -304,9 +304,14 @@ endif()
 # MoE expert cache test (CUDA only). Built when CUDA is enabled and the
 # backend is statically linked so the cache symbols are visible to the test.
 # When GGML_BACKEND_DL=ON the test is skipped — that path is week-2 work.
+#
+# The test is a plain .cpp (no device kernels, only host-side cudaMalloc /
+# cudaMemcpyAsync calls), so it does not require enable_language(CUDA) in
+# this directory scope. CUDA headers + libcudart come in via CUDA::cudart.
 if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda)
-    add_executable(test-moe-cache test-moe-cache.cu)
-    target_link_libraries(test-moe-cache PRIVATE ggml-cuda ggml-base)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(test-moe-cache test-moe-cache.cpp)
+    target_link_libraries(test-moe-cache PRIVATE ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-cache COMMAND test-moe-cache)
     set_property(TEST test-moe-cache PROPERTY LABELS "main")
