@@ -51,14 +51,21 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_set_cache_slots(int n_slots);
 GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
 
 // Called by the model loader for every expert tensor going into the cached
-// buffer type, with the per-expert byte stride (tensor->nb[2] for a 3D
-// experts tensor). The cache uses max(observed) as its slot size on first
-// creation, avoiding the grow-on-demand realloc that would otherwise happen
-// when the first cached op was a small-quant matrix and a later op was
-// larger. Reset to 0 between models.
-GGML_BACKEND_API void   ggml_backend_cuda_moe_observe_expert_size(size_t per_expert_bytes);
-GGML_BACKEND_API size_t ggml_backend_cuda_moe_get_max_expert_size(void);
-GGML_BACKEND_API void   ggml_backend_cuda_moe_reset_expert_size_observation(void);
+// buffer type, recording its (data ptr, name, per-expert byte stride). After
+// model load, ggml_backend_cuda_moe_preallocate_pools() walks the recorded
+// list and creates one cache per tensor with the exact slot size it needs.
+// Reset between models.
+GGML_BACKEND_API void ggml_backend_cuda_moe_observe_expert_tensor(
+    const void * tensor_data,
+    const char * tensor_name,
+    size_t       per_expert_bytes);
+GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
+
+// Eagerly create one slot pool per observed tensor on the given device.
+// Each pool's slot_size is the exact expert_stride for that tensor; no
+// padding. Logs each pool as a 'load_tensors:'-style line so they group
+// with the other model buffer allocations. Idempotent.
+GGML_BACKEND_API void ggml_backend_cuda_moe_preallocate_pools(int device);
 
 // Print cache hit/miss/eviction counters per device and reset them. Call at
 // end of a request (or on model unload) to surface telemetry. No-op if the

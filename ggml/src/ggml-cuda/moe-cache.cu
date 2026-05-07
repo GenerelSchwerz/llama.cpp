@@ -34,6 +34,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -376,28 +377,30 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
 // via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
 // ---------------------------------------------------------------------------
 
-// Per-tensor cache registry: one cache per (device, tensor_data_ptr).
+// Per-tensor cache registry: one cache per (device, tensor_name).
 // "Tensor" here means a model expert weight tensor like blk.0.ffn_up_exps.weight.
-// Each such tensor's data pointer is unique and identifies a (layer, matrix_kind)
-// pair. The N slots in that tensor's cache are dedicated to that tensor's
-// experts only -- no cross-layer competition for slots.
+// Each name is unique and identifies a (layer, matrix_kind) pair. The N slots
+// in that tensor's cache are dedicated to that tensor's experts only -- no
+// cross-layer competition.
 //
-// User-facing N is now slots-per-tensor, not slots-total. For Qwen3.6 35B-A3B
-// with 40 layers × 3 matrices = 120 expert tensors and N=32 (--moe-expert-cache-size 32):
-//   total memory = 120 × 32 × ~0.82 MiB ≈ 3.1 GiB
-// vs N=2048 shared pool (~1.7 GiB). Higher per-token VRAM footprint, but hit
-// rate should be much better with no cross-layer churn.
+// We key by name (not data ptr) because t_meta->data isn't reliably set at
+// the point the model loader observes tensors (it's pre-allocation in the
+// override-matching loop). Names are set with metadata and stay stable.
+//
+// User-facing N is slots-per-tensor, not slots-total. For Qwen3.6 35B-A3B
+// with 40 layers × 3 matrices = 120 expert tensors and N=32:
+//   total memory = 120 × 32 × ~0.82 MiB ≈ 3.1 GiB per device
 //
 // Slot size per cache equals that tensor's expert_stride, so slots are tightly
 // packed; the synthetic src0 stays contiguous and kernels run unchanged.
 namespace {
 
 struct moe_cache_key {
-    int          device;
-    const void * tensor_data;   // src0->data of the cached expert tensor
+    int         device;
+    std::string tensor_name;
     bool operator<(const moe_cache_key & o) const {
         if (device != o.device) return device < o.device;
-        return tensor_data < o.tensor_data;
+        return tensor_name < o.tensor_name;
     }
 };
 
@@ -420,11 +423,16 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     size_t       slot_size_bytes,
     int          n_slots,
     const char * tensor_name_for_log) {
+    GGML_UNUSED(tensor_data);
+
+    if (tensor_name_for_log == nullptr || tensor_name_for_log[0] == '\0') {
+        return nullptr;
+    }
 
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
-    moe_cache_key k{device, tensor_data};
+    moe_cache_key k{device, std::string(tensor_name_for_log)};
     auto it = reg.by_key.find(k);
     if (it != reg.by_key.end()) {
         return it->second;
@@ -437,7 +445,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
 
     reg.by_key.emplace(k, c);
     GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots × %.2f MiB)\n",
-                  tensor_name_for_log ? tensor_name_for_log : "?",
+                  tensor_name_for_log,
                   ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0,
                   n_slots,
                   slot_size_bytes / 1024.0 / 1024.0);
@@ -484,46 +492,62 @@ int ggml_backend_cuda_moe_get_cache_slots(void) {
     return g_moe_cache_slots.load(std::memory_order_relaxed);
 }
 
-// Max observed expert byte stride. Updated by the model loader; read by the
-// dispatch hook when sizing the cache for the first time.
-static std::atomic<size_t> g_max_expert_size{0};
-
-extern "C"
-void ggml_backend_cuda_moe_observe_expert_size(size_t per_expert_bytes) {
-    if (per_expert_bytes == 0) return;
-    size_t cur = g_max_expert_size.load(std::memory_order_relaxed);
-    while (per_expert_bytes > cur &&
-           !g_max_expert_size.compare_exchange_weak(cur, per_expert_bytes,
-                                                    std::memory_order_relaxed)) {
-        // retry on contention
-    }
+// Per-tensor observation list: (tensor_data, name, expert_stride) populated
+// by the model loader, drained by preallocate_pools to create one cache per
+// observed tensor. Reset between models.
+namespace {
+struct observed_tensor {
+    const void * tensor_data;
+    std::string  tensor_name;
+    size_t       per_expert_bytes;
+};
+struct observation_state {
+    std::mutex mu;
+    std::vector<observed_tensor> tensors;
+};
+static observation_state & get_observation_state() {
+    static observation_state inst;
+    return inst;
 }
+} // namespace
 
 extern "C"
-size_t ggml_backend_cuda_moe_get_max_expert_size(void) {
-    return g_max_expert_size.load(std::memory_order_relaxed);
+void ggml_backend_cuda_moe_observe_expert_tensor(
+    const void * tensor_data,
+    const char * tensor_name,
+    size_t       per_expert_bytes) {
+    if (tensor_data == nullptr || per_expert_bytes == 0) return;
+    auto & st = get_observation_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    st.tensors.push_back({tensor_data,
+                          tensor_name ? std::string(tensor_name) : std::string(),
+                          per_expert_bytes});
 }
 
 extern "C"
 void ggml_backend_cuda_moe_reset_expert_size_observation(void) {
-    g_max_expert_size.store(0, std::memory_order_relaxed);
+    auto & st = get_observation_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    st.tensors.clear();
 }
 
 extern "C"
+void ggml_backend_cuda_moe_preallocate_pools(int device) {
+    const int n_slots = ggml_backend_cuda_moe_get_cache_slots();
+    if (n_slots <= 0) return;
+    auto & st = get_observation_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    for (const auto & t : st.tensors) {
+        ggml_cuda_moe_cache_get_or_create_for_tensor(
+            device, t.tensor_data, t.per_expert_bytes, n_slots,
+            t.tensor_name.empty() ? "?" : t.tensor_name.c_str());
+    }
+}
+
+// Deprecated singular-pool entry point; superseded by preallocate_pools (plural).
+extern "C"
 void ggml_backend_cuda_moe_preallocate_pool(int device) {
-    const int    n_slots   = ggml_backend_cuda_moe_get_cache_slots();
-    const size_t slot_size = ggml_backend_cuda_moe_get_max_expert_size();
-    if (n_slots <= 0 || slot_size == 0) {
-        return; // feature off or no expert tensors observed
-    }
-    ggml_cuda_moe_cache * c = ggml_cuda_moe_cache_get_or_create(device, slot_size, n_slots);
-    if (!c) {
-        return; // alloc failed; init already logged the cause
-    }
-    // Match the "load_tensors:" prefix used elsewhere so the line groups
-    // visually with the other model buffer allocations.
-    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool model buffer size = %8.2f MiB\n",
-                  ((double)n_slots * slot_size) / 1024.0 / 1024.0);
+    ggml_backend_cuda_moe_preallocate_pools(device);
 }
 
 extern "C"
@@ -534,19 +558,18 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     // Aggregate across all per-tensor caches into one line per request.
     // 120+ per-tensor lines would drown the timing output.
     uint64_t total_hits = 0, total_misses = 0, total_evictions = 0;
-    int      n_caches = 0;
+    size_t   n_caches = reg.by_key.size();
     for (auto & kv : reg.by_key) {
         uint64_t h = 0, m = 0, e = 0;
         ggml_cuda_moe_cache_stats(kv.second, &h, &m, &e);
         total_hits      += h;
         total_misses    += m;
         total_evictions += e;
-        n_caches++;
         ggml_cuda_moe_cache_reset_stats(kv.second);
     }
     const uint64_t total = total_hits + total_misses;
     const double rate = total > 0 ? 100.0 * (double)total_hits / (double)total : 0.0;
-    GGML_LOG_INFO("moe-cache: %d caches  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
+    GGML_LOG_INFO("moe-cache: %zu caches  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
                   n_caches,
                   (unsigned long long)total_hits,
                   (unsigned long long)total_misses,

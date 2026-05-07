@@ -1177,17 +1177,20 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
 #ifdef GGML_USE_CUDA
                     // For tensors going into the CUDA_MoE_Cached buffer
-                    // (--moe-expert-cache-size > 0), record the per-expert
-                    // byte stride so the cache can size its slot pool to
-                    // max(observed) on first use, avoiding a grow_pool
-                    // realloc when a later op has a larger expert.
+                    // (--moe-expert-cache-size > 0), record the per-tensor
+                    // (data, name, expert_stride) tuple. After load completes,
+                    // ggml_backend_cuda_moe_preallocate_pools eagerly creates
+                    // one slot pool per observed tensor with the exact
+                    // expert_stride for that tensor.
                     if (ggml_backend_buft_is_cuda_moe_cached(buft)) {
                         const int n_dims = ggml_n_dims(t_meta);
-                        if (n_dims >= 3) {
-                            ggml_backend_cuda_moe_observe_expert_size(t_meta->nb[n_dims - 1]);
-                        } else {
-                            ggml_backend_cuda_moe_observe_expert_size(ggml_nbytes(t_meta));
-                        }
+                        const size_t per_expert_bytes = (n_dims >= 3)
+                            ? t_meta->nb[n_dims - 1]
+                            : ggml_nbytes(t_meta);
+                        ggml_backend_cuda_moe_observe_expert_tensor(
+                            t_meta->data,
+                            t_meta->name,
+                            per_expert_bytes);
                     }
 #endif
 
