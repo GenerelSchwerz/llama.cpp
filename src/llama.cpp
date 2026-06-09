@@ -75,12 +75,18 @@ bool llama_supports_mlock(void) {
 }
 
 bool llama_supports_gpu_offload(void) {
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
     return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) != nullptr ||
            ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU) != nullptr ||
            llama_supports_rpc();
 }
 
 bool llama_supports_rpc(void) {
+    if (!ggml_backend_reg_count()) {
+        ggml_backend_load_all();
+    }
     return ggml_backend_reg_by_name("RPC") != nullptr;
 }
 
@@ -223,7 +229,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
                     }
 
                     case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        igpus.push_back({false, dev});
+                        if (igpus.empty()) {
+                            igpus.push_back({false, dev});
+                        }
                         break;
                     case GGML_BACKEND_DEVICE_TYPE_META:
                         GGML_ABORT("fatal error");
@@ -237,8 +245,9 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // add GPUs
         model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
 
-        // add integrated GPUs only if no other devices were found
-        if (model->devices.empty()) {
+        // add integrated GPUs only if no discrete GPUs were found
+        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
+        if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
