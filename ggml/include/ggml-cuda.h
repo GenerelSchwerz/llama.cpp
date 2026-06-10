@@ -42,6 +42,8 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 // See ggml/src/ggml-cuda/moe-cache.cu and DESIGN.md.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
 GGML_BACKEND_API bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size);
+GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 
 // Configure / inspect the GPU LRU cache slot count. Set once at model load
 // time when --moe-expert-cache-size N is parsed; read by the dispatch hook
@@ -58,7 +60,8 @@ GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_observe_expert_tensor(
     const void * tensor_data,
     const char * tensor_name,
-    size_t       per_expert_bytes);
+    size_t       per_expert_bytes,
+    int64_t      n_experts);
 GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
 
 // Eagerly create one slot pool per observed tensor on the given device.
@@ -66,6 +69,7 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
 // padding. Logs each pool as a 'load_tensors:'-style line so they group
 // with the other model buffer allocations. Idempotent.
 GGML_BACKEND_API void ggml_backend_cuda_moe_preallocate_pools(int device);
+GGML_BACKEND_API void ggml_backend_cuda_moe_prefill_pools(int device);
 
 // Issue async H2D prefetches for the given expert ids into the cache for
 // `tensor_name`. Used by the dispatch hook to warm up sibling matrix

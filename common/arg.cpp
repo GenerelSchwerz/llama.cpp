@@ -2360,6 +2360,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_moe_expert_cache_slots = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-prefill"},
+        {"--no-moe-expert-cache-prefill"},
+        "prefill all configured MoE expert cache slots after the context is created (default: disabled)",
+        [](common_params & params, bool value) {
+            params.moe_expert_cache_prefill = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_PREFILL"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

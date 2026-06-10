@@ -28,6 +28,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -391,6 +392,17 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
         && buft->iface.get_name == ggml_backend_cuda_moe_cached_buffer_type_name;
 }
 
+extern "C"
+ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size) {
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
+
+    buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
+    return buffer;
+}
+
 // ---------------------------------------------------------------------------
 // Per-device cache singleton
 //
@@ -523,6 +535,7 @@ struct observed_tensor {
     const void * tensor_data;
     std::string  tensor_name;
     size_t       per_expert_bytes;
+    int64_t      n_experts;
 };
 struct observation_state {
     std::mutex mu;
@@ -538,13 +551,15 @@ extern "C"
 void ggml_backend_cuda_moe_observe_expert_tensor(
     const void * tensor_data,
     const char * tensor_name,
-    size_t       per_expert_bytes) {
+    size_t       per_expert_bytes,
+    int64_t      n_experts) {
     if (tensor_data == nullptr || per_expert_bytes == 0) return;
     auto & st = get_observation_state();
     std::lock_guard<std::mutex> lk(st.mu);
     st.tensors.push_back({tensor_data,
                           tensor_name ? std::string(tensor_name) : std::string(),
-                          per_expert_bytes});
+                          per_expert_bytes,
+                          n_experts});
 }
 
 extern "C"
@@ -564,6 +579,34 @@ void ggml_backend_cuda_moe_preallocate_pools(int device) {
         ggml_cuda_moe_cache_get_or_create_for_tensor(
             device, t.tensor_data, t.per_expert_bytes, n_slots,
             t.tensor_name.empty() ? "?" : t.tensor_name.c_str());
+    }
+}
+
+extern "C"
+void ggml_backend_cuda_moe_prefill_pools(int device) {
+    const int n_slots = ggml_backend_cuda_moe_get_cache_slots();
+    if (n_slots <= 0) return;
+
+    auto & st = get_observation_state();
+    std::lock_guard<std::mutex> lk(st.mu);
+    for (const auto & t : st.tensors) {
+        ggml_cuda_moe_cache * cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
+            device, t.tensor_data, t.per_expert_bytes, n_slots,
+            t.tensor_name.empty() ? "?" : t.tensor_name.c_str());
+        if (!cache) {
+            continue;
+        }
+
+        cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+        const char * src_base = (const char *) t.tensor_data;
+        const int64_t n_prefill = std::min<int64_t>(n_slots, t.n_experts);
+        for (int64_t eid = 0; eid < n_prefill; ++eid) {
+            const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
+            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream);
+        }
+
+        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+        ggml_cuda_moe_cache_reset_stats(cache);
     }
 }
 

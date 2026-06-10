@@ -297,6 +297,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (params.moe_expert_cache_slots > 0) {
             // Tell ggml-cuda how big the LRU slot pool should be so the
             // dispatch hook can lazy-init the per-device cache on first use.
+            ggml_backend_cuda_moe_reset_expert_size_observation();
             ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
@@ -371,15 +372,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
-
-#ifdef GGML_USE_CUDA
-        // Eagerly create one slot pool per observed expert tensor, with
-        // each pool sized to that tensor's exact expert_stride. Each pool
-        // logs as a 'load_tensors:'-style line. No lazy creation later.
-        if (params.moe_expert_cache_slots > 0) {
-            ggml_backend_cuda_moe_preallocate_pools(/*device=*/0);
-        }
-#endif
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
@@ -628,4 +620,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

@@ -1516,6 +1516,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+#ifdef GGML_USE_CUDA
+        if (ml.use_mmap && use_mmap_buffer && ggml_backend_buft_is_cuda_moe_cached(buft)) {
+            GGML_ASSERT(!ml.no_alloc);
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = nullptr;
+                size_t first, last; // NOLINT
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                ggml_backend_buffer_t buf = ggml_backend_cuda_moe_cached_buffer_from_host_ptr((char *) addr + first, last - first);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
+                bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
+            }
+        } else
+#endif
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -2297,6 +2316,7 @@ void llama_model_free(llama_model * model) {
     // Reset the observed-expert-size globals so a subsequent model load
     // starts from a clean slate.
     ggml_backend_cuda_moe_reset_expert_size_observation();
+    ggml_cuda_moe_cache_free_all();
 #endif
     delete model;
 }
