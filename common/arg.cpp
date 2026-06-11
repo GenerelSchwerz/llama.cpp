@@ -2361,13 +2361,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
-        {"--moe-expert-cache-prefill"},
-        {"--no-moe-expert-cache-prefill"},
-        "prefill all configured MoE expert cache slots after the context is created (default: disabled)",
-        [](common_params & params, bool value) {
-            params.moe_expert_cache_prefill = value;
+        {"--moe-expert-cache-l2-pinned-mb"}, "N",
+        "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
         }
-    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_PREFILL"));
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -3383,6 +3385,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.verbosity = INT_MAX;
             common_log_set_verbosity_thold(INT_MAX);
+        }
+    ));
+    add_opt(common_arg(
+        {"--experimental-logs"},
+        "Enable experimental debug logs",
+        [](common_params & params) {
+            params.experimental_logs = true;
         }
     ));
     add_opt(common_arg(

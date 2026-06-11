@@ -5,6 +5,7 @@
 // code (__device__, __shfl_*, threadIdx, ...) that only nvcc can compile,
 // which would prevent .cpp consumers (e.g. tests) from including this header.
 #include <cuda_runtime.h>
+#include <stddef.h>
 #include <stdint.h>
 
 // MoE expert cache: keeps a fixed-size GPU slot pool of expert weight slabs
@@ -40,7 +41,10 @@ struct ggml_cuda_moe_cache;
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     int    device,
     size_t slot_size_bytes,
-    int    n_slots);
+    int    n_slots,
+    bool   source_is_mmap,
+    size_t l2_budget_bytes,
+    int    l2_target_slots);
 
 void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache);
 
@@ -57,7 +61,21 @@ int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
     size_t       byte_count,
-    cudaStream_t copy_stream);
+    cudaStream_t copy_stream,
+    bool         use_l2,
+    bool         is_decode);
+
+void ggml_cuda_moe_record_op_stats(
+    bool     is_decode,
+    bool     staged,
+    bool     overflow,
+    uint64_t unique_experts,
+    uint64_t ids_bytes,
+    uint64_t ids_d2h_time_us,
+    uint64_t acquire_time_us,
+    uint64_t remap_time_us,
+    uint64_t total_time_us,
+    bool     ids_cache_hit);
 
 // Ensure the cache's slot size is at least `min_slot_size_bytes`. If the
 // current slot size already covers it, no-op. Otherwise the existing pool is
@@ -99,6 +117,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     const void * tensor_data,
     size_t       slot_size_bytes,
     int          n_slots,
+    int64_t      n_experts,
     const char * tensor_name_for_log);
 
 // Deprecated: keys solely by slot_size_bytes. Kept for compat; returns nullptr.

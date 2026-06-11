@@ -86,6 +86,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
@@ -2844,12 +2845,91 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
         nb1, nb2, nb3, stream);
 }
 
+struct ggml_cuda_moe_ids_cache_key {
+    const void * data;
+    size_t       nbytes;
+    int64_t      ne0;
+    int64_t      ne1;
+    int64_t      ne2;
+    size_t       nb0;
+    size_t       nb1;
+    size_t       nb2;
+    int          layer;
+};
+
+struct ggml_cuda_moe_ids_cache_key_hash {
+    size_t operator()(const ggml_cuda_moe_ids_cache_key & k) const {
+        size_t h = std::hash<const void *>{}(k.data);
+        h ^= std::hash<size_t>{}(k.nbytes) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.ne0) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.ne1) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int64_t>{}(k.ne2) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>{}(k.nb0) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>{}(k.nb1) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<size_t>{}(k.nb2) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.layer) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static bool operator==(const ggml_cuda_moe_ids_cache_key & a, const ggml_cuda_moe_ids_cache_key & b) {
+    return a.data == b.data && a.nbytes == b.nbytes &&
+        a.ne0 == b.ne0 && a.ne1 == b.ne1 && a.ne2 == b.ne2 &&
+        a.nb0 == b.nb0 && a.nb1 == b.nb1 && a.nb2 == b.nb2 &&
+        a.layer == b.layer;
+}
+
+struct ggml_cuda_moe_ids_cache_state {
+    int device = -1;
+    int last_layer = -1;
+    std::unordered_map<ggml_cuda_moe_ids_cache_key, std::vector<char>, ggml_cuda_moe_ids_cache_key_hash> entries;
+};
+
+static int ggml_cuda_moe_layer_from_name(const char * name) {
+    if (name == nullptr) {
+        return -1;
+    }
+
+    const char * blk = strstr(name, "blk.");
+    if (blk == nullptr) {
+        return -1;
+    }
+
+    blk += 4;
+    int layer = 0;
+    bool found_digit = false;
+    while (*blk >= '0' && *blk <= '9') {
+        found_digit = true;
+        layer = 10 * layer + (*blk - '0');
+        ++blk;
+    }
+
+    return found_digit ? layer : -1;
+}
+
+static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_tensor * ids, int layer) {
+    return {
+        ids->data,
+        ggml_nbytes(ids),
+        ids->ne[0],
+        ids->ne[1],
+        ids->ne[2],
+        ids->nb[0],
+        ids->nb[1],
+        ids->nb[2],
+        layer,
+    };
+}
+
 // Per-op staging fallback for the cached path. Used when the persistent cache
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
 // this op into a pool scratch buffer, run the impl, free the scratch.
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
-                                        const std::vector<char> & ids_host_bytes) {
+                                        const std::vector<char> & ids_host_bytes,
+                                        bool is_decode,
+                                        bool overflow) {
+    const int64_t op_start_us = ggml_time_us();
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * ids  = dst->src[2];
     cudaStream_t  stream = ctx.stream();
@@ -2936,6 +3016,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
+
+    ggml_cuda_moe_record_op_stats(
+        is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
+        0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
 }
 
 // Cached path for mul_mat_id when experts live in CUDA_MoE_Cached (CPU pinned)
@@ -2944,7 +3028,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 // cache and skip the H2D copy.
 //
 // Steps:
-//   1. D2H the routing decision (ids tensor) -- small, blocking sync is OK.
+//   1. D2H the routing decision (ids tensor); decode reuses this across
+//      sibling expert matrices in the same layer when possible.
 //   2. Get-or-create the per-device cache, slot_size = this op's expert stride.
 //      If a cache exists with a different slot size, fall back to per-op
 //      staging (the iteration-1 path) for this op.
@@ -2962,17 +3047,47 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 // Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
 // Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
 static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const int64_t op_start_us = ggml_time_us();
     ggml_tensor * src0 = dst->src[0];   // experts in CPU pinned
     ggml_tensor * ids  = dst->src[2];   // routing decision
 
     cudaStream_t stream = ctx.stream();
     const int    device = ggml_cuda_get_device();
+    const bool   is_decode = ids->ne[1] * ids->ne[2] == 1;
 
     // 1. Read ids -> host so we can drive acquire() per unique expert.
-    std::vector<char> ids_host_bytes(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
-                               cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    thread_local ggml_cuda_moe_ids_cache_state ids_cache;
+    std::vector<char> ids_host_bytes;
+    uint64_t ids_d2h_time_us = 0;
+    bool ids_cache_hit = false;
+    const int layer = ggml_cuda_moe_layer_from_name(src0->name);
+    if (!is_decode || layer < 0 || ids_cache.device != device ||
+            (ids_cache.last_layer >= 0 && layer < ids_cache.last_layer)) {
+        ids_cache.entries.clear();
+        ids_cache.device = device;
+    }
+    ids_cache.last_layer = is_decode ? layer : -1;
+
+    const ggml_cuda_moe_ids_cache_key ids_cache_key = ggml_cuda_moe_ids_cache_make_key(ids, layer);
+    if (is_decode && layer >= 0) {
+        auto it = ids_cache.entries.find(ids_cache_key);
+        if (it != ids_cache.entries.end()) {
+            ids_host_bytes = it->second;
+            ids_cache_hit = true;
+        }
+    }
+
+    if (!ids_cache_hit) {
+        ids_host_bytes.resize(ggml_nbytes(ids));
+        const int64_t ids_d2h_start_us = ggml_time_us();
+        CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        ids_d2h_time_us = (uint64_t) (ggml_time_us() - ids_d2h_start_us);
+        if (is_decode && layer >= 0) {
+            ids_cache.entries[ids_cache_key] = ids_host_bytes;
+        }
+    }
 
     // 2. Look up the per-tensor cache. Each MoE expert tensor (one per
     //    layer-and-matrix-kind) gets its own pool of N slots; only that
@@ -2985,11 +3100,11 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_moe_cache * cache = nullptr;
     if (requested_slots > 0) {
         cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
-            device, src0->data, expert_stride, requested_slots, src0->name);
+            device, src0->data, expert_stride, requested_slots, src0->ne[2], src0->name);
     }
 
     if (cache == nullptr) {
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, false);
         return;
     }
 
@@ -3006,6 +3121,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const size_t  ids_nb0 = ids->nb[0];
     const size_t  ids_nb1 = ids->nb[1];
     const size_t  ids_nb2 = ids->nb[2];
+
+    const bool use_l2 = true;
 
     // Single dedup pass: build unique_eids with -2 sentinel for "seen".
     // If we exceed the cache's slot count, fall back to staging.
@@ -3034,9 +3151,11 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (overflow) {
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, true);
         return;
     }
+
+    const int64_t acquire_start_us = ggml_time_us();
 
     // 4. Same-layer sibling prefetch (Prefetch B). The router picks the same
     //    expert ids for all of up/gate/down in one MoE FFN. Fire async H2D
@@ -3059,7 +3178,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                     sibling.replace(pos, std::strlen(this_kind), kinds[k]);
                     ggml_backend_cuda_moe_prefetch_experts(
                         device, sibling.c_str(),
-                        unique_eids.data(), (int)unique_eids.size());
+                        unique_eids.data(), (int)unique_eids.size(), use_l2, is_decode);
                 }
             }
         }
@@ -3081,7 +3200,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream);
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
@@ -3096,9 +3215,10 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (any_cache_failure) {
         // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
         // Fall back so we still produce correct output.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, false);
         return;
     }
+    const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
 
     // Compute stream must wait for all pending H2D copies on copy_stream
     // before reading the slot pool. Use an event to express the dependency.
@@ -3112,6 +3232,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 
     // 4. Build remapped ids on host and push to a scratch GPU buffer. Each
     //    entry now points at slot_id within the cache pool.
+    const int64_t remap_start_us = ggml_time_us();
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
     std::vector<int32_t> remapped_ids_host;
     remapped_ids_host.reserve(ids_total_elems);
@@ -3129,6 +3250,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
                                ids_total_elems * sizeof(int32_t),
                                cudaMemcpyHostToDevice, stream));
+    const uint64_t remap_time_us = (uint64_t) (ggml_time_us() - remap_start_us);
 
     // 5. Synthetic src0 points at the cache slot pool. Slots in this pool
     //    are tightly packed at expert_stride apart, so the original src0
@@ -3158,6 +3280,10 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
+
+    ggml_cuda_moe_record_op_stats(
+        is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
+        ids_d2h_time_us, acquire_time_us, remap_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
 }
 
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
