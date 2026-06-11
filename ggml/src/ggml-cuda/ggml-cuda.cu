@@ -3200,7 +3200,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode);
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, false);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;

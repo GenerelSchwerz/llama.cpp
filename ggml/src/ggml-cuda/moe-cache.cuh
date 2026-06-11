@@ -63,7 +63,8 @@ int ggml_cuda_moe_cache_acquire(
     size_t       byte_count,
     cudaStream_t copy_stream,
     bool         use_l2,
-    bool         is_decode);
+    bool         is_decode,
+    bool         is_prefetch);
 
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,

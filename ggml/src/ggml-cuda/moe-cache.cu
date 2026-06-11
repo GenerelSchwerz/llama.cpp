@@ -554,6 +554,12 @@ struct moe_cache_phase_stats {
     uint64_t h2d_copy_count;
     uint64_t h2d_copy_bytes;
     uint64_t h2d_enqueue_time_us;
+    uint64_t prefetch_hits;
+    uint64_t prefetch_misses;
+    uint64_t prefetch_used;
+    uint64_t prefetch_h2d_copy_count;
+    uint64_t prefetch_h2d_copy_bytes;
+    uint64_t prefetch_h2d_enqueue_time_us;
     uint64_t l2_hits;
     uint64_t l2_misses;
     uint64_t l2_fills;
@@ -622,6 +628,7 @@ struct ggml_cuda_moe_cache {
     // Per-slot state.
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
     std::vector<uint64_t>     last_used;     // [n_slots]
+    std::vector<char>         slot_prefetched;
 
     // host_ptr -> slot_id, O(1) lookup.
     std::unordered_map<const void *, int> host_to_slot;
@@ -642,6 +649,12 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> phase_h2d_copy_count[2];
     std::atomic<uint64_t> phase_h2d_copy_bytes[2];
     std::atomic<uint64_t> phase_h2d_enqueue_time_us[2];
+    std::atomic<uint64_t> phase_prefetch_hits[2];
+    std::atomic<uint64_t> phase_prefetch_misses[2];
+    std::atomic<uint64_t> phase_prefetch_used[2];
+    std::atomic<uint64_t> phase_prefetch_h2d_copy_count[2];
+    std::atomic<uint64_t> phase_prefetch_h2d_copy_bytes[2];
+    std::atomic<uint64_t> phase_prefetch_h2d_enqueue_time_us[2];
     std::atomic<uint64_t> sampled_mincore_checks{0};
     std::atomic<uint64_t> sampled_pages_total{0};
     std::atomic<uint64_t> sampled_pages_resident{0};
@@ -722,6 +735,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
 
     c->slot_to_host.assign(n_slots, nullptr);
     c->last_used  .assign(n_slots, 0);
+    c->slot_prefetched.assign(n_slots, 0);
     c->host_to_slot.reserve(n_slots * 2);
     for (int phase = 0; phase < 2; ++phase) {
         c->phase_hits[phase].store(0, std::memory_order_relaxed);
@@ -730,6 +744,12 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         c->phase_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
         c->phase_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
         c->phase_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_hits[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
     }
 
     cudaSetDevice(prev_device);
@@ -836,7 +856,8 @@ int ggml_cuda_moe_cache_acquire(
     size_t       byte_count,
     cudaStream_t copy_stream,
     bool         use_l2,
-    bool         is_decode) {
+    bool         is_decode,
+    bool         is_prefetch) {
 
     if (!cache || host_src == nullptr || byte_count == 0) {
         return -1;
@@ -859,6 +880,12 @@ int ggml_cuda_moe_cache_acquire(
         cache->last_used[slot] = ++cache->access_counter;
         cache->hits.fetch_add(1, std::memory_order_relaxed);
         cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
+        if (is_prefetch) {
+            cache->phase_prefetch_hits[phase].fetch_add(1, std::memory_order_relaxed);
+        } else if (cache->slot_prefetched[slot]) {
+            cache->phase_prefetch_used[phase].fetch_add(1, std::memory_order_relaxed);
+            cache->slot_prefetched[slot] = 0;
+        }
         return slot;
     }
 
@@ -882,11 +909,16 @@ int ggml_cuda_moe_cache_acquire(
     cache->slot_to_host[lru_slot] = host_src;
     cache->host_to_slot[host_src] = lru_slot;
     cache->last_used[lru_slot]    = ++cache->access_counter;
+    cache->slot_prefetched[lru_slot] = is_prefetch ? 1 : 0;
     cache->misses.fetch_add(1, std::memory_order_relaxed);
     cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    if (is_prefetch) {
+        cache->phase_prefetch_misses[phase].fetch_add(1, std::memory_order_relaxed);
+    }
     auto rollback_miss = [&]() {
         cache->slot_to_host[lru_slot] = nullptr;
         cache->host_to_slot.erase(host_src);
+        cache->slot_prefetched[lru_slot] = 0;
     };
 
     const bool debug_mm = moe_cache_mm_debug_enabled();
@@ -920,6 +952,11 @@ int ggml_cuda_moe_cache_acquire(
         cache->phase_h2d_copy_count[phase].fetch_add(1, std::memory_order_relaxed);
         cache->phase_h2d_copy_bytes[phase].fetch_add(byte_count, std::memory_order_relaxed);
         cache->phase_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+        if (is_prefetch) {
+            cache->phase_prefetch_h2d_copy_count[phase].fetch_add(1, std::memory_order_relaxed);
+            cache->phase_prefetch_h2d_copy_bytes[phase].fetch_add(byte_count, std::memory_order_relaxed);
+            cache->phase_prefetch_h2d_enqueue_time_us[phase].fetch_add(h2d_enqueue_time_us, std::memory_order_relaxed);
+        }
     }
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaMemcpyAsync failed: %s\n",
@@ -973,6 +1010,7 @@ bool ggml_cuda_moe_cache_grow_pool(
     // so the next acquires re-populate slots in the new (larger) pool.
     std::fill(cache->slot_to_host.begin(), cache->slot_to_host.end(), nullptr);
     std::fill(cache->last_used.begin(),    cache->last_used.end(),    0ull);
+    std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
     cache->host_to_slot.clear();
     cache->access_counter = 0;
     if (cache->l2.slot_pool_h) {
@@ -1093,6 +1131,12 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
     s.h2d_copy_count = cache->phase_h2d_copy_count[phase].load(std::memory_order_relaxed);
     s.h2d_copy_bytes = cache->phase_h2d_copy_bytes[phase].load(std::memory_order_relaxed);
     s.h2d_enqueue_time_us = cache->phase_h2d_enqueue_time_us[phase].load(std::memory_order_relaxed);
+    s.prefetch_hits = cache->phase_prefetch_hits[phase].load(std::memory_order_relaxed);
+    s.prefetch_misses = cache->phase_prefetch_misses[phase].load(std::memory_order_relaxed);
+    s.prefetch_used = cache->phase_prefetch_used[phase].load(std::memory_order_relaxed);
+    s.prefetch_h2d_copy_count = cache->phase_prefetch_h2d_copy_count[phase].load(std::memory_order_relaxed);
+    s.prefetch_h2d_copy_bytes = cache->phase_prefetch_h2d_copy_bytes[phase].load(std::memory_order_relaxed);
+    s.prefetch_h2d_enqueue_time_us = cache->phase_prefetch_h2d_enqueue_time_us[phase].load(std::memory_order_relaxed);
     if (cache->l2.slot_pool_h) {
         s.l2_hits = cache->l2.phase_hits[phase].load(std::memory_order_relaxed);
         s.l2_misses = cache->l2.phase_misses[phase].load(std::memory_order_relaxed);
@@ -1149,6 +1193,12 @@ static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe
     dst.h2d_copy_count += src.h2d_copy_count;
     dst.h2d_copy_bytes += src.h2d_copy_bytes;
     dst.h2d_enqueue_time_us += src.h2d_enqueue_time_us;
+    dst.prefetch_hits += src.prefetch_hits;
+    dst.prefetch_misses += src.prefetch_misses;
+    dst.prefetch_used += src.prefetch_used;
+    dst.prefetch_h2d_copy_count += src.prefetch_h2d_copy_count;
+    dst.prefetch_h2d_copy_bytes += src.prefetch_h2d_copy_bytes;
+    dst.prefetch_h2d_enqueue_time_us += src.prefetch_h2d_enqueue_time_us;
     dst.l2_hits += src.l2_hits;
     dst.l2_misses += src.l2_misses;
     dst.l2_fills += src.l2_fills;
@@ -1175,7 +1225,7 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
     const double l2_hit_rate = l2_total > 0 ? 100.0 * (double) s.l2_hits / (double) l2_total : 0.0;
     const double avg_unique = s.ops > 0 ? (double) s.unique_experts / (double) s.ops : 0.0;
     GGML_LOG(
-        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_ms=%.3f ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f\n",
+        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_ms=%.3f ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
         name,
         (unsigned long long) s.ops,
         (unsigned long long) s.staged_ops,
@@ -1201,7 +1251,13 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
         l2_hit_rate,
         (unsigned long long) s.h2d_copy_count,
         (double) s.h2d_copy_bytes / 1024.0 / 1024.0,
-        (double) s.h2d_enqueue_time_us / 1000.0);
+        (double) s.h2d_enqueue_time_us / 1000.0,
+        (unsigned long long) s.prefetch_hits,
+        (unsigned long long) s.prefetch_misses,
+        (unsigned long long) s.prefetch_used,
+        (unsigned long long) s.prefetch_h2d_copy_count,
+        (double) s.prefetch_h2d_copy_bytes / 1024.0 / 1024.0,
+        (double) s.prefetch_h2d_enqueue_time_us / 1000.0);
 }
 
 static uint64_t ggml_cuda_moe_cache_top_accesses(std::vector<uint64_t> counts, size_t n_top) {
@@ -1278,6 +1334,12 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
         cache->phase_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
         cache->phase_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
         cache->phase_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_hits[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
     }
     cache->sampled_mincore_checks.store(0, std::memory_order_relaxed);
     cache->sampled_pages_total.store(0, std::memory_order_relaxed);
@@ -1710,11 +1772,11 @@ void ggml_backend_cuda_moe_prefill_pools(int device) {
 
         for (int64_t eid = 0; eid < n_l2_prefill; ++eid) {
             const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
-            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false);
+            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
         }
         for (int64_t eid = 0; eid < std::min<int64_t>(t.n_experts, n_slots); ++eid) {
             const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
-            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false);
+            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
         }
 
         if (copy_stream) {
@@ -1774,7 +1836,7 @@ void ggml_backend_cuda_moe_prefetch_experts(
         int32_t eid = eids[i];
         if (eid < 0) continue;
         const void * host_ptr = src_base + (size_t)eid * expert_stride;
-        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode);
+        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, true);
     }
 }
 
