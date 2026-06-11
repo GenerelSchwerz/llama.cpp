@@ -82,7 +82,9 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_prefetch_experts(
     int           device,
     const char *  tensor_name,
     const int32_t * eids,
-    int           n_eids);
+    int           n_eids,
+    bool          use_l2,
+    bool          is_decode);
 
 // Print cache hit/miss/eviction counters per device and reset them. Call at
 // end of a request (or on model unload) to surface telemetry. No-op if the
