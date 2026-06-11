@@ -501,6 +501,7 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     int32_t n_moe_expert_cache_slots = 0; // --moe-expert-cache-size: GPU LRU cache for MoE experts; 0 = off
+    size_t moe_expert_cache_l2_pinned_size = 0;
     bool moe_expert_cache_prefill = false;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
@@ -509,6 +510,7 @@ struct common_params {
     std::vector<common_control_vector_load_info> control_vectors; // control vector with user defined scale
 
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
+    bool    experimental_logs          = false;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;
