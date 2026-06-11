@@ -79,9 +79,12 @@ struct moe_cache_op_phase_stats {
     std::atomic<uint64_t> unique_experts_max{0};
     std::atomic<uint64_t> ids_bytes{0};
     std::atomic<uint64_t> ids_d2h_time_us{0};
+    std::atomic<uint64_t> ids_d2h_sync_count{0};
     std::atomic<uint64_t> ids_cache_hits{0};
     std::atomic<uint64_t> acquire_time_us{0};
     std::atomic<uint64_t> remap_time_us{0};
+    std::atomic<uint64_t> copy_wait_event_count{0};
+    std::atomic<uint64_t> copy_wait_event_time_us{0};
     std::atomic<uint64_t> total_time_us{0};
 };
 
@@ -557,6 +560,13 @@ struct moe_cache_phase_stats {
     uint64_t prefetch_hits;
     uint64_t prefetch_misses;
     uint64_t prefetch_used;
+    uint64_t prefetch_evictions;
+    uint64_t demand_evictions;
+    uint64_t evicted_prefetched;
+    uint64_t evicted_hit_count_le1;
+    uint64_t evicted_hit_count_ge2;
+    uint64_t evicted_age_le_l1;
+    uint64_t evicted_age_gt_l1;
     uint64_t prefetch_h2d_copy_count;
     uint64_t prefetch_h2d_copy_bytes;
     uint64_t prefetch_h2d_enqueue_time_us;
@@ -573,10 +583,23 @@ struct moe_cache_phase_stats {
     uint64_t unique_experts_max;
     uint64_t ids_bytes;
     uint64_t ids_d2h_time_us;
+    uint64_t ids_d2h_sync_count;
     uint64_t ids_cache_hits;
     uint64_t acquire_time_us;
     uint64_t remap_time_us;
+    uint64_t copy_wait_event_count;
+    uint64_t copy_wait_event_time_us;
     uint64_t total_time_us;
+};
+
+struct moe_cache_reuse_hist {
+    uint64_t first_touch = 0;
+    uint64_t le8 = 0;
+    uint64_t le16 = 0;
+    uint64_t le32 = 0;
+    uint64_t le_l1 = 0;
+    uint64_t le_2xl1 = 0;
+    uint64_t gt_2xl1 = 0;
 };
 
 struct moe_cache_expert_stats {
@@ -611,6 +634,38 @@ struct moe_cache_hot_tensor_stats {
     uint64_t top10_accesses = 0;
 };
 
+struct moe_cache_tensor_decode_stats {
+    std::string name;
+    uint64_t experts = 0;
+    uint64_t unique_experts = 0;
+    uint64_t accesses = 0;
+    uint64_t touched_once = 0;
+    uint64_t touched_ge2 = 0;
+    uint64_t top1_accesses = 0;
+    uint64_t top5_accesses = 0;
+    uint64_t top10_accesses = 0;
+    uint64_t l1_hits = 0;
+    uint64_t l1_misses = 0;
+    uint64_t l1_evictions = 0;
+    uint64_t h2d_copy_count = 0;
+    uint64_t h2d_copy_bytes = 0;
+    uint64_t h2d_enqueue_time_us = 0;
+    uint64_t prefetch_h2d_copy_count = 0;
+    uint64_t prefetch_h2d_copy_bytes = 0;
+    uint64_t prefetch_used = 0;
+    uint64_t prefetch_evictions = 0;
+    uint64_t demand_evictions = 0;
+    uint64_t evicted_prefetched = 0;
+    uint64_t evicted_hit_count_le1 = 0;
+    uint64_t evicted_hit_count_ge2 = 0;
+    uint64_t evicted_age_le_l1 = 0;
+    uint64_t evicted_age_gt_l1 = 0;
+    uint64_t reuse_le_l1 = 0;
+    uint64_t reuse_gt_l1 = 0;
+    uint64_t reuse_total = 0;
+    moe_cache_reuse_hist reuse_hist = {};
+};
+
 } // namespace
 
 struct ggml_cuda_moe_cache {
@@ -629,6 +684,8 @@ struct ggml_cuda_moe_cache {
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
     std::vector<uint64_t>     last_used;     // [n_slots]
     std::vector<char>         slot_prefetched;
+    std::vector<uint64_t>     slot_hit_count;
+    std::vector<uint64_t>     slot_fill_access;
 
     // host_ptr -> slot_id, O(1) lookup.
     std::unordered_map<const void *, int> host_to_slot;
@@ -652,6 +709,13 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> phase_prefetch_hits[2];
     std::atomic<uint64_t> phase_prefetch_misses[2];
     std::atomic<uint64_t> phase_prefetch_used[2];
+    std::atomic<uint64_t> phase_prefetch_evictions[2];
+    std::atomic<uint64_t> phase_demand_evictions[2];
+    std::atomic<uint64_t> phase_evicted_prefetched[2];
+    std::atomic<uint64_t> phase_evicted_hit_count_le1[2];
+    std::atomic<uint64_t> phase_evicted_hit_count_ge2[2];
+    std::atomic<uint64_t> phase_evicted_age_le_l1[2];
+    std::atomic<uint64_t> phase_evicted_age_gt_l1[2];
     std::atomic<uint64_t> phase_prefetch_h2d_copy_count[2];
     std::atomic<uint64_t> phase_prefetch_h2d_copy_bytes[2];
     std::atomic<uint64_t> phase_prefetch_h2d_enqueue_time_us[2];
@@ -677,7 +741,24 @@ struct ggml_cuda_moe_cache {
     uint64_t expert_reuse_le_l1 = 0;
     uint64_t expert_reuse_le_l2 = 0;
     uint64_t expert_reuse_gt_l2 = 0;
+    uint64_t phase_expert_access_counter[2] = {};
+    std::vector<uint64_t> phase_expert_access_counts[2];
+    std::vector<uint64_t> phase_expert_last_access[2];
+    uint64_t phase_expert_first_touches[2] = {};
+    uint64_t phase_expert_reuse_le_l1[2] = {};
+    uint64_t phase_expert_reuse_gt_l1[2] = {};
+    moe_cache_reuse_hist phase_expert_reuse_hist[2];
 };
+
+static void ggml_cuda_moe_cache_append_expert_counts(
+        const struct ggml_cuda_moe_cache * cache,
+        std::vector<uint64_t> & counts) {
+    if (!cache || cache->expert_access_counts.empty()) {
+        return;
+    }
+
+    counts.insert(counts.end(), cache->expert_access_counts.begin(), cache->expert_access_counts.end());
+}
 
 extern "C"
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
@@ -736,6 +817,8 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->slot_to_host.assign(n_slots, nullptr);
     c->last_used  .assign(n_slots, 0);
     c->slot_prefetched.assign(n_slots, 0);
+    c->slot_hit_count.assign(n_slots, 0);
+    c->slot_fill_access.assign(n_slots, 0);
     c->host_to_slot.reserve(n_slots * 2);
     for (int phase = 0; phase < 2; ++phase) {
         c->phase_hits[phase].store(0, std::memory_order_relaxed);
@@ -747,6 +830,13 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         c->phase_prefetch_hits[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
+        c->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        c->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
+        c->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
+        c->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);
+        c->phase_evicted_hit_count_ge2[phase].store(0, std::memory_order_relaxed);
+        c->phase_evicted_age_le_l1[phase].store(0, std::memory_order_relaxed);
+        c->phase_evicted_age_gt_l1[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
         c->phase_prefetch_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
@@ -813,7 +903,7 @@ static int64_t ggml_cuda_moe_cache_expert_id(const ggml_cuda_moe_cache * cache, 
     return eid >= 0 && eid < cache->n_experts ? eid : -1;
 }
 
-static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache, const void * host_src) {
+static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache, const void * host_src, int phase) {
     if (!moe_cache_mm_debug_enabled()) {
         return;
     }
@@ -827,6 +917,10 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
         cache->expert_access_counts.assign((size_t) cache->n_experts, 0);
         cache->expert_last_access.assign((size_t) cache->n_experts, 0);
     }
+    if (phase >= 0 && phase < 2 && cache->phase_expert_access_counts[phase].empty()) {
+        cache->phase_expert_access_counts[phase].assign((size_t) cache->n_experts, 0);
+        cache->phase_expert_last_access[phase].assign((size_t) cache->n_experts, 0);
+    }
 
     const uint64_t access = ++cache->expert_access_counter;
     const size_t idx = (size_t) eid;
@@ -836,16 +930,52 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
 
     if (last_access == 0) {
         cache->expert_first_touches++;
+    } else {
+        const uint64_t distance = access - last_access;
+        if (distance <= (uint64_t) cache->n_slots) {
+            cache->expert_reuse_le_l1++;
+        } else if (cache->l2_target_slots > cache->n_slots && distance <= (uint64_t) cache->l2_target_slots) {
+            cache->expert_reuse_le_l2++;
+        } else {
+            cache->expert_reuse_gt_l2++;
+        }
+    }
+
+    if (phase < 0 || phase >= 2) {
         return;
     }
 
-    const uint64_t distance = access - last_access;
-    if (distance <= (uint64_t) cache->n_slots) {
-        cache->expert_reuse_le_l1++;
-    } else if (cache->l2_target_slots > cache->n_slots && distance <= (uint64_t) cache->l2_target_slots) {
-        cache->expert_reuse_le_l2++;
+    const uint64_t phase_access = ++cache->phase_expert_access_counter[phase];
+    cache->phase_expert_access_counts[phase][idx]++;
+    const uint64_t phase_last_access = cache->phase_expert_last_access[phase][idx];
+    cache->phase_expert_last_access[phase][idx] = phase_access;
+
+    moe_cache_reuse_hist & hist = cache->phase_expert_reuse_hist[phase];
+    if (phase_last_access == 0) {
+        cache->phase_expert_first_touches[phase]++;
+        hist.first_touch++;
+        return;
+    }
+
+    const uint64_t phase_distance = phase_access - phase_last_access;
+    if (phase_distance <= (uint64_t) cache->n_slots) {
+        cache->phase_expert_reuse_le_l1[phase]++;
     } else {
-        cache->expert_reuse_gt_l2++;
+        cache->phase_expert_reuse_gt_l1[phase]++;
+    }
+
+    if (phase_distance <= 8) {
+        hist.le8++;
+    } else if (phase_distance <= 16) {
+        hist.le16++;
+    } else if (phase_distance <= 32) {
+        hist.le32++;
+    } else if (phase_distance <= (uint64_t) cache->n_slots) {
+        hist.le_l1++;
+    } else if (phase_distance <= 2ull * (uint64_t) cache->n_slots) {
+        hist.le_2xl1++;
+    } else {
+        hist.gt_2xl1++;
     }
 }
 
@@ -871,13 +1001,14 @@ int ggml_cuda_moe_cache_acquire(
     }
 
     const int phase = moe_cache_phase_index(is_decode);
-    ggml_cuda_moe_cache_record_expert_access(cache, host_src);
+    ggml_cuda_moe_cache_record_expert_access(cache, host_src, phase);
 
     // Hit path: O(1) hash lookup.
     auto it = cache->host_to_slot.find(host_src);
     if (it != cache->host_to_slot.end()) {
         int slot = it->second;
         cache->last_used[slot] = ++cache->access_counter;
+        cache->slot_hit_count[slot]++;
         cache->hits.fetch_add(1, std::memory_order_relaxed);
         cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
         if (is_prefetch) {
@@ -904,12 +1035,35 @@ int ggml_cuda_moe_cache_acquire(
         cache->host_to_slot.erase(evicted);
         cache->evictions.fetch_add(1, std::memory_order_relaxed);
         cache->phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        if (is_prefetch) {
+            cache->phase_prefetch_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_demand_evictions[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (cache->slot_prefetched[lru_slot]) {
+            cache->phase_evicted_prefetched[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t hit_count = cache->slot_hit_count[lru_slot];
+        if (hit_count <= 1) {
+            cache->phase_evicted_hit_count_le1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_hit_count_ge2[phase].fetch_add(1, std::memory_order_relaxed);
+        }
+        const uint64_t age = cache->access_counter >= cache->slot_fill_access[lru_slot] ?
+            cache->access_counter - cache->slot_fill_access[lru_slot] : 0;
+        if (age <= (uint64_t) cache->n_slots) {
+            cache->phase_evicted_age_le_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            cache->phase_evicted_age_gt_l1[phase].fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     cache->slot_to_host[lru_slot] = host_src;
     cache->host_to_slot[host_src] = lru_slot;
     cache->last_used[lru_slot]    = ++cache->access_counter;
     cache->slot_prefetched[lru_slot] = is_prefetch ? 1 : 0;
+    cache->slot_hit_count[lru_slot] = 0;
+    cache->slot_fill_access[lru_slot] = cache->access_counter;
     cache->misses.fetch_add(1, std::memory_order_relaxed);
     cache->phase_misses[phase].fetch_add(1, std::memory_order_relaxed);
     if (is_prefetch) {
@@ -1011,6 +1165,8 @@ bool ggml_cuda_moe_cache_grow_pool(
     std::fill(cache->slot_to_host.begin(), cache->slot_to_host.end(), nullptr);
     std::fill(cache->last_used.begin(),    cache->last_used.end(),    0ull);
     std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
+    std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0ull);
+    std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0ull);
     cache->host_to_slot.clear();
     cache->access_counter = 0;
     if (cache->l2.slot_pool_h) {
@@ -1134,6 +1290,13 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
     s.prefetch_hits = cache->phase_prefetch_hits[phase].load(std::memory_order_relaxed);
     s.prefetch_misses = cache->phase_prefetch_misses[phase].load(std::memory_order_relaxed);
     s.prefetch_used = cache->phase_prefetch_used[phase].load(std::memory_order_relaxed);
+    s.prefetch_evictions = cache->phase_prefetch_evictions[phase].load(std::memory_order_relaxed);
+    s.demand_evictions = cache->phase_demand_evictions[phase].load(std::memory_order_relaxed);
+    s.evicted_prefetched = cache->phase_evicted_prefetched[phase].load(std::memory_order_relaxed);
+    s.evicted_hit_count_le1 = cache->phase_evicted_hit_count_le1[phase].load(std::memory_order_relaxed);
+    s.evicted_hit_count_ge2 = cache->phase_evicted_hit_count_ge2[phase].load(std::memory_order_relaxed);
+    s.evicted_age_le_l1 = cache->phase_evicted_age_le_l1[phase].load(std::memory_order_relaxed);
+    s.evicted_age_gt_l1 = cache->phase_evicted_age_gt_l1[phase].load(std::memory_order_relaxed);
     s.prefetch_h2d_copy_count = cache->phase_prefetch_h2d_copy_count[phase].load(std::memory_order_relaxed);
     s.prefetch_h2d_copy_bytes = cache->phase_prefetch_h2d_copy_bytes[phase].load(std::memory_order_relaxed);
     s.prefetch_h2d_enqueue_time_us = cache->phase_prefetch_h2d_enqueue_time_us[phase].load(std::memory_order_relaxed);
@@ -1162,9 +1325,12 @@ static moe_cache_phase_stats ggml_cuda_moe_op_phase_stats(int phase) {
     s.unique_experts_max = op.unique_experts_max.load(std::memory_order_relaxed);
     s.ids_bytes = op.ids_bytes.load(std::memory_order_relaxed);
     s.ids_d2h_time_us = op.ids_d2h_time_us.load(std::memory_order_relaxed);
+    s.ids_d2h_sync_count = op.ids_d2h_sync_count.load(std::memory_order_relaxed);
     s.ids_cache_hits = op.ids_cache_hits.load(std::memory_order_relaxed);
     s.acquire_time_us = op.acquire_time_us.load(std::memory_order_relaxed);
     s.remap_time_us = op.remap_time_us.load(std::memory_order_relaxed);
+    s.copy_wait_event_count = op.copy_wait_event_count.load(std::memory_order_relaxed);
+    s.copy_wait_event_time_us = op.copy_wait_event_time_us.load(std::memory_order_relaxed);
     s.total_time_us = op.total_time_us.load(std::memory_order_relaxed);
     return s;
 }
@@ -1179,9 +1345,12 @@ static void ggml_cuda_moe_reset_op_phase_stats(void) {
         s.unique_experts_max.store(0, std::memory_order_relaxed);
         s.ids_bytes.store(0, std::memory_order_relaxed);
         s.ids_d2h_time_us.store(0, std::memory_order_relaxed);
+        s.ids_d2h_sync_count.store(0, std::memory_order_relaxed);
         s.ids_cache_hits.store(0, std::memory_order_relaxed);
         s.acquire_time_us.store(0, std::memory_order_relaxed);
         s.remap_time_us.store(0, std::memory_order_relaxed);
+        s.copy_wait_event_count.store(0, std::memory_order_relaxed);
+        s.copy_wait_event_time_us.store(0, std::memory_order_relaxed);
         s.total_time_us.store(0, std::memory_order_relaxed);
     }
 }
@@ -1196,6 +1365,13 @@ static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe
     dst.prefetch_hits += src.prefetch_hits;
     dst.prefetch_misses += src.prefetch_misses;
     dst.prefetch_used += src.prefetch_used;
+    dst.prefetch_evictions += src.prefetch_evictions;
+    dst.demand_evictions += src.demand_evictions;
+    dst.evicted_prefetched += src.evicted_prefetched;
+    dst.evicted_hit_count_le1 += src.evicted_hit_count_le1;
+    dst.evicted_hit_count_ge2 += src.evicted_hit_count_ge2;
+    dst.evicted_age_le_l1 += src.evicted_age_le_l1;
+    dst.evicted_age_gt_l1 += src.evicted_age_gt_l1;
     dst.prefetch_h2d_copy_count += src.prefetch_h2d_copy_count;
     dst.prefetch_h2d_copy_bytes += src.prefetch_h2d_copy_bytes;
     dst.prefetch_h2d_enqueue_time_us += src.prefetch_h2d_enqueue_time_us;
@@ -1212,9 +1388,12 @@ static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe
     dst.unique_experts_max = std::max(dst.unique_experts_max, src.unique_experts_max);
     dst.ids_bytes += src.ids_bytes;
     dst.ids_d2h_time_us += src.ids_d2h_time_us;
+    dst.ids_d2h_sync_count += src.ids_d2h_sync_count;
     dst.ids_cache_hits += src.ids_cache_hits;
     dst.acquire_time_us += src.acquire_time_us;
     dst.remap_time_us += src.remap_time_us;
+    dst.copy_wait_event_count += src.copy_wait_event_count;
+    dst.copy_wait_event_time_us += src.copy_wait_event_time_us;
     dst.total_time_us += src.total_time_us;
 }
 
@@ -1225,7 +1404,7 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
     const double l2_hit_rate = l2_total > 0 ? 100.0 * (double) s.l2_hits / (double) l2_total : 0.0;
     const double avg_unique = s.ops > 0 ? (double) s.unique_experts / (double) s.ops : 0.0;
     GGML_LOG(
-        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_ms=%.3f ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
+        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_mib=%.2f ids_d2h_ms=%.3f ids_d2h_syncs=%llu ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f copy_wait_events=%llu copy_wait_event_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
         name,
         (unsigned long long) s.ops,
         (unsigned long long) s.staged_ops,
@@ -1233,10 +1412,14 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
         avg_unique,
         (unsigned long long) s.unique_experts_max,
         (double) s.ids_bytes / 1024.0 / 1024.0,
+        (double) s.ids_bytes / 1024.0 / 1024.0,
         (double) s.ids_d2h_time_us / 1000.0,
+        (unsigned long long) s.ids_d2h_sync_count,
         (unsigned long long) s.ids_cache_hits,
         (double) s.acquire_time_us / 1000.0,
         (double) s.remap_time_us / 1000.0,
+        (unsigned long long) s.copy_wait_event_count,
+        (double) s.copy_wait_event_time_us / 1000.0,
         (double) s.total_time_us / 1000.0,
         (unsigned long long) s.l1_hits,
         (unsigned long long) s.l1_misses,
@@ -1279,6 +1462,10 @@ static uint64_t ggml_cuda_moe_cache_top_accesses(std::vector<uint64_t> counts, s
     return total;
 }
 
+static double moe_cache_pct(uint64_t numerator, uint64_t denominator) {
+    return denominator > 0 ? 100.0 * (double) numerator / (double) denominator : 0.0;
+}
+
 static moe_cache_hot_tensor_stats ggml_cuda_moe_cache_expert_stats(const struct ggml_cuda_moe_cache * cache) {
     moe_cache_hot_tensor_stats s = {};
     if (!cache || cache->n_experts <= 0) {
@@ -1318,6 +1505,144 @@ static moe_cache_hot_tensor_stats ggml_cuda_moe_cache_expert_stats(const struct 
     return s;
 }
 
+static moe_cache_tensor_decode_stats ggml_cuda_moe_cache_decode_tensor_stats(const struct ggml_cuda_moe_cache * cache) {
+    moe_cache_tensor_decode_stats s = {};
+    if (!cache || cache->n_experts <= 0) {
+        return s;
+    }
+
+    s.name = cache->tensor_name;
+    s.experts = (uint64_t) cache->n_experts;
+    const moe_cache_phase_stats ds = ggml_cuda_moe_cache_phase_stats(cache, 1);
+    s.l1_hits = ds.l1_hits;
+    s.l1_misses = ds.l1_misses;
+    s.l1_evictions = ds.l1_evictions;
+    s.h2d_copy_count = ds.h2d_copy_count;
+    s.h2d_copy_bytes = ds.h2d_copy_bytes;
+    s.h2d_enqueue_time_us = ds.h2d_enqueue_time_us;
+    s.prefetch_h2d_copy_count = ds.prefetch_h2d_copy_count;
+    s.prefetch_h2d_copy_bytes = ds.prefetch_h2d_copy_bytes;
+    s.prefetch_used = ds.prefetch_used;
+    s.prefetch_evictions = ds.prefetch_evictions;
+    s.demand_evictions = ds.demand_evictions;
+    s.evicted_prefetched = ds.evicted_prefetched;
+    s.evicted_hit_count_le1 = ds.evicted_hit_count_le1;
+    s.evicted_hit_count_ge2 = ds.evicted_hit_count_ge2;
+    s.evicted_age_le_l1 = ds.evicted_age_le_l1;
+    s.evicted_age_gt_l1 = ds.evicted_age_gt_l1;
+
+    const std::vector<uint64_t> & counts = cache->phase_expert_access_counts[1];
+    if (!counts.empty()) {
+        for (uint64_t count : counts) {
+            s.accesses += count;
+            if (count > 0) {
+                s.unique_experts++;
+                if (count == 1) {
+                    s.touched_once++;
+                } else {
+                    s.touched_ge2++;
+                }
+            }
+        }
+
+        const size_t n_experts = (size_t) cache->n_experts;
+        const size_t n_top1 = std::max<size_t>(1, (n_experts + 99) / 100);
+        const size_t n_top5 = std::max<size_t>(1, (n_experts * 5 + 99) / 100);
+        const size_t n_top10 = std::max<size_t>(1, (n_experts * 10 + 99) / 100);
+        s.top1_accesses = ggml_cuda_moe_cache_top_accesses(counts, n_top1);
+        s.top5_accesses = ggml_cuda_moe_cache_top_accesses(counts, n_top5);
+        s.top10_accesses = ggml_cuda_moe_cache_top_accesses(counts, n_top10);
+    }
+
+    s.reuse_le_l1 = cache->phase_expert_reuse_le_l1[1];
+    s.reuse_gt_l1 = cache->phase_expert_reuse_gt_l1[1];
+    s.reuse_total = s.reuse_le_l1 + s.reuse_gt_l1;
+    s.reuse_hist = cache->phase_expert_reuse_hist[1];
+    return s;
+}
+
+static double moe_cache_donor_score(const moe_cache_tensor_decode_stats & s) {
+    const uint64_t l1_total = s.l1_hits + s.l1_misses;
+    const double l1_hit_rate = moe_cache_pct(s.l1_hits, l1_total);
+    const double h2d_mib = (double) s.h2d_copy_bytes / 1024.0 / 1024.0;
+    const double reuse_gt_l1_pct = moe_cache_pct(s.reuse_gt_l1, s.reuse_total);
+    return l1_hit_rate - 0.10 * h2d_mib - 0.001 * (double) s.l1_misses - reuse_gt_l1_pct;
+}
+
+static void moe_cache_log_decode_tensor_line(
+        const char * tag,
+        int rank,
+        const moe_cache_tensor_decode_stats & s,
+        bool include_eviction_detail) {
+    const uint64_t l1_total = s.l1_hits + s.l1_misses;
+    const double l1_hit_rate = moe_cache_pct(s.l1_hits, l1_total);
+    const double unique_pct = moe_cache_pct(s.unique_experts, s.experts);
+    const double top1_pct = moe_cache_pct(s.top1_accesses, s.accesses);
+    const double top5_pct = moe_cache_pct(s.top5_accesses, s.accesses);
+    const double top10_pct = moe_cache_pct(s.top10_accesses, s.accesses);
+    const double reuse_le_l1_pct = moe_cache_pct(s.reuse_le_l1, s.reuse_total);
+    const double reuse_gt_l1_pct = moe_cache_pct(s.reuse_gt_l1, s.reuse_total);
+    const double prefetch_use_rate = moe_cache_pct(s.prefetch_used, s.prefetch_h2d_copy_count);
+    const uint64_t prefetch_unused = s.prefetch_h2d_copy_count > s.prefetch_used ?
+        s.prefetch_h2d_copy_count - s.prefetch_used : 0;
+    const uint64_t demand_h2d_copies = s.h2d_copy_count > s.prefetch_h2d_copy_count ?
+        s.h2d_copy_count - s.prefetch_h2d_copy_count : 0;
+
+    if (include_eviction_detail) {
+        GGML_LOG(
+            "%s: rank=%d tensor=%s phase=decode l1_hits=%llu l1_misses=%llu l1_hit_rate=%.2f%% l1_evictions=%llu h2d_copies=%llu h2d_mib=%.2f reuse_gt_l1_pct=%.2f reuse_le_l1_pct=%.2f unique_experts=%llu unique_pct=%.2f touched_once=%llu touched_ge2=%llu top1_pct=%.2f top5_pct=%.2f top10_pct=%.2f demand_h2d_copies=%llu prefetch_h2d_copies=%llu prefetch_used=%llu prefetch_unused=%llu prefetch_use_rate=%.2f%% demand_evictions=%llu prefetch_evictions=%llu evicted_prefetched=%llu evicted_hit_count_le1=%llu evicted_hit_count_ge2=%llu evicted_age_le_l1=%llu evicted_age_gt_l1=%llu rd_first_touch=%llu rd_le8=%llu rd_le16=%llu rd_le32=%llu rd_le_l1=%llu rd_le_2xl1=%llu rd_gt_2xl1=%llu\n",
+            tag,
+            rank,
+            s.name.empty() ? "?" : s.name.c_str(),
+            (unsigned long long) s.l1_hits,
+            (unsigned long long) s.l1_misses,
+            l1_hit_rate,
+            (unsigned long long) s.l1_evictions,
+            (unsigned long long) s.h2d_copy_count,
+            (double) s.h2d_copy_bytes / 1024.0 / 1024.0,
+            reuse_gt_l1_pct,
+            reuse_le_l1_pct,
+            (unsigned long long) s.unique_experts,
+            unique_pct,
+            (unsigned long long) s.touched_once,
+            (unsigned long long) s.touched_ge2,
+            top1_pct,
+            top5_pct,
+            top10_pct,
+            (unsigned long long) demand_h2d_copies,
+            (unsigned long long) s.prefetch_h2d_copy_count,
+            (unsigned long long) s.prefetch_used,
+            (unsigned long long) prefetch_unused,
+            prefetch_use_rate,
+            (unsigned long long) s.demand_evictions,
+            (unsigned long long) s.prefetch_evictions,
+            (unsigned long long) s.evicted_prefetched,
+            (unsigned long long) s.evicted_hit_count_le1,
+            (unsigned long long) s.evicted_hit_count_ge2,
+            (unsigned long long) s.evicted_age_le_l1,
+            (unsigned long long) s.evicted_age_gt_l1,
+            (unsigned long long) s.reuse_hist.first_touch,
+            (unsigned long long) s.reuse_hist.le8,
+            (unsigned long long) s.reuse_hist.le16,
+            (unsigned long long) s.reuse_hist.le32,
+            (unsigned long long) s.reuse_hist.le_l1,
+            (unsigned long long) s.reuse_hist.le_2xl1,
+            (unsigned long long) s.reuse_hist.gt_2xl1);
+    } else {
+        GGML_LOG(
+            "%s: rank=%d tensor=%s l1_hit_rate=%.2f%% h2d_mib=%.2f l1_misses=%llu reuse_gt_l1_pct=%.2f unique_pct=%.2f top10_pct=%.2f\n",
+            tag,
+            rank,
+            s.name.empty() ? "?" : s.name.c_str(),
+            l1_hit_rate,
+            (double) s.h2d_copy_bytes / 1024.0 / 1024.0,
+            (unsigned long long) s.l1_misses,
+            reuse_gt_l1_pct,
+            unique_pct,
+            top10_pct);
+    }
+}
+
 extern "C"
 void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
     if (!cache) return;
@@ -1327,6 +1652,8 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
     cache->h2d_copy_count.store(0, std::memory_order_relaxed);
     cache->h2d_copy_bytes.store(0, std::memory_order_relaxed);
     cache->h2d_enqueue_time_us.store(0, std::memory_order_relaxed);
+    std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0ull);
+    std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), cache->access_counter);
     for (int phase = 0; phase < 2; ++phase) {
         cache->phase_hits[phase].store(0, std::memory_order_relaxed);
         cache->phase_misses[phase].store(0, std::memory_order_relaxed);
@@ -1337,6 +1664,13 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
         cache->phase_prefetch_hits[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_misses[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_used[phase].store(0, std::memory_order_relaxed);
+        cache->phase_prefetch_evictions[phase].store(0, std::memory_order_relaxed);
+        cache->phase_demand_evictions[phase].store(0, std::memory_order_relaxed);
+        cache->phase_evicted_prefetched[phase].store(0, std::memory_order_relaxed);
+        cache->phase_evicted_hit_count_le1[phase].store(0, std::memory_order_relaxed);
+        cache->phase_evicted_hit_count_ge2[phase].store(0, std::memory_order_relaxed);
+        cache->phase_evicted_age_le_l1[phase].store(0, std::memory_order_relaxed);
+        cache->phase_evicted_age_gt_l1[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_h2d_copy_count[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_h2d_copy_bytes[phase].store(0, std::memory_order_relaxed);
         cache->phase_prefetch_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
@@ -1369,6 +1703,15 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
     cache->expert_reuse_le_l1 = 0;
     cache->expert_reuse_le_l2 = 0;
     cache->expert_reuse_gt_l2 = 0;
+    for (int phase = 0; phase < 2; ++phase) {
+        std::fill(cache->phase_expert_access_counts[phase].begin(), cache->phase_expert_access_counts[phase].end(), 0);
+        std::fill(cache->phase_expert_last_access[phase].begin(), cache->phase_expert_last_access[phase].end(), 0);
+        cache->phase_expert_access_counter[phase] = 0;
+        cache->phase_expert_first_touches[phase] = 0;
+        cache->phase_expert_reuse_le_l1[phase] = 0;
+        cache->phase_expert_reuse_gt_l1[phase] = 0;
+        cache->phase_expert_reuse_hist[phase] = {};
+    }
 }
 
 extern "C"
@@ -1379,8 +1722,11 @@ void ggml_cuda_moe_record_op_stats(
     uint64_t unique_experts,
     uint64_t ids_bytes,
     uint64_t ids_d2h_time_us,
+    uint64_t ids_d2h_sync_count,
     uint64_t acquire_time_us,
     uint64_t remap_time_us,
+    uint64_t copy_wait_event_count,
+    uint64_t copy_wait_event_time_us,
     uint64_t total_time_us,
     bool     ids_cache_hit) {
 
@@ -1397,9 +1743,12 @@ void ggml_cuda_moe_record_op_stats(
     moe_cache_atomic_max(s.unique_experts_max, unique_experts);
     s.ids_bytes.fetch_add(ids_bytes, std::memory_order_relaxed);
     s.ids_d2h_time_us.fetch_add(ids_d2h_time_us, std::memory_order_relaxed);
+    s.ids_d2h_sync_count.fetch_add(ids_d2h_sync_count, std::memory_order_relaxed);
     s.ids_cache_hits.fetch_add(ids_cache_hit ? 1 : 0, std::memory_order_relaxed);
     s.acquire_time_us.fetch_add(acquire_time_us, std::memory_order_relaxed);
     s.remap_time_us.fetch_add(remap_time_us, std::memory_order_relaxed);
+    s.copy_wait_event_count.fetch_add(copy_wait_event_count, std::memory_order_relaxed);
+    s.copy_wait_event_time_us.fetch_add(copy_wait_event_time_us, std::memory_order_relaxed);
     s.total_time_us.fetch_add(total_time_us, std::memory_order_relaxed);
 }
 
@@ -1858,6 +2207,9 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     moe_cache_l2_stats l2 = {};
     moe_cache_expert_stats experts = {};
     moe_cache_hot_tensor_stats hot_tensor = {};
+    std::vector<uint64_t> all_expert_access_counts;
+    moe_cache_tensor_decode_stats hot_decode_miss_tensor = {};
+    std::vector<moe_cache_tensor_decode_stats> decode_tensor_stats;
     moe_cache_phase_stats phase_stats[2] = {};
     if (moe_cache_mm_debug_enabled()) {
         for (int phase = 0; phase < 2; ++phase) {
@@ -1909,12 +2261,18 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
                 experts.reuse_gt_l2    += es.reuse_gt_l2;
                 experts.touched_once   += es.touched_once;
                 experts.touched_ge2    += es.touched_ge2;
-                experts.top1_accesses  += es.top1_accesses;
-                experts.top5_accesses  += es.top5_accesses;
-                experts.top10_accesses += es.top10_accesses;
+                ggml_cuda_moe_cache_append_expert_counts(kv.second, all_expert_access_counts);
                 if (es.accesses > hot_tensor.accesses) {
                     hot_tensor = es;
                 }
+            }
+
+            moe_cache_tensor_decode_stats ds = ggml_cuda_moe_cache_decode_tensor_stats(kv.second);
+            if (ds.l1_hits + ds.l1_misses + ds.h2d_copy_count > 0) {
+                decode_tensor_stats.push_back(ds);
+            }
+            if (ds.h2d_copy_bytes > hot_decode_miss_tensor.h2d_copy_bytes) {
+                hot_decode_miss_tensor = ds;
             }
         }
         ggml_cuda_moe_cache_reset_stats(kv.second);
@@ -1947,6 +2305,15 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
             100.0 * (double) experts.reuse_le_l2 / (double) reuse_total : 0.0;
         const double reuse_gt_l2_pct = reuse_total > 0 ?
             100.0 * (double) experts.reuse_gt_l2 / (double) reuse_total : 0.0;
+        if (!all_expert_access_counts.empty()) {
+            const size_t n_experts = all_expert_access_counts.size();
+            const size_t n_top1 = std::max<size_t>(1, (n_experts + 99) / 100);
+            const size_t n_top5 = std::max<size_t>(1, (n_experts * 5 + 99) / 100);
+            const size_t n_top10 = std::max<size_t>(1, (n_experts * 10 + 99) / 100);
+            experts.top1_accesses = ggml_cuda_moe_cache_top_accesses(all_expert_access_counts, n_top1);
+            experts.top5_accesses = ggml_cuda_moe_cache_top_accesses(all_expert_access_counts, n_top5);
+            experts.top10_accesses = ggml_cuda_moe_cache_top_accesses(all_expert_access_counts, n_top10);
+        }
         const double top1_pct = experts.accesses > 0 ?
             100.0 * (double) experts.top1_accesses / (double) experts.accesses : 0.0;
         const double top5_pct = experts.accesses > 0 ?
@@ -1960,6 +2327,11 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
         const uint64_t hot_reuse_total = hot_tensor.reuse_le_l1 + hot_tensor.reuse_le_l2 + hot_tensor.reuse_gt_l2;
         const double hot_reuse_gt_l2_pct = hot_reuse_total > 0 ?
             100.0 * (double) hot_tensor.reuse_gt_l2 / (double) hot_reuse_total : 0.0;
+        const uint64_t hot_decode_total = hot_decode_miss_tensor.l1_hits + hot_decode_miss_tensor.l1_misses;
+        const double hot_decode_hit_rate = hot_decode_total > 0 ?
+            100.0 * (double) hot_decode_miss_tensor.l1_hits / (double) hot_decode_total : 0.0;
+        const double hot_decode_reuse_gt_l1_pct = hot_decode_miss_tensor.reuse_total > 0 ?
+            100.0 * (double) hot_decode_miss_tensor.reuse_gt_l1 / (double) hot_decode_miss_tensor.reuse_total : 0.0;
 
         GGML_LOG(
             "moe-cache-l2: l2_budget_mib=%.2f l2_slots=%llu l2_used_mib=%.2f l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%%\n",
@@ -2004,6 +2376,41 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
             (unsigned long long) hot_tensor.touched_ge2,
             hot_top10_pct,
             hot_reuse_gt_l2_pct);
+        GGML_LOG(
+            "moe-cache-tensor-hot-decode-miss: tensor=%s l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f reuse_gt_l1_pct=%.2f\n",
+            hot_decode_miss_tensor.name.empty() ? "?" : hot_decode_miss_tensor.name.c_str(),
+            (unsigned long long) hot_decode_miss_tensor.l1_hits,
+            (unsigned long long) hot_decode_miss_tensor.l1_misses,
+            (unsigned long long) hot_decode_miss_tensor.l1_evictions,
+            hot_decode_hit_rate,
+            (unsigned long long) hot_decode_miss_tensor.h2d_copy_count,
+            (double) hot_decode_miss_tensor.h2d_copy_bytes / 1024.0 / 1024.0,
+            (double) hot_decode_miss_tensor.h2d_enqueue_time_us / 1000.0,
+            (unsigned long long) hot_decode_miss_tensor.prefetch_used,
+            (unsigned long long) hot_decode_miss_tensor.prefetch_h2d_copy_count,
+            (double) hot_decode_miss_tensor.prefetch_h2d_copy_bytes / 1024.0 / 1024.0,
+            hot_decode_reuse_gt_l1_pct);
+
+        std::vector<moe_cache_tensor_decode_stats> top_miss = decode_tensor_stats;
+        std::sort(top_miss.begin(), top_miss.end(),
+            [](const moe_cache_tensor_decode_stats & a, const moe_cache_tensor_decode_stats & b) {
+                return a.h2d_copy_bytes > b.h2d_copy_bytes;
+            });
+        const size_t top_miss_n = std::min<size_t>(10, top_miss.size());
+        for (size_t i = 0; i < top_miss_n; ++i) {
+            moe_cache_log_decode_tensor_line("moe-cache-tensor-top-decode-miss", (int) i + 1, top_miss[i], true);
+        }
+
+        std::vector<moe_cache_tensor_decode_stats> donors = decode_tensor_stats;
+        std::sort(donors.begin(), donors.end(),
+            [](const moe_cache_tensor_decode_stats & a, const moe_cache_tensor_decode_stats & b) {
+                return moe_cache_donor_score(a) > moe_cache_donor_score(b);
+            });
+        const size_t donor_n = std::min<size_t>(10, donors.size());
+        for (size_t i = 0; i < donor_n; ++i) {
+            moe_cache_log_decode_tensor_line("moe-cache-tensor-donor-candidate", (int) i + 1, donors[i], false);
+        }
+
         ggml_cuda_moe_log_phase_stats("prefill", phase_stats[0]);
         ggml_cuda_moe_log_phase_stats("decode", phase_stats[1]);
         GGML_LOG(

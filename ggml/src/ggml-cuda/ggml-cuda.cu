@@ -3019,7 +3019,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     ggml_cuda_moe_record_op_stats(
         is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
-        0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
+        0, 0, 0, 0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
 }
 
 // Cached path for mul_mat_id when experts live in CUDA_MoE_Cached (CPU pinned)
@@ -3059,6 +3059,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     thread_local ggml_cuda_moe_ids_cache_state ids_cache;
     std::vector<char> ids_host_bytes;
     uint64_t ids_d2h_time_us = 0;
+    uint64_t ids_d2h_sync_count = 0;
     bool ids_cache_hit = false;
     const int layer = ggml_cuda_moe_layer_from_name(src0->name);
     if (!is_decode || layer < 0 || ids_cache.device != device ||
@@ -3083,6 +3084,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
+        ids_d2h_sync_count = 1;
         ids_d2h_time_us = (uint64_t) (ggml_time_us() - ids_d2h_start_us);
         if (is_decode && layer >= 0) {
             ids_cache.entries[ids_cache_key] = ids_host_bytes;
@@ -3219,15 +3221,18 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         return;
     }
     const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
+    uint64_t copy_wait_event_time_us = 0;
 
     // Compute stream must wait for all pending H2D copies on copy_stream
     // before reading the slot pool. Use an event to express the dependency.
     {
+        const int64_t event_start_us = ggml_time_us();
         cudaEvent_t copy_done;
         CUDA_CHECK(cudaEventCreateWithFlags(&copy_done, cudaEventDisableTiming));
         CUDA_CHECK(cudaEventRecord(copy_done, copy_stream));
         CUDA_CHECK(cudaStreamWaitEvent(stream, copy_done, 0));
         CUDA_CHECK(cudaEventDestroy(copy_done));
+        copy_wait_event_time_us = (uint64_t) (ggml_time_us() - event_start_us);
     }
 
     // 4. Build remapped ids on host and push to a scratch GPU buffer. Each
@@ -3283,7 +3288,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 
     ggml_cuda_moe_record_op_stats(
         is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
-        ids_d2h_time_us, acquire_time_us, remap_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
+        ids_d2h_time_us, ids_d2h_sync_count, acquire_time_us, remap_time_us,
+        1, copy_wait_event_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
 }
 
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors

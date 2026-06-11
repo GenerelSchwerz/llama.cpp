@@ -73,8 +73,11 @@ void ggml_cuda_moe_record_op_stats(
     uint64_t unique_experts,
     uint64_t ids_bytes,
     uint64_t ids_d2h_time_us,
+    uint64_t ids_d2h_sync_count,
     uint64_t acquire_time_us,
     uint64_t remap_time_us,
+    uint64_t copy_wait_event_count,
+    uint64_t copy_wait_event_time_us,
     uint64_t total_time_us,
     bool     ids_cache_hit);
 
