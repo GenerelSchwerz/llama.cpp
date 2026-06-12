@@ -501,6 +501,9 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     int32_t n_moe_expert_cache_slots = 0; // --moe-expert-cache-size: GPU LRU cache for MoE experts; 0 = off
+    std::string moe_expert_cache_profile_save;
+    std::string moe_expert_cache_slot_profile_save;
+    std::string moe_expert_cache_slot_profile;
     size_t moe_expert_cache_l2_pinned_size = 0;
     bool moe_expert_cache_prefill = false;
 

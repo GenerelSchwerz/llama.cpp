@@ -297,6 +297,9 @@ extern "C" {
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
         int32_t moe_expert_cache_slots; // # of MoE expert slabs to keep cached on GPU (LRU). 0 = disabled.
+        const char * moe_expert_cache_profile_save;      // path to write raw MoE expert cache telemetry; NULL = disabled.
+        const char * moe_expert_cache_slot_profile_save; // path to write computed MoE expert cache slot profile; NULL = disabled.
+        const char * moe_expert_cache_slot_profile;      // path to load MoE expert cache slot profile; NULL = disabled.
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE

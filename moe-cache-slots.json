@@ -1,0 +1,971 @@
+{
+  "version": 1,
+  "policy": "fixed_budget_hot_donor_v1",
+  "base_slots": 44,
+  "min_slots": 24,
+  "max_slots": 64,
+  "total_slots_baseline": 5280,
+  "total_slots_allocated": 5280,
+  "tensors": {
+    "blk.0.ffn_down_exps.weight": {
+      "slots": 60,
+      "base_slots": 44,
+      "delta": 16,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.0.ffn_gate_exps.weight": {
+      "slots": 60,
+      "base_slots": 44,
+      "delta": 16,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.0.ffn_up_exps.weight": {
+      "slots": 60,
+      "base_slots": 44,
+      "delta": 16,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.1.ffn_down_exps.weight": {
+      "slots": 56,
+      "base_slots": 44,
+      "delta": 12,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.1.ffn_gate_exps.weight": {
+      "slots": 56,
+      "base_slots": 44,
+      "delta": 12,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.1.ffn_up_exps.weight": {
+      "slots": 56,
+      "base_slots": 44,
+      "delta": 12,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.10.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.10.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.10.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.11.ffn_down_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.11.ffn_gate_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.11.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.12.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.12.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.12.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.13.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.13.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.13.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.14.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.14.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.14.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.15.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.15.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.15.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.16.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.16.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.16.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.17.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.17.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.17.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.18.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.18.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.18.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.19.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.19.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.19.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.2.ffn_down_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.2.ffn_gate_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.2.ffn_up_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.20.ffn_down_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.20.ffn_gate_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.20.ffn_up_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.21.ffn_down_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.21.ffn_gate_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.21.ffn_up_exps.weight": {
+      "slots": 40,
+      "base_slots": 44,
+      "delta": -4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.22.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.22.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.22.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.23.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.23.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.23.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.24.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.24.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.24.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.25.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.25.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.25.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.26.ffn_down_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.26.ffn_gate_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.26.ffn_up_exps.weight": {
+      "slots": 24,
+      "base_slots": 44,
+      "delta": -20,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "donor"
+    },
+    "blk.27.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.27.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.27.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.28.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.28.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.28.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.29.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.29.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.29.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.3.ffn_down_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.3.ffn_gate_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.3.ffn_up_exps.weight": {
+      "slots": 52,
+      "base_slots": 44,
+      "delta": 8,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.30.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.30.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.30.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.31.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.31.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.31.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.32.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.32.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.32.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.33.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.33.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.33.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.34.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.34.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.34.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.35.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.35.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.35.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.36.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.36.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.36.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.37.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.37.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.37.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.38.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.38.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.38.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.39.ffn_down_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.39.ffn_gate_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.39.ffn_up_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.4.ffn_down_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.4.ffn_gate_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.4.ffn_up_exps.weight": {
+      "slots": 48,
+      "base_slots": 44,
+      "delta": 4,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "hot"
+    },
+    "blk.5.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.5.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.5.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.6.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.6.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.6.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.7.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.7.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.7.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.8.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.8.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.8.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.9.ffn_down_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.9.ffn_gate_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    },
+    "blk.9.ffn_up_exps.weight": {
+      "slots": 44,
+      "base_slots": 44,
+      "delta": 0,
+      "n_experts": 205,
+      "slot_size_bytes": 557056,
+      "reason": "baseline"
+    }
+  }
+}

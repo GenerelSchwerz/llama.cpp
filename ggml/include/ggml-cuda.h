@@ -51,6 +51,9 @@ GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 // back to per-op staging.
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_cache_slots(int n_slots);
 GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
+GGML_BACKEND_API void ggml_backend_cuda_moe_set_profile_save_path(const char * path);
+GGML_BACKEND_API void ggml_backend_cuda_moe_set_slot_profile_save_path(const char * path);
+GGML_BACKEND_API void ggml_backend_cuda_moe_set_slot_profile_path(const char * path);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_l2_pinned_cache_size(size_t bytes);
 GGML_BACKEND_API size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_debug_mm(bool enabled);

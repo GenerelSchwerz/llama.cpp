@@ -299,6 +299,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             // dispatch hook can lazy-init the per-device cache on first use.
             ggml_backend_cuda_moe_reset_expert_size_observation();
             ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
+            ggml_backend_cuda_moe_set_profile_save_path(params.moe_expert_cache_profile_save);
+            ggml_backend_cuda_moe_set_slot_profile_save_path(params.moe_expert_cache_slot_profile_save);
+            ggml_backend_cuda_moe_set_slot_profile_path(params.moe_expert_cache_slot_profile);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
@@ -318,6 +321,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
+        } else {
+            ggml_backend_cuda_moe_set_profile_save_path(nullptr);
+            ggml_backend_cuda_moe_set_slot_profile_save_path(nullptr);
+            ggml_backend_cuda_moe_set_slot_profile_path(nullptr);
         }
 #endif
 

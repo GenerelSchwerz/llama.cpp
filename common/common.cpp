@@ -1539,6 +1539,12 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_expert_cache_profile_save =
+        params.moe_expert_cache_profile_save.empty() ? nullptr : params.moe_expert_cache_profile_save.c_str();
+    mparams.moe_expert_cache_slot_profile_save =
+        params.moe_expert_cache_slot_profile_save.empty() ? nullptr : params.moe_expert_cache_slot_profile_save.c_str();
+    mparams.moe_expert_cache_slot_profile =
+        params.moe_expert_cache_slot_profile.empty() ? nullptr : params.moe_expert_cache_slot_profile.c_str();
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;

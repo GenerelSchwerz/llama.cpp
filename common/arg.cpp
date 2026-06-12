@@ -2361,6 +2361,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--moe-expert-cache-profile-save"}, "PATH",
+        "MoE expert cache: write raw per-tensor telemetry profile JSON before cache stats reset.",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_profile_save = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_PROFILE_SAVE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-slot-profile-save"}, "PATH",
+        "MoE expert cache: write computed fixed-budget per-tensor slot profile JSON before cache stats reset.",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_slot_profile_save = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SLOT_PROFILE_SAVE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-slot-profile"}, "PATH",
+        "MoE expert cache: load per-tensor slot profile JSON for cache pool allocation.",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_slot_profile = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SLOT_PROFILE"));
+    add_opt(common_arg(
         {"--moe-expert-cache-l2-pinned-mb"}, "N",
         "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
         [](common_params & params, int value) {

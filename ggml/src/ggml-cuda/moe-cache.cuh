@@ -133,6 +133,10 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
 // Global teardown: free all per-device caches. Safe to call repeatedly.
 void ggml_cuda_moe_cache_free_all(void);
 
+void ggml_backend_cuda_moe_set_profile_save_path(const char * path);
+void ggml_backend_cuda_moe_set_slot_profile_save_path(const char * path);
+void ggml_backend_cuda_moe_set_slot_profile_path(const char * path);
+
 #ifdef __cplusplus
 }
 #endif

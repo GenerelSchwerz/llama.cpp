@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -55,6 +56,7 @@ namespace {
 
 static constexpr uint64_t MOE_CACHE_MM_SAMPLE_RATE = 64;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
+static std::atomic<bool> g_moe_cache_profile_detail{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
 
 static bool moe_cache_mm_debug_enabled() {
@@ -65,11 +67,55 @@ static bool moe_cache_mm_verbose_enabled() {
     return moe_cache_mm_debug_enabled();
 }
 
+static bool moe_cache_detail_enabled() {
+    return moe_cache_mm_debug_enabled() || g_moe_cache_profile_detail.load(std::memory_order_relaxed);
+}
+
 static int moe_cache_phase_index(bool is_decode) {
     return is_decode ? 1 : 0;
 }
 
 static std::atomic<uint64_t> g_moe_cache_mm_miss_counter{0};
+
+struct moe_cache_slot_profile_entry {
+    int slots = 0;
+    int base_slots = 0;
+    int64_t n_experts = -1;
+    uint64_t slot_size_bytes = 0;
+    std::string reason;
+};
+
+struct moe_cache_slot_profile {
+    bool loaded = false;
+    bool active = false;
+    int base_slots = 0;
+    int min_slots = 0;
+    int max_slots = 0;
+    uint64_t total_slots_baseline = 0;
+    uint64_t total_slots_allocated = 0;
+    std::map<std::string, moe_cache_slot_profile_entry> tensors;
+};
+
+struct moe_cache_profile_config {
+    std::mutex mu;
+    std::string profile_save_path;
+    std::string slot_profile_save_path;
+    std::string slot_profile_path;
+    moe_cache_slot_profile loaded_slot_profile;
+    std::map<std::string, moe_cache_slot_profile_entry> active_slots;
+};
+
+static moe_cache_profile_config & moe_cache_get_profile_config() {
+    static moe_cache_profile_config inst;
+    return inst;
+}
+
+static int moe_cache_effective_slots_for_tensor(const std::string & tensor_name, int base_slots);
+
+static void moe_cache_update_profile_detail_locked(const moe_cache_profile_config & cfg) {
+    const bool enabled = !cfg.profile_save_path.empty() || !cfg.slot_profile_save_path.empty();
+    g_moe_cache_profile_detail.store(enabled, std::memory_order_relaxed);
+}
 
 struct moe_cache_op_phase_stats {
     std::atomic<uint64_t> ops{0};
@@ -637,6 +683,9 @@ struct moe_cache_hot_tensor_stats {
 struct moe_cache_tensor_decode_stats {
     std::string name;
     uint64_t experts = 0;
+    uint64_t slot_size_bytes = 0;
+    int base_slots = 0;
+    int slots = 0;
     uint64_t unique_experts = 0;
     uint64_t accesses = 0;
     uint64_t touched_once = 0;
@@ -671,6 +720,7 @@ struct moe_cache_tensor_decode_stats {
 struct ggml_cuda_moe_cache {
     int      device;
     size_t   slot_size_bytes;
+    int      base_n_slots;
     int      n_slots;
 
     void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
@@ -788,6 +838,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     auto * c = new ggml_cuda_moe_cache;
     c->device          = device;
     c->slot_size_bytes = slot_size_bytes;
+    c->base_n_slots    = n_slots;
     c->n_slots         = n_slots;
     c->slot_pool_d     = nullptr;
     c->copy_stream     = nullptr;
@@ -904,7 +955,7 @@ static int64_t ggml_cuda_moe_cache_expert_id(const ggml_cuda_moe_cache * cache, 
 }
 
 static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache, const void * host_src, int phase) {
-    if (!moe_cache_mm_debug_enabled()) {
+    if (!moe_cache_detail_enabled()) {
         return;
     }
 
@@ -1513,6 +1564,9 @@ static moe_cache_tensor_decode_stats ggml_cuda_moe_cache_decode_tensor_stats(con
 
     s.name = cache->tensor_name;
     s.experts = (uint64_t) cache->n_experts;
+    s.slot_size_bytes = (uint64_t) cache->slot_size_bytes;
+    s.base_slots = cache->base_n_slots;
+    s.slots = cache->n_slots;
     const moe_cache_phase_stats ds = ggml_cuda_moe_cache_phase_stats(cache, 1);
     s.l1_hits = ds.l1_hits;
     s.l1_misses = ds.l1_misses;
@@ -1567,6 +1621,513 @@ static double moe_cache_donor_score(const moe_cache_tensor_decode_stats & s) {
     const double h2d_mib = (double) s.h2d_copy_bytes / 1024.0 / 1024.0;
     const double reuse_gt_l1_pct = moe_cache_pct(s.reuse_gt_l1, s.reuse_total);
     return l1_hit_rate - 0.10 * h2d_mib - 0.001 * (double) s.l1_misses - reuse_gt_l1_pct;
+}
+
+static std::string moe_cache_json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (char ch : s) {
+        switch (ch) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:   out += ch;      break;
+        }
+    }
+    return out;
+}
+
+static bool moe_cache_write_atomic(const std::string & path, const std::string & data) {
+    if (path.empty()) {
+        return true;
+    }
+
+    const std::string tmp_path = path + ".tmp";
+    {
+        std::ofstream out(tmp_path, std::ios::out | std::ios::trunc);
+        if (!out) {
+            GGML_LOG("moe-cache-profile: failed to open %s\n", tmp_path.c_str());
+            return false;
+        }
+        out << data;
+        out.flush();
+        if (!out) {
+            GGML_LOG("moe-cache-profile: failed to write %s\n", tmp_path.c_str());
+            return false;
+        }
+    }
+
+    if (std::rename(tmp_path.c_str(), path.c_str()) != 0) {
+        GGML_LOG("moe-cache-profile: failed to rename %s to %s errno=%d\n",
+            tmp_path.c_str(), path.c_str(), errno);
+        return false;
+    }
+    return true;
+}
+
+static bool moe_cache_read_file(const std::string & path, std::string & out) {
+    std::ifstream in(path, std::ios::in | std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    out = ss.str();
+    return true;
+}
+
+static void moe_cache_json_skip_ws(const std::string & s, size_t & pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\n' || s[pos] == '\r' || s[pos] == '\t')) {
+        ++pos;
+    }
+}
+
+static bool moe_cache_json_parse_string(const std::string & s, size_t & pos, std::string & out) {
+    moe_cache_json_skip_ws(s, pos);
+    if (pos >= s.size() || s[pos] != '"') {
+        return false;
+    }
+    ++pos;
+    out.clear();
+    while (pos < s.size()) {
+        char ch = s[pos++];
+        if (ch == '"') {
+            return true;
+        }
+        if (ch == '\\') {
+            if (pos >= s.size()) {
+                return false;
+            }
+            char esc = s[pos++];
+            switch (esc) {
+                case '"':  out += '"';  break;
+                case '\\': out += '\\'; break;
+                case 'n':  out += '\n'; break;
+                case 'r':  out += '\r'; break;
+                case 't':  out += '\t'; break;
+                default:   out += esc;  break;
+            }
+        } else {
+            out += ch;
+        }
+    }
+    return false;
+}
+
+static bool moe_cache_json_find_matching_brace(const std::string & s, size_t open_pos, size_t & close_pos) {
+    if (open_pos >= s.size() || s[open_pos] != '{') {
+        return false;
+    }
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (size_t i = open_pos; i < s.size(); ++i) {
+        const char ch = s[i];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch == '\\') {
+                escaped = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0) {
+                close_pos = i;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool moe_cache_json_get_int64(const std::string & s, const char * key, int64_t & value) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = s.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos = s.find(':', pos + needle.size());
+    if (pos == std::string::npos) {
+        return false;
+    }
+    ++pos;
+    moe_cache_json_skip_ws(s, pos);
+    char * end = nullptr;
+    const long long parsed = std::strtoll(s.c_str() + pos, &end, 10);
+    if (end == s.c_str() + pos) {
+        return false;
+    }
+    value = (int64_t) parsed;
+    return true;
+}
+
+static bool moe_cache_json_get_string(const std::string & s, const char * key, std::string & value) {
+    const std::string needle = std::string("\"") + key + "\"";
+    size_t pos = s.find(needle);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos = s.find(':', pos + needle.size());
+    if (pos == std::string::npos) {
+        return false;
+    }
+    ++pos;
+    return moe_cache_json_parse_string(s, pos, value);
+}
+
+static bool moe_cache_load_slot_profile_file(const std::string & path, moe_cache_slot_profile & profile) {
+    std::string data;
+    if (!moe_cache_read_file(path, data)) {
+        GGML_LOG("moe-cache-alloc: failed to read slot profile %s\n", path.c_str());
+        return false;
+    }
+
+    moe_cache_slot_profile parsed;
+    int64_t v = 0;
+    if (!moe_cache_json_get_int64(data, "version", v) || v != 1) {
+        GGML_LOG("moe-cache-alloc: invalid slot profile version in %s\n", path.c_str());
+        return false;
+    }
+    if (!moe_cache_json_get_int64(data, "base_slots", v) || v <= 0) {
+        GGML_LOG("moe-cache-alloc: missing base_slots in %s\n", path.c_str());
+        return false;
+    }
+    parsed.base_slots = (int) v;
+    if (!moe_cache_json_get_int64(data, "min_slots", v) || v <= 0) {
+        GGML_LOG("moe-cache-alloc: missing min_slots in %s\n", path.c_str());
+        return false;
+    }
+    parsed.min_slots = (int) v;
+    if (!moe_cache_json_get_int64(data, "max_slots", v) || v < parsed.min_slots) {
+        GGML_LOG("moe-cache-alloc: missing max_slots in %s\n", path.c_str());
+        return false;
+    }
+    parsed.max_slots = (int) v;
+    if (moe_cache_json_get_int64(data, "total_slots_baseline", v) && v >= 0) {
+        parsed.total_slots_baseline = (uint64_t) v;
+    }
+    if (moe_cache_json_get_int64(data, "total_slots_allocated", v) && v >= 0) {
+        parsed.total_slots_allocated = (uint64_t) v;
+    }
+    if (parsed.total_slots_baseline > 0 && parsed.total_slots_allocated > parsed.total_slots_baseline) {
+        GGML_LOG("moe-cache-alloc: invalid slot profile total_slots_allocated=%llu baseline=%llu in %s\n",
+            (unsigned long long) parsed.total_slots_allocated,
+            (unsigned long long) parsed.total_slots_baseline,
+            path.c_str());
+        return false;
+    }
+
+    const std::string tensors_key = "\"tensors\"";
+    size_t tensors_pos = data.find(tensors_key);
+    if (tensors_pos == std::string::npos) {
+        GGML_LOG("moe-cache-alloc: missing tensors in %s\n", path.c_str());
+        return false;
+    }
+    size_t obj_pos = data.find('{', tensors_pos + tensors_key.size());
+    size_t obj_end = 0;
+    if (!moe_cache_json_find_matching_brace(data, obj_pos, obj_end)) {
+        GGML_LOG("moe-cache-alloc: malformed tensors object in %s\n", path.c_str());
+        return false;
+    }
+
+    size_t pos = obj_pos + 1;
+    while (pos < obj_end) {
+        moe_cache_json_skip_ws(data, pos);
+        if (pos >= obj_end || data[pos] == '}') {
+            break;
+        }
+        if (data[pos] == ',') {
+            ++pos;
+            continue;
+        }
+        std::string name;
+        if (!moe_cache_json_parse_string(data, pos, name)) {
+            return false;
+        }
+        moe_cache_json_skip_ws(data, pos);
+        if (pos >= obj_end || data[pos] != ':') {
+            return false;
+        }
+        ++pos;
+        moe_cache_json_skip_ws(data, pos);
+        size_t entry_end = 0;
+        if (pos >= obj_end || data[pos] != '{' || !moe_cache_json_find_matching_brace(data, pos, entry_end)) {
+            return false;
+        }
+        const std::string entry_json = data.substr(pos, entry_end - pos + 1);
+        moe_cache_slot_profile_entry entry;
+        if (!moe_cache_json_get_int64(entry_json, "slots", v) || v <= 0) {
+            return false;
+        }
+        entry.slots = (int) v;
+        if (moe_cache_json_get_int64(entry_json, "base_slots", v)) {
+            entry.base_slots = (int) v;
+        }
+        if (moe_cache_json_get_int64(entry_json, "n_experts", v)) {
+            entry.n_experts = v;
+        }
+        if (moe_cache_json_get_int64(entry_json, "slot_size_bytes", v) && v >= 0) {
+            entry.slot_size_bytes = (uint64_t) v;
+        }
+        (void) moe_cache_json_get_string(entry_json, "reason", entry.reason);
+        parsed.tensors[name] = entry;
+        pos = entry_end + 1;
+    }
+
+    parsed.loaded = true;
+    profile = std::move(parsed);
+    GGML_LOG_INFO("moe-cache-alloc: loaded slot profile %s tensors=%zu base_slots=%d total_slots_allocated=%llu\n",
+        path.c_str(),
+        profile.tensors.size(),
+        profile.base_slots,
+        (unsigned long long) profile.total_slots_allocated);
+    return true;
+}
+
+static double moe_cache_hot_score(const moe_cache_tensor_decode_stats & s) {
+    const double h2d_mib = (double) s.h2d_copy_bytes / 1024.0 / 1024.0;
+    const double reuse_gt_l1_pct = moe_cache_pct(s.reuse_gt_l1, s.reuse_total);
+    const double evicted_reused =
+        (double) s.evicted_hit_count_ge2 / (double) std::max<uint64_t>(s.l1_evictions, 1);
+    return h2d_mib * (1.0 + reuse_gt_l1_pct / 100.0) * (1.0 + evicted_reused);
+}
+
+static std::string moe_cache_raw_profile_json(
+        const std::vector<moe_cache_tensor_decode_stats> & tensors,
+        const moe_cache_phase_stats & decode_stats,
+        int base_slots) {
+    const uint64_t total_l1 = decode_stats.l1_hits + decode_stats.l1_misses;
+    const uint64_t timestamp = (uint64_t) std::time(nullptr);
+
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"version\": 1,\n";
+    out << "  \"timestamp\": " << timestamp << ",\n";
+    out << "  \"base_slots\": " << base_slots << ",\n";
+    out << "  \"total_expert_tensors_observed\": " << tensors.size() << ",\n";
+    out << "  \"total_slots_baseline\": " << ((uint64_t) tensors.size() * (uint64_t) std::max(base_slots, 0)) << ",\n";
+    out << "  \"runtime\": {\n";
+    out << "    \"moe_expert_cache_size\": " << base_slots << "\n";
+    out << "  },\n";
+    out << "  \"decode\": {\n";
+    out << "    \"ops\": " << decode_stats.ops << ",\n";
+    out << "    \"ids_d2h_ms\": " << ((double) decode_stats.ids_d2h_time_us / 1000.0) << ",\n";
+    out << "    \"ids_d2h_syncs\": " << decode_stats.ids_d2h_sync_count << ",\n";
+    out << "    \"ids_cache_hits\": " << decode_stats.ids_cache_hits << ",\n";
+    out << "    \"l1_hits\": " << decode_stats.l1_hits << ",\n";
+    out << "    \"l1_misses\": " << decode_stats.l1_misses << ",\n";
+    out << "    \"l1_hit_rate\": " << moe_cache_pct(decode_stats.l1_hits, total_l1) << ",\n";
+    out << "    \"h2d_copies\": " << decode_stats.h2d_copy_count << ",\n";
+    out << "    \"h2d_mib\": " << ((double) decode_stats.h2d_copy_bytes / 1024.0 / 1024.0) << ",\n";
+    out << "    \"h2d_enqueue_ms\": " << ((double) decode_stats.h2d_enqueue_time_us / 1000.0) << "\n";
+    out << "  },\n";
+    out << "  \"tensors\": {\n";
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto & s = tensors[i];
+        const uint64_t l1_total = s.l1_hits + s.l1_misses;
+        const uint64_t prefetch_unused = s.prefetch_h2d_copy_count > s.prefetch_used ?
+            s.prefetch_h2d_copy_count - s.prefetch_used : 0;
+        const uint64_t demand_h2d_copies = s.h2d_copy_count > s.prefetch_h2d_copy_count ?
+            s.h2d_copy_count - s.prefetch_h2d_copy_count : 0;
+        out << "    \"" << moe_cache_json_escape(s.name) << "\": {\n";
+        out << "      \"n_experts\": " << s.experts << ",\n";
+        out << "      \"slot_size_bytes\": " << s.slot_size_bytes << ",\n";
+        out << "      \"base_slots\": " << s.base_slots << ",\n";
+        out << "      \"slots\": " << s.slots << ",\n";
+        out << "      \"l1_hits\": " << s.l1_hits << ",\n";
+        out << "      \"l1_misses\": " << s.l1_misses << ",\n";
+        out << "      \"l1_hit_rate\": " << moe_cache_pct(s.l1_hits, l1_total) << ",\n";
+        out << "      \"l1_evictions\": " << s.l1_evictions << ",\n";
+        out << "      \"h2d_copies\": " << s.h2d_copy_count << ",\n";
+        out << "      \"h2d_mib\": " << ((double) s.h2d_copy_bytes / 1024.0 / 1024.0) << ",\n";
+        out << "      \"h2d_enqueue_ms\": " << ((double) s.h2d_enqueue_time_us / 1000.0) << ",\n";
+        out << "      \"reuse_gt_l1_pct\": " << moe_cache_pct(s.reuse_gt_l1, s.reuse_total) << ",\n";
+        out << "      \"reuse_le_l1_pct\": " << moe_cache_pct(s.reuse_le_l1, s.reuse_total) << ",\n";
+        out << "      \"unique_experts\": " << s.unique_experts << ",\n";
+        out << "      \"unique_pct\": " << moe_cache_pct(s.unique_experts, s.experts) << ",\n";
+        out << "      \"touched_once\": " << s.touched_once << ",\n";
+        out << "      \"touched_ge2\": " << s.touched_ge2 << ",\n";
+        out << "      \"top1_pct\": " << moe_cache_pct(s.top1_accesses, s.accesses) << ",\n";
+        out << "      \"top5_pct\": " << moe_cache_pct(s.top5_accesses, s.accesses) << ",\n";
+        out << "      \"top10_pct\": " << moe_cache_pct(s.top10_accesses, s.accesses) << ",\n";
+        out << "      \"demand_h2d_copies\": " << demand_h2d_copies << ",\n";
+        out << "      \"prefetch_h2d_copies\": " << s.prefetch_h2d_copy_count << ",\n";
+        out << "      \"prefetch_used\": " << s.prefetch_used << ",\n";
+        out << "      \"prefetch_unused\": " << prefetch_unused << ",\n";
+        out << "      \"prefetch_use_rate\": " << moe_cache_pct(s.prefetch_used, s.prefetch_h2d_copy_count) << ",\n";
+        out << "      \"demand_evictions\": " << s.demand_evictions << ",\n";
+        out << "      \"prefetch_evictions\": " << s.prefetch_evictions << ",\n";
+        out << "      \"evicted_hit_count_le1\": " << s.evicted_hit_count_le1 << ",\n";
+        out << "      \"evicted_hit_count_ge2\": " << s.evicted_hit_count_ge2 << ",\n";
+        out << "      \"rd_first_touch\": " << s.reuse_hist.first_touch << ",\n";
+        out << "      \"rd_le8\": " << s.reuse_hist.le8 << ",\n";
+        out << "      \"rd_le16\": " << s.reuse_hist.le16 << ",\n";
+        out << "      \"rd_le32\": " << s.reuse_hist.le32 << ",\n";
+        out << "      \"rd_le_l1\": " << s.reuse_hist.le_l1 << ",\n";
+        out << "      \"rd_le_2xl1\": " << s.reuse_hist.le_2xl1 << ",\n";
+        out << "      \"rd_gt_2xl1\": " << s.reuse_hist.gt_2xl1 << "\n";
+        out << "    }" << (i + 1 == tensors.size() ? "\n" : ",\n");
+    }
+    out << "  }\n";
+    out << "}\n";
+    return out.str();
+}
+
+static moe_cache_slot_profile moe_cache_compute_slot_profile(
+        const std::vector<moe_cache_tensor_decode_stats> & tensors,
+        int base_slots) {
+    moe_cache_slot_profile profile;
+    profile.loaded = true;
+    profile.active = true;
+    profile.base_slots = base_slots;
+    profile.min_slots = std::min(base_slots, 24);
+    profile.max_slots = std::max(base_slots, 64);
+    profile.total_slots_baseline = (uint64_t) tensors.size() * (uint64_t) base_slots;
+
+    struct tensor_rank {
+        size_t idx;
+        double score;
+    };
+
+    std::vector<tensor_rank> hot;
+    std::vector<tensor_rank> donors;
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const auto & s = tensors[i];
+        if (s.name.empty()) {
+            continue;
+        }
+        hot.push_back({i, moe_cache_hot_score(s)});
+        donors.push_back({i, moe_cache_donor_score(s)});
+        moe_cache_slot_profile_entry entry;
+        entry.slots = base_slots;
+        entry.base_slots = base_slots;
+        entry.n_experts = (int64_t) s.experts;
+        entry.slot_size_bytes = s.slot_size_bytes;
+        entry.reason = "baseline";
+        profile.tensors[s.name] = entry;
+    }
+
+    std::sort(hot.begin(), hot.end(), [](const tensor_rank & a, const tensor_rank & b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.idx < b.idx;
+    });
+    std::sort(donors.begin(), donors.end(), [](const tensor_rank & a, const tensor_rank & b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.idx < b.idx;
+    });
+
+    std::map<std::string, int> hot_delta;
+    int slots_needed = 0;
+    const size_t hot_n = std::min<size_t>(20, hot.size());
+    for (size_t rank = 0; rank < hot_n; ++rank) {
+        const auto & s = tensors[hot[rank].idx];
+        int add = 4;
+        if (rank < 3) {
+            add = 16;
+        } else if (rank < 6) {
+            add = 12;
+        } else if (rank < 12) {
+            add = 8;
+        }
+        auto & entry = profile.tensors[s.name];
+        add = std::min(add, profile.max_slots - entry.slots);
+        if (add <= 0 || hot[rank].score <= 0.0) {
+            continue;
+        }
+        entry.slots += add;
+        entry.reason = "hot";
+        hot_delta[s.name] = add;
+        slots_needed += add;
+    }
+
+    int slots_removed = 0;
+    for (const tensor_rank & donor : donors) {
+        if (slots_removed >= slots_needed) {
+            break;
+        }
+        const auto & s = tensors[donor.idx];
+        if (hot_delta.find(s.name) != hot_delta.end()) {
+            continue;
+        }
+        auto & entry = profile.tensors[s.name];
+        const int available = entry.slots - profile.min_slots;
+        if (available <= 0) {
+            continue;
+        }
+        const int remove = std::min(available, slots_needed - slots_removed);
+        entry.slots -= remove;
+        entry.reason = "donor";
+        slots_removed += remove;
+    }
+
+    if (slots_removed < slots_needed) {
+        int rollback = slots_needed - slots_removed;
+        for (auto it = hot.rbegin(); it != hot.rend() && rollback > 0; ++it) {
+            const auto & s = tensors[it->idx];
+            auto hd = hot_delta.find(s.name);
+            if (hd == hot_delta.end()) {
+                continue;
+            }
+            auto & entry = profile.tensors[s.name];
+            const int take_back = std::min(hd->second, rollback);
+            entry.slots -= take_back;
+            hd->second -= take_back;
+            rollback -= take_back;
+            if (entry.slots == base_slots) {
+                entry.reason = "baseline";
+            }
+        }
+    }
+
+    profile.total_slots_allocated = 0;
+    for (auto & kv : profile.tensors) {
+        kv.second.slots = std::max(profile.min_slots, std::min(profile.max_slots, kv.second.slots));
+        profile.total_slots_allocated += (uint64_t) kv.second.slots;
+    }
+
+    return profile;
+}
+
+static std::string moe_cache_slot_profile_json(const moe_cache_slot_profile & profile) {
+    std::ostringstream out;
+    out << "{\n";
+    out << "  \"version\": 1,\n";
+    out << "  \"policy\": \"fixed_budget_hot_donor_v1\",\n";
+    out << "  \"base_slots\": " << profile.base_slots << ",\n";
+    out << "  \"min_slots\": " << profile.min_slots << ",\n";
+    out << "  \"max_slots\": " << profile.max_slots << ",\n";
+    out << "  \"total_slots_baseline\": " << profile.total_slots_baseline << ",\n";
+    out << "  \"total_slots_allocated\": " << profile.total_slots_allocated << ",\n";
+    out << "  \"tensors\": {\n";
+    size_t i = 0;
+    for (const auto & kv : profile.tensors) {
+        const auto & e = kv.second;
+        out << "    \"" << moe_cache_json_escape(kv.first) << "\": {\n";
+        out << "      \"slots\": " << e.slots << ",\n";
+        out << "      \"base_slots\": " << e.base_slots << ",\n";
+        out << "      \"delta\": " << (e.slots - e.base_slots) << ",\n";
+        out << "      \"n_experts\": " << e.n_experts << ",\n";
+        out << "      \"slot_size_bytes\": " << e.slot_size_bytes << ",\n";
+        out << "      \"reason\": \"" << moe_cache_json_escape(e.reason) << "\"\n";
+        out << "    }" << (++i == profile.tensors.size() ? "\n" : ",\n");
+    }
+    out << "  }\n";
+    out << "}\n";
+    return out.str();
 }
 
 static void moe_cache_log_decode_tensor_line(
@@ -1730,7 +2291,7 @@ void ggml_cuda_moe_record_op_stats(
     uint64_t total_time_us,
     bool     ids_cache_hit) {
 
-    if (!moe_cache_mm_debug_enabled()) {
+    if (!moe_cache_detail_enabled()) {
         return;
     }
 
@@ -1927,6 +2488,8 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
         return it->second;
     }
 
+    const int effective_slots = moe_cache_effective_slots_for_tensor(k.tensor_name, n_slots);
+
     const bool source_is_mmap = moe_cache_is_mmap_range(tensor_data, slot_size_bytes);
     size_t l2_budget_bytes = 0;
     int l2_target_slots = 0;
@@ -1942,20 +2505,22 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     }
 
     ggml_cuda_moe_cache * c = ggml_cuda_moe_cache_init(
-        device, slot_size_bytes, n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
+        device, slot_size_bytes, effective_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
     if (!c) {
         return nullptr;
     }
 
+    c->base_n_slots = n_slots;
     c->tensor_name = tensor_name_for_log;
     c->tensor_data = tensor_data;
     c->n_experts = n_experts;
     reg.by_key.emplace(k, c);
-    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots x %.2f MiB)\n",
+    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots x %.2f MiB%s)\n",
                   tensor_name_for_log,
-                  ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0,
-                  n_slots,
-                  slot_size_bytes / 1024.0 / 1024.0);
+                  ((double)effective_slots * slot_size_bytes) / 1024.0 / 1024.0,
+                  effective_slots,
+                  slot_size_bytes / 1024.0 / 1024.0,
+                  effective_slots == n_slots ? "" : " profiled");
     return c;
 }
 
@@ -2000,6 +2565,34 @@ int ggml_backend_cuda_moe_get_cache_slots(void) {
 }
 
 extern "C"
+void ggml_backend_cuda_moe_set_profile_save_path(const char * path) {
+    auto & cfg = moe_cache_get_profile_config();
+    std::lock_guard<std::mutex> lk(cfg.mu);
+    cfg.profile_save_path = path ? path : "";
+    moe_cache_update_profile_detail_locked(cfg);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_set_slot_profile_save_path(const char * path) {
+    auto & cfg = moe_cache_get_profile_config();
+    std::lock_guard<std::mutex> lk(cfg.mu);
+    cfg.slot_profile_save_path = path ? path : "";
+    moe_cache_update_profile_detail_locked(cfg);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_set_slot_profile_path(const char * path) {
+    auto & cfg = moe_cache_get_profile_config();
+    std::lock_guard<std::mutex> lk(cfg.mu);
+    cfg.slot_profile_path = path ? path : "";
+    cfg.loaded_slot_profile = {};
+    cfg.active_slots.clear();
+    if (!cfg.slot_profile_path.empty()) {
+        (void) moe_cache_load_slot_profile_file(cfg.slot_profile_path, cfg.loaded_slot_profile);
+    }
+}
+
+extern "C"
 void ggml_backend_cuda_moe_set_l2_pinned_cache_size(size_t bytes) {
     g_moe_cache_l2_pinned_size.store(bytes, std::memory_order_relaxed);
 }
@@ -2036,6 +2629,105 @@ struct observation_state {
 static observation_state & get_observation_state() {
     static observation_state inst;
     return inst;
+}
+
+static void moe_cache_prepare_slot_profile_for_observed(const std::vector<observed_tensor> & tensors, int base_slots) {
+    auto & cfg = moe_cache_get_profile_config();
+    std::lock_guard<std::mutex> lk(cfg.mu);
+    cfg.active_slots.clear();
+
+    moe_cache_slot_profile & profile = cfg.loaded_slot_profile;
+    if (!profile.loaded) {
+        return;
+    }
+    if (profile.base_slots != base_slots) {
+        GGML_LOG("moe-cache-alloc: ignoring slot profile base_slots=%d current_base_slots=%d\n",
+            profile.base_slots, base_slots);
+        return;
+    }
+
+    const uint64_t total_slots_baseline = (uint64_t) tensors.size() * (uint64_t) base_slots;
+    uint64_t total_slots_allocated = 0;
+    uint64_t applied = 0;
+    int min_slots = base_slots;
+    int max_slots = base_slots;
+
+    std::map<std::string, moe_cache_slot_profile_entry> active;
+    for (const auto & t : tensors) {
+        int slots = base_slots;
+        moe_cache_slot_profile_entry active_entry;
+        active_entry.slots = base_slots;
+        active_entry.base_slots = base_slots;
+        active_entry.n_experts = t.n_experts;
+        active_entry.slot_size_bytes = (uint64_t) t.per_expert_bytes;
+        active_entry.reason = "baseline";
+
+        auto it = profile.tensors.find(t.tensor_name);
+        if (it != profile.tensors.end()) {
+            const auto & entry = it->second;
+            bool valid = entry.slots >= profile.min_slots && entry.slots <= profile.max_slots;
+            valid = valid && (entry.base_slots == 0 || entry.base_slots == base_slots);
+            valid = valid && (entry.n_experts < 0 || entry.n_experts == t.n_experts);
+            valid = valid && (entry.slot_size_bytes == 0 || entry.slot_size_bytes == (uint64_t) t.per_expert_bytes);
+            if (valid) {
+                slots = entry.slots;
+                active_entry = entry;
+                ++applied;
+            } else {
+                GGML_LOG("moe-cache-alloc: ignoring stale tensor override tensor=%s\n",
+                    t.tensor_name.empty() ? "?" : t.tensor_name.c_str());
+            }
+        }
+
+        active_entry.slots = slots;
+        active_entry.base_slots = base_slots;
+        active_entry.n_experts = t.n_experts;
+        active_entry.slot_size_bytes = (uint64_t) t.per_expert_bytes;
+        total_slots_allocated += (uint64_t) slots;
+        min_slots = std::min(min_slots, slots);
+        max_slots = std::max(max_slots, slots);
+        active[t.tensor_name] = active_entry;
+    }
+
+    if (total_slots_allocated > total_slots_baseline) {
+        GGML_LOG("moe-cache-alloc: rejecting slot profile total_slots_allocated=%llu baseline=%llu\n",
+            (unsigned long long) total_slots_allocated,
+            (unsigned long long) total_slots_baseline);
+        return;
+    }
+
+    cfg.active_slots = std::move(active);
+    profile.active = true;
+    for (const auto & kv : cfg.active_slots) {
+        const auto & entry = kv.second;
+        if (entry.slots != base_slots) {
+            GGML_LOG_INFO("moe-cache-alloc: tensor=%s slots=%d base=%d delta=%+d reason=%s\n",
+                kv.first.c_str(),
+                entry.slots,
+                base_slots,
+                entry.slots - base_slots,
+                entry.reason.empty() ? "profile" : entry.reason.c_str());
+        }
+    }
+    GGML_LOG_INFO("moe-cache-alloc-summary: tensors=%zu base_slots=%d total_slots_baseline=%llu total_slots_allocated=%llu min=%d max=%d profile_applied=%d overrides_applied=%llu\n",
+        tensors.size(),
+        base_slots,
+        (unsigned long long) total_slots_baseline,
+        (unsigned long long) total_slots_allocated,
+        min_slots,
+        max_slots,
+        1,
+        (unsigned long long) applied);
+}
+
+static int moe_cache_effective_slots_for_tensor(const std::string & tensor_name, int base_slots) {
+    auto & cfg = moe_cache_get_profile_config();
+    std::lock_guard<std::mutex> lk(cfg.mu);
+    auto it = cfg.active_slots.find(tensor_name);
+    if (it == cfg.active_slots.end()) {
+        return base_slots;
+    }
+    return it->second.slots;
 }
 } // namespace
 
@@ -2074,6 +2766,7 @@ void ggml_backend_cuda_moe_preallocate_pools(int device) {
         }
     }
     g_moe_cache_l2_mmap_tensor_count.store(n_mmap_tensors, std::memory_order_relaxed);
+    moe_cache_prepare_slot_profile_for_observed(st.tensors, n_slots);
     for (const auto & t : st.tensors) {
         ggml_cuda_moe_cache_get_or_create_for_tensor(
             device, t.tensor_data, t.per_expert_bytes, n_slots,
@@ -2115,7 +2808,8 @@ void ggml_backend_cuda_moe_prefill_pools(int device) {
         }
 
         const int64_t l2_slots = cache->source_is_mmap ? cache->l2_target_slots : 0;
-        const int64_t n_l2_prefill = std::min<int64_t>(t.n_experts, std::max<int64_t>(n_slots, l2_slots));
+        const int64_t n_l1_prefill = cache->n_slots;
+        const int64_t n_l2_prefill = std::min<int64_t>(t.n_experts, std::max<int64_t>(n_l1_prefill, l2_slots));
         cudaStream_t copy_stream = cache->copy_stream;
         const char * src_base = (const char *) t.tensor_data;
 
@@ -2123,7 +2817,7 @@ void ggml_backend_cuda_moe_prefill_pools(int device) {
             const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
             (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
         }
-        for (int64_t eid = 0; eid < std::min<int64_t>(t.n_experts, n_slots); ++eid) {
+        for (int64_t eid = 0; eid < std::min<int64_t>(t.n_experts, n_l1_prefill); ++eid) {
             const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
             (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
         }
@@ -2200,6 +2894,17 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
+    std::string profile_save_path;
+    std::string slot_profile_save_path;
+    {
+        auto & cfg = moe_cache_get_profile_config();
+        std::lock_guard<std::mutex> cfg_lk(cfg.mu);
+        profile_save_path = cfg.profile_save_path;
+        slot_profile_save_path = cfg.slot_profile_save_path;
+    }
+    const bool save_profiles = !profile_save_path.empty() || !slot_profile_save_path.empty();
+    const bool need_detail = moe_cache_mm_debug_enabled() || save_profiles;
+
     // Aggregate across all per-tensor caches into one line per request.
     // 120+ per-tensor lines would drown the timing output.
     uint64_t total_hits = 0, total_misses = 0, total_evictions = 0;
@@ -2211,7 +2916,7 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
     moe_cache_tensor_decode_stats hot_decode_miss_tensor = {};
     std::vector<moe_cache_tensor_decode_stats> decode_tensor_stats;
     moe_cache_phase_stats phase_stats[2] = {};
-    if (moe_cache_mm_debug_enabled()) {
+    if (need_detail) {
         for (int phase = 0; phase < 2; ++phase) {
             ggml_cuda_moe_add_phase_stats(phase_stats[phase], ggml_cuda_moe_op_phase_stats(phase));
         }
@@ -2223,7 +2928,7 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
         total_hits      += h;
         total_misses    += m;
         total_evictions += e;
-        if (moe_cache_mm_debug_enabled()) {
+        if (need_detail) {
             moe_cache_mm_stats s = ggml_cuda_moe_cache_mm_stats(kv.second);
             mm.h2d_copy_count                   += s.h2d_copy_count;
             mm.h2d_copy_bytes                   += s.h2d_copy_bytes;
@@ -2268,7 +2973,7 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
             }
 
             moe_cache_tensor_decode_stats ds = ggml_cuda_moe_cache_decode_tensor_stats(kv.second);
-            if (ds.l1_hits + ds.l1_misses + ds.h2d_copy_count > 0) {
+            if (ds.experts > 0) {
                 decode_tensor_stats.push_back(ds);
             }
             if (ds.h2d_copy_bytes > hot_decode_miss_tensor.h2d_copy_bytes) {
@@ -2434,6 +3139,31 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
             (unsigned long long) proc.vm_pgpgout,
             (unsigned long long) proc.vm_workingset_refault_file,
             (unsigned long long) proc.vm_workingset_refault_anon);
+    }
+    if (save_profiles) {
+        const int base_slots = ggml_backend_cuda_moe_get_cache_slots();
+        if (!profile_save_path.empty()) {
+            const std::string json = moe_cache_raw_profile_json(decode_tensor_stats, phase_stats[1], base_slots);
+            if (moe_cache_write_atomic(profile_save_path, json)) {
+                GGML_LOG_INFO("moe-cache-profile: wrote %s\n", profile_save_path.c_str());
+            }
+        }
+        if (!slot_profile_save_path.empty()) {
+            const moe_cache_slot_profile profile = moe_cache_compute_slot_profile(decode_tensor_stats, base_slots);
+            if (profile.total_slots_allocated <= profile.total_slots_baseline) {
+                const std::string json = moe_cache_slot_profile_json(profile);
+                if (moe_cache_write_atomic(slot_profile_save_path, json)) {
+                    GGML_LOG_INFO("moe-cache-profile: wrote %s total_slots_baseline=%llu total_slots_allocated=%llu\n",
+                        slot_profile_save_path.c_str(),
+                        (unsigned long long) profile.total_slots_baseline,
+                        (unsigned long long) profile.total_slots_allocated);
+                }
+            } else {
+                GGML_LOG("moe-cache-profile: not writing slot profile total_slots_allocated=%llu baseline=%llu\n",
+                    (unsigned long long) profile.total_slots_allocated,
+                    (unsigned long long) profile.total_slots_baseline);
+            }
+        }
     }
     ggml_cuda_moe_reset_op_phase_stats();
 }
