@@ -2083,59 +2083,6 @@ void ggml_backend_cuda_moe_preallocate_pools(int device) {
 }
 
 extern "C"
-void ggml_backend_cuda_moe_prefill_pools(int device) {
-    const int n_slots = ggml_backend_cuda_moe_get_cache_slots();
-    if (n_slots <= 0) return;
-
-    std::vector<observed_tensor> tensors;
-    {
-        auto & st = get_observation_state();
-        std::lock_guard<std::mutex> lk(st.mu);
-        tensors = st.tensors;
-    }
-
-    for (const auto & t : tensors) {
-        if (t.tensor_data == nullptr || t.per_expert_bytes == 0 || t.n_experts <= 0 || t.tensor_name.empty()) {
-            continue;
-        }
-
-        auto & reg = get_registry();
-        ggml_cuda_moe_cache * cache = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(reg.mu);
-            moe_cache_key k{device, t.tensor_name};
-            auto it = reg.by_key.find(k);
-            if (it == reg.by_key.end()) {
-                continue;
-            }
-            cache = it->second;
-        }
-        if (!cache) {
-            continue;
-        }
-
-        const int64_t l2_slots = cache->source_is_mmap ? cache->l2_target_slots : 0;
-        const int64_t n_l2_prefill = std::min<int64_t>(t.n_experts, std::max<int64_t>(n_slots, l2_slots));
-        cudaStream_t copy_stream = cache->copy_stream;
-        const char * src_base = (const char *) t.tensor_data;
-
-        for (int64_t eid = 0; eid < n_l2_prefill; ++eid) {
-            const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
-            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
-        }
-        for (int64_t eid = 0; eid < std::min<int64_t>(t.n_experts, n_slots); ++eid) {
-            const void * host_ptr = src_base + (size_t) eid * t.per_expert_bytes;
-            (void) ggml_cuda_moe_cache_acquire(cache, host_ptr, t.per_expert_bytes, copy_stream, true, false, false);
-        }
-
-        if (copy_stream) {
-            cudaStreamSynchronize(copy_stream);
-        }
-        ggml_cuda_moe_cache_reset_stats(cache);
-    }
-}
-
-extern "C"
 void ggml_backend_cuda_moe_prefetch_experts(
     int             device,
     const char *    tensor_name,

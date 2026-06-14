@@ -73,7 +73,6 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_reset_expert_size_observation(void);
 // padding. Logs each pool as a 'load_tensors:'-style line so they group
 // with the other model buffer allocations. Idempotent.
 GGML_BACKEND_API void ggml_backend_cuda_moe_preallocate_pools(int device);
-GGML_BACKEND_API void ggml_backend_cuda_moe_prefill_pools(int device);
 
 // Issue async H2D prefetches for the given expert ids into the cache for
 // `tensor_name`. Used by the dispatch hook to warm up sibling matrix

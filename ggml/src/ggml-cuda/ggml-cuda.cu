@@ -3091,6 +3091,11 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         }
     }
 
+    if (!is_decode) {
+        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, false);
+        return;
+    }
+
     // 2. Look up the per-tensor cache. Each MoE expert tensor (one per
     //    layer-and-matrix-kind) gets its own pool of N slots; only that
     //    tensor's experts compete for those slots. Slot size = this tensor's
