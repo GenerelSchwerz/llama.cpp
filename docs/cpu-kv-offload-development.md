@@ -197,6 +197,42 @@ capacity is pinned at context creation and released at context destruction.
 This consumes page-locked system RAM and CUDA mapping resources even though
 `nvidia-smi` did not report additional device memory.
 
+### 10. ik_llama.cpp identified a faster CPU FlashAttention reference
+
+The `ikawrakow/ik_llama.cpp` repository was cloned into `../ik_llama.cpp` at
+commit `8337e4cd3861406fc04e0854b1409cd1b027fbc9` and built with CUDA, native CPU
+optimization, and its IQK FlashAttention kernels. This fork is a design
+reference only; its large divergent feature surface must not be merged wholesale.
+
+Its CPU KV allocation already uses `CUDA_Host`. More importantly, it contains a
+dedicated IQK CPU FlashAttention implementation, cache-specific quant formats,
+repacked layouts, and single-query specializations.
+
+A strict-affinity Q8_0 sweep used CPUs 0-2, three generation and batch threads,
+FlashAttention, CPU KV, 256-token prompt increments, 64-token generation tests,
+three repetitions, and a context capacity of 18432. Selected rows were:
+
+| Populated KV | Prefill t/s (256 tokens) | Decode t/s (64 tokens) | Process VRAM delta |
+| ---: | ---: | ---: | ---: |
+| 0 | 1336.71 | 25.75 | 13,270 MiB |
+| 4096 | 1489.46 | 23.39 | 13,296 MiB |
+| 8192 | 1438.11 | 21.60 | 13,312 MiB |
+| 12288 | 1347.47 | 19.96 | 13,328 MiB |
+| 16384 | 1309.33 | 18.57 | 13,344 MiB |
+
+These numbers are not a perfectly interchangeable benchmark with BeeLlama's
+synthetic `llama-bench -d` tests: ik_llama's sweep populates the cache and uses a
+different benchmark implementation. They nevertheless establish that its
+standard Q8_0 CPU attention path is a serious optimization reference. Relative
+to the closest pinned Bee measurements, the observed decode rates were about
+14.1% higher at 4096 and 7.7% higher at 16384.
+
+The same sweep with ik_llama's cache-specific `q8_KV` format did not run on this
+Qwen3.5 hybrid model. Allocation completed (`585 MiB` reported KV size at a
+18432-token capacity), but graph construction aborted at `ggml.c:5427` with a
+tensor-view bounds assertion. Do not port or benchmark `q8_KV` until its layout
+assumptions and this hybrid-model failure are understood.
+
 ## Current understanding of the execution path
 
 With `--no-kv-offload`, the KV buffers and the graph section from KV store
@@ -243,6 +279,12 @@ overhead of generic split-K.
 
 Any new partitioning experiment must explain why it differs from the neutral
 split-K attempt and must test both 4K and long context.
+
+ik_llama's IQK FlashAttention implementation is now the primary reference for
+this hypothesis. Compare its Q8_0 single-query dispatch, work partitioning,
+temporary layout, and vectorized inner loops with BeeLlama's generic
+`ggml_compute_forward_flash_attn_ext_f16_one_chunk` path. Port the smallest
+separable mechanism first rather than importing the IQK type system.
 
 ### H3: Cache layout can improve sequential access and vectorization
 
@@ -343,12 +385,16 @@ uses CUDA architecture `120a` as selected by current CMake/CUDA handling.
    the intended maximum serving context.
 3. Trace which CPU tensors cross to CUDA during one decode token and test whether
    transfers can be reduced or safely overlapped.
-4. Prototype a targeted Q8 decode partition/layout change only after the timing
-   data identifies the dominant CPU loop.
-5. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
-6. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
+4. Diff ik_llama's IQK Q8_0 single-query FlashAttention path against BeeLlama's
+   generic quantized path and isolate its work partitioning and inner-loop
+   advantages.
+5. Prototype the smallest targeted Q8 decode kernel/partition change supported
+   by the timing data; do not import `q8_KV` while its Qwen3.5 layout assertion
+   remains unresolved.
+6. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
+7. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
    and quality measurements.
-7. Replace the environment-only switch with a supported CLI/INI option only if
+8. Replace the environment-only switch with a supported CLI/INI option only if
    the allocation policy survives the full benchmark and resource suite.
 
 ## Known non-goals
