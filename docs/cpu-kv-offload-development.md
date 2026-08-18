@@ -233,6 +233,34 @@ Qwen3.5 hybrid model. Allocation completed (`585 MiB` reported KV size at a
 tensor-view bounds assertion. Do not port or benchmark `q8_KV` until its layout
 assumptions and this hybrid-model failure are understood.
 
+### 11. MTP depth sanity check near maximum test context
+
+Built-in MTP was tested as a serving configuration on the pinned Q8_0 CPU-KV
+branch at a context capacity of 18432. The fixed stress prompt repeated
+`The quick brown fox jumps over the lazy dog.` 1800 times, filling the context
+near its usable maximum while reserving generation space. Generation used
+greedy sampling, CPUs 0-2, three threads, FlashAttention, and 128 tokens for the
+matched comparison.
+
+| Speculation | Generation t/s | Change vs no MTP |
+| --- | ---: | ---: |
+| none | 16.8 | baseline |
+| MTP, `--spec-draft-n-max 1` | 23.7 | +41.1% |
+| MTP, `--spec-draft-n-max 3` | 27.8 | +65.5% |
+
+Confirmation runs generating 256 tokens produced 23.9 t/s at depth 1 and 28.8
+t/s at depth 3. Both MTP configurations reported 13,684 MiB process VRAM, so no
+depth-dependent VRAM difference was visible through `nvidia-smi`.
+
+This prompt and continuation are highly repetitive and therefore favorable to
+speculative acceptance. Treat the speedups as a maximum-depth stress result,
+not a representative general-workload claim. The CLI does not call
+`common_speculative_print_stats`, so accepted-token counts and acceptance by
+draft position were not captured. A server benchmark with realistic prompts is
+required before choosing depth 3 as the serving default. Prompt processing also
+varied materially across these runs and should be remeasured separately rather
+than attributed to MTP decode behavior.
+
 ## Current understanding of the execution path
 
 With `--no-kv-offload`, the KV buffers and the graph section from KV store
