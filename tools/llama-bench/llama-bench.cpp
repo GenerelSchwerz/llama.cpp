@@ -397,6 +397,7 @@ struct cmd_params {
     bool                             no_warmup;
     bool                             kv_cpu_pinned;
     bool                             recurrent_state_offload;
+    int                              kv_gpu_layers;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -446,6 +447,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* kv_cpu_pinned        */ false,
     /* recurrent_state_offload */ false,
+    /* kv_gpu_layers        */ 0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -467,6 +469,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --kv-memory                                capture synchronized KV component and device allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  --kv-cpu-pinned                             route CPU-resident KV cache layers through pinned/host memory\n");
+    printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident\n");
     printf("  --recurrent-state-offload                   for hybrid models, keep recurrent state GPU-resident despite -nkvo\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -688,6 +691,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.kv_cpu_pinned        = cmd_params_defaults.kv_cpu_pinned;
     params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
+    params.kv_gpu_layers        = cmd_params_defaults.kv_gpu_layers;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1240,6 +1244,12 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.kv_cpu_pinned = true;
             } else if (arg == "--recurrent-state-offload") {
                 params.recurrent_state_offload = true;
+            } else if (arg == "--kv-gpu-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.kv_gpu_layers = std::stoi(argv[i]);
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1415,6 +1425,7 @@ struct cmd_params_instance {
     bool               no_kv_offload;
     bool               kv_cpu_pinned;
     bool               recurrent_state_offload;
+    int                kv_gpu_layers;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
@@ -1499,6 +1510,7 @@ struct cmd_params_instance {
         cparams.offload_kqv     = !no_kv_offload;
         cparams.kv_cpu_pinned   = kv_cpu_pinned;
         cparams.recurrent_state_offload = recurrent_state_offload;
+        cparams.kv_gpu_layers   = (uint32_t) std::max(0, kv_gpu_layers);
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
@@ -1571,6 +1583,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1611,6 +1624,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1651,6 +1665,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,

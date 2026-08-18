@@ -1154,3 +1154,114 @@ gate. The fork already has a segmented merge primitive in
 `ggml_kv_tail_attention_merge_segmented` for KVarN tails, which is the closest
 existing reference. The dial degrades gracefully: N = 0 reproduces today's
 behaviour, N = n_ctx reproduces GPU-resident KV.
+
+## Experiment 010: tunable partial GPU KV residency
+
+Status: retained. Implements the direction identified at the end of Experiment
+009 and gives the first continuous dial between host-resident and GPU-resident
+attention KV.
+
+### Change
+
+`--kv-gpu-layers N` (env `LLAMA_ARG_KV_GPU_LAYERS`, also accepted by
+`llama-bench`) keeps the first N attention-KV layers device-resident while
+`--no-kv-offload` is active; the remaining layers stay on the host exactly as
+before. `N = 0` reproduces current behaviour and any `N` at or above the
+attention-layer count matches `--kv-offload`.
+
+The selection is per layer rather than per token range. That was deliberate:
+`llama_kv_cache` already chooses a buffer type per layer at both the route-probe
+and the allocation site, so the placement decision fits the existing structure
+with no change to cell indexing, defragmentation, state serialization, or the
+attention graph. Each layer's attention still reads one contiguous cache in one
+buffer, so no partial-result merge and no new kernel are involved. A recency
+window would have required splitting each layer's cache in two and combining the
+two partial attentions with log-sum-exp rescaling for the same byte reduction.
+
+Implementation is `[TAG_KV_PARTIAL_GPU_RESIDENCY]` in `llama-kv-cache.cpp`: a
+`layer_on_device` plan is computed once from `hparams.has_kv()` and the layer
+filter, then consulted at both buffer-type selection sites. The value flows
+`common_params` -> `llama_context_params::kv_gpu_layers` (appended at the end of
+the struct, preserving existing field offsets) -> `llama_cparams` ->
+`llama_model::create_memory()`, reaching the hybrid `mem_attn` cache and the
+plain non-SWA target cache.
+
+### Configuration
+
+RTX 4070 12 GiB (compute capability 8.9), Intel Core i5-13400F, 31 GiB RAM,
+PCIe 4.0 x16. Model `Qwen3.8-27B-UD-IQ2_M.gguf` (`qwen35`, 27.32B, 9.60 GiB,
+16 attention layers of 65). Release CUDA build, `GGML_NATIVE=ON`. Three distinct
+P-cores via `taskset -c 0,2,4`; note that `taskset -c 0-2` on this part spans
+only two physical cores, since CPUs 0 and 1 are SMT siblings. Common settings:
+`-ngl 99 -t 3 --poll 100 -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 --kv-cpu-pinned
+--recurrent-state-offload`. Decode `-p 0 -n 32 -r 2`, prefill `-p 512 -n 0 -r 3`.
+
+### Results
+
+Decode, 32 tokens:
+
+| `--kv-gpu-layers` | d16384 (t/s) | ms/token | d32768 (t/s) | ms/token |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 19.70 +/- 0.11 | 50.76 | 13.03 +/- 0.05 | 76.75 |
+| 4 | 22.34 +/- 0.12 | 44.76 | -- | -- |
+| 8 | 25.70 +/- 0.17 | 38.91 | 18.76 +/- 0.09 | 53.30 |
+| 12 | 30.15 +/- 0.22 | 33.17 | 24.00 +/- 0.15 | 41.67 |
+| 16 | 36.00 +/- 0.21 | 27.78 | 32.42 +/- 0.17 | 30.84 |
+
+Full residency is +82.7% at 16K and **+148.8% at 32K**. The endpoints reproduce
+the independent references from Experiment 009 (19.76 t/s host-resident and
+36.13 t/s GPU-resident at 16K), confirming the dial is not introducing a path of
+its own.
+
+Per-token time is linear in the number of host-resident layers, which is the
+signature of a pure transfer cost: about 1.44 ms per layer at 16K and 2.85 ms
+per layer at 32K, roughly doubling with depth as the per-layer tensor doubles.
+
+Prefill of 512 tokens at depth 16384 was 984.72 +/- 6.65, 1009.94 +/- 10.70, and
+1033.99 +/- 17.00 t/s at N = 0, 8, and 16. Prefill improves slightly; there is no
+regression to trade against the decode gain.
+
+### Resource cost
+
+Reported KV buffer split at depth 16384:
+
+| `--kv-gpu-layers` | `CUDA0` KV | `CUDA_Host` KV |
+| ---: | ---: | ---: |
+| 0 | -- | 552.50 MiB |
+| 4 | 138.12 MiB | 414.38 MiB |
+| 8 | 276.25 MiB | 276.25 MiB |
+| 12 | 414.38 MiB | 138.12 MiB |
+| 16 | 552.50 MiB | -- |
+
+The total is unchanged, so this moves memory rather than adding it: 34.53 MiB of
+device memory per layer at 16K and 69.06 MiB at 32K. The exchange rate is
+therefore 34.53 MiB per 1.44 ms/token at 16K, and 69.06 MiB per 2.85 ms/token at
+32K. At 32K, full residency needs 1,105 MiB of device memory and still fits on
+this 12 GiB card alongside the 9,227 MiB of weights.
+
+### Correctness
+
+Greedy generation (`--temp 0 --seed 1234`, 96 tokens, `-no-cnv`) was
+byte-identical across `--kv-gpu-layers` 0, 8, and 16. This is expected rather
+than fortunate: both placements feed the same Q8_0 bytes to the same CUDA
+FlashAttention kernel, and only the source buffer differs. The Q8_0 quality gate
+is untouched.
+
+`ctest -R "test-kvarn|test-adaptive-dm|test-server-loop-guard"` passed 8/8.
+
+### Scope and limitations
+
+- Wired for the hybrid `mem_attn` cache and the plain non-SWA target cache. The
+  KVarN, ISWA, and `llama_kv_cache_kvarn` constructors take the new parameter's
+  default of 0 and are unaffected; extending them is unstarted.
+- `N` counts attention-KV layers from the lowest index. No evidence was gathered
+  that the choice of which layers to keep matters for throughput, and the linear
+  scaling suggests it does not, but this was not tested directly.
+- There is no automatic sizing. Choosing `N` to fill available VRAM requires
+  knowing the cache size per layer at the configured context, which the user must
+  currently work out from the reported buffer sizes.
+- `llama-bench` treats the flag as process-wide rather than sweeping it like
+  `-nkvo`, matching how `--kv-cpu-pinned` was wired in Experiment 008.
+- Measured on one machine only. The gain is proportional to the host-to-device
+  transfer cost, so a host with faster PCIe than this PCIe 4.0 x16 link will see
+  a smaller relative improvement.

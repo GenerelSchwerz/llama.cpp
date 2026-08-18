@@ -2404,7 +2404,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* tail_tokens       */ params.kv_tail_tokens,
                                 /* tail_type         */ params.kv_tail_type,
                                 /* tail requested    */ params.kv_tail_tokens_requested,
-                                /* rollback reserve  */ params.kv_tail_rollback_tokens);
+                                /* rollback reserve  */ params.kv_tail_rollback_tokens,
+                                /* gpu_resident_attn */ cparams.kv_gpu_layers);
                         }
                     }
                 } else {
@@ -2556,7 +2557,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     false,
                                     params.kv_tail_rollback_tokens,
                                     /* tail_visibility_window */ 0,
-                                    cparams.kv_cpu_pinned);
+                                    cparams.kv_cpu_pinned,
+                                    cparams.kv_gpu_layers);
                         }
                     }
                 }

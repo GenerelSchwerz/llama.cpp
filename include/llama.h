@@ -507,6 +507,8 @@ extern "C" {
                                        // let attention run on the GPU even with kv-offload disabled
         bool recurrent_state_offload; // for hybrid attention/recurrent models, allow the fixed recurrent (R/S) state to stay
                                        // GPU-resident even when offload_kqv=false keeps attention KV on CPU
+        uint32_t kv_gpu_layers;       // with offload_kqv=false, keep this many attention-KV layers device-resident anyway.
+                                       // Trades device memory for host-to-device KV traffic; 0 keeps every layer on host.
     };
 
     struct llama_model_tensor_override {

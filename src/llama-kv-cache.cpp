@@ -402,7 +402,8 @@ llama_kv_cache::llama_kv_cache(
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
                  uint32_t   tail_visibility_window,
-                     bool   cpu_pinned) :
+                     bool   cpu_pinned,
+                 uint32_t   gpu_resident_layers) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -425,6 +426,31 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+
+    // [TAG_KV_PARTIAL_GPU_RESIDENCY]
+    // With offload disabled the whole attention KV lives in host memory and the
+    // scheduler re-sends every K/V tensor to the device on each decode step,
+    // even though only the newest row changed. Keeping part of the cache
+    // device-resident removes that traffic for those layers exactly, at the
+    // cost of their device memory. The selection is per layer, so each layer's
+    // attention still reads a single contiguous cache and needs no partial
+    // result merge: the same bytes go through the same kernels.
+    std::vector<bool> layer_on_device(n_layer, false);
+    if (!offload && gpu_resident_layers > 0) {
+        uint32_t placed = 0;
+        for (uint32_t il = 0; il < n_layer && placed < gpu_resident_layers; ++il) {
+            if (!hparams.has_kv(il)) {
+                continue;
+            }
+            if (filter && !filter(il)) {
+                continue;
+            }
+            layer_on_device[il] = true;
+            placed++;
+        }
+        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested KV layers device-resident\n",
+                __func__, placed, gpu_resident_layers);
+    }
     const uint32_t n_layer_kv = hparams.n_layer_kv();
     const bool is_mla = hparams.is_mla();
 
@@ -545,7 +571,7 @@ llama_kv_cache::llama_kv_cache(
                 const int32_t il_share = share(il);
                 const auto & source = other->layers[other->map_layer_ids.at(il_share)];
                 route_buft = ggml_backend_buffer_get_type(source.k->buffer);
-            } else if (offload) {
+            } else if (offload || layer_on_device[il]) {
                 route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
                 route_buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
@@ -874,7 +900,7 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
 
-        if (offload) {
+        if (offload || layer_on_device[il]) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
