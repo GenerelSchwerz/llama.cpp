@@ -15,6 +15,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model,
+        uint32_t il,
+        bool cpu_pinned);
+
 //
 // llama_kv_cache
 //

@@ -19,19 +19,6 @@
 
 namespace {
 
-static ggml_backend_buffer_type_t llama_kv_cache_kvarn_cpu_buft(
-        const llama_model & model, uint32_t il, bool cpu_pinned) {
-    if (cpu_pinned) {
-        ggml_backend_dev_t dev = model.dev_layer(il);
-        if (dev != nullptr) {
-            if (ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev)) {
-                return buft;
-            }
-        }
-    }
-    return ggml_backend_cpu_buffer_type();
-}
-
 using backend_kvarn_capabilities_t = bool (*)(
         ggml_backend_dev_t,
         ggml_backend_kvarn_capabilities *);
@@ -1293,7 +1280,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 "KVarN cache layer %u is assigned to backend %s, which cannot store and materialize KVarN records",
                 il, dev ? ggml_backend_dev_name(dev) : "unknown"));
         }
-        auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : llama_kv_cache_kvarn_cpu_buft(model, il, cpu_pinned);
+        auto * buft = offload ?
+                ggml_backend_dev_buffer_type(dev) :
+                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create KVarN cache tensor context");

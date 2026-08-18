@@ -28,13 +28,13 @@ public:
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
-                     bool   offload_attn,
-                     bool   cpu_pinned_attn,
+                     bool   attn_offload,
+                     bool   attn_cpu_pinned,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
-                     bool   offload_recr,
+                     bool   recurrent_offload,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -47,7 +47,7 @@ public:
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   gpu_resident_layers_attn = 0);
+                 uint32_t   attn_n_gpu_layers = 0);
 
     llama_memory_hybrid(
         const llama_model & model,

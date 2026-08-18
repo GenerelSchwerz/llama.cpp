@@ -27,19 +27,6 @@ static bool ggml_is_power_of_2(int n) {
 
 namespace {
 
-static ggml_backend_buffer_type_t llama_kv_cache_cpu_buft(
-        const llama_model & model, uint32_t il, bool cpu_pinned) {
-    if (cpu_pinned) {
-        ggml_backend_dev_t dev = model.dev_layer(il);
-        if (dev != nullptr) {
-            if (ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev)) {
-                return buft;
-            }
-        }
-    }
-    return ggml_backend_cpu_buffer_type();
-}
-
 // A pinned/host buffer type's registered ggml_backend_buft_get_device() is the
 // GPU that allocated it (see e.g. ggml_backend_cuda_host_buffer_type()), but
 // that is only where the memory is *addressable from*, not where ops on it
@@ -50,7 +37,7 @@ static ggml_backend_buffer_type_t llama_kv_cache_cpu_buft(
 // unified memory), so the op actually falls back to the CPU backend. Mirror
 // that decision here so KV-tail capability probing checks the backend that
 // will really run the op, not just the buft's nominal owner device.
-static ggml_backend_dev_t llama_kv_tail_route_owner_device(ggml_backend_buffer_type_t buft) {
+static ggml_backend_dev_t llama_kv_cache_get_backend(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
     if (dev != nullptr && !ggml_backend_dev_supports_buft(dev, buft)) {
         dev = nullptr;
@@ -81,7 +68,7 @@ static bool backend_supports_native_kv_tail(
         ggml_type tail_k, ggml_type tail_v,
         int64_t d_k, int64_t d_v,
         bool segmented) {
-    auto * dev = llama_kv_tail_route_owner_device(buft);
+    auto * dev = llama_kv_cache_get_backend(buft);
     const auto supports = [&](ggml_backend_dev_t candidate) {
         const auto reg = candidate ? ggml_backend_dev_backend_reg(candidate) : nullptr;
         const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
@@ -113,7 +100,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    auto * dev = llama_kv_tail_route_owner_device(spec.buft);
+    auto * dev = llama_kv_cache_get_backend(spec.buft);
     if (!dev || !cpu) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
@@ -238,7 +225,7 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
-    auto * dev = llama_kv_tail_route_owner_device(spec.buft);
+    auto * dev = llama_kv_cache_get_backend(spec.buft);
     if (!dev) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
@@ -334,6 +321,21 @@ private:
 
 }
 
+ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model,
+        uint32_t il,
+        bool cpu_pinned) {
+    if (cpu_pinned) {
+        if (auto * dev = model.dev_layer(il)) {
+            if (auto * buft = ggml_backend_dev_host_buffer_type(dev)) {
+                return buft;
+            }
+        }
+    }
+
+    return ggml_backend_cpu_buffer_type();
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -427,29 +429,36 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
-    // [TAG_KV_PARTIAL_GPU_RESIDENCY]
-    // With offload disabled the whole attention KV lives in host memory and the
-    // scheduler re-sends every K/V tensor to the device on each decode step,
-    // even though only the newest row changed. Keeping part of the cache
-    // device-resident removes that traffic for those layers exactly, at the
-    // cost of their device memory. The selection is per layer, so each layer's
-    // attention still reads a single contiguous cache and needs no partial
-    // result merge: the same bytes go through the same kernels.
-    std::vector<bool> layer_on_device(n_layer, false);
-    if (!offload && gpu_resident_layers > 0) {
-        uint32_t placed = 0;
-        for (uint32_t il = 0; il < n_layer && placed < gpu_resident_layers; ++il) {
-            if (!hparams.has_kv(il)) {
-                continue;
-            }
-            if (filter && !filter(il)) {
-                continue;
-            }
-            layer_on_device[il] = true;
-            placed++;
+    std::vector<int32_t> layer_share_ids(n_layer, -1);
+    std::vector<ggml_backend_buffer_type_t> layer_buft(n_layer, nullptr);
+    uint32_t n_gpu_resident = 0;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (!hparams.has_kv(il) || (filter && !filter(il))) {
+            continue;
         }
+
+        if (share && other) {
+            layer_share_ids[il] = share(il);
+        }
+
+        if (layer_share_ids[il] >= 0) {
+            continue;
+        }
+
+        const bool layer_offload = offload || n_gpu_resident < gpu_resident_layers;
+        layer_buft[il] = layer_offload ?
+                ggml_backend_dev_buffer_type(model.dev_layer(il)) :
+                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
+
+        if (!offload && layer_offload) {
+            ++n_gpu_resident;
+        }
+    }
+
+    if (!offload && gpu_resident_layers > 0) {
         LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested KV layers device-resident\n",
-                __func__, placed, gpu_resident_layers);
+                __func__, n_gpu_resident, gpu_resident_layers);
     }
     const uint32_t n_layer_kv = hparams.n_layer_kv();
     const bool is_mla = hparams.is_mla();
@@ -499,8 +508,8 @@ llama_kv_cache::llama_kv_cache(
             uint32_t actual_k_dim = owned_k_dim;
             uint32_t actual_v_dim = owned_v_dim;
 
-            if (share && other) {
-                const int32_t il_share = share(il);
+            if (layer_share_ids[il] >= 0) {
+                const int32_t il_share = layer_share_ids[il];
                 if (il_share >= 0) {
                     const auto & source = other->layers[other->map_layer_ids.at(il_share)];
                     shared_layer = true;
@@ -568,13 +577,11 @@ llama_kv_cache::llama_kv_cache(
 
             ggml_backend_buffer_type_t route_buft = nullptr;
             if (shared_layer) {
-                const int32_t il_share = share(il);
+                const int32_t il_share = layer_share_ids[il];
                 const auto & source = other->layers[other->map_layer_ids.at(il_share)];
                 route_buft = ggml_backend_buffer_get_type(source.k->buffer);
-            } else if (offload || layer_on_device[il]) {
-                route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
-                route_buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
+                route_buft = layer_buft[il];
             }
             route_probe_specs.push_back({
                     il, route_buft, actual_type_k, actual_type_v,
@@ -655,7 +662,7 @@ llama_kv_cache::llama_kv_cache(
                                 tail_plan.compact_layout.history_stride, 256) :
                         tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ?
                             tail_plan.layout.arena_stride : 0;
-            auto * dev = llama_kv_tail_route_owner_device(spec.buft);
+            auto * dev = llama_kv_cache_get_backend(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -685,7 +692,7 @@ llama_kv_cache::llama_kv_cache(
             const ggml_type actual_v = ggml_is_quantized(spec.body_type_v) ? candidate : spec.body_type_v;
             const auto capability = probe_standard_native_exact_route(
                     spec, actual_k, actual_v, v_trans, !v_trans);
-            auto * dev = llama_kv_tail_route_owner_device(spec.buft);
+            auto * dev = llama_kv_cache_get_backend(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -856,8 +863,8 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
-        if (share && other) {
-            const int32_t il_share = share(il);
+        if (layer_share_ids[il] >= 0) {
+            const int32_t il_share = layer_share_ids[il];
 
             if (il_share >= 0) {
                 const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
@@ -896,22 +903,11 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-        const char * dev_name;
+        ggml_backend_buffer_type_t buft = layer_buft[il];
+        GGML_ASSERT(buft != nullptr);
 
-        ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
-
-        if (offload || layer_on_device[il]) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
-
-            dev_name = ggml_backend_dev_name(dev);
-        } else {
-            // cpu_pinned layers report the backend that will actually execute
-            // ops on them (llama_kv_tail_route_owner_device), not the buft's
-            // nominal owner, which is the GPU for a CUDA/Vulkan host buft.
-            auto * dev = llama_kv_tail_route_owner_device(buft);
-            dev_name = dev ? ggml_backend_dev_name(dev) : "CPU";
-        }
+        auto * dev = llama_kv_cache_get_backend(buft);
+        const char * dev_name = dev ? ggml_backend_dev_name(dev) : "CPU";
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 

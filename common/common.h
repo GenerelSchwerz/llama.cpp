@@ -511,6 +511,7 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    int32_t kv_gpu_layers      = 0;     // with no_kv_offload, keep this many attention-KV layers device-resident
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -616,7 +617,6 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool kv_cpu_pinned     = false; // route CPU-resident KV cache layers through pinned/host memory
     bool recurrent_state_offload = false; // for hybrid models, keep recurrent state GPU-resident even with no_kv_offload
-    int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention-KV layers device-resident anyway
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

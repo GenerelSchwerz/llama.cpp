@@ -628,6 +628,14 @@ was unchanged within single-run noise (74.82 versus 74.67 t/s), while prompt
 throughput fell 0.9%. A draft ubatch of 32 saved 110 MiB but reduced prompt
 throughput 4.3%, so 128 is the current balanced recommendation.
 
+The supported CPU-KV placement controls now follow the existing cache ownership
+layout: `llama_model::create_memory()` derives attention and recurrent placement,
+while `llama_kv_cache` builds one per-layer buffer-type plan used by both route
+probing and allocation. Standard and KVarN caches share pinned-host buffer
+selection. This replaced the first partial-residency implementation's parallel
+layer bitmap and duplicated placement branches without changing the measured
+4K allocation split.
+
 The non-MTP 90K-versus-240K Nsight allocation trace isolated context-scaled
 VRAM to the target scheduler's prompt graph. Model weights and the 149.62 MiB
 active recurrent state were constant, while CUDA compute grew from 707.27 to

@@ -378,6 +378,7 @@ struct cmd_params {
     std::vector<llama_load_mode>     load_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
+    std::vector<int>                 kv_gpu_layers;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
@@ -397,7 +398,6 @@ struct cmd_params {
     bool                             no_warmup;
     bool                             kv_cpu_pinned;
     bool                             recurrent_state_offload;
-    int                              kv_gpu_layers;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -428,6 +428,7 @@ static const cmd_params cmd_params_defaults = {
     /* load_mode            */ { LLAMA_LOAD_MODE_MMAP },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
+    /* kv_gpu_layers        */ { 0 },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -447,7 +448,6 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* kv_cpu_pinned        */ false,
     /* recurrent_state_offload */ false,
-    /* kv_gpu_layers        */ 0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -469,7 +469,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --kv-memory                                capture synchronized KV component and device allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  --kv-cpu-pinned                             route CPU-resident KV cache layers through pinned/host memory\n");
-    printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident\n");
+    printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident (default: %s)\n",
+            join(cmd_params_defaults.kv_gpu_layers, ",").c_str());
     printf("  --recurrent-state-offload                   for hybrid models, keep recurrent state GPU-resident despite -nkvo\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -691,7 +692,6 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.kv_cpu_pinned        = cmd_params_defaults.kv_cpu_pinned;
     params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
-    params.kv_gpu_layers        = cmd_params_defaults.kv_gpu_layers;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1249,7 +1249,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
-                params.kv_gpu_layers = std::stoi(argv[i]);
+                auto p = parse_int_range(argv[i]);
+                params.kv_gpu_layers.insert(params.kv_gpu_layers.end(), p.begin(), p.end());
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1358,6 +1359,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     }
     if (params.no_kv_offload.empty()) {
         params.no_kv_offload = cmd_params_defaults.no_kv_offload;
+    }
+    if (params.kv_gpu_layers.empty()) {
+        params.kv_gpu_layers = cmd_params_defaults.kv_gpu_layers;
     }
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
@@ -1499,22 +1503,22 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
-        cparams.n_batch         = n_batch;
-        cparams.n_ubatch        = n_ubatch;
-        cparams.type_k          = type_k.ggml;
-        cparams.type_v          = type_v.ggml;
-        cparams.kvarn           = kvarn_params_from_cache_pair(type_k, type_v);
-        cparams.kv_tail_tokens  = kv_tail_tokens;
-        cparams.kv_tail_type    = kv_tail_type;
-        cparams.offload_kqv     = !no_kv_offload;
-        cparams.kv_cpu_pinned   = kv_cpu_pinned;
+        cparams.n_ctx                   = n_prompt + n_gen + n_depth;
+        cparams.n_batch                 = n_batch;
+        cparams.n_ubatch                = n_ubatch;
+        cparams.type_k                  = type_k.ggml;
+        cparams.type_v                  = type_v.ggml;
+        cparams.kvarn                   = kvarn_params_from_cache_pair(type_k, type_v);
+        cparams.kv_tail_tokens          = kv_tail_tokens;
+        cparams.kv_tail_type            = kv_tail_type;
+        cparams.offload_kqv             = !no_kv_offload;
+        cparams.kv_cpu_pinned           = kv_cpu_pinned;
         cparams.recurrent_state_offload = recurrent_state_offload;
-        cparams.kv_gpu_layers   = (uint32_t) std::max(0, kv_gpu_layers);
-        cparams.flash_attn_type = flash_attn;
-        cparams.embeddings      = embeddings;
-        cparams.op_offload      = !no_op_offload;
-        cparams.swa_full        = false;
+        cparams.kv_gpu_layers           = (uint32_t) kv_gpu_layers;
+        cparams.flash_attn_type         = flash_attn;
+        cparams.embeddings              = embeddings;
+        cparams.op_offload              = !no_op_offload;
+        cparams.swa_full                = false;
 
         return cparams;
     }
@@ -1546,6 +1550,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tail_n : params.kv_tail_tokens)
     for (const auto & tail_type : params.kv_tail_type)
     for (const auto & nkvo : params.no_kv_offload)
+    for (const auto & kvgl : params.kv_gpu_layers)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
@@ -1583,7 +1588,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
-                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1624,7 +1629,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
-                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1665,7 +1670,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
-                /* .kv_gpu_layers         = */ params.kv_gpu_layers,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1769,6 +1774,9 @@ struct test {
     llama_load_mode          load_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
+    bool                     kv_cpu_pinned;
+    bool                     recurrent_state_offload;
+    int                      kv_gpu_layers;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
@@ -1818,6 +1826,9 @@ struct test {
         load_mode      = inst.load_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
+        kv_cpu_pinned  = inst.kv_cpu_pinned;
+        recurrent_state_offload = inst.recurrent_state_offload;
+        kv_gpu_layers  = inst.kv_gpu_layers;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
@@ -1902,7 +1913,8 @@ struct test {
             "cuda_context_delta_bytes", "cuda_peak_delta_bytes", "cuda_reconciliation_delta_bytes",
             "cuda_runtime_overhead_bytes", "cuda_teardown_delta_bytes",
             "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
+            "kv_gpu_layers",  "flash_attn",     "devices",       "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1921,7 +1933,8 @@ struct test {
         }
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "kv_gpu_layers" || field == "n_prompt" || field == "n_gen" ||
+            field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens" ||
             field == "kv_tail_tokens_effective" || field == "kvarn_route_split" || field == "kvarn_route_vector" ||
@@ -1935,8 +1948,9 @@ struct test {
             field == "kv_tail_device_fallback_layers" || field == "kv_tail_cpu_layers") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_cpu_pinned" ||
+            field == "recurrent_state_offload" || field == "cpu_strict" || field == "embeddings" ||
+            field == "no_host") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -2069,6 +2083,9 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
+                                            std::to_string(kv_cpu_pinned),
+                                            std::to_string(recurrent_state_offload),
+                                            std::to_string(kv_gpu_layers),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
@@ -2239,6 +2256,15 @@ struct markdown_printer : public printer {
         if (field == "n_gpu_layers") {
             return 3;
         }
+        if (field == "kv_gpu_layers") {
+            return 4;
+        }
+        if (field == "kv_cpu_pinned") {
+            return 5;
+        }
+        if (field == "recurrent_state_offload") {
+            return 3;
+        }
         if (field == "n_threads") {
             return 7;
         }
@@ -2293,6 +2319,15 @@ struct markdown_printer : public printer {
         }
         if (field == "no_kv_offload") {
             return "nkvo";
+        }
+        if (field == "kv_cpu_pinned") {
+            return "kvpin";
+        }
+        if (field == "recurrent_state_offload") {
+            return "rso";
+        }
+        if (field == "kv_gpu_layers") {
+            return "kvgl";
         }
         if (field == "flash_attn") {
             return "fa";
@@ -2381,6 +2416,15 @@ struct markdown_printer : public printer {
         }
         if (params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
             fields.emplace_back("no_kv_offload");
+        }
+        if (params.kv_cpu_pinned != cmd_params_defaults.kv_cpu_pinned) {
+            fields.emplace_back("kv_cpu_pinned");
+        }
+        if (params.recurrent_state_offload != cmd_params_defaults.recurrent_state_offload) {
+            fields.emplace_back("recurrent_state_offload");
+        }
+        if (params.kv_gpu_layers.size() > 1 || params.kv_gpu_layers != cmd_params_defaults.kv_gpu_layers) {
+            fields.emplace_back("kv_gpu_layers");
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");

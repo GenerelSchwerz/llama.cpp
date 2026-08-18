@@ -15,6 +15,7 @@ struct llama_cparams {
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
     uint32_t n_outputs_max;   // max outputs supported by the context
+    uint32_t kv_gpu_layers;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
@@ -54,8 +55,6 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool kv_cpu_pinned;
     bool recurrent_state_offload;
-
-    uint32_t kv_gpu_layers;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

@@ -1264,6 +1264,34 @@ confirming that all three supported flags reached the intended allocation
 policy without the removed `GGML_KV_CPU_PINNED` or
 `GGML_RECURRENT_STATE_OFFLOAD` switches.
 
+### Post-merge code-layout cleanup
+
+The integration was subsequently refactored to keep placement inside the
+standard cache's existing per-layer buffer-type plan. The initial implementation
+maintained a parallel `vector<bool>` for partial residency and repeated the
+host/device choice in tail-capability probing and tensor allocation. The cleanup
+instead computes one `layer_buft` table and consumes it in both paths. Pinned
+host-buffer selection is also shared by the standard and KVarN caches rather
+than duplicated in both translation units.
+
+This exposed and fixed one edge case: a layer that shares another context's KV
+previously consumed the `--kv-gpu-layers` budget even though it allocated no KV
+of its own. Shared-layer indices are now resolved once, excluded from placement,
+and reused by tail planning and allocation. Hybrid and hybrid-iSWA constructor
+arguments were regrouped by attention and recurrent ownership, the recurrent
+offload decision is derived once in `llama_model::create_memory()`, and
+`llama-bench` now treats `--kv-gpu-layers` as a normal numeric benchmark
+dimension, including comma/range sweeps and negative-value rejection. Its CSV,
+JSON, JSONL, SQL, and Markdown records now include `kv_cpu_pinned`,
+`recurrent_state_offload`, and `kv_gpu_layers`, so placement sweeps remain
+self-describing.
+
+The Release CUDA build completed successfully and the focused suite passed 8/8.
+The same bounded 4K allocation smoke test remained exactly 17.00 MiB CUDA KV,
+119.00 MiB CUDA-host KV, and 149.62 MiB CUDA recurrent state with two resident
+attention layers, confirming that the layout cleanup did not change the tested
+placement policy.
+
 ### Correctness
 
 Greedy generation (`--temp 0 --seed 1234`, 96 tokens, `-no-cnv`) was
@@ -1285,8 +1313,9 @@ is untouched.
 - There is no automatic sizing. Choosing `N` to fill available VRAM requires
   knowing the cache size per layer at the configured context, which the user must
   currently work out from the reported buffer sizes.
-- `llama-bench` treats the flag as process-wide rather than sweeping it like
-  `-nkvo`, matching how `--kv-cpu-pinned` was wired in Experiment 009.
+- `llama-bench` sweeps `--kv-gpu-layers` like its other numeric benchmark
+  dimensions. `--kv-cpu-pinned` and `--recurrent-state-offload` remain
+  process-wide toggles.
 - Measured on one machine only. The gain is proportional to the host-to-device
   transfer cost, so a host with faster PCIe than this PCIe 4.0 x16 link will see
   a smaller relative improvement.
