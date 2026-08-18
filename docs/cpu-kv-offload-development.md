@@ -623,6 +623,41 @@ was unchanged within single-run noise (74.82 versus 74.67 t/s), while prompt
 throughput fell 0.9%. A draft ubatch of 32 saved 110 MiB but reduced prompt
 throughput 4.3%, so 128 is the current balanced recommendation.
 
+### Follow-on branch: configurable MTP recurrent planes
+
+The dedicated branch `exp/mtp-recurrent-plane-cap` will investigate a bounded,
+configurable pool of target recurrent-state rollback planes. It branches from
+the CPU KV-offload work because the motivating capacity problem is visible when
+CPU-resident Q8 KV leaves recurrent state on the GPU, but the implementation is
+an MTP state-management change rather than partial KV placement.
+
+The current implementation reserves one committed recurrent state plus one
+state for every possible MTP position. Each additional state costs about
+149.625 MiB for the Qwen3.8 27B test model, producing allocations of 598.50 MiB
+at MTP depth 3, 897.75 MiB at depth 5, and 1,346.62 MiB at depth 8. Exact-seed
+traces show that a smaller retained set can cover most rollback boundaries and
+reconstruct an omitted boundary by restoring the nearest earlier retained
+state and replaying only the missing accepted recurrent transitions.
+
+The first candidate will add an opt-in MTP recurrent-plane limit. An unspecified
+limit must preserve the upstream allocation and behavior. The bounded mode
+must retain the committed state and the final state for the actual speculative
+run, use deterministic early-prefix intermediate retention initially, and
+report retained positions, recurrent allocation, replay cycles, and replayed
+tokens. Replay must remain within upstream task, sequence-removal, checkpoint,
+and sampler abstractions; it must not introduce fork-private verifier state.
+Bit-for-bit output equivalence at a fixed seed is required before performance
+claims are accepted.
+
+The initial comparison will use symmetric Q8_0/Q8_0 target and draft caches at
+MTP depths 3, 5, and 8. It will not test lower cache quants, asymmetric K/V
+pairs, or partial GPU KV offload. Measurements must include prefill, decode,
+initialized and live VRAM, recurrent-plane memory, replay work, and Nsight
+transfer behavior. The existing exact-seed traces suggest that a four-plane
+pool is a useful first candidate, but it is a hypothesis rather than a default:
+the short generation favored different intermediate positions from the long
+reasoning trace, so placement must not be specialized to one prompt.
+
 1. Run output-equivalence and recurrent-state regression tests for the separated
    placement policy.
 2. Measure no-MTP and MTP depth-1 serving with realistic prompts, including
