@@ -125,7 +125,8 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0);
+                 uint32_t   tail_visibility_window = 0,
+                     bool   cpu_pinned = false);
 
     ~llama_kv_cache() = default;
 

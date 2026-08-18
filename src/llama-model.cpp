@@ -28,9 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
-#include <cstdlib>
 #include <cstdint>
-#include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -2355,7 +2353,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         hparams.n_swa, hparams.swa_type, nullptr, filter_attn,
                                         nullptr, nullptr, cparams.n_ubatch, 0,
                                         kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
-                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0,
+                                        cparams.kv_cpu_pinned);
                             } else {
                                 mem_attn = std::make_unique<llama_kv_cache_kvarn>(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
@@ -2376,9 +2375,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter_recr);
                             res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
                         } else {
-                            const char * recurrent_offload_env = std::getenv("GGML_RECURRENT_STATE_OFFLOAD");
-                            const bool offload_recr = cparams.offload_kqv ||
-                                    (recurrent_offload_env && std::strcmp(recurrent_offload_env, "1") == 0);
+                            const bool offload_recr = cparams.offload_kqv || cparams.recurrent_state_offload;
 
                             res = new llama_memory_hybrid(
                                 /* model             */ *this,
@@ -2390,6 +2387,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* attn_n_swa        */ hparams.n_swa,
                                 /* attn_swa_type     */ hparams.swa_type,
                                 /* offload_attn      */ cparams.offload_kqv,
+                                /* cpu_pinned_attn   */ cparams.kv_cpu_pinned,
                                 /* recurrent_type_k  */ GGML_TYPE_F32,
                                 /* recurrent_type_v  */ GGML_TYPE_F32,
                                 /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2517,7 +2515,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         hparams.n_swa, hparams.swa_type, nullptr, filter,
                                         reuse, nullptr, cparams.n_ubatch, 0,
                                         kvarn_tail_type, 0, false, params.kv_tail_rollback_tokens,
-                                        params.kv_tail_native_exact ? cparams.n_ctx : 0);
+                                        params.kv_tail_native_exact ? cparams.n_ctx : 0,
+                                        cparams.kv_cpu_pinned);
                             } else {
                                 res = new llama_kv_cache_kvarn(
                                         *this, hparams, params.kvarn, cparams.offload_kqv,
@@ -2550,7 +2549,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_type,
                                     params.kv_tail_tokens_requested,
                                     false,
-                                    params.kv_tail_rollback_tokens);
+                                    params.kv_tail_rollback_tokens,
+                                    /* tail_visibility_window */ 0,
+                                    cparams.kv_cpu_pinned);
                         }
                     }
                 }

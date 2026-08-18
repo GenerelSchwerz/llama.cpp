@@ -959,3 +959,88 @@ prefill because single-token quantized attention uses a different, smaller
 route. It would reduce steady-state decode VRAM but not peak prefill VRAM and
 would require reallocation/graph recapture for later prompt ingestion. It is a
 secondary policy option, not a solution for fitting the initial 240K context.
+## Experiment 009: replace the environment switches with supported CLI/server options
+
+Status: retained. Closes "Proposed next sequence" item 11 from
+`cpu-kv-offload-development.md` for the standard non-SWA hybrid path; the
+scope limitation from Experiment 002 (ISWA and other special memory
+constructors not covered) still applies.
+
+### Change
+
+`GGML_KV_CPU_PINNED` and `GGML_RECURRENT_STATE_OFFLOAD` are replaced by first-class
+parameters that follow the same `common_arg` pattern as `--kv-offload`/`--no-kv-offload`:
+
+- `--kv-cpu-pinned` / `--no-kv-cpu-pinned` (env `LLAMA_ARG_KV_CPU_PINNED`)
+- `--recurrent-state-offload` / `--no-recurrent-state-offload`
+  (env `LLAMA_ARG_RECURRENT_STATE_OFFLOAD`)
+
+Both flags are available on `llama-cli`, `llama-completion`, `llama-server`, and
+`llama-bench` (the latter has its own argument parser and `cmd_params`/
+`cmd_params_instance` structs, so it required separate wiring). The values flow
+`common_params` -> `llama_context_params` (new `kv_cpu_pinned` and
+`recurrent_state_offload` bools, appended to the trailing bool block) ->
+`llama_cparams` -> `llama_model::create_memory()`, replacing the `std::getenv`
+reads in `llama-kv-cache.cpp` and `llama-model.cpp`.
+
+`llama_kv_cache_cpu_buft()` now takes an explicit `cpu_pinned` bool instead of
+reading the environment. The `llama_kv_cache` constructor gained a trailing
+`cpu_pinned = false` default parameter (kept at the end so the ~15 existing call
+sites across `llama-kv-cache-{kvarn,dsa,dsv4,msa,iswa}.cpp` do not need to change);
+it is wired to `cparams.kv_cpu_pinned` at the four call sites that construct the
+actual target attention-KV cache (the plain non-hybrid path, its kvarn-native-exact
+variant, the MTP-draft cache, and `llama_memory_hybrid`'s `mem_attn`). The
+recurrent-state getenv check in `llama-model.cpp` is replaced by
+`cparams.offload_kqv || cparams.recurrent_state_offload`.
+
+Unlike the global environment variable, which applied to every `llama_kv_cache`
+instance in the process including auxiliary DSA/MSA/DSV4 indexer caches, the CLI
+option only affects the primary target attention-KV cache. Those auxiliary caches
+were never part of the documented pinning workflow or its benchmarks, so this is
+considered a scope correction, not a regression.
+
+### Verification
+
+Functional equivalence against Experiment 001/002 was confirmed on different
+hardware (RTX 4070, 12 GiB, compute capability 8.9; Intel host; three pinned
+decode threads) using `Qwen3.8-27B-UD-IQ2_M.gguf`:
+
+```bash
+taskset -c 0-2 build/bin/llama-bench -m MODEL -ngl 99 -t 3 --poll 100 \
+  -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 -p 0 -n 64 -d DEPTH -r 3 \
+  [--kv-cpu-pinned] [--recurrent-state-offload]
+```
+
+| Config | Prefill @4K (t/s) | Decode @4K (t/s) | Decode @16K (t/s) |
+| --- | ---: | ---: | ---: |
+| baseline (no flags) | 993.40 +/- 6.57 | 13.72 +/- 0.02 | 8.96 +/- 0.01 |
+| `--kv-cpu-pinned` | 1011.65 +/- 2.30 | 15.26 +/- 0.02 | 11.79 +/- 0.03 |
+| `--recurrent-state-offload` | 1152.98 +/- 10.94 | 26.34 +/- 0.11 | 13.21 +/- 0.02 |
+| both | 1173.53 +/- 11.59 | 31.80 +/- 0.11 | 19.75 +/- 0.04 |
+| both, re-measured after the CLI-flag refactor | -- | 31.92 +/- 0.11 | -- |
+
+The last row re-ran the "both" decode@4K case through the new
+`--kv-cpu-pinned --recurrent-state-offload` flags instead of the old environment
+variables; the result (31.92 t/s) matches the pre-refactor value (31.80 t/s)
+within run-to-run noise, confirming the parameter-plumbing change did not alter
+behavior.
+
+Process VRAM peak (decode@4K, sampled repeatedly via `nvidia-smi
+--query-compute-apps`, 8 repetitions): baseline 10,002 MiB vs. both flags
+enabled 10,130 MiB (+128 MiB), consistent with the +124 MiB reported for the
+same comparison in Experiment 002 on different hardware.
+
+An end-to-end smoke test with `llama-completion -nkvo --kv-cpu-pinned
+--recurrent-state-offload` produced coherent output and exited cleanly,
+confirming the option reaches context creation through the normal
+`common/arg.cpp` parsing path (not just `llama-bench`'s separate parser).
+
+### Remaining scope for a supported policy
+
+- MTP rollback-state VRAM and realistic-prompt validation from Experiment 002's
+  "current limitations" are still open.
+- `llama_memory_hybrid_iswa` (the SWA-hybrid path) still ties recurrent-state
+  and attention-KV placement to a single `offload` argument; extending the
+  split there is unstarted.
+- `llama-bench`'s new flags are process-wide (not swept per combination like
+  `-nkvo`), matching how the documented benchmark protocol invokes them today.

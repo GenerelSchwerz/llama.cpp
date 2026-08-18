@@ -29,6 +29,7 @@ public:
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                      bool   offload_attn,
+                     bool   cpu_pinned_attn,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
