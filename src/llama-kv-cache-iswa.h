@@ -37,7 +37,8 @@ public:
                      uint32_t   tail_tokens_requested = UINT32_MAX,
                      uint32_t   tail_tokens_swa_requested = UINT32_MAX,
                      uint32_t   tail_rollback_tokens = 0,
-                         bool   tail_native_exact_swa = false);
+                         bool   tail_native_exact_swa = false,
+                         bool   cpu_pinned = false);
 
     // DSV4 uses a projected hparams view for its raw iSWA cache.  Keep this
     // explicit overload so KVarN support does not erase that upstream need.
@@ -66,7 +67,8 @@ public:
                      uint32_t   tail_tokens_requested = UINT32_MAX,
                      uint32_t   tail_tokens_swa_requested = UINT32_MAX,
                      uint32_t   tail_rollback_tokens = 0,
-                         bool   tail_native_exact_swa = false);
+                         bool   tail_native_exact_swa = false,
+                         bool   cpu_pinned = false);
 
     ~llama_kv_cache_iswa() = default;
 

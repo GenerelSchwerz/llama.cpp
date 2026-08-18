@@ -2578,7 +2578,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--kv-cpu-pinned"},
         {"--no-kv-cpu-pinned"},
         string_format("route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory; "
-                      "only affects layers not offloaded to GPU, e.g. when combined with --no-kv-offload (default: %s)",
+                      "only affects layers not offloaded to GPU, e.g. when combined with --no-kv-offload; "
+                      "on an integrated GPU the pinned buffer is GPU-visible unified memory, so attention for those "
+                      "layers may still run on the GPU even with --no-kv-offload (default: %s)",
                       params.kv_cpu_pinned ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.kv_cpu_pinned = value;
@@ -2588,7 +2590,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},
         string_format("for hybrid attention/recurrent models, keep the fixed recurrent (R/S) state GPU-resident "
-                      "even when --no-kv-offload moves attention KV to CPU (default: %s)",
+                      "even when --no-kv-offload moves attention KV to CPU; only takes effect when --kv-offload "
+                      "is disabled, since --kv-offload already keeps the recurrent state on GPU (default: %s)",
                       params.recurrent_state_offload ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.recurrent_state_offload = value;

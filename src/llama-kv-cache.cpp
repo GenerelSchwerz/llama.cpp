@@ -40,6 +40,27 @@ static ggml_backend_buffer_type_t llama_kv_cache_cpu_buft(
     return ggml_backend_cpu_buffer_type();
 }
 
+// A pinned/host buffer type's registered ggml_backend_buft_get_device() is the
+// GPU that allocated it (see e.g. ggml_backend_cuda_host_buffer_type()), but
+// that is only where the memory is *addressable from*, not where ops on it
+// actually execute. ggml_backend_sched picks the highest-priority backend that
+// both supports the buft and the op (ggml_backend_sched_backend_from_buffer);
+// on a discrete GPU, ggml_backend_*_device_supports_buft() rejects a host buft
+// (it is accepted only on an integrated GPU, where host memory is GPU-visible
+// unified memory), so the op actually falls back to the CPU backend. Mirror
+// that decision here so KV-tail capability probing checks the backend that
+// will really run the op, not just the buft's nominal owner device.
+static ggml_backend_dev_t llama_kv_tail_route_owner_device(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (dev != nullptr && !ggml_backend_dev_supports_buft(dev, buft)) {
+        dev = nullptr;
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return dev;
+}
+
 using backend_kv_tail_attention_supported_t = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 
@@ -60,10 +81,7 @@ static bool backend_supports_native_kv_tail(
         ggml_type tail_k, ggml_type tail_v,
         int64_t d_k, int64_t d_v,
         bool segmented) {
-    auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-    if (!dev) {
-        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
+    auto * dev = llama_kv_tail_route_owner_device(buft);
     const auto supports = [&](ggml_backend_dev_t candidate) {
         const auto reg = candidate ? ggml_backend_dev_backend_reg(candidate) : nullptr;
         const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
@@ -95,10 +113,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    auto * dev = ggml_backend_buft_get_device(spec.buft);
-    if (!dev) {
-        dev = cpu;
-    }
+    auto * dev = llama_kv_tail_route_owner_device(spec.buft);
     if (!dev || !cpu) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
@@ -223,10 +238,7 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
-    auto * dev = ggml_backend_buft_get_device(spec.buft);
-    if (!dev) {
-        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
+    auto * dev = llama_kv_tail_route_owner_device(spec.buft);
     if (!dev) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
@@ -617,10 +629,7 @@ llama_kv_cache::llama_kv_cache(
                                 tail_plan.compact_layout.history_stride, 256) :
                         tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ?
                             tail_plan.layout.arena_stride : 0;
-            auto * dev = ggml_backend_buft_get_device(spec.buft);
-            if (!dev) {
-                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            }
+            auto * dev = llama_kv_tail_route_owner_device(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -650,10 +659,7 @@ llama_kv_cache::llama_kv_cache(
             const ggml_type actual_v = ggml_is_quantized(spec.body_type_v) ? candidate : spec.body_type_v;
             const auto capability = probe_standard_native_exact_route(
                     spec, actual_k, actual_v, v_trans, !v_trans);
-            auto * dev = ggml_backend_buft_get_device(spec.buft);
-            if (!dev) {
-                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            }
+            auto * dev = llama_kv_tail_route_owner_device(spec.buft);
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -864,7 +870,7 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-        const char * dev_name = "CPU";
+        const char * dev_name;
 
         ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
 
@@ -873,6 +879,12 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        } else {
+            // cpu_pinned layers report the backend that will actually execute
+            // ops on them (llama_kv_tail_route_owner_device), not the buft's
+            // nominal owner, which is the GPU for a CUDA/Vulkan host buft.
+            auto * dev = llama_kv_tail_route_owner_device(buft);
+            dev_name = dev ? ggml_backend_dev_name(dev) : "CPU";
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

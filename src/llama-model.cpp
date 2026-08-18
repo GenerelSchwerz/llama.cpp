@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -2330,7 +2331,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
-                            /* offload           */ cparams.offload_kqv,
+                            /* offload_attn      */ cparams.offload_kqv,
+                            /* cpu_pinned_attn   */ cparams.kv_cpu_pinned,
+                            /* offload_recr      */ cparams.offload_kqv || cparams.recurrent_state_offload,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
@@ -2362,13 +2365,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter_attn, nullptr, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens);
+                                        params.kv_tail_rollback_tokens, cparams.kv_cpu_pinned);
                             }
                             auto mem_recr = std::make_unique<llama_memory_recurrent>(
                                     *this,
                                     GGML_TYPE_F32,
                                     GGML_TYPE_F32,
-                                    cparams.offload_kqv,
+                                    cparams.offload_kqv || cparams.recurrent_state_offload,
                                     std::max((uint32_t) 1, cparams.n_seq_max),
                                     cparams.n_seq_max,
                                     cparams.n_rs_seq,
@@ -2475,7 +2478,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
                                     params.kv_tail_rollback_tokens,
-                                    params.kv_tail_native_exact_swa);
+                                    params.kv_tail_native_exact_swa,
+                                    cparams.kv_cpu_pinned);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2501,7 +2505,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     params.kv_tail_tokens_requested,
                                     params.kv_tail_tokens_swa_requested,
                                     params.kv_tail_rollback_tokens,
-                                    params.kv_tail_native_exact_swa);
+                                    params.kv_tail_native_exact_swa,
+                                    cparams.kv_cpu_pinned);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2524,7 +2529,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                         cparams.n_batch, cparams.n_ubatch, 1, hparams.n_swa,
                                         hparams.swa_type, filter, reuse, params.kv_tail_tokens,
                                         kvarn_tail_type, params.kv_tail_tokens_requested,
-                                        params.kv_tail_rollback_tokens);
+                                        params.kv_tail_rollback_tokens, cparams.kv_cpu_pinned);
                             }
                         } else {
                             res = new llama_kv_cache(
