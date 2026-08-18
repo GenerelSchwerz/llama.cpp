@@ -55,6 +55,8 @@ struct llama_cparams {
     bool kv_cpu_pinned;
     bool recurrent_state_offload;
 
+    uint32_t kv_gpu_layers;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;

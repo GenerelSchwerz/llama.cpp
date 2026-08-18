@@ -126,7 +126,8 @@ public:
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
-                     bool   cpu_pinned = false);
+                     bool   cpu_pinned = false,
+                 uint32_t   gpu_resident_layers = 0);
 
     ~llama_kv_cache() = default;
 

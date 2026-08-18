@@ -36,7 +36,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
-                 uint32_t   tail_rollback_tokens) :
+                 uint32_t   tail_rollback_tokens,
+                 uint32_t   gpu_resident_layers_attn) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -64,7 +65,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         false,
         tail_rollback_tokens,
         /* tail_visibility_window */ 0,
-        cpu_pinned_attn
+        cpu_pinned_attn,
+        gpu_resident_layers_attn
     )),
     mem_recr(new llama_memory_recurrent(
         model,

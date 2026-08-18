@@ -300,6 +300,7 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
+    cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -4257,6 +4258,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_request             =*/ nullptr,
         /*.kv_cpu_pinned               =*/ false,
         /*.recurrent_state_offload     =*/ false,
+        /*.kv_gpu_layers               =*/ 0,
     };
 
     return result;
