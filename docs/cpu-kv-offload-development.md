@@ -185,8 +185,9 @@ or quantized dot-product behavior.
 
 Standard CPU KV allocated ordinary pageable memory through
 `ggml_backend_cpu_buffer_type()`, even though CUDA exposes a compatible host
-buffer type backed by `cudaMallocHost()`. Experiment 001 selects that device
-host buffer for CPU KV when `GGML_KV_CPU_PINNED=1`.
+buffer type backed by `cudaMallocHost()`. Experiment 001 originally selected
+that device host buffer with `GGML_KV_CPU_PINNED=1`; the supported interface is
+now `--kv-cpu-pinned` (Experiment 009).
 
 Committed result: `346ca3000` (`kv-cache: experiment with pinned CPU buffers`).
 
@@ -290,11 +291,11 @@ vectorized two-pass softmax—were neutral and removed. Future kernel work must
 start from the decoupled-placement baseline rather than trying to recover graph
 boundary overhead inside the attention kernel.
 
-The implementation remains opt-in through
-`GGML_RECURRENT_STATE_OFFLOAD=1`. The environment switch is deliberately not a
-public CLI/INI promise yet. MTP creates recurrent rollback snapshots, so its
-additional GPU-state cost and correctness must be measured before choosing a
-serving default.
+The implementation remains opt-in through `--recurrent-state-offload`; the
+original `GGML_RECURRENT_STATE_OFFLOAD=1` experiment switch was removed in
+Experiment 009. MTP creates recurrent rollback snapshots, so its additional
+GPU-state cost and correctness must still be measured before choosing a serving
+default.
 
 ### 13. CPU KV does not make VRAM independent of context
 
@@ -576,9 +577,9 @@ taskset -c 0-2 build-cuda-all/bin/llama-bench \
   -nkvo 1 -fa on -ctk q8_0 -ctv q8_0
 ```
 
-For the pinned candidate, prefix the command with
-`GGML_KV_CPU_PINNED=1`. For the ordinary baseline, explicitly remove that
-variable with `env -u GGML_KV_CPU_PINNED`.
+For the pinned candidate, add `--kv-cpu-pinned`. Omit it for the ordinary
+pageable-CPU-buffer baseline. Add `--recurrent-state-offload` when measuring the
+retained hybrid placement policy.
 
 While each clean process is alive, sample process GPU allocation repeatedly:
 
@@ -692,8 +693,8 @@ reasoning trace, so placement must not be specialized to one prompt.
 9. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
 10. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
    and quality measurements.
-11. Replace the environment-only switches with supported CLI/INI policies only
-   if their allocation behavior survives the full benchmark and resource suite.
+11. Retained: the experimental environment-only switches were replaced by
+   `--kv-cpu-pinned` and `--recurrent-state-offload` in Experiment 009.
 
 ## Known non-goals
 

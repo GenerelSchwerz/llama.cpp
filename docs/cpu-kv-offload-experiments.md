@@ -1045,7 +1045,7 @@ confirming the option reaches context creation through the normal
 - `llama-bench`'s new flags are process-wide (not swept per combination like
   `-nkvo`), matching how the documented benchmark protocol invokes them today.
 
-## Experiment 009: lossless compression of the Q8_0 transfer stream
+## Experiment 010: lossless compression of the Q8_0 transfer stream
 
 Status: rejected on measured entropy grounds. No implementation was written; the
 measurement is the deliverable, and it closes the direction.
@@ -1155,10 +1155,10 @@ gate. The fork already has a segmented merge primitive in
 existing reference. The dial degrades gracefully: N = 0 reproduces today's
 behaviour, N = n_ctx reproduces GPU-resident KV.
 
-## Experiment 010: tunable partial GPU KV residency
+## Experiment 011: tunable partial GPU KV residency
 
 Status: retained. Implements the direction identified at the end of Experiment
-009 and gives the first continuous dial between host-resident and GPU-resident
+010 and gives the first continuous dial between host-resident and GPU-resident
 attention KV.
 
 ### Change
@@ -1209,7 +1209,7 @@ Decode, 32 tokens:
 | 16 | 36.00 +/- 0.21 | 27.78 | 32.42 +/- 0.17 | 30.84 |
 
 Full residency is +82.7% at 16K and **+148.8% at 32K**. The endpoints reproduce
-the independent references from Experiment 009 (19.76 t/s host-resident and
+the independent references from Experiment 010 (19.76 t/s host-resident and
 36.13 t/s GPU-resident at 16K), confirming the dial is not introducing a path of
 its own.
 
@@ -1239,6 +1239,31 @@ therefore 34.53 MiB per 1.44 ms/token at 16K, and 69.06 MiB per 2.85 ms/token at
 32K. At 32K, full residency needs 1,105 MiB of device memory and still fits on
 this 12 GiB card alongside the 9,227 MiB of weights.
 
+### RTX 5070 Ti integration validation
+
+The implementation was subsequently exercised at commit `b8f855761` with the
+Qwen3.8 27B AtomicChat model used throughout this branch, target Q8_0/Q8_0 CPU
+KV, MTP maximum depth 3, draft Q4_0/Q4_0, target ubatch 512, draft ubatch 128,
+and three pinned decode threads. At 64K configured context with a 60,052-token
+prompt, moving four of the sixteen target attention layers to the GPU changed
+decode from 19.32 to 25.57 t/s (+32.3%), prefill from 1,164.98 to 1,188.23 t/s
+(+2.0%), and peak process VRAM from 14,924 to 15,466 MiB (+542 MiB). The N=4
+run left only about 414 MiB of physical VRAM margin, so it is the practical
+maximum tested setting on this 15,880 MiB card at that context and MTP depth.
+
+At 32K and the same MTP depth, N=4 improved representative decode from 30.77
+to 37.60 t/s while adding about 238 MiB of peak VRAM. Those two longer samples
+did not terminate at identical token counts, so they are a compatibility and
+directional-performance check rather than a publication-grade matched result.
+
+After integration onto `exp/kv-cpu-offload`, a bounded 4K startup smoke test at
+commit `abb66abb1` used only `--kv-cpu-pinned`,
+`--recurrent-state-offload`, and `--kv-gpu-layers 2`. It reported 17.00 MiB of
+CUDA KV, 119.00 MiB of CUDA-host KV, and 149.62 MiB of CUDA recurrent state,
+confirming that all three supported flags reached the intended allocation
+policy without the removed `GGML_KV_CPU_PINNED` or
+`GGML_RECURRENT_STATE_OFFLOAD` switches.
+
 ### Correctness
 
 Greedy generation (`--temp 0 --seed 1234`, 96 tokens, `-no-cnv`) was
@@ -1261,7 +1286,7 @@ is untouched.
   knowing the cache size per layer at the configured context, which the user must
   currently work out from the reported buffer sizes.
 - `llama-bench` treats the flag as process-wide rather than sweeping it like
-  `-nkvo`, matching how `--kv-cpu-pinned` was wired in Experiment 008.
+  `-nkvo`, matching how `--kv-cpu-pinned` was wired in Experiment 009.
 - Measured on one machine only. The gain is proportional to the host-to-device
   transfer cost, so a host with faster PCIe than this PCIe 4.0 x16 link will see
   a smaller relative improvement.
