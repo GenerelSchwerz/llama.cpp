@@ -23,6 +23,8 @@ Success requires all of the following:
 
 - Higher decode throughput, especially as context length grows.
 - No material prefill regression.
+- Minimize GPU memory after throughput is protected, so larger contexts and
+  auxiliary features fit without giving back the CPU-KV performance gains.
 - Explicit accounting for GPU memory, system memory, and pinned memory.
 - Correct output and unchanged KV-cache semantics.
 - Small, reviewable changes that remain aligned with current llama.cpp
@@ -290,6 +292,62 @@ public CLI/INI promise yet. MTP creates recurrent rollback snapshots, so its
 additional GPU-state cost and correctness must be measured before choosing a
 serving default.
 
+### 13. CPU KV does not make VRAM independent of context
+
+Live testing showed that GPU memory can still rise when configured or populated
+context grows even though the target Q8 K/V buffers report `CUDA_Host`. CPU KV
+offload controls the long attention K/V storage and the CPU attention region;
+it does not move every context-shaped tensor or every auxiliary state out of
+CUDA memory.
+
+The current resource model is:
+
+| Resource | Normal location in this experiment | Scaling behavior |
+| --- | --- | --- |
+| Target attention Q8 K/V | CUDA-pinned system RAM | Scales strongly with configured context |
+| Recurrent R/S state | GPU with Experiment 002 | Fixed by sequence count and rollback snapshots, not attention depth |
+| Target CUDA compute workspace | GPU | Can grow with reserved graph and context shapes |
+| CPU/GPU boundary-copy buffers | GPU and pinned host memory | Can grow with scheduled tensor shapes |
+| CUDA graph captures | GPU | Can grow as new execution shapes are captured during serving |
+| MTP draft compute workspace | GPU when the draft layer is offloaded | Additional fixed/reserved cost |
+| MTP draft KV | Pinned system RAM under CPU-KV placement | Scales with its configured context |
+
+Observed examples establish the size of the non-KV costs:
+
+- The no-MTP 4K candidate reported approximately 555 MiB of CUDA compute
+  buffers.
+- The 92K target server reserve reported approximately 721 MiB of CUDA compute
+  buffers.
+- The MTP draft context reported approximately 631 MiB of additional CUDA
+  compute buffer.
+- Recurrent state was approximately 299.25 MiB with one rollback snapshot and
+  598.50 MiB with three snapshots in the recorded server configurations.
+
+These categories must not be described as KV-cache VRAM. A `CUDA_Host KV
+buffer` line identifies host-resident KV, while `CUDA0 RS buffer` and `CUDA0
+compute buffer` are device allocations. CUDA host mappings can also consume
+driver resources without appearing as ordinary process VRAM.
+
+Reducing VRAM is now an explicit goal, subordinate to preserving performance.
+Candidate reductions should target unnecessary workspace retention, redundant
+boundary buffers, excessive graph variants, or avoidable MTP state. Moving the
+recurrent state back to CPU is not an acceptable memory optimization unless a
+new mechanism avoids the throughput regression demonstrated by Experiment 002.
+
+Every future serving measurement should distinguish:
+
+1. GPU memory immediately after model/context initialization.
+2. GPU memory after warmup.
+3. GPU memory at fixed live depths such as 4K, 16K, and 32K.
+4. GPU memory after returning to an idle slot.
+5. Target recurrent state, target compute, draft compute, and CUDA graph-cache
+   contributions when MTP is enabled.
+
+This sequence separates static reservation from live-context growth and from
+CUDA graph caching. A graph-disabled diagnostic may be used to identify capture
+growth, but it is not a retained optimization unless throughput remains
+competitive.
+
 ## Current understanding of the execution path
 
 With `--no-kv-offload`, the KV buffers and the graph section from KV store
@@ -441,19 +499,23 @@ uses CUDA architecture `120a` as selected by current CMake/CUDA handling.
    placement policy.
 2. Measure no-MTP and MTP depth-1 serving with realistic prompts, including
    recurrent rollback VRAM, acceptance, prefill, decode, and total VRAM.
-3. Count graph splits and boundary-transfer bytes before and after recurrent
+3. Record startup, post-warmup, fixed-live-depth, and post-idle VRAM; distinguish
+   static workspace growth from CUDA graph-capture growth.
+4. Attribute target compute, recurrent state, MTP draft compute, boundary
+   buffers, and graph-cache allocations before attempting to reduce them.
+5. Count graph splits and boundary-transfer bytes before and after recurrent
    offload so the remaining CPU-attention boundary cost is explicit.
-4. Measure pinned system-memory size and CUDA mapping overhead at 4K, 16K, and
+6. Measure pinned system-memory size and CUDA mapping overhead at 4K, 16K, and
    the intended maximum serving context.
-5. Prototype further Bee-derived Q8 scheduling or layout changes only when the
+7. Prototype further Bee-derived Q8 scheduling or layout changes only when the
    measurements identify a specific remaining bottleneck.
-6. Compare the validated Bee implementation with external implementations only
+8. Compare the validated Bee implementation with external implementations only
    after the Bee candidate is complete; do not use external source to design the
    candidate.
-7. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
-8. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
+9. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
+10. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
    and quality measurements.
-9. Replace the environment-only switches with supported CLI/INI policies only
+11. Replace the environment-only switches with supported CLI/INI policies only
    if their allocation behavior survives the full benchmark and resource suite.
 
 ## Known non-goals

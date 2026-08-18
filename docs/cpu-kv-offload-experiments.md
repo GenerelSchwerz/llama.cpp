@@ -90,6 +90,12 @@ baseline:
 5. Any system-RAM, pinned-memory, compatibility, or allocation-lifetime cost.
 6. Whether the experiment is retained, revised, or reverted.
 
+For serving changes, GPU-memory reporting must also separate initialization,
+post-warmup, fixed live-context depths, and post-idle state. Record target and
+draft compute buffers, recurrent-state buffers, CPU/GPU boundary buffers, and
+CUDA graph-cache growth where the backend exposes them. A host-resident KV
+buffer does not imply that CUDA workspace is independent of context size.
+
 ## Experiment 002: decouple recurrent-state and attention-KV placement
 
 Status: promising, retained behind an experimental environment switch.
@@ -206,6 +212,15 @@ approximately 299.25 MiB for one MTP rollback snapshot and 598.50 MiB for three,
 versus the smaller no-MTP state measured here. MTP serving therefore needs a
 separate VRAM-capacity check before enabling GPU recurrent state at a 92K
 context.
+
+The target CUDA compute workspace is also context-shape dependent: it was about
+555 MiB in the 4K no-MTP measurement and about 721 MiB in the recorded 92K
+server reserve. MTP added an approximately 631 MiB draft compute workspace.
+These are GPU allocations even when target and draft KV buffers are
+`CUDA_Host`. CUDA graph captures and boundary-copy buffers may add further live
+growth as new serving shapes appear. Future VRAM optimization must attribute
+these categories separately and may not trade away the recurrent-placement
+throughput gain without an alternative that preserves performance.
 
 ### Correctness and compatibility considerations
 
