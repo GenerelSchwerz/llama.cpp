@@ -2914,14 +2914,13 @@ int llama_bench(int argc, char ** argv) {
                     t.cuda_compute_buffer_bytes += memory.compute;
                 }
             }
-            if (t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
-                fprintf(stderr, "%s: error: GPU context buffers are smaller than categorized resident KV storage\n", __func__);
-                llama_free(ctx);
-                llama_model_free(lmodel);
-                return 1;
-            }
-            t.cuda_non_kv_context_buffer_bytes =
-                t.cuda_context_buffer_bytes - t.kv_resident_bytes;
+            // kv_resident_bytes() totals K/V payload across all layers regardless of
+            // which buffer type actually backs them (see llama_kv_cache::kv_memory_stats).
+            // With --kv-gpu-layers splitting the cache across host and device, that total
+            // can exceed what is actually GPU-resident; treat any excess as host-side
+            // rather than erroring, instead of assuming full-offload placement.
+            t.cuda_non_kv_context_buffer_bytes = t.cuda_context_buffer_bytes > t.kv_resident_bytes ?
+                t.cuda_context_buffer_bytes - t.kv_resident_bytes : 0;
 
             uint64_t cuda_free_context = 0;
             uint64_t cuda_total_context = 0;

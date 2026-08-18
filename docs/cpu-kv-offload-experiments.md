@@ -1147,3 +1147,124 @@ is untouched.
 - Measured on one machine only. The gain is proportional to the host-to-device
   transfer cost, so a host with faster PCIe than this PCIe 4.0 x16 link will see
   a smaller relative improvement.
+
+## Experiment 011: transient CUDA compute-buffer overhead is independent of KV residency
+
+Status: characterized, not fixed. External review of Experiment 010 (from the
+PR1 side) pointed out that reducing VRAM allocation overhead is a separate
+problem from KV placement, specifically flagging F16 materialization of
+quantized K/V during prompt attention, a fixed-window KV staging idea, a
+compact causal-mask representation, and a decode-only graph after prefill.
+This experiment measures and confirms the first of those on our own hardware,
+and explains in code why fixing it is out of scope for a single-session change.
+
+### Hypothesis
+
+`--kv-gpu-layers` (Experiment 010) only moves the persistent, quantized K/V
+tensor between host and device. It does not touch the transient CUDA compute
+buffer the scheduler reserves for the flash-attention graph. If that transient
+buffer materializes a full F16 copy of the attended K/V range regardless of
+`N`, its cost is additive to Experiment 010's savings, not covered by them.
+
+### Code confirmation
+
+`ggml_cuda_flash_attn_ext_get_alloc_size` in
+`ggml/src/ggml-cuda/fattn.cu` sets `need_f16_K = need_f16_V = true`
+unconditionally for `BEST_FATTN_KERNEL_TILE` and `BEST_FATTN_KERNEL_MMA_F16`.
+`ggml_cuda_get_best_fattn_kernel` only routes quantized K/V to the
+F16-materialization-free vector kernel when the query width is very small
+(`Q->ne[1] <= 2` on Ada, `== 1` before Ada); anything wider, i.e. ordinary
+prompt processing, takes the MMA/tile path and pays the F16 cast. This is
+upstream behaviour, not fork-specific, and it applies however the persistent
+cache is placed.
+
+The fork already has a kernel that avoids this for KVarN cache types:
+`ggml_cuda_flash_attn_ext_kvarn_uses_views` and the descriptor-native loaders
+in `fattn-mma-kvarn-load.cuh` dequantize per tile from KVarN's packed records
+instead of pre-casting a full K/V tensor. That path is specific to KVarN's
+variable-bit, three-axis (scale/zero-point/other-axis) affine block format and
+its rotated staging layout; it is not a drop-in generalization to plain
+`q8_0`, whose block format is much simpler but structurally different. Writing
+an equivalent quantized-native MMA path for standard `qN_0` types would be new
+tensor-core kernel work comparable in scope to that existing implementation,
+not a wiring change like Experiment 010, and this fork's correctness bar for
+KV-cache changes (byte-identical output, real GPU testing) is not something to
+approximate. It was not attempted here.
+
+The tail-merge primitives already in the codebase
+(`ggml_kv_tail_attention_merge`, `ggml_kv_tail_attention_merge_segmented`)
+were considered as a way to chunk prefill K/V through a small reused F16
+buffer instead of writing a new kernel. They do not fit: both attach extra
+source tensors to a single `GGML_OP_FLASH_ATTN_EXT` node so the backend can
+compute the merge inside one kernel launch, capped at one history and one
+current source; they are not a standalone op that can combine independently
+executed passes, so they cannot be reused externally for an arbitrary-way
+context chunking.
+
+Experiment 004 already showed that changing which backend runs attention does
+not reduce these buffers either: its matched-memory run recorded identical
+CUDA context and compute buffer sizes whether decode attention ran on CPU or
+GPU, because the scheduler reserves compute buffers for the worst-case graph
+once, independent of where a given step's op is actually dispatched.
+
+### Method
+
+`llama-bench --kv-memory -o json` reports `cuda_compute_buffer_bytes`, the
+scheduler's transient CUDA workspace, separately from `cuda_context_buffer_bytes`
+(the persistent KV storage). Sweeping `--kv-gpu-layers` at fixed depth isolates
+whether that transient buffer responds to the residency dial:
+
+```bash
+taskset -c 0,2,4 build/bin/llama-bench -m Qwen3.8-27B-UD-IQ2_M.gguf \
+  -p 32 -n 4 -d DEPTH -r 1 -t 3 --poll 100 \
+  -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 --kv-gpu-layers N \
+  --kv-memory -o json
+```
+
+Getting this to run at `--kv-gpu-layers 0` required a fix: `llama-bench`'s
+`--kv-memory` sanity check assumed every byte `llama_kv_cache::kv_memory_stats`
+counts as KV payload is GPU-resident, which held before Experiment 010 (KV
+placement was all-or-nothing) but not after (`kv_resident_bytes()` totals K/V
+tensor sizes across all layers regardless of which buffer type actually backs
+them). At `N = 0` this total legitimately exceeds the GPU context buffer, and
+the check aborted the run instead of reporting it. `tools/llama-bench/llama-bench.cpp`
+now treats any excess as host-side instead of erroring.
+
+### Results
+
+| `--kv-gpu-layers` | Depth | Compute buffer | Context buffer |
+| ---: | ---: | ---: | ---: |
+| 0 | 16384 | 551.66 MiB | 0 MiB |
+| 0 | 32768 | 567.61 MiB | 0 MiB |
+| 8 | 16384 | 595.90 MiB | 276.28 MiB |
+| 8 | 32768 | 611.90 MiB | 548.28 MiB |
+| 16 | 16384 | 551.66 MiB | 552.50 MiB |
+| 16 | 32768 | 623.87 MiB | 1,096.50 MiB |
+
+The compute buffer sits in the same 550-625 MiB band at every `N`; it does not
+scale with how many layers `--kv-gpu-layers` keeps device-resident, confirming
+the hypothesis. Its context buffer counterpart, by contrast, is exactly
+Experiment 010's per-layer KV storage and scales with `N` as already
+documented (0 at `N=0`, matching the full 552.50/1096.50 MiB total at `N=16`).
+
+The compute buffer does grow with depth, at different rates depending on `N`:
+1,024 bytes/token between 16K and 32K at `N=0` and `N=8`, but 4,625 bytes/token
+at `N=16` (single-repetition measurements, no error bars; the `N=8` depth-16384
+figure exceeding both its neighbours suggests some run-to-run noise rather than
+a real non-monotonicity). Taking the `N=16` slope as an upper-bound estimate
+and extrapolating linearly to the 240K depth the original report cited gives
+roughly 1.03 GiB of growth, in the same range as the "approximately 950 MiB"
+figure reported there, on different hardware and a different model. That
+cross-check makes the original estimate credible rather than just plausible.
+
+### Disposition
+
+Characterized, not fixed. The overhead is real, roughly gigabyte-scale at long
+context, and confirmed independent of `--kv-gpu-layers` on this machine's own
+numbers, not just by extrapolation from another report. Closing it needs a
+quantized-native MMA prefill kernel for standard `qN_0` K/V, i.e. genuinely new
+CUDA tensor-core kernel code, not a routing or buffer-placement change; that is
+a separate, larger effort from this PR's KV-placement work and was not
+attempted. The `llama-bench` `--kv-memory` fix is retained because the
+diagnostic is otherwise unusable at partial residency, which the measurement
+above depends on.
