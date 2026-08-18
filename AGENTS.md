@@ -113,6 +113,10 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/quickstart-qwen36-dflash.md` - Qwen3.6 DFlash guide.
 - `docs/quickstart-gemma-4-31b-dflash.md` - Gemma 4 DFlash guide.
 - `docs/preset.md` - INI preset format.
+- `docs/cpu-kv-offload-development.md` - objective, investigation history,
+  hypotheses, benchmark protocol, and roadmap for the CPU KV-offload branch.
+- `docs/cpu-kv-offload-experiments.md` - authoritative per-change CPU KV
+  benchmark and resource ledger.
 
 ### Invariants
 
@@ -155,6 +159,45 @@ build/bin/llama-server -m target.gguf \
 
 KLD comparisons use matching `-b` and `-ub` values for the baseline and
 candidate. Record both values with every result.
+
+## CPU KV-offload Experiment Workflow
+
+These instructions apply when working on `exp/kv-cpu-offload` or continuing its
+CPU-resident KV-cache investigation.
+
+- Read `docs/cpu-kv-offload-development.md` and
+  `docs/cpu-kv-offload-experiments.md` before changing code or interpreting old
+  measurements. Treat Git commits as the source of truth for exact diffs.
+- Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
+  build, profile, and documentation changes in the dedicated experimental
+  worktree and branch.
+- Give each independently testable optimization its own commit. Include the
+  implementation and its corresponding update to
+  `docs/cpu-kv-offload-experiments.md` in that commit so the code and evidence
+  cannot drift apart.
+- Update `docs/cpu-kv-offload-development.md` whenever an experiment changes the
+  working theory, rejects a path, reveals a bottleneck, changes the benchmark
+  protocol, or changes the roadmap. Pure result additions that do not change
+  those conclusions belong only in the experiment ledger.
+- Record rejected and neutral experiments before reverting them. Prefer a clean
+  revert or a separate revert commit when preserving the exact attempted diff
+  is useful; never leave an undocumented partial implementation in the branch.
+- For every performance change, measure clean baseline and candidate processes
+  with identical model, depth, cache formats, affinity, thread counts, build
+  options, and runtime settings. At minimum record prefill, decode at depth 4096,
+  decode at a long-context depth, and peak process VRAM.
+- Record system-RAM and pinned-memory costs when allocation behavior changes.
+  Do not equate `nvidia-smi` process VRAM with CUDA host mappings or page-locked
+  system memory.
+- Run correctness/regression coverage proportional to the change. Cache-format
+  quality comparisons require matching `llama-perplexity` `-b` and `-ub`
+  values for baseline and candidate.
+- Every experiment entry must state its base and candidate commit IDs, exact
+  commands or command template, hardware, model path, measurements, resource
+  tradeoffs, and disposition: retained, revised, neutral, or reverted.
+- Do not present measurements from an uncommitted or differently configured
+  binary as results for the current commit. Rebuild or verify the binary's build
+  commit before benchmarking.
 
 ## Git Conventions
 
