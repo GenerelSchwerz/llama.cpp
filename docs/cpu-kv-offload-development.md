@@ -350,10 +350,11 @@ competitive.
 
 ## Current understanding of the execution path
 
-With `--no-kv-offload`, the KV buffers and the graph section from KV store
-through attention output are placed on CPU. Model weights and the rest of the
-graph remain GPU-resident. Standard Q8 KV uses the ordinary CPU FlashAttention
-implementation rather than KVarN's record-native paths.
+With `--no-kv-offload`, the persistent KV tensors are placed in host memory.
+That placement does not imply that attention executes on CPU. A 32K Nsight
+Systems trace showed that the scheduler copies each full K and V tensor to the
+GPU and executes standard Q8 attention with CUDA FlashAttention. Model weights
+and the rest of the graph also remain GPU-resident.
 
 At long context, each generated token requires scanning increasingly large K/V
 history. Relevant costs may include:
@@ -365,6 +366,29 @@ history. Relevant costs may include:
 - Synchronization and launch overhead around those boundaries.
 - Pageable-memory staging or registration overhead, which pinned memory appears
   to reduce substantially.
+
+A generation-aligned `nvidia-smi dmon` sample at 64K later measured sustained
+PCIe receive traffic of approximately 34-38 GB/s while Q8 CPU KV decoded at
+`15.01` t/s. PCIe transmit was approximately 2.9-3.3 GB/s, SM utilization was
+98-99%, and GPU power was only approximately 158-159 W at full reported clocks.
+The receive rate is consistent with full-cache-scale host-to-GPU traffic per
+token. Consequently, the current pinned-host path must not be described as a
+purely CPU-computed attention path with only a small result crossing to CUDA.
+The subsequent Nsight Systems trace resolved the ambiguity in favor of explicit
+scheduler copies. Each measured 32K decode token issued 32 host-to-device
+copies of 35,094,528 bytes: one complete K or V tensor for each of 16 attention
+layers, or 1,123,024,896 bytes per token before smaller transfers. It then
+launched one CUDA FlashAttention kernel per attention layer. The 64K PCIe rate
+is therefore explained by copying the complete Q8 attention cache every token,
+not by CPU FlashAttention scanning the history or a CUDA kernel directly reading
+mapped host memory.
+
+A matched unpinned trace produced the same copy sizes and counts and the same
+CUDA FlashAttention launch count. Pinned allocation therefore did not change
+backend placement. It reduced the average duration of the dominant 35,094,528-
+byte copy from 1,698.773 microseconds to 624.707 microseconds, increasing its
+effective transfer rate from 20.0 to 56.0 GB/s in the profiler. Experiment 001
+accelerates the existing scheduler-copy path; it did not create that path.
 
 The sharp degradation from excessive CPU threads indicates that synchronization,
 shared-cache pressure, heterogeneous-core scheduling, or memory-bandwidth
@@ -386,7 +410,35 @@ The remaining task is to count graph splits and transferred bytes after the
 change, then determine which boundaries are intrinsic to CPU attention KV and
 which can still be removed or overlapped.
 
-### H2: Q8 CPU FlashAttention partitioning is suboptimal for three P-cores
+### H2: full-cache scheduler copies dominate long-context Q8 offload
+
+The 32K trace observed 2,048 identical 35,094,528-byte host-to-device copies,
+which is exactly 32 tensors times 64 measured tokens. Eliminating, overlapping,
+or reducing these full-cache copies has higher priority than optimizing the CPU
+FlashAttention loop. Software prefetch in that CPU loop cannot affect the
+currently selected CUDA-attention path.
+
+The next implementation investigation should focus on whether the scheduler can
+operate on bounded context tiles, pipeline transfers with CUDA attention, or
+retain a deliberately sized GPU-side cache window without restoring full GPU
+KV residency.
+
+### H2b: Q8 CPU FlashAttention partitioning may matter only for a forced CPU-attention path
+
+A guarded placement experiment forced standard Q8 FlashAttention onto CPU only
+for single-token decode while retaining CUDA attention for multi-token prefill.
+It eliminated the 32K decode-time 35,094,528-byte K/V copies, but reached only
+`18.38` t/s at 4K and `3.34` t/s at 32K with all eight P-cores. The corresponding
+CUDA-copy path reached approximately `43` t/s at 4K and `21.91` t/s in the
+matched 32K memory run. CUDA peak allocation was identical at 32K because the
+scheduler reserved the same buffers for both graph shapes. The implementation
+was reverted.
+
+This rejects unoptimized CPU FlashAttention as a direct substitute for the
+current CUDA-copy path. CPU kernel changes such as prefetching cannot be treated
+as small placement fixes: they would need to recover roughly 6.6x at 32K before
+matching the existing path, as well as provide a mechanism that reduces the
+scheduler's reserved CUDA buffers.
 
 The rejected broad split-K switch does not eliminate more targeted scheduling
 improvements. Context-depth-aware tiles, static work assignment, or avoiding
@@ -395,6 +447,13 @@ overhead of generic split-K.
 
 Any new partitioning experiment must explain why it differs from the neutral
 split-K attempt and must test both 4K and long context.
+
+The later 64K thread sweep produced `15.00` to `15.04` t/s across one through
+eight P-core threads. Worker-only strict affinity also matched whole-process
+pinning at `15.03` t/s. Ordinary thread-count and affinity tuning therefore
+cannot recover the long-context loss. A future partitioning change must alter
+how context tiles are exposed to workers or reduce synchronization; merely
+requesting more CPU threads is not sufficient.
 
 The implementation process must remain Bee-first: derive and measure a Bee
 candidate without consulting another fork's source, and compare externally only
@@ -434,10 +493,38 @@ mixed K/V pairs should be evaluated with quality measurements, prefill, decode,
 and VRAM. Q8 remains the baseline until a lower-width candidate meets an
 explicit quality criterion.
 
+The no-MTP 64K sweep strengthened this hypothesis: homogeneous Q6_0, Q5_0, and
+Q4_0 CPU KV reached `16.23`, `17.85`, and `20.71` t/s respectively, versus
+`15.03` t/s for Q8_0. Q6_1 reached `16.09` t/s in the shorter screening
+protocol. This confirms that long-cache byte traffic is material, but the
+nonlinear format ordering shows that kernel implementation and fixed costs also
+matter. No lower-width format is approved until matched KLD/perplexity data is
+recorded.
+
+### H7: the remaining Q8 CPU-offload cost is predictably context-linear
+
+No-MTP Q8 CPU KV measured `49.64` t/s at depth 128, `23.97` t/s at 30K, and
+`15.03` t/s at 64K. The implied incremental latency is approximately `0.726`
+microseconds per cached token, consistent with the earlier 4K-to-16K estimate.
+This makes the current long-context loss predictable and supplies a direct
+metric for future changes: a useful optimization must reduce the slope, not
+only the fixed small-context intercept.
+
+All-GPU measurements are retained only as comparison ceilings. Q8 GPU KV
+reached `44.06` t/s at 30K and did not fit at 64K; narrower GPU formats fit at
+64K and reached `32.22` to `37.10` t/s. Those results quantify the placement
+gap but do not change the objective of accelerating CPU-resident KV.
+
 ## Benchmark protocol for every code change
 
 Use clean baseline and candidate processes. Do not compare a warm process with a
 cold process or change affinity between runs.
+
+Any run with potentially long or uncertain preparation or execution time must
+expose progress. Add `--progress` to such `llama-bench` launches and preserve it
+in the recorded command. If another tool has no native progress output,
+document an external progress signal before starting it; do not launch a run
+whose only observable states are running and finished.
 
 Minimum throughput suite:
 

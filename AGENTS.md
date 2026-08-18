@@ -192,6 +192,13 @@ CPU-resident KV-cache investigation.
 - Run correctness/regression coverage proportional to the change. Cache-format
   quality comparisons require matching `llama-perplexity` `-b` and `-ub`
   values for baseline and candidate.
+- Every command that may have a long or uncertain runtime must expose progress.
+  Use the tool's native progress option when available (`llama-bench
+  --progress`, for example); otherwise launch it with a documented external
+  progress mechanism that can be inspected without restarting or attaching a
+  debugger. State the progress mechanism in the launch update and preserve it
+  in the recorded command. Do not start an unbounded or duration-uncertain run
+  whose only observable states are running and finished.
 - Every experiment entry must state its base and candidate commit IDs, exact
   commands or command template, hardware, model path, measurements, resource
   tradeoffs, and disposition: retained, revised, neutral, or reverted.

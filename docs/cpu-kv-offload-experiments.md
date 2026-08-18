@@ -237,3 +237,308 @@ throughput gain without an alternative that preserves performance.
   silently changed.
 - Full generation-output equivalence and MTP correctness still require explicit
   regression coverage before this becomes a supported CLI/INI policy.
+
+## Characterization 003: no-MTP context scaling and 64K cache-width sweep
+
+Status: characterization only; no implementation change. CPU KV offload remains
+the target. GPU-KV measurements below are comparison baselines, not the proposed
+solution.
+
+### Configuration
+
+- Source implementation: `339c275c0` (`kv-cache: decouple recurrent state
+  offload`); worktree HEAD was `6d156a059`, whose later changes are documentation
+  only.
+- Model and hardware: the baseline Qwen3.5 27B model, Core Ultra 9 285K, and RTX
+  5070 Ti recorded at the top of this document.
+- No speculative decoding or multimodal projector.
+- Q8 CPU-KV scaling used pinned host allocation and GPU recurrent state:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+taskset -c 0-2 build-cuda-all/bin/llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 0 -n 64 -d DEPTH -r 3 -t 3 --poll 100 \
+  -b 1024 -ub 512 -nkvo 1 -fa on -ctk TYPE -ctv TYPE \
+  -ngl 999 -sm none
+```
+
+The 128-token Q8 result used five repetitions. The homogeneous Q6_0, Q5_0,
+and Q4_0 CPU results used the full command above. The Q6_1 CPU result was a
+screening run with `-n 32 -r 2` and is marked accordingly. GPU comparison runs
+used the same command with both experiment environment variables removed and
+`-nkvo 0`.
+
+### Context scaling with Q8 CPU KV
+
+| Populated depth | Decode throughput | Time per token |
+| ---: | ---: | ---: |
+| 128 | 49.64 +/- 0.13 t/s | 20.14 ms |
+| 30,000 | 23.97 +/- 0.06 t/s | 41.72 ms |
+| 64,000 | 15.03 +/- 0.02 t/s | 66.53 ms |
+
+The additional latency is approximately 0.726 microseconds per cached token
+over the 128-to-64K interval. This agrees with the earlier 4K-to-16K estimate
+of approximately 0.735 microseconds and establishes a stable context-linear
+cost in the current CPU-offload path.
+
+### 64K CPU thread and affinity sweep
+
+The coarse sweep used `-n 32 -r 2`, batch 1024, ubatch 512, CPUs 0-7, and one
+through eight decode threads. It produced:
+
+| Threads | Decode throughput |
+| ---: | ---: |
+| 1 | 15.00 +/- 0.05 t/s |
+| 2 | 15.03 +/- 0.02 t/s |
+| 3 | 15.02 +/- 0.02 t/s |
+| 4 | 15.03 +/- 0.02 t/s |
+| 5 | 15.02 +/- 0.03 t/s |
+| 6 | 15.04 +/- 0.03 t/s |
+| 7 | 15.01 +/- 0.02 t/s |
+| 8 | 14.96 +/- 0.03 t/s |
+
+A full `-n 64 -r 3` run with three workers strictly pinned by `-C 0x7
+--cpu-strict 1`, while leaving the rest of the process unrestricted, also
+produced `15.03 +/- 0.02` t/s. Whole-process pinning and worker-only affinity
+were therefore equivalent. Three P-core decode threads remain the general
+configuration; increasing the thread count is not a 64K optimization.
+
+### 64K CPU cache-width sweep
+
+| CPU-resident K/V format | Decode throughput | Change from CPU Q8 |
+| --- | ---: | ---: |
+| Q8_0 / Q8_0 | 15.03 +/- 0.02 t/s | baseline |
+| Q6_1 / Q6_1 | 16.09 +/- 0.06 t/s | +7.1% (screening protocol) |
+| Q6_0 / Q6_0 | 16.23 +/- 0.02 t/s | +8.0% |
+| Q5_0 / Q5_0 | 17.85 +/- 0.03 t/s | +18.8% |
+| Q4_0 / Q4_0 | 20.71 +/- 0.04 t/s | +37.8% |
+
+Lower-width CPU KV materially improves 64K decode, confirming that bytes read
+from the long cache are a major part of the remaining cost. Throughput does not
+scale directly with nominal bit width, so fixed model execution, format-specific
+kernels, work partitioning, and backend boundaries remain material. These are
+performance results only: no local evaluation corpus or persisted Q8 KLD
+baseline was available, so none of the lower-width formats is quality-approved.
+
+### 64K PCIe and GPU utilization observation
+
+A generation-aligned diagnostic extended the Q8 CPU-KV test to 384 generated
+tokens with one repetition and `--no-warmup`, then sampled `nvidia-smi dmon
+-s putc -d 1` during the generation interval. Decode remained `15.01` t/s.
+During active generation, representative counters were:
+
+- PCIe receive: approximately 34-38 GB/s, usually 36-38 GB/s.
+- PCIe transmit: approximately 2.9-3.3 GB/s.
+- SM utilization: 98-99%.
+- GPU memory utilization counter: approximately 44-45%.
+- GPU power: approximately 158-159 W at a 2827 MHz reported graphics clock.
+
+The host-to-GPU traffic rate is of the same order as reading the complete 64K
+Q8 attention cache once per generated token at 15 t/s. This rules out a model
+where CPU attention consumes the long cache and returns only a small attention
+result without substantial PCIe traffic. The operation-level trace below later
+identified scheduler-inserted copies as the mechanism.
+
+The link is heavily used but does not reach its Gen5 x16 theoretical payload
+rate. The practical bottleneck is therefore best described as effective
+host-to-GPU cache-delivery throughput plus the access pattern, transaction
+efficiency, and synchronization around it, rather than proven saturation of
+the physical PCIe link. The low power at high SM utilization is consistent
+with GPU warps waiting on host-memory data instead of sustaining dense compute.
+
+### 32K Nsight Systems trace
+
+Nsight Systems 2026.1.3 traced an unchanged build of implementation commit
+`339c275c0`. CPU sampling and context-switch tracing were disabled to reduce
+measurement overhead; CUDA, NVTX, and OS runtime APIs were enabled, with CUDA
+graphs recorded at graph granularity. The command was:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --cuda-graph-trace=graph --output=q8-cpu-kv-32k \
+  taskset -c 0-2 build-cuda-all/bin/llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 0 -n 64 -d 32000 -r 1 -t 3 --poll 100 \
+  -b 1024 -ub 512 -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  -ngl 999 -sm none
+```
+
+The profiled run reached `22.81` t/s. The trace recorded:
+
+- 1,008 CUDA `flash_attn_ext_f16` launches, exactly 16 attention layers times
+  63 measured decode transitions.
+- 2,048 host-to-device copies of exactly 35,094,528 bytes, exactly 32 K/V
+  tensors times 64 measured tokens.
+- 1,123,024,896 bytes of full-cache K/V transfer per token at 32K, excluding
+  smaller graph-boundary transfers.
+- 123.053 GB total host-to-device traffic and 4.456 GB device-to-host traffic
+  across initialization, warmup, cache population, and measured decode.
+- 3.256 seconds of aggregate CUDA FlashAttention kernel time in the complete
+  trace. Median FlashAttention kernel duration was 2.799 ms.
+- 10,100 `cudaMemcpyAsync` calls and 23,771 `cudaStreamSynchronize` calls over
+  the complete process. These whole-process API totals include initialization
+  and cache population and must not be divided directly by 64 decode tokens.
+
+This establishes that persistent KV ownership is on the CPU, but active
+attention is GPU-computed after full K/V history copies. CPU-loop prefetching is
+therefore not relevant to the measured serving path. The primary optimization
+target is the copy extent and scheduling between host KV storage and CUDA
+attention.
+
+A second trace repeated the command with `GGML_KV_CPU_PINNED` explicitly unset
+and all other settings unchanged. It reached `12.53` t/s under Nsight versus
+`22.81` t/s for pinned allocation. Placement and traffic were identical:
+
+- Both traces issued 2,048 copies of 35,094,528 bytes and 5,811 total
+  host-to-device copies.
+- Both transferred 123.053 GB host-to-device over the complete process.
+- Both launched 1,008 CUDA FlashAttention kernels.
+- The dominant 35,094,528-byte copy averaged 1,698.773 microseconds unpinned
+  versus 624.707 microseconds pinned, corresponding to effective rates of 20.0
+  and 56.0 GB/s inside the profiler.
+- Aggregate host-to-device copy time was 5.925 seconds unpinned versus 2.668
+  seconds pinned. Aggregate CUDA FlashAttention time was nearly unchanged at
+  3.216 versus 3.256 seconds.
+
+This confirms that Experiment 001 did not move attention work from CPU to GPU.
+It accelerated an otherwise identical full-cache scheduler-copy path.
+
+### GPU-KV comparison baselines
+
+These measurements bound the attention cost when KV is not CPU-offloaded. They
+do not change the branch objective.
+
+| Depth and GPU-resident K/V | Decode throughput | Fit result |
+| --- | ---: | --- |
+| 128, Q8_0 / Q8_0 | 50.83 +/- 0.15 t/s | fit |
+| 30,000, Q8_0 / Q8_0 | 44.06 +/- 0.12 t/s | fit |
+| 32,000, Q8_0 / Q8_0 | 43.62 +/- 0.15 t/s | fit |
+| 64,000, Q8_0 / Q8_0 | not measured | context allocation failed |
+| 64,000, Q6_1 / Q6_1 | 34.41 +/- 0.10 t/s | fit |
+| 64,000, Q6_0 / Q6_0 | 32.22 +/- 0.08 t/s | fit |
+| 64,000, Q5_0 / Q5_0 | 33.22 +/- 0.08 t/s | fit |
+| 64,000, Q4_0 / Q4_0 | 37.10 +/- 0.12 t/s | fit |
+
+The 64K Q8 GPU context failed with both the benchmark's default batch 2048 and
+the server-matched batch 1024, each with ubatch 512. The successful lower-width
+GPU rows serve only as a hardware ceiling and format-kernel comparison. They do
+not include server, multimodal, MTP, or CUDA-graph memory overhead.
+
+### Disposition
+
+- Retain three P-core decode threads; thread-count retuning is exhausted for
+  this 64K workload.
+- Continue optimizing CPU-resident KV. Do not substitute the GPU comparison
+  configurations for the CPU-offload objective.
+- Treat reduced cache width as a valid CPU performance lever only after matched
+  KLD/perplexity validation.
+- Use the 32K trace as the Q8 CPU-offload baseline: prioritize reducing or
+  overlapping the 32 full-cache host-to-device copies per token before changing
+  CPU attention kernels.
+
+## Experiment 004: force single-token standard attention onto CPU
+
+Status: rejected and reverted.
+
+### Hypothesis and implementation
+
+The 32K trace showed that host-resident KV was copied in full to CUDA for every
+decode token. A narrow placement override tested whether executing attention on
+CPU could replace those context-sized copies with only the small query and
+attention-output boundary transfers.
+
+When `GGML_CPU_KV_ATTENTION=1`, the candidate assigned the
+`GGML_OP_FLASH_ATTN_EXT` result to the CPU backend only when all of the following
+were true:
+
+- `--no-kv-offload` was active;
+- the query contained one token per stream;
+- the cache was standard rather than KVarN; and
+- no KV tail was active.
+
+The single-token condition was added after an initial whole-path prototype made
+32K depth preparation take longer than eight minutes. The phase-aware revision
+kept multi-token prefill and depth population on CUDA while forcing only decode
+attention onto CPU. Recurrent R/S state remained on GPU through
+`GGML_RECURRENT_STATE_OFFLOAD=1`; model weights remained GPU-resident. The
+candidate changed no cache representation, quantization, attention arithmetic,
+or MTP behavior.
+
+The source base and reported build commit were `6d156a059`; the candidate was
+an uncommitted diff to `src/llama-graph.cpp`, rebuilt with ccache in the existing
+Release CUDA build. The implementation was removed after measurement. The
+experiment record is retained in the following documentation commit.
+
+### Commands and progress reporting
+
+All duration-uncertain runs used `llama-bench --progress`. The common candidate
+environment was:
+
+```bash
+GGML_KV_CPU_PINNED=1 \
+GGML_RECURRENT_STATE_OFFLOAD=1 \
+GGML_CPU_KV_ATTENTION=1
+```
+
+Decode used all eight P-cores because genuine CPU FlashAttention, unlike the
+CUDA-copy baseline, benefited from the additional workers:
+
+```bash
+taskset -c 0-7 build-cuda-all/bin/llama-bench --progress \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 0 -n TOKENS -d DEPTH -r REPS -t 8 --poll 100 \
+  -b 1024 -ub 512 -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  -ngl 999 -sm none
+```
+
+The matched prefill pair used `-p 512 -n 0 -d 4096 -r 3`. Memory accounting
+used `--kv-memory -o json -p 0 -n 4 -d 32000 -r 1`. The baseline explicitly
+removed `GGML_CPU_KV_ATTENTION` and otherwise used identical settings.
+
+### Results
+
+| Test | CUDA-copy baseline | Forced CPU decode attention | Result |
+| --- | ---: | ---: | ---: |
+| Prefill, 512 tokens at depth 4096 | 1777.07 +/- 22.39 t/s | 1775.73 +/- 23.06 t/s | -0.1% |
+| Decode, 32 tokens at depth 4096 | approximately 43 t/s from Experiment 002 | 18.38 +/- 0.13 t/s | approximately -57% |
+| Decode, 16 tokens at depth 32000 | not rerun with 16-token protocol | 3.34 +/- 0.02 t/s | screening |
+| Matched memory run, 4 tokens at depth 32000 | 21.91 t/s | 3.34 t/s | -84.7% |
+| CUDA peak used, depth 32000 | 14,619,181,056 B | 14,619,181,056 B | unchanged |
+| CUDA context buffers, depth 32000 | 1,279,918,080 B | 1,279,918,080 B | unchanged |
+| CUDA compute buffers, depth 32000 | 701,272,096 B | 701,272,096 B | unchanged |
+
+Three-thread CPU attention reached `16.07` t/s in an eight-token 4K screening
+run. Eight P-cores improved that to `18.22` t/s in the same short protocol,
+which motivated the eight-core measurements above but did not make the path
+competitive.
+
+### Placement trace
+
+Nsight Systems 2026.1.3 traced `-n 4 -d 32000 -r 1 -t 8` with native benchmark
+progress enabled. The report was generated as `cpu-attn-32k.nsys-rep`.
+
+- No 35,094,528-byte host-to-device copies occurred. The baseline issues 32 of
+  these full-cache copies per decode token.
+- The trace contained 1,008 CUDA FlashAttention launches, attributable to the
+  63 depth-population microbatches times 16 attention layers. Decode attention
+  itself was therefore successfully placed on CPU.
+- Whole-process host-to-device traffic was 51.150 GB across 3,386 copies,
+  primarily model initialization and CUDA depth population; it is not a
+  decode-only traffic total.
+
+The trace proves that the intended copy elimination worked. Poor throughput was
+therefore caused by the current CPU Q8 FlashAttention path, not a failure to
+change backend placement.
+
+### Disposition
+
+- Revert the placement override. It is substantially slower at both 4K and 32K.
+- Do not pursue software prefetch as an easy standalone fix. Matching the
+  existing 32K path would require approximately a 6.6x CPU-attention speedup.
+- Do not claim a VRAM benefit: the scheduler reserved identical CUDA context and
+  compute buffers in the matched memory runs.
+- Preserve CUDA prefill and GPU recurrent state.
+- Continue investigating bounded CUDA staging, copy/compute overlap, or other
+  mechanisms that retain host KV ownership without full-cache resident VRAM.
