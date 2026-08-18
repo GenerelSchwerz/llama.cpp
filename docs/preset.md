@@ -56,6 +56,9 @@ overrides:
 ctx-size    = 32768
 batch-size  = 1024
 ubatch-size = 512
+# Optional: keep the target ubatch above while reducing only the speculative
+# draft context workspace.
+spec-draft-ubatch-size = 128
 
 [qwen-local]
 model        = D:/models/qwen.gguf

@@ -2398,6 +2398,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
     result.n_outputs_max = params.n_parallel;

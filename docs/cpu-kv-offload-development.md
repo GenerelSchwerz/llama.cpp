@@ -334,6 +334,23 @@ boundary buffers, excessive graph variants, or avoidable MTP state. Moving the
 recurrent state back to CPU is not an acceptable memory optimization unless a
 new mechanism avoids the throughput regression demonstrated by Experiment 002.
 
+At a 32K context with target batch/ubatch fixed at 1024/512, MTP-1 increased
+process VRAM by 664 MiB after initialization and 682 MiB after a live 32K
+request. Detailed startup logs attribute most of the fixed increase to three
+categories: 234.56 MiB of MTP-head model tensors, an additional 149.63 MiB
+target recurrent rollback snapshot, and a 276.27 MiB CUDA compute buffer owned
+by the MTP context. Only the last category is directly addressable by reducing
+the MTP context's ubatch.
+
+The MTP context currently inherits target `n_batch=1024` and `n_ubatch=512`
+because `common_speculative_init_result` derives both contexts from the same
+`common_params` and changes only the context type and speculative memory
+settings. Equal ubatch sizes are not required by the MTP algorithm. Draft prompt
+synchronization already chunks work according to `llama_n_ubatch(ctx_dft)`,
+while MTP-1 decode normally submits only one or two rows. A draft-specific
+ubatch should therefore trade prompt-synchronization call count for a smaller
+draft compute reservation without changing target prefill geometry.
+
 Every future serving measurement should distinguish:
 
 1. GPU memory immediately after model/context initialization.
@@ -422,6 +439,16 @@ The next implementation investigation should focus on whether the scheduler can
 operate on bounded context tiles, pipeline transfers with CUDA attention, or
 retain a deliberately sized GPU-side cache window without restoring full GPU
 KV residency.
+
+A direct mapped-host CUDA experiment then removed staging copies by allowing a
+discrete CUDA backend to consume `CUDA_Host` buffers when
+`GGML_KV_CUDA_ZERO_COPY=1`. Nsight confirmed that the full-cache decode copies
+disappeared, but CUDA FlashAttention averaged 8.016 ms per layer at 4K while
+reading host memory directly. Decode fell to `10.15` t/s, prefill fell to
+`462.01` t/s, and CUDA peak allocation remained effectively unchanged. The
+exception was reverted. Direct mapped-host access is therefore not a viable
+substitute for staging with the current CUDA kernel and scheduler reservation
+model.
 
 ### H2b: Q8 CPU FlashAttention partitioning may matter only for a forced CPU-attention path
 
@@ -581,6 +608,20 @@ source-only rebuilds should reuse this worktree's cache. The RTX 5070 Ti build
 uses CUDA architecture `120a` as selected by current CMake/CUDA handling.
 
 ## Proposed next sequence
+
+The matched 32K MTP depth sweep found initialized process VRAM of 14,290 MiB at
+depth 1, 14,590 MiB at depth 3, 14,888 MiB at depth 5, and 15,338 MiB at depth
+8. The fixed draft workspace did not grow. The target recurrent rollback buffer
+grew from 299.25 MiB to 598.50, 897.75, and 1,346.62 MiB. On the artificial
+repeated-token sample, depth 5 was fastest at 68.92 t/s; depth 8 fell to 61.60
+t/s as acceptance dropped to 0.632 while using another 450 MiB.
+
+An independent draft-context ubatch control is now a retained candidate.
+`--spec-draft-ubatch-size 128` leaves the target at ubatch 512 and, at MTP
+depth 5 and 32K, reduced live process VRAM from 14,922 to 14,834 MiB. Decode
+was unchanged within single-run noise (74.82 versus 74.67 t/s), while prompt
+throughput fell 0.9%. A draft ubatch of 32 saved 110 MiB but reduced prompt
+throughput 4.3%, so 128 is the current balanced recommendation.
 
 1. Run output-equivalence and recurrent-state regression tests for the separated
    placement policy.

@@ -543,6 +543,18 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 123);
     assert(params.speculative.draft_n_max_explicit);
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "64"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 64);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH", "32");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 32);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
     set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf"};

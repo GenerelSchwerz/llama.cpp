@@ -542,3 +542,301 @@ change backend placement.
 - Preserve CUDA prefill and GPU recurrent state.
 - Continue investigating bounded CUDA staging, copy/compute overlap, or other
   mechanisms that retain host KV ownership without full-cache resident VRAM.
+
+## Experiment 005: CUDA attention directly reading mapped host KV
+
+Status: rejected and reverted after the 4K gate.
+
+### Hypothesis and change
+
+Pinned host memory is mapped into CUDA's unified virtual address space. The
+candidate tested whether CUDA FlashAttention could read host-resident KV
+directly, eliminating scheduler staging copies without consuming VRAM for
+persistent KV or moving attention compute to CPU.
+
+Behind `GGML_KV_CUDA_ZERO_COPY=1`, the CUDA device buffer-support predicate
+temporarily accepted `CUDA_Host` buffers on a discrete GPU. The experiment was
+used only with `GGML_KV_CPU_PINNED=1`, standard Q8 K/V, GPU recurrent state,
+and `--no-kv-offload`. Default behavior remained unchanged. This was a broad
+screening hook rather than a retainable interface: it made all CUDA-host buffers
+eligible for direct CUDA access, not only KV tensors. A competitive result would
+have required replacement with a KV-specific mapped buffer type.
+
+The source base and reported build commit were `2e4ba398b`; the candidate was an
+uncommitted one-function diff in `ggml/src/ggml-cuda/ggml-cuda.cu`. It was built
+with ccache in the existing Release CUDA build and removed after the 4K gate.
+
+### Commands and progress
+
+All runs enabled native progress reporting. The common environment was:
+
+```bash
+GGML_KV_CPU_PINNED=1 \
+GGML_RECURRENT_STATE_OFFLOAD=1 \
+GGML_KV_CUDA_ZERO_COPY=1
+```
+
+Decode and prefill used the established model and:
+
+```bash
+taskset -c 0-2 build-cuda-all/bin/llama-bench --progress \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p PROMPT -n GENERATION -d DEPTH -r REPS -t 3 --poll 100 \
+  -b 1024 -ub 512 -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  -ngl 999 -sm none
+```
+
+The trace used `-p 0 -n 8 -d 4096 -r 1`. Prefill used
+`-p 512 -n 0 -d 4096 -r 1`. Memory accounting used
+`--kv-memory -o json -p 0 -n 4 -d 4096 -r 1`.
+
+### Results
+
+| Test | Staged pinned baseline | Direct mapped-host CUDA | Result |
+| --- | ---: | ---: | ---: |
+| Decode, depth 128 screening | 49.64 t/s | 27.57 t/s | -44.5% |
+| Decode, depth 4096 | approximately 43 t/s | 10.15 t/s | approximately -76% |
+| Prefill, 512 tokens at depth 4096 | 1777.07 t/s | 462.01 t/s | -74.0% |
+| CUDA peak used, depth 4096 | 14,499,643,392 B | 14,501,740,544 B | +2,097,152 B |
+| CUDA context buffers, depth 4096 | 308,412,416 B | 308,412,416 B | unchanged |
+| CUDA compute buffers, depth 4096 | 555,259,936 B | 555,257,888 B | effectively unchanged |
+
+The baseline throughput values are the retained Experiment 002 result and the
+matched prefill baseline from Experiment 004. The baseline and candidate CUDA
+memory values use the same 4K Q8 CPU-KV configuration and three decode threads;
+the 2 MiB peak difference is not a saving and is too small to be material.
+
+### Trace result
+
+Nsight Systems 2026.1.3 generated `zero-copy-4k.nsys-rep` with CUDA, NVTX, and
+OS runtime tracing, graph granularity, CPU sampling disabled, and benchmark
+progress enabled.
+
+- The trace contained no per-token full-cache K/V staging-copy pattern.
+- It recorded 128 CUDA FlashAttention launches for eight decode tokens across
+  16 attention layers.
+- CUDA FlashAttention consumed 1.026 seconds in aggregate, averaging 8.016 ms
+  per layer and reaching 14.107 ms at the maximum.
+- Whole-process host-to-device traffic was 13.505 GB across 850 copies. Those
+  copies were dominated by model initialization and graph preparation rather
+  than decode-time full-cache staging.
+
+This confirms that direct mapped access worked mechanically. Performance was
+lost inside CUDA attention reading host memory, rather than because the
+scheduler silently retained the original copy path.
+
+### Disposition
+
+- Revert the discrete-CUDA `CUDA_Host` support exception.
+- Do not build a KV-specific mapped buffer type for the current CUDA attention
+  kernel; the broad probe is already far below the 4K acceptance gate.
+- Do not run 32K or 64K: mapped-host attention already worsens sharply between
+  depth 128 and 4096, prefill regresses by 74%, and CUDA reservation does not
+  decrease.
+- Continue with bounded staged transfers and explicit copy/compute overlap,
+  where CUDA attention still consumes device-local tiles.
+
+## Characterization 006: 32K no-MTP versus MTP-1 VRAM baseline
+
+Status: characterization before draft-specific ubatch implementation.
+
+### Objective and configuration
+
+This sweep establishes how much VRAM MTP-1 adds before changing its context
+geometry. The target model remained fixed at batch 1024 and ubatch 512. Both
+configurations used standard pinned Q8 CPU KV, GPU recurrent state, three
+decode threads on P-cores 0-2, CUDA FlashAttention, all model layers on GPU,
+one slot, and a 32,768-token context.
+
+The no-MTP controlled benchmark used:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+taskset -c 0-2 build-cuda-all/bin/llama-bench --progress --kv-memory -o json \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 0 -n 16 -d 32000 -r 2 -t 3 --poll 100 \
+  -b 1024 -ub 512 -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  -ngl 999 -sm none
+```
+
+Matched server runs used the same target settings and `--parallel 1
+--cache-ram 0 --metrics`. The MTP variant added:
+
+```bash
+--spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-ngl all \
+--cache-type-k-draft q4_0 --cache-type-v-draft q4_0
+```
+
+Each server received an explicit 32,000-token array containing token ID 100 and
+generated 16 greedy tokens. Server logs provided native prompt progress. The
+repetitive synthetic prompt yielded perfect observed MTP acceptance and is not
+a representative quality/workload benchmark.
+
+### Throughput and process VRAM
+
+| Measurement | No MTP | MTP-1 | Difference |
+| --- | ---: | ---: | ---: |
+| Controlled `llama-bench` decode | 22.95 +/- 0.25 t/s | not applicable | - |
+| Server prompt, 32,000 tokens | 1533.24 t/s | 1473.60 t/s | -3.9% |
+| Server decode, 16 tokens | 24.17 t/s | 38.55 t/s | +59.5% |
+| MTP draft acceptance | - | 7/7, 1.000 | synthetic maximum |
+| Process VRAM after initialization | 13,626 MiB | 14,290 MiB | +664 MiB |
+| Process VRAM after live 32K request | 13,642 MiB | 14,324 MiB | +682 MiB |
+
+The controlled no-MTP benchmark reported a synchronized CUDA peak of
+14,619,181,056 bytes, 701,272,096 bytes of CUDA compute buffers, and
+1,279,918,080 bytes of CUDA context buffers. These benchmark accounting values
+are not directly interchangeable with server `nvidia-smi` process VRAM; both
+are retained for their respective future comparisons.
+
+### Startup allocation breakdown
+
+Bounded ten-second server launches at verbosity 4 recorded:
+
+| Allocation | No MTP | MTP-1 | Difference |
+| --- | ---: | ---: | ---: |
+| CUDA model buffer | 12,879.47 MiB | 13,114.03 MiB | +234.56 MiB |
+| Target CUDA recurrent state | 149.62 MiB | 299.25 MiB | +149.63 MiB |
+| Target CUDA compute buffer | 342.27 MiB | 342.27 MiB | unchanged |
+| Target CUDA-host compute buffer | 52.28 MiB | 52.28 MiB | unchanged |
+| Target CUDA-host Q8 KV | 1,088.00 MiB | 1,088.00 MiB | unchanged |
+| MTP CUDA compute buffer | - | 276.27 MiB | +276.27 MiB |
+| MTP CUDA-host compute buffer | - | 52.28 MiB | host RAM |
+| MTP CUDA-host Q4 KV | - | 36.00 MiB | host RAM |
+
+The extra model buffer is the built-in MTP head, which the no-MTP load reports
+as unused. The larger target recurrent buffer is the rollback snapshot required
+by MTP-1. The 276.27 MiB draft CUDA compute buffer is the primary allocation a
+draft-specific ubatch can reduce. Consequently, draft ubatch tuning cannot
+remove the full 664-682 MiB MTP overhead by itself; its theoretical saving is
+bounded by that draft compute category plus small shape-dependent allocations.
+
+### Why draft and target ubatch were initially equal
+
+`common_speculative_init_result` converts the shared `common_params` into
+`llama_context_params`, sets `ctx_type=LLAMA_CONTEXT_TYPE_MTP`, disables draft
+recurrent snapshots, points `ctx_other` at the target, and creates the second
+context. It does not override `n_batch` or `n_ubatch`, so the MTP context
+inherits target 1024/512 by implementation convenience.
+
+This is not an algorithmic equality constraint. MTP prompt synchronization
+reads `llama_n_ubatch(ctx_dft)` and chunks rows to fit. MTP-1 decode uses only a
+small number of rows. A smaller draft ubatch should therefore reduce reserved
+draft graph workspace while increasing the number of calls needed to mirror a
+long prompt. The target context and its prefill batch remain unchanged.
+
+### Original next gate
+
+Add an experimental draft-context ubatch override without changing target
+1024/512. Sweep draft ubatch 256, 128, 64, and 32. For each value record startup
+allocation categories, initialized and live-32K process VRAM, 32K prompt speed,
+decode throughput, and draft acceptance. Reject any setting that materially
+reduces decode throughput or changes generated output under matched sampling.
+
+### MTP depth scaling at 32K
+
+Before adding the draft-specific ubatch control, the same server protocol was
+extended to draft maxima 3, 5, and 8. The target remained at batch 1024 and
+ubatch 512. Each run used a fresh server, the same explicit 32,000-token array
+of token ID 100, 16 greedy output tokens, and native five-second progress
+reporting. The only changed argument was `--spec-draft-n-max`:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --ctx-size 32768 --batch-size 1024 --ubatch-size 512 \
+  --threads 3 --threads-batch 24 \
+  --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+  --n-gpu-layers all --split-mode none --parallel 1 \
+  --no-kv-offload --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --spec-type draft-mtp --spec-draft-n-max DEPTH --spec-draft-ngl all \
+  --cache-type-k-draft q4_0 --cache-type-v-draft q4_0 \
+  --cache-ram 0 --metrics --host 127.0.0.1 --port PORT --log-verbosity 4
+
+jq -nc \
+  '{prompt:[range(0;32000)|100],n_predict:16,temperature:0,seed:1234,cache_prompt:false,stream:false}' | \
+curl -sS -o /dev/null -H 'Content-Type: application/json' \
+  --data-binary @- http://127.0.0.1:PORT/completion
+```
+
+Process VRAM was sampled with `nvidia-smi` after server initialization and
+again after the request completed. These are single runs intended to determine
+allocation scaling, not statistically stable throughput comparisons.
+
+| Draft maximum | Init VRAM | Live 32K VRAM | Target recurrent buffer | Prompt | Decode | Acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 14,290 MiB | 14,324 MiB | 299.25 MiB | 1473.60 t/s | 38.55 t/s | 7/7, 1.000 |
+| 3 | 14,590 MiB | 14,624 MiB | 598.50 MiB | 1470.27 t/s | 60.43 t/s | 11/11, 1.000 |
+| 5 | 14,888 MiB | 14,922 MiB | 897.75 MiB | 1468.25 t/s | 68.92 t/s | 12/12, 1.000 |
+| 8 | 15,338 MiB | 15,374 MiB | 1346.62 MiB | 1466.26 t/s | 61.60 t/s | 12/19, 0.632 |
+
+The MTP model buffer (13,114.03 MiB), draft CUDA compute buffer (276.27 MiB),
+draft CUDA-host Q4 KV (36.00 MiB), and target CUDA compute buffer (342.27 MiB)
+were invariant across depths 3, 5, and 8. Depth-dependent VRAM is dominated by
+the target recurrent rollback allocation. It grows by approximately 149.625
+MiB per additional rollback sequence: 299.25 MiB at depth 1, 598.50 MiB at
+depth 3, 897.75 MiB at depth 5, and 1346.62 MiB at depth 8. Consequently,
+increasing MTP depth from 1 to 8 costs about 1,048 MiB of process VRAM on this
+model and configuration.
+
+Depth 5 was the best decode result in this artificial high-predictability
+sample. Depth 8 consumed another 450 MiB relative to depth 5 while acceptance
+fell to 0.632 and decode throughput fell by 10.6%. This does not establish a
+production-optimal depth because the repeated-token prompt is unusually easy,
+but it does show that deeper MTP is not free and that its rollback state, rather
+than its draft workspace, is the principal depth-scaling VRAM cost.
+
+## Experiment 007: independent speculative draft ubatch
+
+Status: retained candidate.
+
+### Implementation
+
+Added `common_params_speculative_draft::n_ubatch`, defaulting to zero so
+existing behavior continues to inherit the target ubatch. The new
+`--spec-draft-ubatch-size N` option (aliases `--ubatch-size-draft` and `-ubd`,
+environment variable `LLAMA_ARG_SPEC_DRAFT_UBATCH`) overrides `n_ubatch` only
+when `common_base_params_to_speculative` creates parameters for the separate
+draft context. Target batch and ubatch are not modified. Negative values are
+rejected; zero preserves inheritance.
+
+The implementation is deliberately common to model-backed speculative modes
+and MTP rather than adding a second MTP-only initialization path. Parser tests
+cover CLI and environment-variable propagation.
+
+### Validation
+
+`build-cuda-all/bin/test-arg-parser` passed. The CUDA server and parser test
+targets compiled successfully. Server startup logs confirmed that target
+`n_ubatch` remained 512 while the MTP context reported each requested draft
+value.
+
+At MTP maximum depth 5 and 32K target context, an allocation-only sweep gave:
+
+| Draft ubatch | Init VRAM | Draft CUDA compute | Init saving vs 512 |
+| ---: | ---: | ---: | ---: |
+| 512 | 14,888 MiB | 276.27 MiB | - |
+| 256 | 14,832 MiB | 220.27 MiB | 56 MiB |
+| 128 | 14,804 MiB | 192.27 MiB | 84 MiB |
+| 64 | 14,790 MiB | 178.27 MiB | 98 MiB |
+| 32 | 14,782 MiB | 171.27 MiB | 106 MiB |
+
+The savings diminish below 128. Full matched runs therefore compared 512,
+128, and 32. Each used the Experiment 006 server command with MTP maximum 5,
+added `--spec-draft-ubatch-size UB`, and requested 64 greedy tokens after the
+same explicit 32,000-token prompt. Native server logs reported progress.
+
+| Draft ubatch | Init VRAM | Live 32K VRAM | Prompt | Decode | Acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 14,888 MiB | 14,922 MiB | 1468.09 t/s | 74.82 t/s | 51/55, 0.9273 |
+| 128 | 14,804 MiB | 14,834 MiB | 1454.97 t/s | 74.67 t/s | 51/55, 0.9273 |
+| 32 | 14,782 MiB | 14,812 MiB | 1404.62 t/s | 74.84 t/s | 51/55, 0.9273 |
+
+Draft ubatch 128 saved 88 MiB of live process VRAM, changed decode by -0.2%,
+and reduced prompt throughput by 0.9%. Draft ubatch 32 saved 110 MiB, left
+decode unchanged within single-run noise, and reduced prompt throughput by
+4.3%. Output-side draft counts and acceptance were identical in all three
+runs. Recommend 128 as the balanced setting for this hardware and workload;
+32 remains an explicit capacity-first option rather than a default.
