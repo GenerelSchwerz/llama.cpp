@@ -2575,6 +2575,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-cpu-pinned"},
+        {"--no-kv-cpu-pinned"},
+        string_format("route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory; "
+                      "only affects layers not offloaded to GPU, e.g. when combined with --no-kv-offload (default: %s)",
+                      params.kv_cpu_pinned ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_cpu_pinned = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
+    add_opt(common_arg(
+        {"--recurrent-state-offload"},
+        {"--no-recurrent-state-offload"},
+        string_format("for hybrid attention/recurrent models, keep the fixed recurrent (R/S) state GPU-resident "
+                      "even when --no-kv-offload moves attention KV to CPU (default: %s)",
+                      params.recurrent_state_offload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.recurrent_state_offload = value;
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

@@ -28,9 +28,8 @@ static bool ggml_is_power_of_2(int n) {
 namespace {
 
 static ggml_backend_buffer_type_t llama_kv_cache_cpu_buft(
-        const llama_model & model, uint32_t il) {
-    const char * pinned = std::getenv("GGML_KV_CPU_PINNED");
-    if (pinned != nullptr && std::strcmp(pinned, "1") == 0) {
+        const llama_model & model, uint32_t il, bool cpu_pinned) {
+    if (cpu_pinned) {
         ggml_backend_dev_t dev = model.dev_layer(il);
         if (dev != nullptr) {
             if (ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev)) {
@@ -390,7 +389,8 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_tokens_requested,
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
-                 uint32_t   tail_visibility_window) :
+                 uint32_t   tail_visibility_window,
+                     bool   cpu_pinned) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -536,7 +536,7 @@ llama_kv_cache::llama_kv_cache(
             } else if (offload) {
                 route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
-                route_buft = llama_kv_cache_cpu_buft(model, il);
+                route_buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
             }
             route_probe_specs.push_back({
                     il, route_buft, actual_type_k, actual_type_v,
@@ -866,7 +866,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il);
+        ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il, cpu_pinned);
 
         if (offload) {
             auto * dev = model.dev_layer(il);
