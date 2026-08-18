@@ -1,5 +1,9 @@
 # CPU KV-offload development journal
 
+The ranked memory backlog is maintained in
+[`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). Read it
+alongside this journal before starting a VRAM experiment.
+
 This document reconstructs the development process for the
 `exp/kv-cpu-offload` branch. It explains the goal, evidence, decisions,
 implementation hypotheses, and intended next steps. The companion
@@ -622,6 +626,16 @@ depth 5 and 32K, reduced live process VRAM from 14,922 to 14,834 MiB. Decode
 was unchanged within single-run noise (74.82 versus 74.67 t/s), while prompt
 throughput fell 0.9%. A draft ubatch of 32 saved 110 MiB but reduced prompt
 throughput 4.3%, so 128 is the current balanced recommendation.
+
+The non-MTP 90K-versus-240K Nsight allocation trace isolated context-scaled
+VRAM to the target scheduler's prompt graph. Model weights and the 149.62 MiB
+active recurrent state were constant, while CUDA compute grew from 707.27 to
+1,751.09 MiB. The exact 7,296-byte-per-cell GPU slope is 4,096 bytes of F16 K/V
+materialization inside prompt FlashAttention, 1,088-byte Q8 K staging,
+1,088-byte Q8 V staging, and a 1,024-byte F16 attention mask. A second
+1,024-byte-per-cell mask lives in pinned host compute memory. The best complete
+solution is fixed-window online-softmax KV streaming; the most isolated smaller
+candidate is replacing the explicit causal mask with compact position metadata.
 
 ### Follow-on branch: configurable MTP recurrent planes
 

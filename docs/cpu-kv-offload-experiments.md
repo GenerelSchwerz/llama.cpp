@@ -1,5 +1,9 @@
 # CPU KV-offload experiments
 
+Candidate VRAM reductions and their complexity ordering are maintained in
+[`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). This ledger
+remains the source of exact commands and measured acceptance or rejection.
+
 This document records changes made on the `exp/kv-cpu-offload` branch. Each
 accepted or rejected experiment should have its own commit so that its complete
 diff remains inspectable. Do not treat these measurements as portable benchmark
@@ -840,3 +844,118 @@ decode unchanged within single-run noise, and reduced prompt throughput by
 4.3%. Output-side draft counts and acceptance were identical in all three
 runs. Recommend 128 as the balanced setting for this hardware and workload;
 32 remains an explicit capacity-first option rather than a default.
+
+## Characterization 008: context-scaled non-MTP CUDA allocation
+
+Status: allocation trace; no candidate implementation yet.
+
+### Objective and protocol
+
+The user observed higher VRAM with a 240K configured context than with 90K
+despite CPU-resident KV. Nsight Systems 2026.1.3 captured bounded server startup
+and warmup at both sizes with no speculative implementation. Target batch 1024
+and ubatch 512 were unchanged. The captures used pinned Q8 CPU KV, GPU recurrent
+state, CUDA FlashAttention, all model layers on the GPU, and identical CPU
+placement:
+
+```bash
+nsys profile --force-overwrite=true --output=TRACE \
+  --trace=cuda,nvtx,osrt --sample=process-tree --backtrace=lbr \
+  --cuda-memory-usage=true --cudabacktrace=memory:0 \
+  timeout --signal=INT --kill-after=5s 15s env \
+    GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+    build-cuda-all/bin/llama-server \
+      --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+      --ctx-size CTX --batch-size 1024 --ubatch-size 512 \
+      --threads 3 --threads-batch 24 \
+      --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+      --n-gpu-layers all --main-gpu 0 --split-mode none --parallel 1 \
+      --no-kv-offload --flash-attn on \
+      --cache-type-k q8_0 --cache-type-v q8_0 \
+      --cache-ram 0 --metrics --host 127.0.0.1 --port PORT \
+      --log-verbosity 4
+```
+
+The comparable reports are:
+
+- `/tmp/beellama-nsys-ctx.VxAYMO/ctx90k-bt.nsys-rep`
+- `/tmp/beellama-nsys-ctx.VxAYMO/ctx240k.nsys-rep`
+
+The server self-reported build 11215 at commit `2e4ba398b`. A temporary
+allocator-logging build named graph-planner tensors after Nsight identified the
+single backing allocation. That diagnostic-only source change was reverted and
+the normal server rebuilt before recording this result.
+
+### Allocation comparison
+
+Requested contexts were padded to 90,112 and 240,128 cells, a difference of
+150,016 cells.
+
+| Allocation | 90K | 240K | Difference |
+| --- | ---: | ---: | ---: |
+| CUDA model buffer | 12,879.47 MiB | 12,879.47 MiB | unchanged |
+| CUDA recurrent state | 149.62 MiB | 149.62 MiB | unchanged |
+| CUDA compute buffer | 707.27 MiB | 1,751.09 MiB | +1,043.82 MiB |
+| CUDA-host Q8 KV | 2,992.00 MiB | 7,973.00 MiB | +4,981.00 MiB host RAM |
+| CUDA-host compute buffer | 108.28 MiB | 254.78 MiB | +146.50 MiB host RAM |
+| Graph nodes / splits | 3,847 / 34 | 3,847 / 34 | unchanged |
+
+Nsight recorded the CUDA compute reservation as one `cudaMalloc`, with the
+backtrace:
+
+```text
+ggml_backend_cuda_buffer_type_alloc_buffer
+ggml_gallocr_reserve_n_impl
+ggml_backend_sched_reserve
+llama_context::graph_reserve
+llama_context::sched_reserve
+```
+
+It is therefore a monolithic graph-planner buffer whose tensor extents grow;
+the growth is not additional graphs or a GPU-resident persistent KV cache.
+
+### Exact context-scaled CUDA composition
+
+Allocator planning and CUDA FlashAttention allocation code account for the
+GPU slope exactly:
+
+| Component | Bytes per context cell | 90K allocation | 240K allocation | 90K -> 240K growth |
+| --- | ---: | ---: | ---: | ---: |
+| F16 K/V materialization for prompt FlashAttention | 4,096 | 364.00 MiB context-scaled portion | 950.00 MiB context-scaled portion | 614,465,536 B |
+| Q8 K scheduler staging | 1,088 | 93.50 MiB | 249.16 MiB | 163,217,408 B |
+| Q8 V scheduler staging | 1,088 | 93.50 MiB | 249.16 MiB | 163,217,408 B |
+| GPU F16 attention mask for 512 prompt rows | 1,024 | 88.00 MiB | 234.50 MiB | 153,616,384 B |
+| **Total GPU slope** | **7,296** | - | - | **1,094,516,736 B (1,043.82 MiB)** |
+
+The CUDA-host compute slope is another 1,024 bytes per cell: the source F16
+attention mask has shape `[n_kv, 512]`. Its 153,616,384-byte growth exactly
+matches the 146.50 MiB host-compute difference.
+
+For the quantized K and V inputs, the prompt-processing FlashAttention route
+selects the tile/MMA path. `ggml_cuda_flash_attn_ext_get_alloc_size` therefore
+reserves complete F16 K and V materializations after the output tensor. The Q8
+cache views must first be copied from CUDA-host memory into separate device
+staging tensors. The planner reuses these allocations across attention layers,
+so the slope is one layer's working set rather than all 16 attention layers.
+
+### Reduction implications
+
+The largest individual target is full-context F16 materialization: eliminating
+it with a direct quantized multi-query prompt-attention kernel would save about
+950 MiB at 240K. Fixed-window, online-softmax attention would cap both that
+materialization and the 498 MiB combined Q8 K/V staging instead of scaling them
+with maximum context. This is the most complete solution but is a substantial
+kernel and scheduling change.
+
+The attention mask is the most isolated smaller target. A CUDA attention path
+that derives causal validity from compact query/KV positions rather than an
+explicit `[n_kv, 512]` F16 tensor would save approximately 234.5 MiB of GPU
+memory and 234.5 MiB of pinned host memory at 240K. The existing no-mask kernel
+mode is not by itself sufficient because causal/padding semantics still need to
+be represented explicitly.
+
+A decode-only scheduler shrink could release the prompt-sized reservation after
+prefill because single-token quantized attention uses a different, smaller
+route. It would reduce steady-state decode VRAM but not peak prefill VRAM and
+would require reallocation/graph recapture for later prompt ingestion. It is a
+secondary policy option, not a solution for fitting the initial 240K context.
