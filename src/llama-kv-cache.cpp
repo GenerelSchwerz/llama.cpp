@@ -27,6 +27,20 @@ static bool ggml_is_power_of_2(int n) {
 
 namespace {
 
+static ggml_backend_buffer_type_t llama_kv_cache_cpu_buft(
+        const llama_model & model, uint32_t il) {
+    const char * pinned = std::getenv("GGML_KV_CPU_PINNED");
+    if (pinned != nullptr && std::strcmp(pinned, "1") == 0) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev != nullptr) {
+            if (ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev)) {
+                return buft;
+            }
+        }
+    }
+    return ggml_backend_cpu_buffer_type();
+}
+
 using backend_kv_tail_attention_supported_t = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 
@@ -522,7 +536,7 @@ llama_kv_cache::llama_kv_cache(
             } else if (offload) {
                 route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
-                route_buft = ggml_backend_cpu_buffer_type();
+                route_buft = llama_kv_cache_cpu_buft(model, il);
             }
             route_probe_specs.push_back({
                     il, route_buft, actual_type_k, actual_type_v,
@@ -852,7 +866,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft = llama_kv_cache_cpu_buft(model, il);
 
         if (offload) {
             auto * dev = model.dev_layer(il);
