@@ -261,6 +261,35 @@ required before choosing depth 3 as the serving default. Prompt processing also
 varied materially across these runs and should be remeasured separately rather
 than attributed to MTP decode behavior.
 
+### 12. Hybrid memory placement was the dominant Bee bottleneck
+
+A closed-book review of BeeLlama's own hybrid-memory construction found that
+`--no-kv-offload` controlled two different resources through one
+`offload_kqv` boolean. It correctly placed the 16 full-attention layers' long
+Q8 K/V history in CPU RAM, but it also placed the fixed-size recurrent R/S
+state for the other 48 layers on CPU. Because the recurrent-layer weights stay
+on GPU, this introduced repeated backend boundaries unrelated to long-context
+KV capacity.
+
+Experiment 002 separates the policies in `llama_memory_hybrid`. With attention
+KV still pinned in CPU RAM and recurrent state returned to the GPU, decode rose
+from 20.59 to 43.10 t/s at depth 4096 and from 17.24 to 31.23 t/s at depth
+16384. Prefill rose from 1388.96 to 1788.16 t/s. The matched CUDA peak increased
+by 124.0 MiB in the no-MTP benchmark.
+
+This result changes the working theory: the largest observed loss was not the
+Q8 attention inner loop. It was an overly broad placement policy for a hybrid
+architecture. Two isolated Q8 kernel experiments—fused V dequantization and a
+vectorized two-pass softmax—were neutral and removed. Future kernel work must
+start from the decoupled-placement baseline rather than trying to recover graph
+boundary overhead inside the attention kernel.
+
+The implementation remains opt-in through
+`GGML_RECURRENT_STATE_OFFLOAD=1`. The environment switch is deliberately not a
+public CLI/INI promise yet. MTP creates recurrent rollback snapshots, so its
+additional GPU-state cost and correctness must be measured before choosing a
+serving default.
+
 ## Current understanding of the execution path
 
 With `--no-kv-offload`, the KV buffers and the graph section from KV store
@@ -287,16 +316,17 @@ contention can dominate nominal parallelism.
 
 The hypotheses below are ordered roughly by expected value and testability.
 
-### H1: Boundary transfers still dominate long-context decode
+### H1: Hybrid recurrent-state placement dominated avoidable boundaries
 
-Pinned host memory improves more at depth 16384 than at depth 4096. This suggests
-that transfers or memory registration/staging remain central. The next useful
-step is to identify the exact tensors crossing CPU/GPU boundaries per token and
-their sizes, then reduce copies, synchronization points, or pageable staging.
+Experiment 002 confirmed that boundary placement was central, but not solely at
+the attention KV interface. CPU placement of fixed recurrent state caused the
+48 recurrent layers to participate in CPU/GPU scheduling even though only 16
+layers own long attention KV. Decoupling those policies more than doubled 4K
+decode throughput.
 
-Evidence that would support H1: fewer transfer operations or bytes increases
-decode without materially changing CPU attention time. Evidence against it:
-attention kernel timing dominates and transfers are already overlapped or small.
+The remaining task is to count graph splits and transferred bytes after the
+change, then determine which boundaries are intrinsic to CPU attention KV and
+which can still be removed or overlapped.
 
 ### H2: Q8 CPU FlashAttention partitioning is suboptimal for three P-cores
 
@@ -308,11 +338,11 @@ overhead of generic split-K.
 Any new partitioning experiment must explain why it differs from the neutral
 split-K attempt and must test both 4K and long context.
 
-ik_llama's IQK FlashAttention implementation is now the primary reference for
-this hypothesis. Compare its Q8_0 single-query dispatch, work partitioning,
-temporary layout, and vectorized inner loops with BeeLlama's generic
-`ggml_compute_forward_flash_attn_ext_f16_one_chunk` path. Port the smallest
-separable mechanism first rather than importing the IQK type system.
+The implementation process must remain Bee-first: derive and measure a Bee
+candidate without consulting another fork's source, and compare externally only
+after the candidate is implemented and validated. The neutral fused-V and
+two-pass-softmax experiments show why profiling evidence is required before
+another Q8 kernel change.
 
 ### H3: Cache layout can improve sequential access and vectorization
 
@@ -407,23 +437,24 @@ uses CUDA architecture `120a` as selected by current CMake/CUDA handling.
 
 ## Proposed next sequence
 
-1. Add direct timing/instrumentation around CPU attention and scheduler boundary
-   transfers so optimization is based on time and bytes rather than inference.
-2. Measure pinned system-memory size and CUDA mapping overhead at 4K, 16K, and
+1. Run output-equivalence and recurrent-state regression tests for the separated
+   placement policy.
+2. Measure no-MTP and MTP depth-1 serving with realistic prompts, including
+   recurrent rollback VRAM, acceptance, prefill, decode, and total VRAM.
+3. Count graph splits and boundary-transfer bytes before and after recurrent
+   offload so the remaining CPU-attention boundary cost is explicit.
+4. Measure pinned system-memory size and CUDA mapping overhead at 4K, 16K, and
    the intended maximum serving context.
-3. Trace which CPU tensors cross to CUDA during one decode token and test whether
-   transfers can be reduced or safely overlapped.
-4. Diff ik_llama's IQK Q8_0 single-query FlashAttention path against BeeLlama's
-   generic quantized path and isolate its work partitioning and inner-loop
-   advantages.
-5. Prototype the smallest targeted Q8 decode kernel/partition change supported
-   by the timing data; do not import `q8_KV` while its Qwen3.5 layout assertion
-   remains unresolved.
-6. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
-7. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
+5. Prototype further Bee-derived Q8 scheduling or layout changes only when the
+   measurements identify a specific remaining bottleneck.
+6. Compare the validated Bee implementation with external implementations only
+   after the Bee candidate is complete; do not use external source to design the
+   candidate.
+7. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
+8. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
    and quality measurements.
-8. Replace the environment-only switch with a supported CLI/INI option only if
-   the allocation policy survives the full benchmark and resource suite.
+9. Replace the environment-only switches with supported CLI/INI policies only
+   if their allocation behavior survives the full benchmark and resource suite.
 
 ## Known non-goals
 

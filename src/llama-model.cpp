@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -2375,6 +2376,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter_recr);
                             res = new llama_memory_hybrid(*this, std::move(mem_attn), std::move(mem_recr));
                         } else {
+                            const char * recurrent_offload_env = std::getenv("GGML_RECURRENT_STATE_OFFLOAD");
+                            const bool offload_recr = cparams.offload_kqv ||
+                                    (recurrent_offload_env && std::strcmp(recurrent_offload_env, "1") == 0);
+
                             res = new llama_memory_hybrid(
                                 /* model             */ *this,
                                 /* attn_type_k       */ params.type_k,
@@ -2384,12 +2389,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* attn_n_pad        */ 1,
                                 /* attn_n_swa        */ hparams.n_swa,
                                 /* attn_swa_type     */ hparams.swa_type,
+                                /* offload_attn      */ cparams.offload_kqv,
                                 /* recurrent_type_k  */ GGML_TYPE_F32,
                                 /* recurrent_type_v  */ GGML_TYPE_F32,
                                 /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
+                                /* offload_recr      */ offload_recr,
                                 /* n_seq_max         */ cparams.n_seq_max,
                                 /* n_rs_seq          */ cparams.n_rs_seq,
-                                /* offload           */ cparams.offload_kqv,
                                 /* unified           */ cparams.kv_unified,
                                 /* filter_attn       */ std::move(filter_attn),
                                 /* filter_recr       */ std::move(filter_recr),
