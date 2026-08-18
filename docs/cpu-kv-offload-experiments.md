@@ -1044,3 +1044,113 @@ confirming the option reaches context creation through the normal
   split there is unstarted.
 - `llama-bench`'s new flags are process-wide (not swept per combination like
   `-nkvo`), matching how the documented benchmark protocol invokes them today.
+
+## Experiment 009: lossless compression of the Q8_0 transfer stream
+
+Status: rejected on measured entropy grounds. No implementation was written; the
+measurement is the deliverable, and it closes the direction.
+
+### Hypothesis
+
+Experiment 005 and the Nsight traces established that decode cost at long context
+is dominated by scheduler host-to-device copies of the complete Q8_0 K and V
+tensors, running at the PCIe hardware limit. With Q8_0 K/V fixed as the quality
+gate, the only remaining way to reduce that cost is to move fewer bytes for the
+same information. The hypothesis was that the Q8_0 stream carries enough
+redundancy for a GPU-decodable lossless codec to pay for itself.
+
+### Method
+
+Real cache contents were used rather than synthetic data. `llama-server` ran the
+established model with `-c 8192 -nkvo -fa on -ctk q8_0 -ctv q8_0
+--kv-cpu-pinned --recurrent-state-offload` and `--slot-save-path`. A 6,391-token
+prompt of ordinary English prose was evaluated and the populated slot was written
+out with `POST /slots/1?action=save`, producing 379,801,088 bytes for 6,398
+cells.
+
+Q8_0 regions were located by their structural signature: Q8_0 derives its block
+scale as `amax/127`, so every 32-value block must contain an element of magnitude
+exactly 127. Scanning all 34-byte phases found the attention-KV region starting
+at file offset 1,048,608 and covering approximately 212 MiB, consistent with the
+expected 16 layers x 2 tensors x 6,398 tokens x 1,088 bytes. Recurrent state and
+headers were excluded. Measurements below used 4,000 token rows (about 4.4 MiB)
+for the structured tests and 176,470 blocks (about 11.3 MiB of payload) for the
+entropy tests.
+
+### Results
+
+Payload statistics: standard deviation 55.0; 11.1% of values with magnitude below
+8, 22.6% below 16, 43.8% below 32. The distribution is close to Gaussian and
+occupies the full signed 8-bit range by construction.
+
+| Scheme | Entropy | Achievable ratio |
+| --- | ---: | ---: |
+| Order-0 entropy coding of the int8 payload | 7.685 bits | 1.041x |
+| Delta along the context dimension, then order-0 | 7.550 bits | 1.060x |
+| Delta along the channel dimension, then order-0 | 8.355 bits | 0.958x |
+| `zlib` level 9 on the raw stream | -- | 1.033x |
+| `lzma` preset 6 on the raw stream | -- | 1.028x |
+| FP16 block scales alone (5.9% of bytes) | 10.061 of 16 bits | 1.590x |
+
+Combining the best payload result with separately coded scales bounds a perfect
+adaptive coder at approximately **1.081x**, or an 8% byte reduction.
+
+### Disposition
+
+Rejected. The bound is an entropy limit assuming an ideal coder; a real
+GPU-decodable implementation would realise less while adding a decompression
+kernel, a host-side compression step on the write path, and a variable-length
+addressing scheme on top of the current fixed-stride cache layout. An 8% ceiling
+does not justify that.
+
+The underlying reason is structural and will not change with a better codec.
+Q8_0 normalises every 32-value block by its own maximum, which forces the full
+8-bit range in every block and leaves a near-Gaussian residual with a standard
+deviation of 55. That residual carries 7.685 bits of genuine entropy per stored
+byte. Q8_0 is already close to an optimal fixed-rate code for this data, so there
+is no payload redundancy for a lossless codec to remove. Delta coding along the
+context dimension recovers only 0.135 bits because per-block rescaling destroys
+the smoothness that would otherwise exist between neighbouring tokens.
+
+Do not revisit payload compression for any block-scaled `qN_0` cache format. The
+same normalisation argument applies to all of them.
+
+### The redundancy that does exist
+
+The measurement redirects rather than ends the byte-reduction effort. The Q8_0
+payload is incompressible, but the *transfer schedule* is massively redundant:
+the KV cache is append-only, so between two decode steps exactly one row of
+1,088 bytes per tensor changes, while the scheduler re-sends the entire tensor.
+At 32K that is 1,123,024,896 bytes sent per token to convey roughly 34,816 bytes
+of new information.
+
+Eliminating that redundancy is exactly lossless and needs no codec, but it
+requires the previously sent bytes to stay resident on the GPU, which is the
+VRAM cost that offload exists to avoid. It is therefore a tunable trade rather
+than a free win. Measured on the RTX 4070 with `Qwen3.8-27B-UD-IQ2_M.gguf`,
+`-ngl 99 -t 3 --poll 100 -fa on -ctk q8_0 -ctv q8_0 --recurrent-state-offload`,
+`-p 0 -n 32 -r 2`, three real P-cores via `taskset -c 0,2,4`:
+
+| Depth | Host KV (`-nkvo 1 --kv-cpu-pinned`) | GPU-resident KV | Change |
+| ---: | ---: | ---: | ---: |
+| 0 | 39.38 +/- 0.29 t/s | 39.95 +/- 0.32 t/s | +1.4% |
+| 4096 | 31.89 +/- 0.21 t/s | 39.02 +/- 0.21 t/s | +22.4% |
+| 16384 | 19.76 +/- 0.05 t/s | 36.13 +/- 0.17 t/s | +82.8% |
+
+Reported buffer sizes for the host-KV configuration were 8.50 MiB of
+`CUDA_Host` KV at depth 0, 144.50 MiB at 4096, 280.50 MiB at 8192, and 552.50
+MiB at 16384. The `CUDA0` compute buffer did not scale with depth in the same
+way, measuring 7.14, 505.00, 562.04, and 505.00 MiB respectively; the staging
+copies therefore reuse a small per-layer arena rather than reserving
+cache-sized space. A persistent GPU-side mirror is consequently **not** free in
+VRAM, and the 552.50 MiB at 16K is genuine additional device memory.
+
+Since the whole 16K Q8_0 cache is only 552.50 MiB and buys 82.8%, the useful
+next step is a **tunable partial GPU KV window**: keep the newest N tokens
+device-resident, stream only the older remainder, and merge the two partial
+attention results. FlashAttention decomposes exactly over the KV dimension via
+log-sum-exp rescaling, so the merge is lossless and preserves the Q8_0 quality
+gate. The fork already has a segmented merge primitive in
+`ggml_kv_tail_attention_merge_segmented` for KVarN tails, which is the closest
+existing reference. The dial degrades gracefully: N = 0 reproduces today's
+behaviour, N = n_ctx reproduces GPU-resident KV.
