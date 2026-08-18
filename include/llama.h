@@ -479,10 +479,6 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
-        bool kv_cpu_pinned;           // route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory
-                                       // (only affects layers not offloaded to GPU; speeds up CPU<->GPU KV transfers)
-        bool recurrent_state_offload; // for hybrid attention/recurrent models, allow the fixed recurrent (R/S) state to stay
-                                       // GPU-resident even when offload_kqv=false keeps attention KV on CPU
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -501,6 +497,16 @@ extern "C" {
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
         const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
+
+        // Appended at the end of the struct (rather than grouped with the other
+        // booleans above) to preserve the offset of every preexisting field for
+        // callers built against earlier BeeLlama.cpp releases.
+        bool kv_cpu_pinned;           // route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory
+                                       // (only affects layers not offloaded to GPU; speeds up CPU<->GPU KV transfers)
+                                       // on integrated GPUs the pinned buffer is host-visible to the GPU too, so this can
+                                       // let attention run on the GPU even with kv-offload disabled
+        bool recurrent_state_offload; // for hybrid attention/recurrent models, allow the fixed recurrent (R/S) state to stay
+                                       // GPU-resident even when offload_kqv=false keeps attention KV on CPU
     };
 
     struct llama_model_tensor_override {

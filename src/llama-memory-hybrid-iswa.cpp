@@ -27,7 +27,9 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
+                     bool   offload_attn,
+                     bool   cpu_pinned_attn,
+                     bool   offload_recr,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -46,7 +48,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_attn,
         swa_full,
         unified,
         kv_size,
@@ -67,13 +69,14 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         tail_tokens_requested,
         tail_tokens_swa_requested,
         tail_rollback_tokens,
-        tail_native_exact_swa
+        tail_native_exact_swa,
+        cpu_pinned_attn
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        offload_recr,
         rs_size,
         n_seq_max,
         n_rs_seq,

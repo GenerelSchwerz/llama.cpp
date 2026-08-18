@@ -4248,8 +4248,6 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
-        /*.kv_cpu_pinned               =*/ false,
-        /*.recurrent_state_offload     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4257,6 +4255,8 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
         /*.kv_tail_request             =*/ nullptr,
+        /*.kv_cpu_pinned               =*/ false,
+        /*.recurrent_state_offload     =*/ false,
     };
 
     return result;
