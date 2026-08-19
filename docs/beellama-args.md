@@ -226,6 +226,52 @@ replay cycles, and actual replay-batch tokens. These byte counters describe
 serialized payload size; use a backend profiler such as Nsight Systems for
 authoritative host-to-device and device-to-host transfer totals.
 
+## Phase-aware compute workspace
+
+Prompt processing and token generation need different graph-allocation
+geometries. The opt-in phase-aware policy retains only the active geometry and,
+for an integrated MTP context, lets the target and draft schedulers use the same
+physical backing because they execute sequentially.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--phase-aware-workspace`, `--no-phase-aware-workspace` | `LLAMA_ARG_PHASE_AWARE_WORKSPACE` | Disabled | Starts with a compact generation reservation, grows to the configured physical ubatch when a prompt batch requires it, and shrinks after returning to generation. The INI key is `phase-aware-workspace`. The negated form is useful when overriding a preset or environment value. |
+
+The generation bound is not assumed to be one token. The server reserves for
+`parallel * (1 + resolved speculative draft maximum)`, capped by `batch-size`;
+the derived MTP context uses the same bound. A batch larger than that bound is
+classified as prompt processing and receives the full target or draft
+`ubatch-size`. Later requests on the same live context regrow prompt backing and
+shrink it again after prefill.
+
+Target and MTP schedulers retain independent allocation plans. A generic GGML
+shared-backing group tracks the maximum current requirement for each exact
+backend buffer type, so heterogeneous and multi-backend layouts are not merged
+by name. Growth is immediate. Shrink is a group epoch completed only after
+every active member has published its new plan; this prevents speculative
+replay variants from causing target/draft reallocation ping-pong. Physical
+generation changes invalidate peer scheduler graph addresses, and the MTP
+handoffs synchronize before the next sequential owner uses the backing.
+
+This option changes transient compute allocation only. It does not unload model
+weights or the MTP head, move active recurrent state, reduce recurrent rollback
+planes, change KV representation, alter sampling, or reduce the prompt-phase
+workspace required at the configured context. Fit/no-allocation measurement
+continues to evaluate the full prompt geometry. The default-off path retains
+the existing full reservations.
+
+Per-request completion timings expose:
+
+- `workspace_target_reserves`, `workspace_target_grows`,
+  `workspace_target_shrinks`, and `workspace_target_reserve_ms`;
+- `workspace_draft_reserves`, `workspace_draft_grows`,
+  `workspace_draft_shrinks`, and `workspace_draft_reserve_ms`.
+
+The complete implementation history, exact 140K commands, clean-process memory
+measurements, fixed-seed hashes, Nsight transfer totals, and later-turn test are
+in
+[`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash

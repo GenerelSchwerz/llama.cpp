@@ -357,6 +357,15 @@ struct result_timings {
     uint64_t spec_replay_cycles = 0;
     uint64_t spec_replay_batch_tokens = 0;
 
+    uint64_t workspace_target_reserves = 0;
+    uint64_t workspace_target_grows = 0;
+    uint64_t workspace_target_shrinks = 0;
+    double workspace_target_reserve_ms = 0.0;
+    uint64_t workspace_draft_reserves = 0;
+    uint64_t workspace_draft_grows = 0;
+    uint64_t workspace_draft_shrinks = 0;
+    double workspace_draft_reserve_ms = 0.0;
+
     json to_json() const;
 };
 

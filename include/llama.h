@@ -508,6 +508,8 @@ extern "C" {
                                        // GPU-resident even when offload_kqv=false keeps attention KV on CPU
         uint32_t kv_gpu_layers;       // with offload_kqv=false, keep this many attention-KV layers device-resident anyway.
                                        // Trades device memory for host-to-device KV traffic; 0 keeps every layer on host.
+        bool phase_aware_workspace;   // resize compute schedulers between prompt processing and token generation.
+                                      // Fit/no-alloc contexts still measure the full prompt reservation.
     };
 
     struct llama_model_tensor_override {

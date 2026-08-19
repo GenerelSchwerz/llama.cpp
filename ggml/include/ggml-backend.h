@@ -357,6 +357,20 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Use caller-owned backing buffers shared by schedulers that are never
+    // executed concurrently. Each scheduler retains an independent graph
+    // allocation plan; the backing store tracks their maximum requirement.
+    // Must be called before the scheduler's first reserve operation.
+    GGML_API void                 ggml_backend_sched_set_shared_buffers(
+            ggml_backend_sched_t sched,
+            ggml_gallocr_shared_buffers_t shared);
+    GGML_API uint64_t             ggml_backend_sched_shared_buffers_generation(
+            ggml_backend_sched_t sched);
+    GGML_API uint64_t             ggml_backend_sched_shared_buffers_plan_generation(
+            ggml_backend_sched_t sched);
+    GGML_API void                 ggml_backend_sched_request_shared_buffer_shrink(
+            ggml_backend_sched_t sched);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

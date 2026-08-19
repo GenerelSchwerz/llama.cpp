@@ -53,7 +53,9 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(uint32_t n_tokens = 0);
+    llama_workspace_stats get_workspace_stats() const;
+    bool shares_workspace_with(const llama_context & other) const;
     void record_backend_private_workspace(ggml_cgraph * gf);
 
     void synchronize();
@@ -344,9 +346,20 @@ private:
 
     std::vector<swap_info> output_swaps;
 
+    // Declared before sched so the scheduler unregisters from the caller-owned
+    // shared backing store before the last shared_ptr can release it.
+    std::shared_ptr<ggml_gallocr_shared_buffers> sched_shared_buffers;
     ggml_backend_sched_ptr sched;
+    uint64_t sched_shared_generation = 0;
+    uint64_t sched_shared_plan_generation = 0;
 
     bool sched_need_reserve = true;
+    uint32_t sched_reserved_tokens = 0;
+
+    uint64_t workspace_reserve_count = 0;
+    uint64_t workspace_grow_count    = 0;
+    uint64_t workspace_shrink_count  = 0;
+    int64_t  workspace_reserve_us    = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
