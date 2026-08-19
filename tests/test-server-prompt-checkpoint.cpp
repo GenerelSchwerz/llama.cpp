@@ -16,6 +16,41 @@ static void speculative_rollback_checkpoint_boundary() {
     assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, reserve, reserve + 1));
     assert( server_speculative_rollback_requires_checkpoint(COMMON_CONTEXT_SEQ_RM_TYPE_RS, 0, 1));
 
+    // Four total recurrent planes expose three direct rollback positions.
+    constexpr uint32_t capped_horizon = 3;
+    {
+        const auto policy = server_speculative_checkpoint_policy_for(
+                COMMON_CONTEXT_SEQ_RM_TYPE_RS, capped_horizon,
+                /*actual_draft=*/ 3, /*rejected_suffix=*/ 3);
+        assert(!policy.capture);
+        assert(!policy.restore);
+        assert(!policy.replay);
+    }
+    for (const size_t rejected_suffix : {size_t(0), size_t(3)}) {
+        const auto policy = server_speculative_checkpoint_policy_for(
+                COMMON_CONTEXT_SEQ_RM_TYPE_RS, capped_horizon,
+                /*actual_draft=*/ 8, rejected_suffix);
+        assert(policy.capture);
+        assert(!policy.restore);
+        assert(!policy.replay);
+    }
+    {
+        const auto policy = server_speculative_checkpoint_policy_for(
+                COMMON_CONTEXT_SEQ_RM_TYPE_RS, capped_horizon,
+                /*actual_draft=*/ 8, /*rejected_suffix=*/ 4);
+        assert(policy.capture);
+        assert(policy.restore);
+        assert(policy.replay);
+    }
+    {
+        const auto policy = server_speculative_checkpoint_policy_for(
+                COMMON_CONTEXT_SEQ_RM_TYPE_FULL, 0,
+                /*actual_draft=*/ 8, /*rejected_suffix=*/ 0);
+        assert(policy.capture);
+        assert(!policy.restore);
+        assert(!policy.replay);
+    }
+
     assert(!server_prompt_reuse_requires_checkpoint_search(false, 0, 528));
     assert( server_prompt_reuse_requires_checkpoint_search(false, 512, 512));
     assert( server_prompt_reuse_requires_checkpoint_search(true, 0, 528));
@@ -28,6 +63,34 @@ static void speculative_rollback_checkpoint_boundary() {
     assert(server_prompt_checkpoint_boundary(795, 132, 128) == 640);
     assert(server_prompt_checkpoint_boundary(795,   4, 128) == 768);
     assert(server_prompt_checkpoint_boundary(3,     4, 128) == 0);
+}
+
+static void speculative_checkpoint_timing_json() {
+    result_timings timings;
+    timings.draft_n = 8;
+    timings.draft_n_accepted = 5;
+    timings.spec_checkpoint_captures = 3;
+    timings.spec_checkpoint_restores = 2;
+    timings.spec_checkpoint_capture_ms = 4.5;
+    timings.spec_checkpoint_restore_ms = 1.25;
+    timings.spec_checkpoint_target_bytes = 100;
+    timings.spec_checkpoint_draft_bytes = 20;
+    timings.spec_checkpoint_spec_bytes = 3;
+    timings.spec_checkpoint_peak_bytes = 123;
+    timings.spec_replay_cycles = 2;
+    timings.spec_replay_batch_tokens = 9;
+
+    const auto json = timings.to_json();
+    assert(json.at("spec_checkpoint_captures") == 3);
+    assert(json.at("spec_checkpoint_restores") == 2);
+    assert(json.at("spec_checkpoint_capture_ms") == 4.5);
+    assert(json.at("spec_checkpoint_restore_ms") == 1.25);
+    assert(json.at("spec_checkpoint_target_bytes") == 100);
+    assert(json.at("spec_checkpoint_draft_bytes") == 20);
+    assert(json.at("spec_checkpoint_spec_bytes") == 3);
+    assert(json.at("spec_checkpoint_peak_bytes") == 123);
+    assert(json.at("spec_replay_cycles") == 2);
+    assert(json.at("spec_replay_batch_tokens") == 9);
 }
 
 static server_prompt make_prompt(const llama_tokens & tokens) {
@@ -325,6 +388,7 @@ int main() {
     prompt_cache_load_target_success_draft_failure_is_atomic();
     restore_transaction_validation_failures_are_atomic();
     speculative_rollback_checkpoint_boundary();
+    speculative_checkpoint_timing_json();
     checkpoint_failed_target_save_cannot_reuse_stale_bytes();
     server_unsupported_removal_falls_back_to_full_reprocess();
     server_post_preflight_mutation_failure_clears_both_contexts();

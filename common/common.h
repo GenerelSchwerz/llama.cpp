@@ -394,6 +394,8 @@ struct common_params_speculative {
     // controller; the old fringe controller was coupled to the retired fork
     // verifier and is intentionally not part of the v0.4.0 API.
     bool draft_n_max_explicit = false;
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    bool mtp_rs_planes_explicit = false;
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min               = 0.05f;
     float   dm_profit_raise_margin      = 0.05f;
@@ -407,14 +409,30 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool is_mtp_rs_capped() const {
+        return mtp_rs_planes > 0 &&
+               int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
+    }
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(
+                types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        if (has_mtp && mtp_rs_planes > 0) {
+            return uint32_t(mtp_rs_planes - 1);
+        }
+
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
     }
 };
+
+// Validate options whose legality depends on the complete speculative-mode
+// selection. This is intentionally separate from individual argument handlers
+// so CLI, environment, and rendered INI options are order-independent.
+void common_validate_speculative_params(const common_params_speculative & params);
 
 // Resolve Bee's omitted DFlash draft maximum before target-context allocation.
 // Returns false when the draft GGUF metadata cannot be read or is invalid.

@@ -165,6 +165,14 @@ llama_memory_i::seq_rm_capability llama_memory_hybrid::get_seq_rm_capability() c
     return llama_memory_seq_rm_capability_all({ mem_attn.get(), mem_recr.get() });
 }
 
+bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
+    return mem_recr->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
+    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

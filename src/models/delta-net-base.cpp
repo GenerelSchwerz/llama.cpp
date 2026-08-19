@@ -3,6 +3,21 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
+extern "C" {
+GGML_API ggml_tensor * ggml_gated_delta_net_ext(
+        ggml_context * ctx,
+        ggml_tensor  * q,
+        ggml_tensor  * k,
+        ggml_tensor  * v,
+        ggml_tensor  * g,
+        ggml_tensor  * beta,
+        ggml_tensor  * state,
+        int64_t        K,
+        int32_t        trailing_snapshots,
+        int32_t        selected_token,
+        bool           reserve_input);
+}
+
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -500,10 +515,27 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+        const bool sparse = mctx_cur->has_sparse_snapshots();
+        const int32_t selected = mctx_cur->get_selected_snapshot_token();
+        const int64_t n_copies = sparse
+                ? (selected >= 0 ? 1 : K)
+                : K;
 
-        for (int64_t t = 1; t <= K; ++t) {
-            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
-            const int64_t s_slot = K - t;
+        for (int64_t t = 0; t < n_copies; ++t) {
+            int64_t s_idx;
+            int64_t s_slot;
+            if (sparse && selected >= 0) {
+                s_idx = selected + 1;
+                s_slot = 0;
+            } else if (sparse && t == K - 1) {
+                s_idx = 0;
+                s_slot = K - 1;
+            } else {
+                const int64_t K_write = sparse ? K - 1 : K;
+                s_idx = std::max<int64_t>(0,
+                        conv_input->ne[0] - conv_states->ne[0] - K_write + t + 1);
+                s_slot = K_write - 1 - t;
+            }
 
             ggml_tensor * conv_state_last =
                 ggml_view_3d(ctx0, conv_input,
@@ -562,9 +594,14 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
+    const bool sparse = mctx_cur->has_sparse_snapshots();
+    const int32_t selected = mctx_cur->get_selected_snapshot_token();
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = sparse
+            ? ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, K,
+                    selected >= 0 ? 0 : K - 1, selected, selected < 0)
+            : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -585,7 +622,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+    const int64_t n_written = sparse
+            ? (selected >= 0 ? 1 : K)
+            : std::min<int64_t>(n_seq_tokens, K);
 
     // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
     ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,

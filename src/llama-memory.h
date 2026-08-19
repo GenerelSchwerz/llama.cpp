@@ -146,6 +146,9 @@ struct llama_memory_i {
 
     virtual seq_rm_capability get_seq_rm_capability() const { return {}; }
 
+    virtual bool recurrent_sparse_snapshots_supported() const { return false; }
+    virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
+
     virtual bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,
             llama_pos & planned_p0, llama_pos & planned_p1) const {

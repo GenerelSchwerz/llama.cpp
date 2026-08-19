@@ -648,7 +648,7 @@ candidate is replacing the explicit causal mask with compact position metadata.
 
 ### Follow-on branch: configurable MTP recurrent planes
 
-The dedicated branch `exp/mtp-recurrent-plane-cap` will investigate a bounded,
+The dedicated branch `exp/mtp-recurrent-plane-cap` investigated a bounded,
 configurable pool of target recurrent-state rollback planes. It branches from
 the CPU KV-offload work because the motivating capacity problem is visible when
 CPU-resident Q8 KV leaves recurrent state on the GPU, but the implementation is
@@ -657,29 +657,67 @@ an MTP state-management change rather than partial KV placement.
 The current implementation reserves one committed recurrent state plus one
 state for every possible MTP position. Each additional state costs about
 149.625 MiB for the Qwen3.8 27B test model, producing allocations of 598.50 MiB
-at MTP depth 3, 897.75 MiB at depth 5, and 1,346.62 MiB at depth 8. Exact-seed
-traces show that a smaller retained set can cover most rollback boundaries and
-reconstruct an omitted boundary by restoring the nearest earlier retained
-state and replaying only the missing accepted recurrent transitions.
+at MTP depth 3, 897.75 MiB at depth 5, and 1,346.62 MiB at depth 8.
 
-The first candidate will add an opt-in MTP recurrent-plane limit. An unspecified
-limit must preserve the upstream allocation and behavior. The bounded mode
-must retain the committed state and the final state for the actual speculative
-run, use deterministic early-prefix intermediate retention initially, and
-report retained positions, recurrent allocation, replay cycles, and replayed
-tokens. Replay must remain within upstream task, sequence-removal, checkpoint,
-and sampler abstractions; it must not introduce fork-private verifier state.
-Bit-for-bit output equivalence at a fixed seed is required before performance
-claims are accepted.
+The first candidate used the existing consecutive rollback snapshots plus a
+target host checkpoint. Four total planes reduced the recurrent buffer to
+598.50 MiB at every tested depth, saving 299.25 MiB at MTP-5 and 748.12 MiB at
+MTP-8. It captured a checkpoint only when the actual draft exceeded the
+three-token direct horizon and restored/replayed only when the rejected suffix
+also exceeded it. Omitting the option preserved full-plane behavior.
 
-The initial comparison will use symmetric Q8_0/Q8_0 target and draft caches at
-MTP depths 3, 5, and 8. It will not test lower cache quants, asymmetric K/V
-pairs, or partial GPU KV offload. Measurements must include prefill, decode,
-initialized and live VRAM, recurrent-plane memory, replay work, and Nsight
-transfer behavior. The existing exact-seed traces suggest that a four-plane
-pool is a useful first candidate, but it is a hypothesis rather than a default:
-the short generation favored different intermediate positions from the long
-reasoning trace, so placement must not be specialized to one prompt.
+That compatibility-first design was rejected. The 128-token fixed-seed outputs
+matched at MTP depths 3, 5, and 8, but the 5,000-token MTP-8 orbital-sandbox
+comparison diverged at byte 1,337. Two clean full-plane controls matched each
+other, isolating the difference to capped replay. Replaying the accepted prefix
+uses a smaller target batch than original verification, so it does not recreate
+the original recurrent state bit-for-bit on CUDA. Preserving the first pass's
+sampled token was insufficient because subsequent logits still consumed the
+numerically different reconstructed state.
+
+The checkpoint cost was also material. In the long capped run, 132 captures and
+18 restores serialized 20.71 GB of target payload, used 2,888.89 ms capture and
+167.14 ms restore wall time, and added 20.64 GB D2H plus 10.82 GB H2D in Nsight.
+In the short test, four planes reduced MTP-5 decode by 34.1% and MTP-8 by 38.1%.
+The exact commands and resource ledger are in Experiment 012.
+
+This changed the roadmap: sparse GPU snapshot selection was required for
+correctness, not merely as a checkpoint-traffic optimization. The second
+candidate implements that path behind two explicit capabilities: the model
+graph must support selected recurrent snapshots and every recurrent-state
+buffer backend must advertise the corresponding operation. NVIDIA CUDA is the
+current backend provider; unsupported graphs and backends fail closed without
+an architecture-name check in recurrent memory. During ordinary capped
+verification it retains the pre-verification input plus the latest output
+boundaries. A rejection beyond the direct horizon reruns the original full
+verification batch shape and writes only the selected accepted boundary. This
+reproduces the first pass's state exactly without serializing a target host
+checkpoint.
+
+The second candidate passed the long correctness gate. The matched 5,000-token
+MTP-8 orbital run produced identical full/capped reasoning output and identical
+draft counts. Four planes reduced the recurrent allocation from 1,346.62 MiB
+to 598.50 MiB. Under Nsight, decode changed from 51.38 to 50.98 t/s (-0.79%);
+the cap performed 38 replay cycles containing 217 actual batch tokens and used
+zero target checkpoint captures/restores. It added 3,938.563 MB H2D plus
+250.206 MB D2H to the complete trace. An initial selected-boundary matcher miss
+also added 4,888.461 MB D2D; accepting the one-plane fused destination removed
+that traffic entirely. Experiment 013 records the exact command, short sweep,
+memory ledger, and transfer totals.
+
+The working theory is therefore revised again: deterministic sparse GPU replay
+is a viable capacity/performance trade for this Qwen CUDA configuration. Host
+checkpoint/replay remains a rejected diagnostic. The interface boundary is now
+capability-based, leaving backend/model expansion independent of recurrent
+memory. Lower cache quants, asymmetric K/V pairs, implementations of the
+capability on other backends/models, and partial GPU KV offload remain out of
+scope.
+
+The standalone
+[`mtp-recurrent-plane-cap-reproduction.md`](mtp-recurrent-plane-cap-reproduction.md)
+records the complete process: workspace and ccache setup, failed candidates,
+exact validation and profiling commands, artifact hashes, and CPU-KV
+integration procedure.
 
 1. Run output-equivalence and recurrent-state regression tests for the separated
    placement policy.
