@@ -15,9 +15,12 @@ branch:
   at the time. This predates the MTP draft-ubatch/target-ubatch matching
   fix and the canonical accelerator-quant-store fix that later landed as
   Experiments 017/018.
-- **Pass 2** (tags `A2-`, `G-`): re-measured against commit `c9f727c1e`
+- **Pass 2** (tags `A2-`, `G-`, `H-`): re-measured against commit `c9f727c1e`
   ("docs: record live draft KV decode comparison"), the Pass 2 source tip,
-  after rebasing onto that work. MTP configurations in this pass omit
+  after rebasing onto that work. The `H-` run additionally postdates the
+  DSpark `n_max` fix in this PR and verifies that the omitted default resolves
+  to the same trained depth and runtime behavior as explicit depth 6. MTP
+  configurations in this pass omit
   `--spec-draft-ubatch-size` entirely (the flag now hard-rejects any value
   that does not equal the target ubatch for `draft-mtp`).
 
@@ -42,7 +45,8 @@ superseded.
   monitor summary, and the tail of each server's own log (`print_timing`,
   `memory breakdown`, checkpoint/replay lines).
 - `logs/` — full server log for every run (`--log-verbosity 4`), plus the
-  exact `llama-server` command line in the matching `.cmd` file.
+  recorded `llama-server` arguments in the matching `.cmd` file. The historical
+  whole-process affinity wrapper is preserved separately in `archived-harness/`.
 - `monitor/` — the 0.5 s-interval VRAM (`nvidia-smi --query-compute-apps`)
   and RSS/VmHWM (`/proc/<pid>/status`) CSV sampled for the lifetime of each
   server process.
@@ -115,6 +119,7 @@ timing summary printed).
 | G | MTP-6, planes=0, crash re-check 2/3 | c9f727c1e (Pass 2) | - | - | - | - | - | 11108 | 2252 | **CRASHED @954** |
 | G | MTP-6, planes=0, crash re-check 3/3 | c9f727c1e (Pass 2) | - | - | - | - | - | 11108 | 2250 | **CRASHED @956** |
 | G | MTP-6, planes=0, `CUDA_LAUNCH_BLOCKING=1` | c9f727c1e (Pass 2) | 135 | 383.32 | 1200 | 39.01 | 84.3% (423/502, len 2.57) | 11108 | 2166 | ok |
+| H | DSpark, fixed binary, `--spec-draft-n-max` omitted (resolves to 6) | 85552567e (fix applied) | 135 | 325.80 | 1200 | 10.53 | 93.8% (211/225, len 2.34) | 11278 | 4058 | ok |
 
 The following is the exact historical common-flag record, not a current command:
 `--no-kv-offload --kv-cpu-pinned
@@ -130,9 +135,9 @@ commands are in `logs/<tag>.cmd`.
 ## Historical crash attempts
 
 The `G-` and `smoke-mtp-ubatch-mismatch` rows are historical crash/rejection
-attempts referenced in Characterization 021. Their command snapshots
+attempts referenced in Characterization 021. The representative command snapshot
 (against `c9f727c1e`, `--spec-mtp-rs-planes 0` so the plane-cap/sparse-replay
-code path is not involved) is in `logs/G-mtp-coding-crashcheck-2.cmd`. It
+code path is not involved) is `logs/G-mtp-coding-crashcheck-2.cmd`. It
 crashed 2 of 3 initial unmodified attempts. Across the full corrected-geometry
 Pass 2 set, 5 of 6 non-blocking inference runs crashed. One of three eligible
 `CUDA_LAUNCH_BLOCKING=1` inference runs crashed; two additional blocking

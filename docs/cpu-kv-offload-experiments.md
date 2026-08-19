@@ -4095,18 +4095,57 @@ if (!has_dflash_family || params.draft_n_max_explicit) {
 Verified against the same DSpark GGUF: omitting `--spec-draft-n-max` now
 logs `DFlash: omitted --spec-draft-n-max defaults to the drafter block
 depth (6); pass the flag to override`, matching the explicit-6 behavior
-above exactly. `test-arg-parser` and the standard focused CTest selection
-(`test-kvarn`, `test-adaptive-dm`, `test-server-loop-guard`) pass
-unchanged; `git diff --check` passes. No other call site depends on DSpark
-being excluded from this resolver.
+above exactly. The historical fixed binary passed `test-arg-parser` and the
+standard focused CTest selection (`test-kvarn`, `test-adaptive-dm`,
+`test-server-loop-guard`). The rebased PR adds a direct `DRAFT_DSPARK`
+fixture assertion that reads the same `dflash.block_size` metadata and checks
+the derived default. No other call site depends on DSpark being excluded from
+this resolver.
+
+### Full-throughput verification on the fixed binary
+
+The log line above only confirms the *resolved depth*, not that the fixed
+default path behaves identically to explicitly passing the now-correct
+value at runtime. Two more clean-process requests, same 135-token coding
+prompt, 1,200 requested output tokens, same fixed binary (with the patch
+above applied and rebuilt):
+
+| Invocation | Decode t/s | Draft acceptance |
+| --- | ---: | --- |
+| Fixed default (`--spec-draft-n-max` omitted, resolves to 6) | 10.53 | 93.8% (211/225), mean len 2.34 |
+| Explicit `--spec-draft-n-max 6` (same fixed binary) | 10.52 | 93.8% (211/225), mean len 2.34 |
+
+Identical within run-to-run noise, and matching the pre-fix explicit-6 row
+in the table above almost exactly (325.34/325.80 t/s prefill, 10.72/10.53
+t/s decode, 228 vs 211 accepted out of a similar generated count on
+different single runs) — confirming the fixed default path reaches the
+same runtime state as the explicit flag, not a new or different code path.
+
+**This fix does cost a small amount of throughput relative to the old
+buggy default**, and that should be stated plainly rather than left
+implicit: the old silent `n_max=3` behavior in the first table of this
+entry decoded at 10.90 t/s; the corrected `n_max=6` default decodes at
+10.53 t/s, about **-3.4%** on this CPU-bound DSpark configuration. This is
+expected, not a regression to chase: the old behavior was only faster
+because it was silently drafting shallower than the model was trained for,
+and each additional CPU-side draft step has a real cost on this
+CPU-drafted, CPU-bottlenecked configuration (Characterization 023). Mean
+accepted draft length barely moved (2.34 vs 2.36), so the deeper draft is
+not buying materially better acceptance here either — the fix trades a
+small, explicable amount of speed for actually matching the drafter's
+trained depth, rather than silently under-drafting.
 
 ### Disposition
 
-Fixed. Every DSpark measurement in Characterizations 020-023 above already
-passed `--spec-draft-n-max 6` explicitly and is therefore unaffected by
-this bug either way; this entry exists so that a `--spec-type draft-dspark`
-deployment that omits the flag going forward gets the model's actual
-trained depth instead of a silent, undocumented fallback to 3.
+Fixed and verified end-to-end: the resolved depth, the runtime behavior at
+that depth, and the throughput/acceptance consequence of the fix are all
+confirmed on the same rebuilt binary. Every DSpark measurement in
+Characterizations 020-023 above already passed `--spec-draft-n-max 6`
+explicitly and is therefore unaffected by this bug either way; this entry
+exists so that a `--spec-type draft-dspark` deployment that omits the flag
+going forward gets the model's actual trained depth — at a small, expected
+CPU-bound throughput cost — instead of a silently faster but incorrect
+fallback to 3.
 
 ## Characterization 025: draft-ubatch, partial GPU KV residency, and the MTP recurrent-plane cap on Qwen3.8 IQ2_M / RTX 4070
 
