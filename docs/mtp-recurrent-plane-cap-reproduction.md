@@ -38,7 +38,9 @@ output. Four planes reduced target recurrent allocation from 1,346.62 MiB to
 The cap performed 38 replay cycles covering 217 actual target batch tokens and
 performed zero target checkpoint captures or restores.
 
-Implementation commit: `TO_BE_FILLED_AFTER_THE_IMPLEMENTATION_COMMIT`.
+Implementation commit:
+`d743456922e6005578d5c94e74e99180c0dbe4c7`
+(`speculative: cap MTP recurrent rollback planes`).
 
 ## Scope and non-goals
 

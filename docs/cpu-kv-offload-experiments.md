@@ -790,7 +790,9 @@ than its draft workspace, is the principal depth-scaling VRAM cost.
 
 ## Experiment 007: independent speculative draft ubatch
 
-Status: retained candidate.
+Status: retained. The final implementation is commit
+`d743456922e6005578d5c94e74e99180c0dbe4c7`; the benchmark provenance below
+continues to identify the pre-commit binary exactly as it reported itself.
 
 ### Implementation
 
