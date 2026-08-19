@@ -1628,15 +1628,17 @@ performance comparison.
 ## Experiment 014: phase-aware target/MTP compute workspace
 
 Status: retained as an opt-in candidate on the dedicated
-`exp/phase-aware-prefill-decode` branch. The benchmarked source is an
-uncommitted source-only diff with SHA-256
+`exp/phase-aware-prefill-decode` branch. The source was benchmarked before
+commit as a source-only diff with SHA-256
 `f6407cfd0987a37835a4c428ba6a63581928614a9efa691a20957b7e9bfcfec8`
-against base `324873dc5ca44eb31727ba3bd09897841574fa3b`. The candidate server SHA-256
-is `6b7169ca2141a606613527deecf7134c530e27884187de0a75b8c72e26ea54b2`;
+against base `324873dc5ca44eb31727ba3bd09897841574fa3b`, then committed with
+its evidence as `44474cd8668de56f9bf77a0682366351867f96f5` without a source
+change. The candidate server SHA-256 is
+`6b7169ca2141a606613527deecf7134c530e27884187de0a75b8c72e26ea54b2`;
 the detached-base server SHA-256 is
 `7b63ef24b1cfae76738793a47c8b96e5087307b627ef0d13302f8cddf89ae89b`.
-No measurement below is attributed to a commit that does not contain the
-benchmarked code.
+The source-diff hash ties the pre-commit binary to the published implementation;
+no measurement below is attributed to a differently configured binary.
 
 ### Objective and retained design
 

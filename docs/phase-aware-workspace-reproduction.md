@@ -49,10 +49,11 @@ The comparison is rooted at BeeLlama commit:
 The candidate is:
 
 ```text
-worktree: /home/gencoolpc/beellama-prefill-decode
-branch:   exp/phase-aware-prefill-decode
-HEAD:     324873dc5ca44eb31727ba3bd09897841574fa3b
-state:    uncommitted candidate diff
+worktree:               /home/gencoolpc/beellama-prefill-decode
+branch:                 exp/phase-aware-prefill-decode
+benchmark base:         324873dc5ca44eb31727ba3bd09897841574fa3b
+implementation commit:  44474cd8668de56f9bf77a0682366351867f96f5
+benchmarked source:      pre-commit source diff recorded below
 ```
 
 The matched baseline is an exact detached worktree:
@@ -91,12 +92,17 @@ f6407cfd0987a37835a4c428ba6a63581928614a9efa691a20957b7e9bfcfec8
 Recalculate it with:
 
 ```bash
-git diff -- common ggml include src tests tools | sha256sum
+git diff \
+  324873dc5ca44eb31727ba3bd09897841574fa3b \
+  44474cd8668de56f9bf77a0682366351867f96f5 \
+  -- common ggml include src tests tools | sha256sum
 ```
 
-Do not call the base commit the candidate commit: the source remained
-deliberately uncommitted because no commit was requested. The binary and diff
-hashes identify the measured state.
+The source was deliberately left uncommitted while measurements and the final
+audit ran. It was then committed with this evidence, without changing any
+source file. The implementation commit, source-diff hash, and binary hash
+together identify the measured state; the base commit alone does not contain
+the candidate.
 
 ## Build-cache correction and build workflow
 
@@ -937,9 +943,10 @@ Before moving this candidate into another branch or a PR:
 7. Keep model, projector, cache formats, MTP depth, plane count, affinity,
    thread count, batch/ubatch sizes, and cleared environment identical on both
    sides.
-8. Add a commit ID to Experiment 014 only after the measured code and docs are
-   committed together. Do not rewrite the current base commit as if it already
-   contained the candidate.
+8. Preserve the measured implementation commit
+   `44474cd8668de56f9bf77a0682366351867f96f5` and record any later merge or
+   rebase separately. Do not rewrite the base commit as if it contained the
+   candidate.
 
 The implementation can be separated conceptually into a generic GGML shared
 backing change and a llama/server phase-policy consumer, but they are not
