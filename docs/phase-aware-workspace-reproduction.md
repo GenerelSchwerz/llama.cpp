@@ -53,6 +53,7 @@ worktree:               /home/gencoolpc/beellama-prefill-decode
 branch:                 exp/phase-aware-prefill-decode
 benchmark base:         324873dc5ca44eb31727ba3bd09897841574fa3b
 implementation commit:  44474cd8668de56f9bf77a0682366351867f96f5
+CPU-KV merge commit:     20777977d288fbb72e9541c1e982785e90d75993
 benchmarked source:      pre-commit source diff recorded below
 ```
 
@@ -945,8 +946,9 @@ Before moving this candidate into another branch or a PR:
    sides.
 8. Preserve the measured implementation commit
    `44474cd8668de56f9bf77a0682366351867f96f5` and record any later merge or
-   rebase separately. Do not rewrite the base commit as if it contained the
-   candidate.
+   rebase separately. The first CPU-KV integration is
+   `20777977d288fbb72e9541c1e982785e90d75993`. Do not rewrite the base commit
+   as if it contained the candidate.
 
 The implementation can be separated conceptually into a generic GGML shared
 backing change and a llama/server phase-policy consumer, but they are not

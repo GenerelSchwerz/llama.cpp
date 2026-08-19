@@ -1979,7 +1979,10 @@ commit as a source-only diff with SHA-256
 `f6407cfd0987a37835a4c428ba6a63581928614a9efa691a20957b7e9bfcfec8`
 against base `324873dc5ca44eb31727ba3bd09897841574fa3b`, then committed with
 its evidence as `44474cd8668de56f9bf77a0682366351867f96f5` without a source
-change. The candidate server SHA-256 is
+change. It was merged into `exp/kv-cpu-offload` as
+`20777977d288fbb72e9541c1e982785e90d75993`; the ledger entry was renumbered
+from 014 to 016 so Characterization 014 and Experiment 015 from the destination
+branch remain intact. The candidate server SHA-256 is
 `6b7169ca2141a606613527deecf7134c530e27884187de0a75b8c72e26ea54b2`;
 the detached-base server SHA-256 is
 `7b63ef24b1cfae76738793a47c8b96e5087307b627ef0d13302f8cddf89ae89b`.

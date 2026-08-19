@@ -750,6 +750,8 @@ The dedicated `exp/phase-aware-prefill-decode` worktree at base
 VRAM category: retaining prompt-sized target and MTP compute reservations while
 only generation graphs are active. This is a workspace-lifetime change, not an
 attempt to unload MTP weights or persistent speculative/recurrent state.
+The retained implementation was merged back into this branch as
+`20777977d288fbb72e9541c1e982785e90d75993`.
 
 The retained opt-in `--phase-aware-workspace` policy starts each context with a
 generation reservation, grows to its full physical ubatch for prompt work, and
