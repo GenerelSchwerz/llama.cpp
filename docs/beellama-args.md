@@ -49,10 +49,11 @@ capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
 participating layers, selected compact-overlay or compact-native-exact
 representation, actual body and exact types, logical history rows, rollback
-rows, graph-local body execution rows, owner backend, current-segment
-presence, transient estimate, and memory increments. Native routes are checked
-again against the final constructed operation. A mismatch fails context/graph
-construction instead of allowing the scheduler to move that layer silently.
+rows, graph-local body execution rows, storage buffer type, execution backend,
+current-segment presence, transient estimate, and memory increments. Native
+routes are checked again against the final constructed operation. A mismatch
+fails context/graph construction instead of allowing the scheduler to move that
+layer silently.
 
 The CLI is parsed once into an immutable, model-independent request. Fit probes
 and the final context bind that same request to the model's canonical cache
@@ -174,6 +175,41 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
+## CPU-resident KV versus CPU execution
+
+Persistent KV placement and attention execution are independent policies. In
+particular, `--no-kv-offload --kv-cpu-pinned` stores the attention history in
+CUDA-pinned host RAM, but with normal operation offload the attention graph
+still executes on CUDA. The growing host cache must therefore participate in
+the accelerator path. This saves persistent VRAM at the cost of substantial,
+context-dependent H2D traffic; it is not equivalent to CPU attention.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--kv-offload`, `--no-kv-offload` | `LLAMA_ARG_KV_OFFLOAD` | Enabled | Controls whether the ordinary persistent KV cache is device-resident. Disabling it moves eligible KV storage to the host; it does not by itself describe every operation's execution backend. |
+| `--kv-cpu-pinned`, `--no-kv-cpu-pinned` | `LLAMA_ARG_KV_CPU_PINNED` | Disabled | Uses accelerator-visible pinned host buffers for CPU-resident KV. With normal operation offload, attention placement is resolved independently and can remain on CUDA. |
+| `--recurrent-state-offload`, `--no-recurrent-state-offload` | `LLAMA_ARG_RECURRENT_STATE_OFFLOAD` | Disabled | For hybrid models under `--no-kv-offload`, keeps the fixed recurrent R/S state on the GPU while long attention KV remains in host memory. With ordinary KV offload enabled, recurrent state is already device-resident. |
+| `--kv-gpu-layers N` | `LLAMA_ARG_KV_GPU_LAYERS` | `0` | Under `--no-kv-offload`, retains the first `N` attention-KV layers on the device. This trades VRAM for lower repeated host-to-device traffic; a value at or above the attention-layer count matches full KV offload for those layers. |
+| `--op-offload`, `--no-op-offload` | — | Enabled | Controls whether operations over host tensors may execute on the accelerator. The negated form selects the separately tested CPU execution route; it is not the serving-performance path measured below. |
+
+For standard quantized KV whose persistent storage is on the CPU but whose
+attention executes on an accelerator, new rows are quantized by a small
+accelerator stage and copied byte-for-byte into the host cache. This preserves
+the accelerator's canonical quantized representation across GPU- and
+CPU-resident storage. Storage capability governs the cache write, while
+execution capability governs attention and exact-tail math; unsupported
+combinations fail during route construction.
+
+The final matched MTP-6/Q8_0 5K Nsight comparison measured 61.001 decode t/s
+and 14,778 MiB peak VRAM for GPU-resident KV versus 55.622 t/s and 14,532 MiB
+for pinned CPU-resident KV. The pinned case saved 246 MiB, decoded 8.82% more
+slowly, and added 310,224.226 MB H2D. These are single-run profiler results,
+not confidence intervals. Exact commands, model and binary hashes, token hashes,
+transfer counts, D2H totals, and the CPU-execution smoke test are in
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md)
+and Experiment 018 of
+[`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
+
 ## MTP recurrent-plane cap
 
 MTP draft depth and target recurrent-state rollback capacity are separate
@@ -218,9 +254,9 @@ path. The selected-boundary full-shape GPU replay in Experiment 013 passed the
 long fixed-seed output gate.
 
 Startup logs report resolved draft depth, total planes, direct rollback
-horizon, total per-slot recurrent allocation, and whether checkpoint fallback
-is enabled. Completion timing JSON and the speculative timing log report
-checkpoint capture/restore counts and wall time, cumulative serialized
+horizon, total per-slot recurrent allocation, and whether selected full-shape
+GPU replay is enabled. Completion timing JSON and the speculative timing log
+report checkpoint capture/restore counts and wall time, cumulative serialized
 target/draft/speculative-state bytes, peak live checkpoint payload bytes,
 replay cycles, and actual replay-batch tokens. These byte counters describe
 serialized payload size; use a backend profiler such as Nsight Systems for
@@ -283,7 +319,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
-| `--spec-draft-ubatch-size N`, `--ubatch-size-draft N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH` | `0` (inherit target) | Sets the physical batch size of the separate draft context without changing the target context. Smaller values reduce draft CUDA workspace but can slow synchronization of long prompts. |
+| `--spec-draft-ubatch-size N`, `--ubatch-size-draft N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH` | `0` (inherit target) | Sets the physical batch size of a separate draft context. For `draft-mtp`, omit it or set it equal to the target `--ubatch-size`; another value is rejected because clean Bee MTP inherits the target geometry and different recurrent prompt-synchronization chunks can change later output. Other model-backed speculative modes retain independent draft ubatches. Use `--phase-aware-workspace` to reduce MTP decode workspace without changing its physical ubatch. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
 | `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | `profit` adapts DFlash depth from measured cycle profit; `off` keeps the resolved or explicit maximum static. Other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |

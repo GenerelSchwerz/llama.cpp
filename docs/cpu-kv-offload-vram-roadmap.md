@@ -57,12 +57,21 @@ fallback, not a preferred optimization.
 
 ## Complexity 1: small allocation controls
 
-### Independent draft ubatch (implemented)
+### Independent draft ubatch (retained outside MTP; rejected for MTP)
 
-`--spec-draft-ubatch-size 128` leaves target ubatch at 512. At MTP depth 5 and
-32K it saved 88 MiB of live process VRAM with decode unchanged within
-single-run noise and a 0.9% prompt-throughput cost. Draft ubatch 32 saved 110
-MiB but reduced prompt throughput by 4.3%.
+The control remains valid for other model-backed speculative modes. It is no
+longer a supported MTP memory lever. The original 64-token MTP-5 screen found
+the same visible output and acceptance counts at draft ubatches 512, 128, and
+32, but a 1,000-token MTP-2 audit first diverged at generated token 100 for
+both 128 and 32. The smaller physical ubatch split the 149-token recurrent
+prompt synchronization into different decode calls and changed later
+verification/acceptance geometry.
+
+MTP now requires `--spec-draft-ubatch-size` to be omitted or equal to the
+target ubatch. `--phase-aware-workspace` is the supported replacement: it
+keeps clean Bee's physical prompt geometry while shrinking the retained decode
+reservation, and in the post-fix MTP-2 1K check reduced sampled peak VRAM from
+14,104 to 13,870 MiB with identical tokens and content.
 
 ### Cap speculative recurrent rollback planes
 
@@ -88,11 +97,14 @@ generation bound, grows to the full physical ubatch for prompt work, and
 shrinks when generation resumes. A second prompt on the same live server was
 verified to regrow and shrink both target and MTP contexts safely.
 
-At 140K with MTP-6, three recurrent planes, target ubatch 512, and draft ubatch
-128, it reduced initialized/steady VRAM by 1,108 MiB and measured peak VRAM by
-902-926 MiB. The 138K prompt changed prefill by -0.12%; the plain 5K run changed
-decode by -1.83%. Target plus draft transition work was 41.8 ms in the 5K run
-and 46.0 ms in the 138K run.
+The original 140K MTP-6 experiment used target ubatch 512 and the now-rejected
+draft ubatch 128; its allocator result remains historical characterization,
+not a supported current command. It reduced initialized/steady VRAM by 1,108
+MiB and measured peak VRAM by 902-926 MiB. The 138K prompt changed prefill by
+-0.12%; the plain 5K run changed decode by -1.83%. Target plus draft transition
+work was 41.8 ms in the 5K run and 46.0 ms in the 138K run. The supported
+equal-ubatch long-run matrix must be remeasured before publishing replacement
+performance numbers.
 
 - Reduces startup and steady generation residency.
 - Reduces coexistence peak by sharing sequential target/draft backing, but does

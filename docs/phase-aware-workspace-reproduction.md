@@ -7,6 +7,33 @@ detailed than the user-facing argument documentation. The authoritative result
 row is also recorded as Experiment 016 in the merged CPU-KV ledger:
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
+## Exactness update: physical MTP ubatch
+
+The commands and measurements in this record used target ubatch 512 and draft
+ubatch 128. They remain the exact historical reproduction of the allocator
+experiment, and their baseline/candidate comparisons used the same geometry on
+both sides. A later 1,000-token MTP-2 audit found that changing the physical
+draft ubatch from clean Bee's inherited 512 can change the generated stream at
+token 100 even when a 64-token screen and aggregate acceptance counts agree.
+
+Current MTP therefore rejects a nonzero draft ubatch that differs from target
+ubatch. To exercise the supported configuration, omit
+`--spec-draft-ubatch-size 128` below or replace it with 512. Do not reuse the
+historical throughput/VRAM numbers as measurements of that equal-ubatch
+configuration; the long 5K, 140K, and Nsight pairs require fresh measurement.
+The phase-aware mechanism itself passed a fresh placement-matched 1K check with
+inherited/equal 512 and remains the supported way to reduce retained MTP decode
+workspace. See Experiment 017 and
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md).
+
+A subsequent equal-ubatch cross-residency gate also established that phase-aware
+pinned-CPU Q8 is not a separate numerical mode: its MTP-2 and MTP-6 1K streams
+match clean GPU, and its stochastic MTP-6 5K full/capped streams match clean
+GPU for all 5,000 tokens. That matrix records CPU/GPU throughput and VRAM in
+Experiment 018. It is not a replacement for the historical phase-off versus
+phase-on 5K/140K/Nsight performance pairs, which still need supported
+equal-ubatch repetition.
+
 ## Final result
 
 The retained `--phase-aware-workspace` candidate reduces 140K-context MTP-6

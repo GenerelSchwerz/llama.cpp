@@ -56,11 +56,12 @@ overrides:
 ctx-size    = 32768
 batch-size  = 1024
 ubatch-size = 512
-# Optional: keep the target ubatch above while reducing only the speculative
-# draft context workspace.
-spec-draft-ubatch-size = 128
+# A smaller spec-draft-ubatch-size may be used by non-MTP model-backed
+# speculation. MTP must inherit 512 here (or explicitly set 512) so recurrent
+# prompt synchronization retains clean Bee's batch geometry.
 # Optional: retain only the active prompt or generation workspace. This regrows
-# automatically when a later request needs prompt processing.
+# automatically when a later request needs prompt processing and is the MTP
+# workspace-reduction control.
 phase-aware-workspace = true
 
 [qwen-local]
