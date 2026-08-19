@@ -1992,7 +1992,8 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
     llama_kv_memory_stats result;
     llama_kv_memory_component_stats & component = swa ? result.swa : result.global;
     for (const auto & route : metadata->get_tail_layer_routes()) {
-        const bool cpu = !route.owner || ggml_backend_dev_type(route.owner) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool cpu = !route.execution_backend ||
+                ggml_backend_dev_type(route.execution_backend) == GGML_BACKEND_DEVICE_TYPE_CPU;
         if (cpu) {
             component.tail_cpu_layers++;
         } else if (route.capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE) {

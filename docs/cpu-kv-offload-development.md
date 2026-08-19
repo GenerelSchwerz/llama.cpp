@@ -162,7 +162,10 @@ behavior was effectively comparable. Source inspection also found that both
 implementations force the graph region from KV store through attention output
 onto CPU when `--no-kv-offload` is active. The working conclusion was that the
 main bottleneck is architectural/data-movement behavior shared with upstream,
-not a broad BeeLlama regression.
+not a broad BeeLlama regression. This describes the clean baseline and the
+pre-Experiment-015 Bee route. It must not be read as the current pinned-host
+policy: the retained `--no-kv-offload --kv-cpu-pinned` route now separates
+persistent storage from CUDA attention execution, as documented below.
 
 ### 7. Scheduler knobs did not explain the remaining gap
 
@@ -347,14 +350,16 @@ target recurrent rollback snapshot, and a 276.27 MiB CUDA compute buffer owned
 by the MTP context. Only the last category is directly addressable by reducing
 the MTP context's ubatch.
 
-The MTP context currently inherits target `n_batch=1024` and `n_ubatch=512`
-because `common_speculative_init_result` derives both contexts from the same
+Clean Bee MTP inherits target `n_batch=1024` and `n_ubatch=512` because
+`common_speculative_init_result` derives both contexts from the same
 `common_params` and changes only the context type and speculative memory
-settings. Equal ubatch sizes are not required by the MTP algorithm. Draft prompt
-synchronization already chunks work according to `llama_n_ubatch(ctx_dft)`,
-while MTP-1 decode normally submits only one or two rows. A draft-specific
-ubatch should therefore trade prompt-synchronization call count for a smaller
-draft compute reservation without changing target prefill geometry.
+settings. The initial investigation assumed that a different draft ubatch was
+only a workspace/performance choice because prompt synchronization chunks work
+according to `llama_n_ubatch(ctx_dft)`. The later 1,000-token exactness audit
+disproved that assumption: changing those chunks changes recurrent floating-
+point state and later verification/acceptance batch geometry even when the
+first 99 generated tokens agree. MTP must preserve the inherited physical
+ubatch; workspace lifetime is reduced by phase-aware reservation instead.
 
 Every future serving measurement should distinguish:
 
@@ -378,6 +383,22 @@ Systems trace showed that the scheduler copies each full K and V tensor to the
 GPU and executes standard Q8 attention with CUDA FlashAttention. Model weights
 and the rest of the graph also remain GPU-resident.
 
+Storage placement also must not choose the numerical converter. A later
+cross-residency exactness audit found that independently converting F32 KV rows
+to Q8_0 on CPU and CUDA produced sparse byte differences and changed output at
+generated token 5. F16 was an exact control. Host-resident quantized standard
+KV for accelerator layers now converts the current rows in a bounded device
+stage and performs a same-type byte-preserving scatter into host storage. At
+ubatch 512 the Qwen3.8 target uses 17.00 MiB for 16 layers of K/V stages; the
+one-layer MTP context uses another 1.06 MiB, for 18.06 MiB total. Clean
+GPU, candidate GPU, and candidate pinned-CPU output then matched for target-only
+1K, MTP-2/MTP-6 1K, exact-tail 128, and stochastic MTP-6 5K. This adds a D2H
+transfer of newly written quantized rows. The final Nsight matrix measured the
+complete route: pinned CPU full added 310,224.226 MB H2D and 214.858 MB D2H
+versus GPU full over the 5K request, saved 246 MiB of profiled peak VRAM, and
+reduced decode from 61.001 to 55.622 t/s. The much larger H2D delta comes from
+CUDA attention over the growing host cache, not the bounded new-row store.
+
 The placement policy now represents those decisions separately. Internal
 `offload_kqv` continues to select persistent KV storage, while
 `offload_attn_compute` controls whether graph construction forces the complete
@@ -391,6 +412,13 @@ be selected by an accelerator when their device inputs determine placement.
 This makes the established pinned-host/CUDA-attention path explicit instead of
 relying on the generic scheduler's operation-offload heuristic to override a
 cache-derived CPU constraint.
+
+Exact-tail planning follows the same separation. Its persistent storage buffer
+type validates writes, while its planned attention execution backend validates
+math/native-attention support. A final native-tail op is explicitly scheduled
+on that execution backend. Without this split, pinned CPU storage incorrectly
+selected CPU tail numerics even when operation offload placed attention on
+CUDA. `--no-op-offload` still retains the deliberate CPU route.
 
 At long context, each generated token requires scanning increasingly large K/V
 history. Relevant costs may include:
@@ -645,12 +673,31 @@ grew from 299.25 MiB to 598.50, 897.75, and 1,346.62 MiB. On the artificial
 repeated-token sample, depth 5 was fastest at 68.92 t/s; depth 8 fell to 61.60
 t/s as acceptance dropped to 0.632 while using another 450 MiB.
 
-An independent draft-context ubatch control is now a retained candidate.
-`--spec-draft-ubatch-size 128` leaves the target at ubatch 512 and, at MTP
-depth 5 and 32K, reduced live process VRAM from 14,922 to 14,834 MiB. Decode
-was unchanged within single-run noise (74.82 versus 74.67 t/s), while prompt
-throughput fell 0.9%. A draft ubatch of 32 saved 110 MiB but reduced prompt
-throughput 4.3%, so 128 is the current balanced recommendation.
+The independent draft-context ubatch control remains available to non-MTP
+model-backed speculation, but its MTP use is rejected. The original 64-token
+MTP-5 screen reported identical visible output and draft counts while draft
+ubatch 128 reduced live process VRAM from 14,922 to 14,834 MiB. That gate was
+too short: a later 1,000-token MTP-2 run diverged from inherited-512 clean Bee
+output at generated token 100 for draft ubatches 128 and 32. Trace logs showed
+the first acceptance-cycle regrouping at token 60 after the 149-token prompt
+was synchronized as `128 + 21` rather than one call.
+
+The current fail-closed policy accepts an omitted value or an explicit value
+equal to target ubatch, rejects other values for `draft-mtp` through CLI,
+environment, and rendered INI paths, and leaves DFlash/other model-backed modes
+unchanged. A rebuilt placement-matched MTP-2 1K run produced the clean Bee
+token hash `b1e3f667bf3a2269f9ba2b0d41ca6f1229b1780250b173ba17db3fa0a9abad9a`
+and content hash `fae6d743dc309784a909e015cc46450b7bfebfafb5e2a18c92c999206d019057`
+for inherited phase-off, inherited phase-on, and explicit-equal phase-on.
+Phase awareness reduced sampled peak process VRAM from 14,104 to 13,870 MiB
+without changing the stream. This replaces the former MTP draft-ubatch
+recommendation. A fresh equal-ubatch, cross-residency MTP-6 5K gate subsequently
+matched clean GPU output for candidate GPU, pinned-CPU full planes, and
+pinned-CPU three planes. Decode was 63.281/63.223/57.200/55.363 t/s for clean
+GPU/candidate GPU/CPU full/CPU capped, and sampled peak VRAM was
+15,006/15,006/14,514/13,926 MiB. The old 140K phase-aware pair remains
+historical, but the supported equal-ubatch final Nsight transfer matrix was
+subsequently completed and is reported in the final theory update below.
 
 The supported CPU-KV placement controls now follow the existing cache ownership
 layout: `llama_model::create_memory()` derives attention and recurrent placement,
@@ -763,6 +810,13 @@ attempt to unload MTP weights or persistent speculative/recurrent state.
 The retained implementation was merged back into this branch as
 `20777977d288fbb72e9541c1e982785e90d75993`.
 
+That historical benchmark used target/draft ubatches 512/128 on both sides. A
+later 1K exactness audit rejected the smaller physical MTP ubatch because it can
+change the clean-Bee stream after token 100. The allocator design remains
+retained, and a fresh inherited/equal-512 MTP-2 run is exact, but the 5K/140K
+performance and memory rows below remain historical until the supported
+equal-ubatch matrix is remeasured.
+
 The retained opt-in `--phase-aware-workspace` policy starts each context with a
 generation reservation, grows to its full physical ubatch for prompt work, and
 shrinks after returning to generation. The generation bound includes parallel
@@ -823,6 +877,65 @@ prompt peak is real active target workspace with the previously measured
 context-linear F16 materialization, Q8 staging, and explicit mask. Compact mask
 metadata is therefore the next contained VRAM target; direct-Q8 prompt MMA and
 fixed-window streaming remain progressively larger follow-ons.
+
+The output-exactness audit adds one constraint to that roadmap: CPU/GPU cache
+residency may change storage location but must not silently change the
+persistent quantized bytes when accelerator attention remains the execution
+policy. The retained 17 MiB conversion stage is small compared with the
+hundreds of MiB saved by phase awareness and recurrent-plane capping. Its
+new-row D2H traffic is included in the final profiler ledger. See
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md)
+and Experiment 018.
+
+The follow-up same-process MTP-6 lifecycle matrix also passed across GPU and
+pinned-CPU Q8 residency, phase awareness off/on, and the three-plane cap. It
+exercised prompt-cache reuse, prefix shrink, regrowth from an earlier longer
+branch, and two observed sleep/unload/wake/reload cycles. This removes those
+direct-server lifecycle paths from the current list of suspected correctness
+risks for the supported Q8/CUDA configuration. Explicit router
+`/models/reload`, other cache formats/backends, and authoritative profiler
+transfer accounting remain separate gates; the lifecycle result does not
+generalize them by implication.
+
+The explicit router gate subsequently passed as well. A preset metadata change
+forced each live model from `loaded` to `unloaded`; the following identical
+request autoloaded a new child process. Clean GPU, candidate phase-aware GPU,
+candidate phase-aware pinned CPU, and the three-plane pinned-CPU candidate all
+matched before/after within the case and matched clean Bee across cases. This
+closes the supported Q8/CUDA lifecycle gate. The remaining immediate evidence
+gap was authoritative Nsight transfer accounting for the final canonical-store
+implementation, not another lifecycle-specific code path.
+
+That final profiler matrix now changes the performance theory materially. With
+phase awareness held constant, GPU-resident full planes recorded 17,485.510 MB
+H2D and 5,700.920 MB D2H over the 5K request. Pinned-CPU full planes recorded
+327,709.736 MB H2D and 5,915.778 MB D2H: 310,224.226 MB more H2D for only 246
+MiB less profiled peak VRAM, with decode falling from 61.001 to 55.622 t/s.
+This confirms that normal operation offload is an accelerator-attention path
+over host-resident persistent KV, not a CPU-attention path. The dominant
+transfer cost is repeatedly making the growing host cache available to CUDA;
+the canonical new-row store's D2H direction is much smaller.
+
+The three-plane CPU case saved another 588 MiB, but its 90 selected replay
+cycles/443 replay-batch tokens added 10,045.292 MB H2D and 465.483 MB D2H and
+reduced profiled decode another 2.80%. Output, acceptance, and all checkpoint
+counters remained exact. This reinforces the roadmap distinction: recurrent
+plane capping is a controllable VRAM/throughput trade, while materially
+improving CPU-KV serving performance requires reducing accelerator access to
+the full growing host cache (for example bounded GPU windows/streaming) or a
+separately competitive native CPU attention path. Store-stage tuning alone
+cannot remove the 310 GB residency traffic.
+
+The final acceptance-edge audit does not change that theory, but closes the
+remaining supported-Q8 correctness bias. Full-plane depths 1/2/3/5/6/8 and
+2-/3-/4-/full-plane policies at depths 3/5/8 all matched clean Bee. Two
+stochastic seeds on an independent number-game prompt at `p_min=0` forced
+43/69 selected replay cycles and 387/621 replay-batch tokens through a
+two-plane, zero-token direct horizon; GPU and pinned-CPU candidates remained
+exact. A third seed and website prompt at `p_min=0.999` accepted every actual
+draft and used no replay. The cap remains a workload-dependent trade: the
+rejection-heavy two-plane rows were much slower, so production selection must
+be based on measured acceptance/replay behavior rather than VRAM alone.
 
 1. Implement a fail-closed compact causal-mask descriptor for the supported
    single-slot contiguous layout and measure the predicted GPU and CUDA-host

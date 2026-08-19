@@ -165,8 +165,28 @@ def main() -> None:
 
     generic_kv = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     generic_kv_h = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
-    if generic_kv.count("dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);") < 4:
-        raise AssertionError("standard KV-tail routes must retain a concrete CPU owner for CPU buffer types")
+    require(
+        generic_kv,
+        "dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);",
+        "standard KV storage must retain a concrete CPU backend for CPU buffer types",
+    )
+    if generic_kv.count(
+        "auto * storage_dev = llama_kv_cache_get_backend(spec.buft);"
+    ) < 2:
+        raise AssertionError(
+            "standard KV-tail capability probes must resolve storage ownership independently"
+        )
+    for needle in (
+        "auto * execution_dev = spec.execution_backend;",
+        "requirements.write_k = storage_supports",
+        "requirements.body_score = execution_supports",
+        "return execution_supports(attn)",
+    ):
+        require(
+            generic_kv,
+            needle,
+            "standard KV-tail probes must keep storage ownership separate from execution",
+        )
     for retired_generic_msa in ("msa_strict_slots", "get_k_idx", "cpy_k_idx", "n_embd_k_idx"):
         if retired_generic_msa in generic_kv or retired_generic_msa in generic_kv_h:
             raise AssertionError("MiniMax MSA index ownership must not return to the generic KV cache")

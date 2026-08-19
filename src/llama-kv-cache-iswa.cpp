@@ -39,7 +39,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_swa_requested,
                  uint32_t tail_rollback_tokens,
                      bool tail_native_exact_swa,
-                     bool cpu_pinned) :
+                     bool cpu_pinned,
+                     bool offload_attn_compute) :
     llama_kv_cache_iswa(
             model, model.hparams,
             type_k, type_v,
@@ -47,7 +48,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             kv_size, n_seq_max, n_batch, n_ubatch, n_pad,
             mem_other, filter, reuse, share, kvarn, tail_tokens, tail_tokens_swa, tail_type,
             tail_tokens_requested, tail_tokens_swa_requested, tail_rollback_tokens,
-            tail_native_exact_swa, cpu_pinned) {
+            tail_native_exact_swa, cpu_pinned, offload_attn_compute) {
 }
 
 llama_kv_cache_iswa::llama_kv_cache_iswa(
@@ -76,7 +77,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t tail_tokens_swa_requested,
                  uint32_t tail_rollback_tokens,
                      bool tail_native_exact_swa,
-                     bool cpu_pinned) : unified(unified) {
+                     bool cpu_pinned,
+                     bool offload_attn_compute) : unified(unified) {
 
     if (tail_tokens_requested == UINT32_MAX) {
         tail_tokens_requested = tail_tokens;
@@ -172,7 +174,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                         v_trans, offload, unified, size, n_seq_max, n_pad,
                         n_swa, swa_type, nullptr, layer_filter, reuse, nullptr,
                         n_ubatch, exact_tokens, tail_type, exact_requested,
-                        false, tail_rollback_tokens, exact_tokens, cpu_pinned);
+                        false, tail_rollback_tokens, exact_tokens, cpu_pinned, 0,
+                        offload_attn_compute);
             }
             // Structured KVarN records do not participate in cross-context
             // sharing, so cache_mem_other and share are intentionally omitted.
@@ -190,7 +193,8 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                 n_swa, swa_type, cache_mem_other, layer_filter, reuse, share,
                 n_ubatch, n_swa > 0 ? tail_tokens_swa : tail_tokens, tail_type,
                 n_swa > 0 ? tail_tokens_swa_requested : tail_tokens_requested,
-                false, tail_rollback_tokens, 0, cpu_pinned);
+                false, tail_rollback_tokens, 0, cpu_pinned, 0,
+                offload_attn_compute);
     };
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);

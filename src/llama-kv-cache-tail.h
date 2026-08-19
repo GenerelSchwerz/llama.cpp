@@ -188,7 +188,9 @@ struct llama_kv_tail_layer_route {
     bool has_body;
     bool has_current;
     uint32_t body_execution_rows;
-    ggml_backend_dev_t owner;
+    // Storage ownership and attention execution are deliberately independent:
+    // pinned host KV can be read by an accelerator-scheduled attention op.
+    ggml_backend_dev_t execution_backend;
     llama_kv_tail_route_capability capability;
 };
 

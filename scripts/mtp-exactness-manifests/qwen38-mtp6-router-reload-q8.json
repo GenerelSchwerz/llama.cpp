@@ -1,0 +1,139 @@
+{
+  "request_file": "scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json",
+  "output_dir": "/tmp/qwen38-mtp6-router-reload-q8-20260819",
+  "input_files": [
+    {
+      "role": "target-and-mtp-model",
+      "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf"
+    },
+    {
+      "role": "router-preset-before",
+      "path": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini"
+    },
+    {
+      "role": "router-preset-after",
+      "path": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-after.ini"
+    }
+  ],
+  "environment": {"CUDA_PATH": "/opt/cuda"},
+  "startup_timeout_seconds": 600,
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 1,
+  "sequence": [
+    {
+      "name": "before-reload",
+      "type": "completion",
+      "request": {"n_predict": 96, "cache_prompt": true}
+    },
+    {
+      "name": "explicit-reload",
+      "type": "reload_models",
+      "model": "mtp6-reload",
+      "timeout_seconds": 300
+    },
+    {
+      "name": "after-reload",
+      "type": "completion",
+      "require_equal_to": "before-reload",
+      "request": {"n_predict": 96, "cache_prompt": true}
+    }
+  ],
+  "comparison_contract": {
+    "require_explicit_references": true,
+    "required_identity_keys": [
+      "model.sha256", "mtp.depth", "mtp.p_min",
+      "target_kv.k", "target_kv.v", "draft_kv.k", "draft_kv.v",
+      "context", "batch", "ubatch", "effective_draft_ubatch",
+      "sampler.seed", "sampler.temperature", "lifecycle"
+    ],
+    "common_identity": {
+      "model": {"sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"},
+      "mtp": {"depth": 6, "p_min": 0.85},
+      "target_kv": {"k": "q8_0", "v": "q8_0", "residency": "gpu"},
+      "draft_kv": {"k": "q8_0", "v": "q8_0", "residency": "gpu"},
+      "recurrent_planes": "full",
+      "workspace": {"phase_aware": false},
+      "context": 4096,
+      "batch": 1024,
+      "ubatch": 512,
+      "effective_draft_ubatch": 512,
+      "sampler": {"seed": 1234, "temperature": 0},
+      "lifecycle": "router-explicit-models-reload"
+    }
+  },
+  "common_args": [
+    "--models-max", "1",
+    "--n-gpu-layers", "999", "--n-gpu-layers-draft", "999",
+    "--fit", "off", "--split-mode", "none", "--main-gpu", "0", "--flash-attn", "on",
+    "--ctx-size", "4096", "--parallel", "1", "--cont-batching", "--kv-unified",
+    "--batch-size", "1024", "--ubatch-size", "512",
+    "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+    "--threads", "3", "--threads-batch", "24", "--cpu-range", "0-2", "--cpu-range-batch", "0-23",
+    "--cpu-strict", "1", "--poll", "100", "--seed", "1234", "--cache-ram", "0", "--verbosity", "4",
+    "--spec-type", "draft-mtp", "--spec-draft-n-max", "6", "--spec-draft-p-min", "0.85",
+    "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"
+  ],
+  "cases": [
+    {
+      "name": "clean-gpu-phase-off",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "request": {"model": "mtp6-reload"},
+      "router_preset": {
+        "initial_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini",
+        "reload_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-after.ini"
+      }
+    },
+    {
+      "name": "candidate-gpu-phase-on",
+      "compare_to": "clean-gpu-phase-off",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "request": {"model": "mtp6-reload"},
+      "identity": {"workspace": {"phase_aware": true}},
+      "args": ["--phase-aware-workspace"],
+      "router_preset": {
+        "initial_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini",
+        "reload_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-after.ini"
+      }
+    },
+    {
+      "name": "candidate-cpu-phase-on",
+      "compare_to": "clean-gpu-phase-off",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "request": {"model": "mtp6-reload"},
+      "identity": {
+        "target_kv": {"residency": "cpu"},
+        "draft_kv": {"residency": "cpu"},
+        "workspace": {"phase_aware": true}
+      },
+      "args": [
+        "--no-kv-offload", "--kv-cpu-pinned", "--recurrent-state-offload",
+        "--phase-aware-workspace"
+      ],
+      "router_preset": {
+        "initial_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini",
+        "reload_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-after.ini"
+      }
+    },
+    {
+      "name": "candidate-cpu-phase-on-planes3",
+      "compare_to": "clean-gpu-phase-off",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "request": {"model": "mtp6-reload"},
+      "identity": {
+        "target_kv": {"residency": "cpu"},
+        "draft_kv": {"residency": "cpu"},
+        "workspace": {"phase_aware": true},
+        "recurrent_planes": 3
+      },
+      "args": [
+        "--no-kv-offload", "--kv-cpu-pinned", "--recurrent-state-offload",
+        "--phase-aware-workspace", "--spec-mtp-rs-planes", "3"
+      ],
+      "router_preset": {
+        "initial_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini",
+        "reload_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-after.ini"
+      }
+    }
+  ]
+}

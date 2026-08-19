@@ -56,14 +56,18 @@ overrides:
 ctx-size    = 32768
 batch-size  = 1024
 ubatch-size = 512
-# Optional: keep the target ubatch above while reducing only the speculative
-# draft context workspace.
+# Optional for non-MTP model-backed speculation: keep the target ubatch above
+# while reducing only the separate draft context's physical ubatch.
 spec-draft-ubatch-size = 128
+# MTP must omit that setting or explicitly use 512 so recurrent prompt
+# synchronization retains clean Bee's physical batch geometry. Use the
+# phase-aware workspace setting below for MTP decode-workspace reduction.
 # Optional: override target KV placement for independently owned draft cache
 # layers. Omit this key to inherit the target policy.
 # spec-draft-kv-gpu-layers = N
 # Optional: retain only the active prompt or generation workspace. This regrows
-# automatically when a later request needs prompt processing.
+# automatically when a later request needs prompt processing and is the MTP
+# workspace-reduction control.
 phase-aware-workspace = true
 
 [qwen-local]

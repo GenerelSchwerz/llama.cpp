@@ -1280,7 +1280,7 @@ private:
             return false;
         }
         try {
-            common_validate_speculative_params(params_base.speculative);
+            common_validate_speculative_params(params_base.speculative, params_base.n_ubatch);
         } catch (const std::invalid_argument & e) {
             SRV_ERR("invalid speculative configuration: %s\n", e.what());
             return false;

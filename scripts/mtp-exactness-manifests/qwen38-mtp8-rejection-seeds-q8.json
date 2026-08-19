@@ -1,0 +1,213 @@
+{
+  "request_file": "scripts/mtp-exactness-manifests/requests/qwen38-number-game-256.json",
+  "output_dir": "/tmp/qwen38-mtp8-rejection-seeds-q8-20260819",
+  "input_files": [
+    {
+      "role": "target-and-mtp-model",
+      "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf"
+    }
+  ],
+  "environment": {
+    "CUDA_PATH": "/opt/cuda"
+  },
+  "startup_timeout_seconds": 600,
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 1,
+  "comparison_contract": {
+    "require_explicit_references": true,
+    "required_identity_keys": [
+      "model.sha256",
+      "prompt",
+      "mtp.depth",
+      "mtp.p_min",
+      "target_kv.k",
+      "target_kv.v",
+      "draft_kv.k",
+      "draft_kv.v",
+      "context",
+      "batch",
+      "ubatch",
+      "effective_draft_ubatch",
+      "sampler.seed",
+      "sampler.temperature"
+    ],
+    "common_identity": {
+      "model": {
+        "sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"
+      },
+      "prompt": "number-game-40-turns-v1",
+      "mtp": {
+        "depth": 8,
+        "p_min": 0.0
+      },
+      "target_kv": {
+        "k": "q8_0",
+        "v": "q8_0",
+        "residency": "gpu"
+      },
+      "draft_kv": {
+        "k": "q8_0",
+        "v": "q8_0",
+        "residency": "gpu"
+      },
+      "recurrent_planes": "full",
+      "workspace": {
+        "phase_aware": false
+      },
+      "context": 4096,
+      "batch": 1024,
+      "ubatch": 512,
+      "effective_draft_ubatch": 512,
+      "sampler": {
+        "seed": 7,
+        "temperature": 0.8
+      }
+    }
+  },
+  "common_args": [
+    "--model",
+    "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+    "--n-gpu-layers",
+    "999",
+    "--n-gpu-layers-draft",
+    "999",
+    "--fit",
+    "off",
+    "--split-mode",
+    "none",
+    "--main-gpu",
+    "0",
+    "--flash-attn",
+    "on",
+    "--ctx-size",
+    "4096",
+    "--parallel",
+    "1",
+    "--cont-batching",
+    "--kv-unified",
+    "--batch-size",
+    "1024",
+    "--ubatch-size",
+    "512",
+    "--cache-type-k",
+    "q8_0",
+    "--cache-type-v",
+    "q8_0",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "8",
+    "--spec-draft-p-min",
+    "0",
+    "--spec-draft-type-k",
+    "q8_0",
+    "--spec-draft-type-v",
+    "q8_0",
+    "--threads",
+    "3",
+    "--threads-batch",
+    "24",
+    "--cpu-range",
+    "0-2",
+    "--cpu-range-batch",
+    "0-23",
+    "--cpu-strict",
+    "1",
+    "--poll",
+    "100",
+    "--seed",
+    "7",
+    "--cache-ram",
+    "0",
+    "--verbosity",
+    "4"
+  ],
+  "cases": [
+    {
+      "name": "clean-gpu-seed7",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "args": ["--alias", "clean-gpu-seed7"]
+    },
+    {
+      "name": "candidate-gpu-cap2-seed7",
+      "compare_to": "clean-gpu-seed7",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {
+        "recurrent_planes": 2,
+        "workspace": {"phase_aware": true}
+      },
+      "args": [
+        "--alias", "candidate-gpu-cap2-seed7",
+        "--spec-mtp-rs-planes", "2",
+        "--phase-aware-workspace"
+      ]
+    },
+    {
+      "name": "candidate-cpu-cap2-seed7",
+      "compare_to": "clean-gpu-seed7",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {
+        "target_kv": {"residency": "cpu"},
+        "draft_kv": {"residency": "cpu"},
+        "recurrent_planes": 2,
+        "workspace": {"phase_aware": true}
+      },
+      "args": [
+        "--alias", "candidate-cpu-cap2-seed7",
+        "--no-kv-offload",
+        "--kv-cpu-pinned",
+        "--recurrent-state-offload",
+        "--spec-mtp-rs-planes", "2",
+        "--phase-aware-workspace"
+      ]
+    },
+    {
+      "name": "clean-gpu-seed42",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"sampler": {"seed": 42}},
+      "request": {"seed": 42},
+      "args": ["--alias", "clean-gpu-seed42", "--seed", "42"]
+    },
+    {
+      "name": "candidate-gpu-cap2-seed42",
+      "compare_to": "clean-gpu-seed42",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {
+        "sampler": {"seed": 42},
+        "recurrent_planes": 2,
+        "workspace": {"phase_aware": true}
+      },
+      "request": {"seed": 42},
+      "args": [
+        "--alias", "candidate-gpu-cap2-seed42",
+        "--seed", "42",
+        "--spec-mtp-rs-planes", "2",
+        "--phase-aware-workspace"
+      ]
+    },
+    {
+      "name": "candidate-cpu-cap2-seed42",
+      "compare_to": "clean-gpu-seed42",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {
+        "sampler": {"seed": 42},
+        "target_kv": {"residency": "cpu"},
+        "draft_kv": {"residency": "cpu"},
+        "recurrent_planes": 2,
+        "workspace": {"phase_aware": true}
+      },
+      "request": {"seed": 42},
+      "args": [
+        "--alias", "candidate-cpu-cap2-seed42",
+        "--seed", "42",
+        "--no-kv-offload",
+        "--kv-cpu-pinned",
+        "--recurrent-state-offload",
+        "--spec-mtp-rs-planes", "2",
+        "--phase-aware-workspace"
+      ]
+    }
+  ]
+}

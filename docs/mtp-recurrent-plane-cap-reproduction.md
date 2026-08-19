@@ -7,6 +7,45 @@ queries, artifacts, measurements, failures, and integration. Another developer
 should be able to reproduce the work without shell history or conversation
 context.
 
+## Exactness update: physical MTP ubatch
+
+The historical cap benchmarks in this document used target ubatch 512 and
+draft ubatch 128 on both the full and capped sides. Their exact-output result
+therefore remains evidence that sparse selected-boundary replay preserved that
+specific execution geometry. A later 1,000-token MTP audit showed that changing
+the physical draft ubatch from clean Bee's inherited target value can alter the
+MTP stream after a longer prefix. Current MTP rejects a nonzero draft ubatch
+that differs from target ubatch.
+
+For a supported current reproduction, omit every
+`--spec-draft-ubatch-size 128` below or replace it with 512. The historical
+performance and memory rows must not be relabeled as equal-ubatch measurements;
+the historical MTP-8 full/capped 5K and Nsight pairs require a fresh rerun.
+
+The supported equal-ubatch 1K matrix has now passed at MTP-3, MTP-5, and MTP-8:
+
+| MTP depth | Planes | Decode t/s | Replay cycles/tokens | Peak VRAM |
+|---:|---:|---:|---:|---:|
+| 3 | clean full | 65.400 | 0/0 | 14,406 MiB |
+| 3 | 2 / 3 / explicit 4 | 62.457 / 63.818 / 65.474 | 27/95 / 11/42 / 0/0 | 14,106 / 14,256 / 14,406 MiB |
+| 5 | clean full | 65.927 | 0/0 | 14,704 MiB |
+| 5 | 2 / 3 / 4 / explicit 6 | 63.333 / 64.190 / 64.561 / 65.924 | 27/117 / 16/80 / 10/59 / 0/0 | 14,106 / 14,256 / 14,406 / 14,704 MiB |
+| 8 | clean full | 63.927 | 0/0 | 15,154 MiB |
+| 8 | 2 / 3 / 4 / explicit 9 | 62.071 / 62.883 / 63.042 / 63.858 | 23/127 / 12/82 / 8/66 / 0/0 | 14,106 / 14,256 / 14,406 / 15,154 MiB |
+
+Every row matched its clean-Bee 1,000-token stream and response bytes. Every
+cap used sparse GPU replay with zero host checkpoint captures/restores; peak
+VRAM showed no hidden full-depth allocation. These t/s figures are single-run
+matched characterization. Exact command, per-row hashes, and artifact hashes
+are in Experiment 017. The cap algorithm and capability boundary remain
+retained. A later equal-ubatch MTP-6 5K run compared clean GPU full planes,
+candidate GPU full planes, pinned-CPU full planes, and pinned-CPU three planes.
+All four streams were exact. CPU full/capped decode was 57.200/55.363 t/s,
+peak VRAM was 14,514/13,926 MiB, and the cap performed 90 replay cycles over
+443 actual batch tokens with zero checkpoint traffic. The historical MTP-8
+Nsight pair still requires an equal-ubatch rerun. See Experiment 018 and
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md).
+
 The compact result ledger remains
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md). This document
 deliberately preserves more process detail, including rejected paths.
@@ -558,10 +597,11 @@ Recorded negative log:
 
 Both rows used clean processes, context 32,000, one slot, target batch/ubatch
 1,024/512, draft ubatch 128, MTP maximum 8, symmetric target/draft Q8_0 KV,
-pinned CPU attention KV, GPU recurrent state, all layers on GPU, FlashAttention,
-split none, fit off, three strict decode workers on CPUs 0-2, 24 strict batch
-workers on CPUs 0-23, draft p-min 0.85, seed 1234, default chat sampling, prompt
-cache off, streaming off, and reasoning loop guard `force-close`.
+pinned CPU-resident attention KV with CUDA attention execution, GPU recurrent
+state, all layers on GPU, FlashAttention, split none, fit off, three strict
+decode workers on CPUs 0-2, 24 strict batch workers on CPUs 0-23, draft p-min
+0.85, seed 1234, default chat sampling, prompt cache off, streaming off, and
+reasoning loop guard `force-close`.
 
 Nsight traced CUDA, NVTX, and OS runtime with CPU sampling and context-switch
 collection disabled. The only experimental difference was:

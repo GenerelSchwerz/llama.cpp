@@ -132,7 +132,8 @@ public:
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
                      bool   cpu_pinned = false,
-                 uint32_t   gpu_resident_layers = 0);
+                 uint32_t   gpu_resident_layers = 0,
+                     bool   offload_attn_compute = false);
 
     ~llama_kv_cache() = default;
 
@@ -365,6 +366,10 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
+    ggml_tensor * stage_store_rows(
+            ggml_context * ctx,
+            ggml_tensor  * source,
+            ggml_tensor  * stage) const;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -378,6 +383,8 @@ private:
         ggml_tensor * v;
         ggml_tensor * k_tail;
         ggml_tensor * v_tail;
+        ggml_tensor * k_store_stage;
+        ggml_tensor * v_store_stage;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;

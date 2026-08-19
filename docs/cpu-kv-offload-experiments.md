@@ -794,7 +794,8 @@ than its draft workspace, is the principal depth-scaling VRAM cost.
 
 ## Experiment 007: independent speculative draft ubatch
 
-Status: retained candidate.
+Status: retained for non-MTP model-backed speculative contexts; superseded and
+rejected for MTP after the longer exactness gate in Experiment 017.
 
 ### Implementation
 
@@ -842,8 +843,16 @@ Draft ubatch 128 saved 88 MiB of live process VRAM, changed decode by -0.2%,
 and reduced prompt throughput by 0.9%. Draft ubatch 32 saved 110 MiB, left
 decode unchanged within single-run noise, and reduced prompt throughput by
 4.3%. Output-side draft counts and acceptance were identical in all three
-runs. Recommend 128 as the balanced setting for this hardware and workload;
-32 remains an explicit capacity-first option rather than a default.
+64-token runs. At the time, 128 was recommended as the balanced setting.
+
+That MTP recommendation is withdrawn. Experiment 017 extended the check to
+1,000 tokens and found both 128 and 32 diverging from clean Bee's inherited-512
+MTP stream at generated token 100. The short screen ended before the numerical
+state difference became visible. Current MTP requires an omitted draft ubatch
+or one equal to target ubatch; `--phase-aware-workspace` provides the retained
+workspace saving without changing recurrent prompt-synchronization geometry.
+The option and measurements above remain applicable historical evidence for
+other model-backed speculative modes, whose independent ubatch is not rejected.
 
 ## Characterization 008: context-scaled non-MTP CUDA allocation
 
@@ -2266,3 +2275,628 @@ metadata. Direct-Q8 prompt MMA and bounded fixed-window GPU streaming remain
 larger follow-ons. The complete commands, chronology, artifact map, and
 integration procedure are in
 [`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).
+
+## Experiment 017: placement-matched MTP exactness and draft-ubatch gate
+
+Status: retained. MTP now preserves clean Bee's inherited physical ubatch;
+non-MTP model-backed speculative modes retain the independent control.
+
+### Why the oracle and gate changed
+
+The original correctness request compared MTP with one-token target decoding.
+That is not the upstream contract: clean BeeLlama and clean llama.cpp produce
+the same corresponding MTP streams, but MTP verification can differ from
+target-only decoding because it evaluates multiple target rows together. The
+correct oracle is therefore clean Bee MTP at the same MTP depth, sampling,
+cache placement, and execution geometry.
+
+Clean Bee commit `ba27edad2a84ff045a556df06661e821285c2fab` does not expose a
+draft-specific ubatch. Integrated MTP inherits target `n_ubatch`. Experiment
+007 added a common draft-context override after that baseline. Its 64-token
+MTP-5 screen was insufficient: output and aggregate acceptance counts agreed,
+but it ended before a changed recurrent state affected a sampled token.
+
+A 1,000-token CPU-Q8 MTP-2 diagnostic used the canonical 149-token coding
+prompt, greedy sampling, seed 1234, target ubatch 512, and candidate draft
+ubatches 512, 128, and 32. The inherited/equal-512 case matched clean Bee. Both
+128 cases (phase awareness off and on) and the 32 case first differed at
+generated token 100 and shared the same divergent stream. Phase awareness was
+therefore neither the cause nor a correction for changed physical geometry.
+
+`LLAMA_TRACE=1` reran 130 output tokens at 512 and 128. The first acceptance
+cycle regrouping occurred at output token 60: the 512 case accepted one of one
+draft rows and advanced 60 to 62, while 128 accepted two of two and advanced 60
+to 63. The preceding 149-token prompt had reached the draft recurrent context
+in one physical microbatch at 512 versus `128 + 21` at 128. Later acceptance
+cycles regrouped again around tokens 91-103, and the visible stream changed at
+100. This is a recurrent/model floating-point and verification-batch-geometry
+effect, not sampler corruption or a phase allocator bug.
+
+### Retained implementation
+
+The complete speculative configuration validator now receives target
+`n_ubatch`. If `draft-mtp` is active and an explicit nonzero draft ubatch differs
+from target ubatch, parsing fails with:
+
+```text
+draft-mtp requires spec-draft-ubatch-size (128) to match the target ubatch (512) for output-stable recurrent prompt synchronization; omit the draft override or use --phase-aware-workspace to reduce decode workspace
+```
+
+Validation remains order-independent and is called by both common argument
+parsing and server model loading. The MTP restriction applies through CLI,
+`LLAMA_ARG_SPEC_DRAFT_UBATCH`, and rendered INI/preset arguments. Omitted/zero
+and explicit-equal values pass. DFlash and other non-MTP model-backed modes
+remain able to use an independent draft ubatch. No model, architecture, prompt,
+token position, or MTP-depth check was added.
+
+The exactness runner now requires `effective_draft_ubatch` in every maintained
+MTP manifest. It independently resolves target and draft ubatch from merged
+CLI/environment settings and rejects a manifest whose declared identity does
+not match its actual command. This prevents a mismatched-geometry run from
+being reported as contract-exact merely because a descriptive field was
+omitted.
+
+### Source, build, hardware, and inputs
+
+- Clean Bee source: `ba27edad2a84ff045a556df06661e821285c2fab`;
+  server SHA-256
+  `9af36fc55d7b2e6bee806485d698ccbddee7970cff4ca106d1df0dda6ef4fcab`.
+- Candidate branch/base: `exp/mtp-bit-exact` at
+  `7febdc06a795002bf9e82f4b84026fd3740a3a12`, with uncommitted source/test diff
+  SHA-256
+  `a30fc3b48a158317742f7b3ce4923c3baf72b3041423215a2679ae6a4bec6666`
+  at measurement time. The retained validation was later committed as
+  `3693c6119` without changing its runtime policy.
+- Candidate server SHA-256:
+  `da7374a9c26c4ddf89136c67c5927fc6f27d09dcee36fe365c04c59eb07f6be3`.
+- Release CUDA build, native CPU, CUDA FlashAttention, effective architecture
+  `120a`, default quant matrix, shared ccache.
+- NVIDIA GeForce RTX 5070 Ti, 15,880 MiB usable process capacity, compute
+  capability 12.0, driver 610.57.04; Intel Core Ultra 9 285K; CUDA 13.3.
+- Model:
+  `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`,
+  14,437,471,712 bytes, SHA-256
+  `ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+- Request: originally
+  `/tmp/mtp-target-1k-audit-20260819/request-greedy.json`, now preserved
+  byte-for-byte as
+  `scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json`
+  (SHA-256
+  `c91ffa3ff2ca9958a7835004e3d5a6ffa7a242a9f74bfce3e7935d52161dce4c`);
+  149 prompt tokens, 1,000 output tokens, temperature zero, seed 1234, prompt
+  cache off.
+- Target/draft K/V: Q8_0/Q8_0; context 4,096; batch/ubatch 1,024/512; MTP-2,
+  `p_min=0.85`, full recurrent planes; three strict decode workers on CPUs 0-2.
+
+The maintained exact command is:
+
+```bash
+cd /home/gencoolpc/beellama-mtp-exact
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-cpu-q8-mtp2-phase-1k.json
+```
+
+The manifest contains the exact sterile environment and every server argument.
+It launches a fresh live clean-Bee golden followed by inherited phase-off,
+inherited phase-on, and explicit-equal phase-on candidates. `/slots` polling
+every two seconds provides request progress and the harness samples process
+VRAM throughout.
+
+### Post-fix exactness and resource result
+
+| Case | Decode | Draft accepted/generated | Peak VRAM | Exact tokens/content |
+|---|---:|---:|---:|---|
+| Clean Bee CPU MTP-2 | 17.096 t/s | 354/382 | 13,692 MiB | golden |
+| Candidate, inherited, phase off | 58.883 t/s | 354/382 | 14,104 MiB | yes |
+| Candidate, inherited, phase on | 58.610 t/s | 354/382 | 13,870 MiB | yes |
+| Candidate, explicit 512, phase on | 58.499 t/s | 354/382 | 13,870 MiB | yes |
+
+All four streams contain 1,000 tokens with token SHA-256
+`b1e3f667bf3a2269f9ba2b0d41ca6f1229b1780250b173ba17db3fa0a9abad9a`
+and generated-content SHA-256
+`fae6d743dc309784a909e015cc46450b7bfebfafb5e2a18c92c999206d019057`.
+Prompt-token, request-semantic, required-identity, token, and content comparisons
+all passed. Both phase-aware cases performed exactly one target/draft grow and
+one shrink, used zero speculative checkpoint captures/restores and zero replay,
+and saved 234 MiB of sampled peak VRAM versus candidate phase-off. The small
+decode difference is a single-run observation, not a performance claim.
+
+Artifacts:
+
+- `/tmp/mtp-cpu-q8-mtp2-postfix-v2-1k-20260819`
+- manifest SHA-256:
+  `015f134500063b08701b66a234aa4f417f56e8df9c6aa31019c5153ae60efee9`
+- provenance SHA-256:
+  `578c8aa0ac39d16b2475a5a9c2abeda3cea60c1acaf4986960f0df85a921d6cc`
+- comparisons SHA-256:
+  `d6cb6d06b5405538c944bd6bcf58ef1803aec5d02228866fab4e333ee80bb67c`
+- pre-gate mismatch artifact:
+  `/tmp/mtp-cpu-q8-mtp2-draft-ubatch-1k-20260819`
+- trace artifact:
+  `/tmp/qwen38-cpu-mtp2-ubatch-trace-130-20260819`
+
+### Tests and disposition
+
+`build-mtp-exact/bin/test-arg-parser` passes and covers inherited, equal,
+mismatched CLI, mismatched environment, valid non-MTP, and valid/invalid INI
+configurations. `scripts/test-mtp-exactness.py` passes 20/20 tests, including
+CLI and environment disagreement between declared and actual ubatch geometry;
+all four maintained manifests pass structural validation. The CUDA server and
+parser test rebuilt successfully with ccache, and `git diff --check` passes.
+
+Retain the fail-closed MTP validation and the strengthened manifest contract.
+Withdraw the MTP-specific draft-ubatch recommendation from current docs while
+preserving Experiment 007 as historical evidence and retaining the option for
+other speculative modes. Use inherited/equal physical ubatch plus phase-aware
+workspace for MTP.
+
+### Equal-ubatch recurrent-plane matrix
+
+The next clean-process run exercised the cap at MTP depths 3, 5, and 8 with
+two, three, four, and explicit-full plane values where valid. All contexts used
+target/effective-draft ubatch 512, GPU-resident Q8_0/Q8_0 target and draft KV,
+phase awareness off, the same 1K greedy request, and a fresh live clean-Bee
+golden for each MTP depth. Two capped planes have a zero-token direct rejection
+horizon, so every rejection requires deterministic original-full-shape sparse
+GPU replay. Three and four planes provide one- and two-token direct horizons.
+
+Exact command:
+
+```bash
+cd /home/gencoolpc/beellama-mtp-exact
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-gpu-q8-plane-cap-depths-1k.json
+```
+
+| MTP depth | Planes | Direct horizon | Decode t/s | Replay cycles/tokens | Peak VRAM | Exact to clean Bee |
+|---:|---:|---:|---:|---:|---:|---|
+| 3 | clean full | 3 | 65.400 | 0/0 | 14,406 MiB | golden |
+| 3 | 2 | 0 | 62.457 | 27/95 | 14,106 MiB | yes |
+| 3 | 3 | 1 | 63.818 | 11/42 | 14,256 MiB | yes |
+| 3 | explicit 4 | 3 | 65.474 | 0/0 | 14,406 MiB | yes |
+| 5 | clean full | 5 | 65.927 | 0/0 | 14,704 MiB | golden |
+| 5 | 2 | 0 | 63.333 | 27/117 | 14,106 MiB | yes |
+| 5 | 3 | 1 | 64.190 | 16/80 | 14,256 MiB | yes |
+| 5 | 4 | 2 | 64.561 | 10/59 | 14,406 MiB | yes |
+| 5 | explicit 6 | 5 | 65.924 | 0/0 | 14,704 MiB | yes |
+| 8 | clean full | 8 | 63.927 | 0/0 | 15,154 MiB | golden |
+| 8 | 2 | 0 | 62.071 | 23/127 | 14,106 MiB | yes |
+| 8 | 3 | 1 | 62.883 | 12/82 | 14,256 MiB | yes |
+| 8 | 4 | 2 | 63.042 | 8/66 | 14,406 MiB | yes |
+| 8 | explicit 9 | 8 | 63.858 | 0/0 | 15,154 MiB | yes |
+
+Every candidate matched its golden token IDs and generated content bytes for
+all 1,000 tokens. Draft generated/accepted counts also matched within each
+depth: 457/417 at MTP-3, 498/439 at MTP-5, and 479/419 at MTP-8. Every capped
+case recorded zero target checkpoint captures/restores and zero serialized
+checkpoint payload; all recovery work used sparse GPU replay. Explicit-full
+values matched clean Bee performance, allocation, output, and zero-replay
+behavior.
+
+Peak allocation increased by approximately 150 MiB per plane and never hid a
+full-depth snapshot. Relative to full allocation, two planes saved 300 MiB at
+MTP-3, 598 MiB at MTP-5, and 1,048 MiB at MTP-8. Four planes saved 748 MiB at
+MTP-8. The corresponding MTP-8 single-run decode changes were -2.90% for two
+planes, -1.63% for three, and -1.38% for four. These throughput values are
+recorded as matched single-run characterization, not confidence intervals.
+
+Artifacts:
+
+- `/tmp/mtp-gpu-q8-plane-cap-depths-1k-20260819`
+- manifest SHA-256:
+  `df6847f50bdbbe779b2a94f43166de5a2bcc5500b8d3c96107402df704b43aef`
+- provenance SHA-256:
+  `740cdc2f75408430fc6804930dba5009f65d771d894885273905956f86a3c684`
+- comparisons SHA-256:
+  `7119dbd4283b6013e0c1d3a0e17b6feb9f5215e07ff1b2aac00d318b96ff4965`
+
+The equal-ubatch 1K cap matrix is accepted. Experiment 018 adds a supported
+equal-ubatch MTP-6 CPU/GPU full-versus-three-plane 5K result. The historical
+MTP-8 5K, 140K phase-aware, and Nsight matrices remain to be rerun before their
+128-draft-ubatch numbers can be replaced.
+
+## Experiment 018: canonical Q8 KV stores across CPU/GPU residency
+
+Status: retained. Host-resident standard quantized KV now preserves the model
+layer accelerator's conversion semantics, and exact-tail planning separates
+storage ownership from attention execution placement.
+
+### Failure and controls
+
+The first placement-crossing exactness matrix used clean Bee GPU Q8 KV as the
+golden and ran the candidate with GPU and pinned-CPU Q8 KV. Target-only output
+first differed in the CPU case at generated token 5. MTP inherited the same
+body-cache difference; enabling the exact-tail option did not correct it.
+
+The corresponding F16 target-only control matched across CPU and GPU
+residency. Raw state comparison then found sparse byte differences in Q8 rows
+written by the CPU and CUDA converters. This isolated the issue to persistent
+quantized-KV construction rather than the sampler, MTP scheduler, phase-aware
+allocator, recurrent rollback, or prompt cache. CPU and CUDA quantization are
+both valid approximate converters, but placement-dependent converter bytes are
+not an acceptable basis for an output-invariance contract.
+
+Two low-level approaches were rejected:
+
+- changing CPU or CUDA rounding in an attempt to make independently maintained
+  converters converge; this was backend-specific, fragile across types, and
+  did not express which implementation owned the numerical contract;
+- a device-side indexed `SET_ROWS` into a full persistent-sized stage; partial
+  microbatches left unwritten rows and coupled scratch size to the cache rather
+  than the current write batch.
+
+Both experiments were fully reverted before the retained implementation.
+
+### Retained implementation
+
+For a standard quantized KV tensor that is persistent in host memory while its
+model layer executes on an accelerator, `llama_kv_cache` now allocates a small
+per-layer quantized store stage on that layer's device. The graph performs:
+
+1. the normal accelerator `F32 -> cache type` conversion into the stage;
+2. a transfer of only the newly written quantized rows to the host backend;
+3. a same-type `SET_ROWS` scatter into persistent host KV.
+
+CPU same-type `SET_ROWS` is a byte-preserving row copy. It does not dequantize
+and requantize. Construction capability-probes both the accelerator conversion
+and store operations for each layer/type and fails closed for an accelerator
+layer if canonical conversion cannot be represented. There is no model-family,
+prompt, token-position, or Qwen enum check.
+
+The stage is bounded by the maximum of physical ubatch and the largest fused-op
+probe shape times sequence count. The Qwen Gated Delta Net resolver builds a
+synthetic 16-token graph even when a one-token benchmark requests ubatch one;
+using the shared 16-token probe contract prevents a stage-shape failure without
+hard-coding that behavior inside the cache implementation. At the production
+ubatch of 512, the Qwen3.8 test case allocates stages for 16 host-resident
+attention layers, 512 rows each, totaling 17.00 MiB of device memory.
+
+Exact-tail routing required a separate correction. The original route planner
+treated the persistent buffer owner as the execution device. With pinned host
+KV and operation offload enabled, that incorrectly planned the final tail
+attention for CPU even though the scheduler runs attention on CUDA. The route
+descriptor now carries storage buffer type and execution backend independently:
+storage capability validates writes, execution capability validates attention
+and math, and a native final-tail op is assigned explicitly to the matching
+scheduler backend. `--no-op-offload` still selects and successfully runs the
+CPU route.
+
+### Source, build, hardware, and environment
+
+- Candidate branch/base: `exp/mtp-bit-exact` at
+  `7febdc06a795002bf9e82f4b84026fd3740a3a12` with an uncommitted retained
+  source/test patch. The runtime-bearing diff SHA-256 at the final server
+  rebuild was
+  `28c5eedaf35c2c776b574ffeb8a35f76346e11e71b430478a15514a026f98f32`.
+  After replacing a stale syntactic upstream-merge guard with semantic
+  storage/execution assertions, the final audited
+  `git diff -- common ggml src tests tools/server` SHA-256 is
+  `12b51655d51ab26c16ac527eeef1cdf3cc4d884d8b1bfbe06e208801406bb49c`;
+  that test-only change did not require a server rebuild. The retained source
+  was later committed as `3693c6119` and `d4b50c5cc`, and the harness and
+  maintained manifests as `85eef4a89`.
+- Candidate server SHA-256:
+  `da7374a9c26c4ddf89136c67c5927fc6f27d09dcee36fe365c04c59eb07f6be3`.
+- Clean Bee: `ba27edad2a84ff045a556df06661e821285c2fab`; server SHA-256
+  `9af36fc55d7b2e6bee806485d698ccbddee7970cff4ca106d1df0dda6ef4fcab`.
+- Clean llama.cpp control: `af5172627d3513a7efed526b206dca9cd6536452`;
+  server SHA-256
+  `710538e3219625f43531037128e0357621b5ba6c6898e5bbd4ec5682ed094b27`.
+  Its 1K target-only, MTP-2, and MTP-6 token hashes equal the clean Bee hashes
+  used below.
+- Release CUDA build, native CPU, CUDA FlashAttention, effective architecture
+  `120a`, default quant matrix, CUDA 13.3, shared ccache.
+- NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, driver 610.57.04; Intel
+  Core Ultra 9 285K, 24 cores without SMT.
+- Qwen3.8 27B model path and SHA-256 are the same as Experiment 017.
+
+The runner does not inherit the launching shell's `LLAMA_*`, `GGML_*`, CUDA
+visibility, tuning, or preset variables. It creates a sterile environment and
+adds only the manifest's explicit `CUDA_PATH=/opt/cuda`; every behavior-changing
+server choice is a command-line argument. This prevents an ambient environment
+flag from making a CPU/GPU comparison asymmetric.
+
+### Exact commands and progress
+
+Each command launches fresh servers sequentially, polls health and `/slots`,
+samples process VRAM, and terminates a case before starting the next:
+
+```bash
+cd /home/gencoolpc/beellama-mtp-exact
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-tail-cross-residency-q8-128.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-target-cross-residency-q8-1k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp-cross-residency-q8-1k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-gpu-q8-full-depths-1k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-gpu-q8-plane-cap-depths-1k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-cross-residency-q8-5k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-lifecycle-q8.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-router-reload-q8.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp8-rejection-seeds-q8.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp8-high-confidence-q8.json
+```
+
+All final target/draft caches are homogeneous Q8_0/Q8_0, target and effective
+draft ubatch are 512, batch is 1,024, FlashAttention is on, prompt cache is
+disabled, seed is 1234, strict decode affinity is CPUs 0-2, and batch affinity
+is CPUs 0-23. The 1K request is greedy. The 5K orbital-sandbox request uses
+temperature 0.8 and MTP `p_min=0.85` in an 8,192-token context.
+
+### Final target-only and exact-tail controls
+
+| 1K target-only case | Prefill | Decode | Peak VRAM | Exact to clean GPU |
+|---|---:|---:|---:|---|
+| Clean Bee, GPU Q8 | 1,015.914 t/s | 50.055 t/s | 13,560 MiB | golden |
+| Candidate, GPU Q8 | 977.607 t/s | 50.021 t/s | 13,560 MiB | yes |
+| Candidate, pinned CPU Q8 | 879.466 t/s | 47.532 t/s | 13,442 MiB | yes |
+
+All three target-only cases produced token SHA-256
+`cd8d20d1270ee556a5035994abe08e55fab1a38600a89208becbc9e348e8d283`.
+The 128-token exact-tail control also matched token-for-token and byte-for-byte:
+
+| Exact-tail case | Prefill | Decode | Peak VRAM | Exact |
+|---|---:|---:|---:|---|
+| Clean Bee, GPU Q8 | 975.201 t/s | 47.773 t/s | 13,584 MiB | golden |
+| Candidate, GPU Q8 | 953.027 t/s | 47.649 t/s | 13,584 MiB | yes |
+| Candidate, pinned CPU Q8 | 820.516 t/s | 45.632 t/s | 13,464 MiB | yes |
+
+The exact-tail token SHA-256 is
+`31e64405e471ffe000382e76ddc4a6ba75b82ed19f0f52c057b9967764f9d5b0`.
+Verbose logs identify CUDA0 as the CPU-resident case's native-tail execution
+device; a separate `--no-op-offload` smoke test identifies CPU and completes.
+
+### Final 1K MTP CPU/GPU matrix
+
+| Case | Prefill | Decode | Accepted/generated | Replay cycles/tokens | Peak VRAM | Exact |
+|---|---:|---:|---:|---:|---:|---|
+| Clean GPU MTP-2 | 848.548 t/s | 61.918 t/s | 365/390 | 0/0 | 14,256 MiB | golden |
+| Candidate GPU MTP-2 | 848.273 t/s | 62.047 t/s | 365/390 | 0/0 | 14,256 MiB | yes |
+| Candidate CPU MTP-2, phase off | 808.140 t/s | 58.836 t/s | 365/390 | 0/0 | 14,124 MiB | yes |
+| Candidate CPU MTP-2, phase on | 771.713 t/s | 58.416 t/s | 365/390 | 0/0 | 13,890 MiB | yes |
+| Clean GPU MTP-6 | 835.586 t/s | 65.321 t/s | 428/470 | 0/0 | 14,854 MiB | golden |
+| Candidate GPU MTP-6 | 840.549 t/s | 65.335 t/s | 428/470 | 0/0 | 14,854 MiB | yes |
+| Candidate CPU MTP-6, phase off | 804.809 t/s | 62.091 t/s | 428/470 | 0/0 | 14,722 MiB | yes |
+| Candidate CPU MTP-6, phase on | 751.091 t/s | 61.812 t/s | 428/470 | 0/0 | 14,488 MiB | yes |
+| Candidate CPU MTP-6, phase on, 3 planes | 756.602 t/s | 60.790 t/s | 428/470 | 10/56 | 13,890 MiB | yes |
+
+MTP-2 token SHA-256 is
+`14e47fb5c35897bfe818339bd163ef1be1f630b558055fe0d323cad922c36217`;
+MTP-6 is
+`842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`.
+All full-plane rows used zero checkpoint captures/restores and zero replay. The
+capped row used selected GPU replay only and still used zero checkpoints.
+
+### Final 5K stochastic MTP-6 CPU/GPU gate
+
+| Case | Prefill | Decode | Accepted/generated | Replay cycles/tokens | Peak VRAM | Exact |
+|---|---:|---:|---:|---:|---:|---|
+| Clean GPU, full planes | 847.371 t/s | 63.281 t/s | 2,077/2,435 | 0/0 | 15,006 MiB | golden |
+| Candidate GPU, full planes | 841.466 t/s | 63.223 t/s | 2,077/2,435 | 0/0 | 15,006 MiB | yes |
+| Candidate CPU, phase-aware, full planes | 751.182 t/s | 57.200 t/s | 2,077/2,435 | 0/0 | 14,514 MiB | yes |
+| Candidate CPU, phase-aware, 3 planes | 750.641 t/s | 55.363 t/s | 2,077/2,435 | 90/443 | 13,926 MiB | yes |
+
+All four emitted 5,000 tokens with token SHA-256
+`1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`
+and identical generated bytes. Acceptance was 85.298%. Every case recorded
+zero checkpoint captures/restores, zero checkpoint payload, and zero
+capture/restore wall time. CPU full saved 492 MiB of sampled peak VRAM versus
+GPU full; CPU with three planes saved 1,080 MiB. The capped CPU row was 3.21%
+slower in decode than CPU full in these single runs and did 443 actual replay
+batch tokens. The matched final Nsight matrix below measures the transfer cost;
+serialized checkpoint payload remains distinct from profiler totals.
+
+### Same-process prompt-cache, sleep/wake, and regrowth gate
+
+The lifecycle manifest keeps each case's server alive for four completions. It
+starts from the 149-token coding prompt, generates 96 tokens, waits until
+`GET /props` reports `is_sleeping=true`, wakes with a 255-token continuation,
+generates 96 tokens, shrinks to a 192-token cached branch for 32 tokens, sleeps
+again, and wakes/regrows a 365-token branch for 64 tokens. Continuation prompts
+are assembled from recorded token IDs and an unspecialized suffix, and the
+harness compares every step's prompt IDs, request semantics, output IDs, and
+response bytes independently.
+
+| Case | Peak VRAM | Exact to clean GPU at all four completions |
+|---|---:|---|
+| Clean GPU, phase off | 14,854 MiB | golden |
+| Candidate GPU, phase off | 14,854 MiB | yes |
+| Candidate GPU, phase on | 14,614 MiB | yes |
+| Candidate pinned CPU, phase off | 14,722 MiB | yes |
+| Candidate pinned CPU, phase on | 14,488 MiB | yes |
+| Candidate pinned CPU, phase on, three planes | 13,896 MiB | yes |
+
+Both sleep transitions were observed in every case, and server logs show model
+context creation after each wake. Common per-completion token SHA-256 values
+were `83388a4200b4dc6292a1a88f4f1e5cdcb223d853f6c851ee63342670d5bd9447`,
+`0c68b2382550f4e53b662682e5f2900cda42cfad24f4abd8b5717b0354b6d0e9`,
+`d5fe0a774d226db31b79a29843a2e3e6639d7a078c72b302edcc49a43360f31e`,
+and `b23508c341f7afd50bf72c089c2011de52a45e1e0aaa852e69e8fcb5b8738287`.
+Full-plane candidates accepted 160/183 draft tokens with zero checkpoints and
+zero replay. The capped row accepted the same tokens, performed five selected
+GPU replay cycles with 30 replay-batch tokens, and still captured/restored no
+host checkpoint.
+
+The explicit router matrix separately replaced the harness-owned preset with a
+hashed fixture whose informational tag changed, called `POST /models/reload`,
+required the live model to transition from `loaded` to `unloaded`, and sent an
+identical request that autoloaded a new child process. The before/after outputs
+within each case and both outputs across cases were token- and byte-exact:
+
+| Router reload case | Peak child VRAM | Before/after token SHA-256 | Exact |
+|---|---:|---|---|
+| Clean GPU, phase off | 14,854 MiB | `83388a4200b4dc6292a1a88f4f1e5cdcb223d853f6c851ee63342670d5bd9447` | golden |
+| Candidate GPU, phase on | 14,614 MiB | same | yes |
+| Candidate pinned CPU, phase on | 14,488 MiB | same | yes |
+| Candidate pinned CPU, phase on, three planes | 13,890 MiB | same | yes |
+
+Router logs identify the unload reason as `source updated or removed` and show
+different child PIDs loading the model before and after. The harness now sums
+GPU use across the router process tree, so the table reports child allocations.
+The capped case repeated 3 replay cycles/20 replay-batch tokens on both sides of
+the reload; all candidate checkpoint counters and payloads remained zero.
+
+### Final depth, cap, stochastic-seed, and acceptance-edge gates
+
+The final server binary was also the candidate in two earlier clean-process
+depth matrices. Full-plane GPU MTP matched clean Bee at depths 1, 2, 3, 5, 6,
+and 8. At depths 3, 5, and 8, all tested 2-, 3-, 4-, and full-plane policies
+matched. Capped rows exercised 8-27 selected GPU replay cycles and 42-127
+replay-batch tokens; full-plane rows used none.
+
+Two new 256-token stochastic matrices removed the remaining single-prompt,
+single-seed, and middle-acceptance bias:
+
+| Prompt / threshold / seed | Placement | Accepted/generated | Replay cycles/tokens | Decode | Peak VRAM | Exact |
+|---|---|---:|---:|---:|---:|---|
+| number game / `p_min=0` / 7 | clean GPU full | 202/424 | 0/0 | 106.376 t/s | 15,154 MiB | golden |
+| same | candidate GPU, 2 planes | 202/424 | 43/387 | 65.117 t/s | 13,860 MiB | yes |
+| same | candidate pinned CPU, 2 planes | 202/424 | 43/387 | 64.420 t/s | 13,754 MiB | yes |
+| number game / `p_min=0` / 42 | clean GPU full | 178/614 | 0/0 | 73.679 t/s | 15,154 MiB | golden |
+| same | candidate GPU, 2 planes | 178/614 | 69/621 | 43.273 t/s | 13,860 MiB | yes |
+| same | candidate pinned CPU, 2 planes | 178/614 | 69/621 | 42.635 t/s | 13,754 MiB | yes |
+| website / `p_min=0.999` / 2026 | clean GPU full | 31/31 | 0/0 | 49.185 t/s | 15,154 MiB | golden |
+| same | candidate GPU full | 31/31 | 0/0 | 48.545 t/s | 14,920 MiB | yes |
+| same | candidate pinned CPU full | 31/31 | 0/0 | 46.982 t/s | 14,794 MiB | yes |
+| same | candidate pinned CPU, 3 planes | 31/31 | 0/0 | 47.073 t/s | 13,892 MiB | yes |
+
+`p_min=0` forced full-depth MTP-8 drafting and frequent rejection beyond the
+two-plane policy's zero-token direct horizon. Both seeds remained exactly
+equal to their clean Bee oracle despite 387 and 621 actual replay-batch tokens.
+At `p_min=0.999`, every actual draft was accepted and the capped policy did no
+replay. Common token hashes were
+`b1cdcec6763a8335d171825bc4a33d73feb96956dc4090599ed6cbc28763b028`
+(seed 7),
+`5a5450968f1862765c77170595dda7632f242fa9747e62f67ea7242c1e6cc4d0`
+(seed 42), and
+`f8e70e80e321d5d31efe9b47dc69a87f7d120886f67b6d3c19b2ed68b4386a13`
+(website seed 2026). Every checkpoint capture/restore count, time, and payload
+was zero. These are correctness and single-run characterization results, not
+throughput confidence intervals.
+
+### Final Nsight CPU/GPU and recurrent-cap accounting
+
+The maintained profiler command is:
+
+```bash
+cd /home/gencoolpc/beellama-mtp-exact
+
+scripts/mtp-nsys-profile.sh gpu-full gpu 0
+scripts/mtp-nsys-profile.sh cpu-full cpu 0
+scripts/mtp-nsys-profile.sh cpu-planes3 cpu 3
+```
+
+It uses a sterile environment, wraps the final candidate server with Nsight
+Systems 2026.1.3 (`cuda,nvtx,osrt`, no CPU sampling/context switches), polls
+health and `/slots`, samples process VRAM/RSS every five seconds, gracefully
+stops the server, waits for report finalization, and emits both
+`cuda_gpu_mem_size_sum` and `cuda_gpu_mem_time_sum`. At measurement time the
+harness SHA-256 was
+`3f53b7698e1d2621c679aa9c12738ab6e5bbc02c7c51a4104c5659047ac74df5`.
+All rows used phase-aware workspace, MTP-6, the 5K stochastic request,
+Q8_0/Q8_0 target/draft KV, context 8,192, batch/ubatch/effective draft ubatch
+1,024/512/512, and otherwise identical arguments.
+
+| Measurement | GPU full | Pinned CPU full | Pinned CPU, 3 planes |
+|---|---:|---:|---:|
+| Prefill | 751.827 t/s | 719.122 t/s | 726.574 t/s |
+| Decode under Nsight | 61.001 t/s | 55.622 t/s | 54.065 t/s |
+| Request wall | 82.167 s | 90.103 s | 92.688 s |
+| Sampled peak VRAM | 14,778 MiB | 14,532 MiB | 13,944 MiB |
+| H2D total/count | 17,485.510 MB / 97,840 | 327,709.736 MB / 185,590 | 337,755.028 MB / 189,820 |
+| H2D aggregate time | 0.886 s | 6.549 s | 6.710 s |
+| D2H total/count | 5,700.920 MB / 21,699 | 5,915.778 MB / 131,647 | 6,381.261 MB / 134,887 |
+| D2H aggregate time | 0.156 s | 0.213 s | 0.223 s |
+| Replay cycles/batch tokens | 0/0 | 0/0 | 90/443 |
+
+CPU full saved 246 MiB versus same-phase GPU full under the profiler, while it
+added 310,224.226 MB H2D and 214.858 MB D2H. Decode fell 8.82% and wall time
+rose 9.66%. This is not a hidden full-depth GPU snapshot and not a correctness
+bug: pinned CPU is persistent KV storage, while normal operation offload keeps
+attention on CUDA, so the growing host KV participates in accelerator
+attention. The bounded 17 MiB canonical store stage accounts for newly written
+quantized rows in the D2H direction; the whole-case delta is reported rather
+than mislabeled as a stage-only counter.
+
+The three-plane cap saved another 588 MiB, added 10,045.292 MB H2D and 465.483
+MB D2H, and reduced decode 2.80% versus CPU full. These deltas accompany exactly
+90 selected GPU replay cycles/443 replay-batch tokens. All three traces had
+token SHA-256
+`1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`,
+content SHA-256
+`afd0208aaaf57cd003c1b0a8d8f29a83c73fa8a8264b547fc6cba0093e1cbe5c`,
+acceptance 2,077/2,435, and zero checkpoint counts/times/payloads.
+
+| Case | Artifact | Trace / provenance SHA-256 |
+|---|---|---|
+| GPU full | `/tmp/mtp-exact-nsys-gpu-full-20260819` | `2a89d5977705e5502c8cbb38026ba875f41105a989f0afa8e8fc0ce57fab4ee7` / `ecf675c279b9426c927dc1b296fa6065c5ae3087997e33d2d887cc2091bc065b` |
+| pinned CPU full | `/tmp/mtp-exact-nsys-cpu-full-20260819` | `6552e47910792a2c375d8d6f8e7987eb30074b2661793f47ce3c453de624191c` / `98373df9e9ac171015490fa39304909ab37333dc8f921d642858af2883fdd093` |
+| pinned CPU, 3 planes | `/tmp/mtp-exact-nsys-cpu-planes3-20260819` | `b8b42f0e05fdc231ebb82bc365546919d40aee130338c243af5cb9179ffa65b0` / `a4152610ed7491ac52d43b206f1abab8ac0cf59a9328ab307859f2a38eb69141` |
+
+### Artifacts, hashes, tests, and disposition
+
+| Matrix | Artifact | Manifest / provenance / comparisons / summary SHA-256 |
+|---|---|---|
+| exact tail | `/tmp/qwen38-tail-cross-residency-q8-128-v3-20260819` | `e2f1cbe8524bd60541019b99297b711b10ffd51337e083082425b4a3b25b6dad` / `52c523c90ea5e499c9f9bee1ba76431afcc37e50cb6ab7a94326d560303955ca` / `d43fad0f228c61ce85d7d99d23534209a0db06eb811cd2290ecedf5162d287c3` / `f8d37c1f6137aa28137482113f650907a306abcee924013aaa86b7378b02a7a1` |
+| target 1K | `/tmp/qwen38-target-cross-residency-q8-1k-final-v2-20260819` | `72ce3de204c9fee4b13c8c9b28d13413b7bc80fc541de9fcee97c56949ae4735` / `8656d1a1539aafbd920894f55854c30619db641631a6f7d950e746885bc4d7d0` / `e8118f4f690ffa519b5396c57fd5c14842a7067c24524830d21e4bb83eaf4b33` / `4d5ddb2f81861005df31b8a77fe3c867131911481e002a02ec51cd83115d974e` |
+| MTP 1K | `/tmp/qwen38-mtp-cross-residency-q8-1k-final-v2-20260819` | `fa056f5fea141e627fb0d8101c1a24b204e4cde2ee0ae3e625d78cb6fdddfe2a` / `92b6ee20ed9832d0a44d2de7c08c4a7fe0276fd152c89f483671658232ee8a10` / `eb6d3f275310a5855f12067e4a15931cae6abb00d923468125f9af4695733cab` / `fe4d12e2691962f82cf886846f821942dca9d375be78043142c1d1ed04aebe5f` |
+| full-plane depth sweep | `/tmp/mtp-golden-gpu-q8-full-depths-1k-20260819` | `0cd15951f029869a5497e7ebba169259d262757c73eb140fcc61252e77f77700` / `fda16144ae164c8399036b5361d7251f6d04e3a072101034457540023c2190f8` / `bbc72c9aabb1e9808b03f3032017180b3714e7a0275f324ef32b2dda16c086c6` / `f3d51aae99e3b74aa392ffd71ce95c8835b6f46af4ec46c4f4ec8363dcc02951` |
+| recurrent-plane depth sweep | `/tmp/mtp-gpu-q8-plane-cap-depths-1k-20260819` | `df6847f50bdbbe779b2a94f43166de5a2bcc5500b8d3c96107402df704b43aef` / `740cdc2f75408430fc6804930dba5009f65d771d894885273905956f86a3c684` / `7119dbd4283b6013e0c1d3a0e17b6feb9f5215e07ff1b2aac00d318b96ff4965` / `2607c124009105180d6d59c547b6760140c2df1db98806aee01352ed0f9f3514` |
+| MTP-8 rejection/seeds | `/tmp/qwen38-mtp8-rejection-seeds-q8-20260819` | `0f605d28c782439bfbe16b42e824b9d6769def5ab5c8ce7383f0ceea3f28b148` / `312613aa2803222bbfcc4591845460e249896386c8d0213daf0e7de68ce644ba` / `e2f177efe29a30bb0ee9ec16e204d0aa527816784ab2031c3f47c824cb713bd9` / `03176b06fdd2816833c93286cef679d294539c357575017ad85e42c52fe209dd` |
+| MTP-8 high confidence | `/tmp/qwen38-mtp8-high-confidence-q8-20260819` | `7d542a5a514e6d0db24b08ba30c0dcce0ff6833b3f02888dd4d35932f38dba35` / `8283338a3a734770c1e3a3bddf57fab46aaee0faf3347b3e5e9489c12fc9b398` / `15c28dd9db58bec25f1b79e80846c1153dcdfda0bfcc757e050b680844a1d4fd` / `b1c9bb20bc0cb33476e821fad5c2a9d03ae380ec7aacba8b18067f963997610c` |
+| MTP-6 5K | `/tmp/qwen38-mtp6-cross-residency-q8-5k-v2-20260819` | `7bb54c0bbabcf16b44be11ae1016f55880b55a4f47d08f5113b160dd38477105` / `63385922b8fb63be331a9e467350bdaa155803fc1ddac07be00dae1edec7a0de` / `5f38d35db1a63b979c355115978d469f1d0dac0f8928e7ea099c4331073595bd` / `23490d7c5a2b69b79bb1386fead97976069b434e420bb7d349f129ae851b83cb` |
+| MTP-6 lifecycle | `/tmp/qwen38-mtp6-lifecycle-q8-20260819` | `bd974faf394447b3d71eacf3ac2a3e4597dc9f9f75377b15e21ffff39387cf69` / `fe3a6781a81daf4d3e1b1a4da58921100c1f3eb74a57c83943f17b17fe18dc2d` / `4acf083d85b1ea64c1504ab2c043a5ec5ae481c0389da9cb6d61e4b195c43556` / `77d84efddc79f702978ecdeb4e2bf660941dc0aa970703a700e6b59e89d71723` |
+| MTP-6 router reload | `/tmp/qwen38-mtp6-router-reload-q8-20260819` | `94b47d3eac42696fb288124131703036ffad082d879976188e82e9e7ab683b0f` / `12f4f5744521a753633fedd2417e16903184fdf948b059c02dff8ffd875eeb90` / `5d194ac098b7aed6f63dab80d9832a06b58492771df79f4d9ca4b7ea328d2983` / `f6942b8ec35fac297f881eee50557e3970ce84dc79634505bc8484f4b0c0d40e` |
+
+The full hashes and complete chronology are in
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md).
+The first 5K attempt used an obsolete chat-message request shape that the
+runner intentionally rejected before generation; it is a setup error, not a
+benchmark result.
+
+After the final source freeze, `llama-server`, `llama-bench`,
+`test-arg-parser`, `test-backend-ops`, and `test-kv-cache-tail` rebuilt. CPU
+same-type/standard `SET_ROWS` passed 721/721 backend cases; CUDA passed 267/267.
+The exactness-runner unit suite passed 35/35, including typed lifecycle,
+request-to-sampler-identity binding, and
+later-step comparison coverage. Focused parser, recurrent
+rollback, prompt-checkpoint, sampler/loop-guard rollback, allocator-sharing,
+and server regression results are recorded in the reproduction document.
+
+The final focused CTest rerun passed 11/11. A stale upstream-merge guard first
+counted copies of the old CPU-owner assignment and failed after the intentional
+storage/execution descriptor split. It was revised to assert the actual
+invariant—CPU ownership for host storage, storage-backend write probing, and
+execution-backend attention probing—and then passed. The unfiltered generic
+backend-op CTest was stopped after it expanded into unrelated operations; the
+two relevant selections passed 721/721 CPU and 267/267 CUDA cases.
+
+Retain the capability-probed store stage, byte-copy scatter, storage/execution
+tail split, and explicit native-tail scheduling. The measured MTP trade is
+17.00 MiB of bounded target device staging plus 1.06 MiB for the one-layer MTP
+context, and a D2H transfer of each newly written quantized row, in exchange for
+placement-independent persistent Q8 bytes. The much larger
+310,224.226 MB CPU-versus-GPU H2D delta belongs to CUDA attention over the
+growing host-resident cache and cannot be removed by changing the row scatter.
+KVarN, lower or
+asymmetric standard cache types, multi-GPU/meta placement, Vulkan/HIP, and
+non-Qwen model families require their own output and profiler matrices before
+equivalent claims are made.
