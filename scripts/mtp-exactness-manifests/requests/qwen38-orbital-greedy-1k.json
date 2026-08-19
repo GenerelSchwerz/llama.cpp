@@ -1,0 +1,9 @@
+{
+  "prompt": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nWrite a single self-contained HTML file: an interactive orbital mechanics sandbox.\nCanvas-based, 60fps. Users can click-drag to fling new planets into the system;\ngravity is simulated with velocity Verlet integration against a central star.\nInclude trailing orbit paths that fade, collision merging with a mass-conserving\nflash, a mass/velocity readout on hover, and a pause/reset UI. No libraries,\nno assets — one file, pure JS.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+  "n_predict": 1000,
+  "seed": 1234,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true,
+  "temperature": 0
+}
