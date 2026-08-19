@@ -8655,6 +8655,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F16, GGML_TYPE_F16, GGML_TYPE_I32, { 32, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_I64, { 128, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_I64, { 128, 8, 1, 1 }, { 1, 1 }, 4, false, true, true));
+    for (ggml_type type : standard_cache_types) {
+        if (ggml_is_quantized(type)) {
+            // Host-resident quantized KV uses SET_ROWS as a byte-preserving
+            // scatter after conversion on the model-layer accelerator.
+            test_cases.emplace_back(new test_set_rows(
+                    type, type, GGML_TYPE_I64, { 256, 11, 1, 1 }, { 1, 1 }, 3, false));
+            test_cases.emplace_back(new test_set_rows(
+                    type, type, GGML_TYPE_I32, { 256, 11, 2, 3 }, { 1, 1 }, 3, false, true));
+        }
+    }
     for (ggml_type body_type : standard_cache_types) {
         if (!ggml_is_quantized(body_type)) {
             continue;

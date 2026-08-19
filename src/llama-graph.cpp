@@ -3181,7 +3181,7 @@ static void validate_native_tail_operation(
         throw std::logic_error(format(
                 "KV tail layer %d execution descriptor does not match final tensor types or extents", il));
     }
-    auto * dev = route->owner;
+    auto * dev = route->execution_backend;
     if (!dev || !ggml_backend_dev_supports_op(dev, op)) {
         throw std::runtime_error(format(
                 "KV tail layer %d native operation is unsupported by its planned backend %s; "
@@ -3195,6 +3195,23 @@ static void validate_native_tail_operation(
             ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type),
             ggml_type_name(op->src[5]->type), ggml_type_name(op->src[6]->type),
             mctx->get_tail_body_execution_rows(il));
+}
+
+static ggml_backend_t get_native_tail_execution_backend(
+        ggml_backend_sched_t sched,
+        const llama_kv_cache_context * mctx,
+        int32_t il) {
+    auto * dev = mctx->get_tail_backend(il);
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; ++i) {
+        auto * backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(backend) == dev) {
+            return backend;
+        }
+    }
+    throw std::runtime_error(format(
+            "KV tail layer %d planned execution device %s has no scheduler backend",
+            il, dev ? ggml_backend_dev_name(dev) : "unknown"));
 }
 
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
@@ -3646,6 +3663,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        ggml_backend_sched_set_tensor_backend(
+                sched, final_tail_op,
+                get_native_tail_execution_backend(sched, mctx_cur, il));
     }
     if (compact_tail) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(
@@ -4082,6 +4102,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        ggml_backend_sched_set_tensor_backend(
+                sched, final_tail_op,
+                get_native_tail_execution_backend(sched, mctx_cur, il));
     }
     if (compact_tail) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(

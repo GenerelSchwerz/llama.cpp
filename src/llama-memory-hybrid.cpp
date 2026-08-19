@@ -20,6 +20,7 @@ llama_memory_hybrid::llama_memory_hybrid(
            llama_swa_type   swa_type,
                      bool   attn_offload,
                      bool   attn_cpu_pinned,
+                     bool   attn_offload_compute,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -66,7 +67,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         tail_rollback_tokens,
         /* tail_visibility_window */ 0,
         attn_cpu_pinned,
-        attn_n_gpu_layers
+        attn_n_gpu_layers,
+        attn_offload_compute
     )),
     mem_recr(new llama_memory_recurrent(
         model,

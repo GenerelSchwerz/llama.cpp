@@ -5263,6 +5263,45 @@ static void ggml_compute_forward_set_rows_impl(
     }
 }
 
+template<typename idx_t>
+static void ggml_compute_forward_set_rows_copy_impl(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ne0 == ne00 && ne2 == ne02 && ne3 == ne03);
+    GGML_ASSERT(ne02 % ne11 == 0 && ne03 % ne12 == 0);
+
+    const int64_t dr  = (ne01 + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne01);
+    const size_t row_bytes = ggml_row_size(src0->type, ne00);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03 % ne12;
+                const int64_t i11 = i02 % ne11;
+                const int64_t i1 = *(const idx_t *) ((const char *) src1->data +
+                        i*nb10 + i11*nb11 + i12*nb12);
+
+                if (i1 < 0) {
+                    continue;
+                }
+                GGML_ASSERT(i1 < ne1);
+
+                memcpy((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3,
+                       (const char *) src0->data + i*nb01 + i02*nb02 + i03*nb03,
+                       row_bytes);
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_set_rows(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -5293,6 +5332,17 @@ void ggml_compute_forward_set_rows(
                 from_float((const float *) ((const char *) src0->data + row*src0->nb[1]),
                         (char *) shadow->data + dst_row*shadow->nb[1], src0->ne[0]);
             }
+        }
+        return;
+    }
+
+    if (src0->type == dst->type) {
+        if (src1->type == GGML_TYPE_I64) {
+            ggml_compute_forward_set_rows_copy_impl<int64_t>(params, dst);
+        } else if (src1->type == GGML_TYPE_I32) {
+            ggml_compute_forward_set_rows_copy_impl<int32_t>(params, dst);
+        } else {
+            GGML_ABORT("src1->type = %d (%s) not supported", src1->type, ggml_type_name(src1->type));
         }
         return;
     }

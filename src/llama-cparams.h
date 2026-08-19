@@ -7,6 +7,12 @@
 
 #define LLAMA_MAX_SEQ 256
 
+// Persistent per-layer scratch used by memory modules must also cover the
+// synthetic graphs built while resolving fused operations.  Keep this value
+// next to the probe definitions rather than duplicating their largest token
+// geometry in individual memory implementations.
+constexpr uint32_t LLAMA_MAX_FUSED_OP_PROBE_TOKENS_PER_SEQ = 16;
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence

@@ -232,7 +232,7 @@ static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
 static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_CH,
     /*.name             =*/ "fused Gated Delta Net (chunked)",
-    /*.n_tokens_per_seq =*/ 16,
+    /*.n_tokens_per_seq =*/ LLAMA_MAX_FUSED_OP_PROBE_TOKENS_PER_SEQ,
 };
 
 static const llm_fused_op_probe llm_fused_op_lid_probe = {

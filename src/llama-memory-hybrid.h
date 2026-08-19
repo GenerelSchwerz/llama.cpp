@@ -30,6 +30,7 @@ public:
            llama_swa_type   swa_type,
                      bool   attn_offload,
                      bool   attn_cpu_pinned,
+                     bool   attn_offload_compute,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
