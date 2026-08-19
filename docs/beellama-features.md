@@ -573,6 +573,12 @@ Residency is selected per owned layer, not per token window, and there is no
 automatic VRAM sizing. The option does not create independent placement for a
 cache that the draft context shares with another owner.
 
+The retained Q8/CUDA MTP validation covers pinned-CPU target KV with the
+independently owned draft cache on CUDA, including a 5,000-token stochastic
+same-geometry exactness gate. Other cache formats, models, backends, and
+arbitrary partial target or multi-layer draft mixes still require their own
+measurements.
+
 ## Phase-aware prompt and generation workspace
 
 ### What it is

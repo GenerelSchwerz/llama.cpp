@@ -1,5 +1,13 @@
 # CPU KV-offload experiments
 
+For the current runnable build, server arguments, exactness oracle, benchmark
+shape, progress mechanism, and required artifacts, use
+[`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). This
+ledger intentionally preserves the exact commands used by each historical
+experiment, including retired environment variables and execution geometries.
+Those commands explain their recorded results; they are not templates for a
+new run.
+
 Candidate VRAM reductions and their complexity ordering are maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). This ledger
 remains the source of exact commands and measured acceptance or rejection.
@@ -2900,3 +2908,202 @@ KVarN, lower or
 asymmetric standard cache types, multi-GPU/meta placement, Vulkan/HIP, and
 non-Qwen model families require their own output and profiler matrices before
 equivalent claims are made.
+
+## Experiment 019: independent draft-owned KV residency after exactness merge
+
+Status: retained. The draft context can override inherited target KV residency
+through the shared per-owned-layer placement plan. The tested split is exact
+against same-geometry MTP after the physical-ubatch and canonical host-store
+fixes; it is not compared with target-only decoding.
+
+### Integration, source, hardware, and inputs
+
+The implementation was committed as `7febdc06a` and its user documentation as
+`9be4be34b`. Phase-aware workspace was already present in the branch. The MTP
+output-exactness work was then merged at
+`db2a119a3487f59e585e1bed8bcb155decd41069`, so the validation uses:
+
+- target/effective-draft physical ubatch 512; the obsolete 128 override is not
+  present;
+- the canonical accelerator quant-store path for host-resident standard KV;
+- phase-aware target/draft compute backing and three recurrent planes; and
+- a clean same-depth MTP golden artifact with matching prompt, sampler, seed,
+  cache formats, and execution geometry.
+
+The measured server was the Release CUDA build at `db2a119a3`, SHA-256
+`6895bb103078c43832a1ff9715a449b94f3554ba0a72804c8bee4c7f0d7f461d`,
+built with native CPU optimization, CUDA FlashAttention, architecture 120, and
+GNU 16.1.1. Hardware was an NVIDIA GeForce RTX 5070 Ti with 15,880 MiB usable
+process capacity, compute capability 12.0, driver 610.57.04, and an Intel Core
+Ultra 9 285K. The model was
+`/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`,
+14,437,471,712 bytes, SHA-256
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+
+Both candidate configurations used that same binary. The baseline omitted the
+draft override, inheriting target host residency. The candidate added
+`--kv-gpu-layers-draft 1`; the value is this model's owned-cache count, not a
+model-specific policy in the implementation. Target KV remained pinned-host
+Q8_0/Q8_0 under `--no-kv-offload --kv-gpu-layers 0`. Draft weights remained
+offloaded on both sides, so the comparison changes only draft-owned KV
+residency.
+
+### Maintained exactness gates
+
+The exact commands were:
+
+```bash
+cd /home/gencoolpc/beellama-kv-offload
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-1k.json
+
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-5k.json
+```
+
+Each live case used a fresh server process. Native `/slots` polling reported
+decoded-token progress every two seconds for 1K and every five seconds for 5K;
+the runner sampled process VRAM throughout. The artifact-backed golden is the
+merged clean-GPU MTP-6 result at the same target/effective-draft ubatch of 512.
+
+| Request and case | Accepted/generated | Replay cycles/tokens | Peak VRAM | Exact tokens/content |
+|---|---:|---:|---:|---|
+| 1K clean GPU, full planes | 428/470 | 0/0 | 14,854 MiB | golden |
+| 1K inherited CPU draft, three planes | 428/470 | 10/56 | 13,890 MiB | yes |
+| 1K explicit CPU draft, three planes | 428/470 | 10/56 | 13,890 MiB | yes |
+| 1K GPU draft, three planes | 428/470 | 10/56 | 13,898 MiB | yes |
+| 5K clean GPU, full planes | 2,077/2,435 | 0/0 | 15,006 MiB | golden |
+| 5K inherited CPU draft, three planes | 2,077/2,435 | 90/443 | 13,926 MiB | yes |
+| 5K GPU draft, three planes | 2,077/2,435 | 90/443 | 13,942 MiB | yes |
+
+All 1K cases produced token SHA-256
+`842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`
+and content SHA-256
+`41dd817295f51516f3750049cfe3ecd2b5de9ae0f4d08df7a58a1408318f3bb2`.
+All 5K cases produced token SHA-256
+`1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`
+and content SHA-256
+`afd0208aaaf57cd003c1b0a8d8f29a83c73fa8a8264b547fc6cba0093e1cbe5c`.
+Prompt-token, request-semantic, required-identity, token-ID, and response-byte
+comparisons all passed with no first mismatch. Acceptance and replay work were
+also unchanged within each request.
+
+At context 4,096, inherited/explicit CPU draft residency logged 8.50 MiB of
+draft `CUDA_Host` KV plus a 1.06 MiB bounded CUDA store stage; the override
+logged 8.50 MiB of draft CUDA KV and no draft host KV. At context 8,192 those
+values were 17.00 MiB host plus the same 1.06 MiB stage versus 17.00 MiB CUDA.
+The corresponding sampled process-VRAM increases were 8 and 16 MiB. Moving the
+cache to CUDA therefore releases the context-linear pinned-host allocation;
+`nvidia-smi` does not measure that host-memory saving.
+
+The exactness pass overlapped a user-owned graphics workload. Its token and
+response comparisons and per-process allocation samples remain valid, but its
+throughput is intentionally excluded. Matched performance uses a separate idle
+GPU run with the original multimodal layout.
+
+### Matched original-layout performance screen
+
+An idle-GPU, one-run screen compared a fresh inherited-host-draft server with a
+fresh draft-owned-GPU server. Both used the canonical server command in
+[`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md) at this
+experiment's commit: context 32,768, the original F16 multimodal projector in
+host memory, target Q8_0/Q8_0 KV pinned on the host, target KV GPU layers zero,
+MTP depth 6, physical target/effective-draft ubatch 512, phase-aware workspace,
+three recurrent planes, and alias `qwen38-kv-test`. The baseline omitted the
+draft residency override. The candidate changed only one server argument by
+adding `--spec-draft-kv-gpu-layers 1`.
+
+The benchmark command below was run once against each fresh server, changing
+only the result filename from `cpu-draft.json` to `gpu-draft.json`:
+
+```bash
+python3 -c \
+  'import numpy as np; np.random.seed(1234); from llama_benchy.__main__ import main; main()' \
+  --base-url http://127.0.0.1:8080/v1 \
+  --model Qwen/Qwen3.5-27B \
+  --served-model-name qwen38-kv-test \
+  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
+  --pp 512 --tg 64 --depth 4096 30000 \
+  --runs 1 --no-warmup --skip-coherence --no-adapt-prompt \
+  --latency-mode none --exact-tg \
+  --extra-body temperature=0,seed=1234,cache_prompt=false \
+  --emit-progress - \
+  --save-result /tmp/draft-kv-residency-perf-matched-20260819/cpu-draft.json \
+  --format json
+```
+
+This explicit NumPy seed is required by `llama-benchy` 0.4.0 because its stock
+CLI does not seed corpus-offset selection. `--no-cache` was intentionally
+omitted because that option appends a per-process UUID and invalidates a
+cross-process prompt match. Prompt caching was instead disabled by the common
+request body and each server used `--cache-ram 0`. The cached 606,662-byte
+corpus SHA-256 was
+`8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
+JSONL events exposed request progress, and timestamped `nvidia-smi` samples
+recorded process VRAM once per second.
+
+Server timings are authoritative below. The API client's independently timed
+values remain in the artifacts.
+
+| Depth | Draft residency | Prompt tokens | Prefill | Decode | Acceptance | Replay | Peak process VRAM |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 4,096 | inherited host | 4,661 | 1,545.66 t/s | 62.01 t/s | 35/39 | 1 cycle / 4 tokens | 14,216 MiB |
+| 4,096 | owned GPU | 4,661 | 1,558.17 t/s | 63.43 t/s | 35/39 | 1 cycle / 4 tokens | 14,282 MiB |
+| 30,000 | inherited host | 30,565 | 1,479.82 t/s | 29.29 t/s | 23/25 | 0 / 0 | 14,216 MiB |
+| 30,000 | owned GPU | 30,565 | 1,473.09 t/s | 30.00 t/s | 23/25 | 0 / 0 | 14,282 MiB |
+
+The candidate delta was +0.81% prefill and +2.29% decode at 4K, then -0.45%
+prefill and +2.42% decode at 30K. Both requests produced the same normalized
+stream-token SHA-256,
+`1a42b5ce580eb774367e4e4d096ef6ddc7c1695956967b699269ca9c24231621`,
+and had identical acceptance and replay work. The prefill movement is within
+the ambiguity of a one-run pair. The consistent approximately 2.4% decode
+direction is promising but must be repeated in alternating clean pairs before
+being claimed as stable.
+
+Peak sampled process VRAM increased by 66 MiB. The exactness allocation logs
+established 17.00 MiB of draft pinned-host KV at context 8,192 and a 1.06 MiB
+bounded CUDA host-store stage. Scaling the context-linear Q8 draft KV to 32,768
+gives 68.00 MiB: the candidate moves that allocation to CUDA while eliminating
+the store stage, consistent with the sampled delta after MiB accounting. The
+trade therefore releases approximately 68 MiB of pinned system memory for
+approximately 66 MiB of process VRAM in this layout.
+
+Matched-performance artifacts and SHA-256 values:
+
+| Artifact | Inherited host draft | Draft-owned GPU |
+|---|---|---|
+| Result JSON | `ca2a312a88fa03af8716eb099bbeb803c87c886d1d1ca9851209bb8911faef83` | `833f521a3b5e61661d009742bbc9dee934f0b7a8b3d54b489601b014dc811068` |
+| Server log | `4e56ea3e9267b1d43d64a47cbdb78097007f3f482babea42be6f2244baf8fd96` | `04282377c73b9600562361cc8856f46b14f6e8f28d025f1ace72989fdf9bd99b` |
+| Client/progress log | `e7501a0b56e41c6f044f697adf6012d517ed6950552c5c8bf44a5234c6b7e8ed` | `f3131c66e2f3b8ad6299b0351ff2edab32ed3b5ef1e74b84293cc5c9f035c5dc` |
+| Timestamped VRAM log | `e9e6c8fa805cd256d8c561e4bb95b431c5b9be94f720d6916917ee8ad26fe683` | `dcb8f2b4c2c111f44ecf1881c27ac3141b112602aef9e3b23e6c8cd5d8b65874` |
+
+All files are under
+`/tmp/draft-kv-residency-perf-matched-20260819`. The earlier mismatched
+`--no-cache` attempt is preserved separately under
+`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819` and is not evidence
+for a performance delta.
+
+Artifacts and hashes:
+
+| Matrix | Artifact | Manifest / provenance / comparisons / summary SHA-256 |
+|---|---|---|
+| 1K greedy | `/tmp/qwen38-mtp6-partial-draft-residency-q8-1k-20260819` | `4bb855b72343ae25f24c848a419cfe7fc381cb723a6d113cbfe04ded07ddc01f` / `634facaa592cc90b344d328412031861fae5feed1b6e6cbc6255d1611b48f9eb` / `8814390ac38f4afe6fa7694a7303d46968538668e934ae46295042a3a41913a3` / `e2525105d7ad9390d4a87fbcd43bffa2669905fc481c78660b120f58ef5d7219` |
+| 5K stochastic | `/tmp/qwen38-mtp6-partial-draft-residency-q8-5k-20260819` | `bd5172c96d4498a4a24ca007634408aaba92e896093e9a503085f8c847af7f42` / `43dd71e11dc162059f2a34725e77014fafdb72fe190b823c0ca9ad1cf99fffe8` / `acf3b3c638a777cd8a8e9020018768b63ef35892444a22de9d4924f27d51a4b3` / `b4b18a6a8163e40c38569624e320c786563d639ec01e211ef963e3f7b205cd08` |
+
+### Regression coverage and disposition
+
+The final merged binary passed 12/12 focused CTest cases covering argument
+parsing, batch allocation, recurrent rollback, KV-tail policy, prompt
+checkpointing, loop-guard/sampler rollback, and the relevant static guards.
+The exactness runner passed 35/35 unit tests. Same-type/standard `SET_ROWS`
+passed 721/721 CPU cases and 267/267 CUDA cases. Both maintained manifests pass
+JSON validation and `git diff --check` passes.
+
+Retain the independent draft residency option. Its default path remains exact
+inheritance, explicit zero is equivalent to inherited full host residency in
+the tested layout, and the GPU-draft split is output-exact after the merged MTP
+fixes. The empirical claim remains limited to the ownership split above;
+arbitrary partial target-layer mixes, lower/asymmetric formats, other models,
+multi-GPU, and other backends need separate gates.

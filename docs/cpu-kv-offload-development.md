@@ -1,4 +1,62 @@
-# CPU KV-offload development journal
+# CPU KV-offload progress and decision journal
+
+The authoritative runnable setup is
+[`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). Read it
+before launching any current test. This journal deliberately preserves earlier
+protocol editions, superseded commands, rejected paths, and the evidence that
+changed the working theory. They are available for historical reasoning, but
+they are not current setup instructions unless the current-testing document
+explicitly adopts them.
+
+When the live protocol changes, update the current-testing document first and
+add the transition and rationale here. Do not silently rewrite old measurements
+to use new flags or geometry; their original commands remain part of their
+evidence. The companion experiment ledger records the exact per-change results.
+
+## Current protocol edition transition: 2026-08-19
+
+Current runnable instructions moved into
+[`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md) after
+the phase-aware, MTP physical-ubatch, canonical quant-store, and independent
+draft-residency work converged. This journal had accumulated valid commands
+from several incompatible implementation eras. Keeping those commands was
+necessary for interpreting prior evidence, but presenting them beside the live
+setup made it too easy to restore removed controls or superseded geometry.
+
+The current edition makes the supported CLI the only live interface. The
+removed `GGML_KV_CPU_PINNED` and `GGML_RECURRENT_STATE_OFFLOAD` variables must
+not be copied into new commands, even as defensive `env -u` entries. Historical
+entries retain them exactly where they were used. MTP draft ubatch 128 is also
+historical; current MTP omits the draft override or explicitly matches the
+target physical ubatch.
+
+The first post-merge `llama-benchy` 0.4.0 performance pair was rejected before
+publication because its prompts were not identical. At nominal depths 4,096
+and 30,000, the inherited-host-draft run reported 4,661 and 30,564 prompt
+tokens, while the draft-owned-GPU run reported 4,659 and 30,566. The attempted
+command used `--no-cache`, which adds a different UUID in every invocation;
+the stock prompt generator also chooses its corpus offset from an unseeded
+NumPy process RNG. Acceptance and replay work consequently differed, so the
+throughput values cannot isolate KV residency.
+
+The replacement protocol explicitly seeds NumPy before invoking the same
+`llama-benchy` CLI, omits `--no-cache`, sends `cache_prompt=false` in the shared
+request body, uses the same served alias, and requires equal observed prompt
+token counts before accepting a pair. The servers remain fresh and use
+`--cache-ram 0`. The rejected result files were preserved as diagnostic
+artifacts at
+`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819`; their directional
+performance numbers are intentionally not part of the experiment ledger.
+
+The corrected single-run screen then matched 4,661 prompt tokens at depth 4K
+and 30,565 at depth 30K, plus identical visible streamed tokens, MTP acceptance,
+and replay work. Moving all independently owned draft KV in this layout from
+pinned host memory to CUDA changed server-reported prefill by +0.81% at 4K and
+-0.45% at 30K, while decode changed by +2.29% and +2.42%, respectively. Sampled
+peak process VRAM rose from 14,216 to 14,282 MiB. This supports a small decode
+benefit and a neutral-prefill working theory, but a single baseline/candidate
+pair is only a screen; repeat alternating pairs before treating a small delta
+as stable.
 
 The ranked memory backlog is maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). Read it
@@ -589,7 +647,14 @@ reached `44.06` t/s at 30K and did not fit at 64K; narrower GPU formats fit at
 64K and reached `32.22` to `37.10` t/s. Those results quantify the placement
 gap but do not change the objective of accelerating CPU-resident KV.
 
-## Benchmark protocol for every code change
+## Previous benchmark-protocol edition
+
+This section records the pre-server, `llama-bench`-centered protocol used by
+the early experiments. It remains useful for interpreting those measurements,
+but it has been superseded for current work by
+[`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). Do not
+copy this section's command lines into a new experiment without reconciling
+them against the current protocol and current CLI.
 
 Use clean baseline and candidate processes. Do not compare a warm process with a
 cold process or change affinity between runs.
@@ -717,6 +782,17 @@ from the count by `llama_kv_cache`, so this is architecture-neutral and does
 not create a second placement mechanism. The option is independent of draft
 weight offload and of the phase-aware target/draft compute-backing group.
 
+After merging the output-exactness work, the independent policy passed both
+the maintained 1,000-token greedy and 5,000-token stochastic MTP-6 gates with
+target Q8 KV in pinned host memory, draft-owned Q8 KV on CUDA, phase-aware
+workspace enabled, and three recurrent planes. Both cases matched the clean
+same-geometry MTP oracle token-for-token and response-byte-for-byte. The 5K
+token SHA-256 was
+`1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`.
+This validates the ownership split exercised by the integrated-MTP model; it
+does not generalize arbitrary internal partial-layer mixes, cache formats,
+models, or backends.
+
 The non-MTP 90K-versus-240K Nsight allocation trace isolated context-scaled
 VRAM to the target scheduler's prompt graph. Model weights and the 149.62 MiB
 active recurrent state were constant, while CUDA compute grew from 707.27 to
@@ -791,8 +867,8 @@ is a viable capacity/performance trade for this Qwen CUDA configuration. Host
 checkpoint/replay remains a rejected diagnostic. The interface boundary is now
 capability-based, leaving backend/model expansion independent of recurrent
 memory. Lower cache quants, asymmetric K/V pairs, implementations of the
-capability on other backends/models, and partial GPU KV offload remain out of
-scope.
+capability on other backends/models, and unmeasured partial target-layer or
+multi-layer draft mixes remain out of scope.
 
 The standalone
 [`mtp-recurrent-plane-cap-reproduction.md`](mtp-recurrent-plane-cap-reproduction.md)

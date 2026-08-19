@@ -113,10 +113,15 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/quickstart-qwen36-dflash.md` - Qwen3.6 DFlash guide.
 - `docs/quickstart-gemma-4-31b-dflash.md` - Gemma 4 DFlash guide.
 - `docs/preset.md` - INI preset format.
-- `docs/cpu-kv-offload-development.md` - objective, investigation history,
-  hypotheses, benchmark protocol, and roadmap for the CPU KV-offload branch.
+- `docs/cpu-kv-offload-current-testing.md` - authoritative current CPU KV
+  build, runtime, exactness, benchmark, progress, and artifact protocol. Start
+  here before running or recording any CPU KV experiment.
+- `docs/cpu-kv-offload-development.md` - progress and decision journal. It
+  preserves previous protocol editions and rejected paths for historical
+  reasoning; its old commands are not current instructions.
 - `docs/cpu-kv-offload-experiments.md` - authoritative per-change CPU KV
-  benchmark and resource ledger.
+  benchmark and resource ledger. Commands inside an older experiment reproduce
+  that historical experiment, not necessarily the current branch.
 
 ### Invariants
 
@@ -165,9 +170,21 @@ candidate. Record both values with every result.
 These instructions apply when working on `exp/kv-cpu-offload` or continuing its
 CPU-resident KV-cache investigation.
 
-- Read `docs/cpu-kv-offload-development.md` and
-  `docs/cpu-kv-offload-experiments.md` before changing code or interpreting old
-  measurements. Treat Git commits as the source of truth for exact diffs.
+- Read `docs/cpu-kv-offload-current-testing.md` before changing code, launching
+  a test, or interpreting a current result. It is the only documentation source
+  for the runnable current protocol; the local source remains authoritative if
+  documentation and behavior disagree.
+- Read the relevant sections of `docs/cpu-kv-offload-development.md` and
+  `docs/cpu-kv-offload-experiments.md` when historical rationale, prior
+  protocol editions, rejected approaches, or old measurements are needed.
+  Never promote a command from those records into a current run unless the
+  current-testing document explicitly permits it. Treat Git commits as the
+  source of truth for exact historical diffs.
+- Do not include retired arguments or environment-variable names in a current
+  command, including defensive `env -u` entries. In particular,
+  `GGML_KV_CPU_PINNED` and `GGML_RECURRENT_STATE_OFFLOAD` are historical and
+  must not appear in current setup or benchmark commands. Use the supported
+  CLI controls documented in the current-testing document.
 - Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
   build, profile, and documentation changes in the dedicated experimental
   worktree and branch.
@@ -175,10 +192,12 @@ CPU-resident KV-cache investigation.
   implementation and its corresponding update to
   `docs/cpu-kv-offload-experiments.md` in that commit so the code and evidence
   cannot drift apart.
-- Update `docs/cpu-kv-offload-development.md` whenever an experiment changes the
-  working theory, rejects a path, reveals a bottleneck, changes the benchmark
-  protocol, or changes the roadmap. Pure result additions that do not change
-  those conclusions belong only in the experiment ledger.
+- Update `docs/cpu-kv-offload-current-testing.md` first whenever supported
+  controls, the active setup, exactness oracle, benchmark shape, progress
+  mechanism, or required artifact set changes. Record why the prior edition
+  was superseded in `docs/cpu-kv-offload-development.md`; do not rewrite away
+  useful history. Pure result additions that do not change the protocol or
+  working theory belong only in the experiment ledger.
 - Record rejected and neutral experiments before reverting them. Prefer a clean
   revert or a separate revert commit when preserving the exact attempted diff
   is useful; never leave an undocumented partial implementation in the branch.

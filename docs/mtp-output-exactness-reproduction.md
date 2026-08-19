@@ -13,6 +13,8 @@ For the tested Qwen3.8 27B CUDA configuration, the candidate now matches clean
 BeeLlama MTP token-for-token and response-byte-for-byte when:
 
 - target and draft Q8_0/Q8_0 KV move between GPU and pinned CPU storage;
+- target KV remains in pinned CPU storage while an independently owned draft
+  cache uses GPU storage;
 - phase-aware target/draft workspace is off or on;
 - full-plane GPU MTP depth is 1, 2, 3, 5, 6, or 8;
 - MTP-3, MTP-5, and MTP-8 use 2-, 3-, 4-, and full-plane policies, while
@@ -680,14 +682,15 @@ The implementation is structurally general for standard quantized KV:
 
 The empirical claim is deliberately narrower. It currently covers one Qwen3.8
 27B model, homogeneous Q8_0/Q8_0, one NVIDIA CUDA device, coupled full CPU
-versus full GPU target/draft KV, phase awareness, full-plane MTP depths
-1/2/3/5/6/8, recurrent-plane capping at depths 3/5/6/8, three stochastic
-seeds, three prompts, and the acceptance/rejection edges above. It does not
-yet establish exactness or performance for:
+versus full GPU target/draft KV, a CPU-target/GPU-draft ownership split, phase
+awareness, full-plane MTP depths 1/2/3/5/6/8, recurrent-plane capping at depths
+3/5/6/8, three stochastic seeds, three prompts, and the acceptance/rejection
+edges above. It does not yet establish exactness or performance for:
 
 - lower standard cache quants or asymmetric K/V;
 - KVarN, whose native structured-cache path is separate;
-- partial GPU KV layer mixes;
+- arbitrary partial target-layer mixes or multi-layer draft mixes beyond the
+  tested ownership split;
 - multi-GPU/meta devices;
 - Vulkan, HIP/ROCm, MUSA, or CPU-only model execution;
 - other architectures, SWA layouts, or transposed-V non-FlashAttention paths;
