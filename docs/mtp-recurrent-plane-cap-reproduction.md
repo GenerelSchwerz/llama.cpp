@@ -864,6 +864,61 @@ supported placement flags.
 
 ## Post-merge validation record
 
-Merge commit: `TO_BE_FILLED_AFTER_MERGE`.
+Merge commit:
+`5e16db7c9182bd6fad148a3caa80fc86b11440d0`
+(`Merge MTP recurrent-plane cap into CPU KV offload`).
 
-Post-merge build/test/runtime results: `TO_BE_FILLED_AFTER_MERGE_VALIDATION`.
+The three-way merge had no source-code conflict. Both branches had appended
+experiments after Experiment 007, producing one conflict in
+`docs/cpu-kv-offload-experiments.md`. Resolution retained CPU-KV
+Characterization 008 and Experiments 009-011 first, then renumbered the MTP
+branch's local Experiments 008/009 as merged Experiments 012/013. References in
+the argument and development docs were updated to those merged numbers. The
+untracked `/home/gencoolpc/beellama-kv-offload/models.ini` remained untouched.
+
+The first merged build completed successfully. A first expanded CTest command
+reported 11 passes and two `Not Run` entries because this build directory had
+not yet built `test-llama-archs`, the fixture generator used by
+`test-generate-models`; `test-recurrent-state-rollback` was skipped only because
+it depends on that fixture. This was not a code failure. After explicitly
+building `test-llama-archs`, the same suite passed 13/13:
+
+```text
+test-server-loop-guard-checkpoint-static
+test-kvarn-eager-workspace-static
+test-kvarn-rollback-static
+test-kvarn-hip-tail-capability-static
+test-kvarn-hip-runtime-validation
+test-generate-models
+test-recurrent-state-rollback
+test-arg-parser
+test-kvarn
+test-adaptive-dm
+test-server-loop-guard
+test-server-prompt-checkpoint
+test-backend-sampler
+```
+
+The CUDA `GATED_DELTA_NET` selection passed 36/36 again and `git diff --check`
+was clean. The rebuilt server identified itself as version 11227 at
+`5e16db7c9`.
+
+A final clean MTP-8/four-plane request used the short-sweep command with the
+merged flags `--kv-cpu-pinned --recurrent-state-offload`. No other compute
+process was present. It reported:
+
+```text
+policy:               4 total planes, direct horizon 2, GPU replay enabled
+init/live VRAM:       14,142 / 14,164 MiB
+prompt:               171.9554 t/s (26 tokens)
+decode:                85.5382 t/s (128 tokens)
+draft accepted/total:  89 / 114
+replay:                 5 cycles / 39 batch tokens
+checkpoints:            0 captures / 0 restores / 0 payload bytes
+output SHA-256:        64ccba06fd390281d73f4bf6d55e49f21e8cbf42a5a2064693b3a883d2c6e7c3
+```
+
+The output hash and work counters exactly match the pre-merge capability test.
+The response artifact is `/tmp/mtp8-cap4-merged.json`, 2,842 bytes, SHA-256
+`3d0306f255117b460857b2e069901067a4663cc01c1d5d054c4b72f803ba98ee`.
+The server was stopped with SIGINT and exited zero after the measurement.

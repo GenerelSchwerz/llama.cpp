@@ -1607,3 +1607,20 @@ Retain the sparse GPU candidate. Its long-run 0.79% decode cost is materially
 smaller than the host-checkpoint candidate's traffic and short-request
 regression, while preserving 748.12 MiB of MTP-8 recurrent VRAM. Keep the
 full-plane default and the graph/backend capability fail-closed boundary.
+
+### CPU-KV branch merge validation
+
+The candidate was merged into `exp/kv-cpu-offload` as
+`5e16db7c9182bd6fad148a3caa80fc86b11440d0`. Source merged without conflict;
+the ledger conflict was resolved by preserving CPU-KV Experiments 008-011 and
+renumbering the MTP entries 012-013. The committed Release CUDA server built,
+the combined focused suite passed 13/13, and CUDA GDN passed 36/36.
+
+A clean merged MTP-8/four-plane short request used
+`--kv-cpu-pinned --recurrent-state-offload` in place of the historical
+environment switches. It reproduced output SHA-256
+`64ccba06fd390281d73f4bf6d55e49f21e8cbf42a5a2064693b3a883d2c6e7c3`,
+draft/accepted 114/89, replay 5/39, checkpoints 0/0, and init/live process VRAM
+14,142/14,164 MiB. Decode was 85.54 t/s. This confirms the merged placement
+interface reaches the same cap/replay path; it is not a new matched 5K
+performance comparison.
