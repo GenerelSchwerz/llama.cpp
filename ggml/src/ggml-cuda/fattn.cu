@@ -344,6 +344,9 @@ static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggm
     ggml_cuda_flash_attn_ext_mma_q8_log_route(dst);
 
     switch (Q->ne[0]) {
+        case 64:
+            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<64>(ctx, dst);
+            break;
         case 128:
             ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<128>(ctx, dst);
             break;
@@ -507,19 +510,30 @@ enum best_fattn_kernel {
 // GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT, set from the
 // --flash-attn-native-quants context option.
 //
-// GGML_CUDA_FATTN_Q8_NATIVE=0 additionally forces the route off for the whole
-// process. That override is deliberately not user-facing: every measurement of
-// this path is an A/B within one binary (byte-identical output, compute-buffer
-// allocation), and without it each comparison would need its own build of every
-// flash-attention template instance.
+// GGML_CUDA_FATTN_Q8_NATIVE additionally overrides that per process: 0 forces
+// the route off, 1 forces it on. Neither is user-facing; both exist because the
+// evidence for this path cannot be produced without them.
+//
+// Force-off keeps every measurement an A/B within one binary (byte-identical
+// output, compute-buffer allocation); otherwise each comparison would need its
+// own build of every flash-attention template instance.
+//
+// Force-on is what makes the route testable at all. test-backend-ops builds ggml
+// graphs directly and never runs through llama-graph, so the op param is never
+// set there and the correctness sweep would silently exercise only the
+// F16-casting path.
 static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-    static const bool force_off = [] {
+    enum override_t { OVERRIDE_NONE, OVERRIDE_OFF, OVERRIDE_ON };
+    static const override_t override = [] {
         const char * env = getenv("GGML_CUDA_FATTN_Q8_NATIVE");
-        return env != nullptr && atoi(env) == 0;
+        if (env == nullptr) {
+            return OVERRIDE_NONE;
+        }
+        return atoi(env) == 0 ? OVERRIDE_OFF : OVERRIDE_ON;
     }();
-    if (force_off) {
-        return false;
+    if (override != OVERRIDE_NONE) {
+        return override == OVERRIDE_ON;
     }
     return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT) != 0;
 #else
@@ -543,7 +557,7 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
 
     const bool ok = ampere_mma_available(cc) &&
         K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
-        (Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
+        (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
     static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
     if (!ok && verbose) {

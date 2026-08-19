@@ -24,7 +24,8 @@
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_q8_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     static_assert(DKQ == DV, "quantized-native MMA requires matching K/V head dimensions");
-    static_assert(DKQ == 128 || DKQ == 256, "quantized-native MMA is scoped to head dimension 128 or 256");
+    static_assert(DKQ == 64 || DKQ == 128 || DKQ == 256,
+            "quantized-native MMA is scoped to head dimension 64, 128 or 256");
 
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -108,6 +109,23 @@ void ggml_cuda_flash_attn_ext_mma_q8_case(ggml_backend_cuda_context & ctx, ggml_
 // deliberately not reused: most of what it generates is unreachable for
 // Q8_0/Q8_0 and would only cost compile time, in the same spirit as the fork's
 // existing 103-pair vs. 169-pair vector-kernel tradeoff.
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  8,  1);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 16,  1);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 32,  1);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 64,  1);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  4,  2);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  8,  2);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 16,  2);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 32,  2);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  2,  4);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  4,  4);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  8,  4);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64, 16,  4);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  1,  8);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  2,  8);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  4,  8);
+extern DECL_FATTN_MMA_Q8_CASE( 64,  64,  8,  8);
+
 extern DECL_FATTN_MMA_Q8_CASE(128, 128,  8,  1);
 extern DECL_FATTN_MMA_Q8_CASE(128, 128, 16,  1);
 extern DECL_FATTN_MMA_Q8_CASE(128, 128, 32,  1);
