@@ -3085,6 +3085,68 @@ All files are under
 `/tmp/draft-kv-residency-perf-invalid-no-cache-20260819` and is not evidence
 for a performance delta.
 
+### Full 5K stochastic live decode
+
+The short-generation screen was followed by one full live CPU/GPU pair using
+the maintained matrix below:
+
+```bash
+cd /home/gencoolpc/beellama-kv-offload
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-draft-residency-live-mmproj-q8-5k.json
+```
+
+Both fresh servers retained the original F16 multimodal projector in host
+memory and used context 8,192, target and draft Q8_0/Q8_0 caches, target host
+KV, MTP depth 6, p-min 0.85, target/effective-draft ubatch 512, phase-aware
+workspace, three recurrent planes, three decode threads on CPUs 0-2, and the
+same stochastic 5,000-token request at temperature 0.8 and seed 1234. The only
+configuration difference was that the candidate added
+`--spec-draft-kv-gpu-layers 1`. The runner launched each server in a sterile
+environment and reported `/slots` progress plus process VRAM every five
+seconds.
+
+The source HEAD during the run was documentation-only commit `61216c968`; the
+measured binary remained build `11241` from `db2a119a3`, SHA-256
+`6895bb103078c43832a1ff9715a449b94f3554ba0a72804c8bee4c7f0d7f461d`.
+The manifest itself was untracked during execution but is committed unchanged
+with this evidence; its recorded SHA-256 is
+`854aa520122ad8320ba1f0e72a2fbb82d684a3b3cbfff69c1fad637cf5363f79`.
+
+| Draft residency | Prompt | Decode | Total server time | Acceptance | Replay | Peak process VRAM |
+|---|---:|---:|---:|---:|---:|---:|
+| inherited host | 149 tokens at 758.63 t/s | 5,000 tokens at 54.56 t/s | 91,842.61 ms | 2,077/2,435 | 90 cycles / 443 tokens | 13,926 MiB |
+| owned GPU | 149 tokens at 755.18 t/s | 5,000 tokens at 55.16 t/s | 90,839.74 ms | 2,077/2,435 | 90 cycles / 443 tokens | 13,942 MiB |
+
+GPU draft residency improved server-reported live decode by 1.11% and reduced
+total server time by 1,002.87 ms. Prefill changed by -0.46%. Both cases
+produced token SHA-256
+`1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`
+and content SHA-256
+`afd0208aaaf57cd003c1b0a8d8f29a83c73fa8a8264b547fc6cba0093e1cbe5c`;
+the comparison contract, prompt tokens, request semantics, token IDs, and
+response bytes were all exact. Acceptance and replay work were identical.
+
+The CPU-draft allocation contained 17.00 MiB of pinned-host draft KV and a
+1.06 MiB CUDA store stage. The GPU-draft allocation contained 17.00 MiB of
+device draft KV and no store stage. Sampled process VRAM rose by 16 MiB, which
+matches that exchange after MiB accounting. This sustained decode confirms no
+performance regression and points in the same direction as the 64-token
+screen, but 1.11% remains below the threshold for a stable claim from one
+ordered pair.
+
+Artifacts are under
+`/tmp/qwen38-mtp6-draft-residency-live-mmproj-q8-5k-20260819`:
+
+| Artifact | SHA-256 |
+|---|---|
+| Manifest | `854aa520122ad8320ba1f0e72a2fbb82d684a3b3cbfff69c1fad637cf5363f79` |
+| Provenance | `aca071d17efb3cc3121c1e1398540dc5bbc93ddaf10378d73cb88e58cb0dfeb0` |
+| Comparisons | `e60eaecd1e4a0b1a14a96ae20510f2960087e60551c730516d5a70d2a797357a` |
+| Summary | `3c4bb19c920861d9b181a843bacfffb0e08488cb1bbfaa44291106c62c9d4abb` |
+| CPU-draft server log | `a8833a278def595eb4be0f078d22301e9e24f6291ded5c58b2bc7f821abf62f4` |
+| GPU-draft server log | `cd23ef55b812e0695c1304f6da90cce377061014c3df8f0ff90f64fef025100c` |
+
 Artifacts and hashes:
 
 | Matrix | Artifact | Manifest / provenance / comparisons / summary SHA-256 |

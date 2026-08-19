@@ -58,6 +58,18 @@ benefit and a neutral-prefill working theory, but a single baseline/candidate
 pair is only a screen; repeat alternating pairs before treating a small delta
 as stable.
 
+A subsequent full 5,000-token stochastic live request retained the original
+host-resident multimodal projector and exercised 2,435 draft tokens plus 90
+replay cycles. Inherited host draft KV decoded at 54.56 t/s; moving the complete
+independently owned draft KV to CUDA decoded at 55.16 t/s, a +1.11% change.
+Prefill changed by -0.46%. The token IDs, response bytes, 2,077 accepted draft
+tokens, and 443 replay batch tokens were exact between configurations. At
+context 8,192, the trade moved 17.00 MiB of pinned draft KV onto CUDA, removed
+the 1.06 MiB store stage, and raised sampled process VRAM by 16 MiB. This
+confirms that realistic sustained MTP does not regress, but the benefit is
+small enough that repeated alternating pairs would be required before calling
+1.11% stable.
+
 The ranked memory backlog is maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). Read it
 alongside this journal before starting a VRAM experiment.

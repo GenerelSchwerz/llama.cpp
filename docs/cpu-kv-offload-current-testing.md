@@ -204,6 +204,33 @@ A single run is acceptable for the requested long screen, but it is a screen,
 not a noise-resistant performance claim. Repeat clean alternating pairs before
 claiming a small improvement or regression.
 
+## Full live MTP decode protocol
+
+Use the maintained 5,000-token live matrix when the short `llama-benchy`
+generation is not representative enough. It sends one stochastic chat
+completion with the original host-resident multimodal projector, MTP depth 6,
+temperature 0.8, seed 1234, phase-aware workspace, three recurrent planes, and
+target/effective-draft physical ubatch 512. A fresh inherited-host-draft server
+is the live reference; a fresh draft-owned-GPU server is compared against it.
+
+```bash
+cd /home/gencoolpc/beellama-kv-offload
+python3 scripts/mtp-exactness.py \
+  scripts/mtp-exactness-manifests/qwen38-mtp6-draft-residency-live-mmproj-q8-5k.json
+```
+
+The runner reports decoded-token progress and process VRAM every five seconds,
+captures server timings and allocation logs, and requires exact prompt tokens,
+request semantics, output token IDs, and response bytes. The configured output
+directory must not already exist; use a new dated output-directory suffix for
+a later run rather than overwriting prior evidence.
+
+Use server-reported `predicted_per_second` for the decode comparison. Confirm
+equal acceptance, generated-draft count, replay cycles/tokens, token count, and
+hashes before attributing a throughput change to residency. This remains a
+single ordered pair unless the experiment explicitly repeats alternating
+configurations, so small differences are screens rather than stable claims.
+
 ## Current exactness oracle
 
 MTP placement comparisons use a clean, same-MTP-geometry reference, not
