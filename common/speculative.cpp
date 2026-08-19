@@ -2420,6 +2420,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.kv_gpu_layers >= 0) {
+        // An explicit draft count is an independent partial-residency policy.
+        // The standard cache already excludes shared layers from this budget,
+        // so only storage owned by the draft context is affected.
+        result.no_kv_offload = true;
+        result.kv_gpu_layers = params_spec.kv_gpu_layers;
+    }
     if (params_spec.n_ubatch > 0) {
         result.n_ubatch = params_spec.n_ubatch;
     }

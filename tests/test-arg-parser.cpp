@@ -557,6 +557,23 @@ static void test(void) {
     assert(params.speculative.draft.n_ubatch == 32);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
 
+    params = common_params();
+    assert(params.speculative.draft.kv_gpu_layers == -1);
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-layers-draft", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kv_gpu_layers == 0);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS", "3");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kv_gpu_layers == 3);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
     unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -659,6 +676,7 @@ static void test(void) {
                 << "spec-type = draft-mtp\n"
                 << "spec-draft-n-max = 8\n"
                 << "spec-mtp-rs-planes = 4\n"
+                << "spec-draft-kv-gpu-layers = 2\n"
                 << "phase-aware-workspace = true\n";
         assert(fixture.good());
     }
@@ -671,6 +689,7 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.mtp_rs_planes == 4);
     assert(params.speculative.need_n_rs_seq() == 3);
+    assert(params.speculative.draft.kv_gpu_layers == 2);
     assert(params.phase_aware_workspace);
     assert(std::filesystem::remove(mtp_preset_fixture));
 
@@ -963,10 +982,36 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
     }
 }
 
+static void test_draft_kv_gpu_layers_override() {
+    common_params params;
+    params.no_kv_offload = true;
+    params.kv_gpu_layers = 7;
+
+    const common_params inherited = common_base_params_to_speculative(params);
+    assert(inherited.no_kv_offload);
+    assert(inherited.kv_gpu_layers == 7);
+
+    params.speculative.draft.kv_gpu_layers = 3;
+    const common_params overridden = common_base_params_to_speculative(params);
+    assert(overridden.no_kv_offload);
+    assert(overridden.kv_gpu_layers == 3);
+
+    params.no_kv_offload = false;
+    params.speculative.draft.kv_gpu_layers = 0;
+    const common_params host_draft = common_base_params_to_speculative(params);
+    assert(host_draft.no_kv_offload);
+    assert(host_draft.kv_gpu_layers == 0);
+
+    // Converting the draft parameters must not mutate the target policy.
+    assert(!params.no_kv_offload);
+    assert(params.kv_gpu_layers == 7);
+}
+
 int main(void) {
     try {
         test();
         test_single_device_draft_does_not_inherit_target_tensor_split();
+        test_draft_kv_gpu_layers_override();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;
