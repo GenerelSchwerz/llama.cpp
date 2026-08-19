@@ -1624,3 +1624,214 @@ draft/accepted 114/89, replay 5/39, checkpoints 0/0, and init/live process VRAM
 14,142/14,164 MiB. Decode was 85.54 t/s. This confirms the merged placement
 interface reaches the same cap/replay path; it is not a new matched 5K
 performance comparison.
+
+## Characterization 014: raw MTP-2 and MTP-6 recurrent-plane tradeoffs
+
+Status: characterization only; no source change. The three-plane candidate is
+a useful capacity/performance trade on this workload, but this single matched
+run does not change the full-plane default.
+
+### Question and correction
+
+This comparison tests MTP maximum depth six while changing the target recurrent
+allocation, not partial attention-KV placement:
+
+```text
+full: --spec-draft-n-max 6 --spec-mtp-rs-planes 0 --kv-gpu-layers 0
+cap:  --spec-draft-n-max 6 --spec-mtp-rs-planes 3 --kv-gpu-layers 0
+```
+
+An initial candidate process mistakenly used `--kv-gpu-layers 2` with full
+recurrent planes. It reached server health but received no request. It was
+stopped, the GPU was confirmed clear, and none of its allocation or timing data
+is included below.
+
+Three is the total recurrent-plane allocation. In the retained sparse-replay
+implementation, a true cap reserves one plane for the exact pre-verification
+input, so three planes expose a one-token ordinary rejection horizon (`N - 2`),
+not two. The remaining two planes hold the newest verification outputs. A
+deeper rejection uses deterministic full-shape GPU replay.
+
+### Provenance and fixed configuration
+
+- Source and measured binary commit:
+  `324873dc5ca44eb31727ba3bd09897841574fa3b`; server version 11228.
+- Build: Release, CUDA, native CPU, CUDA FlashAttention, CUDA architecture
+  `120a`, default quant matrix (`GGML_CUDA_FA_ALL_QUANTS=OFF`).
+- Hardware: NVIDIA GeForce RTX 5070 Ti, 15,880 MiB; Intel Core Ultra 9
+  285K; the established strict CPU 0-2 decode and CPU 0-23 batch placement.
+- Target/MTP model:
+  `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`.
+- Projector:
+  `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf`,
+  loaded with projector offload disabled.
+- Context 32,000; one slot; target batch/ubatch 1,024/512; draft ubatch 128;
+  all target and draft model layers on CUDA; split none; fit disabled.
+- Target and draft K/V were both Q8_0/Q8_0 in CUDA-pinned host memory. The
+  supported merged-branch controls `--kv-cpu-pinned` and
+  `--recurrent-state-offload` were explicitly present; the removed historical
+  environment switches were not used. Both rows explicitly set
+  `--kv-gpu-layers 0`.
+- Nsight Systems 2026.1.3 traced CUDA, NVTX, and OS runtime with CPU sampling
+  and context-switch collection disabled. `LLAMA_TRACE=1` enabled per-draft
+  server progress. An external ten-second loop sampled the child server's
+  `nvidia-smi` allocation while the request ran.
+
+Both clean processes used this command, changing only `PLANES`, `PORT`, `TAG`,
+and the trace/log filenames:
+
+```bash
+LLAMA_TRACE=1 nsys profile \
+  --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --force-overwrite=true -o /tmp/mtp6-coding-5k-${TAG}-trace \
+  build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers 0 --ctx-size 32000 --parallel 1 --cont-batching \
+  --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --spec-type draft-mtp --spec-draft-n-max 6 \
+  --spec-mtp-rs-planes "${PLANES}" --spec-draft-ubatch-size 128 \
+  --draft-p-min 0.85 --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+  --alias mtp6-coding-5k --host 127.0.0.1 --port "${PORT}" \
+  --log-file /tmp/mtp6-coding-5k-${TAG}.log --log-verbosity 4
+```
+
+The OpenAI-compatible request was 571 bytes, SHA-256
+`6edbe87e0896f13681887883efba7b18a669e29802a161fcfa6a737bd5695995`:
+
+```json
+{"model":"mtp6-coding-5k","messages":[{"role":"user","content":"Write a single self-contained HTML file: an interactive orbital mechanics sandbox.\nCanvas-based, 60fps. Users can click-drag to fling new planets into the system;\ngravity is simulated with velocity Verlet integration against a central star.\nInclude trailing orbit paths that fade, collision merging with a mass-conserving\nflash, a mass/velocity readout on hover, and a pause/reset UI. No libraries,\nno assets — one file, pure JS."}],"max_tokens":5000,"seed":1234,"stream":false,"cache_prompt":false}
+```
+
+Temperature was intentionally omitted, selecting the model/server default. Both
+rows processed 149 prompt tokens and produced 5,000 completion tokens, all
+reported as reasoning, with finish reason `length`.
+
+### Results
+
+| Measurement | Full, 7 planes | Cap, 3 planes | Change |
+|---|---:|---:|---:|
+| Prompt | 619.463 t/s | 613.985 t/s | -0.88% |
+| Decode under Nsight | 53.6445 t/s | 52.2560 t/s | -2.59% |
+| Decode latency | 18.6413 ms/token | 19.1365 ms/token | +2.66% |
+| Draft accepted/generated | 1,851/2,193 | 1,851/2,193 | identical |
+| Acceptance / mean draft length | 0.84405 / 2.61 | 0.84405 / 2.61 | identical |
+| Replay cycles/batch tokens | 0/0 | 88/430 | +88/+430 |
+| Target captures/restores | 0/0 | 0/0 | identical |
+| Target checkpoint payload | 0 | 0 | identical |
+| Target recurrent allocation | 1,047.38 MiB | 448.88 MiB | -598.50 MiB |
+| Init process VRAM | 14,986 MiB | 14,388 MiB | -598 MiB |
+| Live/peak process VRAM | 15,018/15,018 MiB | 14,426/14,426 MiB | -592 MiB |
+| Process `VmHWM` | 15,187.59 MiB | 15,186.11 MiB | -1.48 MiB |
+| Request wall time | 100 s | 100 s | same one-second resolution |
+| Nsight H2D | 368,271.043 MB / 196,492 copies | 378,465.886 MB / 200,628 copies | +10,194.843 MB / +4,136 |
+| Nsight D2H | 6,649.862 MB / 140,044 copies | 7,145.663 MB / 143,212 copies | +495.800 MB / +3,168 |
+| Nsight D2D | 0 MB | 0 MB | unchanged |
+
+The complete-trace H2D increase was 2.77% and D2H increase was 7.46%.
+Aggregate H2D copy duration increased from 7,302.897 to 7,509.101 ms;
+aggregate D2H duration increased from 249.904 to 256.016 ms. These are
+whole-process Nsight totals, including initialization, and are authoritative
+transfer measurements. The server's replay-batch counter identifies the added
+work; serialized checkpoint payload remains zero and is not used as a transfer
+proxy.
+
+The reasoning fields were byte-identical and had SHA-256
+`2f994f600563b04a0a8ce172b59b8f04515edae27664f0b15cab003ad257f44e`
+without an added newline. Draft totals, acceptance at every position, and token
+counts were also identical. The full response JSON hashes differ because their
+timing and replay fields differ.
+
+### Artifacts
+
+`/tmp` is ephemeral. The exact artifacts were:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `/tmp/mtp6-coding-5k-request.json` | 571 | `6edbe87e0896f13681887883efba7b18a669e29802a161fcfa6a737bd5695995` |
+| `/tmp/mtp6-coding-5k-raw-response.json` | 19,739 | `cd1bee84af7d3f70b730e7e8f76f3def08ed7a105388733217cff7ad6939c306` |
+| `/tmp/mtp6-coding-5k-rs3-response.json` | 19,742 | `58cb86a9438b50e59dd91e91d4e9500e14b440ab2885c6a9b8550498519322f7` |
+| `/tmp/mtp6-coding-5k-raw.log` | 245,465 | `87479e50352f0fd07d1a107f7db4ce0ac45eded066f0a7cd3da15e1a42c7c6c2` |
+| `/tmp/mtp6-coding-5k-rs3.log` | 247,686 | `1cecb8ee1a42b27d902ffd6120ec184c822c6770916d573184a9c2a70378c3b0` |
+| `/tmp/mtp6-coding-5k-raw-trace.nsys-rep` | 249,288,079 | `21af80c91a026a788dad4b6e9fd037f96f6cfbda1cc4dcd43fda2ded4c7d55cb` |
+| `/tmp/mtp6-coding-5k-rs3-trace.nsys-rep` | 245,608,445 | `ef76598fd937a32371bbe68e4ec11f9622c8e1d2f1fb368111c33f2d37b4f421` |
+| `/tmp/mtp6-coding-5k-raw-trace.sqlite` | 737,636,352 | `dcbe8681dffd99e5c2b5c6f5e20d61a9576297beb84563c6dc19ae787f9f4ef3` |
+| `/tmp/mtp6-coding-5k-rs3-trace.sqlite` | 718,307,328 | `3ba210d7191fbc154918bb775503a2868dbff0300ef188066a7bb6ce1de8d771` |
+
+### Disposition
+
+For this 5K coding request, MTP-6 with three total recurrent planes exchanges
+2.59% decode throughput for 592 MiB lower observed peak process VRAM and
+598.50 MiB lower recurrent allocation, while preserving exact output. It is a
+credible capacity-first setting. Full planes remain the compatibility and
+maximum-throughput default; a four-plane MTP-6 comparison would be the next
+useful point if a gentler memory/performance trade is desired.
+
+### Raw MTP-2 equal-memory follow-up
+
+A third clean process tested raw MTP-2 after the MTP-6 comparison. It used the
+same commit, binary, model/projector, request file, default sampling, Nsight
+settings, placement flags, affinity, Q8_0/Q8_0 target and draft KV, and external
+progress monitor. Only these server values and artifact names changed:
+
+```text
+--spec-draft-n-max 2 --spec-mtp-rs-planes 0
+--host 127.0.0.1 --port 8109
+/tmp/mtp2-coding-5k-raw-{log,response,trace}
+```
+
+Raw MTP-2 allocates its default three total planes. Its 448.88 MiB recurrent
+buffer and 14,388 MiB initialized process VRAM exactly matched capped MTP-6
+with three total planes, making this an equal-recurrent-memory speed comparison.
+It has a two-token direct rollback horizon and does not use selected replay.
+
+| Measurement | Raw MTP-2, 3 planes | Capped MTP-6, 3 planes | Full MTP-6, 7 planes |
+|---|---:|---:|---:|
+| Prompt | 626.232 t/s | 613.985 t/s | 619.463 t/s |
+| Decode under Nsight | 50.8641 t/s | 52.2560 t/s | 53.6445 t/s |
+| Decode latency | 19.6602 ms/token | 19.1365 ms/token | 18.6413 ms/token |
+| Draft accepted/generated | 1,527/1,727 | 1,851/2,193 | 1,851/2,193 |
+| Acceptance / mean draft length | 0.88419 / 2.27 | 0.84405 / 2.61 | 0.84405 / 2.61 |
+| Replay cycles/batch tokens | 0/0 | 88/430 | 0/0 |
+| Recurrent allocation | 448.88 MiB | 448.88 MiB | 1,047.38 MiB |
+| Init VRAM | 14,388 MiB | 14,388 MiB | 14,986 MiB |
+| Live/peak VRAM | 14,422/14,422 MiB | 14,426/14,426 MiB | 15,018/15,018 MiB |
+| Process `VmHWM` | 15,187.77 MiB | 15,186.11 MiB | 15,187.59 MiB |
+| Nsight H2D | 399,518.732 MB / 206,302 copies | 378,465.886 MB / 200,628 copies | 368,271.043 MB / 196,492 copies |
+| Nsight D2H | 6,468.824 MB / 148,698 copies | 7,145.663 MB / 143,212 copies | 6,649.862 MB / 140,044 copies |
+| Nsight D2D | 0 MB | 0 MB | 0 MB |
+
+At effectively equal VRAM, capped MTP-6 was 2.74% faster than raw MTP-2.
+Full MTP-6 was 5.47% faster than raw MTP-2, at a 596 MiB higher observed peak
+and 598.50 MiB higher recurrent allocation. Raw MTP-2 generated fewer accepted
+draft tokens and therefore performed more target-side work; its complete trace
+transferred 21,052.846 MB more H2D than capped MTP-6 despite avoiding replay.
+
+Raw MTP-2 produced a different default-sampling reasoning stream, SHA-256
+`f1e577d9f5fb2218aae850846f0bb1c59ac3c852dc03e797271b2f1af3194cb8`
+without a newline, versus the common full/capped MTP-6 hash. Changing MTP depth
+changes verification batch shapes and can change fixed-seed stochastic output;
+unlike the full-versus-capped MTP-6 pair, this follow-up is therefore a matched
+prompt/token-count serving comparison rather than an output-equivalence test.
+Both responses still contain 149 prompt and 5,000 reasoning tokens and finish
+at the requested length.
+
+Raw MTP-2 artifacts:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `/tmp/mtp2-coding-5k-raw-response.json` | 20,732 | `380658990c32e4b271a7c87898c504541b2df938cbbb1628313c6bffd8436b3b` |
+| `/tmp/mtp2-coding-5k-raw.log` | 250,047 | `93931efcdbf301c1e380b219dc3cff6f4e7aecf14e5eaae4a1f9271e0da55ed7` |
+| `/tmp/mtp2-coding-5k-raw-trace.nsys-rep` | 241,242,124 | `b3cbc981fbad22cae175fd2b927918a86c72ccc3f93e65449a8481117c3d0a83` |
+| `/tmp/mtp2-coding-5k-raw-trace.sqlite` | 699,625,472 | `b8bfdca34b7002b001d9debb06f9b467a7ae3b3088ffb2bfcd9cc245f5c49cba` |
+
+Disposition: for this long coding workload and the same three-plane recurrent
+budget, retain capped MTP-6 as the better-performing option. Raw MTP-2 avoids
+replay but gives back more throughput than replay costs at MTP-6.
