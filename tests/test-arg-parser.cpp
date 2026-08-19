@@ -7,6 +7,7 @@
 #include "speculative.h"
 
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -37,7 +38,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -54,7 +55,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     assert(_dup2(saved_fd, stderr_fd) == 0);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);
@@ -531,6 +532,7 @@ static void test(void) {
     assert(params.n_batch == 9090);
 
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
+    unset_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES");
     params = common_params();
     argv = {"binary_name", "--spec-type", "draft-dflash"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
@@ -554,6 +556,98 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_ubatch == 32);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
+    // MTP recurrent-plane cap: zero preserves the full draft-depth reserve.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 0);
+    assert(!params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 0);
+    assert(params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    // The minimum cap allocates two planes; the full value is behavior- and
+    // allocation-equivalent to the default for MTP-8.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 2);
+    assert(params.speculative.need_n_rs_seq() == 1);
+    assert(params.speculative.is_mtp_rs_capped());
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "9"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.need_n_rs_seq() == 8);
+    assert(!params.speculative.is_mtp_rs_capped());
+
+    for (const char * invalid : {"-1", "1", "10"}) {
+        params = common_params();
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+                "--spec-mtp-rs-planes", invalid};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-mtp-rs-planes", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // An explicit full allocation does not activate the cap, so the plane
+    // option itself adds no mixed-mode restriction.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "9"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.speculative.is_mtp_rs_capped());
+
+    set_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES", "4");
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 4);
+    assert(params.speculative.need_n_rs_seq() == 3);
+    unset_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES");
+
+    // INI keys are rendered through the same common argument definitions.
+    const std::filesystem::path mtp_preset_fixture =
+            std::filesystem::temp_directory_path() / "beellama-mtp-rs-planes.ini";
+    {
+        std::ofstream fixture(mtp_preset_fixture);
+        fixture << "[mtp-cap]\n"
+                << "spec-type = draft-mtp\n"
+                << "spec-draft-n-max = 8\n"
+                << "spec-mtp-rs-planes = 4\n";
+        assert(fixture.good());
+    }
+    common_preset global;
+    common_preset_context preset_ctx(LLAMA_EXAMPLE_SERVER);
+    const common_presets presets = preset_ctx.load_from_ini(mtp_preset_fixture.string(), global);
+    assert(presets.count("mtp-cap") == 1);
+    argv = presets.at("mtp-cap").to_args("binary_name");
+    params = common_params();
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 4);
+    assert(params.speculative.need_n_rs_seq() == 3);
+    assert(std::filesystem::remove(mtp_preset_fixture));
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");
     params = common_params();

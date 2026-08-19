@@ -86,6 +86,44 @@ const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_m
     return "unknown";
 }
 
+void common_validate_speculative_params(const common_params_speculative & params) {
+    if (!params.mtp_rs_planes_explicit) {
+        return;
+    }
+
+    const bool has_mtp = std::find(
+            params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
+    if (!has_mtp) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires --spec-type draft-mtp");
+    }
+
+    if (params.mtp_rs_planes == 0) {
+        return;
+    }
+
+    if (params.draft.n_max < 1) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires spec-draft-n-max >= 1");
+    }
+
+    const int64_t max_planes = int64_t(params.draft.n_max) + 1;
+    if (params.mtp_rs_planes < 2 || int64_t(params.mtp_rs_planes) > max_planes) {
+        throw std::invalid_argument(string_format(
+                "spec-mtp-rs-planes must be 0 or in [2, %" PRId64 "] for spec-draft-n-max=%d",
+                max_planes, params.draft.n_max));
+    }
+
+    const bool has_other_recurrent_mode = std::any_of(
+            params.types.begin(), params.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    if (params.is_mtp_rs_capped() && has_other_recurrent_mode) {
+        throw std::invalid_argument(
+                "spec-mtp-rs-planes cannot be combined with another speculative mode that requires recurrent rollback");
+    }
+}
+
 void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
     if (params.min_reasoning_tokens < 0) {
         throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");

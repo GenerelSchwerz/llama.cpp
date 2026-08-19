@@ -4449,6 +4449,16 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+bool llama_recurrent_sparse_snapshots_supported(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_memory() != nullptr &&
+            ctx->get_memory()->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_recurrent_set_sparse_snapshot_mode(llama_context * ctx, bool enabled, int32_t selected_token) {
+    return ctx != nullptr && ctx->get_memory() != nullptr &&
+            ctx->get_memory()->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }

@@ -6430,6 +6430,19 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
+GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K,
+        int32_t               trailing_snapshots,
+        int32_t               selected_token,
+        bool                  reserve_input);
+
 struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -6439,6 +6452,21 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
         int64_t               K) {
+    return ggml_gated_delta_net_ext(ctx, q, k, v, g, beta, state, K, (int32_t) K, -1, false);
+}
+
+GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               K,
+        int32_t               trailing_snapshots,
+        int32_t               selected_token,
+        bool                  reserve_input) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6468,11 +6496,17 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[2] == H);
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
+    GGML_ASSERT(trailing_snapshots >= 0 && trailing_snapshots <= K);
+    GGML_ASSERT(selected_token >= -1 && selected_token < n_tokens);
+    GGML_ASSERT(!(selected_token >= 0 && trailing_snapshots > 0));
     const int64_t state_rows = K * S_v * n_seqs;
     const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+    ggml_set_op_params_i32(result, 1, trailing_snapshots);
+    ggml_set_op_params_i32(result, 2, selected_token);
+    ggml_set_op_params_i32(result, 3, reserve_input ? 1 : 0);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;

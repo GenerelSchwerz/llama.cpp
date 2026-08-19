@@ -2782,7 +2782,10 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int64_t       n_seqs    = src_v->ne[3];
     const int64_t       D         = S_v * S_v * H;
     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    const int32_t       selected  = ggml_get_op_params_i32(gdn, 2);
+    const bool          sparse    = selected >= 0 || ggml_get_op_params_i32(gdn, 3) != 0;
+    const int64_t       n_written = selected >= 0 ? 1 :
+                                    sparse ? K : std::min<int64_t>(n_tokens, K);
 
     // snapshot tail starts right after the attention scores
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
@@ -5737,6 +5740,15 @@ static bool ggml_backend_cuda_kv_tail_segmented_attention_supported(
 #endif
 }
 
+static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return false;
+#else
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5756,6 +5768,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_recurrent_sparse_snapshots_supported") == 0) {
+        return (void *)ggml_backend_cuda_recurrent_sparse_snapshots_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;

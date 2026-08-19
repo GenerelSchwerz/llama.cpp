@@ -840,3 +840,290 @@ decode unchanged within single-run noise, and reduced prompt throughput by
 4.3%. Output-side draft counts and acceptance were identical in all three
 runs. Recommend 128 as the balanced setting for this hardware and workload;
 32 remains an explicit capacity-first option rather than a default.
+
+## Experiment 008: capped MTP recurrent planes with checkpoint/replay
+
+Status: rejected as a merge candidate; retained uncommitted for diagnosis.
+
+### Implementation and configuration
+
+Base commit: `5d6441f5310625911e6e9d2699d711df74af888c`. The candidate
+was measured from the uncommitted `exp/mtp-recurrent-plane-cap` worktree, so
+the results must not be attributed to the base binary.
+
+The candidate adds `--spec-mtp-rs-planes N`, environment variable
+`LLAMA_ARG_SPEC_MTP_RS_PLANES`, and INI key `spec-mtp-rs-planes`. Zero keeps
+the existing `draft_max + 1` total recurrent planes. Positive values from two
+through `draft_max + 1` allocate exactly that many total planes, leaving
+`N - 1` direct rollback positions. Draft depth is unchanged. A target host
+checkpoint is captured only when the actual draft exceeds the direct horizon;
+it is restored and the accepted prefix replayed only when the rejected suffix
+also exceeds that horizon. Per-request timing JSON and server timing logs report
+capture/restore counts and time, serialized target/draft/speculative bytes,
+peak payload, replay cycles, and replay-batch tokens.
+
+All runtime comparisons explicitly set both experimental placement switches:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 \
+build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --n-gpu-layers all --fit off --split-mode none --flash-attn on \
+  --no-kv-offload --parallel 1 --cont-batching --kv-unified \
+  --batch-size 1024 --ubatch-size 512 --spec-draft-ubatch-size 128 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 \
+  --spec-type draft-mtp --spec-draft-n-max DEPTH \
+  --spec-mtp-rs-planes PLANES --draft-p-min 0.85 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --seed 1234 --cache-ram 0
+```
+
+The clean-process short test used a 4,096-token context, 128 greedy output
+tokens, and prompt `Continue the sequence and explain the rule briefly: 1, 4,
+9, 16, 25,`. The candidate was four total planes. All six short outputs had
+SHA-256 `e87b691143030a0ac2025ab750ed5aeebbca7296734de5c24b884cbdda7f223b`.
+
+| MTP depth | Planes | Decode | Init/live VRAM | RS buffer | Captures/restores | Capture/restore | Replay |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | full (4) | 109.17 t/s | 14,142/14,164 MiB | 598.50 MiB | 0/0 | 0/0 ms | 0/0 tokens |
+| 3 | 4 | 109.20 t/s | 14,142/14,164 MiB | 598.50 MiB | 0/0 | 0/0 ms | 0/0 tokens |
+| 5 | full (6) | 105.56 t/s | 14,440/14,462 MiB | 897.75 MiB | 0/0 | 0/0 ms | 0/0 tokens |
+| 5 | 4 | 69.57 t/s | 14,142/14,164 MiB | 598.50 MiB | 28/3 | 601.07/26.95 ms | 3/8 tokens |
+| 8 | full (9) | 99.50 t/s | 14,890/14,914 MiB | 1,346.62 MiB | 0/0 | 0/0 ms | 0/0 tokens |
+| 8 | 4 | 61.54 t/s | 14,142/14,164 MiB | 598.50 MiB | 22/14 | 478.15/123.86 ms | 14/65 tokens |
+
+Four planes saved 299.25 MiB of recurrent allocation at depth 5 and 748.12
+MiB at depth 8. The corresponding short decode regressions were 34.1% and
+38.1%. Each target checkpoint was 156,914,888 bytes (149.6 MiB); its buffer was
+reused, so cumulative serialized bytes are traffic counters rather than
+simultaneously resident host memory.
+
+### Long reasoning comparison and transfer accounting
+
+The matched 32,000-context comparison requested 5,000 greedy tokens for the
+orbital-sandbox single-file HTML prompt recorded in the benchmark artifacts.
+Each clean process ran under:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 LLAMA_TRACE=1 \
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --force-overwrite=true -o TRACE \
+  build-cuda-all/bin/llama-server [common arguments above] --ctx-size 32000
+```
+
+| Measurement | MTP-8 full (9 planes) | MTP-8 capped (4 planes) |
+| --- | ---: | ---: |
+| Prompt | 575.18 t/s | 600.55 t/s |
+| Decode under Nsight | 55.66 t/s | 54.29 t/s |
+| Initialized/live/peak VRAM | 15,286/15,320/15,320 MiB | 14,538/14,570/14,570 MiB |
+| RS buffer | 1,346.62 MiB | 598.50 MiB |
+| Captures/restores | 0/0 | 132/18 |
+| Capture/restore wall time | 0/0 ms | 2,888.89/167.14 ms |
+| Cumulative target payload | 0 | 20,710,056,048 bytes |
+| Peak checkpoint payload | 0 | 156,914,888 bytes |
+| Replay | 0 | 18 cycles / 58 batch tokens |
+| Process host `VmHWM` | 15,182.9 MiB | 15,182.8 MiB |
+| Nsight H2D | 347,417.603 MB | 358,234.870 MB |
+| Nsight D2H | 6,678.289 MB | 27,313.481 MB |
+
+Nsight totals, not serialized payload sizes, are the authoritative transfer
+measurement. The cap added 10,817.267 MB H2D and 20,635.192 MB D2H. The latter
+closely tracks cumulative target checkpoint capture traffic.
+
+### Correctness result and disposition
+
+The long outputs were not identical. Full planes produced SHA-256
+`61634266bc12320f360f804c472479e84748d45648ef826ca7cd59f1106b528d`;
+four planes produced
+`9f66a45fae91a1ec0bd261c712ccf90a6b87dd4ebced20afbbfa9b3d8b1d7317`,
+with the first text difference at byte 1,337. A clean-process 512-token control
+confirmed that two full-plane runs were identical to each other while the
+capped run diverged. Therefore this is caused by deep checkpoint/replay, not
+ordinary run-to-run CUDA nondeterminism.
+
+Replay reconstructs an omitted recurrent boundary using a smaller target batch
+than the original verification. The resulting floating-point state can differ
+slightly; after enough tokens a close greedy decision changes. An attempted
+diagnostic that retained the first pass's sampled token still diverged because
+the reconstructed recurrent state itself was different, and was removed.
+
+The four-plane compatibility candidate fails the fixed-output acceptance gate
+and must not be merged or described as output-equivalent. It also imposes
+material checkpoint traffic and short-request overhead. The next implementation
+must retain selected rollback boundaries directly from the original target
+verification, beginning with sparse GPU snapshots for Qwen CUDA and failing
+closed elsewhere. Host checkpoint/replay remains useful as instrumentation and
+a compatibility experiment, not as the accepted cap mechanism.
+
+## Experiment 009: sparse GPU replay for capped MTP recurrent planes
+
+Status: retained candidate.
+
+### Implementation
+
+Base commit: `5d6441f5310625911e6e9d2699d711df74af888c`. The candidate
+was built as version 11217 from the uncommitted
+`exp/mtp-recurrent-plane-cap` worktree, so these results must not be attributed
+to the base binary.
+
+This revision replaces target host checkpoint/replay for a true plane cap with
+a sparse snapshot mode gated by model-graph and recurrent-backend capabilities.
+NVIDIA CUDA currently advertises the backend capability. An ordinary capped
+verification retains the exact pre-verification input in one plane and the most
+recent outputs in the remaining planes. A rejected suffix of at most `N - 2`
+uses a retained boundary directly. A deeper rejection restores the retained
+input, reruns the same full target batch shape, and writes only the originally
+accepted boundary to plane zero. Convolution state and gated-delta-net state use
+the same selected-boundary policy.
+
+The first conforming trace exposed a CUDA fusion-matcher miss: selected replay
+writes one state plane, while the matcher still required a four-plane
+destination. That produced 4,888.461 MB of separate D2D copies. Matching the
+selected operation as a one-plane destination lets the fused GDN kernel write
+the cache directly and removes that D2D traffic; the final results below use
+this fused path.
+
+The target graph reuse keys include sparse mode and selected token, preventing
+a normal-verification graph from being reused for selected-boundary replay.
+That omission was the cause of the initial GPU replay failure: the replay graph
+was still writing the final token state. A forced-replay diagnostic with the
+full nine-plane allocation confirmed that the fixed replayed recurrent state
+matched the originally selected boundary byte-for-byte across 156,894,364
+serialized bytes before the temporary diagnostic was removed.
+
+Zero and an explicit full-plane value preserve ordinary consecutive-snapshot
+behavior. Only `0 < N < spec-draft-n-max + 1` enables sparse replay. The cap
+fails closed unless the target graph declares selected recurrent snapshots and
+every recurrent buffer resides on a backend that advertises the corresponding
+operation. This removes the recurrent-memory architecture whitelist while
+preserving the tested NVIDIA CUDA boundary. The target checkpoint counters
+remain available for other speculative policies, but the capped path records
+zero target captures, restores, and serialized target payload.
+
+### Short fixed-seed sweep
+
+Each clean server process used the Experiment 008 common arguments, both
+placement environment switches, a 4,096-token context, temperature zero, seed
+1234, and 128 output tokens for prompt
+`Continue the sequence and explain the rule briefly: 1, 4, 9, 16, 25,`.
+Every output had SHA-256
+`64ccba06fd390281d73f4bf6d55e49f21e8cbf42a5a2064693b3a883d2c6e7c3`
+when hashed with the response text's trailing newline.
+
+| MTP depth | Planes | Decode | Init/live VRAM | RS buffer | Replay cycles/tokens | Checkpoints |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 3 | full (4) | 91.18 t/s | 14,142/14,164 MiB | 598.50 MiB | 0/0 | 0/0 |
+| 3 | explicit full (4) | 90.99 t/s | 14,142/14,164 MiB | 598.50 MiB | 0/0 | 0/0 |
+| 5 | full (6) | 93.67 t/s | 14,440/14,462 MiB | 897.75 MiB | 0/0 | 0/0 |
+| 5 | capped (4) | 87.23 t/s | 14,142/14,170 MiB | 598.50 MiB | 3/18 | 0/0 |
+| 8 | full (9) | 94.59 t/s | 14,890/14,912 MiB | 1,346.62 MiB | 0/0 | 0/0 |
+| 8 | capped (4) | 85.29 t/s | 14,142/14,164 MiB | 598.50 MiB | 5/39 | 0/0 |
+
+The short cap cost 6.9% at MTP-5 and 9.8% at MTP-8. It saved 299.25 MiB and
+748.12 MiB of recurrent allocation respectively. These short samples trigger
+replay often enough that their percentage overhead is not representative of a
+long reasoning request.
+
+### Matched 5,000-token MTP-8 run
+
+The exact prompt was:
+
+```text
+Write a single self-contained HTML file: an interactive orbital mechanics sandbox.
+Canvas-based, 60fps. Users can click-drag to fling new planets into the system;
+gravity is simulated with velocity Verlet integration against a central star.
+Include trailing orbit paths that fade, collision merging with a mass-conserving
+flash, a mass/velocity readout on hover, and a pause/reset UI. No libraries,
+no assets — one file, pure JS.
+```
+
+The request used the OpenAI-compatible chat endpoint, the model's default
+sampling parameters, seed 1234, `max_tokens: 5000`, no prompt cache, and no
+streaming. Both clean processes ran under:
+
+```bash
+GGML_KV_CPU_PINNED=1 GGML_RECURRENT_STATE_OFFLOAD=1 LLAMA_TRACE=1 \
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --force-overwrite=true -o TRACE \
+  build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on \
+  --no-kv-offload --ctx-size 32000 --parallel 1 --cont-batching \
+  --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --spec-type draft-mtp --spec-draft-n-max 8 \
+  --spec-mtp-rs-planes PLANES --spec-draft-ubatch-size 128 \
+  --draft-p-min 0.85 --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0
+```
+
+An external ten-second poll of `/slots` exposed generated-token progress, and
+`nvidia-smi` sampled process VRAM without restarting the request.
+
+| Measurement | Full (9 planes) | Capped (4 planes) | Change |
+| --- | ---: | ---: | ---: |
+| Prompt | 663.26 t/s | 674.41 t/s | +1.7% |
+| Decode under Nsight | 51.383 t/s | 50.979 t/s | -0.79% |
+| Target RS allocation | 1,346.62 MiB | 598.50 MiB | -748.12 MiB |
+| Observed process VRAM | 15,314 MiB live sample | 14,538 init / 14,576 peak | at least -738 MiB |
+| Process host `VmHWM` | 15,222.6 MiB | 15,188.8 MiB | -33.8 MiB |
+| Draft accepted/generated | 1,689/2,027 | 1,689/2,027 | identical |
+| Replay cycles/batch tokens | 0/0 | 38/217 | +38/+217 |
+| Target captures/restores | 0/0 | 0/0 | unchanged |
+| Target checkpoint payload | 0 | 0 | unchanged |
+| Nsight H2D | 388,825.670 MB | 392,764.233 MB | +3,938.563 MB |
+| Nsight D2H | 6,646.602 MB | 6,896.808 MB | +250.206 MB |
+| Nsight D2D | 0 MB | 0 MB | unchanged |
+
+The full and capped reasoning fields were byte-identical and had SHA-256
+`09ab907a3b42bb586f7714eb1327461ff853e37cf4895795ab4328f99382bdb6`
+without an added newline. They also match the earlier clean full-plane MTP-8
+artifact. Nsight totals, rather than serialized payload counters, are the
+authoritative transfer measurement. Unlike Experiment 008, there is no
+recurring roughly 150 MiB target checkpoint transfer to host. The remaining
+extra H2D/D2H traffic comes from the 38 full-shape replay batches rather than a
+serialized recurrent-state payload.
+
+Artifacts:
+
+- `/tmp/mtp8-gpu-replay-5k-full-response.json`
+- `/tmp/mtp8-gpu-replay-5k-cap4-fused-response.json`
+- `/tmp/mtp8-gpu-replay-5k-full-trace.nsys-rep`
+- `/tmp/mtp8-gpu-replay-5k-cap4-fused-trace.nsys-rep`
+
+The complete artifact hashes, environment/toolchain identity, build and ccache
+configuration, corrected monitoring procedure, profiler SQL, implementation
+chronology, and integration steps are in
+[`mtp-recurrent-plane-cap-reproduction.md`](mtp-recurrent-plane-cap-reproduction.md).
+
+### Validation and disposition
+
+The argument parser, recurrent rollback, prompt-checkpoint, loop-guard,
+sampler, and server fixture tests passed before and after the final matcher
+change. The CUDA `GATED_DELTA_NET` backend-op selection passed 36/36 cases. A
+startup control confirmed that explicit full MTP-3 reports a
+three-token direct horizon with GPU replay disabled. The full/capped short
+outputs matched at MTP-3, MTP-5, and MTP-8, and the long MTP-8 output now passes
+the fixed-output acceptance gate. No hidden full-depth recurrent allocation
+appears: server allocation logs and the shutdown memory breakdown show
+598.50 MiB for four planes versus 1,346.62 MiB for nine.
+
+A post-measurement interface cleanup replaced the Qwen architecture and CUDA
+buffer-name checks with the model-graph/backend capability contract described
+above; it did not change the replay graph or kernels. The rebuilt tree again
+passed the seven focused regressions and all 36 CUDA gated-delta-net cases. A
+fresh capped MTP-8 short request produced the same output hash, draft counts
+(`114/89`), replay work (`5/39`), and zero checkpoint counts at 85.14 t/s. With
+recurrent state deliberately left on CPU, the same configuration failed at
+startup through the missing backend capability as intended.
+
+Retain the sparse GPU candidate. Its long-run 0.79% decode cost is materially
+smaller than the host-checkpoint candidate's traffic and short-request
+regression, while preserving 748.12 MiB of MTP-8 recurrent VRAM. Keep the
+full-plane default and the graph/backend capability fail-closed boundary.

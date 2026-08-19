@@ -278,6 +278,16 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["spec_checkpoint_captures"] = spec_checkpoint_captures;
+        base["spec_checkpoint_restores"] = spec_checkpoint_restores;
+        base["spec_checkpoint_capture_ms"] = spec_checkpoint_capture_ms;
+        base["spec_checkpoint_restore_ms"] = spec_checkpoint_restore_ms;
+        base["spec_checkpoint_target_bytes"] = spec_checkpoint_target_bytes;
+        base["spec_checkpoint_draft_bytes"] = spec_checkpoint_draft_bytes;
+        base["spec_checkpoint_spec_bytes"] = spec_checkpoint_spec_bytes;
+        base["spec_checkpoint_peak_bytes"] = spec_checkpoint_peak_bytes;
+        base["spec_replay_cycles"] = spec_replay_cycles;
+        base["spec_replay_batch_tokens"] = spec_replay_batch_tokens;
     }
 
     return base;

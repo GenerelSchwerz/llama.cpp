@@ -1740,6 +1740,10 @@ bool llama_model::graph_consumes_exact_kv_tail() const {
     return !hparams.is_mla();
 }
 
+bool llama_model::graph_supports_recurrent_sparse_snapshots() const {
+    return false;
+}
+
 bool llama_model::self_attention_uses_explicit_bias(uint32_t il) const {
     if (il >= layers.size()) {
         return false;

@@ -174,6 +174,58 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
+## MTP recurrent-plane cap
+
+MTP draft depth and target recurrent-state rollback capacity are separate
+controls. `--spec-draft-n-max 8` still permits an eight-token draft when the
+target retains only four recurrent planes; the cap changes how a rejected
+suffix is recovered, not how many tokens MTP may propose.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--spec-mtp-rs-planes N` | `LLAMA_ARG_SPEC_MTP_RS_PLANES` | `0` | Sets total target recurrent planes for `draft-mtp`, including the current state. `0` preserves the full allocation of `spec-draft-n-max + 1`; otherwise `N` must be in `2..spec-draft-n-max + 1`. The same name, `spec-mtp-rs-planes`, is accepted in INI presets. |
+
+The default and an explicit full value (`N = spec-draft-n-max + 1`) use the
+ordinary consecutive snapshots and expose `N - 1` direct rollback positions.
+A smaller value is a true cap: it reserves one of the `N` planes for the exact
+pre-verification input state and uses the other `N - 1` planes for recent
+verified outputs. That gives a direct rejected-suffix horizon of `N - 2`.
+Deeper rejection runs the original verification batch shape again on the GPU
+and writes only the selected accepted boundary, avoiding a target host
+checkpoint while retaining deterministic output.
+
+The capped GPU path requires the loaded model graph to declare selected sparse
+recurrent-snapshot support and every recurrent-state buffer backend to advertise
+the matching operation capability. The current provider is NVIDIA CUDA; other
+backends fail closed. This is a capability contract rather than an architecture
+name check, so another compatible graph can opt in without changing recurrent
+memory code. A cap cannot be combined with another speculative implementation
+that requires recurrent rollback. The server logs the resolved depth, total
+planes, direct horizon, allocation, and GPU replay policy. Completion timing
+JSON reports speculative checkpoint counts/times/payloads plus replay cycles and
+actual replay-batch tokens. Nsight transfer totals remain authoritative;
+serialized payload counters are not transfer measurements. Omitting the option
+preserves full-plane behavior.
+
+The complete source lineage, build/ccache setup, implementation chronology,
+failed designs, exact commands, profiler queries, artifact hashes, and merge
+procedure are recorded separately in
+[`mtp-recurrent-plane-cap-reproduction.md`](mtp-recurrent-plane-cap-reproduction.md).
+
+The earlier host-checkpoint replay implementation changed CUDA batch shape and
+failed long output-equivalence validation; Experiment 008 records that rejected
+path. The selected-boundary full-shape GPU replay in Experiment 009 passed the
+long fixed-seed output gate.
+
+Startup logs report resolved draft depth, total planes, direct rollback
+horizon, total per-slot recurrent allocation, and whether checkpoint fallback
+is enabled. Completion timing JSON and the speculative timing log report
+checkpoint capture/restore counts and wall time, cumulative serialized
+target/draft/speculative-state bytes, peak live checkpoint payload bytes,
+replay cycles, and actual replay-batch tokens. These byte counters describe
+serialized payload size; use a backend profiler such as Nsight Systems for
+authoritative host-to-device and device-to-host transfer totals.
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash

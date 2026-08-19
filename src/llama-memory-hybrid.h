@@ -70,6 +70,9 @@ public:
     bool get_can_shift() const override;
     seq_rm_capability get_seq_rm_capability() const override;
 
+    bool recurrent_sparse_snapshots_supported() const override;
+    bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
+
     void clear(bool data) override;
 
     bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;

@@ -27,7 +27,10 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   rq3_magic,
                                      float         scale,
                                      int64_t       state_slot_stride,
-                                     int           K) {
+                                     int           K,
+                                     int           trailing_snapshots,
+                                     int           selected_token,
+                                     bool          reserve_input) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -58,6 +61,16 @@ gated_delta_net_cuda(const float * q,
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
         s_shard[r]  = curr_state[i];
+    }
+
+    if constexpr (keep_rs_t) {
+        if (reserve_input) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                state[(K - 1) * state_slot_stride + col * S_v + i] = s_shard[r];
+            }
+        }
     }
 
     for (int t = 0; t < n_tokens; t++) {
@@ -145,8 +158,11 @@ gated_delta_net_cuda(const float * q,
         if constexpr (keep_rs_t) {
             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
-            const int target_slot = (int) n_tokens - 1 - t;
-            if (target_slot >= 0 && target_slot < K) {
+            const int target_slot = selected_token >= 0
+                    ? (t == selected_token ? 0 : -1)
+                    : (int) n_tokens - 1 - t;
+            const int snapshot_slots = selected_token >= 0 ? 1 : trailing_snapshots;
+            if (target_slot >= 0 && target_slot < snapshot_slots) {
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
@@ -176,7 +192,8 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+        float scale, int64_t state_slot_stride, int K,
+        int trailing_snapshots, int selected_token, bool reserve_input, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -192,26 +209,30 @@ static void launch_gated_delta_net(
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input);
             break;
         }
         case 128: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input);
             break;
         }
         default:
@@ -284,6 +305,9 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
+    const int trailing_snapshots = ggml_get_op_params_i32(dst, 1);
+    const int selected_token = ggml_get_op_params_i32(dst, 2);
+    const bool reserve_input = ggml_get_op_params_i32(dst, 3) != 0;
     const bool keep_rs = K > 1;
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
@@ -298,21 +322,25 @@ static void ggml_cuda_op_gated_delta_net_impl(
         if (keep_rs) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
+                trailing_snapshots, selected_token, reserve_input, stream);
         }
     }
 }
