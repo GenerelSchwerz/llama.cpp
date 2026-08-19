@@ -635,6 +635,7 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool kv_cpu_pinned     = false; // route CPU-resident KV cache layers through pinned/host memory
     bool recurrent_state_offload = false; // for hybrid models, keep recurrent state GPU-resident even with no_kv_offload
+    bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

@@ -2599,6 +2599,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
     add_opt(common_arg(
+        {"--phase-aware-workspace"},
+        {"--no-phase-aware-workspace"},
+        string_format("resize compute workspaces between prompt processing and token generation; "
+                      "later prompt turns regrow the prompt reservation, and fit still budgets the full prompt peak "
+                      "(default: %s)",
+                      params.phase_aware_workspace ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.phase_aware_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
+    add_opt(common_arg(
         {"--kv-gpu-layers"}, "N",
         string_format("with --no-kv-offload, keep the first N attention-KV layers device-resident anyway. "
                       "Those layers stop being re-sent to the device on every decode step, which is the dominant "

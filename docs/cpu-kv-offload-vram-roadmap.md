@@ -80,16 +80,27 @@ lifetimes and graph topology remain unchanged.
 
 ## Complexity 2: phase-aware allocation policy
 
-### Shrink to a decode-only scheduler after prefill
+### Shrink to a decode-only scheduler after prefill (implemented)
 
-The scheduler retains the worst-case 512-token prompt graph. Rebuilding it for
-single-token decode could reclaim much of the context-scaled workspace during
-generation.
+The retained `--phase-aware-workspace` implementation rebuilds the scheduler
+reservation for the active geometry. It starts at a speculation-aware
+generation bound, grows to the full physical ubatch for prompt work, and
+shrinks when generation resumes. A second prompt on the same live server was
+verified to regrow and shrink both target and MTP contexts safely.
 
-- Reduces steady-state decode residency.
-- Does not reduce initial prefill peak.
-- Requires allocation and CUDA graph recapture before later prompt ingestion.
-- Interactive turns may repeatedly shrink and regrow the scheduler.
+At 140K with MTP-6, three recurrent planes, target ubatch 512, and draft ubatch
+128, it reduced initialized/steady VRAM by 1,108 MiB and measured peak VRAM by
+902-926 MiB. The 138K prompt changed prefill by -0.12%; the plain 5K run changed
+decode by -1.83%. Target plus draft transition work was 41.8 ms in the 5K run
+and 46.0 ms in the 138K run.
+
+- Reduces startup and steady generation residency.
+- Reduces coexistence peak by sharing sequential target/draft backing, but does
+  not shrink the active target prompt geometry itself.
+- Requires allocation, graph-address invalidation, and recapture at each phase
+  boundary.
+- Retains model weights, KV, recurrent state, rollback planes, samplers, and
+  checkpoints unchanged.
 
 ### Grow workspace with live context
 
@@ -100,16 +111,23 @@ maximum `--ctx-size` at startup.
 - Does not reduce a genuinely full-context peak.
 - Requires safe buffer relocation and graph invalidation at growth boundaries.
 
-### Phase MTP allocation against target prefill
+### Phase MTP allocation against target prefill (implemented)
 
-Ordinary target prefill does not require all decode-time rollback planes. Use
-target prompt workspace first, release or shrink it, and then allocate the
-speculative decode state.
+Target and integrated MTP schedulers now retain private allocation plans while
+using one physical backing group keyed by exact backend buffer type. The active
+allocation is the maximum requirement, not the sum, because execution is
+sequential. Explicit synchronization protects each target/MTP ownership
+handoff, and a coalesced shrink epoch waits for every active member to publish
+its current plan.
 
-- Potentially saves hundreds of MiB of coexistence peak at deeper MTP settings.
-- Later turns still need prompt ingestion while speculative state exists.
-- Active recurrent state, checkpoints, and draft synchronization must survive
-  buffer and graph reconstruction.
+- The 140K generation allocation was 840.82 MiB CUDA plus 2.41 MiB CUDA-host
+  backing, instead of retaining the full target 1,054.62/157.03 MiB and draft
+  892.05/39.46 MiB reservations concurrently.
+- Later-turn prompt ingestion passed with identical fixed-seed output.
+- Active recurrent state and checkpoints remain persistent; this policy only
+  phases transient graph workspace.
+- The allocator protocol is backend-type based and contains no Qwen or CUDA
+  architecture check.
 
 ### Evict cold CUDA graphs
 
@@ -184,15 +202,13 @@ explicit staging with GPU online-softmax accumulation.
 
 ## Recommended order
 
-1. Finish isolated MTP allocation controls on their experiment branch and
-   measure prefill peak separately from decode residency.
-2. Test phase-aware prompt/decode scheduler resizing to quantify reclaimable
-   steady-state VRAM without kernel changes.
-3. Implement a fail-closed compact mask for single-slot contiguous causality
+1. Retained: capped MTP recurrent planes and phase-aware target/draft workspace
+   have separate controls and matched correctness/resource measurements.
+2. Implement a fail-closed compact mask for single-slot contiguous causality
    and verify the predicted 1,024-byte-per-cell GPU and host reductions.
-4. Reassess peak pressure. Pursue direct-Q8 prompt MMA only if its approximately
+3. Reassess peak pressure. Pursue direct-Q8 prompt MMA only if its approximately
    950 MiB saving justifies the kernel-development and tuning cost.
-5. Treat fixed-window streaming as the long-term solution when VRAM must remain
+4. Treat fixed-window streaming as the long-term solution when VRAM must remain
    approximately flat at genuinely full 90K-to-240K contexts.
 
 Every experiment must record model files, command, prompt, sampling settings,

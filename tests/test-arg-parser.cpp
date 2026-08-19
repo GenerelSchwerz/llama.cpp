@@ -557,6 +557,29 @@ static void test(void) {
     assert(params.speculative.draft.n_ubatch == 32);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
 
+    unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.phase_aware_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--phase-aware-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.phase_aware_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--phase-aware-workspace", "--no-phase-aware-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.phase_aware_workspace);
+
+    set_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE", "1");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.phase_aware_workspace);
+    unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+
     // MTP recurrent-plane cap: zero preserves the full draft-depth reserve.
     params = common_params();
     argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
@@ -635,7 +658,8 @@ static void test(void) {
         fixture << "[mtp-cap]\n"
                 << "spec-type = draft-mtp\n"
                 << "spec-draft-n-max = 8\n"
-                << "spec-mtp-rs-planes = 4\n";
+                << "spec-mtp-rs-planes = 4\n"
+                << "phase-aware-workspace = true\n";
         assert(fixture.good());
     }
     common_preset global;
@@ -647,6 +671,7 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.mtp_rs_planes == 4);
     assert(params.speculative.need_n_rs_seq() == 3);
+    assert(params.phase_aware_workspace);
     assert(std::filesystem::remove(mtp_preset_fixture));
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");

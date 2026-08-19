@@ -806,6 +806,7 @@ struct ggml_backend_sched {
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
+    ggml_gallocr_shared_buffers_t shared_buffers;
 
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
@@ -1972,6 +1973,32 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+void ggml_backend_sched_set_shared_buffers(
+        ggml_backend_sched_t sched,
+        ggml_gallocr_shared_buffers_t shared) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(shared != nullptr);
+    GGML_ASSERT(sched->shared_buffers == nullptr);
+    ggml_gallocr_set_shared_buffers(sched->galloc, shared);
+    sched->shared_buffers = shared;
+}
+
+uint64_t ggml_backend_sched_shared_buffers_generation(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    return ggml_gallocr_shared_buffers_generation(sched->shared_buffers);
+}
+
+uint64_t ggml_backend_sched_shared_buffers_plan_generation(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    return ggml_gallocr_shared_buffers_plan_generation(sched->shared_buffers);
+}
+
+void ggml_backend_sched_request_shared_buffer_shrink(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    GGML_ASSERT(sched->shared_buffers != nullptr);
+    ggml_gallocr_shared_buffers_request_shrink(sched->shared_buffers);
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

@@ -290,6 +290,17 @@ json result_timings::to_json() const {
         base["spec_replay_batch_tokens"] = spec_replay_batch_tokens;
     }
 
+    if (workspace_target_reserves > 0 || workspace_draft_reserves > 0) {
+        base["workspace_target_reserves"] = workspace_target_reserves;
+        base["workspace_target_grows"] = workspace_target_grows;
+        base["workspace_target_shrinks"] = workspace_target_shrinks;
+        base["workspace_target_reserve_ms"] = workspace_target_reserve_ms;
+        base["workspace_draft_reserves"] = workspace_draft_reserves;
+        base["workspace_draft_grows"] = workspace_draft_grows;
+        base["workspace_draft_shrinks"] = workspace_draft_shrinks;
+        base["workspace_draft_reserve_ms"] = workspace_draft_reserve_ms;
+    }
+
     return base;
 }
 

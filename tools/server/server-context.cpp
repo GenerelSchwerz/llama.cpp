@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -420,6 +421,9 @@ struct server_slot {
     uint64_t n_spec_replay_cycles = 0;
     uint64_t n_spec_replay_batch_tokens = 0;
 
+    llama_workspace_stats workspace_start_tgt;
+    llama_workspace_stats workspace_start_dft;
+
     // State belonging to the next speculative checkpoint is captured in phases
     // around draft generation. Keep only serialization time here so draft
     // compute is not mislabeled as checkpoint capture time.
@@ -488,6 +492,8 @@ struct server_slot {
         n_spec_replay_cycles = 0;
         n_spec_replay_batch_tokens = 0;
         t_spec_checkpoint_capture_pending_us = 0;
+        workspace_start_tgt = {};
+        workspace_start_dft = {};
 
         task_prev = std::move(task);
         task.reset();
@@ -720,6 +726,18 @@ struct server_slot {
             timings.spec_replay_batch_tokens = n_spec_replay_batch_tokens;
         }
 
+        const auto workspace_end_tgt = llama_get_workspace_stats(ctx_tgt);
+        const auto workspace_end_dft = llama_get_workspace_stats(ctx_dft);
+        auto delta = [](uint64_t end, uint64_t start) { return end >= start ? end - start : 0; };
+        timings.workspace_target_reserves = delta(workspace_end_tgt.reserve_count, workspace_start_tgt.reserve_count);
+        timings.workspace_target_grows = delta(workspace_end_tgt.grow_count, workspace_start_tgt.grow_count);
+        timings.workspace_target_shrinks = delta(workspace_end_tgt.shrink_count, workspace_start_tgt.shrink_count);
+        timings.workspace_target_reserve_ms = delta(workspace_end_tgt.reserve_us, workspace_start_tgt.reserve_us) / 1000.0;
+        timings.workspace_draft_reserves = delta(workspace_end_dft.reserve_count, workspace_start_dft.reserve_count);
+        timings.workspace_draft_grows = delta(workspace_end_dft.grow_count, workspace_start_dft.grow_count);
+        timings.workspace_draft_shrinks = delta(workspace_end_dft.shrink_count, workspace_start_dft.shrink_count);
+        timings.workspace_draft_reserve_ms = delta(workspace_end_dft.reserve_us, workspace_start_dft.reserve_us) / 1000.0;
+
         return timings;
     }
 
@@ -841,6 +859,26 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        const auto workspace_end_tgt = llama_get_workspace_stats(ctx_tgt);
+        const auto workspace_end_dft = llama_get_workspace_stats(ctx_dft);
+        auto delta = [](uint64_t end, uint64_t start) { return end >= start ? end - start : 0; };
+        const uint64_t tgt_reserves = delta(workspace_end_tgt.reserve_count, workspace_start_tgt.reserve_count);
+        const uint64_t dft_reserves = delta(workspace_end_dft.reserve_count, workspace_start_dft.reserve_count);
+        if (tgt_reserves > 0 || dft_reserves > 0) {
+            SLT_INF(*this,
+                    "workspace transitions = target %" PRIu64 " (%" PRIu64 " grow / %" PRIu64
+                    " shrink, %.3f ms), draft %" PRIu64 " (%" PRIu64 " grow / %" PRIu64
+                    " shrink, %.3f ms)\n",
+                    tgt_reserves,
+                    delta(workspace_end_tgt.grow_count, workspace_start_tgt.grow_count),
+                    delta(workspace_end_tgt.shrink_count, workspace_start_tgt.shrink_count),
+                    delta(workspace_end_tgt.reserve_us, workspace_start_tgt.reserve_us) / 1000.0,
+                    dft_reserves,
+                    delta(workspace_end_dft.grow_count, workspace_start_dft.grow_count),
+                    delta(workspace_end_dft.shrink_count, workspace_start_dft.shrink_count),
+                    delta(workspace_end_dft.reserve_us, workspace_start_dft.reserve_us) / 1000.0);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -2112,6 +2150,9 @@ private:
         }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+
+        slot.workspace_start_tgt = llama_get_workspace_stats(ctx_tgt);
+        slot.workspace_start_dft = llama_get_workspace_stats(ctx_dft);
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt

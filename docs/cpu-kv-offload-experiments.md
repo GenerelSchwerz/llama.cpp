@@ -1624,3 +1624,294 @@ draft/accepted 114/89, replay 5/39, checkpoints 0/0, and init/live process VRAM
 14,142/14,164 MiB. Decode was 85.54 t/s. This confirms the merged placement
 interface reaches the same cap/replay path; it is not a new matched 5K
 performance comparison.
+
+## Experiment 014: phase-aware target/MTP compute workspace
+
+Status: retained as an opt-in candidate on the dedicated
+`exp/phase-aware-prefill-decode` branch. The benchmarked source is an
+uncommitted source-only diff with SHA-256
+`f6407cfd0987a37835a4c428ba6a63581928614a9efa691a20957b7e9bfcfec8`
+against base `324873dc5ca44eb31727ba3bd09897841574fa3b`. The candidate server SHA-256
+is `6b7169ca2141a606613527deecf7134c530e27884187de0a75b8c72e26ea54b2`;
+the detached-base server SHA-256 is
+`7b63ef24b1cfae76738793a47c8b96e5087307b627ef0d13302f8cddf89ae89b`.
+No measurement below is attributed to a commit that does not contain the
+benchmarked code.
+
+### Objective and retained design
+
+With CPU-resident target KV, active model weights and compute reservations
+dominate process VRAM. The baseline retains a prompt-high-water target
+scheduler and a separate prompt-high-water integrated-MTP scheduler throughout
+generation, even though target and MTP graphs execute sequentially.
+
+`--phase-aware-workspace` makes that transient lifetime explicit:
+
+1. Each context initially reserves the generation geometry. The server derives
+   its bound as `parallel * (1 + resolved speculative draft maximum)`, capped
+   by `batch-size`; this experiment therefore uses seven tokens for MTP-6.
+2. A submitted batch above the generation bound grows the scheduler to its
+   configured physical ubatch: 512 target tokens and 128 draft tokens here.
+3. Returning to generation starts one group shrink epoch. Every active member
+   publishes its current allocation plan once before the physical backing can
+   shrink.
+4. Target and MTP schedulers retain independent graph plans but join a generic
+   backing group. Chunks are matched by exact backend buffer-type identity and
+   allocated to the maximum current member requirement, not their sum.
+5. Physical generation counters invalidate peer graph addresses after backing
+   replacement. Target/MTP ownership handoffs synchronize before the next
+   sequential user executes.
+
+The policy does not unload weights or the MTP head and does not move or change
+KV, recurrent state, rollback planes, checkpoints, samplers, cache formats, or
+model outputs. Fit/no-allocation probing still measures the full prompt
+geometry. The option defaults off and is available through CLI,
+`LLAMA_ARG_PHASE_AWARE_WORKSPACE`, and the INI key
+`phase-aware-workspace`.
+
+### Rejected implementations and the replay failure
+
+A scheduler-destruction/model-unload approach was rejected before benchmark
+because it mixed persistent state lifetime with transient graph allocation and
+made later prompts unsafe. The allocator-sharing layer preserves the existing
+scheduler plans and execution model instead.
+
+The first shared-backing version automatically treated every smaller
+allocation plan as permission to shrink. That was incorrect: recurrent
+rollback replay builds legitimate graph variants inside the same generation
+phase. The 128-token short request, with four replay cycles, performed six
+target plus six draft reserves. The 5,000-token request, with 88 replay cycles,
+performed 90 plus 90 reserves and spent 462.110 ms in target plus 265.997 ms in
+draft reservation, or 728.107 ms total. An intermediate per-member high-water
+permission still produced six plus six short-request reserves; temporary
+instrumentation showed every extra replacement came from a peer plan-generation
+publication rather than a local geometry transition.
+
+The retained explicit group epoch fixes the cause. Only a real
+prompt-to-generation token-geometry transition permits shrink; replay replans
+within generation cannot begin another epoch. The same short and 5K cases now
+perform exactly two target and two draft reserves per request: one grow and one
+shrink for each context.
+
+### Hardware, build, model, and environment
+
+- GPU: NVIDIA GeForce RTX 5070 Ti, 15,880 MiB usable process capacity,
+  compute capability 12.0, driver 610.57.04.
+- CPU: Intel Core Ultra 9 285K, 24 cores without SMT, one NUMA node; 62 GiB
+  system RAM.
+- Compiler: GCC 16.2.1 20260810; CUDA 13.3; Nsight Systems
+  2026.1.3.425-261338342291v0.
+- Build: Release, CUDA, native CPU, CUDA FlashAttention, effective CUDA
+  architecture `120a`, KVarN enabled, default quant matrix
+  (`GGML_CUDA_FA_ALL_QUANTS=OFF`).
+- Model:
+  `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`.
+- Multimodal projector:
+  `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf`.
+
+The clean baseline was the exact detached base in
+`/home/gencoolpc/beellama-phase-baseline`; the candidate was
+`/home/gencoolpc/beellama-prefill-decode`. The shared ccache uses
+`cache_dir=/home/gencoolpc/.cache/ccache`, `base_dir=/home/gencoolpc`,
+`hash_dir=false`, and a 50 GiB limit. A public-header change caused 847 genuine
+misses after the statistics reset; this is dependency invalidation, not a
+failure to share cache objects across worktrees.
+
+Every process was launched after explicitly unsetting
+`GGML_KV_CPU_PINNED`, `GGML_RECURRENT_STATE_OFFLOAD`, `LLAMA_TRACE`,
+`LLAMA_ARG_PHASE_AWARE_WORKSPACE`, and `CUDA_VISIBLE_DEVICES`. Placement and
+phase selection therefore came only from the command below; no old experiment
+environment flag could contaminate one side of the comparison.
+
+### Matched server command and progress collection
+
+The command template was identical on both sides except that `SERVER` selected
+the exact baseline or candidate binary and candidate runs appended
+`--phase-aware-workspace`:
+
+```bash
+env -u GGML_KV_CPU_PINNED \
+    -u GGML_RECURRENT_STATE_OFFLOAD \
+    -u LLAMA_TRACE \
+    -u LLAMA_ARG_PHASE_AWARE_WORKSPACE \
+    -u CUDA_VISIBLE_DEVICES \
+SERVER \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --ctx-size 140000 --parallel 1 --cont-batching --kv-unified \
+  --batch-size 1024 --ubatch-size 512 \
+  --spec-type draft-mtp --spec-draft-n-max 6 \
+  --spec-mtp-rs-planes 3 --spec-draft-ubatch-size 128 \
+  --draft-p-min 0.85 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 \
+  --threads 3 --threads-batch 24 \
+  --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+  --host 127.0.0.1 --port PORT --verbosity 4 [--phase-aware-workspace]
+```
+
+Each measurement used a new process and an idle GPU. The harness polled
+`/slots` every ten seconds to expose request progress and sampled
+`nvidia-smi` process memory plus `/proc/PID/status` RSS, high-water RSS, and
+locked memory every 0.5 seconds. It recorded initialization and post-request
+checkpoints, the exact escaped server command, relevant environment, request
+hash, response, output hash, logs, and summaries. The plain harness SHA-256 is
+`64d7e49d020b8323bff5fdea45f111f21cd2b7970da9f691faae63b41f1bcc3d`.
+The profiler harness SHA-256 is
+`fe48787f6ab25c8d053111133808e3c49d2f557eeae99b8ae93c59e80c0f6d07`.
+
+The short `/completion` request generated 128 greedy tokens. The coding
+`/v1/chat/completions` request used the orbital-sandbox HTML prompt and
+generated 5,000 tokens with seed 1234 and the model's default sampling
+temperature. The long `/completion` request contained 138,000 explicit token
+IDs repeating `[1000, 1001, 1002, 1003]`, followed by 64 greedy tokens. Prompt
+cache was disabled in every request. Their request SHA-256 values were,
+respectively, `408fc8936598794b092fef75283311a3f0ff9df35318416ebe4f4ffa3cbe011a`,
+`6edbe87e0896f13681887883efba7b18a669e29802a161fcfa6a737bd5695995`,
+and `b60a55d02f8cf01f53b73ab80bf46b22d8d5886ff970c09a4f660475a0e0f546`.
+
+### Throughput, transition, and speculative results
+
+| Workload | Metric | Baseline | Candidate | Change |
+| --- | --- | ---: | ---: | ---: |
+| Short, 26 prompt + 128 output | Prefill | 197.65 t/s | 149.25 t/s | cold 26-token sample; not used for acceptance |
+| Short | Decode | 84.10 t/s | 82.78 t/s | -1.57% |
+| Short | Wall | 1.655 s | 1.722 s | +4.04% |
+| Coding, 149 prompt + 5,000 output | Prefill | 633.10 t/s | 571.95 t/s | cold 149-token sample; not used for acceptance |
+| Coding | Decode | 52.098 t/s | 51.146 t/s | -1.83% |
+| Coding | Wall | 96.211 s | 98.023 s | +1.88% |
+| Long, 138,000 prompt + 64 output | Prefill | 742.519 t/s | 741.661 t/s | -0.12% |
+| Long | Decode | 30.67 t/s | 33.02 t/s | 64-token tail; too short for a stable claim |
+| Long | Wall | 187.959 s | 188.030 s | +0.04% |
+| Nsight coding pair | Decode | 50.498 t/s | 50.275 t/s | -0.44% |
+| Nsight coding pair | Wall | 99.259 s | 99.794 s | +0.54% |
+
+| Candidate workload | Target reserves | Draft reserves | Target time | Draft time | Total transition time |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short | 2 (1 grow, 1 shrink) | 2 (1 grow, 1 shrink) | 35.302 ms | 9.429 ms | 44.731 ms |
+| Coding 5K | 2 (1 grow, 1 shrink) | 2 (1 grow, 1 shrink) | 32.482 ms | 9.313 ms | 41.795 ms |
+| Long 138K | 2 (1 grow, 1 shrink) | 2 (1 grow, 1 shrink) | 36.074 ms | 9.929 ms | 46.003 ms |
+| Nsight coding | 2 (1 grow, 1 shrink) | 2 (1 grow, 1 shrink) | 31.681 ms | 10.137 ms | 41.818 ms |
+
+The coding baseline and candidate both generated 2,193 draft tokens, accepted
+1,851, and performed 88 replay cycles carrying 430 actual replay-batch tokens.
+The long pair both generated and accepted 54 drafts with zero replay. Every
+target checkpoint counter, serialized checkpoint payload counter, capture time,
+and restore time was zero. Thus the candidate neither changed speculation nor
+hid allocation work in the compatibility checkpoint path.
+
+### Device and host memory
+
+| Workload and point | Baseline VRAM | Candidate VRAM | Saving |
+| --- | ---: | ---: | ---: |
+| Initialized | 15,768 MiB | 14,660 MiB | 1,108 MiB |
+| Coding 5K complete/steady | 15,800 MiB | 14,692 MiB | 1,108 MiB |
+| Coding 5K sampled peak | 15,800 MiB | 14,874 MiB | 926 MiB |
+| Long 138K complete/steady | 15,800 MiB | 14,692 MiB | 1,108 MiB |
+| Long 138K sampled peak | 15,800 MiB | 14,898 MiB | 902 MiB |
+
+At baseline startup, the target scheduler reported 1,054.62 MiB CUDA plus
+157.03 MiB CUDA-host compute and the draft scheduler reported 892.05 MiB plus
+39.46 MiB. The candidate's stable shared generation backing was 840.82 MiB
+CUDA plus 2.41 MiB CUDA-host. During prompt processing the shared backing grew
+to the active target maximum, 1,054.62/157.03 MiB, rather than the sum of both
+scheduler maxima.
+
+The 5K initialization/completion RSS changed from 7,480,900/7,929,392 KiB to
+7,237,808/7,686,608 KiB, about 237 MiB lower. The 138K values changed from
+7,480,912/8,551,064 KiB to 7,235,776/8,306,416 KiB. Process `VmHWM` is
+dominated by model load and was 43.6-45.4 MiB lower in the candidate. `VmLck`
+was zero on both sides, but Linux `VmLck` is not a measurement of CUDA pinned
+allocations or CUDA mapping resources; the logged CUDA-host buffer sizes are
+the relevant allocator accounting here.
+
+The shutdown breakdown for the 5K baseline was approximately
+`CUDA: 15880 = 46 + (14617 = 13114 model + 448 context + 1054 compute) + 1216`
+and `Host: 5450 = 644 + 4649 + 157`. The candidate was
+`CUDA: 15880 = 1154 + (14403 = 13114 + 448 + 840) + 322` and
+`Host: 5296 = 644 + 4649 + 2`. The CUDA driver reports free/unaccounted terms
+differently after replacing allocations, so the direct process samples and
+named compute components are the acceptance measurements.
+
+### Nsight transfer accounting
+
+The clean 5K pair used:
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=none --cpuctxsw=none \
+  --force-overwrite=true --output=TRACE SERVER [matched arguments]
+nsys stats --force-export=true --report cuda_gpu_mem_size_sum --format csv TRACE.nsys-rep
+nsys stats --report cuda_gpu_mem_time_sum --format csv TRACE.nsys-rep
+```
+
+| Operation | Baseline total/count | Candidate total/count | Difference |
+| --- | ---: | ---: | ---: |
+| H2D | 378,465.886 MB / 200,628 | 378,465.886 MB / 200,628 | exactly zero |
+| D2H | 7,145.663 MB / 143,212 | 7,145.663 MB / 143,212 | exactly zero |
+| Memset | 969.646 MB / 3,159 | 969.646 MB / 3,159 | exactly zero |
+
+H2D medians/averages were 1.114/1.886 MB and D2H medians/averages were
+0.004/0.050 MB on both sides. Baseline/candidate H2D time was 8.520/8.164 s and
+D2H time was 0.274/0.263 s; timing variation under profiling is not treated as
+a benefit. Identical byte totals and call counts are the authoritative result:
+replacing the compute backing adds no host/device traffic. Serialized payload
+counters are not PCIe measurements.
+
+### Correctness, compatibility, and regression coverage
+
+All fixed-output pairs were byte-identical:
+
+- short output SHA-256:
+  `e87b691143030a0ac2025ab750ed5aeebbca7296734de5c24b884cbdda7f223b`;
+- coding 5K output SHA-256:
+  `2f994f600563b04a0a8ce172b59b8f04515edae27664f0b15cab003ad257f44e`;
+- long 138K output SHA-256:
+  `02ba58ab1c1df7dec6df58c435c3fa9eeb5c42fb04c549c82552639aaebf54dc`.
+
+The candidate binary with the new option omitted reproduced the baseline's
+15,768/15,790 MiB initialization/completion values, the same short output hash,
+and the same 103/88 draft/accept and 4/26 replay statistics. This confirms the
+default-off compatibility path retains full reservations.
+
+Two identical short requests were also issued to one live candidate process.
+Both output hashes matched the baseline. Each request independently performed
+one target/draft grow and one target/draft shrink; the second transition took
+33.396/9.427 ms. This validates prompt regrowth after generation and safe reuse
+of the live context. The second run's acceptance/replay path differed slightly
+because the server restored/invalidated its retained prompt state, but the
+fixed output did not.
+
+The final CUDA binary passed `test-alloc`. A focused CTest selection passed 9/9:
+argument parsing, allocator sharing, recurrent rollback, prompt checkpoint,
+loop-guard checkpoint/static and runtime, sampler rollback, model fixture
+generation, and KVarN rollback static coverage. The broad suite, excluding the
+three independently classified environment/upstream failures below, passed
+93/93:
+
+- `test-upstream-merge-keepers-static` fails identically on the exact detached
+  base;
+- `test-tokenizers-ggml-vocabs` sees a Git LFS pointer instead of its external
+  tokenizer fixture;
+- CUDA `test-backend-ops` aborts at the existing `fattn.cu:380`; this patch
+  changes no CUDA kernel or attention dispatch code.
+
+### Disposition and next work
+
+Retain the option. It removes 1,108 MiB of steady process VRAM and 902-926 MiB
+of peak VRAM in the intended MTP-6 CPU-Q8-KV configuration, with identical
+outputs, replay work, and PCIe byte totals. The measured trade is a 42-46 ms
+phase-transition cost and a 0.44-1.83% 5K decode regression. The allocator is
+backend-type based and has no Qwen or CUDA architecture gate; integrated MTP is
+the current consumer because it has two sequential schedulers to share.
+
+This result changes the working theory: roughly 1.1 GiB of the CPU-KV serving
+floor was inactive prompt-high-water/coexistence allocation, not irreducible
+model or KV residency. The next contained target is compact causal-mask
+metadata. Direct-Q8 prompt MMA and bounded fixed-window GPU streaming remain
+larger follow-ons. The complete commands, chronology, artifact map, and
+integration procedure are in
+[`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).

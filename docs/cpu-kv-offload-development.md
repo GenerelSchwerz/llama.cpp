@@ -608,9 +608,19 @@ remains enabled, so the default build still compiles its standard KVarN
 templates even though the runtime experiment uses Q8.
 
 ccache is enabled. The first build in a new worktree had few or no hits because
-path-dependent compilation prevented reuse from the baseline build. Subsequent
-source-only rebuilds should reuse this worktree's cache. The RTX 5070 Ti build
-uses CUDA architecture `120a` as selected by current CMake/CUDA handling.
+the original cache configuration did not normalize sibling-worktree paths. The
+shared configuration is now `cache_dir=/home/gencoolpc/.cache/ccache`,
+`base_dir=/home/gencoolpc`, `hash_dir=false`, and `max_size=50G`. Related
+worktrees therefore share compatible objects. A genuine public-header content
+change still invalidates every dependent translation unit; ccache cannot turn a
+new dependency hash into a hit.
+
+For allocator and parser iteration, use the separate CPU-only Ninja directory
+`build-phase-dev`. Its first `test-alloc` plus `test-arg-parser` build completed
+in 24 seconds on all 24 cores. Only a state that passes those cheap gates should
+be built in the matched CUDA directory. The production RTX 5070 Ti build
+requests CMake architecture `120`, which current CUDA handling compiles as
+`120a`.
 
 ## Proposed next sequence
 
@@ -719,28 +729,86 @@ records the complete process: workspace and ccache setup, failed candidates,
 exact validation and profiling commands, artifact hashes, and CPU-KV
 integration procedure.
 
-1. Run output-equivalence and recurrent-state regression tests for the separated
-   placement policy.
-2. Measure no-MTP and MTP depth-1 serving with realistic prompts, including
-   recurrent rollback VRAM, acceptance, prefill, decode, and total VRAM.
-3. Record startup, post-warmup, fixed-live-depth, and post-idle VRAM; distinguish
-   static workspace growth from CUDA graph-capture growth.
-4. Attribute target compute, recurrent state, MTP draft compute, boundary
-   buffers, and graph-cache allocations before attempting to reduce them.
-5. Count graph splits and boundary-transfer bytes before and after recurrent
-   offload so the remaining CPU-attention boundary cost is explicit.
-6. Measure pinned system-memory size and CUDA mapping overhead at 4K, 16K, and
-   the intended maximum serving context.
-7. Prototype further Bee-derived Q8 scheduling or layout changes only when the
-   measurements identify a specific remaining bottleneck.
-8. Compare the validated Bee implementation with external implementations only
-   after the Bee candidate is complete; do not use external source to design the
-   candidate.
-9. Evaluate selective/chunked pinning if full-context pinned memory is too costly.
-10. Sweep Q6/Q8 and mixed standard K/V pairs with throughput, VRAM, pinned RAM,
-   and quality measurements.
-11. Retained: the experimental environment-only switches were replaced by
-   `--kv-cpu-pinned` and `--recurrent-state-offload` in Experiment 009.
+### Follow-on branch: phase-aware target and MTP workspace
+
+The dedicated `exp/phase-aware-prefill-decode` worktree at base
+`324873dc5ca44eb31727ba3bd09897841574fa3b` tested the next largest avoidable
+VRAM category: retaining prompt-sized target and MTP compute reservations while
+only generation graphs are active. This is a workspace-lifetime change, not an
+attempt to unload MTP weights or persistent speculative/recurrent state.
+
+The retained opt-in `--phase-aware-workspace` policy starts each context with a
+generation reservation, grows to its full physical ubatch for prompt work, and
+shrinks after returning to generation. The generation bound includes parallel
+sequences and the resolved speculative horizon. Fit/no-allocation measurement
+still uses the full prompt geometry. Later requests on the same server context
+repeat the transition safely.
+
+Integrated MTP creates a second scheduler, so resizing each private scheduler
+was insufficient: two prompt high-water allocations would still coexist. The
+implementation adds a generic GGML shared-backing group below the schedulers.
+Each scheduler retains its graph plan, while physical chunks are keyed by exact
+backend buffer type and sized to the maximum current member requirement rather
+than their sum. Target and MTP execution remains sequential and uses explicit
+ownership fences. A physical-generation counter invalidates peer graph
+addresses after replacement.
+
+The initial automatic-shrink protocol exposed a performance bug. Recurrent
+checkpoint replay legitimately replans graph variants, and every smaller plan
+was mistaken for a phase reduction. A short request with four replay cycles
+performed six target plus six draft reserves; the 5K request with 88 replays
+performed 90 plus 90 and spent 728.11 ms rebuilding workspaces. An intermediate
+per-member high-water permission did not solve it because every extra reserve
+was caused by peer plan-generation publication. The final protocol begins one
+explicit group shrink epoch only when token geometry crosses from prompt to
+generation. Growth remains immediate; shrink waits until every active member
+has published once. The same replay-heavy cases now perform exactly two target
+and two draft reserves: one grow and one shrink per context.
+
+The clean 140K MTP-6/Q8 comparison retained the candidate. Initialized and
+steady process VRAM fell from 15,768/15,800 MiB to 14,660/14,692 MiB, saving
+1,108 MiB. Peak fell from 15,800 MiB to 14,874 MiB in the 5K case and 14,898
+MiB in the 138K case, saving 926 and 902 MiB. The active generation backing was
+840.82 MiB CUDA plus 2.41 MiB CUDA-host memory. The uncapped baseline retained
+separate target (1,054.62/157.03 MiB) and draft (892.05/39.46 MiB) plans.
+
+Performance is an explicit trade rather than a free win. The plain 5K coding
+run changed decode from 52.10 to 51.15 t/s (-1.83%) and wall time from 96.21 to
+98.02 seconds. Its target/draft transition work was 32.48/9.31 ms. The matched
+138K prompt changed prefill from 742.52 to 741.66 t/s (-0.12%) and total wall
+time from 187.96 to 188.03 seconds; its 64-token decode tail was too short for a
+stable throughput conclusion. The Nsight pair changed decode from 50.50 to
+50.27 t/s (-0.44%). H2D/D2H bytes and operation counts were exactly identical,
+so no hidden transfer mechanism explains the remaining small decode cost.
+
+All short, 5K, 138K, default-off, and same-process second-turn fixed-seed output
+hashes matched their baselines. Draft counts, accepted counts, replay cycles,
+and replay-batch tokens also matched. The final focused suite passed 9/9 and
+the broad suite passed all 93 remaining tests after the three independent
+upstream/fixture failures were classified. Experiment 014 contains
+the authoritative ledger, and
+[`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md)
+records the complete work process.
+
+This revises the working theory: about 1.1 GiB of the apparent CPU-KV serving
+floor was inactive scheduler high-water and target/draft coexistence, and can
+be removed without new attention kernels or transfer traffic. The remaining
+prompt peak is real active target workspace with the previously measured
+context-linear F16 materialization, Q8 staging, and explicit mask. Compact mask
+metadata is therefore the next contained VRAM target; direct-Q8 prompt MMA and
+fixed-window streaming remain progressively larger follow-ons.
+
+1. Implement a fail-closed compact causal-mask descriptor for the supported
+   single-slot contiguous layout and measure the predicted GPU and CUDA-host
+   savings.
+2. Reassess full prompt peak after removing explicit-mask storage; pursue
+   direct-Q8 prompt MMA only if its larger kernel/tuning cost remains justified.
+3. Treat bounded fixed-window GPU streaming as the long-term path when active
+   prompt workspace must remain approximately flat with maximum context.
+4. Measure pinned system-memory size and CUDA mapping overhead separately from
+   `nvidia-smi`; `VmLck=0` does not prove CUDA-host allocations are pageable.
+5. Sweep lower homogeneous cache widths only with matched quality validation;
+   asymmetric K/V and partial GPU KV remain outside the current scope.
 
 ## Known non-goals
 
