@@ -5241,14 +5241,26 @@ The same code shows 22 MiB or nothing under `llama-bench` and 140 to 972 MiB
 under `llama-server`. Both measurements reproduce on demand, so the difference
 is a property of the harnesses rather than of the kernel.
 
-The likely mechanism is the logits reservation: at physical ubatch 512 and a
-248,320-token vocabulary it alone reserves roughly 485 MiB, which exceeds the
-F16 K/V copy at the two depths `llama-bench` was run at and would mask its
-removal. **This has not been verified.** Until it is, the honest statement is
-that the reserve-time figures above describe the serving configuration, the
-`llama-bench` figures describe 512-token prefill benchmarking, and the boundary
-between them is not established. Anyone extending this work should resolve that
-before quoting a single number as the allocation result.
+The mechanism is the logits reservation, and the controlling variable is
+`n_outputs_max`, not the physical ubatch, which is 512 in both harnesses.
+`llama-bench` does not set `n_outputs_max`, so `llama_context` defaults it to
+`n_batch` (`src/llama-context.cpp`, `cparams.n_outputs_max = ... : cparams.n_batch`).
+Reservation then uses `n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max)`
+with `n_tokens = min(n_ctx, n_ubatch) = 512`, so the logits tensor reserves
+512 x 248,320 x 4 bytes = 485.0 MiB — the same figure derived independently
+when the `llama-bench` allocation table was first read. `llama-server` sets the
+value explicitly (`tools/server/server-context.cpp` via `server_n_outputs_max`)
+and reports `n_outputs_max = 1`, giving a 0.95 MiB output buffer, so nothing
+covers the F16 copy.
+
+The two harnesses therefore measure the same allocation. `llama-bench` masks
+the saving below the context at which the F16 copy exceeds 485 MiB, which for
+4 KiB per token is about 124,000 tokens; `llama-server` exposes it at every
+context. There is no CLI option for `n_outputs_max`, so this was established by
+reading the reservation path rather than by toggling it. The remaining
+empirical cross-check is to run `llama-bench` above that crossover, where the
+saving should reappear as roughly `4 KiB x n_ctx - 485 MiB`; that has not been
+done.
 
 The throughput gain is present in all four `llama-bench` configurations
 regardless, because the bandwidth cost of writing and re-reading the copy is
@@ -5270,10 +5282,11 @@ deployed, the change removes over half of the device compute buffer at long
 context, which is a different class of result and justifies the build cost. The
 throughput gain is now the secondary effect.
 
-The default has not been changed here, because the boundary between the two
-allocation measurements is still unexplained and the flag's default should not
-be moved on an unreconciled result. Resolving that reconciliation is the
-gating item for enabling it by default.
+The default has not been changed here. The harness discrepancy is now explained
+by `n_outputs_max`, but that explanation rests on reading the reservation path
+rather than on a measurement that toggles it, and output exactness has not been
+rechecked at the contexts where the allocation result lives. Those two items
+gate a change of default, not this entry.
 
 The empirical claim is limited to `Q8_0`/`Q8_0` at head dimensions 128 and 256
 on `sm_89`, one model, and one host. Reserve-time allocation was measured at
