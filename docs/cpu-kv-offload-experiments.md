@@ -5020,3 +5020,205 @@ ubatch-matched MTP protocol (Characterization 025's caveat) to get a
 current-provenance number is future work, not expected to change the
 qualitative finding since this entry's own DSpark half of the pair already
 used the unaffected, always-current DSpark configuration.
+## Experiment 021: quantized-native Q8_0 K/V in the MMA FlashAttention kernel
+
+Status: retained, behind an off-by-default build flag. The CUDA MMA kernel can
+read a `Q8_0` cache in place instead of casting it to F16 first. Output is
+byte-identical and 512-token prefill improves by 1.2% to 1.8% at depth, which
+is real but small on this model and consistent with what the removed memory
+traffic can account for. Transient allocation falls by 22 MiB in one of four
+tested configurations and is unchanged in the other three.
+
+### Motivation
+
+The MMA/tile flash-attention path casts K and V to F16 before running,
+regardless of the cache's storage type or where `--kv-gpu-layers` places it
+(`ggml_cuda_flash_attn_ext_get_alloc_size` sets `need_f16_K = need_f16_V =
+true` for `BEST_FATTN_KERNEL_TILE` and `BEST_FATTN_KERNEL_MMA_F16`). That cast
+allocates a transient F16 copy of the attention window and re-materializes it
+on every graph execution. `docs/qn0-native-mma-kernel-plan.md` scoped the work;
+this entry records its outcome.
+
+### Scope correction made during implementation
+
+The plan scoped the first pass to `DKQ = DV = 128`. That scope was never
+checked against the model the work exists to serve.
+`Qwen3.8-27B-UD-IQ2_M.gguf` is `qwen35` with
+`attention.key_length = attention.value_length = 256`, so a kernel gated at 128
+never engages on it at all. Head dimension 256 was added (commit `223964887`)
+and needs no loader change: the Ampere config table gives
+`nbatch_K2 = nbatch_V2 = 128` at `DKQ = DV = 256`, so a tile chunk is eight
+whole `Q8_0` blocks rather than four and every alignment invariant the loader
+asserts still holds.
+
+### Integration, source, hardware, and inputs
+
+The implementation was committed as `7d0c6cdbb`, its test coverage as
+`a2f523786`, the head-256 extension as `223964887`, and route observability as
+`4af38f91d`. Scope is `Q8_0` K with `Q8_0` V at head dimension 128 or 256 on
+Ampere/Ada, behind `GGML_CUDA_FATTN_Q8_NATIVE` (default off). Within such a
+build `GGML_CUDA_FATTN_Q8_NATIVE=0` disables the route at run time, so every
+comparison below is a same-binary A/B rather than a two-build comparison.
+
+Hardware and model follow Experiment 011's configuration: RTX 4070 12 GiB
+(compute capability 8.9), Intel Core i5-13400F, 31 GiB RAM, PCIe 4.0 x16,
+driver 610.57.04, CUDA 13.3, GNU 16.2.1. Release CUDA build, architecture 890,
+`GGML_CUDA_FA_ALL_QUANTS=OFF`, `GGML_CUDA_KVARN=ON`,
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`. Model
+`/home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf`,
+10,319,907,904 bytes, SHA-256
+`04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`
+(`qwen35`, 27.32B, 9.60 GiB, 16 attention layers of 65, head dimension 256,
+24 attention heads, 4 KV heads, vocabulary 248,320).
+
+Libraries at `223964887`:
+
+- `build/bin/libggml-cuda.so`, SHA-256
+  `6b96fd50a2d1040627ada2935d5ac9894201d1f22a8a62b522cd9a1118c1678a`
+- `build/bin/libllama-bench-impl.so`, SHA-256
+  `731b3e26f4f879243aa2100dcda58441ac3e3a72f01f784e25b4b735edfc44bf`
+- `build/bin/libllama-completion-impl.so`, SHA-256
+  `9b8613de878d16d292e2fd374ad4dd1aa883160c81f7eafc88a7a65b163715eb`
+
+The `llama-bench` and `llama-completion` files in `build/bin` are thin
+wrappers that load these; hashing them identifies nothing.
+
+### The route was confirmed to engage, not assumed
+
+The first measurement pass found an unchanged compute buffer and a throughput
+delta inside noise. That is equally consistent with the route being a no-op on
+this model and with the route never engaging, so the two were separated
+directly rather than by inference:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1 \
+  build/bin/llama-completion -m Qwen3.8-27B-UD-IQ2_M.gguf -f prompt.txt \
+  -n 4 --temp 0 -s 1234 --no-warmup --simple-io -v \
+  -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 8192 </dev/null 2>&1 \
+  | grep -c "fattn-q8-native: D="
+```
+
+112 launches with the flag on, 0 with it off, reported as
+`D=256 n_q=512 n_kv=... n_head=24 n_head_kv=4`. That is 16 attention layers
+times 7 graph executions. Note that `-v` is required: without it llama.cpp's
+log filter discards these lines, and an earlier count of 0 was an artifact of
+that filter rather than of routing.
+
+### Correctness
+
+The F16 cast (`dequantize_block_q8_0_f16`, `ggml/src/ggml-cuda/convert.cu`)
+computes the dequantized pair as `__hmul2(make_half2(qs.x, qs.y),
+__half2half2(d))`, and the new loader performs the same `half2` multiply, so
+both paths feed identical `half` values to identical `mma()` calls. The bar is
+therefore bit-identity, not tolerance.
+
+| Gate | Result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "type_K=q8_0"`, native off | 413/413 passed |
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "type_K=q8_0"`, native on | 413/413 passed |
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "hsk=256"`, native on | 165/165 passed |
+| `ctest -R "test-kvarn\|test-adaptive-dm\|test-server-loop-guard"` | 8/8 passed |
+
+The `type_K=q8_0` count is 413 rather than the plan's recorded 349 because this
+work added 32 head-128 and 32 head-256 `Q8_0`/`Q8_0` cases; the general sweep
+had paired quantized K/V only with head sizes 64 and 72.
+
+Greedy generation, 128 tokens from a 12,000-byte prompt:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V build/bin/llama-completion \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -f prompt.txt -n 128 --temp 0 -s 1234 \
+  --no-warmup --simple-io -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 8192
+```
+
+Both settings produced 12,624 bytes with SHA-256
+`717035f38f5485f44bdb53f4ad9b38a18e47fd32c2a0a41fb60543fb3e33eaf0`.
+
+### Prefill throughput
+
+Experiment 011's command shape, with `-r 10` rather than `-r 3`. Ten
+repetitions were needed: at three the deltas were 0.8 to 1.6 combined standard
+deviations from zero, which does not support a claim in either direction.
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V taskset -c 0,2,4 build/bin/llama-bench \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -ngl 99 -t 3 --poll 100 -nkvo 1 -fa on \
+  -ctk q8_0 -ctv q8_0 --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers $N -p 512 -n 0 -d 16384,32768 -r 10 --kv-memory -o json
+```
+
+| `--kv-gpu-layers` | Depth | Native off (t/s) | Native on (t/s) | Change | Welch t |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 16,384 | 999.52 +/- 5.47 | 1016.27 +/- 5.17 | +1.68% | 7.0 |
+| 0 | 32,768 | 819.33 +/- 4.61 | 828.99 +/- 4.93 | +1.18% | 4.5 |
+| 16 | 16,384 | 1046.00 +/- 11.11 | 1064.94 +/- 11.77 | +1.81% | 3.7 |
+| 16 | 32,768 | 875.71 +/- 5.43 | 891.71 +/- 5.67 | +1.83% | 6.5 |
+
+All four are significant at n = 10 per side. The native-off column reproduces
+Experiment 011's independent figures for the same shape (984.72 and 1033.99 t/s
+at N = 0 and 16, depth 16,384), so the harness is measuring the same thing.
+
+The size of the effect is what the removed traffic accounts for, which is worth
+stating because it bounds what this kernel can ever be worth here. At depth
+32,768 the cast touches 16 attention layers times 32,768 tokens times 1,024
+elements times two tensors, so it reads about 1.1 GB of `Q8_0` and writes about
+2.1 GB of F16 per graph execution. At roughly 500 GB/s that is near 6.4 ms
+against a 512-token prefill of about 587 ms at 875.71 t/s, or close to 1.1% of
+runtime. Measured 1.18% to 1.83% is the same order.
+
+This model is a poor case for the optimization by construction: only 16 of 65
+layers are attention layers, and IQ2_M weight matmuls dominate the rest. A
+model whose layers are all attention would expose proportionally more.
+
+### Decode
+
+Single-token decode never reaches this path.
+`ggml_cuda_get_best_fattn_kernel` sends quantized K/V with `Q->ne[1] <= 2` to
+the vector kernel on Ada, which already reads `Q8_0` natively. This work is a
+prefill and large-batch optimization only, and does not interact with the
+decode residency results in Experiments 010 and 011.
+
+### Transient allocation
+
+| `--kv-gpu-layers` | Depth | Native off | Native on | Saved |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 16,384 | 541.79 MiB | 541.79 MiB | none |
+| 0 | 32,768 | 669.79 MiB | 669.79 MiB | none |
+| 16 | 16,384 | 541.79 MiB | 541.79 MiB | none |
+| 16 | 32,768 | 579.79 MiB | 557.79 MiB | 22.00 MiB |
+
+The F16 copy is always removed, but `cuda_compute_buffer_bytes` is a peak over
+one reused arena, so the removal lowers that peak only by however much the copy
+exceeded what other tensors in the graph already reserve. The largest of those
+is the logits tensor: at physical ubatch 512 and a 248,320-token vocabulary it
+alone reserves roughly 485 MiB, more than the F16 K/V copy in three of the four
+configurations, so the peak does not move there at all.
+
+This bounds the claim, and it is the opposite of what the motivating review
+report assumed. That report treated the cast as a fixed VRAM cost to be
+recovered and extrapolated it to roughly 950 MiB at 240K context. On a
+large-vocabulary model at a realistic physical ubatch the cast is instead
+mostly hidden inside an allocation that exists anyway, and recovering it
+changes the reported peak by 22 MiB or by nothing. The throughput gain is
+present in all four configurations regardless, because the bandwidth cost of
+writing and re-reading the copy is real whether or not it raises the peak.
+
+### Disposition
+
+Retain the kernel behind `GGML_CUDA_FATTN_Q8_NATIVE`, default off. It is
+output-exact, faster in every configuration measured, never slower, and
+strictly reduces transient allocation. It is also, on this model, worth about
+1.5% of prefill and at most 22 MiB, against sixteen additional template
+instantiations per head dimension and a compile definition that rebuilds every
+flash-attention template instance when toggled. Default-off is the honest
+setting for a change with that ratio; whether it is worth enabling is a
+deployment decision, not a correctness one.
+
+The empirical claim is limited to `Q8_0`/`Q8_0` at head dimensions 128 and 256
+on `sm_89`, one model, one host, and 512-token prefill at two depths. The
+model's GQA ratio of 6 selects `ncols2 = 8`, so inference exercises only that
+column geometry; the other three are covered by `test-backend-ops` against the
+CPU reference rather than end to end. Other quantized pairs, Turing, Volta,
+AMD, multi-GPU, MTP/DSpark speculative geometries, and the serving-level
+protocol in `cpu-kv-offload-current-testing.md` are all unmeasured. The plan's
+remaining non-goals stand.
