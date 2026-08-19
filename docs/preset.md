@@ -59,6 +59,9 @@ ubatch-size = 512
 # Optional: keep the target ubatch above while reducing only the speculative
 # draft context workspace.
 spec-draft-ubatch-size = 128
+# Optional: override target KV placement for independently owned draft cache
+# layers. Omit this key to inherit the target policy.
+# spec-draft-kv-gpu-layers = N
 # Optional: retain only the active prompt or generation workspace. This regrows
 # automatically when a later request needs prompt processing.
 phase-aware-workspace = true

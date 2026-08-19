@@ -66,11 +66,20 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--yarn-beta-slow N` | YaRN: high correction dim or alpha (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_SLOW) |
 | `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
 | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
+| `--kv-cpu-pinned, --no-kv-cpu-pinned` | route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory; only affects layers not offloaded to GPU, e.g. when combined with --no-kv-offload; with operation offload enabled, attention placement is resolved independently of persistent KV placement even with --no-kv-offload (default: disabled)<br/>(env: LLAMA_ARG_KV_CPU_PINNED) |
+| `--recurrent-state-offload, --no-recurrent-state-offload` | for hybrid attention/recurrent models, keep the fixed recurrent (R/S) state GPU-resident even when --no-kv-offload moves attention KV to CPU; only takes effect when --kv-offload is disabled, since --kv-offload already keeps the recurrent state on GPU (default: disabled)<br/>(env: LLAMA_ARG_RECURRENT_STATE_OFFLOAD) |
+| `--phase-aware-workspace, --no-phase-aware-workspace` | resize compute workspaces between prompt processing and token generation; later prompt turns regrow the prompt reservation, and fit still budgets the full prompt peak (default: disabled)<br/>(env: LLAMA_ARG_PHASE_AWARE_WORKSPACE) |
+| `--kv-gpu-layers N` | with --no-kv-offload, keep the first N attention-KV layers device-resident anyway. Those layers stop being re-sent to the device on every decode step, which is the dominant long-context cost of KV offload, in exchange for their device memory. 0 keeps every layer on the host, a value at or above the attention-layer count matches --kv-offload (default: 0)<br/>(env: LLAMA_ARG_KV_GPU_LAYERS) |
 | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
-| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
-| `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |
+| `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1, kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
+| `--kv-tail-tokens SPEC` | exact KV-cache tail: 0, auto, N, positional list, or named group list<br/>KVarN always retains an intrinsic 128-token exact suffix<br/>(default: 0)<br/>(env: LLAMA_ARG_KV_TAIL_TOKENS) |
+| `--kv-tail-type TYPE` | exact KV-cache tail type: f16 or bf16<br/>(default: bf16 for standard caches, f16 for KVarN)<br/>(env: LLAMA_ARG_KV_TAIL_TYPE) |
+| `--cache-type-k-swa TYPE` | SWA-layer KVarN cache type override for K<br/>allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8<br/>(default: same as --cache-type-k)<br/>(env: LLAMA_ARG_CACHE_TYPE_K_SWA) |
+| `--cache-type-v-swa TYPE` | SWA-layer KVarN cache type override for V<br/>allowed values: kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8<br/>(default: same as --cache-type-v)<br/>(env: LLAMA_ARG_CACHE_TYPE_V_SWA) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
+| `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
 | `--mlock` | DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |
 | `--mmap, --no-mmap` | DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>(env: LLAMA_ARG_MMAP) |
 | `-dio, --direct-io, -ndio, --no-direct-io` | DEPRECATED in favor of `--load-mode`: use DirectIO if available<br/>(env: LLAMA_ARG_DIO) |
@@ -101,8 +110,6 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-dr, --docker-repo [<repo>/]<model>[:quant]` | Docker Hub model repository. repo is optional, default to ai/. quant is optional, default to :latest.<br/>example: gemma3<br/>(default: unused)<br/>(env: LLAMA_ARG_DOCKER_REPO) |
 | `-hf, -hfr, --hf-repo <user>/<model>[:quant]` | Hugging Face model repository; quant is optional, case-insensitive, default to Q4_K_M, or falls back to the first file in the repo if Q4_K_M doesn't exist.<br/>mmproj is also downloaded automatically if available. to disable, add --no-mmproj<br/>example: ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M<br/>(default: unused)<br/>(env: LLAMA_ARG_HF_REPO) |
 | `-hff, --hf-file FILE` | Hugging Face model file. If specified, it will override the quant in --hf-repo (default: unused)<br/>(env: LLAMA_ARG_HF_FILE) |
-| `-hfv, -hfrv, --hf-repo-v <user>/<model>[:quant]` | Hugging Face model repository for the vocoder model (default: unused)<br/>(env: LLAMA_ARG_HF_REPO_V) |
-| `-hffv, --hf-file-v FILE` | Hugging Face model file for the vocoder model (default: unused)<br/>(env: LLAMA_ARG_HF_FILE_V) |
 | `-hft, --hf-token TOKEN` | Hugging Face access token (default: value from HF_TOKEN environment variable)<br/>(env: HF_TOKEN) |
 | `--log-disable` | Log disable |
 | `--log-file FNAME` | Log to file<br/>(env: LLAMA_ARG_LOG_FILE) |
@@ -112,8 +119,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-lv, --verbosity, --log-verbosity N` | Set the verbosity threshold. Messages with a higher verbosity will be ignored. Values:<br/> - 0: generic output<br/> - 1: error<br/> - 2: warning<br/> - 3: info<br/> - 4: trace (more info)<br/> - 5: debug<br/>(default: 3)<br/><br/>(env: LLAMA_ARG_LOG_VERBOSITY) |
 | `--log-prefix, --no-log-prefix` | Enable prefix in log messages<br/>(env: LLAMA_ARG_LOG_PREFIX) |
 | `--log-timestamps, --no-log-timestamps` | Enable timestamps in log messages<br/>(env: LLAMA_ARG_LOG_TIMESTAMPS) |
-| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
-| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
+| `--spec-draft-type-k, -ctkd, --cache-type-k-draft TYPE` | KV cache data type for K for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K) |
+| `--spec-draft-type-v, -ctvd, --cache-type-v-draft TYPE` | KV cache data type for V for the draft model<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1<br/>(default: f16)<br/>(env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V) |
 
 
 ### Sampling params
@@ -197,9 +204,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--ui-config, --webui-config JSON` | JSON that provides default UI settings (overrides UI defaults)<br/>(env: LLAMA_ARG_UI_CONFIG) |
 | `--ui-config-file, --webui-config-file PATH` | JSON file that provides default UI settings (overrides UI defaults)<br/>(env: LLAMA_ARG_UI_CONFIG_FILE) |
 | `--ui-mcp-proxy, --webui-mcp-proxy, --no-ui-mcp-proxy, --no-webui-mcp-proxy` | experimental: whether to enable MCP CORS proxy - do not enable in untrusted environments (default: disabled)<br/>(env: LLAMA_ARG_UI_MCP_PROXY) |
-| `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_datetime<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_TOOLS) |
-| `--tools-runtime OPTION` | experimental: run tools in a separate runtime environment (default: none, use host environment)<br/>available options:<br/>  'docker:<image>': spin up a new Docker container and reuse it for all invocations, clean up on server exit<br/>  'docker-container:<id>': use an existing Docker container by ID, won't stop on server exit<br/><br/>(env: LLAMA_ARG_TOOLS_RUNTIME) |
 | `--tools TOOL1,TOOL2,...` | experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)<br/>specify "all" to enable all tools<br/>available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, get_datetime, get_info<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_TOOLS) |
+| `--tools-runtime OPTION` | experimental: run tools in a separate runtime environment (default: none, use host environment)<br/>available options:<br/>  'docker:<image>': spin up a new Docker container and reuse it for all invocations, clean up on server exit<br/>  'docker-container:<id>': use an existing Docker container by ID, won't stop on server exit<br/><br/>(env: LLAMA_ARG_TOOLS_RUNTIME) |
 | `--mcp-servers-config PATH` | experimental: path to JSON file with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_CONFIG) |
 | `--mcp-servers-json JSON` | experimental: inline JSON with MCP server definitions (Cursor-compatible format) - do not enable in untrusted environments (default: none)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_MCP_SERVERS_JSON) |
 | `-ag, --agent, -no-ag, --no-agent` | whether to enable CORS proxy and all built-in tools - do not enable in untrusted environments (default: disabled)<br/>note: for security reasons, this will limit --cors-origins to localhost by default<br/>(env: LLAMA_ARG_AGENT) |
@@ -230,6 +236,13 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
 | `--reasoning-budget N` | token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)<br/>(env: LLAMA_ARG_THINK_BUDGET) |
 | `--reasoning-budget-message MESSAGE` | message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)<br/>(env: LLAMA_ARG_THINK_BUDGET_MESSAGE) |
+| `--reasoning-loop-guard MODE` | reasoning loop guard mode: off, force-close, or stop (default: force-close)<br/>(env: LLAMA_ARG_REASONING_LOOP_GUARD) |
+| `--reasoning-loop-min-tokens N` | minimum hidden reasoning tokens before loop checks (default: 512)<br/>(env: LLAMA_ARG_REASONING_LOOP_MIN_TOKENS) |
+| `--reasoning-loop-window N` | token tail window for reasoning loop checks (default: 1024)<br/>(env: LLAMA_ARG_REASONING_LOOP_WINDOW) |
+| `--reasoning-loop-max-period N` | maximum periodic loop length to check (default: 128)<br/>(env: LLAMA_ARG_REASONING_LOOP_MAX_PERIOD) |
+| `--reasoning-loop-min-coverage N` | minimum repeated token coverage before loop trigger (default: 256)<br/>(env: LLAMA_ARG_REASONING_LOOP_MIN_COVERAGE) |
+| `--reasoning-loop-check-interval N` | accepted-token interval between loop checks (default: 64)<br/>(env: LLAMA_ARG_REASONING_LOOP_CHECK_INTERVAL) |
+| `--reasoning-loop-interventions N` | maximum force-close interventions before stop (default: 2)<br/>(env: LLAMA_ARG_REASONING_LOOP_INTERVENTIONS) |
 | `--reasoning-preserve, --no-reasoning-preserve` | preserve reasoning trace in the full history, not just the last assistant message (default: template default)<br/>compatible with certain templates having 'supports_preserve_reasoning' capability<br/>example: https://docs.z.ai/guides/capabilities/thinking-mode#preserved-thinking<br/>(env: LLAMA_ARG_REASONING_PRESERVE) |
 | `--chat-template JINJA_TEMPLATE` | set custom jinja chat template (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE) |
 | `--chat-template-file JINJA_TEMPLATE_FILE` | set custom jinja chat template file (default: template taken from model's metadata)<br/>if suffix/prefix are specified, template will be disabled<br/>only commonly used templates are accepted (unless --jinja is set before this flag):<br/>list of built-in templates:<br/>bailing, bailing-think, bailing2, chatglm3, chatglm4, chatml, command-r, deepseek, deepseek-ocr, deepseek2, deepseek3, exaone-moe, exaone3, exaone4, falcon3, gemma, gigachat, glmedge, gpt-oss, granite, granite-4.0, granite-4.1, grok-2, hunyuan-dense, hunyuan-moe, hunyuan-vl, kimi-k2, llama2, llama2-sys, llama2-sys-bos, llama2-sys-strip, llama3, llama4, megrez, minicpm, mistral-v1, mistral-v3, mistral-v3-tekken, mistral-v7, mistral-v7-tekken, monarch, openchat, orion, pangu-embedded, phi3, phi4, rwkv-world, seed_oss, smolvlm, solar-open, vicuna, vicuna-orca, yandex, zephyr<br/>(env: LLAMA_ARG_CHAT_TEMPLATE_FILE) |
@@ -251,11 +264,22 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-cpu-strict-batch, --cpu-strict-batch-draft <0\|1>` | Use strict CPU placement for draft model (default: --cpu-strict-draft) |
 | `--spec-draft-prio-batch, --prio-batch-draft N` | set draft process/thread priority : 0-normal, 1-medium, 2-high, 3-realtime (default: 0) |
 | `--spec-draft-poll-batch, --poll-batch-draft <0\|1>` | Use polling to wait for draft model work (default: --poll-draft) |
+| `--spec-dm-controller MODE` | adaptive DFlash draft-max controller: off or profit (default: profit)<br/>(env: LLAMA_ARG_SPEC_DM_CONTROLLER) |
+| `--spec-dm-profit-min F` | minimum profit margin over the no-spec baseline before disabling dwell clears (default: 0.0500)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_MIN) |
+| `--spec-dm-profit-raise-margin F` | relative profit margin required to raise adaptive draft depth (default: 0.0500)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN) |
+| `--spec-dm-profit-lower-margin F` | relative profit margin required to lower adaptive draft depth (default: 0.0500)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN) |
+| `--spec-dm-profit-ewma-alpha F` | EWMA alpha for adaptive draft-max profit statistics (default: 0.1500)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_EWMA_ALPHA) |
+| `--spec-dm-profit-min-samples N` | minimum samples before adaptive draft-max profit stats are ready (default: 3)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES) |
+| `--spec-dm-profit-warmup N` | measured samples for each initial positive-depth profit probe (default: 0, 0 = min samples)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_WARMUP) |
+| `--spec-dm-profit-baseline-interval N` | active profit-controller cycles between no-spec baseline probes (default: 1024, 0 = disabled)<br/>(env: LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL) |
+| `--spec-draft-kv-gpu-layers, --kv-gpu-layers-draft N` | override target KV placement for the separate draft context and keep the first N independently owned draft attention-KV layers device-resident; shared KV layers follow their owner (default: inherit target KV placement)<br/>(env: LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS) |
 | `--spec-draft-override-tensor, -otd, --override-tensor-draft <tensor name pattern>=<buffer type>,...` | override tensor buffer type for draft model |
 | `--spec-draft-cpu-moe, -cmoed, --cpu-moe-draft` | keep all Mixture of Experts (MoE) weights in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_CPU_MOE) |
 | `--spec-draft-n-cpu-moe, --spec-draft-ncmoe, -ncmoed, --n-cpu-moe-draft N` | keep the Mixture of Experts (MoE) weights of the first N layers in the CPU for the draft model<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE) |
 | `--spec-draft-n-max N` | number of tokens to draft for speculative decoding (default: 3)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MAX) |
 | `--spec-draft-n-min N` | minimum number of draft tokens to use for speculative decoding (default: 0)<br/>(env: LLAMA_ARG_SPEC_DRAFT_N_MIN) |
+| `--spec-mtp-rs-planes N` | total target recurrent-state planes for draft-mtp, including the current state (default: 0, allocate spec-draft-n-max + 1)<br/>(env: LLAMA_ARG_SPEC_MTP_RS_PLANES) |
+| `--spec-draft-ubatch-size, --ubatch-size-draft, -ubd N` | physical maximum batch size for the draft context (default: 0, inherit target ubatch)<br/>(env: LLAMA_ARG_SPEC_DRAFT_UBATCH) |
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
@@ -280,8 +304,6 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-ngram-size-n N` | the argument has been removed. use the respective --spec-ngram-*-size-n or --spec-ngram-mod-n-match |
 | `--spec-ngram-size-m N` | the argument has been removed. use the respective --spec-ngram-*-size-m |
 | `--spec-ngram-min-hits N` | the argument has been removed. use the respective --spec-ngram-*-min-hits |
-| `-mv, --model-vocoder FNAME` | vocoder model for audio generation (default: unused) |
-| `--tts-use-guide-tokens` | Use guide tokens to improve TTS word recall |
 | `--embd-gemma-default` | use default EmbeddingGemma model (note: can download weights from the internet) |
 | `--fim-qwen-1.5b-default` | use default Qwen 2.5 Coder 1.5B (note: can download weights from the internet) |
 | `--fim-qwen-3b-default` | use default Qwen 2.5 Coder 3B (note: can download weights from the internet) |

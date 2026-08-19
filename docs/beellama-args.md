@@ -226,6 +226,32 @@ replay cycles, and actual replay-batch tokens. These byte counters describe
 serialized payload size; use a backend profiler such as Nsight Systems for
 authoritative host-to-device and device-to-host transfer totals.
 
+## CPU KV placement
+
+Target and draft attention-KV placement can be controlled independently. This
+is separate from model-weight placement: `--n-gpu-layers-draft` controls draft
+weights, while the draft KV option below controls persistent cache storage.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--kv-cpu-pinned`, `--no-kv-cpu-pinned` | `LLAMA_ARG_KV_CPU_PINNED` | Disabled | Routes CPU-resident target and draft attention KV through the device's pinned host buffer when supported. |
+| `--recurrent-state-offload`, `--no-recurrent-state-offload` | `LLAMA_ARG_RECURRENT_STATE_OFFLOAD` | Disabled | Keeps fixed recurrent state on the accelerator when attention KV is CPU-resident. |
+| `--kv-gpu-layers N` | `LLAMA_ARG_KV_GPU_LAYERS` | `0` | With `--no-kv-offload`, keeps the first `N` target-owned attention-KV layers device-resident. |
+| `--spec-draft-kv-gpu-layers N`, `--kv-gpu-layers-draft N` | `LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS` | Inherit target | Overrides the target KV policy for the separate draft context and keeps the first `N` draft-owned attention-KV layers device-resident. The INI key is `spec-draft-kv-gpu-layers`. |
+
+Omitting the draft option preserves the existing behavior exactly: the draft
+context inherits `--kv-offload`/`--no-kv-offload` and
+`--kv-gpu-layers`. Supplying `0` explicitly places every independently owned
+draft KV layer on the CPU; a value at or above the number of owned attention-KV
+layers places all of them on the selected device. Layers whose KV storage is
+shared with another context do not consume the draft count and continue to
+follow the storage owner.
+
+The remaining CPU-resident draft layers inherit `--kv-cpu-pinned`. An explicit
+draft count changes only the draft parameters produced for the auxiliary
+context; it does not modify target cache placement or phase-aware workspace
+lifetime.
+
 ## Phase-aware compute workspace
 
 Prompt processing and token generation need different graph-allocation

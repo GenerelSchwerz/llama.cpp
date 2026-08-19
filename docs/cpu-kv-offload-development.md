@@ -660,6 +660,16 @@ selection. This replaced the first partial-residency implementation's parallel
 layer bitmap and duplicated placement branches without changing the measured
 4K allocation split.
 
+That ownership plan is now also exposed independently for a separate draft
+context. `--spec-draft-kv-gpu-layers N` (alias
+`--kv-gpu-layers-draft`) overrides the inherited target KV policy only while
+`common_base_params_to_speculative()` derives the draft parameters. Omission
+continues to inherit the target policy; an explicit count enables the same
+partial-placement path for draft-owned layers. Shared layers remain excluded
+from the count by `llama_kv_cache`, so this is architecture-neutral and does
+not create a second placement mechanism. The option is independent of draft
+weight offload and of the phase-aware target/draft compute-backing group.
+
 The non-MTP 90K-versus-240K Nsight allocation trace isolated context-scaled
 VRAM to the target scheduler's prompt graph. Model weights and the 149.62 MiB
 active recurrent state were constant, while CUDA compute grew from 707.27 to
@@ -824,7 +834,8 @@ fixed-window streaming remain progressively larger follow-ons.
 4. Measure pinned system-memory size and CUDA mapping overhead separately from
    `nvidia-smi`; `VmLck=0` does not prove CUDA-host allocations are pageable.
 5. Sweep lower homogeneous cache widths only with matched quality validation;
-   asymmetric K/V and partial GPU KV remain outside the current scope.
+   asymmetric K/V and token-window KV residency remain outside the current
+   scope.
 
 ## Known non-goals
 

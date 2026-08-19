@@ -535,6 +535,44 @@ persistent VRAM, and both prompt and generation speed as functions of tail
 length. Treat the uniform capped-1024 `auto` setting as a starting policy and
 measure the exact workload before deploying it.
 
+## Independent target and draft KV residency
+
+### What it is
+
+BeeLlama can keep a bounded number of attention-KV layers on the accelerator
+while the rest remain in host memory. The target uses `--kv-gpu-layers`; a
+separate speculative or integrated-MTP context can override that policy with
+`--spec-draft-kv-gpu-layers` (`--kv-gpu-layers-draft`).
+
+The count follows cache ownership rather than model architecture names. A
+draft layer that owns no cache because it shares another context's KV does not
+consume the draft budget. This keeps shared-cache speculative implementations
+on their existing owner-defined placement path.
+
+### When to use it
+
+Use the draft override when target KV must remain mostly or entirely in host
+RAM but the independently owned draft cache has a different memory/performance
+tradeoff. Draft cache residency is independent of draft weight placement and
+of the phase-aware compute allocator.
+
+### Key arguments
+
+- [`--kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
+- [`--spec-draft-kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
+- [`--kv-cpu-pinned`](beellama-args.md#cpu-kv-placement)
+
+Omitting the draft override inherits the complete target KV policy. An explicit
+nonnegative value selects a draft-only partial-residency policy; zero means no
+independently owned draft KV layers on the device. CPU-resident draft layers
+still use `--kv-cpu-pinned` when enabled.
+
+### Known limitations
+
+Residency is selected per owned layer, not per token window, and there is no
+automatic VRAM sizing. The option does not create independent placement for a
+cache that the draft context shares with another owner.
+
 ## Phase-aware prompt and generation workspace
 
 ### What it is
