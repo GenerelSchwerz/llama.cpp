@@ -5,7 +5,7 @@
 #include "mma.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-kvarn.cuh"
-#include "fattn-mma-q8.cuh"
+#include "fattn-mma-quant.cuh"
 
 using namespace ggml_cuda_mma;
 
@@ -583,8 +583,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
     // Quantized-native loading reads the cache in place, which the cp_async
     // multi-stage pipeline has no path for; force it to the synchronous route.
-    constexpr bool is_q8_kv        = ggml_cuda_fattn_q8_template_type(type_K) || ggml_cuda_fattn_q8_template_type(type_V);
-    constexpr int  nstages         = is_kvarn_kv || is_q8_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_quant_kv     = ggml_cuda_fattn_quant_template_type(type_K) || ggml_cuda_fattn_quant_template_type(type_V);
+    constexpr int  nstages         = is_kvarn_kv || is_quant_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     constexpr int stride_tile_K = nbatch_K2 + 4;
 
@@ -630,15 +630,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         kvarn_original_domain, false,
                         type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE>
                         ((const char *) K_h2, tile_K, k_VKQ_0, k_VKQ_sup, k0_start, k0_stop - k0_start, kvarn_smem);
-                } else if constexpr (ggml_cuda_fattn_q8_template_type(type_K)) {
+                } else if constexpr (ggml_cuda_fattn_quant_template_type(type_K)) {
                     // The K batch loop covers DKQ/2 half2 in whole steps of
                     // nbatch_K2, so k0_start is always a multiple of nbatch_K2
                     // and the batch width is always nbatch_K2. Both are needed
                     // at compile time for the loader's block alignment.
-                    static_assert((DKQ/2) % nbatch_K2 == 0, "K batching leaves a partial Q8_0 tile");
-                    static_assert((2*nbatch_K2) % 32 == 0, "K batch start is not Q8_0 block aligned");
-                    constexpr int nthreads_q8 = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_q8_0_load_tile<nbatch_K2, stride_tile_K, nthreads_q8, nbatch_fa, oob_check>
+                    static_assert((DKQ/2) % nbatch_K2 == 0, "K batching leaves a partial quantized tile");
+                    static_assert((2*nbatch_K2) % 32 == 0, "K batch start is not quant block aligned");
+                    constexpr int nthreads_quant = nwarps * ggml_cuda_get_physical_warp_size();
+                    flash_attn_ext_quant_load_tile<type_K, nbatch_K2, stride_tile_K, nthreads_quant, nbatch_fa, oob_check>
                         ((const char *) K_h2, tile_K, k0_start, k_VKQ_0, stride_K, k_VKQ_sup);
                 } else {
                     const int k0_diff = k0_stop - k0_start;
@@ -1001,15 +1001,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                         type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE>
                         ((const char *) V_h2, tile_V, k_VKQ_0, k_VKQ_sup, i0_start / 2, nbatch_V2, kvarn_smem);
                     __syncthreads();
-                } else if constexpr (ggml_cuda_fattn_q8_template_type(type_V)) {
+                } else if constexpr (ggml_cuda_fattn_quant_template_type(type_V)) {
                     // As above: the V loop steps DV in whole multiples of
                     // 2*nbatch_V2, so i0_start/2 is a multiple of nbatch_V2 and
                     // the batch width is always nbatch_V2.
-                    static_assert(DV % (2*nbatch_V2) == 0, "V batching leaves a partial Q8_0 tile");
-                    static_assert((2*nbatch_V2) % 32 == 0, "V batch start is not Q8_0 block aligned");
-                    static_assert(!V_is_K_view, "Q8_0 K/V data reuse not implemented");
-                    constexpr int nthreads_q8 = nwarps * ggml_cuda_get_physical_warp_size();
-                    flash_attn_ext_q8_0_load_tile<nbatch_V2, stride_tile_V, nthreads_q8, nbatch_fa, oob_check>
+                    static_assert(DV % (2*nbatch_V2) == 0, "V batching leaves a partial quantized tile");
+                    static_assert((2*nbatch_V2) % 32 == 0, "V batch start is not quant block aligned");
+                    static_assert(!V_is_K_view, "quantized-native K/V data reuse not implemented");
+                    constexpr int nthreads_quant = nwarps * ggml_cuda_get_physical_warp_size();
+                    flash_attn_ext_quant_load_tile<type_V, nbatch_V2, stride_tile_V, nthreads_quant, nbatch_fa, oob_check>
                         ((const char *) V_h2, tile_V, i0_start/2, k_VKQ_0, stride_V, k_VKQ_sup);
                     __syncthreads();
                 } else {
@@ -1219,8 +1219,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     constexpr int  nbatch_combine  = ggml_cuda_fattn_mma_get_nbatch_combine(DKQ, DV, ncols);
     constexpr bool Q_in_reg        = ggml_cuda_fattn_mma_get_Q_in_reg      (DKQ, DV, ncols);
     constexpr bool is_kvarn_kv     = ggml_cuda_fattn_kvarn_template_type(type_K) || ggml_cuda_fattn_kvarn_template_type(type_V);
-    constexpr bool is_q8_kv        = ggml_cuda_fattn_q8_template_type(type_K) || ggml_cuda_fattn_q8_template_type(type_V);
-    constexpr int  nstages         = is_kvarn_kv || is_q8_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
+    constexpr bool is_quant_kv     = ggml_cuda_fattn_quant_template_type(type_K) || ggml_cuda_fattn_quant_template_type(type_V);
+    constexpr int  nstages         = is_kvarn_kv || is_quant_kv ? 0 : ggml_cuda_fattn_mma_get_nstages(DKQ, DV, ncols1, ncols2);
 
     if (cols_per_warp > ncols) {
         NO_DEVICE_CODE;
@@ -1898,11 +1898,11 @@ static __global__ void flash_attn_ext_f16(
     const int stride_Q2   = nb02 / sizeof(float2);
     // Quantized-native K/V is read as raw bytes because Q8_0 rows are neither
     // half2-typed nor half2-aligned, so those strides stay in bytes.
-    const int stride_K    = ggml_cuda_fattn_q8_template_type(type_K) ? nb11 : nb11 / sizeof(half2);
+    const int stride_K    = ggml_cuda_fattn_quant_template_type(type_K) ? nb11 : nb11 / sizeof(half2);
     const int stride_mask = nb31 / sizeof(half);
 
     const int stride_V = V_is_K_view ? stride_K :
-        (ggml_cuda_fattn_q8_template_type(type_V) ? nb21 : nb21 / sizeof(half2));
+        (ggml_cuda_fattn_quant_template_type(type_V) ? nb21 : nb21 / sizeof(half2));
 
     const int iter_k     = (ne11      + (nbatch_fa - 1)) / nbatch_fa;
     const int iter_j     = (ne01.z    + (ncols1    - 1)) / ncols1;
