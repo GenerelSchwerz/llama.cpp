@@ -10198,19 +10198,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Quantized-native Q8_0 K/V coverage at head size 128. The general sweep
-    // below only pairs quantized K/V with head sizes 64 and 72, and the
-    // prefill-shaped block above reaches a single tile shape, so neither
-    // exercises the CUDA quantized-native MMA loader broadly. These sweep the
-    // GQA ratios that pick ncols2, the batch sizes that pick ncols1, and an
-    // unpadded KV length, which is what selects the loader's bounds-checked
-    // path.
-    for (int nr2 : { 1, 2, 4, 16 }) {
-        for (int kv : { 512, 113 }) {
-            for (int nb : { 3, 16, 32, 64 }) {
-                test_cases.emplace_back(new test_flash_attn_ext(
-                            128, 128, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+    // Quantized-native Q8_0 K/V coverage at head sizes 128 and 256, the two the
+    // CUDA quantized-native MMA path supports. The general sweep below only
+    // pairs quantized K/V with head sizes 64 and 72, and the prefill-shaped
+    // block above reaches a single tile shape, so neither exercises that loader
+    // broadly. These sweep the GQA ratios that pick ncols2, the batch sizes
+    // that pick ncols1, and an unpadded KV length, which is what selects the
+    // loader's bounds-checked path. Head size 256 is the one that matters for
+    // Qwen3.5/3.8-class models; 128 covers the more common layout.
+    for (int hs : { 128, 256 }) {
+        for (int nr2 : { 1, 2, 4, 16 }) {
+            for (int kv : { 512, 113 }) {
+                for (int nb : { 3, 16, 32, 64 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(
+                                hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                }
             }
         }
     }

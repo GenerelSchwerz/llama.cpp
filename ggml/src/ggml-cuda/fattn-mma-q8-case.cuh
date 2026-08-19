@@ -12,14 +12,19 @@
 // - the shared-memory budget is sized for a single pipeline stage, matching the
 //   kernel's own nstages == 0 for quantized-native K/V.
 //
-// Scope is DKQ == DV == 128 on Ampere/Ada, as decided in
-// docs/qn0-native-mma-kernel-plan.md. ggml_cuda_get_best_fattn_kernel enforces
-// that; the static asserts here keep an out-of-scope instantiation from
-// compiling silently.
+// Scope is DKQ == DV, head dimension 128 or 256, on Ampere/Ada. The plan
+// (docs/qn0-native-mma-kernel-plan.md) scoped the first pass to 128; 256 is
+// required because it is the head dimension of the Qwen3.8 27B target model
+// this work exists to serve, and it needs no loader change: the Ampere table
+// gives nbatch_K2 = nbatch_V2 = 128 there, so a tile chunk is eight whole Q8_0
+// blocks instead of four and every alignment invariant still holds.
+// ggml_cuda_get_best_fattn_kernel enforces the scope; the static asserts here
+// keep an out-of-scope instantiation from compiling silently.
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_q8_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    static_assert(DKQ == 128 && DV == 128, "quantized-native MMA is scoped to head dimension 128");
+    static_assert(DKQ == DV, "quantized-native MMA requires matching K/V head dimensions");
+    static_assert(DKQ == 128 || DKQ == 256, "quantized-native MMA is scoped to head dimension 128 or 256");
 
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();
@@ -98,8 +103,8 @@ void ggml_cuda_flash_attn_ext_mma_q8_case(ggml_backend_cuda_context & ctx, ggml_
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
 // Only the (ncols1, ncols2) pairs reachable from
-// ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2/1 at DKQ = DV = 128 are
-// instantiated. The F16 path's DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2 expansion is
+// ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2/1 are instantiated, for each
+// supported head dimension. The F16 path's DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2 expansion is
 // deliberately not reused: most of what it generates is unreachable for
 // Q8_0/Q8_0 and would only cost compile time, in the same spirit as the fork's
 // existing 103-pair vs. 169-pair vector-kernel tradeoff.
@@ -122,3 +127,23 @@ extern DECL_FATTN_MMA_Q8_CASE(128, 128,  1,  8);
 extern DECL_FATTN_MMA_Q8_CASE(128, 128,  2,  8);
 extern DECL_FATTN_MMA_Q8_CASE(128, 128,  4,  8);
 extern DECL_FATTN_MMA_Q8_CASE(128, 128,  8,  8);
+
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  8,  1);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 16,  1);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 32,  1);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 64,  1);
+
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  4,  2);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  8,  2);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 16,  2);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 32,  2);
+
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  2,  4);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  4,  4);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  8,  4);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256, 16,  4);
+
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  1,  8);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  2,  8);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  4,  8);
+extern DECL_FATTN_MMA_Q8_CASE(256, 256,  8,  8);

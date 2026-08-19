@@ -245,45 +245,42 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 }
 
 // Quantized-native Q8_0/Q8_0 MMA path. Mirrors the ncols2/ncols1 selection of
-// the F16 path but is scoped to DKQ = DV = 128 (see
-// docs/qn0-native-mma-kernel-plan.md), so the DKQ switch and the Volta, MLA and
-// 192/320/576 special cases have no counterpart here.
+// the F16 path but is scoped to DKQ == DV at head dimension 128 or 256, so the
+// Volta, MLA and 192/320/576 special cases have no counterpart here.
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-template <int ncols2>
+template <int D, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_q8_case<128, 128, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 8/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_q8_case<128, 128, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 16/ncols2, ncols2>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
-        ggml_cuda_flash_attn_ext_mma_q8_case<128, 128, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 32/ncols2, ncols2>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_q8_case<128, 128, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 64/ncols2, ncols2>(ctx, dst);
 }
 
-static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <int D>
+static void ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
-
-    GGML_ASSERT(Q->ne[0] == 128 && K->ne[0] == 128 && V->ne[0] == 128);
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
@@ -307,18 +304,37 @@ static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggm
     const int gqa_ratio = Q->ne[2] / K->ne[2];
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<8>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 8>(ctx, dst);
         return;
     }
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<4>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 4>(ctx, dst);
         return;
     }
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 2>(ctx, dst);
         return;
     }
-    ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<1>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 1>(ctx, dst);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
+
+    switch (Q->ne[0]) {
+        case 128:
+            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<128>(ctx, dst);
+            break;
+        case 256:
+            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<256>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_q8_native_applies
+    }
 }
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 
@@ -484,8 +500,10 @@ static bool ggml_cuda_fattn_q8_native_enabled() {
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 }
 
-// First pass targets Ampere/Ada tensor cores at head dimension 128 with a
-// Q8_0 K and V; everything else keeps the existing F16-casting route.
+// Targets Ampere/Ada tensor cores with a Q8_0 K and V at head dimension 128 or
+// 256; everything else keeps the existing F16-casting route. Both dimensions
+// give whole Q8_0 blocks per tile chunk in the Ampere config table (four at
+// 128, eight at 256), which is what the loader's alignment invariants need.
 static bool ggml_cuda_fattn_q8_native_applies(const int cc, const ggml_tensor * dst) {
     if (!ggml_cuda_fattn_q8_native_enabled()) {
         return false;
@@ -495,9 +513,11 @@ static bool ggml_cuda_fattn_q8_native_applies(const int cc, const ggml_tensor * 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    return ampere_mma_available(cc) &&
-        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
-        Q->ne[0] == 128 && K->ne[0] == 128 && V->ne[0] == 128;
+    if (!ampere_mma_available(cc) || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+
+    return (Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 }
 
 // Internal hint used by the compact exact-tail pass. On pre-Ada tensor-core
