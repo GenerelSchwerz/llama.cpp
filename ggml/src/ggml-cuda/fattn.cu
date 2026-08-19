@@ -318,12 +318,30 @@ static void ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2(ggml_backend_cuda_cont
     ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 1>(ctx, dst);
 }
 
+// Routing is otherwise only observable indirectly, through allocation size or
+// throughput, and both can be dominated by unrelated effects. Setting
+// GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE logs every launch that actually takes this
+// path, so a measurement can state that it exercised the kernel rather than
+// inferring it.
+static void ggml_cuda_flash_attn_ext_mma_q8_log_route(const ggml_tensor * dst) {
+    static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
+    if (!verbose) {
+        return;
+    }
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    GGML_LOG_INFO("fattn-q8-native: D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
+        (int) Q->ne[0], (int) Q->ne[1], (int) K->ne[1], (int) Q->ne[2], (int) K->ne[2]);
+}
+
 static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
     GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
+
+    ggml_cuda_flash_attn_ext_mma_q8_log_route(dst);
 
     switch (Q->ne[0]) {
         case 128:
@@ -513,11 +531,18 @@ static bool ggml_cuda_fattn_q8_native_applies(const int cc, const ggml_tensor * 
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    if (!ampere_mma_available(cc) || K->type != GGML_TYPE_Q8_0 || V->type != GGML_TYPE_Q8_0) {
-        return false;
+    const bool ok = ampere_mma_available(cc) &&
+        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        (Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
+
+    static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
+    if (!ok && verbose) {
+        GGML_LOG_INFO("fattn-q8-native: declined ampere=%d K=%s V=%s DQ=%d DK=%d DV=%d n_q=%d\n",
+            (int) ampere_mma_available(cc), ggml_type_name(K->type), ggml_type_name(V->type),
+            (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0], (int) Q->ne[1]);
     }
 
-    return (Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
+    return ok;
 }
 
 // Internal hint used by the compact exact-tail pass. On pre-Ada tensor-core
