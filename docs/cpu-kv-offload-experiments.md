@@ -5024,10 +5024,15 @@ used the unaffected, always-current DSpark configuration.
 
 Status: retained, behind an off-by-default build flag. The CUDA MMA kernel can
 read a `Q8_0` cache in place instead of casting it to F16 first. Output is
-byte-identical and 512-token prefill improves by 1.2% to 1.8% at depth, which
-is real but small on this model and consistent with what the removed memory
-traffic can account for. Transient allocation falls by 22 MiB in one of four
-tested configurations and is unchanged in the other three.
+byte-identical. The primary effect is memory: reserve-time device compute
+buffer falls by 41% to 54% over the context range tested, from 140 MiB at
+32,768 tokens to 972 MiB at 245,760, released at model load with an empty
+cache. 512-token prefill additionally improves by 1.2% to 1.8% at depth.
+
+An earlier revision of this entry reported the allocation effect as "22 MiB in
+one of four configurations, unchanged in the other three." That figure was
+measured under `llama-bench` at 512-token prefill and does not generalise; see
+the reconciliation section below, which is not yet closed.
 
 ### Motivation
 
@@ -5178,7 +5183,7 @@ the vector kernel on Ada, which already reads `Q8_0` natively. This work is a
 prefill and large-batch optimization only, and does not interact with the
 decode residency results in Experiments 010 and 011.
 
-### Transient allocation
+### Transient allocation under `llama-bench`
 
 | `--kv-gpu-layers` | Depth | Native off | Native on | Saved |
 | ---: | ---: | ---: | ---: | ---: |
@@ -5187,35 +5192,95 @@ decode residency results in Experiments 010 and 011.
 | 16 | 16,384 | 541.79 MiB | 541.79 MiB | none |
 | 16 | 32,768 | 579.79 MiB | 557.79 MiB | 22.00 MiB |
 
-The F16 copy is always removed, but `cuda_compute_buffer_bytes` is a peak over
-one reused arena, so the removal lowers that peak only by however much the copy
-exceeded what other tensors in the graph already reserve. The largest of those
-is the logits tensor: at physical ubatch 512 and a 248,320-token vocabulary it
-alone reserves roughly 485 MiB, more than the F16 K/V copy in three of the four
-configurations, so the peak does not move there at all.
+These figures are correct for the harness that produced them and were, for a
+time, read as the allocation result for the change as a whole. That reading was
+wrong: they are specific to `llama-bench` at 512-token prefill, and the section
+below supersedes them as the general claim.
 
-This bounds the claim, and it is the opposite of what the motivating review
-report assumed. That report treated the cast as a fixed VRAM cost to be
-recovered and extrapolated it to roughly 950 MiB at 240K context. On a
-large-vocabulary model at a realistic physical ubatch the cast is instead
-mostly hidden inside an allocation that exists anyway, and recovering it
-changes the reported peak by 22 MiB or by nothing. The throughput gain is
-present in all four configurations regardless, because the bandwidth cost of
-writing and re-reading the copy is real whether or not it raises the peak.
+### Reserve-time allocation under `llama-server`
+
+Compute-buffer allocation is deterministic, so one run per cell suffices and no
+prefill is required: `llama-server` reserves the worst-case graph at startup,
+reports the buffer, and idles. `sched_reserve` builds that graph against
+`memory->init_full()` (`src/llama-context.cpp`), which sets
+`n_kv = kv->get_size()` (`src/llama-kv-cache.cpp`) — the entire allocated cache,
+not the occupied part. The reservation therefore tracks the context size that
+was configured, not the tokens actually present, and the measurement below is
+taken with an empty cache.
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V build/bin/llama-server \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 \
+  -nkvo --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  --parallel 1 -c $CTX --host 127.0.0.1 --port 8099 -v
+```
+
+`-v` is required: llama.cpp's log filter discards the buffer lines without it.
+`--parallel 1` is required so that `-c` maps to one slot unambiguously.
+
+| `n_ctx` | Native off | Native on | Saved | Reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,768 | 342.27 MiB | 202.27 MiB | 140.00 MiB | 40.9% |
+| 65,536 | 536.27 MiB | 268.27 MiB | 268.00 MiB | 50.0% |
+| 131,072 | 992.27 MiB | 468.27 MiB | 524.00 MiB | 52.8% |
+| 245,760 | 1790.27 MiB | 818.27 MiB | 972.00 MiB | 54.3% |
+
+The saving fits `4 KiB per token of context + 12 MiB` exactly at all four
+points. That slope is one attention layer's K and V in F16: two tensors times
+four KV heads times head dimension 256 times two bytes is 4,096 bytes per token.
+The graph allocator reuses the arena across all sixteen attention layers, so the
+peak holds one layer's copy and removing it removes exactly that.
+
+The saving is not displaced to the host. `CUDA_Host` compute buffer is identical
+within every pair (52.28, 84.28, 148.28, and 260.28 MiB), as is `CUDA_Host` KV
+buffer, which is unchanged because cache placement is untouched.
+
+### Reconciling the two allocation measurements
+
+The same code shows 22 MiB or nothing under `llama-bench` and 140 to 972 MiB
+under `llama-server`. Both measurements reproduce on demand, so the difference
+is a property of the harnesses rather than of the kernel.
+
+The likely mechanism is the logits reservation: at physical ubatch 512 and a
+248,320-token vocabulary it alone reserves roughly 485 MiB, which exceeds the
+F16 K/V copy at the two depths `llama-bench` was run at and would mask its
+removal. **This has not been verified.** Until it is, the honest statement is
+that the reserve-time figures above describe the serving configuration, the
+`llama-bench` figures describe 512-token prefill benchmarking, and the boundary
+between them is not established. Anyone extending this work should resolve that
+before quoting a single number as the allocation result.
+
+The throughput gain is present in all four `llama-bench` configurations
+regardless, because the bandwidth cost of writing and re-reading the copy is
+real whether or not it raises the reported peak.
 
 ### Disposition
 
-Retain the kernel behind `GGML_CUDA_FATTN_Q8_NATIVE`, default off. It is
-output-exact, faster in every configuration measured, never slower, and
-strictly reduces transient allocation. It is also, on this model, worth about
-1.5% of prefill and at most 22 MiB, against sixteen additional template
-instantiations per head dimension and a compile definition that rebuilds every
-flash-attention template instance when toggled. Default-off is the honest
-setting for a change with that ratio; whether it is worth enabling is a
-deployment decision, not a correctness one.
+Retain the kernel behind `GGML_CUDA_FATTN_Q8_NATIVE`. It is output-exact,
+faster in every configuration measured, never slower, and reduces reserve-time
+device allocation by 41% to 54% across the context range tested — 972 MiB at
+245,760 tokens, freed at model load with an empty cache.
+
+This reverses the earlier disposition, which weighed roughly 1.5% of prefill
+and at most 22 MiB against sixteen template instantiations per head dimension
+and a full flash-attention rebuild on toggle, and concluded that default-off
+was the honest setting. The allocation figure in that judgement was a
+`llama-bench` artifact. On the measurement that matches how the fork is
+deployed, the change removes over half of the device compute buffer at long
+context, which is a different class of result and justifies the build cost. The
+throughput gain is now the secondary effect.
+
+The default has not been changed here, because the boundary between the two
+allocation measurements is still unexplained and the flag's default should not
+be moved on an unreconciled result. Resolving that reconciliation is the
+gating item for enabling it by default.
 
 The empirical claim is limited to `Q8_0`/`Q8_0` at head dimensions 128 and 256
-on `sm_89`, one model, one host, and 512-token prefill at two depths. The
+on `sm_89`, one model, and one host. Reserve-time allocation was measured at
+`--kv-gpu-layers 0` only, so the saving is not yet shown to be independent of
+persistent cache placement. Output exactness was established at short context;
+it has not been rechecked at the long contexts where the allocation result
+lives. The
 model's GQA ratio of 6 selects `ncols2 = 8`, so inference exercises only that
 column geometry; the other three are covered by `test-backend-ops` against the
 CPU reference rather than end to end. Other quantized pairs, Turing, Volta,
