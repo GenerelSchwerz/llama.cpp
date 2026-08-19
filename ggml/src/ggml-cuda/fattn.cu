@@ -351,7 +351,7 @@ static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggm
             ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<256>(ctx, dst);
             break;
         default:
-            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_q8_native_applies
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
     }
 }
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
@@ -502,18 +502,28 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_Q8  = 500, // MMA reading a Q8_0 cache in place, no F16 copy
 };
 
-// Whether the quantized-native Q8_0 MMA kernels were compiled in, and whether
-// they are enabled at run time. The environment variable exists so a single
-// build can be A/B compared against the F16-casting path, which is what the
-// byte-identical output check and the compute-buffer measurement both need.
-static bool ggml_cuda_fattn_q8_native_enabled() {
+// Whether the quantized-native MMA kernels were compiled in, and whether the
+// graph asked for them. The request arrives per node as
+// GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT, set from the
+// --flash-attn-native-quants context option.
+//
+// GGML_CUDA_FATTN_Q8_NATIVE=0 additionally forces the route off for the whole
+// process. That override is deliberately not user-facing: every measurement of
+// this path is an A/B within one binary (byte-identical output, compute-buffer
+// allocation), and without it each comparison would need its own build of every
+// flash-attention template instance.
+static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-    static const bool enabled = [] {
+    static const bool force_off = [] {
         const char * env = getenv("GGML_CUDA_FATTN_Q8_NATIVE");
-        return env == nullptr || atoi(env) != 0;
+        return env != nullptr && atoi(env) == 0;
     }();
-    return enabled;
+    if (force_off) {
+        return false;
+    }
+    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT) != 0;
 #else
+    GGML_UNUSED(dst);
     return false;
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 }
@@ -522,8 +532,8 @@ static bool ggml_cuda_fattn_q8_native_enabled() {
 // 256; everything else keeps the existing F16-casting route. Both dimensions
 // give whole Q8_0 blocks per tile chunk in the Ampere config table (four at
 // 128, eight at 256), which is what the loader's alignment invariants need.
-static bool ggml_cuda_fattn_q8_native_applies(const int cc, const ggml_tensor * dst) {
-    if (!ggml_cuda_fattn_q8_native_enabled()) {
+static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst) {
+    if (!ggml_cuda_fattn_native_enabled(dst)) {
         return false;
     }
 
@@ -681,7 +691,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
-        if (ggml_cuda_fattn_q8_native_applies(cc, dst)) {
+        if (ggml_cuda_fattn_native_applies(cc, dst)) {
             return BEST_FATTN_KERNEL_MMA_Q8;
         }
         return BEST_FATTN_KERNEL_MMA_F16;
@@ -803,7 +813,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
             ggml_cuda_flash_attn_ext_mma_q8(ctx, dst);
 #else
-            GGML_ABORT("fatal error"); // unreachable: gated by ggml_cuda_fattn_q8_native_enabled()
+            GGML_ABORT("fatal error"); // unreachable: gated by ggml_cuda_fattn_native_applies
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
             break;
     }

@@ -6,6 +6,7 @@ keeps a small set of maintained extensions:
 - KVarN target-context KV-cache compression (`kvarn2` through `kvarn8`).
 - Low-bit standard KV cache types (`q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and
   `q6_1`).
+- Quantized-native CUDA MMA FlashAttention (`--flash-attn-native-quants`).
 - Profit-only adaptive draft depth for upstream `draft-dflash` speculation.
 - Server-side reasoning-loop protection.
 - KLD save/load support in `llama-perplexity` for KVarN validation.
@@ -45,6 +46,14 @@ CUDA FlashAttention vector cache coverage has two build modes:
   `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's internal
   q2 fallback type. It uses `rank(K) <= rank(V) || K == f16 || V == f16`.
 - `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered vector pairs.
+
+`--flash-attn-native-quants` lets the CUDA MMA FlashAttention kernel read a
+quantized K/V cache in place instead of casting it to F16 first, which removes
+the transient F16 copy of the attention window. It is off by default, output is
+unchanged, and it applies only where a native loader exists for the cache type
+and head dimension; every other case keeps the F16-casting path. The kernels are
+compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
+the option is accepted and has no effect.
 
 There is no `GGML_CUDA_FA_HALF_QUANTS` tier. KVarN has 15 balanced fast-decode
 pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN

@@ -3003,6 +3003,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
         }
+        // Backends that have no native loader for this cache type ignore the
+        // request and keep the F16-casting path, so this is a hint rather than
+        // a contract and needs no capability check here.
+        if (cparams.flash_attn_native_quants) {
+            cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT] = 1;
+        }
         if (use_native_tail) {
             GGML_ASSERT(tail_query_order && tail_run_desc);
             cur = k_tail_current ?
