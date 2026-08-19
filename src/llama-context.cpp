@@ -301,6 +301,8 @@ llama_context::llama_context(
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
+    cparams.offload_attn_compute    = params.offload_kqv ||
+        (params.op_offload && (params.kv_cpu_pinned || params.kv_gpu_layers > 0));
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 

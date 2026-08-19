@@ -2580,8 +2580,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--no-kv-cpu-pinned"},
         string_format("route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory; "
                       "only affects layers not offloaded to GPU, e.g. when combined with --no-kv-offload; "
-                      "on an integrated GPU the pinned buffer is GPU-visible unified memory, so attention for those "
-                      "layers may still run on the GPU even with --no-kv-offload (default: %s)",
+                      "with operation offload enabled, attention placement is resolved independently of persistent "
+                      "KV placement even with --no-kv-offload (default: %s)",
                       params.kv_cpu_pinned ? "enabled" : "disabled"),
         [](common_params & params, bool value) {
             params.kv_cpu_pinned = value;

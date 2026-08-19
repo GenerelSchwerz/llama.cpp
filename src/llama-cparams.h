@@ -36,7 +36,8 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
-    bool offload_kqv;
+    bool offload_kqv;             // place attention KV storage on the accelerator
+    bool offload_attn_compute;    // do not force attention compute to CPU solely because KV storage is on the host
     bool flash_attn;
     bool auto_fa;
     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)

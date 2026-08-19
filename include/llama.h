@@ -503,8 +503,7 @@ extern "C" {
         // callers built against earlier BeeLlama.cpp releases.
         bool kv_cpu_pinned;           // route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory
                                        // (only affects layers not offloaded to GPU; speeds up CPU<->GPU KV transfers)
-                                       // on integrated GPUs the pinned buffer is host-visible to the GPU too, so this can
-                                       // let attention run on the GPU even with kv-offload disabled
+                                       // and allows attention placement to be resolved independently of persistent KV placement
         bool recurrent_state_offload; // for hybrid attention/recurrent models, allow the fixed recurrent (R/S) state to stay
                                        // GPU-resident even when offload_kqv=false keeps attention KV on CPU
         uint32_t kv_gpu_layers;       // with offload_kqv=false, keep this many attention-KV layers device-resident anyway.

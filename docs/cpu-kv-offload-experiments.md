@@ -1835,3 +1835,138 @@ Raw MTP-2 artifacts:
 Disposition: for this long coding workload and the same three-plane recurrent
 budget, retain capped MTP-6 as the better-performing option. Raw MTP-2 avoids
 replay but gives back more throughput than replay costs at MTP-6.
+
+## Experiment 015: separate attention-compute and KV-storage placement
+
+Status: retained architectural cleanup. This change makes the established
+pinned-host-KV/CUDA-attention policy explicit; it is not presented as a
+throughput optimization.
+
+### Question and implementation
+
+The graph builder historically used internal `offload_kqv` for two different
+decisions: persistent attention-KV placement and whether to attach a CPU
+backend constraint to the completed attention region. That coupling no longer
+described the pinned CPU-KV path observed in Experiment 011, where the generic
+scheduler selected CUDA FlashAttention while K/V remained in `CUDA_Host`.
+
+The candidate adds internal `offload_attn_compute`. `offload_kqv` continues to
+control persistent cache placement. With operation offload enabled, pinned CPU
+KV or any partial device-KV layer keeps attention accelerator-eligible without
+changing cache residency. Plain pageable CPU KV retains the existing CPU
+constraint. This introduces no public option or serialized state and does not
+change the `llama_context_params` layout.
+
+- Base commit: `30054cb450fe20c4594ae86698d2683b5a7bc3ea`.
+- Measured candidate commit:
+  `d20fe04f769daeca807ae52bb0571f2b17dfc28e`; server version 11230.
+- The final commit amends only this ledger onto the measured candidate; its
+  compiled source is identical.
+- Build: Release, CUDA, native CPU, CUDA FlashAttention, CUDA architecture
+  `120a`, expanded quant matrix (`GGML_CUDA_FA_ALL_QUANTS=ON`).
+- Hardware: NVIDIA GeForce RTX 5070 Ti, 15,880 MiB; Intel Core Ultra 9
+  285K; strict CPU 0-2 decode and CPU 0-23 batch placement.
+- Model and projector are the same Qwen3.8 27B files used in Characterization
+  014. Target and draft K/V are Q8_0/Q8_0 in pinned host memory.
+
+### Placement smoke test
+
+An allocation-only `llama-bench` smoke test used the target model, prompt 32,
+one repetition, no warmup, `--progress`, `--no-kv-offload`,
+`--kv-cpu-pinned`, `--recurrent-state-offload`, Q8_0/Q8_0 KV, and scheduler
+debug output. It retained 34 graph splits, placed all 16 unique
+`FLASH_ATTN` nodes on CUDA0, and kept the cache-store splits on CPU. The target
+KV buffer was 8.50 MiB in `CUDA_Host`. A non-debug repetition completed at
+256.41 t/s. The debug run's 239.28 t/s is diagnostic only.
+
+### Deep-context protocol
+
+The server command was identical for the clean base and candidate processes
+apart from log name and binary commit:
+
+```bash
+build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers 0 --ctx-size 140000 --parallel 1 --cont-batching \
+  --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --spec-type draft-mtp --spec-draft-n-max 6 \
+  --spec-mtp-rs-planes 3 --spec-draft-ubatch-size 128 \
+  --draft-p-min 0.85 --cache-type-k q8_0 --cache-type-v q8_0 \
+  --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+  --alias qwen3.8-27b-mtp6-rs3 --host 127.0.0.1 --port 8080 \
+  --log-file LOG --log-verbosity 3
+```
+
+`llama-benchy` 0.4.0 fetched the official tokenizer itself and used cached
+text. Native JSON progress was emitted to the terminal:
+
+```bash
+llama-benchy --base-url http://127.0.0.1:8080/v1 \
+  --model Qwen/Qwen3.5-27B \
+  --served-model-name qwen3.8-27b-mtp6-rs3 \
+  --pp 4096 --tg 1 --depth 128000 --runs 1 \
+  --enable-prefix-caching --no-warmup --no-adapt-prompt \
+  --skip-coherence --latency-mode none --format json \
+  --save-result RESULT --emit-progress -
+```
+
+Each process first evaluated 128,054 context-load tokens. Prefix restoration
+then retained 128,043 tokens and the server evaluated 4,106 actual
+chat-formatted tokens for the nominal 4,096-token deep prefill. A 500 ms
+`nvidia-smi` process monitor recorded initialized and peak VRAM.
+
+### Results
+
+| Measurement | Base | Candidate | Change |
+|---|---:|---:|---:|
+| Context load, server | 778.64 t/s | 772.35 t/s | -0.81% |
+| Context load, Benchy | 778.016 t/s | 771.755 t/s | -0.80% |
+| Deep prefill, server | 446.88 t/s | 436.67 t/s | -2.28% |
+| Deep prefill, Benchy | 439.631 t/s | 429.575 t/s | -2.29% |
+| Deep prefill server time | 9,188.10 ms | 9,402.98 ms | +2.34% |
+| Init process VRAM | 15,768 MiB | 15,768 MiB | unchanged |
+| Peak process VRAM | 15,792 MiB | 15,792 MiB | unchanged |
+
+These are single runs, as required for the expensive 128K-depth protocol. The
+candidate's 2.3% lower deep-prefill result is therefore a cautionary signal,
+not a statistically supported regression claim. The unchanged graph split,
+CUDA FlashAttention placement, and memory footprint support the intended
+architectural equivalence. This cleanup should not be used to claim a speedup;
+a repeated A/B run is required before making a performance conclusion.
+
+One earlier candidate attempt is excluded. A separate worktree was compiling
+CUDA and C++ with up to 24 jobs throughout that attempt; multiple `ptxas` and
+`fatbinary` processes saturated cores and system load exceeded 14. Its
+720.02 t/s context load and 422.38 t/s deep prefill are invalid and are not
+included in the table. The server was stopped, all build and CUDA processes
+were confirmed absent, and the candidate row above came from the subsequent
+clean process.
+
+### Validation and artifacts
+
+The expanded-matrix CUDA server, `llama-bench`, and `test-arg-parser` built
+successfully. The argument-parser suite passed. `git diff --check` passed.
+The placement smoke and deep run completed without an inference error.
+
+`/tmp` is ephemeral. The retained exact timing artifacts are:
+
+| Artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `/tmp/qwen38-prefill-128k-benchy.json` | 2,762 | `0d6e26c0f2674fc0d5a6d75827e8795ef42cd4f58f465f5e2502da7b97d27500` |
+| `/tmp/qwen38-prefill-128k-server.log` | 62,405 | `322693a52a4e9deb3858f1883c9394288d17d96ca1cb967574cf429e4b22691b` |
+| `/tmp/qwen38-prefill-128k-placement-clean-benchy.json` | 2,762 | `a4e336fb42e114eb1be15dc957d33c79c46c243a2e585806184ecc01dd266ba2` |
+| `/tmp/qwen38-prefill-128k-placement-clean-server.log` | 22,403 | `e69577e15ecd0806eeb017d92edbf6aad45153f512fe93db746d64a5bcb689b4` |
+| `/tmp/attn-placement-pinned-debug.log` | 4,089,270 | `db141a5b48ac7d80c20ffb8053594d99751d7a8cf845850b49cc6b8f188866e2` |
+
+Disposition: retain the separation as an internal architectural cleanup. It
+removes a misleading cache-derived attention constraint while preserving
+plain CPU-KV behavior and leaving actual backend selection to the scheduler.
+Treat performance as neutral/uncertain pending repeated A/B evidence; the
+single deep run provides no basis for a speed claim.

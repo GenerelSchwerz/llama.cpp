@@ -301,9 +301,9 @@ default.
 
 Live testing showed that GPU memory can still rise when configured or populated
 context grows even though the target Q8 K/V buffers report `CUDA_Host`. CPU KV
-offload controls the long attention K/V storage and the CPU attention region;
-it does not move every context-shaped tensor or every auxiliary state out of
-CUDA memory.
+offload controls the long attention K/V storage; it does not move every
+context-shaped tensor, attention compute, or auxiliary state out of CUDA
+memory.
 
 The current resource model is:
 
@@ -377,6 +377,20 @@ That placement does not imply that attention executes on CPU. A 32K Nsight
 Systems trace showed that the scheduler copies each full K and V tensor to the
 GPU and executes standard Q8 attention with CUDA FlashAttention. Model weights
 and the rest of the graph also remain GPU-resident.
+
+The placement policy now represents those decisions separately. Internal
+`offload_kqv` continues to select persistent KV storage, while
+`offload_attn_compute` controls whether graph construction forces the complete
+attention region onto CPU. Ordinary pageable `--no-kv-offload` retains the
+legacy CPU-attention placement. With operation offload enabled,
+`--kv-cpu-pinned`, full KV offload, or a nonzero `--kv-gpu-layers` value keeps
+attention accelerator-eligible without changing which cache layers are
+persistent on the device. Explicitly disabling operation offload preserves the
+legacy cache-derived CPU placement constraint; individual operations can still
+be selected by an accelerator when their device inputs determine placement.
+This makes the established pinned-host/CUDA-attention path explicit instead of
+relying on the generic scheduler's operation-offload heuristic to override a
+cache-derived CPU constraint.
 
 At long context, each generated token requires scanning increasingly large K/V
 history. Relevant costs may include:
