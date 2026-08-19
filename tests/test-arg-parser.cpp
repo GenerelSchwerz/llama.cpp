@@ -557,6 +557,35 @@ static void test(void) {
     assert(params.speculative.draft.n_ubatch == 32);
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
 
+    // Clean Bee MTP always inherits the target physical ubatch. Preserve that
+    // prompt-synchronization geometry unless an explicit value is identical.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "128"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // Other model-backed speculative modes retain an independent draft
+    // ubatch; this restriction is specific to recurrent MTP synchronization.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH", "128");
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
     params = common_params();
     assert(params.speculative.draft.kv_gpu_layers == -1);
     argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-layers-draft", "0"};
@@ -675,9 +704,15 @@ static void test(void) {
         fixture << "[mtp-cap]\n"
                 << "spec-type = draft-mtp\n"
                 << "spec-draft-n-max = 8\n"
+                << "ubatch-size = 512\n"
+                << "spec-draft-ubatch-size = 512\n"
                 << "spec-mtp-rs-planes = 4\n"
                 << "spec-draft-kv-gpu-layers = 2\n"
-                << "phase-aware-workspace = true\n";
+                << "phase-aware-workspace = true\n"
+                << "\n[mtp-ubatch-mismatch]\n"
+                << "spec-type = draft-mtp\n"
+                << "ubatch-size = 512\n"
+                << "spec-draft-ubatch-size = 128\n";
         assert(fixture.good());
     }
     common_preset global;
@@ -689,8 +724,14 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(params.speculative.mtp_rs_planes == 4);
     assert(params.speculative.need_n_rs_seq() == 3);
+    assert(params.speculative.draft.n_ubatch == 512);
     assert(params.speculative.draft.kv_gpu_layers == 2);
     assert(params.phase_aware_workspace);
+
+    assert(presets.count("mtp-ubatch-mismatch") == 1);
+    argv = presets.at("mtp-ubatch-mismatch").to_args("binary_name");
+    params = common_params();
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
     assert(std::filesystem::remove(mtp_preset_fixture));
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");
@@ -1007,11 +1048,37 @@ static void test_draft_kv_gpu_layers_override() {
     assert(params.kv_gpu_layers == 7);
 }
 
+static void test_mtp_draft_ubatch_validation() {
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+
+    // Inheritance and an explicit equal value preserve target prefill geometry.
+    common_validate_speculative_params(params, 512);
+    params.draft.n_ubatch = 512;
+    common_validate_speculative_params(params, 512);
+
+    // A smaller MTP physical ubatch splits recurrent prompt synchronization
+    // differently and is not bitwise output-stable.
+    params.draft.n_ubatch = 128;
+    bool rejected = false;
+    try {
+        common_validate_speculative_params(params, 512);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected);
+
+    // Independent ubatches remain available to the other speculative modes.
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    common_validate_speculative_params(params, 512);
+}
+
 int main(void) {
     try {
         test();
         test_single_device_draft_does_not_inherit_target_tensor_split();
         test_draft_kv_gpu_layers_override();
+        test_mtp_draft_ubatch_validation();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

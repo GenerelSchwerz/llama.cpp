@@ -433,7 +433,9 @@ struct common_params_speculative {
 // Validate options whose legality depends on the complete speculative-mode
 // selection. This is intentionally separate from individual argument handlers
 // so CLI, environment, and rendered INI options are order-independent.
-void common_validate_speculative_params(const common_params_speculative & params);
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch);
 
 // Resolve Bee's omitted DFlash draft maximum before target-context allocation.
 // Returns false when the draft GGUF metadata cannot be read or is invalid.

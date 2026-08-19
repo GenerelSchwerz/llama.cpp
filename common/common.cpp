@@ -86,13 +86,25 @@ const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_m
     return "unknown";
 }
 
-void common_validate_speculative_params(const common_params_speculative & params) {
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch) {
+    const bool has_mtp = std::find(
+            params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
+
+    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch > 0 &&
+            params.draft.n_ubatch != target_ubatch) {
+        throw std::invalid_argument(string_format(
+                "draft-mtp requires spec-draft-ubatch-size (%d) to match the target ubatch (%d) "
+                "for output-stable recurrent prompt synchronization; omit the draft override or use "
+                "--phase-aware-workspace to reduce decode workspace",
+                params.draft.n_ubatch, target_ubatch));
+    }
+
     if (!params.mtp_rs_planes_explicit) {
         return;
     }
 
-    const bool has_mtp = std::find(
-            params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
     if (!has_mtp) {
         throw std::invalid_argument("spec-mtp-rs-planes requires --spec-type draft-mtp");
     }
