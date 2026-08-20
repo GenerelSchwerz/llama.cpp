@@ -1142,6 +1142,18 @@ allocation classes, and identical matched perplexity. Experiment 020 contains
 the exact commands and evidence. The result remains support instrumentation,
 not a VRAM optimization or permission to infer a trimming policy.
 
+## 2026-08-20: live-context workspace protocol edition
+
+The current-testing protocol now names live-context workspace sizing as an
+independent default-off control. The previous edition described only
+phase-aware token geometry and therefore could not reproduce W04/W05/W09 in
+isolation. Current live-sizing comparisons vary only the positive/negative
+live control, require a memory layout that explicitly publishes bounded
+attention reservation, and keep every other optional workspace policy fixed.
+Unsupported layouts retain full reservation and the established upfront
+decode order. CUDA transient-pool trimming is restricted to the all-slots-idle
+boundary after effective live sizing; it is not a per-decode reclamation path.
+
 ## Known non-goals
 
 - Do not restore TurboQuant/TCQ, DDTree, CopySpec, the removed fork DFlash

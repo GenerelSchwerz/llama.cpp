@@ -533,7 +533,7 @@ def process_sample(pid: int) -> dict[str, Any]:
     status_path = pathlib.Path(f"/proc/{pid}/status")
     if not status_path.exists():
         return {}
-    wanted = {"VmRSS", "VmHWM", "VmSize", "RssAnon", "RssFile", "RssShmem"}
+    wanted = {"VmRSS", "VmHWM", "VmSize", "VmLck", "RssAnon", "RssFile", "RssShmem"}
     result: dict[str, Any] = {}
     for line in status_path.read_text(encoding="utf-8", errors="replace").splitlines():
         key, separator, value = line.partition(":")
@@ -1239,6 +1239,7 @@ def run_completion_step(
     )
     samples: list[dict[str, Any]] = []
     peak_vram_mib = 0
+    peak_process_kib: dict[str, int] = {}
     next_report = 0.0
     try:
         while completion.poll() is None:
@@ -1254,6 +1255,10 @@ def run_completion_step(
                 **gpu_sample(process.pid),
             }
             peak_vram_mib = max(peak_vram_mib, int(sample.get("vram_mib", 0)))
+            for key, value in sample["process"].items():
+                with contextlib.suppress(ValueError, IndexError):
+                    amount_kib = int(str(value).split()[0])
+                    peak_process_kib[key] = max(peak_process_kib.get(key, 0), amount_kib)
             try:
                 slots_url = f"{base_url}/slots"
                 if "model" in request_for_step:
@@ -1273,7 +1278,9 @@ def run_completion_step(
                     predicted = str(slots[0].get("next_token", slots[0].get("n_decoded", "?")))
                 print(
                     f"[{case_name}/{step_name}] elapsed={elapsed:.1f}s "
-                    f"progress={predicted} vram={sample.get('vram_mib', '?')} MiB",
+                    f"progress={predicted} vram={sample.get('vram_mib', '?')} MiB "
+                    f"rss_anon={peak_process_kib.get('RssAnon', '?')} KiB "
+                    f"rss_shmem={peak_process_kib.get('RssShmem', '?')} KiB",
                     flush=True,
                 )
                 next_report = elapsed + 10.0
@@ -1302,6 +1309,7 @@ def run_completion_step(
         "tokens_sha256": canonical_sha256(tokens),
         "content_sha256": sha256_bytes(content),
         "peak_vram_mib": peak_vram_mib,
+        "peak_process_kib": peak_process_kib,
         "timings": response_body.get("timings", {}),
     }
     json_dump(step_dir / "summary.json", summary)
@@ -1398,6 +1406,7 @@ def run_case(
     started = time.monotonic()
     error: BaseException | None = None
     peak_vram_mib = 0
+    peak_process_kib: dict[str, int] = {}
     completion_results: dict[str, dict[str, Any]] = {}
     ordered_results: list[dict[str, Any]] = []
     step_summaries: list[dict[str, Any]] = []
@@ -1465,6 +1474,8 @@ def run_case(
                 peak_vram_mib = max(
                     peak_vram_mib, int(result["summary"].get("peak_vram_mib", 0))
                 )
+                for key, value in result["summary"].get("peak_process_kib", {}).items():
+                    peak_process_kib[key] = max(peak_process_kib.get(key, 0), int(value))
             elif step["type"] == "wait_server_state":
                 step_summaries.append(
                     wait_for_server_state(base_url, process, name, step, step_dir)
@@ -1503,6 +1514,7 @@ def run_case(
         "server_sha256": sha256_file(server_path),
         "elapsed_seconds": elapsed,
         "peak_vram_mib": peak_vram_mib,
+        "peak_process_kib": peak_process_kib,
         "completion_count": len(ordered_results),
         "steps": step_summaries,
         "request_semantics_sha256": canonical_sha256(

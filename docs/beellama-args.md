@@ -320,6 +320,30 @@ measurements, fixed-seed hashes, Nsight transfer totals, and later-turn test are
 in
 [`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).
 
+## Live-context compute workspace
+
+This independent, opt-in policy sizes supported standard attention graph plans
+from the padded live physical KV high row rather than configured context
+capacity. It starts at 256 rows, grows in power-of-two bins, and uses shrink
+hysteresis so short speculative rollbacks do not repeatedly replace backing.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--live-context-workspace`, `--no-live-context-workspace` | `LLAMA_ARG_LIVE_CONTEXT_WORKSPACE` | Disabled | Bounds supported standard/hybrid attention graph reservations by live physical KV placement. The INI key is `live-context-workspace`. Unsupported memory layouts and fit/no-allocation contexts retain full reservation and established upfront decode ordering. |
+
+The prepared batch publishes its exact padded physical high row before graph
+execution. A real pending shift or copy still receives the established
+worst-case reservation before it resets or computes through the scheduler.
+After every server slot becomes idle, capable CUDA backends may unmap the
+unused tail of transient VMM pools so a contracted workspace becomes visible
+in process residency. The live graph plan itself remains reserved.
+
+This option does not alter persistent KV storage, attention arithmetic,
+sampling, phase-aware token geometry, causal-mask representation, host staging,
+or native quantized attention. Completion timing JSON adds target/draft KV grow
+and shrink counts plus current reserved rows and capacity. Default-off behavior
+retains the original full-context reservation and ordering.
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash

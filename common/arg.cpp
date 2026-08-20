@@ -2610,6 +2610,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE"));
     add_opt(common_arg(
+        {"--live-context-workspace"},
+        {"--no-live-context-workspace"},
+        string_format("for supported attention caches, grow the compute workspace reservation with the padded live "
+                      "physical KV extent instead of reserving the full context up front (default: %s)",
+                      params.live_context_workspace ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.live_context_workspace = value;
+        }
+    ).set_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE"));
+    add_opt(common_arg(
         {"--kv-gpu-layers"}, "N",
         string_format("with --no-kv-offload, keep the first N attention-KV layers device-resident anyway. "
                       "Those layers stop being re-sent to the device on every decode step, which is the dominant "

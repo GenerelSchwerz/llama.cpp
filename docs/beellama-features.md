@@ -633,6 +633,36 @@ across target and draft contexts. Prompt peak still includes the active target
 prompt workspace, and the policy does not address the context-linear staging
 and explicit-mask allocations within that workspace.
 
+## Live-context workspace growth
+
+`--live-context-workspace` is a separate default-off transient-memory policy
+for supported standard attention layouts. Instead of constructing every graph
+against configured KV capacity, it reserves from the exact padded physical
+high row published by the prepared batch, grows geometrically, and contracts
+after demand falls below its hysteresis boundary. Hybrid memory forwards this
+capability only for its standard attention member while retaining the full
+recurrent reservation.
+
+Capability and layout checks control the path. KVarN, ISWA, recurrent-only,
+and other memory implementations that do not expose bounded attention sizing
+keep full reservation and original upfront decode ordering even if the flag is
+requested. Phase-aware prompt/generation geometry remains independent.
+
+When all server slots are idle, an effective live-sized context asks registered
+CUDA backends to release the unused tail of synchronized transient VMM pools.
+Legacy pools and other backends return zero; no device or model architecture is
+hard-coded. This idle trim does not discard the current graph plan and never
+runs on the default-off or unsupported path.
+
+Use the option when a large configured context normally serves short requests,
+or when a long turn is followed by short turns and lower idle residency
+matters. Expect one-time synchronization, graph re-reservation, and buffer
+replacement cost at growth and shrink boundaries. Persistent KV bytes and
+full-depth peak are unchanged.
+
+The exact argument contract is in
+[`beellama-args.md`](beellama-args.md#live-context-compute-workspace).
+
 ## Upstream DFlash with profit adaptation
 
 ### What it is
