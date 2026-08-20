@@ -3169,3 +3169,102 @@ the tested layout, and the GPU-draft split is output-exact after the merged MTP
 fixes. The empirical claim remains limited to the ownership split above;
 arbitrary partial target-layer mixes, lower/asymmetric formats, other models,
 multi-GPU, and other backends need separate gates.
+
+## W06: declare perplexity's full-batch output capacity
+
+**Date:** 2026-08-20
+
+**Base:** `c9f727c1e1995c4a871a719ab05b5f2478588efd`
+
+**Candidate:** this isolated migration commit
+
+**Disposition:** retained correctness fix
+
+### Implementation and scope
+
+Phase-aware contexts without an explicit output requirement use the compact
+serving maximum of `n_seq_max`. Perplexity instead requests logits for every
+scored token in a slice. With one sequence and a 256-token physical batch,
+that mismatch can reach the fail-closed `output_reserve()` assertion.
+
+Immediately before context creation, `llama-perplexity` now sets
+`params.n_outputs_max = params.n_batch`. The non-phase-aware default already
+resolves an unspecified capacity to `n_batch`, so ordinary behavior is
+unchanged. A focused source-plumbing test verifies that the declaration occurs
+before `common_init_from_params(params)`. No server, live-workspace, telemetry,
+causal-mask, host-staging, native-Q8, or argument-surface change is included.
+
+### Build and identities
+
+The candidate used a Release CUDA build with native CPU code, SM120, the
+default standard quant matrix, and dedicated KVarN kernels disabled because
+this tool contract does not exercise KVarN. The exact configure and focused
+build commands were:
+
+```bash
+cmake -S . -B build-w06-cuda -G Ninja \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=OFF \
+  -DGGML_CUDA_KVARN=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-w06-cuda \
+  --target llama-perplexity test-perplexity-plumbing -j 6
+```
+
+The compiler was GNU 16.2.1 with CUDA 13.3.73; the CUDA host compiler was GNU
+15.3.0. The GPU was an NVIDIA GeForce RTX 5070 Ti, compute capability 12.0,
+with driver 610.57.04. Relevant identities were:
+
+- model SHA-256: `ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`;
+- corpus SHA-256: `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`;
+- `tools/perplexity/perplexity.cpp` SHA-256:
+  `ae9558ebb124ff3a6db8998b57fd53e27eb956c4310674505b7c5e1a0aaa6986`;
+- `llama-perplexity` SHA-256:
+  `84b3140cbb0b284d297ad0119bc265f59b06e0e23bcc3e690a8ac1a5e2b3f446`;
+- `libllama-perplexity-impl.so` SHA-256:
+  `5d8428e7b053e8960b819555a28141e6b0b1c79139870a7f62f9fe8c9b4f83d4`.
+
+### Matched PPL and resource validation
+
+Every model process was fresh and wholly enclosed by
+`flock /tmp/beellama-single-gpu.lock -c`. Native llama affinity exposed the
+three decode CPUs and 24 batch CPUs; no external affinity wrapper was used.
+The native `[1]` counter exposed progress. The exact inner command was:
+
+```bash
+build-w06-cuda/bin/llama-perplexity \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -f /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+  -c 4096 -b 512 -ub 256 --chunks 1 \
+  -t 3 -tb 24 --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+  -ngl 999 -sm none -mg 0 --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --no-kv-cpu-pinned --no-recurrent-state-offload --no-warmup -v \
+  [--phase-aware-workspace]
+```
+
+A 200 ms sampler recorded `/proc/PID/status` separately from
+`nvidia-smi --query-compute-apps=pid,used_memory`. Verbose logs recorded
+allocator component sizes.
+
+| Measurement | Default A1 | Phase-aware | Default A2 |
+|---|---:|---:|---:|
+| cumulative PPL | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` |
+| scoring-pass time | 23.40 s | 23.53 s | 21.26 s |
+| sampled process VRAM peak | 13,682 MiB | 13,682 MiB | 13,682 MiB |
+| sampled `VmHWM` | 14,594,868 KiB | 14,593,824 KiB | 14,593,752 KiB |
+| sampled `RssAnon` peak | 343,536 KiB | 346,664 KiB | 345,520 KiB |
+
+All three contexts reported `n_outputs_max = 512`, then reserved scoring graphs
+with 256 outputs. CUDA compute was 252.50 MiB, CUDA-host compute was 27.78 MiB,
+the CUDA-host output buffer was 0.95 MiB, device KV was 136.00 MiB, device
+recurrent state was 149.62 MiB, and ordinary CPU-mapped model storage was
+644.14 MiB in every run. `VmPin` and `VmLck` remained 0 KiB; those fields do
+not account for the 28.73 MiB of CUDA-host buffers above. Perplexity performs
+scoring passes rather than generated-token decode, so a decode throughput
+measurement is not applicable.
+
+The phase-aware process logged creation of phase-aware backing and completed
+without weakening the allocator assertion. Identical A/B/A cumulative PPL
+shows no numerical increase, while the repeated default rows demonstrate that
+ordinary behavior remains stable. The focused `test-perplexity-plumbing` CTest
+passed 1/1.

@@ -50,6 +50,12 @@ Standard quantized host KV uses the canonical accelerator quant-store path.
 That keeps stored Q8 bytes independent of host versus device residency and is
 part of the current exactness contract.
 
+`llama-perplexity` declares its full logical batch as the maximum output-row
+requirement before context creation. Therefore matched PPL runs may enable or
+disable `--phase-aware-workspace` without reducing the all-logits capacity the
+tool needs. Treat an output-capacity assertion as a failed run, not as quality
+evidence.
+
 ## Retired controls are historical only
 
 Do not put removed controls into a current command, including defensive
