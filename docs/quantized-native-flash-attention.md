@@ -79,6 +79,19 @@ structure:
 - The per-type tile loaders are `fattn_quant_type_traits<GGML_TYPE_*>`
   specializations in `fattn-mma-quant.cuh`. Each dequantizes into the same
   shared-memory `half2` tiles consumed by the existing MMA math.
+- Most types share one of two packed extraction shapes rather than carrying
+  their own loader. `fattn_quant_nibble_traits` covers `Q4_1`, `Q5_0` and
+  `Q5_1`, whose qs byte holds one element per nibble;
+  `fattn_quant_2bit_traits` covers `Q2_0S`, `Q2_1`, `Q3_0` and `Q3_1`, whose
+  qs byte holds the two-bit fields of elements j, j+8, j+16 and j+24. Each
+  takes a flag for the optional one-bit plane in qh. `Q6_0` and `Q6_1` keep
+  their own extraction for the two-bit plane, and all of them finish through
+  the shared `fattn_quant_store4` conversion. A lane unpacks four codes at a
+  time with 32-bit word operations instead of walking the block per element.
+- `fattn_quant_store4` subtracts a zero-point type's bias in float rather than
+  in the packed word. `(code - bias)*d` is the cast path's own expression and
+  is exact for these small integers, and it avoids `__vsubss4`, which is
+  emulated on every NVIDIA architecture since Kepler.
 - Per-type dequantization must reproduce the F16-casting route bit for bit,
   and which helper achieves that differs per type. `Q8_0` reuses the established
   `dequantize_V_q8_0` helper from

@@ -80,21 +80,26 @@ struct fattn_quant_type_traits<GGML_TYPE_Q4_0> {
 // is unchanged.
 
 // Shared tail of every packed loader: four codes already unpacked into the
-// bytes of one word become two half2 values. Types with a min use the stored
-// pair directly; the others bias by half their code range first, which cannot
-// saturate because the biased codes stay well inside int8.
-template <bool has_min, uint32_t bias4>
+// bytes of one word become two half2 values.
+//
+// The zero-point types subtract their bias in float rather than in the packed
+// word. That is the reference cast path's own expression, (code - bias)*d, and
+// it is exact because both operands are small integers. Biasing the word
+// instead would need __vsubss4, which no NVIDIA architecture since Kepler
+// implements in hardware; the emulation it expands to costs more than the one
+// extra FADD per element that this form spends, and it is what made every
+// zero-point type slower than its paired min/scale sibling.
+template <bool has_min, int bias>
 static __device__ __forceinline__ void fattn_quant_store4(
-        half2 * const __restrict__ vals, uint32_t q, const float d, const float2 dm) {
+        half2 * const __restrict__ vals, const uint32_t q, const float d, const float2 dm) {
+    const uint8_t * const q8 = (const uint8_t *) &q;
     if constexpr (has_min) {
-        const uint8_t * const q8 = (const uint8_t *) &q;
         vals[0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
         vals[1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
     } else {
-        q = __vsubss4(q, bias4);
-        const int8_t * const q8 = (const int8_t *) &q;
-        vals[0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
-        vals[1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
+        constexpr float b = bias;
+        vals[0] = ggml_cuda_cast<half2>(make_float2((q8[0] - b)*d, (q8[1] - b)*d));
+        vals[1] = ggml_cuda_cast<half2>(make_float2((q8[2] - b)*d, (q8[3] - b)*d));
     }
 }
 
@@ -145,7 +150,7 @@ struct fattn_quant_nibble_traits {
                 q |= (h4 * 0x02040810u) & 0x10101010u;
             }
 
-            fattn_quant_store4<has_min, has_plane ? 0x10101010u : 0x08080808u>(vals + 2*g, q, d, dm);
+            fattn_quant_store4<has_min, has_plane ? 16 : 8>(vals + 2*g, q, d, dm);
         }
     }
 };
@@ -193,7 +198,7 @@ struct fattn_quant_q6_traits {
             const int hshift = 4*(g/2) + 2*hi;
             q |= ((hbytes >> hshift) & 0x03030303u) << 4;
 
-            fattn_quant_store4<has_min, 0x20202020u>(vals + 2*g, q, d, dm);
+            fattn_quant_store4<has_min, 32>(vals + 2*g, q, d, dm);
         }
     }
 };
@@ -250,7 +255,7 @@ struct fattn_quant_2bit_traits {
                 q |= (h4 * 0x00810204u) & 0x04040404u;
             }
 
-            fattn_quant_store4<has_min, has_plane ? 0x04040404u : 0x02020202u>(vals + 2*g, q, d, dm);
+            fattn_quant_store4<has_min, has_plane ? 4 : 2>(vals + 2*g, q, d, dm);
         }
     }
 };
