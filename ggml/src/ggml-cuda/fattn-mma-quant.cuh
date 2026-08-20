@@ -2,6 +2,7 @@
 
 #include "fattn-common.cuh"
 #include "convert.cuh"
+#include "dequantize.cuh"
 
 // Native quantized K/V tile loading for the MMA FlashAttention kernel.
 //
@@ -67,10 +68,67 @@ struct fattn_quant_type_traits<GGML_TYPE_Q4_0> {
     }
 };
 
+
+// Most types have no dedicated F16 cast kernel and are cast through the generic
+// dequantize_block with a dequantize_q* functor. Calling that same functor here
+// makes the tile bit-identical to that route by construction rather than by
+// reimplementation, which is what the per-type reconstructions cannot promise.
+//
+// The functor yields element iqs in v.x and element iqs + qk/2 in v.y, so a
+// 16-element run is one half of that pair across iqs 0..15.
+template <int qk_, void (*dequant_fn)(const void *, const int64_t, const int, float2 &)>
+struct fattn_quant_functor_traits {
+    static constexpr int qk = qk_;
+
+    template <int nelem>
+    static __device__ __forceinline__ void dequant(
+            const char * const __restrict__ row, half2 * const __restrict__ vals, const int e0) {
+        static_assert(nelem == qk_/2, "run must be exactly half a block");
+
+        const int64_t ib = e0 / qk_;
+        const bool    hi = (e0 % qk_) != 0;
+
+#pragma unroll
+        for (int l = 0; l < nelem/2; ++l) {
+            float2 a, b;
+            dequant_fn(row, ib, 2*l + 0, a);
+            dequant_fn(row, ib, 2*l + 1, b);
+            vals[l] = ggml_cuda_cast<half2>(make_float2(hi ? a.y : a.x, hi ? b.y : b.x));
+        }
+    }
+};
+
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q4_1>  : fattn_quant_functor_traits<QK4_1,  dequantize_q4_1>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_0>  : fattn_quant_functor_traits<QK5_0,  dequantize_q5_0>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_1>  : fattn_quant_functor_traits<QK5_1,  dequantize_q5_1>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_0>  : fattn_quant_functor_traits<QK6_0,  dequantize_q6_0>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_1>  : fattn_quant_functor_traits<QK6_1,  dequantize_q6_1>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0>  : fattn_quant_functor_traits<QK3_0,  dequantize_q3_0>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_functor_traits<QK3_1,  dequantize_q3_1>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_0S> : fattn_quant_functor_traits<QK2_0S, dequantize_q2_0s> {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_1>  : fattn_quant_functor_traits<QK2_1,  dequantize_q2_1>  {};
+
+// Compiled type tiers. The default set keeps build time in the same bracket as
+// before; GGML_CUDA_FA_ALL_QUANTS adds the rest, mirroring how the vector
+// FlashAttention pair matrix is tiered.
+#ifdef GGML_CUDA_FA_ALL_QUANTS
+#define FATTN_MMA_QUANT_TYPES_EXTRA(F) \
+    F(GGML_TYPE_Q4_1) F(GGML_TYPE_Q5_1) F(GGML_TYPE_Q6_1) \
+    F(GGML_TYPE_Q3_0) F(GGML_TYPE_Q3_1) F(GGML_TYPE_Q2_0S) F(GGML_TYPE_Q2_1)
+#else
+#define FATTN_MMA_QUANT_TYPES_EXTRA(F)
+#endif
+
+#define FATTN_MMA_QUANT_TYPES(F) \
+    F(GGML_TYPE_Q8_0) F(GGML_TYPE_Q4_0) F(GGML_TYPE_Q5_0) F(GGML_TYPE_Q6_0) \
+    FATTN_MMA_QUANT_TYPES_EXTRA(F)
+
 // Cache types with a compiled native tile loader. Both the host-side route
 // decision and the device-side kernel selection ask this same question.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_type(ggml_type type) {
-    return type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0;
+#define FATTN_MMA_QUANT_TYPE_MATCH(t) || type == (t)
+    return false FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_TYPE_MATCH);
+#undef FATTN_MMA_QUANT_TYPE_MATCH
 }
 
 // Load quantized rows directly into the half2 shared-memory tile consumed by

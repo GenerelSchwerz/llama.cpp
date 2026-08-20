@@ -288,16 +288,19 @@ static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, 
 
     ggml_cuda_flash_attn_ext_mma_quant_log_route(dst);
 
+    // Expanded from the same list that drives the route predicate and the
+    // extern declarations, so a type can never be routable without a kernel.
+#define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                       \
+        case t:                                                                \
+            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<t>(ctx, dst);  \
+            break;
+
     switch (K->type) {
-        case GGML_TYPE_Q8_0:
-            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<GGML_TYPE_Q8_0>(ctx, dst);
-            break;
-        case GGML_TYPE_Q4_0:
-            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<GGML_TYPE_Q4_0>(ctx, dst);
-            break;
+        FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_DISPATCH_CASE)
         default:
             GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
     }
+#undef FATTN_MMA_QUANT_DISPATCH_CASE
 }
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 
