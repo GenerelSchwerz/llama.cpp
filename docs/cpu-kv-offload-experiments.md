@@ -5310,3 +5310,241 @@ CPU reference rather than end to end. Other quantized pairs, Turing, Volta,
 AMD, multi-GPU, MTP/DSpark speculative geometries, and the serving-level
 protocol in `cpu-kv-offload-current-testing.md` are all unmeasured. The plan's
 remaining non-goals stand.
+
+### Structural cleanup and final integrated validation
+
+This section supersedes the implementation structure, controls, and untested
+scope described earlier in Experiment 020. It does not rewrite the original
+measurements, which remain tied to their recorded commits and host.
+
+The cleaned implementation is source commit
+`afaf37c31a23cf4933ef127527dde366e545f669`, based on PR head `c70051e01`.
+The same Release build produced build number 11254. The enabled server SHA-256
+was `e6bcadd8a140d623cabfcb1359fbae76b9727186ada34c6353a9f47166f976f1`;
+`libggml-cuda.so.0.19.0` was
+`9ff09c018930c9a0d04a5b96abc8d163d1700420f2cbb6609da504f36e4b1783`.
+
+The cleanup follows the existing upstream MMA organization:
+
+- the established F16 launcher, case, and `ncols1`/`ncols2` selectors are
+  templated on K and V storage types, with F16 defaults preserving existing
+  call sites;
+- a 61-line Q8 adapter supplies only the Q8_0 tile loader and calls the shared
+  launcher and selectors;
+- the two copied Q8 launcher/selector headers, totaling 321 lines, were
+  removed;
+- the normal instance generator emits the 16 supported tile translation units,
+  each explicitly instantiating D=64/128/256, for 48 bounded cases;
+- `GGML_CUDA_FATTN_Q8_NATIVE=ON` is a build allowlist, independent of
+  `GGML_CUDA_FA_ALL_QUANTS`; the default is off;
+- `--flash-attn-native-quants` is only run-time permission. The graph's actual
+  K/V tensor types choose the concrete layout, so there is no second
+  `q8_0:q8_0` selector that can disagree with the cache configuration;
+- the historical run-time `GGML_CUDA_FATTN_Q8_NATIVE=0/1` override was removed.
+  `GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` remains audit-only and never selects a
+  route; and
+- `llama-bench` accepts the same option and records the requested boolean in
+  JSON/JSONL/CSV/Markdown results.
+
+Relative to `c70051e01`, implementation checkpoint `afaf37c31` is 572
+insertions and 589 deletions, including its design documentation and focused
+tests. This final evidence note is a later documentation-only addition. The
+principal CUDA change removes duplicate control flow rather than adding another
+parallel kernel framework.
+
+#### Final build and route gates
+
+Both builds used `CMAKE_BUILD_TYPE=Release`, CUDA architecture 120,
+`GGML_CUDA_FA_ALL_QUANTS=OFF`, and the same source commit. One set
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`; the other set it `OFF`. The enabled CUDA shared
+library was 193,300,096 bytes versus 185,830,976 bytes disabled: a 7,469,120
+byte (7.12 MiB, 4.02%) build-size cost.
+
+The generated source pass was byte-idempotent. The disabled Ninja graph had no
+`fattn-mma-q8-instance` source and the following opted-in selection passed
+98/98 through the standard materializing route after one build-missing warning:
+
+```bash
+build-cuda-default/bin/test-backend-ops test \
+  -b CUDA0 -o FLASH_ATTN_EXT -p 'native_quants=1'
+```
+
+The enabled build passed the same 98/98 cases, with audit logs proving native
+launches for every registered D=64/128/256 and tile geometry:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1 \
+  build-cuda-all/bin/test-backend-ops test \
+  -b CUDA0 -o FLASH_ATTN_EXT -p 'native_quants=1'
+```
+
+The set covers four GQA-selected column ratios, query batches 3/16/32/64, KV
+lengths 113 and 512, and the three supported head dimensions. A Q8_0/Q4_0 pair
+and homogeneous Q8_0 at D=72 both passed through their once-warned standard
+fallbacks.
+
+The broader FlashAttention sweep was attempted with native permission off and
+on. Both reached the same pre-existing fatal dispatcher case after thousands
+of prior cases: F16/F16, `DQ=DK=320`, `DV=256`, `nq=1`, `nkv=512`. The isolated
+case reproduced in the untouched `/home/gencoolpc/beellama-kv-offload` binary.
+It is outside the registered Q8 family and is not evidence of a regression in
+this change; fixing that generic vector-dispatch/test-order issue is outside
+this PR.
+
+#### Final MTP token and byte exactness
+
+The current `scripts/mtp-exactness.py` oracle ran two fresh instances of the
+same enabled binary. Both used CPU-resident pinned target and inherited draft
+KV, Q8_0/Q8_0 target and draft caches, phase-aware workspace, MTP depth 6,
+three recurrent planes, physical target/effective-draft ubatch 512, greedy
+sampling, and seed 1234. Only
+`--no-flash-attn-native-quants` versus
+`--flash-attn-native-quants` changed.
+
+The 1,000-token comparison reported `contract_exact=true`,
+`prompt_tokens_exact=true`, `tokens_exact=true`, and `content_exact=true`.
+Both outputs had token SHA-256
+`842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`
+and content SHA-256
+`41dd817295f51516f3750049cfe3ecd2b5de9ae0f4d08df7a58a1408318f3bb2`.
+Both also performed 470 draft generations, accepted 428, and replayed 56 batch
+tokens in 10 cycles. This is the same-MTP-geometry oracle required by the
+current protocol, not a target-only comparison.
+
+The exact runner invocation was:
+
+```bash
+python3 scripts/mtp-exactness.py \
+  /tmp/q8-native-mma-exact-afaf37c31.json
+```
+
+The temporary manifest SHA-256 was
+`62301e7dcf529b76d93d3170ec3a862ac379dc21e4efc4d502fecd52c08e2092`.
+It used the committed
+`scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json`
+request and the server arguments enumerated above. The retained output
+directory was `/tmp/q8-native-mma-exact-afaf37c31-20260819-v2`; its
+`summary.json` and `comparisons.json` SHA-256 values were
+`e7c228e61203b7ea6f6f31382af82fd4ecca90b9452ed4293e3aeb8b3368323c`
+and `1181f578dc2390944a592399eeb4bf3adfd59ea0a282ac54ed9b4fe87508b32d`.
+
+#### Final short, medium, and very-long prefill screen
+
+Hardware was an NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, driver
+610.57.04, with 15,880 MiB usable process memory, and an Intel Core Ultra 9
+285K. Model
+`/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`
+had SHA-256
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+Each row ran three prompt repetitions after one depth fill, with native
+permission as the only changed setting:
+
+```bash
+taskset -c 0,2,4 build-cuda-all/bin/llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -ngl 999 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  --flash-attn-native-quants \
+  -b 1024 -ub 512 -p 512 -n 0 -d DEPTH -r 3 \
+  --kv-memory --progress -o json
+```
+
+The reference substituted `--no-flash-attn-native-quants`. JSON records
+confirmed build commit `afaf37c31`, selected Q8_0/Q8_0, CPU KV, and the
+requested native boolean.
+
+| Depth | Native off (t/s) | Native on (t/s) | Change | Peak off / on | CUDA compute off / on |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 1797.10 +/- 26.60 | 1767.11 +/- 25.31 | -1.67% | 13,849.94 / 13,849.94 MiB | 529.79 / 529.79 MiB |
+| 32,768 | 1183.84 +/- 11.61 | 1224.68 +/- 12.66 | +3.45% | 13,963.94 / 13,963.94 MiB | 669.79 / 669.79 MiB |
+| 245,760 | 295.90 +/- 13.17 | 363.07 +/- 6.30 | +22.70% | 15,153.94 / 14,179.94 MiB | 2,054.62 / 1,080.62 MiB |
+
+The short-depth ranges overlap; this does not establish a short-context
+regression. At depth 32,768 the larger logits arena masks the removed
+allocation. At 245,760, where materialization is larger than that arena, the
+native route saves exactly 974 MiB in both the synchronized process peak and
+the reserved CUDA compute buffer. The three repetitions and single order make
+these performance results a screen rather than a universal claim.
+
+#### Realistic live MTP screen
+
+The current server layout from
+`cpu-kv-offload-current-testing.md` was used with the multimodal projector,
+CPU-resident pinned Q8_0/Q8_0 target and inherited draft KV, MTP depth 6,
+three recurrent planes, phase-aware workspace, physical target/effective-draft
+ubatch 512, context 32,768, and one fresh server per side. `llama-benchy` 0.4.0
+used NumPy seed 1234, its independently loaded Qwen3.5 tokenizer, the recorded
+Gutenberg corpus cache, `--pp 512 --tg 64 --depth 30000 --runs 1`, exact TG,
+greedy seed 1234, cache disabled in the request, and `--emit-progress -`.
+
+Both sides observed 30,565 prompt tokens and 64 generated tokens. Draft work
+was identical: 28/41 accepted, mean length 2.75, and 27 replay batch tokens in
+five cycles.
+
+The exact server template was the following, with `NATIVE_FLAG` set first to
+`--no-flash-attn-native-quants` and then to
+`--flash-attn-native-quants`, using a fresh process each time:
+
+```bash
+NATIVE_FLAG=--no-flash-attn-native-quants
+build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on "$NATIVE_FLAG" \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers 0 --ctx-size 32768 --parallel 1 \
+  --cont-batching --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --phase-aware-workspace --spec-type draft-mtp --spec-draft-n-max 6 \
+  --spec-mtp-rs-planes 3 --spec-draft-p-min 0.85 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+  --alias qwen38-q8-native --host 127.0.0.1 --port 8098
+```
+
+Each server was driven with:
+
+```bash
+python3 -c \
+  'import numpy as np; np.random.seed(1234); from llama_benchy.__main__ import main; main()' \
+  --base-url http://127.0.0.1:8098/v1 \
+  --model Qwen/Qwen3.5-27B --served-model-name qwen38-q8-native \
+  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
+  --pp 512 --tg 64 --depth 30000 --runs 1 --no-warmup \
+  --skip-coherence --no-adapt-prompt --latency-mode none --exact-tg \
+  --extra-body temperature=0,seed=1234,cache_prompt=false \
+  --emit-progress - --save-result RESULT.json --format json
+```
+
+One-second `nvidia-smi` process samples ran from startup through completion.
+The off/on result JSON SHA-256 values were
+`4f1154b39c4c1579c38cec948c433bc196e2912115b171a6bc5b4eb935f8f02a`
+and `ec55e1c16f2eb26808750666fab78def623b5d1f54f8081ab842f7291dc5dcff`.
+
+| Measurement | Native off | Native on | Change |
+|---|---:|---:|---:|
+| llama-benchy prefill | 1444.23 t/s | 1425.12 t/s | -1.32% |
+| llama-benchy generation | 26.88 t/s | 27.77 t/s | +3.32% |
+| server generation | 27.37 t/s | 28.21 t/s | +3.07% |
+| sampled peak process VRAM | 14,212 MiB | 14,072 MiB | -140 MiB |
+
+This proves that speculative verification can reach the optimization even
+though ordinary one-token decode remains on the existing native vector path.
+The decode improvement and small prefill loss are single-run observations;
+alternating repetitions are required before treating either small delta as
+stable.
+
+#### Revised disposition
+
+Retain the cleaned family as an explicit build and run-time opt-in. It removes
+a substantial long-context transient allocation, produces bit-exact output in
+the maintained same-MTP comparison, and shows useful medium/long prefill and
+MTP verification screens on the measured host. Keep both defaults off because
+the enabled build costs 7.12 MiB, short-depth performance is mixed, and only
+one recent NVIDIA architecture and one model have received integrated
+performance coverage. Future native cache pairs must be separately registered
+and evidenced; they must not be inferred from `GGML_CUDA_FA_ALL_QUANTS`.

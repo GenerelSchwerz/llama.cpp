@@ -141,6 +141,38 @@ For route auditing only,
 the Q8 MMA family. It does not enable or disable the route and is not part of a
 serving configuration.
 
+## Recorded validation
+
+The structural revision at source commit `afaf37c31` was tested on an NVIDIA
+GeForce RTX 5070 Ti (compute capability 12.0, driver 610.57.04) with the
+Qwen3.8 27B model and homogeneous Q8_0 target and MTP cache types. The detailed
+commands, hashes, and artifacts are recorded in Experiment 020 of
+[`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
+
+- Both CMake modes built from the same commit. The disabled build contained no
+  Q8 MMA instances and passed all 98 opted-in cases through the once-warned
+  standard fallback. The enabled build passed the same 98 cases, selecting all
+  registered D=64/128/256 geometries and retaining the mixed-pair and D=72
+  fallbacks.
+- A maintained 1,000-token MTP exactness comparison changed only the native
+  permission. Prompt tokens, request semantics, all output token IDs, and
+  response bytes matched exactly.
+- Matched 512-token prefill screens at depths 4,096, 32,768, and 245,760 found
+  changes of -1.67%, +3.45%, and +22.70%, respectively. The very-long case
+  reduced the synchronized peak process allocation and CUDA compute arena by
+  974 MiB. These are three-repetition screens, not cross-device performance
+  guarantees.
+- A one-run live MTP screen at 30,565 prompt tokens and 64 generated tokens
+  improved measured generation throughput by 3.32% and reduced sampled peak
+  process VRAM by 140 MiB. Acceptance, generated drafts, and replay work were
+  identical. Its prefill result was 1.32% lower, within the variability of a
+  single ordered pair.
+
+Enabling the family increased `libggml-cuda.so` by 7,469,120 bytes (7.12 MiB,
+4.02%) in these otherwise matched builds. This build-size cost, the mixed
+short-depth performance, and the limited hardware coverage are why the build
+and run-time defaults remain off.
+
 ## Limitations
 
 - The only registered pair is `Q8_0/Q8_0`; mixed and other quantized pairs use
