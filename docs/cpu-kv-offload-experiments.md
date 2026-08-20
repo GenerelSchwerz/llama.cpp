@@ -3,19 +3,23 @@
 For the current runnable build, server arguments, exactness oracle, benchmark
 shape, progress mechanism, and required artifacts, use
 [`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). This
-ledger intentionally preserves the exact commands used by each historical
-experiment, including retired environment variables and execution geometries.
-Those commands explain their recorded results; they are not templates for a
-new run.
+is a curated evidence ledger, not a chronological attempt log. It retains only
+valid experiments that affected a decision, changed confidence, covered a
+materially different configuration, or prevent likely repeated work. Follow
+the current protocol and the explicit delta recorded by an older entry; its
+commands, when present, are historical rather than current templates.
 
 Candidate VRAM reductions and their complexity ordering are maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). This ledger
-remains the source of exact commands and measured acceptance or rejection.
+remains the source of curated measured acceptance or rejection.
 
-This document records changes made on the `exp/kv-cpu-offload` branch. Each
-accepted or rejected experiment should have its own commit so that its complete
-diff remains inspectable. Do not treat these measurements as portable benchmark
-claims; they apply only to the configuration recorded below.
+This document records decision-relevant changes made on the
+`exp/kv-cpu-offload` branch. Each valid accepted or rejected experiment should
+have its own commit so that its complete diff remains inspectable. Invalid runs
+contribute no measurements or artifact inventories. Required repetitions are
+aggregated into the existing experiment; redundant reruns are omitted. Do not
+treat these measurements as portable benchmark claims; they apply only to the
+configuration recorded below.
 
 ## Baseline
 
@@ -1958,13 +1962,9 @@ CUDA FlashAttention placement, and memory footprint support the intended
 architectural equivalence. This cleanup should not be used to claim a speedup;
 a repeated A/B run is required before making a performance conclusion.
 
-One earlier candidate attempt is excluded. A separate worktree was compiling
-CUDA and C++ with up to 24 jobs throughout that attempt; multiple `ptxas` and
-`fatbinary` processes saturated cores and system load exceeded 14. Its
-720.02 t/s context load and 422.38 t/s deep prefill are invalid and are not
-included in the table. The server was stopped, all build and CUDA processes
-were confirmed absent, and the candidate row above came from the subsequent
-clean process.
+The acceptance protocol excludes measurements collected while another build or
+GPU workload is active. The rows above came from clean processes after that
+preflight passed.
 
 ### Validation and artifacts
 
@@ -2874,12 +2874,8 @@ acceptance 2,077/2,435, and zero checkpoint counts/times/payloads.
 | MTP-6 lifecycle | `/tmp/qwen38-mtp6-lifecycle-q8-20260819` | `bd974faf394447b3d71eacf3ac2a3e4597dc9f9f75377b15e21ffff39387cf69` / `fe3a6781a81daf4d3e1b1a4da58921100c1f3eb74a57c83943f17b17fe18dc2d` / `4acf083d85b1ea64c1504ab2c043a5ec5ae481c0389da9cb6d61e4b195c43556` / `77d84efddc79f702978ecdeb4e2bf660941dc0aa970703a700e6b59e89d71723` |
 | MTP-6 router reload | `/tmp/qwen38-mtp6-router-reload-q8-20260819` | `94b47d3eac42696fb288124131703036ffad082d879976188e82e9e7ab683b0f` / `12f4f5744521a753633fedd2417e16903184fdf948b059c02dff8ffd875eeb90` / `5d194ac098b7aed6f63dab80d9832a06b58492771df79f4d9ca4b7ea328d2983` / `f6942b8ec35fac297f881eee50557e3970ce84dc79634505bc8484f4b0c0d40e` |
 
-The full hashes and complete chronology are in
+The retained matrix details and hashes are in
 [`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md).
-The first 5K attempt used an obsolete chat-message request shape that the
-runner intentionally rejected before generation; it is a setup error, not a
-benchmark result.
-
 After the final source freeze, `llama-server`, `llama-bench`,
 `test-arg-parser`, `test-backend-ops`, and `test-kv-cache-tail` rebuilt. CPU
 same-type/standard `SET_ROWS` passed 721/721 backend cases; CUDA passed 267/267.
@@ -3080,10 +3076,7 @@ Matched-performance artifacts and SHA-256 values:
 | Timestamped VRAM log | `e9e6c8fa805cd256d8c561e4bb95b431c5b9be94f720d6916917ee8ad26fe683` | `dcb8f2b4c2c111f44ecf1881c27ac3141b112602aef9e3b23e6c8cd5d8b65874` |
 
 All files are under
-`/tmp/draft-kv-residency-perf-matched-20260819`. The earlier mismatched
-`--no-cache` attempt is preserved separately under
-`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819` and is not evidence
-for a performance delta.
+`/tmp/draft-kv-residency-perf-matched-20260819`.
 
 ### Full 5K stochastic live decode
 

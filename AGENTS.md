@@ -117,11 +117,11 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   build, runtime, exactness, benchmark, progress, and artifact protocol. Start
   here before running or recording any CPU KV experiment.
 - `docs/cpu-kv-offload-development.md` - progress and decision journal. It
-  preserves previous protocol editions and rejected paths for historical
-  reasoning; its old commands are not current instructions.
-- `docs/cpu-kv-offload-experiments.md` - authoritative per-change CPU KV
-  benchmark and resource ledger. Commands inside an older experiment reproduce
-  that historical experiment, not necessarily the current branch.
+  records protocol transitions, durable rationale, and concise summaries of
+  valid rejected paths. It is not a transcript of every attempted run.
+- `docs/cpu-kv-offload-experiments.md` - curated per-change CPU KV benchmark
+  and resource ledger. It contains only valid, decision-relevant evidence;
+  older commands are historical rather than current templates.
 
 ### Invariants
 
@@ -203,12 +203,27 @@ CPU-resident KV-cache investigation.
 - Update `docs/cpu-kv-offload-current-testing.md` first whenever supported
   controls, the active setup, exactness oracle, benchmark shape, progress
   mechanism, or required artifact set changes. Record why the prior edition
-  was superseded in `docs/cpu-kv-offload-development.md`; do not rewrite away
-  useful history. Pure result additions that do not change the protocol or
-  working theory belong only in the experiment ledger.
-- Record rejected and neutral experiments before reverting them. Prefer a clean
-  revert or a separate revert commit when preserving the exact attempted diff
-  is useful; never leave an undocumented partial implementation in the branch.
+  was superseded in `docs/cpu-kv-offload-development.md`. Preserve durable
+  rationale, not obsolete command copies or an attempt-by-attempt transcript.
+  Pure result additions that do not change the protocol or working theory
+  belong only in the experiment ledger.
+- Record a rejected or neutral experiment only when its run was valid and its
+  result tests a distinct hypothesis or prevents likely repeated work. Prefer a
+  clean revert or a separate revert commit when preserving the exact attempted
+  source diff is useful; never leave an undocumented partial implementation in
+  the branch.
+- Invalid runs are not evidence. A run with a wrong binary, unmatched prompt or
+  configuration, contaminated hardware, setup/launcher failure, incomplete
+  output, or a violated acceptance gate must not contribute measurements,
+  artifact inventories, or a ledger entry. If the mistake exposes a reusable
+  protocol hazard, record only a short correction in the development journal;
+  Git history and temporary artifacts are sufficient for forensic detail.
+- Do not create a new record for an otherwise identical rerun that adds no new
+  confidence or decision. Aggregate required repetitions into the existing
+  experiment with sample count and summary statistics. Record a reproduction
+  separately only when it changes confidence, covers a materially different
+  model/hardware/commit, closes a named correctness gate, or contradicts prior
+  evidence.
 - For every performance change, measure clean baseline and candidate processes
   with identical model, depth, cache formats, affinity, thread counts, build
   options, and runtime settings. At minimum record prefill, decode at depth 4096,
@@ -226,9 +241,11 @@ CPU-resident KV-cache investigation.
   debugger. State the progress mechanism in the launch update and preserve it
   in the recorded command. Do not start an unbounded or duration-uncertain run
   whose only observable states are running and finished.
-- Every experiment entry must state its base and candidate commit IDs, exact
-  commands or command template, hardware, model path, measurements, resource
-  tradeoffs, and disposition: retained, revised, neutral, or reverted.
+- Every experiment entry must state its base and candidate commit IDs, the
+  current protocol plus any explicit command/configuration delta, hardware,
+  model path, measurements, resource tradeoffs, and disposition: retained,
+  revised, neutral, or reverted. Include a full command only when the canonical
+  current template plus recorded deltas cannot reproduce the valid evidence.
 - Do not present measurements from an uncommitted or differently configured
   binary as results for the current commit. Rebuild or verify the binary's build
   commit before benchmarking.

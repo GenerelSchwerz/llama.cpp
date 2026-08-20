@@ -2,16 +2,27 @@
 
 The authoritative runnable setup is
 [`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). Read it
-before launching any current test. This journal deliberately preserves earlier
-protocol editions, superseded commands, rejected paths, and the evidence that
-changed the working theory. They are available for historical reasoning, but
-they are not current setup instructions unless the current-testing document
-explicitly adopts them.
+before launching any current test. This journal records protocol transitions,
+durable rationale, and concise summaries of valid rejected paths. It is not an
+attempt log: invalid measurements, redundant reruns, obsolete command copies,
+and temporary-artifact inventories belong neither here nor in the experiment
+ledger. Use Git history for forensic reconstruction of an older edition.
 
 When the live protocol changes, update the current-testing document first and
-add the transition and rationale here. Do not silently rewrite old measurements
-to use new flags or geometry; their original commands remain part of their
-evidence. The companion experiment ledger records the exact per-change results.
+add the transition and rationale here. Do not rewrite valid old measurements to
+claim new flags or geometry. The companion experiment ledger records curated
+per-change evidence.
+
+## Evidence-curation transition: 2026-08-20
+
+Earlier editions asked agents to preserve invalid attempts and every historical
+command. That policy created runnable-looking conflicts and repeated results
+without adding evidence. Current documentation now retains only valid,
+decision-relevant measurements. A failed acceptance gate contributes no
+numbers; if it exposes a reusable hazard, this journal keeps only the cause and
+the corrective gate. Statistically useful repeats are aggregated into their
+existing experiment, while redundant repeats are omitted. Git history remains
+available when exact discarded text is needed for forensic work.
 
 ## Current protocol edition transition: 2026-08-19
 
@@ -30,45 +41,17 @@ entries retain them exactly where they were used. MTP draft ubatch 128 is also
 historical; current MTP omits the draft override or explicitly matches the
 target physical ubatch.
 
-The first post-merge `llama-benchy` 0.4.0 performance pair was rejected before
-publication because its prompts were not identical. At nominal depths 4,096
-and 30,000, the inherited-host-draft run reported 4,661 and 30,564 prompt
-tokens, while the draft-owned-GPU run reported 4,659 and 30,566. The attempted
-command used `--no-cache`, which adds a different UUID in every invocation;
-the stock prompt generator also chooses its corpus offset from an unseeded
-NumPy process RNG. Acceptance and replay work consequently differed, so the
-throughput values cannot isolate KV residency.
+An early post-merge `llama-benchy` pair failed prompt-identity validation:
+`--no-cache` varied the request and the stock prompt generator used an unseeded
+NumPy RNG. No measurements from that attempt are evidence. The replacement
+protocol seeds NumPy, omits `--no-cache`, sends `cache_prompt=false`, and
+requires identical observed prompt-token counts before accepting a pair.
 
-The replacement protocol explicitly seeds NumPy before invoking the same
-`llama-benchy` CLI, omits `--no-cache`, sends `cache_prompt=false` in the shared
-request body, uses the same served alias, and requires equal observed prompt
-token counts before accepting a pair. The servers remain fresh and use
-`--cache-ram 0`. The rejected result files were preserved as diagnostic
-artifacts at
-`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819`; their directional
-performance numbers are intentionally not part of the experiment ledger.
-
-The corrected single-run screen then matched 4,661 prompt tokens at depth 4K
-and 30,565 at depth 30K, plus identical visible streamed tokens, MTP acceptance,
-and replay work. Moving all independently owned draft KV in this layout from
-pinned host memory to CUDA changed server-reported prefill by +0.81% at 4K and
--0.45% at 30K, while decode changed by +2.29% and +2.42%, respectively. Sampled
-peak process VRAM rose from 14,216 to 14,282 MiB. This supports a small decode
-benefit and a neutral-prefill working theory, but a single baseline/candidate
-pair is only a screen; repeat alternating pairs before treating a small delta
-as stable.
-
-A subsequent full 5,000-token stochastic live request retained the original
-host-resident multimodal projector and exercised 2,435 draft tokens plus 90
-replay cycles. Inherited host draft KV decoded at 54.56 t/s; moving the complete
-independently owned draft KV to CUDA decoded at 55.16 t/s, a +1.11% change.
-Prefill changed by -0.46%. The token IDs, response bytes, 2,077 accepted draft
-tokens, and 443 replay batch tokens were exact between configurations. At
-context 8,192, the trade moved 17.00 MiB of pinned draft KV onto CUDA, removed
-the 1.06 MiB store stage, and raised sampled process VRAM by 16 MiB. This
-confirms that realistic sustained MTP does not regress, but the benefit is
-small enough that repeated alternating pairs would be required before calling
-1.11% stable.
+The corrected short and 5,000-token live screens matched prompt, output, and
+MTP work across draft-KV residency. They support a small possible decode
+benefit at a modest VRAM cost, but not a stable speed claim without alternating
+repetitions. Experiment 019 owns the measurements and resource accounting; they
+are not duplicated in this journal.
 
 The ranked memory backlog is maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). Read it
@@ -119,11 +102,12 @@ The baseline worktree must remain usable as the known upstream-aligned Bee
 build. Experimental changes belong only in the experimental worktree. Do not
 commit unrelated files or reintroduce systems removed from BeeLlama v0.4.0.
 
-Each experiment should be one commit containing its implementation and an
-update to `cpu-kv-offload-experiments.md`. Rejected experiments should normally
-be reverted; their result should still be recorded here or in the experiment
-ledger. No benchmark result is portable unless its model, command, hardware,
-settings, and commit are recorded.
+Each valid, independently testable experiment should be one commit containing
+its implementation and an update to `cpu-kv-offload-experiments.md`. A valid
+rejected experiment should normally be reverted and recorded only when it tests
+a distinct hypothesis or prevents likely repeated work. Invalid and redundant
+runs are omitted. No benchmark result is portable unless its model, protocol,
+hardware, settings, and commit are recorded.
 
 ## Hardware and workload
 

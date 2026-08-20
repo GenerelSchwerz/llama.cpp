@@ -8,16 +8,19 @@ remain authoritative if this document ever disagrees with behavior.
 The companion documents have different roles:
 
 - [`cpu-kv-offload-development.md`](cpu-kv-offload-development.md) is the
-  progress and decision journal. It preserves earlier protocol editions,
-  rejected paths, and the evidence behind current choices.
+  progress and decision journal. It records protocol transitions, durable
+  rationale, and concise summaries of valid rejected paths.
 - [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md) is the
-  immutable evidence ledger. Commands in an older entry reproduce that entry;
-  they are not current command templates.
-- Focused reproduction documents explain their named investigation. Treat
-  their commands as historical unless this document references them.
+  curated evidence ledger. It contains valid, decision-relevant experiments,
+  not every attempted run. Older commands are not current templates.
+- Focused reproduction documents explain the retained result of their named
+  investigation. They are not chronological work logs; treat their commands as
+  historical unless this document references them.
 
 When the protocol changes, update this document first. Add the reason and the
-superseded behavior to the development journal without rewriting old evidence.
+superseded behavior to the development journal. Preserve the rationale and
+valid evidence, but remove invalid measurements and avoid copying obsolete
+commands when a concise transition plus Git history is sufficient.
 
 ## Current implementation under test
 
@@ -313,27 +316,37 @@ quantization behavior changes, and the full maintained 1K/5K exactness gates
 when MTP scheduling, recurrent state, workspace geometry, or KV residency can
 affect output.
 
-Every accepted experiment record must contain:
+Every retained experiment record must contain:
 
 - base and candidate source commits plus binary versions and hashes;
-- exact commands, environment, model/projector/tokenizer/corpus identities,
-  request body, and prompt-token counts;
+- the canonical protocol plus explicit configuration deltas, environment,
+  model/projector/tokenizer/corpus identities, request body, and prompt-token
+  counts; include a full command only when those fields are insufficient;
 - hardware, driver, compiler, and build configuration;
 - prefill, 4K decode, long-context decode, process VRAM, system-memory, and
   pinned-memory measurements as applicable;
 - the progress mechanism and retained progress/log/result artifacts;
 - correctness coverage, resource tradeoffs, and disposition.
 
-If a run violates the matching contract, preserve it as an invalid or
-diagnostic artifact and explain the failure in the development journal. Do not
-publish its directional numbers as a candidate-versus-baseline result.
+If a run violates the matching contract, discard its measurements and do not
+add it to the experiment ledger. Do not retain its full command, hashes, or
+artifact inventory in project documentation. When the failure reveals a
+reusable protocol hazard, add only a concise correction to the development
+journal: what invalidated the run and which gate prevents recurrence.
+
+Do not duplicate a valid result merely because it was rerun. Aggregate
+statistically required repetitions into the existing entry with sample count
+and summary statistics. A separate reproduction record is warranted only when
+it changes confidence, covers materially different hardware/model/source,
+closes a named correctness gate, or contradicts earlier evidence.
 
 ## Reading previous editions
 
 Use the development journal to understand why a control or protocol changed,
 then follow its references into the experiment ledger or Git commits for exact
-evidence. Historical names and commands are intentionally searchable. Their
-presence does not make them supported today.
+evidence. Current documents keep only history that remains useful for a
+decision; use Git history when forensic detail from a superseded edition is
+needed.
 
 This applies specifically to historical `taskset` commands: they reproduce the
 old whole-process placement but are not valid current benchmark or Nsight
