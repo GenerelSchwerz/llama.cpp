@@ -5641,6 +5641,140 @@ contained performance target; Q3 packing, paired-lane loading, and later
 pipelining remain separate experiments. This result does not justify flipping
 either default.
 
+#### Completed packed loader family
+
+Status: retained, except for one rejected variant recorded below. Three
+commits finish the packed-loader work the Q5/Q6 entry left open:
+`864cf8e2c` packs Q3, `f5b975136` packs the last generic-functor types and
+consolidates the family, and `8c54d5265` changes how zero-point types apply
+their bias. Measurement host, model, and build are the same as the Q5/Q6
+entry above: an RTX 4070 (compute capability 8.9), Intel Core i5-13400F,
+`Qwen3.8-27B-UD-IQ2_M.gguf`, Release CUDA architecture 89 with
+`GGML_CUDA_FATTN_Q8_NATIVE=ON` and `GGML_CUDA_FA_ALL_QUANTS=ON`.
+
+Four libraries were kept so each step could be attributed separately:
+
+| Tag | Contents | Bytes | SHA-256 |
+|---|---|---:|---|
+| L0 | packed Q5/Q6 only (`8bcf9d10a`) | 360,588,000 | `b134e5fac4a98a050e62297c363b3ded1afd12c1455ec381ccdbf284fba4ee0d` |
+| L1 | + packed Q3, Q4_1, Q2 | 353,063,904 | `acd44f47d674f0eb3df3974223bc7d64f7c67c76fd80e22fc0c2785b048c128c` |
+| L2 | + float-domain zero point | 348,070,880 | `3671a863db2c9f4cc92323b7090c9f7bdf8b0b47a50873d82d54e7f4b9e82d35` |
+| L3 | + paired-lane block fetch (rejected) | 350,729,184 | not retained |
+
+Throughput used `llama-bench`, 512-token prefill at depth 32,768,
+batch/ubatch 512, three pinned CPU threads, CPU-resident pinned KV, and
+`--kv-gpu-layers 0`. Every arm is two reverse-order runs of `r=5`, ten
+samples per arm, with the library selected by `LD_PRELOAD`:
+
+```bash
+LD_PRELOAD=CUDA_LIBRARY taskset -c 0,2,4 build/bin/llama-bench \
+  --progress -m MODEL -ngl 99 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on NATIVE_FLAG -ctk TYPE -ctv TYPE \
+  -b 512 -ub 512 -p 512 -n 0 -d 32768 -r 5 -o json
+```
+
+Packing the four types that still walked their blocks per element, with
+native attention enabled in both arms (L0 against L2):
+
+| Type | Generic functor | Packed | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q4_1` | 857.933 +/- 5.441 t/s | 888.953 +/- 4.902 t/s | +3.616% | 13.39 |
+| `q3_0` | 838.604 +/- 4.784 t/s | 896.683 +/- 5.097 t/s | +6.926% | 26.27 |
+| `q3_1` | 835.034 +/- 4.706 t/s | 895.900 +/- 4.887 t/s | +7.289% | 28.37 |
+| `q2_0` | 908.586 +/- 5.653 t/s | 927.692 +/- 5.437 t/s | +2.103% | 7.70 |
+| `q2_1` | 905.351 +/- 5.261 t/s | 918.592 +/- 4.983 t/s | +1.463% | 5.78 |
+
+Replacing `__vsubss4` with the cast path's own `(code - bias)*d` (L1 against
+L2). The last two rows are controls that do not execute the changed branch:
+
+| Type | `__vsubss4` | Float bias | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q2_0` | 903.933 t/s | 927.692 t/s | +2.628% | 9.79 |
+| `q3_0` | 882.232 t/s | 896.683 t/s | +1.638% | 6.27 |
+| `q5_0` | 833.428 t/s | 850.550 t/s | +2.054% | 7.24 |
+| `q6_0` | 811.346 t/s | 826.107 t/s | +1.819% | 6.19 |
+| `q5_1` | 862.555 t/s | 864.081 t/s | +0.177% | 0.58 |
+| `q6_1` | 845.285 t/s | 843.941 t/s | -0.159% | -0.56 |
+
+Only the zero-point types move. That is the claimed mechanism rather than a
+general speedup, and it explains the pattern the Q5/Q6 entry left
+unexplained: every `_0` type trailed its `_1` sibling because the bias went
+through an intrinsic that is emulated on this architecture.
+
+Final behavior, same library in both arms, changing only
+`--no-flash-attn-native-quants` against `--flash-attn-native-quants`:
+
+| Type | Materialized | Native | Change | Welch t | Disposition at 32K |
+|---|---:|---:|---:|---:|---|
+| `q2_0` | 866.815 +/- 4.782 t/s | 927.692 +/- 5.437 t/s | +7.023% | 26.59 | gain |
+| `q2_1` | 855.903 +/- 4.253 t/s | 918.592 +/- 4.983 t/s | +7.324% | 30.26 | gain |
+| `q3_0` | 847.444 +/- 4.716 t/s | 896.683 +/- 5.097 t/s | +5.810% | 22.42 | gain |
+| `q3_1` | 842.916 +/- 4.488 t/s | 895.900 +/- 4.887 t/s | +6.286% | 25.25 | gain |
+| `q4_1` | 837.097 +/- 5.235 t/s | 888.953 +/- 4.902 t/s | +6.195% | 22.86 | gain |
+| `q5_0` | 835.070 +/- 4.857 t/s | 850.550 +/- 4.994 t/s | +1.854% | 7.03 | gain |
+| `q5_1` | 830.077 +/- 5.693 t/s | 864.081 +/- 4.843 t/s | +4.096% | 14.39 | gain |
+| `q6_0` | 821.871 +/- 4.931 t/s | 826.107 +/- 5.113 t/s | +0.515% | 1.89 | neutral |
+| `q6_1` | 818.956 +/- 5.218 t/s | 843.941 +/- 5.653 t/s | +3.051% | 10.27 | gain |
+
+No tested type loses to materialization any more. `q6_0` is the one that is
+merely no longer negative: at `t = 1.89` its `+0.515%` is not an established
+gain, only the removal of the `-1.22%` regression.
+
+##### Rejected: paired-lane block fetch
+
+Adjacent lanes of a row consume the two halves of one quant block and
+therefore issue the same byte loads twice. L3 had each lane load only its own
+half and trade words with its partner through `__shfl_xor_sync`, using a
+two-lane mask so a row that skipped an out-of-bounds load could not
+desynchronize one that did not. It compiled without spills and passed the
+same `test-backend-ops` sweep as L2, so it was correct; it was simply slower
+on every type:
+
+| Type | L2 | L3 paired | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q4_1` | 888.953 t/s | 820.878 t/s | -7.658% | -25.75 |
+| `q3_1` | 895.900 t/s | 840.684 t/s | -6.163% | -24.82 |
+| `q2_1` | 918.592 t/s | 878.366 t/s | -4.379% | -17.72 |
+| `q3_0` | 896.683 t/s | 860.808 t/s | -4.001% | -15.63 |
+| `q2_0` | 927.692 t/s | 881.008 t/s | -5.032% | -20.34 |
+| `q5_0` | 850.550 t/s | 813.871 t/s | -4.312% | -17.75 |
+| `q6_0` | 826.107 t/s | 782.941 t/s | -5.225% | -20.37 |
+| `q5_1` | 864.081 t/s | 808.638 t/s | -6.416% | -26.41 |
+| `q6_1` | 843.941 t/s | 781.025 t/s | -7.455% | -28.35 |
+
+The duplicated loads were never the cost they appeared to be. Partner lanes
+read the same address, so the coalescer already served both from one
+transaction; the split removed load instructions but added shuffle latency on
+the critical path and grew the library by 2,658,304 bytes. The variant is not
+kept. Its exchange did not change any result, so the loss is scheduling, not
+work.
+
+##### Correctness
+
+`test-backend-ops FLASH_ATTN_EXT` passed for every natively loadable type at
+each step: `q8_0` 447/447, `q4_0` 472/472, `q4_1` 432/432, `q5_0` 432/432,
+`q5_1` 432/432, `q6_0` 98/98, `q6_1` 97/97, `q3_0` 98/98, `q3_1` 97/97,
+`q2_1` 97/97, and `q2_0s` 97 of 98 with the single failure being the
+pre-existing materializing `hsk=hsv=64` `n_tail=16` case documented for this
+branch, which reports `native_quants=0`.
+
+128-token greedy generation was byte-identical with the native option off and
+on for `q3_0`, `q3_1`, `q4_1`, `q2_1`, `q5_0`, `q5_1`, `q6_0` and `q6_1`,
+each with 128 audited native D=256 launches on and 0 off, and the values did
+not change when the zero point moved into float.
+
+`q2_0` cannot be gated that way and this is worth recording, because a naive
+reading of it looks like a native-path bug. Its model-level output is not
+reproducible across processes in either arm: ten native perplexity runs
+returned 4.0533 seven times and 4.0475, 4.0510 and 4.0516 once each, and six
+materializing runs spread over 4.0519 to 4.0579, while `q8_0` repeated
+3.8565 exactly in both arms. The spread belongs to the 2-bit cache type, not
+to either attention route. `q2_0`'s evidence is therefore the backend-ops
+sweep against the CPU reference plus a host-side check of its extraction
+against `dequantize_q2_0s` over 200,000 random blocks; every other packed
+extraction was checked the same way against its own functor.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes
