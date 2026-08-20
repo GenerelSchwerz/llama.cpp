@@ -5538,6 +5538,109 @@ The decode improvement and small prefill loss are single-run observations;
 alternating repetitions are required before treating either small delta as
 stable.
 
+#### Packed Q5/Q6 loader follow-up
+
+Status: retained. The scalar Q5_0/Q6_0 loaders and generic Q5_1/Q6_1
+functor path were replaced with shared packed Q5/Q6 traits. Each lane now
+extracts four codes with 32-bit operations while preserving the materializing
+cast path's float arithmetic and final `float2`-to-`half2` conversion. This is
+the commit containing this entry, based on `5aa21a48164bb09cc398826cec26bc57dbb80905`.
+The benchmarked CUDA source reports `6b0f9bc7d`; the intervening commits
+`a59f7d419` and `5aa21a481` change only tests and documentation, so the
+benchmark candidate is that same CUDA tree plus this commit's loader diff.
+
+The measurement host was an RTX 4070 (compute capability 8.9, driver
+610.57.04) and Intel Core i5-13400F. The model was
+`/home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf`,
+10,319,907,904 bytes, SHA-256
+`04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`.
+The Release build used CUDA architecture 89,
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`, and `GGML_CUDA_FA_ALL_QUANTS=ON`.
+
+Prefill used two reverse-order pairs, five repetitions per process and ten
+samples per arm. One-second process-VRAM sampling ran concurrently and the
+benchmark's `--kv-memory` checkpoints were retained:
+
+```bash
+LD_PRELOAD=CUDA_LIBRARY taskset -c 0,2,4 build/bin/llama-bench \
+  --progress --kv-memory \
+  -m /home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf \
+  -ngl 99 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on NATIVE_FLAG -ctk TYPE -ctv TYPE \
+  -b 512 -ub 512 -p 512 -n 0 -d 32768 -r 5 \
+  -o json
+```
+
+First, the packed candidate was compared with the previous native loader,
+with native attention enabled in both arms:
+
+| Type | Previous native | Packed native | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q5_0` | 820.698 +/- 4.942 t/s | 835.205 +/- 4.590 t/s | +1.768% | 6.80 |
+| `q5_1` | 803.123 +/- 5.234 t/s | 863.561 +/- 5.714 t/s | +7.525% | 24.66 |
+| `q6_0` | 798.008 +/- 4.064 t/s | 812.164 +/- 4.570 t/s | +1.774% | 7.32 |
+| `q6_1` | 771.329 +/- 4.083 t/s | 844.264 +/- 5.575 t/s | +9.456% | 33.38 |
+
+The final behavior comparison used the same candidate library for both arms
+and changed only `--no-flash-attn-native-quants` versus
+`--flash-attn-native-quants`:
+
+| Type | Materialized | Packed native | Change | Welch t | Disposition at 32K |
+|---|---:|---:|---:|---:|---|
+| `q5_0` | 834.570 +/- 5.529 t/s | 834.872 +/- 4.821 t/s | +0.036% | 0.13 | neutral |
+| `q5_1` | 831.470 +/- 4.864 t/s | 863.817 +/- 4.800 t/s | +3.890% | 14.97 | gain |
+| `q6_0` | 821.803 +/- 4.855 t/s | 811.768 +/- 4.754 t/s | -1.221% | -4.67 | regression remains |
+| `q6_1` | 819.584 +/- 4.430 t/s | 844.467 +/- 4.906 t/s | +3.036% | 11.90 | gain |
+
+Ordinary one-token decode does not select the MMA path on Ada and is therefore
+unchanged by this loader-only diff; the vector kernel remains responsible at
+both 4K and long-context decode depths. No decode throughput claim is made.
+
+Allocation is also unchanged by the unpacking rewrite. The native route still
+removes the same F16 materialization. A clean reserve-time server process used
+the command shape below, once per type and arm, with process VRAM sampled once
+per second:
+
+```bash
+LD_PRELOAD=PACKED_CUDA_LIBRARY build/bin/llama-server \
+  -m /home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf \
+  -ngl 99 --fit off -sm none -mg 0 -fa on NATIVE_FLAG \
+  -nkvo --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -c 245760 --parallel 1 -b 512 -ub 512 -ctk TYPE -ctv TYPE \
+  -t 3 --host 127.0.0.1 --port PORT -v
+```
+
+| Type | CUDA compute off -> on | Process peak off -> on | Saved |
+|---|---:|---:|---:|
+| `q5_0` | 1610.27 -> 638.27 MiB | 11176 -> 10204 MiB | 972 MiB |
+| `q5_1` | 1640.27 -> 668.27 MiB | 11206 -> 10234 MiB | 972 MiB |
+| `q6_0` | 1670.27 -> 698.27 MiB | 11238 -> 10266 MiB | 972 MiB |
+| `q6_1` | 1700.27 -> 728.27 MiB | 11268 -> 10296 MiB | 972 MiB |
+
+`CUDA_Host` compute remained 260.28 MiB in every arm. The previous-loader
+CUDA library was 372,970,464 bytes, SHA-256
+`2fbf59fe60298c9ecf588270190327cb16de9693bccbde11ae817ae6dce6381b`;
+the packed library was 360,588,000 bytes, SHA-256
+`b134e5fac4a98a050e62297c363b3ded1afd12c1455ec381ccdbf284fba4ee0d`.
+The rewrite therefore reduced this all-quants library by 12,382,464 bytes
+(11.81 MiB, 3.32%).
+
+Correctness gates passed: all 16 generated quantized-MMA translation units
+compiled; the generator was byte-idempotent; the focused Q5/Q6
+`FLASH_ATTN_EXT` matrix passed 384/384 against the CPU reference over
+D=64/128/256 and the generated geometries; and 128-token greedy generation
+was byte-identical with native permission off and on for all four types.
+Audited model runs recorded 144 native D=256 launches per type. No changed
+kernel reported local-memory spills.
+
+Retain the packed Q5/Q6 rewrite. It improves every previous native loader,
+fixes both `_1` regressions, makes Q5_0 neutral against materialization, and
+reduces but does not eliminate the Q6_0 regression. Q6_0 remains the next
+contained performance target; Q3 packing, paired-lane loading, and later
+pipelining remain separate experiments. This result does not justify flipping
+either default.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes
