@@ -289,6 +289,39 @@ If a run violates the matching contract, preserve it as an invalid or
 diagnostic artifact and explain the failure in the development journal. Do not
 publish its directional numbers as a candidate-versus-baseline result.
 
+### Allocation and CUDA VMM telemetry
+
+`llama-bench --kv-memory` is the opt-in client for allocation classification
+and CUDA VMM transient-pool telemetry. It reports physical device, accelerator-
+owned host (normally CUDA-pinned), and ordinary-host context/compute buffers,
+plus VMM live, mapped, high-water, and active-pool checkpoints. The older
+CUDA-owner totals remain for result compatibility; they are not physical VRAM
+because they include accelerator-owned host buffers.
+
+The CUDA counters are dormant until this option resets them. Validate a change
+with fresh processes in this order: instrumented on, instrumented off,
+instrumented on. The off result must leave every new field zero, and the two on
+results must reproduce the allocation classes and high-water values. Also
+bracket an instrumented default-path run between two pristine-source runs.
+Use `--no-warmup --progress` so VMM growth is visible and progress remains
+inspectable. Every GPU invocation must remain wholly inside the single-GPU
+lock, for example:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'BUILD/bin/llama-bench -m MODEL -p 128 -n 16 -d 4096 -r 3 \
+   -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 -nkvo 0 -fa on -ctk q8_0 -ctv q8_0 \
+   --no-warmup --progress --kv-memory -o jsonl'
+```
+
+Repeat focused `-nkvo 1` rows without and with `--kv-cpu-pinned` when host
+classification changes. Record buffer bytes separately from process RSS and
+from `nvidia-smi` process VRAM: pinned CUDA-host allocation is system memory,
+and ordinary-host allocation is neither pinned memory nor device VRAM. This
+surface is measurement support only. It does not authorize pool trimming,
+workspace policy, staging changes, causal descriptors, or capacity changes.
+
 ## Reading previous editions
 
 Use the development journal to understand why a control or protocol changed,

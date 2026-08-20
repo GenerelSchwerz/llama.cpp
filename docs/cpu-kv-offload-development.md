@@ -1038,6 +1038,28 @@ be based on measured acceptance/replay behavior rather than VRAM alone.
    asymmetric K/V and token-window KV residency remain outside the current
    scope.
 
+## 2026-08-20: pre-PR4 W02 telemetry isolation
+
+The allocation-classification and CUDA VMM high-water instrumentation from the
+immutable pre-PR4 source snapshot was migrated independently onto
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`. This migration intentionally does
+not depend on the snapshot's native-Q8 reporting field and does not carry its
+live-context workspace, later phase controls, causal descriptors, VMM trimming
+policy, host staging, or perplexity-capacity fix.
+
+The first ordinary-host runtime probe found that the snapshot's legacy
+reconciliation assertion still subtracted all resident KV from a CUDA-owner
+total that deliberately excludes ordinary CPU buffers. The migration was
+revised to subtract KV only when it is device-resident or CUDA-pinned. Physical
+device, accelerator-host, and ordinary-host fields remain classified by buffer
+capability and owning device type rather than architecture names.
+
+Fresh final-binary runs established a dormant zero-valued default path, neutral
+source and on/off performance screens, repeatable VMM peaks, all three physical
+allocation classes, and identical matched perplexity. Experiment 020 contains
+the exact commands and evidence. The result remains support instrumentation,
+not a VRAM optimization or permission to infer a trimming policy.
+
 ## Known non-goals
 
 - Do not restore TurboQuant/TCQ, DDTree, CopySpec, the removed fork DFlash
