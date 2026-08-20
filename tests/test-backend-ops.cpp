@@ -10213,7 +10213,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // These sweep the supported head sizes, GQA ratios that select ncols2,
     // query batches that select ncols1, and an unpadded KV length that
     // exercises the loader's bounds-checked path.
-    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0 }) {
+    // Every type with a native tile loader. The ones past the default tier are
+    // only compiled with GGML_CUDA_FA_ALL_QUANTS; without it they fall back to
+    // the F16-casting path and these cases still check that fallback.
+    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
+                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
+                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
         for (int hs : { 64, 128, 256 }) {
             for (int nr2 : { 1, 2, 4, 16 }) {
                 for (int kv : { 512, 113 }) {
