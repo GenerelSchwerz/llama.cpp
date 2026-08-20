@@ -6,11 +6,12 @@ materialization used by the standard MMA path. It does not change the
 persistent cache format, cache placement, or quantization policy.
 
 The feature is deliberately explicit at both build time and run time. Its
-current kernel inventory is `Q8_0` and `Q4_0`, each with K and V of the same
-type, with equal head
-dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
-implementation. Unsupported cache pairs, dimensions, devices, and builds keep
-the standard materializing path.
+current kernel inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, each
+with K and V of the same type and equal head dimensions 64, 128, or 256, on
+NVIDIA GPUs that use the Ampere MMA implementation. `GGML_CUDA_FA_ALL_QUANTS`
+adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, and `Q2_1` to the same
+head-dimension set. Unsupported cache pairs, dimensions, devices, and builds
+keep the standard materializing path.
 
 ## Selection model
 
@@ -25,8 +26,9 @@ selects nor converts the cache type. For example:
 | `q8_0 / q8_0` | off | Standard Q8-to-F16 materialization, then MMA |
 | `q8_0 / q8_0` | on | Native Q8 MMA when the build, device, and head size support it |
 | `q4_0 / q4_0` | on | Native Q4 MMA when the build, device, and head size support it |
+| `q6_0 / q6_0` | on | Native Q6 MMA when the build, device, and head size support it |
 | `q8_0 / q4_0` | on | Standard materializing fallback; the route requires K and V to agree |
-| `q6_0 / q6_0` | on | Standard materializing fallback until that exact family is implemented |
+| `q2_1 / q2_1` | on | Native MMA only in a `GGML_CUDA_FA_ALL_QUANTS` build; otherwise standard materializing fallback |
 
 This avoids a second K/V type selector that could disagree with the tensors in
 the graph. The graph records a boolean permission; CUDA derives the concrete
@@ -34,7 +36,9 @@ pair from the K and V tensors themselves.
 
 ## Build and use
 
-The native Q8 MMA family is not compiled by default:
+The native MMA family (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`; plus `Q4_1`, `Q5_1`,
+`Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, `Q2_1` under `GGML_CUDA_FA_ALL_QUANTS`) is not
+compiled by default:
 
 ```bash
 cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
@@ -53,14 +57,14 @@ build/bin/llama-server -m model.gguf --flash-attn on \
 The run-time option is exposed by the server, CLI, perplexity, batched,
 parallel, and benchmark tools. A build without native kernels accepts the
 option, retains the standard route, and reports a once-only warning. A build
-with the Q8 family reports the same kind of warning when an opted-in quantized
-pair or head dimension has no registered kernel. F16/BF16 attention is not
-treated as an unsupported quantized request.
+with the native family reports the same kind of warning when an opted-in
+quantized pair or head dimension has no registered kernel. F16/BF16 attention
+is not treated as an unsupported quantized request.
 
-`GGML_CUDA_FA_ALL_QUANTS` does not enable or expand this family. That option
-controls the existing vector FlashAttention pair matrix. Native MMA families
-have their own explicit build registrations so a generic quant-matrix setting
-cannot accidentally instantiate every K/V pair.
+`GGML_CUDA_FA_ALL_QUANTS` extends this family's own registration list (see
+above) in addition to controlling the existing vector FlashAttention pair
+matrix; it does not implicitly instantiate every K/V pair for the native MMA
+route.
 
 ## Implementation structure
 
@@ -72,8 +76,9 @@ structure:
   generated F16 instances do not change behavior.
 - The native route specializes that shared case with one type for both K and V; it does not carry
   a copied launcher or a copied selector tree.
-- The Q8 tile loader is isolated in `fattn-mma-q8.cuh`. It dequantizes into the
-  same shared-memory `half2` tiles consumed by the existing MMA math.
+- The per-type tile loaders are `fattn_quant_type_traits<GGML_TYPE_*>`
+  specializations in `fattn-mma-quant.cuh`. Each dequantizes into the same
+  shared-memory `half2` tiles consumed by the existing MMA math.
 - Per-type dequantization must reproduce the F16-casting route bit for bit,
   and which helper achieves that differs per type. `Q8_0` reuses the established
   `dequantize_V_q8_0` helper from
@@ -86,8 +91,10 @@ structure:
 - CMake includes those generated sources only when
   `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
 
-There are 16 tile shapes and three supported head dimensions, for 48 explicit
-template cases. A future native pair is not inferred from the standard quant
+There are 16 tile shapes and three supported head dimensions. The default
+four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) yields 192 explicit
+template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the remaining seven types for
+528 total. A future native pair is not inferred from the standard quant
 matrix. It requires an intentional loader/registration, a bounded generated
 inventory, route and fallback tests, output validation, and performance and
 memory evidence.
@@ -125,8 +132,9 @@ For a source change, validate both build modes and both execution outcomes:
 
 1. Generate instances from `ggml/src/ggml-cuda/template-instances` and confirm
    a second generator run is byte-idempotent.
-2. Build with `GGML_CUDA_FATTN_Q8_NATIVE=OFF`; verify no Q8 MMA instance is
-   compiled or linked and an opted-in graph uses the fallback with a warning.
+2. Build with `GGML_CUDA_FATTN_Q8_NATIVE=OFF`; verify no native quantized MMA
+   instance is compiled or linked and an opted-in graph uses the fallback with
+   a warning.
 3. Build with it `ON`; run the focused `FLASH_ATTN_EXT` cases filtered by
    `native_quants=1`. They cover D=64/128/256, padded and unpadded KV lengths,
    GQA-selected column geometries, query-batch tile choices, and unsupported
@@ -142,8 +150,8 @@ For a source change, validate both build modes and both execution outcomes:
 
 For route auditing only,
 `GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` logs each launch that actually selects
-the Q8 MMA family. It does not enable or disable the route and is not part of a
-serving configuration.
+the native quantized MMA family, for any of its registered types. It does not
+enable or disable the route and is not part of a serving configuration.
 
 ## Recorded validation
 
@@ -179,17 +187,20 @@ and run-time defaults remain off.
 
 ## Limitations
 
-- The registered pairs are `Q8_0/Q8_0` and `Q4_0/Q4_0`; mixed and other quantized pairs use
-  fallback.
+- The registered pairs are same-type: `Q8_0/Q8_0`, `Q4_0/Q4_0`, `Q5_0/Q5_0`,
+  and `Q6_0/Q6_0` by default, plus `Q4_1/Q4_1`, `Q5_1/Q5_1`, `Q6_1/Q6_1`,
+  `Q3_0/Q3_0`, `Q3_1/Q3_1`, `Q2_0/Q2_0`, and `Q2_1/Q2_1` under
+  `GGML_CUDA_FA_ALL_QUANTS`; mixed and other quantized pairs use fallback.
 - The only registered equal head dimensions are 64, 128, and 256.
 - Routing requires the NVIDIA Ampere MMA implementation. AMD, MUSA, older
   NVIDIA paths, and non-CUDA backends are unchanged.
 - The native loader disables the existing asynchronous F16 copy pipeline and
-  performs synchronous Q8 dequantization into shared memory. That is a
+  performs synchronous dequantization into shared memory. That is a
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
 - Compile time and CUDA-library size increase when the family is built because
-  all 48 explicit cases are emitted. Default builds pay neither cost.
+  all explicit cases are emitted: 192 by default, 528 with
+  `GGML_CUDA_FA_ALL_QUANTS`. Default builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 

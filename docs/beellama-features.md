@@ -8,12 +8,14 @@ for exact names, environment variables, defaults, and validation ranges.
 
 An off-by-default CUDA MMA kernel family can read supported standard quantized
 K/V tensors directly instead of materializing the attention window as F16. The
-current explicit inventory is `Q8_0/Q8_0` at equal head dimensions 64, 128, and
+current explicit inventory is same-type `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0`
+pairs by default (plus `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, and
+`Q2_1` under `GGML_CUDA_FA_ALL_QUANTS`), at equal head dimensions 64, 128, and
 256 on NVIDIA's Ampere MMA implementation. The cache formats remain selected by
 `--cache-type-k` and `--cache-type-v`; `--flash-attn-native-quants` only opts a
 context into a registered direct loader. Unsupported layouts keep the standard
-path and report a warning, while default builds contain no native-Q8 MMA
-instances.
+path and report a warning, while default builds contain no native quantized
+MMA instances.
 
 See [Quantized-native CUDA FlashAttention](quantized-native-flash-attention.md)
 for build controls, implementation structure, tradeoffs, limitations, and the
