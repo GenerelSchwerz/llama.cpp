@@ -69,63 +69,58 @@ struct fattn_quant_type_traits<GGML_TYPE_Q4_0> {
 };
 
 
-// Most types have no dedicated F16 cast kernel and are cast through the generic
-// dequantize_block with a dequantize_q* functor. Calling that same functor here
-// makes the tile bit-identical to that route by construction rather than by
-// reimplementation, which is what the per-type reconstructions cannot promise.
-//
-// The functor yields element iqs in v.x and element iqs + qk/2 in v.y, so a
-// 16-element run is one half of that pair across iqs 0..15.
-template <int qk_, void (*dequant_fn)(const void *, const int64_t, const int, float2 &)>
-struct fattn_quant_functor_traits {
+// The remaining types have no dedicated F16 cast kernel either; they are cast
+// through the generic dequantize_block with a dequantize_q* functor from
+// dequantize.cuh. That functor is the bit-identity reference the loaders below
+// reproduce, but calling it per element is wasteful here: it recomputes both
+// 16-element halves of a block even though a loader lane consumes only one, and
+// it re-reads the block's bytes once per element. Each loader instead unpacks
+// four codes at a time with 32-bit word operations, then performs the functor's
+// own scalar float arithmetic and final float2-to-half2 conversion, so the tile
+// is unchanged.
+
+// Shared tail of every packed loader: four codes already unpacked into the
+// bytes of one word become two half2 values. Types with a min use the stored
+// pair directly; the others bias by half their code range first, which cannot
+// saturate because the biased codes stay well inside int8.
+template <bool has_min, uint32_t bias4>
+static __device__ __forceinline__ void fattn_quant_store4(
+        half2 * const __restrict__ vals, uint32_t q, const float d, const float2 dm) {
+    if constexpr (has_min) {
+        const uint8_t * const q8 = (const uint8_t *) &q;
+        vals[0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
+        vals[1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
+    } else {
+        q = __vsubss4(q, bias4);
+        const int8_t * const q8 = (const int8_t *) &q;
+        vals[0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
+        vals[1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
+    }
+}
+
+// Nibble-coded types: qs byte j holds element j in its low nibble and element
+// j + qk/2 in its high one, so a 16-element run selects one nibble half of every
+// qs byte. Q5 adds a one-bit-per-element plane in qh above that nibble; Q4_1 has
+// no plane. Q4_0 is nibble-coded too but is not routed here because its cast
+// path rounds a different expression.
+template <typename block_t, int qk_, bool has_min, bool has_plane>
+struct fattn_quant_nibble_traits {
     static constexpr int qk = qk_;
 
     template <int nelem>
     static __device__ __forceinline__ void dequant(
             const char * const __restrict__ row, half2 * const __restrict__ vals, const int e0) {
-        static_assert(nelem == qk_/2, "run must be exactly half a block");
-
-        const int64_t ib = e0 / qk_;
-        const bool    hi = (e0 % qk_) != 0;
-
-#pragma unroll
-        for (int l = 0; l < nelem/2; ++l) {
-            float2 a, b;
-            dequant_fn(row, ib, 2*l + 0, a);
-            dequant_fn(row, ib, 2*l + 1, b);
-            vals[l] = ggml_cuda_cast<half2>(make_float2(hi ? a.y : a.x, hi ? b.y : b.x));
-        }
-    }
-};
-
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q4_1>  : fattn_quant_functor_traits<QK4_1,  dequantize_q4_1>  {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_0S> : fattn_quant_functor_traits<QK2_0S, dequantize_q2_0s> {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_1>  : fattn_quant_functor_traits<QK2_1,  dequantize_q2_1>  {};
-
-
-// The generic functor computes both 16-element halves of a block even though a
-// loader lane consumes only one. That is particularly expensive for Q5/Q6,
-// where every element also extracts a separate high-bit plane. Work in four
-// packed 32-bit groups instead: unpack four codes with one set of word
-// operations, then preserve the reference cast path's scalar float arithmetic
-// before the final float2-to-half2 conversion.
-template <typename block_t, bool has_min>
-struct fattn_quant_q5_traits {
-    static_assert(QK5_0 == QK5_1, "Q5 block widths must match");
-    static constexpr int qk = QK5_0;
-
-    template <int nelem>
-    static __device__ __forceinline__ void dequant(
-            const char * const __restrict__ row, half2 * const __restrict__ vals, const int e0) {
-        static_assert(nelem == qk/2, "q5 run must be exactly half a block");
+        static_assert(nelem == qk/2, "nibble run must be exactly half a block");
 
         const block_t * const blk = ((const block_t *) row) + e0/qk;
 
-        uint32_t qh;
-        ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
-
         __align__(16) uint32_t qs[qk/(2*sizeof(uint32_t))];
         ggml_cuda_memcpy_1<qk/2, 2>(qs, blk->qs);
+
+        uint32_t qh = 0;
+        if constexpr (has_plane) {
+            ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
+        }
 
         const bool hi = (e0 % qk) != 0;
 
@@ -141,28 +136,23 @@ struct fattn_quant_q5_traits {
         for (int g = 0; g < nelem/4; ++g) {
             uint32_t q = (qs[g] >> (4*hi)) & 0x0F0F0F0Fu;
 
-            // Scatter four consecutive plane bits into bit 4 of four bytes.
-            // Multiplication is exact here: after the mask, cross-products do
-            // not overlap any selected destination bit.
-            const uint32_t h4 = (qh >> (16*hi + 4*g)) & 0x0Fu;
-            q |= (h4 * 0x02040810u) & 0x10101010u;
-
-            if constexpr (has_min) {
-                const uint8_t * const q8 = (const uint8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
-            } else {
-                q = __vsubss4(q, 0x10101010u);
-                const int8_t * const q8 = (const int8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
+            if constexpr (has_plane) {
+                // Scatter four consecutive plane bits into bit 4 of four bytes.
+                // Multiplication is exact here: the shifted copies of the
+                // multiplier occupy disjoint bits, so no carry can reach a
+                // selected destination bit.
+                const uint32_t h4 = (qh >> (16*hi + 4*g)) & 0x0Fu;
+                q |= (h4 * 0x02040810u) & 0x10101010u;
             }
+
+            fattn_quant_store4<has_min, has_plane ? 0x10101010u : 0x08080808u>(vals + 2*g, q, d, dm);
         }
     }
 };
 
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_0> : fattn_quant_q5_traits<block_q5_0, false> {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_1> : fattn_quant_q5_traits<block_q5_1, true>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q4_1> : fattn_quant_nibble_traits<block_q4_1, QK4_1, true,  false> {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_0> : fattn_quant_nibble_traits<block_q5_0, QK5_0, false, true>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q5_1> : fattn_quant_nibble_traits<block_q5_1, QK5_1, true,  true>  {};
 
 template <typename block_t, bool has_min>
 struct fattn_quant_q6_traits {
@@ -203,16 +193,7 @@ struct fattn_quant_q6_traits {
             const int hshift = 4*(g/2) + 2*hi;
             q |= ((hbytes >> hshift) & 0x03030303u) << 4;
 
-            if constexpr (has_min) {
-                const uint8_t * const q8 = (const uint8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
-            } else {
-                q = __vsubss4(q, 0x20202020u);
-                const int8_t * const q8 = (const int8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
-            }
+            fattn_quant_store4<has_min, 0x20202020u>(vals + 2*g, q, d, dm);
         }
     }
 };
@@ -220,25 +201,25 @@ struct fattn_quant_q6_traits {
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_0> : fattn_quant_q6_traits<block_q6_0, false> {};
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_1> : fattn_quant_q6_traits<block_q6_1, true>  {};
 
-// Q3 stores its two low bits the way Q6 stores its high plane: qs byte j holds
-// the two-bit fields of elements j, j+8, j+16, and j+24. The third bit is a
-// separate one-bit-per-element plane, which is the Q5 case at a different
-// destination bit. Packing therefore reuses both shapes, and the generic
-// functor's per-element byte loads and discarded second half disappear.
-template <typename block_t, bool has_min>
-struct fattn_quant_q3_traits {
-    static_assert(QK3_0 == QK3_1, "Q3 block widths must match");
-    static constexpr int qk = QK3_0;
+// Two-bit-coded types: qs byte j holds the two-bit fields of elements j, j+8,
+// j+16 and j+24, which is how Q6 stores its high plane. Q3 adds a
+// one-bit-per-element plane in qh above those two bits, at the Q5 plane's shape
+// but a different destination bit; Q2 has no plane.
+template <typename block_t, int qk_, bool has_min, bool has_plane>
+struct fattn_quant_2bit_traits {
+    static constexpr int qk = qk_;
 
     template <int nelem>
     static __device__ __forceinline__ void dequant(
             const char * const __restrict__ row, half2 * const __restrict__ vals, const int e0) {
-        static_assert(nelem == qk/2, "q3 run must be exactly half a block");
+        static_assert(nelem == qk/2, "two-bit run must be exactly half a block");
 
         const block_t * const blk = ((const block_t *) row) + e0/qk;
 
-        uint32_t qh;
-        ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
+        uint32_t qh = 0;
+        if constexpr (has_plane) {
+            ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
+        }
 
         __align__(8) uint32_t qs[qk/(4*sizeof(uint32_t))];
         ggml_cuda_memcpy_1<qk/4, 2>(qs, blk->qs);
@@ -260,29 +241,24 @@ struct fattn_quant_q3_traits {
             // this group is.
             uint32_t q = (qs[g & 1] >> (4*hi + 2*(g/2))) & 0x03030303u;
 
-            // Scatter four consecutive plane bits into bit 2 of four bytes.
-            // Multiplication is exact here: the four shifted copies of the
-            // multiplier occupy disjoint bits, so nothing carries into a
-            // selected destination bit.
-            const uint32_t h4 = (qh >> (16*hi + 4*g)) & 0x0Fu;
-            q |= (h4 * 0x00810204u) & 0x04040404u;
-
-            if constexpr (has_min) {
-                const uint8_t * const q8 = (const uint8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
-            } else {
-                q = __vsubss4(q, 0x04040404u);
-                const int8_t * const q8 = (const int8_t *) &q;
-                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
-                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
+            if constexpr (has_plane) {
+                // Scatter four consecutive plane bits into bit 2 of four bytes.
+                // Multiplication is exact here: the shifted copies of the
+                // multiplier occupy disjoint bits, so no carry can reach a
+                // selected destination bit.
+                const uint32_t h4 = (qh >> (16*hi + 4*g)) & 0x0Fu;
+                q |= (h4 * 0x00810204u) & 0x04040404u;
             }
+
+            fattn_quant_store4<has_min, has_plane ? 0x04040404u : 0x02020202u>(vals + 2*g, q, d, dm);
         }
     }
 };
 
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0> : fattn_quant_q3_traits<block_q3_0, false> {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1> : fattn_quant_q3_traits<block_q3_1, true>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_0S> : fattn_quant_2bit_traits<block_q2_0s, QK2_0S, false, false> {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_1>  : fattn_quant_2bit_traits<block_q2_1,  QK2_1,  true,  false> {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0>  : fattn_quant_2bit_traits<block_q3_0,  QK3_0,  false, true>  {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_2bit_traits<block_q3_1,  QK3_1,  true,  true>  {};
 
 // Compiled type tiers. The default set keeps build time in the same bracket as
 // before; GGML_CUDA_FA_ALL_QUANTS adds the rest, mirroring how the vector
