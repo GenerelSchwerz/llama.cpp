@@ -99,8 +99,6 @@ struct fattn_quant_functor_traits {
 };
 
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q4_1>  : fattn_quant_functor_traits<QK4_1,  dequantize_q4_1>  {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0>  : fattn_quant_functor_traits<QK3_0,  dequantize_q3_0>  {};
-template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_functor_traits<QK3_1,  dequantize_q3_1>  {};
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_0S> : fattn_quant_functor_traits<QK2_0S, dequantize_q2_0s> {};
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_1>  : fattn_quant_functor_traits<QK2_1,  dequantize_q2_1>  {};
 
@@ -221,6 +219,70 @@ struct fattn_quant_q6_traits {
 
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_0> : fattn_quant_q6_traits<block_q6_0, false> {};
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q6_1> : fattn_quant_q6_traits<block_q6_1, true>  {};
+
+// Q3 stores its two low bits the way Q6 stores its high plane: qs byte j holds
+// the two-bit fields of elements j, j+8, j+16, and j+24. The third bit is a
+// separate one-bit-per-element plane, which is the Q5 case at a different
+// destination bit. Packing therefore reuses both shapes, and the generic
+// functor's per-element byte loads and discarded second half disappear.
+template <typename block_t, bool has_min>
+struct fattn_quant_q3_traits {
+    static_assert(QK3_0 == QK3_1, "Q3 block widths must match");
+    static constexpr int qk = QK3_0;
+
+    template <int nelem>
+    static __device__ __forceinline__ void dequant(
+            const char * const __restrict__ row, half2 * const __restrict__ vals, const int e0) {
+        static_assert(nelem == qk/2, "q3 run must be exactly half a block");
+
+        const block_t * const blk = ((const block_t *) row) + e0/qk;
+
+        uint32_t qh;
+        ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
+
+        __align__(8) uint32_t qs[qk/(4*sizeof(uint32_t))];
+        ggml_cuda_memcpy_1<qk/4, 2>(qs, blk->qs);
+
+        const bool hi = (e0 % qk) != 0;
+
+        float d = 0.0f;
+        float2 dm = make_float2(0.0f, 0.0f);
+        if constexpr (has_min) {
+            dm = __half22float2(blk->dm);
+        } else {
+            d = blk->d;
+        }
+
+#pragma unroll
+        for (int g = 0; g < nelem/4; ++g) {
+            // Four consecutive elements live in one four-byte half of qs, one
+            // two-bit field each, at a shift set by which quarter of the block
+            // this group is.
+            uint32_t q = (qs[g & 1] >> (4*hi + 2*(g/2))) & 0x03030303u;
+
+            // Scatter four consecutive plane bits into bit 2 of four bytes.
+            // Multiplication is exact here: the four shifted copies of the
+            // multiplier occupy disjoint bits, so nothing carries into a
+            // selected destination bit.
+            const uint32_t h4 = (qh >> (16*hi + 4*g)) & 0x0Fu;
+            q |= (h4 * 0x00810204u) & 0x04040404u;
+
+            if constexpr (has_min) {
+                const uint8_t * const q8 = (const uint8_t *) &q;
+                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*dm.x + dm.y, q8[1]*dm.x + dm.y));
+                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*dm.x + dm.y, q8[3]*dm.x + dm.y));
+            } else {
+                q = __vsubss4(q, 0x04040404u);
+                const int8_t * const q8 = (const int8_t *) &q;
+                vals[2*g + 0] = ggml_cuda_cast<half2>(make_float2(q8[0]*d, q8[1]*d));
+                vals[2*g + 1] = ggml_cuda_cast<half2>(make_float2(q8[2]*d, q8[3]*d));
+            }
+        }
+    }
+};
+
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0> : fattn_quant_q3_traits<block_q3_0, false> {};
+template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1> : fattn_quant_q3_traits<block_q3_1, true>  {};
 
 // Compiled type tiers. The default set keeps build time in the same bracket as
 // before; GGML_CUDA_FA_ALL_QUANTS adds the rest, mirroring how the vector
