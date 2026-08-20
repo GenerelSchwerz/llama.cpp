@@ -98,6 +98,9 @@ server_args=(
     "${residency_args[@]}"
 )
 
+# Keep Nsight collectors and helpers unrestricted. The server arguments above
+# apply affinity only to llama.cpp worker pools; do not wrap either side of
+# this command in taskset.
 profile_command=(
     nsys profile
     --trace=cuda,nvtx,osrt

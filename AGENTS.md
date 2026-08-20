@@ -185,6 +185,14 @@ CPU-resident KV-cache investigation.
   `GGML_KV_CPU_PINNED` and `GGML_RECURRENT_STATE_OFFLOAD` are historical and
   must not appear in current setup or benchmark commands. Use the supported
   CLI controls documented in the current-testing document.
+- Do not use `taskset` in a current CPU-KV benchmark or profiler command. In
+  particular, never put it before or after `ncu` or `nsys`: the former pins
+  profiler collectors and helpers, while the latter makes an affinity wrapper
+  the direct profiling target. Launch the llama binary directly under the
+  profiler and express target worker placement with llama.cpp's own
+  `--cpu-mask`/`--cpu-range`, batch-affinity, and `--cpu-strict` controls. Any
+  `taskset` command in the development journal, experiment ledger, or a
+  reproduction document is historical evidence, not a current template.
 - Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
   build, profile, and documentation changes in the dedicated experimental
   worktree and branch.

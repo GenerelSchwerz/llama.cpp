@@ -116,6 +116,45 @@ does. Record the build options, compiler, model sizes and hashes, GPU driver,
 and relevant hardware. Do not start a controlled performance run while an
 unrelated GPU workload is active.
 
+## Profiler and affinity launch contract
+
+Do not use `taskset` in a current benchmark or profiler command. It is not an
+equivalent substitute for the application's affinity controls, and placing it
+on either side of an Nsight command creates two different failure modes:
+
+- `taskset ... ncu|nsys ...` restricts the profiler, its collectors, replay
+  machinery, report helpers, and every descendant;
+- `ncu|nsys ... taskset ... LLAMA_BINARY` makes `taskset` the direct target.
+  Application-only collection can then miss the llama child, while following
+  the entire process tree is a fragile workaround rather than the intended
+  launch shape.
+
+Launch `llama-server`, `llama-bench`, or `llama-perplexity` directly under the
+profiler. Keep Nsight and its helper processes unrestricted. Apply affinity
+only to llama.cpp worker pools:
+
+- common-argument tools use `--cpu-range`, `--cpu-range-batch`, and
+  `--cpu-strict` as shown in the canonical server command below;
+- `llama-bench` uses `-C 0x7 --cpu-strict 1` when the intended worker mask is
+  logical CPUs 0--2. Use the explicitly matched mask for another CPU set.
+
+The supported launch shapes are therefore:
+
+```bash
+/usr/bin/ncu NCU_OPTIONS \
+  build-cuda-all/bin/llama-bench BENCH_ARGS -C 0x7 --cpu-strict 1
+
+nsys profile NSYS_OPTIONS \
+  build-cuda-all/bin/llama-server SERVER_ARGS_WITH_NATIVE_AFFINITY
+```
+
+An outer `flock` used only to serialize access to a shared GPU is allowed; it
+must not add or change affinity. For Nsight Compute, target the llama binary
+directly and use `--target-processes application-only` unless the feature under
+test genuinely creates another GPU-active process. Do not select all target
+processes merely to compensate for an affinity wrapper. Profiler timing is
+diagnostic and must not be promoted as acceptance throughput.
+
 ## Canonical server layout
 
 The original multimodal performance layout currently uses:
@@ -295,6 +334,11 @@ Use the development journal to understand why a control or protocol changed,
 then follow its references into the experiment ledger or Git commits for exact
 evidence. Historical names and commands are intentionally searchable. Their
 presence does not make them supported today.
+
+This applies specifically to historical `taskset` commands: they reproduce the
+old whole-process placement but are not valid current benchmark or Nsight
+templates. Translate their intended CPU set into the application's native
+affinity controls before collecting new evidence.
 
 When recovering an older experiment:
 

@@ -1038,6 +1038,33 @@ be based on measured acceptance/replay behavior rather than VRAM alone.
    asymmetric K/V and token-window KV residency remain outside the current
    scope.
 
+## 2026-08-20: profiler affinity protocol correction
+
+A derived worktree's current-testing draft exposed that historical
+whole-process `taskset` commands were being reused around Nsight Compute.
+Putting `taskset` after `ncu` made the wrapper the application-only profiling
+target and produced a no-kernel capture. Moving it before `ncu` attached to the
+llama binary but restricted the profiler, replay machinery, helper processes,
+and target to the same small CPU set. A later all-process capture could follow
+the wrapper, but that was a workaround for the launch shape rather than a
+reason to retain it.
+
+The current protocol now forbids `taskset` in CPU-KV benchmark and profiler
+commands. Nsight launches the llama binary directly and remains unrestricted;
+only llama.cpp worker pools receive native affinity controls. For the former
+logical-CPU 0--2 `llama-bench` shape, the translation is `-C 0x7
+--cpu-strict 1`. Server and common-argument tools retain their explicit
+`--cpu-range`, `--cpu-range-batch`, and `--cpu-strict` controls. An outer GPU
+coordination lock may serialize runs but must not alter affinity.
+
+Historical ledger and reproduction commands remain unchanged so their exact
+measurements can still be reconstructed. Their `taskset` spelling is now
+explicitly superseded for new work. Existing Nsight hardware counters are not
+invalid merely because a profiler was CPU-restricted when it successfully
+captured the intended kernel, but profiler timing is not benchmark evidence;
+no-kernel captures and wrapper-dependent all-process captures require a clean
+direct-target rerun before they support a current claim.
+
 ## Known non-goals
 
 - Do not restore TurboQuant/TCQ, DDTree, CopySpec, the removed fork DFlash
