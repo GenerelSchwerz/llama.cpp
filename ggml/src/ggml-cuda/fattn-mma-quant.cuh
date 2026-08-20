@@ -163,8 +163,13 @@ struct fattn_quant_type_traits<GGML_TYPE_Q6_0> {
 
         __align__(16) uint8_t qs[QK6_0/2];
         ggml_cuda_memcpy_1<QK6_0/2, 2>(qs, blk->qs);
-        __align__(8)  uint8_t qh[QK6_0/4];
-        ggml_cuda_memcpy_1<QK6_0/4, 2>(qh, blk->qh);
+
+        // qh is read as one 64-bit word and shifted rather than indexed as a byte
+        // array: with the loop unrolled every shift is a compile-time constant,
+        // which keeps the plane in registers. Indexing the array cost 3.5% of
+        // prefill against the F16 path; shifting it does not.
+        uint64_t qh;
+        ggml_cuda_memcpy_1<sizeof(qh), 2>(&qh, blk->qh);
 
         const bool hi = (e0 % QK6_0) != 0;
 
@@ -172,8 +177,8 @@ struct fattn_quant_type_traits<GGML_TYPE_Q6_0> {
         for (int l = 0; l < nelem/2; ++l) {
             const int i0 = 2*l + 0;
             const int i1 = 2*l + 1;
-            const int h0 = (qh[i0 % (QK6_0/4)] >> (4*(i0 / (QK6_0/4)))) & 0x0F;
-            const int h1 = (qh[i1 % (QK6_0/4)] >> (4*(i1 / (QK6_0/4)))) & 0x0F;
+            const int h0 = (qh >> (8*(i0 % (QK6_0/4)) + 4*(i0 / (QK6_0/4)))) & 0x0F;
+            const int h1 = (qh >> (8*(i1 % (QK6_0/4)) + 4*(i1 / (QK6_0/4)))) & 0x0F;
             const int a = hi ? ((qs[i0] >> 4) | ((h0 & 0x0C) << 2))
                              : ((qs[i0] & 0x0F) | ((h0 & 0x03) << 4));
             const int b = hi ? ((qs[i1] >> 4) | ((h1 & 0x0C) << 2))
