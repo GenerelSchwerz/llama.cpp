@@ -10209,16 +10209,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Quantized-native Q8_0 K/V coverage. These sweep the supported head sizes,
-    // GQA ratios that select ncols2, query batches that select ncols1, and an
-    // unpadded KV length that exercises the loader's bounds-checked path.
-    for (int hs : { 64, 128, 256 }) {
-        for (int nr2 : { 1, 2, 4, 16 }) {
-            for (int kv : { 512, 113 }) {
-                for (int nb : { 3, 16, 32, 64 }) {
-                    test_cases.emplace_back(new test_flash_attn_ext(
-                                hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
+    // Quantized-native K/V coverage, one pass per type with a native loader.
+    // These sweep the supported head sizes, GQA ratios that select ncols2,
+    // query batches that select ncols1, and an unpadded KV length that
+    // exercises the loader's bounds-checked path.
+    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        for (int hs : { 64, 128, 256 }) {
+            for (int nr2 : { 1, 2, 4, 16 }) {
+                for (int kv : { 512, 113 }) {
+                    for (int nb : { 3, 16, 32, 64 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                    hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                    tkv, tkv, true));
+                    }
                 }
             }
         }
@@ -10226,6 +10229,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // An opted-in unsupported pair and head size must retain the established
     // materializing path rather than silently selecting a mismatched kernel.
+    // The mixed pair is deliberately two types that each have a native loader:
+    // the route requires K and V to agree, so this checks the pairing rule
+    // rather than the absence of a loader.
     test_cases.emplace_back(new test_flash_attn_ext(
                 64, 64, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, true));

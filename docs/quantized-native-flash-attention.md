@@ -6,7 +6,8 @@ materialization used by the standard MMA path. It does not change the
 persistent cache format, cache placement, or quantization policy.
 
 The feature is deliberately explicit at both build time and run time. Its
-current kernel inventory is only `Q8_0` K with `Q8_0` V, with equal head
+current kernel inventory is `Q8_0` and `Q4_0`, each with K and V of the same
+type, with equal head
 dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
 implementation. Unsupported cache pairs, dimensions, devices, and builds keep
 the standard materializing path.
@@ -23,7 +24,8 @@ selects nor converts the cache type. For example:
 | `f16 / f16` | off or on | Existing F16 attention path |
 | `q8_0 / q8_0` | off | Standard Q8-to-F16 materialization, then MMA |
 | `q8_0 / q8_0` | on | Native Q8 MMA when the build, device, and head size support it |
-| `q8_0 / q4_0` | on | Standard materializing fallback |
+| `q4_0 / q4_0` | on | Native Q4 MMA when the build, device, and head size support it |
+| `q8_0 / q4_0` | on | Standard materializing fallback; the route requires K and V to agree |
 | `q6_0 / q6_0` | on | Standard materializing fallback until that exact family is implemented |
 
 This avoids a second K/V type selector that could disagree with the tensors in
@@ -68,11 +70,13 @@ structure:
 - The normal MMA case and `ncols1`/`ncols2` selectors are templated on the K and
   V storage types. Their default remains F16, so existing call sites and
   generated F16 instances do not change behavior.
-- The Q8 route specializes that shared case with `Q8_0/Q8_0`; it does not carry
+- The native route specializes that shared case with one type for both K and V; it does not carry
   a copied launcher or a copied selector tree.
 - The Q8 tile loader is isolated in `fattn-mma-q8.cuh`. It dequantizes into the
   same shared-memory `half2` tiles consumed by the existing MMA math.
-- The loader reuses the established `dequantize_V_q8_0` helper from
+- Per-type dequantization must reproduce the F16-casting route bit for bit,
+  and which helper achieves that differs per type. `Q8_0` reuses the established
+  `dequantize_V_q8_0` helper from
   `fattn-common.cuh`. The helper's historical name is V-specific, but its
   operation is a generic Q8_0 row dequantization and is also valid for K.
 - `template-instances/generate_cu_files.py` owns the supported head-size and
@@ -175,7 +179,7 @@ and run-time defaults remain off.
 
 ## Limitations
 
-- The only registered pair is `Q8_0/Q8_0`; mixed and other quantized pairs use
+- The registered pairs are `Q8_0/Q8_0` and `Q4_0/Q4_0`; mixed and other quantized pairs use
   fallback.
 - The only registered equal head dimensions are 64, 128, and 256.
 - Routing requires the NVIDIA Ampere MMA implementation. AMD, MUSA, older
@@ -188,3 +192,29 @@ and run-time defaults remain off.
   all 48 explicit cases are emitted. Default builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
+
+## Adding a cache type
+
+Bit-identity is against the F16-casting route the option replaces, so the
+reference is that type's cast kernel in `convert.cu`, not the vector path's
+helper. The two do not always agree:
+
+- `Q8_0` casts via `dequantize_block_q8_0_f16`, which multiplies in `half2`.
+  `dequantize_V_q8_0` does the same, so the shared helper is exact here.
+- `Q4_0` has no dedicated cast kernel and goes through the generic
+  `dequantize_block_q4_0<half>`, which computes in float and rounds once
+  (`dm = -8*d`, `y = cast<half>(d*q + dm)`). `dequantize_V_q4_0` instead biases
+  the quant by `-8` as an integer and multiplies in `half2`. Both are correct
+  and they differ in the last bit, so `Q4_0` carries its own dequantization.
+  That helper is also limited to `ne` of 2 or 4 and cannot serve the
+  16-element run the tile loader issues.
+
+A new type therefore needs a `fattn_quant_type_traits` specialization whose
+`dequant()` matches its cast kernel, an entry in
+`ggml_cuda_fattn_mma_quant_type`, one line in `DECL_FATTN_MMA_QUANT_CASE_TYPES`
+and in the generator's `FATTN_MMA_QUANT_TYPES`, a case in the routing switch,
+and a pass in the `test-backend-ops` sweep. Tolerance-based tests are not
+sufficient evidence on their own: with random inputs they would accept a loader
+that permuted elements within a block. A byte-identical generation comparison
+against the same build with the option off is what actually gates a
+reconstructed dequantization.

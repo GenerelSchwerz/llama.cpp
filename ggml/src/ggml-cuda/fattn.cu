@@ -251,7 +251,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 // GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE logs every launch that actually takes this
 // path, so a measurement can state that it exercised the kernel rather than
 // inferring it.
-static void ggml_cuda_flash_attn_ext_mma_q8_log_route(const ggml_tensor * dst) {
+static void ggml_cuda_flash_attn_ext_mma_quant_log_route(const ggml_tensor * dst) {
     static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
     if (!verbose) {
         return;
@@ -262,24 +262,38 @@ static void ggml_cuda_flash_attn_ext_mma_q8_log_route(const ggml_tensor * dst) {
         (int) Q->ne[0], (int) Q->ne[1], (int) K->ne[1], (int) Q->ne[2], (int) K->ne[2]);
 }
 
-static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+template <ggml_type type>
+static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->src[0]->ne[0]) {
+        case 64:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 64,  64, type, type>(ctx, dst);
+            break;
+        case 128:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, type, type>(ctx, dst);
+            break;
+        case 256:
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, type, type>(ctx, dst);
+            break;
+        default:
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
     GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
 
-    ggml_cuda_flash_attn_ext_mma_q8_log_route(dst);
+    ggml_cuda_flash_attn_ext_mma_quant_log_route(dst);
 
-    switch (Q->ne[0]) {
-        case 64:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<64, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+    switch (K->type) {
+        case GGML_TYPE_Q8_0:
+            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<GGML_TYPE_Q8_0>(ctx, dst);
             break;
-        case 128:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
-            break;
-        case 256:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+        case GGML_TYPE_Q4_0:
+            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<GGML_TYPE_Q4_0>(ctx, dst);
             break;
         default:
             GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
@@ -464,7 +478,7 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
     const ggml_tensor * V = dst->src[2];
 
     const bool ok = ampere_mma_available(cc) &&
-        K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+        K->type == V->type && ggml_cuda_fattn_mma_quant_type(K->type) &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
     if (!ok && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
@@ -736,7 +750,7 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
             break;
         case BEST_FATTN_KERNEL_MMA_Q8:
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-            ggml_cuda_flash_attn_ext_mma_q8(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_quant(ctx, dst);
 #else
             GGML_ABORT("fatal error"); // unreachable: gated by ggml_cuda_fattn_native_applies
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
