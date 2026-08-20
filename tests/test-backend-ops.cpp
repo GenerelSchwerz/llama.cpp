@@ -7146,6 +7146,7 @@ struct test_flash_attn_ext : public test_case {
     const float scale;
     const int64_t n_tail_active;
     const int64_t n_tail_history_slots;
+    const bool native_quants;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -7160,7 +7161,8 @@ struct test_flash_attn_ext : public test_case {
             " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
-            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
+            " native_quants=" + std::to_string(int(native_quants));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7221,14 +7223,21 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0)
+                        int64_t n_tail_history_slots = 0, bool native_quants = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), native_quants(native_quants) {}
+
+    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                        ggml_type type_K, ggml_type type_V, bool native_quants)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
+              {0, 1, 2, 3}, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT, false, false, false, false, false, 0, false,
+              0.0f, -1, 0, native_quants) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7411,9 +7420,11 @@ struct test_flash_attn_ext : public test_case {
         }
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_flash_attn_ext_set_native_quants(out, native_quants);
         if (exact != nullptr) {
             ggml_flash_attn_ext_add_sinks(exact, s);
             ggml_flash_attn_ext_set_prec (exact, prec);
+            ggml_flash_attn_ext_set_native_quants(exact, native_quants);
             out = ggml_concat(ctx, out, exact, 3);
         }
         ggml_set_name(out, "out");
@@ -10198,25 +10209,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Quantized-native Q8_0 K/V coverage at head sizes 128 and 256, the two the
-    // CUDA quantized-native MMA path supports. The general sweep below only
-    // pairs quantized K/V with head sizes 64 and 72, and the prefill-shaped
-    // block above reaches a single tile shape, so neither exercises that loader
-    // broadly. These sweep the GQA ratios that pick ncols2, the batch sizes
-    // that pick ncols1, and an unpadded KV length, which is what selects the
-    // loader's bounds-checked path. Head size 256 is the one that matters for
-    // Qwen3.5/3.8-class models; 128 covers the more common layout.
-    for (int hs : { 128, 256 }) {
+    // Quantized-native Q8_0 K/V coverage. These sweep the supported head sizes,
+    // GQA ratios that select ncols2, query batches that select ncols1, and an
+    // unpadded KV length that exercises the loader's bounds-checked path.
+    for (int hs : { 64, 128, 256 }) {
         for (int nr2 : { 1, 2, 4, 16 }) {
             for (int kv : { 512, 113 }) {
                 for (int nb : { 3, 16, 32, 64 }) {
                     test_cases.emplace_back(new test_flash_attn_ext(
                                 hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+                                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
                 }
             }
         }
     }
+
+    // An opted-in unsupported pair and head size must retain the established
+    // materializing path rather than silently selecting a mismatched kernel.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                72, 72, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

@@ -4,6 +4,21 @@ BeeLlama v0.4.3 keeps a small fork surface on top of upstream llama.cpp. Use
 this page to choose a feature; use the [argument reference](beellama-args.md)
 for exact names, environment variables, defaults, and validation ranges.
 
+## Quantized-native CUDA FlashAttention
+
+An off-by-default CUDA MMA kernel family can read supported standard quantized
+K/V tensors directly instead of materializing the attention window as F16. The
+current explicit inventory is `Q8_0/Q8_0` at equal head dimensions 64, 128, and
+256 on NVIDIA's Ampere MMA implementation. The cache formats remain selected by
+`--cache-type-k` and `--cache-type-v`; `--flash-attn-native-quants` only opts a
+context into a registered direct loader. Unsupported layouts keep the standard
+path and report a warning, while default builds contain no native-Q8 MMA
+instances.
+
+See [Quantized-native CUDA FlashAttention](quantized-native-flash-attention.md)
+for build controls, implementation structure, tradeoffs, limitations, and the
+required validation protocol.
+
 ## KVarN target KV cache
 
 ### What it is

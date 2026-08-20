@@ -1895,7 +1895,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.flash_attn_native_quants = value;
         }
-    ).set_env("LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS"));
+    ).set_env("LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS").set_examples({
+        LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_PERPLEXITY,
+        LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},

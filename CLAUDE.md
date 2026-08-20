@@ -53,7 +53,11 @@ the transient F16 copy of the attention window. It is off by default, output is
 unchanged, and it applies only where a native loader exists for the cache type
 and head dimension; every other case keeps the F16-casting path. The kernels are
 compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
-the option is accepted and has no effect.
+the option keeps the standard path and reports a warning. The cache type still
+comes exclusively from `--cache-type-k` and `--cache-type-v`; the native option
+does not select a second layout. See
+[`docs/quantized-native-flash-attention.md`](docs/quantized-native-flash-attention.md)
+for the exact kernel inventory, architecture, tradeoffs, and validation gates.
 
 There is no `GGML_CUDA_FA_HALF_QUANTS` tier. KVarN has 15 balanced fast-decode
 pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN

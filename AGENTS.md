@@ -60,6 +60,12 @@ bit-pair rules as KVarN and adds homogeneous F16/F16 and BF16/BF16 tail pairs.
 `GGML_CUDA_FA_HALF_QUANTS` no longer exists. Valid KVarN pairs outside the fast
 matrix use descriptor-native MMA fallback.
 
+`GGML_CUDA_FATTN_Q8_NATIVE=ON` independently compiles the off-by-default native
+Q8_0/Q8_0 MMA FlashAttention family. `GGML_CUDA_FA_ALL_QUANTS` must not imply or
+expand native MMA families. Runtime cache types still come from the graph;
+`--flash-attn-native-quants` only permits a registered direct loader. Read
+`docs/quantized-native-flash-attention.md` before changing or measuring it.
+
 Use `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 3090 and `89` for RTX 4090 when
 the build host cannot detect the target GPU.
 

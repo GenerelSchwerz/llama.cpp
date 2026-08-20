@@ -5034,6 +5034,15 @@ one of four configurations, unchanged in the other three." That figure was
 measured under `llama-bench` at 512-token prefill and does not generalise; see
 the reconciliation section below, which is not yet closed.
 
+Revision note: this experiment records the original PR implementation and its
+commands verbatim. Its process-wide `GGML_CUDA_FATTN_Q8_NATIVE=0/1` test
+override was removed by the later structural cleanup; it is not a current
+run-time control. Current builds use `GGML_CUDA_FATTN_Q8_NATIVE=ON/OFF` only as
+a CMake option and use `--flash-attn-native-quants` for per-context run-time
+opt-in. See `docs/quantized-native-flash-attention.md` for the maintained
+architecture and current validation protocol. Historical commands below must
+be run at their recorded commits if exact reproduction is required.
+
 ### Motivation
 
 The MMA/tile flash-attention path casts K and V to F16 before running,
@@ -5041,8 +5050,9 @@ regardless of the cache's storage type or where `--kv-gpu-layers` places it
 (`ggml_cuda_flash_attn_ext_get_alloc_size` sets `need_f16_K = need_f16_V =
 true` for `BEST_FATTN_KERNEL_TILE` and `BEST_FATTN_KERNEL_MMA_F16`). That cast
 allocates a transient F16 copy of the attention window and re-materializes it
-on every graph execution. `docs/qn0-native-mma-kernel-plan.md` scoped the work;
-this entry records its outcome.
+on every graph execution. The maintained scope is documented in
+`docs/quantized-native-flash-attention.md`; this entry records the original
+implementation's outcome.
 
 ### Scope correction made during implementation
 

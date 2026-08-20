@@ -399,6 +399,7 @@ struct cmd_params {
     bool                             kv_cpu_pinned;
     bool                             recurrent_state_offload;
     bool                             live_context_workspace;
+    bool                             flash_attn_native_quants;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -450,6 +451,7 @@ static const cmd_params cmd_params_defaults = {
     /* kv_cpu_pinned        */ false,
     /* recurrent_state_offload */ false,
     /* live_context_workspace  */ false,
+    /* flash_attn_native_quants */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -475,6 +477,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident (default: %s)\n",
             join(cmd_params_defaults.kv_gpu_layers, ",").c_str());
     printf("  --recurrent-state-offload                   for hybrid models, keep recurrent state GPU-resident despite -nkvo\n");
+    printf("  --flash-attn-native-quants                  let supported FlashAttention kernels read quantized K/V directly\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -696,6 +699,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.kv_cpu_pinned        = cmd_params_defaults.kv_cpu_pinned;
     params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
     params.live_context_workspace = cmd_params_defaults.live_context_workspace;
+    params.flash_attn_native_quants = cmd_params_defaults.flash_attn_native_quants;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1252,6 +1256,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.live_context_workspace = true;
             } else if (arg == "--no-live-context-workspace") {
                 params.live_context_workspace = false;
+            } else if (arg == "--flash-attn-native-quants") {
+                params.flash_attn_native_quants = true;
+            } else if (arg == "--no-flash-attn-native-quants") {
+                params.flash_attn_native_quants = false;
             } else if (arg == "--kv-gpu-layers") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1440,6 +1448,7 @@ struct cmd_params_instance {
     bool               live_context_workspace;
     int                kv_gpu_layers;
     llama_flash_attn_type flash_attn;
+    bool               flash_attn_native_quants;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1526,6 +1535,7 @@ struct cmd_params_instance {
         cparams.live_context_workspace  = live_context_workspace;
         cparams.kv_gpu_layers           = (uint32_t) kv_gpu_layers;
         cparams.flash_attn_type         = flash_attn;
+        cparams.flash_attn_native_quants = flash_attn_native_quants;
         cparams.embeddings              = embeddings;
         cparams.op_offload              = !no_op_offload;
         cparams.swa_full                = false;
@@ -1601,6 +1611,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
+                /* .flash_attn_native_quants = */ params.flash_attn_native_quants,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1643,6 +1654,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
+                /* .flash_attn_native_quants = */ params.flash_attn_native_quants,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1685,6 +1697,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
+                /* .flash_attn_native_quants = */ params.flash_attn_native_quants,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
                 /* .tensor_buft_overrides = */ ot,
@@ -1812,6 +1825,7 @@ struct test {
     bool                     live_context_workspace;
     int                      kv_gpu_layers;
     llama_flash_attn_type    flash_attn;
+    bool                     flash_attn_native_quants;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
@@ -1865,6 +1879,7 @@ struct test {
         live_context_workspace = inst.live_context_workspace;
         kv_gpu_layers  = inst.kv_gpu_layers;
         flash_attn     = inst.flash_attn;
+        flash_attn_native_quants = inst.flash_attn_native_quants;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
         tensor_buft_overrides = inst.tensor_buft_overrides;
@@ -1961,6 +1976,7 @@ struct test {
             "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
             "live_context_workspace",
             "kv_gpu_layers",  "flash_attn",     "devices",       "tensor_split",
+            "kv_gpu_layers",  "flash_attn",     "flash_attn_native_quants", "devices", "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1996,6 +2012,7 @@ struct test {
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_cpu_pinned" ||
             field == "recurrent_state_offload" || field == "live_context_workspace" ||
+            field == "flash_attn_native_quants" ||
             field == "cpu_strict" || field == "embeddings" ||
             field == "no_host") {
             return BOOL;
@@ -2155,6 +2172,7 @@ struct test {
                                             std::to_string(live_context_workspace),
                                             std::to_string(kv_gpu_layers),
                                             std::to_string((int) flash_attn),
+                                            std::to_string(flash_attn_native_quants),
                                             devices_to_string(devices),
                                             tensor_split_str,
                                             tensor_buft_overrides_str,
@@ -2357,6 +2375,9 @@ struct markdown_printer : public printer {
         if (field == "flash_attn") {
             return 3;
         }
+        if (field == "flash_attn_native_quants") {
+            return 5;
+        }
         if (field == "devices") {
             return -12;
         }
@@ -2405,6 +2426,9 @@ struct markdown_printer : public printer {
         }
         if (field == "flash_attn") {
             return "fa";
+        }
+        if (field == "flash_attn_native_quants") {
+            return "fa_nq";
         }
         if (field == "load_mode") {
             return "lm";
@@ -2505,6 +2529,9 @@ struct markdown_printer : public printer {
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
+        }
+        if (params.flash_attn_native_quants != cmd_params_defaults.flash_attn_native_quants) {
+            fields.emplace_back("flash_attn_native_quants");
         }
         if (params.devices.size() > 1 || params.devices != cmd_params_defaults.devices) {
             fields.emplace_back("devices");

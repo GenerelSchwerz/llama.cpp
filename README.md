@@ -13,6 +13,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
+- **Opt-in quantized-native CUDA FlashAttention**: an explicitly compiled MMA kernel family can consume supported Q8_0 K/V caches without a transient F16 copy. See the [design, limits, and validation protocol](docs/quantized-native-flash-attention.md).
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning output and intervenes.
 

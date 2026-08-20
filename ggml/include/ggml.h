@@ -455,7 +455,7 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
         // Slot 7 is reserved for a CUDA-internal vector-kernel hint.
-        GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT = 8,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS = 8,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2491,6 +2491,12 @@ extern "C" {
 
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
+
+    // Let backends consume supported quantized K/V layouts directly instead
+    // of materializing an intermediate cache representation.
+    GGML_API void ggml_flash_attn_ext_set_native_quants(
+            struct ggml_tensor * a,
+            bool                 enabled);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

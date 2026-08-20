@@ -3,40 +3,41 @@
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
-#include "fattn-mma-q8-case.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-template <int DKQ, int DV, int ncols2>
+template <int DKQ, int DV, int ncols2,
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_K, type_V>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_K, type_V>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_K, type_V>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_K, type_V>(ctx, dst);
 }
 
-template <int DKQ, int DV>
+template <int DKQ, int DV,
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -69,22 +70,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst);
             return;
         }
 
         if constexpr (DKQ <= 256) {
             if (use_gqa_opt && gqa_ratio % 2 == 0) {
-                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst);
                 return;
             }
 
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst);
             return;
         } else {
             GGML_ABORT("fatal error");
@@ -92,22 +93,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_K, type_V>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_K, type_V>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_K, type_V>(ctx, dst);
         return;
     }
 
     if constexpr (DKQ <= 256) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_K, type_V>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
     }
@@ -244,80 +245,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// Quantized-native Q8_0/Q8_0 MMA path. Mirrors the ncols2/ncols1 selection of
-// the F16 path but is scoped to DKQ == DV at head dimension 128 or 256, so the
-// Volta, MLA and 192/320/576 special cases have no counterpart here.
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-template <int D, int ncols2>
-static void ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    const ggml_tensor * Q = dst->src[0];
-
-    if constexpr (ncols2 <= 8) {
-        if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 8/ncols2, ncols2>(ctx, dst);
-            return;
-        }
-    }
-
-    if constexpr (ncols2 <= 16) {
-        if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 16/ncols2, ncols2>(ctx, dst);
-            return;
-        }
-    }
-
-    if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING)) {
-        ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 32/ncols2, ncols2>(ctx, dst);
-        return;
-    }
-
-    ggml_cuda_flash_attn_ext_mma_q8_case<D, D, 64/ncols2, ncols2>(ctx, dst);
-}
-
-template <int D>
-static void ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * KQV  = dst;
-    const ggml_tensor * Q    = dst->src[0];
-    const ggml_tensor * K    = dst->src[1];
-    const ggml_tensor * mask = dst->src[3];
-
-    float max_bias = 0.0f;
-    memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
-
-    // K and V are quantized, so the F16 path's stride-alignment loop over
-    // Q/K/V/mask reduces to the non-quantized tensors here.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
-    for (const ggml_tensor * t : {Q, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
-            continue;
-        }
-        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
-            if (t->nb[i] % 16 != 0) {
-                use_gqa_opt = false;
-                break;
-            }
-        }
-    }
-
-    GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
-    const int gqa_ratio = Q->ne[2] / K->ne[2];
-
-    if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 8>(ctx, dst);
-        return;
-    }
-    if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 4>(ctx, dst);
-        return;
-    }
-    if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 2>(ctx, dst);
-        return;
-    }
-    ggml_cuda_flash_attn_ext_mma_q8_switch_ncols1<D, 1>(ctx, dst);
-}
-
 // Routing is otherwise only observable indirectly, through allocation size or
 // throughput, and both can be dominated by unrelated effects. Setting
 // GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE logs every launch that actually takes this
@@ -345,13 +273,13 @@ static void ggml_cuda_flash_attn_ext_mma_q8(ggml_backend_cuda_context & ctx, ggm
 
     switch (Q->ne[0]) {
         case 64:
-            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<64>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<64, 64, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
             break;
         case 128:
-            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<128>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
             break;
         case 256:
-            ggml_cuda_flash_attn_ext_mma_q8_switch_ncols2<256>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
             break;
         default:
             GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
@@ -505,47 +433,27 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_Q8  = 500, // MMA reading a Q8_0 cache in place, no F16 copy
 };
 
-// Whether the quantized-native MMA kernels were compiled in, and whether the
-// graph asked for them. The request arrives per node as
-// GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT, set from the
-// --flash-attn-native-quants context option.
-//
-// GGML_CUDA_FATTN_Q8_NATIVE additionally overrides that per process: 0 forces
-// the route off, 1 forces it on. Neither is user-facing; both exist because the
-// evidence for this path cannot be produced without them.
-//
-// Force-off keeps every measurement an A/B within one binary (byte-identical
-// output, compute-buffer allocation); otherwise each comparison would need its
-// own build of every flash-attention template instance.
-//
-// Force-on is what makes the route testable at all. test-backend-ops builds ggml
-// graphs directly and never runs through llama-graph, so the op param is never
-// set there and the correctness sweep would silently exercise only the
-// F16-casting path.
+// The graph opts in per node. Builds without a registered native kernel keep
+// the ordinary materializing route and report that the request was ignored.
 static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
+    const bool requested =
+        ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
-    enum override_t { OVERRIDE_NONE, OVERRIDE_OFF, OVERRIDE_ON };
-    static const override_t override = [] {
-        const char * env = getenv("GGML_CUDA_FATTN_Q8_NATIVE");
-        if (env == nullptr) {
-            return OVERRIDE_NONE;
-        }
-        return atoi(env) == 0 ? OVERRIDE_OFF : OVERRIDE_ON;
-    }();
-    if (override != OVERRIDE_NONE) {
-        return override == OVERRIDE_ON;
-    }
-    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANT) != 0;
+    return requested;
 #else
-    GGML_UNUSED(dst);
+    if (requested) {
+        static std::once_flag warn_flag;
+        std::call_once(warn_flag, [] {
+            GGML_LOG_WARN("quantized-native CUDA FlashAttention was requested, but this build has no native kernels; "
+                          "using the standard materializing path\n");
+        });
+    }
     return false;
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 }
 
-// Targets Ampere/Ada tensor cores with a Q8_0 K and V at head dimension 128 or
-// 256; everything else keeps the existing F16-casting route. Both dimensions
-// give whole Q8_0 blocks per tile chunk in the Ampere config table (four at
-// 128, eight at 256), which is what the loader's alignment invariants need.
+// The first registered native family is Q8_0/Q8_0 at the supported equal head
+// sizes on NVIDIA architectures that use the Ampere MMA implementation.
 static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst) {
     if (!ggml_cuda_fattn_native_enabled(dst)) {
         return false;
@@ -559,11 +467,14 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
         K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
-    static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
-    if (!ok && verbose) {
-        GGML_LOG_INFO("fattn-q8-native: declined ampere=%d K=%s V=%s DQ=%d DK=%d DV=%d n_q=%d\n",
-            (int) ampere_mma_available(cc), ggml_type_name(K->type), ggml_type_name(V->type),
-            (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0], (int) Q->ne[1]);
+    if (!ok && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
+        static std::once_flag warn_flag;
+        std::call_once(warn_flag, [=] {
+            GGML_LOG_WARN("quantized-native CUDA FlashAttention has no kernel for K=%s V=%s DQ=%d DK=%d DV=%d; "
+                          "using the standard materializing path\n",
+                ggml_type_name(K->type), ggml_type_name(V->type),
+                (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0]);
+        });
     }
 
     return ok;
