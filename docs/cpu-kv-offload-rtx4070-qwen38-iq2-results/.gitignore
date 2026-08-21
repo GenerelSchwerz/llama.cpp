@@ -1,0 +1,4 @@
+# Server logs in this results archive are intentional, permanent evidence
+# artifacts, not build/debug scratch output. Override the project-wide
+# *.log ignore rule for this directory.
+!*.log

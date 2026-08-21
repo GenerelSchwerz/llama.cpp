@@ -1,0 +1,1571 @@
+=== A-baseline-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 267.694813041199
+predicted_per_second: 39.86038898757103
+predicted_n: 64
+vram/rss summary:
+samples: 4
+vram_mib: min=9758 max=9782 last=9782
+rss_mib: min=1574.9 max=2032.7 last=2032.7
+vmhwm_mib: max=10323.6
+server print_timing / memory breakdown:
+0.00.377.936 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.919.094 I srv    load_model: speculative decoding will use checkpoints
+0.01.919.166 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.138.902 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.227.627 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.626 MiB)
+0.03.875.213 I slot print_timing: id  0 | task 0 | prompt eval time =     268.96 ms /    72 tokens (    3.74 ms per token,   267.69 tokens per second)
+0.03.875.216 I slot print_timing: id  0 | task 0 |        eval time =    1605.60 ms /    64 tokens (   25.09 ms per token,    39.86 tokens per second)
+0.03.875.217 I slot print_timing: id  0 | task 0 |       total time =    1874.57 ms /   136 tokens
+0.03.875.219 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.03.910.828 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A-mtp-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 248.63853137507468
+predicted_per_second: 69.41650008514368
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10826 max=10876 last=10876
+rss_mib: min=1655.5 max=2169.9 last=2169.9
+vmhwm_mib: max=10323.6
+server print_timing / memory breakdown:
+0.00.348.576 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.639.441 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.207.679 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.207.834 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.255.034 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.347.131 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.312.726 I slot print_timing: id  0 | task 0 | prompt eval time =     289.58 ms /    72 tokens (    4.02 ms per token,   248.64 tokens per second)
+0.04.312.729 I slot print_timing: id  0 | task 0 |        eval time =     921.97 ms /    64 tokens (   14.41 ms per token,    69.42 tokens per second)
+0.04.312.730 I slot print_timing: id  0 | task 0 |       total time =    1211.55 ms /   136 tokens
+0.04.312.732 I slot print_timing: id  0 | task 0 |    graphs reused =          2
+0.04.312.735 I slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (   45 accepted /    60 generated), mean len =  3.65
+0.04.312.735 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.312.736 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.312.736 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.312.752 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.296 ms)
+0.04.341.398 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-dspark-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 186.93287292459075
+predicted_per_second: 16.880619729751828
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=11206 max=11246 last=11246
+rss_mib: min=3228.4 max=3951.3 last=3951.3
+vmhwm_mib: max=10326.4
+server print_timing / memory breakdown:
+0.00.630.760 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.475.346 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.305.709 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.03.427.746 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.07.268.789 I slot print_timing: id  0 | task 0 | prompt eval time =     385.17 ms /    72 tokens (    5.35 ms per token,   186.93 tokens per second)
+0.07.268.792 I slot print_timing: id  0 | task 0 |        eval time =    3791.33 ms /    64 tokens (   59.24 ms per token,    16.88 tokens per second)
+0.07.268.793 I slot print_timing: id  0 | task 0 |       total time =    4176.49 ms /   136 tokens
+0.07.268.798 I slot print_timing: id  0 | task 0 |    graphs reused =          8
+0.07.268.803 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.07.268.803 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.07.268.803 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.07.268.804 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.07.268.820 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.916 ms), draft 1 (0 grow / 0 shrink, 0.491 ms)
+0.07.297.723 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-baseline-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 325.33877270517365
+predicted_per_second: 39.00279601293918
+predicted_n: 400
+vram/rss summary:
+samples: 21
+vram_mib: min=9758 max=9780 last=9780
+rss_mib: min=1575.2 max=2036.1 last=2036.1
+vmhwm_mib: max=10325.5
+server print_timing / memory breakdown:
+0.00.354.871 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.885.767 I srv    load_model: speculative decoding will use checkpoints
+0.01.885.841 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.143.084 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.235.110 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 84, pos_max = 84, n_tokens = 85, size = 149.626 MiB)
+0.05.288.375 I slot print_timing: id  0 | task 0 | n_decoded =    119, tg =  39.52 t/s, tg_3s =  39.52 t/s
+0.08.296.546 I slot print_timing: id  0 | task 0 | n_decoded =    236, tg =  39.21 t/s, tg_3s =  38.89 t/s
+0.11.315.918 I slot print_timing: id  0 | task 0 | n_decoded =    353, tg =  39.06 t/s, tg_3s =  38.75 t/s
+0.12.533.158 I slot print_timing: id  0 | task 0 | prompt eval time =     273.56 ms /    89 tokens (    3.07 ms per token,   325.34 tokens per second)
+0.12.533.161 I slot print_timing: id  0 | task 0 |        eval time =   10255.67 ms /   400 tokens (   25.64 ms per token,    39.00 tokens per second)
+0.12.533.162 I slot print_timing: id  0 | task 0 |       total time =   10529.24 ms /   489 tokens
+0.12.533.190 I slot print_timing: id  0 | task 0 |    graphs reused =        397
+0.12.559.904 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A-mtp-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 299.5957140981664
+predicted_per_second: 46.04252418469913
+predicted_n: 400
+vram/rss summary:
+samples: 18
+vram_mib: min=10826 max=10874 last=10874
+rss_mib: min=1657.1 max=2172.5 last=2172.5
+vmhwm_mib: max=10324.1
+server print_timing / memory breakdown:
+0.00.346.667 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.634.484 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.202.580 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.202.731 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.252.751 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.349.095 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 84, pos_max = 84, n_tokens = 85, size = 149.824 MiB)
+0.06.417.903 I slot print_timing: id  0 | task 0 | n_decoded =    168, tg =  55.55 t/s, tg_3s =  55.55 t/s
+0.09.437.938 I slot print_timing: id  0 | task 0 | n_decoded =    283, tg =  46.82 t/s, tg_3s =  38.08 t/s
+0.12.080.989 I slot print_timing: id  0 | task 0 | prompt eval time =     297.07 ms /    89 tokens (    3.34 ms per token,   299.60 tokens per second)
+0.12.080.993 I slot print_timing: id  0 | task 0 |        eval time =    8687.62 ms /   400 tokens (   21.72 ms per token,    46.04 tokens per second)
+0.12.080.993 I slot print_timing: id  0 | task 0 |       total time =    8984.69 ms /   489 tokens
+0.12.080.996 I slot print_timing: id  0 | task 0 |    graphs reused =        135
+0.12.081.000 I slot print_timing: id  0 | task 0 | draft acceptance = 0.90566 (  144 accepted /   159 generated), mean len =  2.69
+0.12.081.000 I slot print_timing: id  0 | task 0 |      acc per pos = (0.918, 0.329, 0.176, 0.165, 0.106)
+0.12.081.000 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.12.081.001 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.12.081.017 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.310 ms)
+0.12.108.351 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-dspark-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 234.21484079969895
+predicted_per_second: 11.409541291657625
+predicted_n: 400
+vram/rss summary:
+samples: 68
+vram_mib: min=11206 max=11254 last=11254
+rss_mib: min=3239.0 max=3956.8 last=3955.6
+vmhwm_mib: max=10324.5
+server print_timing / memory breakdown:
+0.09.093.198 I slot print_timing: id  0 | task 0 | n_decoded =    100, tg =  17.79 t/s, tg_3s =  17.79 t/s
+0.12.113.796 I slot print_timing: id  0 | task 0 | n_decoded =    136, tg =  15.74 t/s, tg_3s =  11.92 t/s
+0.15.191.376 I slot print_timing: id  0 | task 0 | n_decoded =    166, tg =  14.17 t/s, tg_3s =   9.75 t/s
+0.18.299.518 I slot print_timing: id  0 | task 0 | n_decoded =    197, tg =  13.29 t/s, tg_3s =   9.97 t/s
+0.21.358.499 I slot print_timing: id  0 | task 0 | n_decoded =    232, tg =  12.97 t/s, tg_3s =  11.44 t/s
+0.24.373.593 I slot print_timing: id  0 | task 0 | n_decoded =    261, tg =  12.49 t/s, tg_3s =   9.62 t/s
+0.27.398.073 I slot print_timing: id  0 | task 0 | n_decoded =    291, tg =  12.16 t/s, tg_3s =   9.92 t/s
+0.30.426.934 I slot print_timing: id  0 | task 0 | n_decoded =    320, tg =  11.87 t/s, tg_3s =   9.57 t/s
+0.33.464.943 I slot print_timing: id  0 | task 0 | n_decoded =    349, tg =  11.64 t/s, tg_3s =   9.55 t/s
+0.36.506.685 I slot print_timing: id  0 | task 0 | n_decoded =    378, tg =  11.44 t/s, tg_3s =   9.53 t/s
+0.38.531.093 I slot print_timing: id  0 | task 0 | prompt eval time =     379.99 ms /    89 tokens (    4.27 ms per token,   234.21 tokens per second)
+0.38.531.095 I slot print_timing: id  0 | task 0 |        eval time =   35058.38 ms /   400 tokens (   87.65 ms per token,    11.41 tokens per second)
+0.38.531.096 I slot print_timing: id  0 | task 0 |       total time =   35438.37 ms /   489 tokens
+0.38.531.098 I slot print_timing: id  0 | task 0 |    graphs reused =        256
+0.38.531.103 I slot print_timing: id  0 | task 0 | draft acceptance = 0.93902 (   77 accepted /    82 generated), mean len =  2.64
+0.38.531.103 I slot print_timing: id  0 | task 0 |      acc per pos = (0.915, 0.277, 0.191, 0.149, 0.064, 0.043)
+0.38.531.104 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.38.531.104 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.38.531.122 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.285 ms), draft 1 (0 grow / 0 shrink, 0.539 ms)
+0.38.564.599 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-baseline-coding ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 450.2191066318942
+predicted_per_second: 37.79484347942731
+predicted_n: 1200
+vram/rss summary:
+samples: 61
+vram_mib: min=9758 max=9782 last=9782
+rss_mib: min=1590.6 max=2046.7 last=2044.2
+vmhwm_mib: max=10325.8
+server print_timing / memory breakdown:
+0.00.358.329 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.891.154 I srv    load_model: speculative decoding will use checkpoints
+0.01.891.227 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.139.232 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.257.578 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.626 MiB)
+0.05.314.656 I slot print_timing: id  0 | task 0 | n_decoded =    119, tg =  39.47 t/s, tg_3s =  39.47 t/s
+0.08.335.203 I slot print_timing: id  0 | task 0 | n_decoded =    235, tg =  38.94 t/s, tg_3s =  38.40 t/s
+0.11.345.536 I slot print_timing: id  0 | task 0 | n_decoded =    351, tg =  38.80 t/s, tg_3s =  38.53 t/s
+0.14.365.961 I slot print_timing: id  0 | task 0 | n_decoded =    466, tg =  38.62 t/s, tg_3s =  38.07 t/s
+0.17.366.247 I slot print_timing: id  0 | task 0 | n_decoded =    580, tg =  38.50 t/s, tg_3s =  38.00 t/s
+0.20.391.456 I slot print_timing: id  0 | task 0 | n_decoded =    694, tg =  38.36 t/s, tg_3s =  37.68 t/s
+0.23.406.701 I slot print_timing: id  0 | task 0 | n_decoded =    807, tg =  38.23 t/s, tg_3s =  37.48 t/s
+0.26.411.684 I slot print_timing: id  0 | task 0 | n_decoded =    919, tg =  38.11 t/s, tg_3s =  37.27 t/s
+0.29.420.613 I slot print_timing: id  0 | task 0 | n_decoded =   1030, tg =  37.98 t/s, tg_3s =  36.89 t/s
+0.32.428.139 I slot print_timing: id  0 | task 0 | n_decoded =   1141, tg =  37.87 t/s, tg_3s =  36.91 t/s
+0.34.049.992 I slot print_timing: id  0 | task 0 | prompt eval time =     299.85 ms /   135 tokens (    2.22 ms per token,   450.22 tokens per second)
+0.34.049.994 I slot print_timing: id  0 | task 0 |        eval time =   31750.36 ms /  1200 tokens (   26.46 ms per token,    37.79 tokens per second)
+0.34.049.995 I slot print_timing: id  0 | task 0 |       total time =   32050.22 ms /  1335 tokens
+0.34.049.998 I slot print_timing: id  0 | task 0 |    graphs reused =       1193
+0.34.087.038 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A-mtp-coding ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/A-mtp-coding.response.json'
+vram/rss summary:
+samples: 48
+vram_mib: min=10826 max=10868 last=10868
+rss_mib: min=1660.3 max=2284.4 last=2284.4
+vmhwm_mib: max=10330.0
+server print_timing / memory breakdown:
+0.00.350.041 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.643.488 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.213.587 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.213.742 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.259.347 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.383.640 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.450.276 I slot print_timing: id  0 | task 0 | n_decoded =    164, tg =  54.26 t/s, tg_3s =  54.26 t/s
+0.09.456.179 I slot print_timing: id  0 | task 0 | n_decoded =    309, tg =  51.26 t/s, tg_3s =  48.24 t/s
+0.12.477.116 I slot print_timing: id  0 | task 0 | n_decoded =    431, tg =  47.63 t/s, tg_3s =  40.38 t/s
+0.15.495.233 I slot print_timing: id  0 | task 0 | n_decoded =    552, tg =  45.74 t/s, tg_3s =  40.09 t/s
+0.18.527.743 I slot print_timing: id  0 | task 0 | n_decoded =    687, tg =  45.50 t/s, tg_3s =  44.52 t/s
+0.21.557.932 I slot print_timing: id  0 | task 0 | n_decoded =    809, tg =  44.62 t/s, tg_3s =  40.26 t/s
+
+=== A-dspark-coding ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 327.3774880689093
+predicted_per_second: 10.682007548725489
+predicted_n: 1200
+vram/rss summary:
+samples: 215
+vram_mib: min=11206 max=11258 last=11258
+rss_mib: min=3252.4 max=4033.4 last=4033.4
+vmhwm_mib: max=10331.8
+server print_timing / memory breakdown:
+1.26.674.657 I slot print_timing: id  0 | task 0 | n_decoded =    911, tg =  10.96 t/s, tg_3s =  11.19 t/s
+1.29.766.805 I slot print_timing: id  0 | task 0 | n_decoded =    937, tg =  10.86 t/s, tg_3s =   8.41 t/s
+1.32.782.990 I slot print_timing: id  0 | task 0 | n_decoded =    968, tg =  10.85 t/s, tg_3s =  10.28 t/s
+1.35.829.740 I slot print_timing: id  0 | task 0 | n_decoded =    998, tg =  10.81 t/s, tg_3s =   9.85 t/s
+1.38.850.538 I slot print_timing: id  0 | task 0 | n_decoded =   1027, tg =  10.77 t/s, tg_3s =   9.60 t/s
+1.41.878.599 I slot print_timing: id  0 | task 0 | n_decoded =   1055, tg =  10.73 t/s, tg_3s =   9.25 t/s
+1.44.965.837 I slot print_timing: id  0 | task 0 | n_decoded =   1089, tg =  10.74 t/s, tg_3s =  11.01 t/s
+1.48.018.758 I slot print_timing: id  0 | task 0 | n_decoded =   1117, tg =  10.69 t/s, tg_3s =   9.17 t/s
+1.51.090.768 I slot print_timing: id  0 | task 0 | n_decoded =   1147, tg =  10.66 t/s, tg_3s =   9.77 t/s
+1.54.189.999 I slot print_timing: id  0 | task 0 | n_decoded =   1176, tg =  10.63 t/s, tg_3s =   9.36 t/s
+1.55.864.538 I slot print_timing: id  0 | task 0 | prompt eval time =     412.37 ms /   135 tokens (    3.05 ms per token,   327.38 tokens per second)
+1.55.864.540 I slot print_timing: id  0 | task 0 |        eval time =  112338.43 ms /  1200 tokens (   93.62 ms per token,    10.68 tokens per second)
+1.55.864.541 I slot print_timing: id  0 | task 0 |       total time =  112750.80 ms /  1335 tokens
+1.55.864.544 I slot print_timing: id  0 | task 0 |    graphs reused =        710
+1.55.864.548 I slot print_timing: id  0 | task 0 | draft acceptance = 0.95000 (  228 accepted /   240 generated), mean len =  2.40
+1.55.864.548 I slot print_timing: id  0 | task 0 |      acc per pos = (0.963, 0.337, 0.080, 0.018, 0.000, 0.000)
+1.55.864.549 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.55.864.549 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.55.864.565 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.233 ms), draft 1 (0 grow / 0 shrink, 0.577 ms)
+1.55.897.293 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-baseline-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 23
+vram_mib: min=9748 max=9822 last=9822
+rss_mib: min=1555.3 max=2080.6 last=2080.6
+vmhwm_mib: max=10341.2
+server print_timing / memory breakdown:
+0.00.360.115 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.895.170 I srv    load_model: speculative decoding will use checkpoints
+0.01.895.244 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.05.413.346 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.40 s / 1204.72 tokens per second
+0.07.159.845 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.15 s / 1193.83 tokens per second
+0.08.954.274 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   6.94 s / 1180.25 tokens per second
+0.10.798.642 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   8.79 s / 1165.59 tokens per second
+0.11.974.763 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =   9.96 s / 1152.85 tokens per second
+0.12.005.778 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 149.626 MiB)
+0.12.481.978 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  10.47 s / 1145.90 tokens per second
+0.12.513.325 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 149.626 MiB)
+0.13.638.493 I slot print_timing: id  0 | task 0 | prompt eval time =   10563.22 ms / 12000 tokens (    0.88 ms per token,  1136.02 tokens per second)
+0.13.638.496 I slot print_timing: id  0 | task 0 |        eval time =    1061.87 ms /    25 tokens (   42.47 ms per token,    23.54 tokens per second)
+0.13.638.497 I slot print_timing: id  0 | task 0 |       total time =   11625.09 ms / 12025 tokens
+0.13.638.499 I slot print_timing: id  0 | task 0 |    graphs reused =         23
+0.13.670.072 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A-mtp-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 22
+vram_mib: min=10826 max=10890 last=10890
+rss_mib: min=1628.2 max=2311.2 last=2311.2
+vmhwm_mib: max=10339.8
+server print_timing / memory breakdown:
+0.02.217.489 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.217.641 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.06.679.975 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.55 s / 1154.34 tokens per second
+0.08.496.994 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.37 s / 1145.12 tokens per second
+0.10.364.386 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   7.23 s / 1132.62 tokens per second
+0.12.290.365 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   9.16 s / 1118.06 tokens per second
+0.13.518.611 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =  10.39 s / 1105.61 tokens per second
+0.13.552.213 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 173.696 MiB)
+0.14.056.678 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  10.93 s / 1098.03 tokens per second
+0.14.088.980 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 174.769 MiB)
+0.14.504.135 I slot print_timing: id  0 | task 0 | prompt eval time =   11020.75 ms / 12000 tokens (    0.92 ms per token,  1088.86 tokens per second)
+0.14.504.138 I slot print_timing: id  0 | task 0 |        eval time =     351.74 ms /    25 tokens (   14.07 ms per token,    71.08 tokens per second)
+0.14.504.138 I slot print_timing: id  0 | task 0 |       total time =   11372.49 ms / 12025 tokens
+0.14.504.140 I slot print_timing: id  0 | task 0 |    graphs reused =          3
+0.14.504.143 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   20 accepted /    20 generated), mean len =  6.00
+0.14.504.143 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 1.000, 1.000, 1.000, 1.000)
+0.14.504.144 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.14.504.144 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.14.504.171 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.338 ms)
+0.14.536.092 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A-dspark-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 36
+vram_mib: min=11142 max=11312 last=11312
+rss_mib: min=3219.5 max=4783.1 last=4783.1
+vmhwm_mib: max=10340.2
+server print_timing / memory breakdown:
+0.00.638.814 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.484.252 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.07.014.011 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.91 s / 1048.05 tokens per second
+0.08.966.753 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.86 s / 1048.29 tokens per second
+0.10.962.700 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   7.86 s / 1042.65 tokens per second
+0.13.009.256 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   9.90 s / 1033.98 tokens per second
+0.14.317.139 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =  11.21 s / 1024.32 tokens per second
+0.14.364.673 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 268.915 MiB)
+0.14.898.746 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  11.79 s / 1017.22 tokens per second
+0.14.948.765 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 274.234 MiB)
+0.21.878.282 I slot print_timing: id  0 | task 0 | prompt eval time =   11912.40 ms / 12000 tokens (    0.99 ms per token,  1007.35 tokens per second)
+0.21.878.284 I slot print_timing: id  0 | task 0 |        eval time =    6860.09 ms /    25 tokens (  274.40 ms per token,     3.64 tokens per second)
+0.21.878.285 I slot print_timing: id  0 | task 0 |       total time =   18772.49 ms / 12025 tokens
+0.21.878.288 I slot print_timing: id  0 | task 0 |    graphs reused =          4
+0.21.878.291 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   11 accepted /    11 generated), mean len =  2.57
+0.21.878.292 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.429, 0.143, 0.000, 0.000, 0.000)
+0.21.878.292 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.21.878.293 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.21.878.310 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.515 ms), draft 1 (0 grow / 0 shrink, 0.534 ms)
+0.21.904.221 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== B-dspark-default-nmax ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 326.6890428495028
+predicted_per_second: 10.903615113580868
+predicted_n: 1200
+vram/rss summary:
+samples: 210
+vram_mib: min=10758 max=10800 last=10800
+rss_mib: min=3248.8 max=4067.4 last=4067.4
+vmhwm_mib: max=10340.2
+server print_timing / memory breakdown:
+1.23.208.092 I slot print_timing: id  0 | task 0 | n_decoded =    884, tg =  11.09 t/s, tg_3s =  10.10 t/s
+1.26.296.471 I slot print_timing: id  0 | task 0 | n_decoded =    914, tg =  11.04 t/s, tg_3s =   9.71 t/s
+1.29.390.551 I slot print_timing: id  0 | task 0 | n_decoded =    944, tg =  10.99 t/s, tg_3s =   9.70 t/s
+1.32.456.620 I slot print_timing: id  0 | task 0 | n_decoded =    983, tg =  11.05 t/s, tg_3s =  12.72 t/s
+1.35.457.440 I slot print_timing: id  0 | task 0 | n_decoded =   1012, tg =  11.00 t/s, tg_3s =   9.66 t/s
+1.38.566.393 I slot print_timing: id  0 | task 0 | n_decoded =   1042, tg =  10.96 t/s, tg_3s =   9.65 t/s
+1.41.569.332 I slot print_timing: id  0 | task 0 | n_decoded =   1071, tg =  10.92 t/s, tg_3s =   9.66 t/s
+1.44.639.711 I slot print_timing: id  0 | task 0 | n_decoded =   1106, tg =  10.94 t/s, tg_3s =  11.40 t/s
+1.47.711.356 I slot print_timing: id  0 | task 0 | n_decoded =   1140, tg =  10.94 t/s, tg_3s =  11.07 t/s
+1.50.783.139 I slot print_timing: id  0 | task 0 | n_decoded =   1171, tg =  10.91 t/s, tg_3s =  10.09 t/s
+1.53.552.298 I slot print_timing: id  0 | task 0 | prompt eval time =     413.24 ms /   135 tokens (    3.06 ms per token,   326.69 tokens per second)
+1.53.552.300 I slot print_timing: id  0 | task 0 |        eval time =  110055.24 ms /  1200 tokens (   91.71 ms per token,    10.90 tokens per second)
+1.53.552.301 I slot print_timing: id  0 | task 0 |       total time =  110468.48 ms /  1335 tokens
+1.53.552.303 I slot print_timing: id  0 | task 0 |    graphs reused =        787
+1.53.552.307 I slot print_timing: id  0 | task 0 | draft acceptance = 0.94872 (  185 accepted /   195 generated), mean len =  2.36
+1.53.552.307 I slot print_timing: id  0 | task 0 |      acc per pos = (0.956, 0.316, 0.088)
+1.53.552.307 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.53.552.308 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.53.552.323 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.284 ms), draft 1 (0 grow / 0 shrink, 0.458 ms)
+1.53.589.829 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== B-dspark-explicit-nmax6 ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 325.3443227415682
+predicted_per_second: 10.719246141145085
+predicted_n: 1200
+vram/rss summary:
+samples: 214
+vram_mib: min=11206 max=11258 last=11258
+rss_mib: min=3250.4 max=4069.2 last=4069.2
+vmhwm_mib: max=10342.2
+server print_timing / memory breakdown:
+1.26.696.183 I slot print_timing: id  0 | task 0 | n_decoded =    914, tg =  10.99 t/s, tg_3s =   9.93 t/s
+1.29.758.629 I slot print_timing: id  0 | task 0 | n_decoded =    940, tg =  10.90 t/s, tg_3s =   8.49 t/s
+1.32.782.916 I slot print_timing: id  0 | task 0 | n_decoded =    971, tg =  10.88 t/s, tg_3s =  10.25 t/s
+1.35.815.930 I slot print_timing: id  0 | task 0 | n_decoded =   1001, tg =  10.84 t/s, tg_3s =   9.89 t/s
+1.38.858.009 I slot print_timing: id  0 | task 0 | n_decoded =   1032, tg =  10.82 t/s, tg_3s =  10.19 t/s
+1.41.876.052 I slot print_timing: id  0 | task 0 | n_decoded =   1060, tg =  10.78 t/s, tg_3s =   9.28 t/s
+1.44.944.940 I slot print_timing: id  0 | task 0 | n_decoded =   1092, tg =  10.76 t/s, tg_3s =  10.43 t/s
+1.48.010.946 I slot print_timing: id  0 | task 0 | n_decoded =   1124, tg =  10.76 t/s, tg_3s =  10.44 t/s
+1.51.056.529 I slot print_timing: id  0 | task 0 | n_decoded =   1150, tg =  10.69 t/s, tg_3s =   8.54 t/s
+1.54.152.797 I slot print_timing: id  0 | task 0 | n_decoded =   1180, tg =  10.66 t/s, tg_3s =   9.69 t/s
+1.55.452.711 I slot print_timing: id  0 | task 0 | prompt eval time =     414.94 ms /   135 tokens (    3.07 ms per token,   325.34 tokens per second)
+1.55.452.715 I slot print_timing: id  0 | task 0 |        eval time =  111948.17 ms /  1200 tokens (   93.29 ms per token,    10.72 tokens per second)
+1.55.452.715 I slot print_timing: id  0 | task 0 |       total time =  112363.12 ms /  1335 tokens
+1.55.452.718 I slot print_timing: id  0 | task 0 |    graphs reused =        710
+1.55.452.723 I slot print_timing: id  0 | task 0 | draft acceptance = 0.95000 (  228 accepted /   240 generated), mean len =  2.40
+1.55.452.723 I slot print_timing: id  0 | task 0 |      acc per pos = (0.963, 0.337, 0.080, 0.018, 0.000, 0.000)
+1.55.452.724 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.55.452.724 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.55.452.739 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.245 ms), draft 1 (0 grow / 0 shrink, 0.500 ms)
+1.55.494.562 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== C-mtp-ubatch512 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 248.80005805334687
+predicted_per_second: 68.83393168662492
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10898 max=10948 last=10948
+rss_mib: min=1696.9 max=2220.5 last=2220.5
+vmhwm_mib: max=10339.8
+server print_timing / memory breakdown:
+0.00.361.175 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.655.083 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.228.962 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.229.118 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.269.802 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.362.324 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.336.695 I slot print_timing: id  0 | task 0 | prompt eval time =     289.39 ms /    72 tokens (    4.02 ms per token,   248.80 tokens per second)
+0.04.336.697 I slot print_timing: id  0 | task 0 |        eval time =     929.77 ms /    64 tokens (   14.53 ms per token,    68.83 tokens per second)
+0.04.336.698 I slot print_timing: id  0 | task 0 |       total time =    1219.16 ms /   136 tokens
+0.04.336.700 I slot print_timing: id  0 | task 0 |    graphs reused =          2
+0.04.336.704 I slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (   45 accepted /    60 generated), mean len =  3.65
+0.04.336.704 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.336.704 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.336.705 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.336.733 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.311 ms)
+0.04.365.892 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== C-mtp-ubatch128 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 249.77017674709037
+predicted_per_second: 68.77956043412799
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10826 max=10876 last=10876
+rss_mib: min=1673.8 max=2195.5 last=2195.5
+vmhwm_mib: max=10339.9
+server print_timing / memory breakdown:
+0.00.354.245 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.648.924 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.213.906 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.214.068 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.258.769 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.351.154 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.325.586 I slot print_timing: id  0 | task 0 | prompt eval time =     288.26 ms /    72 tokens (    4.00 ms per token,   249.77 tokens per second)
+0.04.325.588 I slot print_timing: id  0 | task 0 |        eval time =     930.51 ms /    64 tokens (   14.54 ms per token,    68.78 tokens per second)
+0.04.325.589 I slot print_timing: id  0 | task 0 |       total time =    1218.77 ms /   136 tokens
+0.04.325.592 I slot print_timing: id  0 | task 0 |    graphs reused =          2
+0.04.325.595 I slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (   45 accepted /    60 generated), mean len =  3.65
+0.04.325.595 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.325.596 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.325.596 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.325.625 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.313 ms)
+0.04.359.503 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== C-mtp-ubatch32 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 247.9953707530793
+predicted_per_second: 69.06047539504749
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10808 max=10858 last=10858
+rss_mib: min=1674.2 max=2189.7 last=2189.7
+vmhwm_mib: max=10340.9
+server print_timing / memory breakdown:
+0.00.347.454 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.641.266 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.216.757 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.216.937 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.266.106 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.358.236 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.329.633 I slot print_timing: id  0 | task 0 | prompt eval time =     290.33 ms /    72 tokens (    4.03 ms per token,   248.00 tokens per second)
+0.04.329.637 I slot print_timing: id  0 | task 0 |        eval time =     926.72 ms /    64 tokens (   14.48 ms per token,    69.06 tokens per second)
+0.04.329.637 I slot print_timing: id  0 | task 0 |       total time =    1217.05 ms /   136 tokens
+0.04.329.639 I slot print_timing: id  0 | task 0 |    graphs reused =          2
+0.04.329.643 I slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (   45 accepted /    60 generated), mean len =  3.65
+0.04.329.643 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.329.644 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.329.644 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.329.673 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.324 ms)
+0.04.366.646 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== C-dspark-ubatch128-control ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 187.3663063335016
+predicted_per_second: 16.952367027222323
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=10852 max=10892 last=10892
+rss_mib: min=3233.1 max=3967.4 last=3967.4
+vmhwm_mib: max=10340.3
+server print_timing / memory breakdown:
+0.00.648.931 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.500.914 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.323.386 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.03.446.330 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.07.271.908 I slot print_timing: id  0 | task 0 | prompt eval time =     384.27 ms /    72 tokens (    5.34 ms per token,   187.37 tokens per second)
+0.07.271.911 I slot print_timing: id  0 | task 0 |        eval time =    3775.28 ms /    64 tokens (   58.99 ms per token,    16.95 tokens per second)
+0.07.271.912 I slot print_timing: id  0 | task 0 |       total time =    4159.56 ms /   136 tokens
+0.07.271.915 I slot print_timing: id  0 | task 0 |    graphs reused =          8
+0.07.271.920 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.07.271.921 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.07.271.921 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.07.271.921 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.07.271.937 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.290 ms), draft 1 (0 grow / 0 shrink, 0.433 ms)
+0.07.298.350 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-baseline-kgl0 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 266.9088617449167
+predicted_per_second: 39.637441279298415
+predicted_n: 64
+vram/rss summary:
+samples: 4
+vram_mib: min=9758 max=9782 last=9782
+rss_mib: min=1610.6 max=2062.2 last=2062.2
+vmhwm_mib: max=10339.8
+server print_timing / memory breakdown:
+0.00.364.189 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.904.847 I srv    load_model: speculative decoding will use checkpoints
+0.01.904.919 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.138.420 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.227.765 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.626 MiB)
+0.03.884.255 I slot print_timing: id  0 | task 0 | prompt eval time =     269.75 ms /    72 tokens (    3.75 ms per token,   266.91 tokens per second)
+0.03.884.257 I slot print_timing: id  0 | task 0 |        eval time =    1614.63 ms /    64 tokens (   25.23 ms per token,    39.64 tokens per second)
+0.03.884.258 I slot print_timing: id  0 | task 0 |       total time =    1884.39 ms /   136 tokens
+0.03.884.260 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.03.919.966 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== D-mtp-kgl0 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 249.39037907337618
+predicted_per_second: 69.01303807255212
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10826 max=10876 last=10876
+rss_mib: min=1672.3 max=2195.5 last=2195.5
+vmhwm_mib: max=10339.7
+server print_timing / memory breakdown:
+0.00.360.434 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.660.052 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.242.411 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.242.598 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.288.368 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.380.674 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.352.609 I slot print_timing: id  0 | task 0 | prompt eval time =     288.70 ms /    72 tokens (    4.01 ms per token,   249.39 tokens per second)
+0.04.352.612 I slot print_timing: id  0 | task 0 |        eval time =     927.36 ms /    64 tokens (   14.49 ms per token,    69.01 tokens per second)
+0.04.352.612 I slot print_timing: id  0 | task 0 |       total time =    1216.07 ms /   136 tokens
+0.04.352.615 I slot print_timing: id  0 | task 0 |    graphs reused =          2
+0.04.352.619 I slot print_timing: id  0 | task 0 | draft acceptance = 0.75000 (   45 accepted /    60 generated), mean len =  3.65
+0.04.352.619 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.352.620 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.352.620 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.352.634 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.300 ms)
+0.04.386.295 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-dspark-kgl0 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 187.52002166898026
+predicted_per_second: 16.979126816567597
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=11206 max=11246 last=11246
+rss_mib: min=3250.2 max=3976.8 last=3976.8
+vmhwm_mib: max=10342.3
+server print_timing / memory breakdown:
+0.00.650.993 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.502.074 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.324.525 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.03.447.168 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.07.266.680 I slot print_timing: id  0 | task 0 | prompt eval time =     383.96 ms /    72 tokens (    5.33 ms per token,   187.52 tokens per second)
+0.07.266.683 I slot print_timing: id  0 | task 0 |        eval time =    3769.33 ms /    64 tokens (   58.90 ms per token,    16.98 tokens per second)
+0.07.266.684 I slot print_timing: id  0 | task 0 |       total time =    4153.29 ms /   136 tokens
+0.07.266.687 I slot print_timing: id  0 | task 0 |    graphs reused =          8
+0.07.266.692 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.07.266.692 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.07.266.693 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.07.266.693 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.07.266.709 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.310 ms), draft 1 (0 grow / 0 shrink, 0.461 ms)
+0.07.294.184 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-baseline-kgl8 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 270.6583765008383
+predicted_per_second: 39.886149970677444
+predicted_n: 64
+vram/rss summary:
+samples: 4
+vram_mib: min=10030 max=10052 last=10052
+rss_mib: min=1324.6 max=1789.3 last=1789.3
+vmhwm_mib: max=10340.2
+server print_timing / memory breakdown:
+0.00.356.722 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.835.800 I srv    load_model: speculative decoding will use checkpoints
+0.01.835.872 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.139.755 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.228.084 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.626 MiB)
+0.03.872.703 I slot print_timing: id  0 | task 0 | prompt eval time =     266.02 ms /    72 tokens (    3.69 ms per token,   270.66 tokens per second)
+0.03.872.705 I slot print_timing: id  0 | task 0 |        eval time =    1604.57 ms /    64 tokens (   25.07 ms per token,    39.89 tokens per second)
+0.03.872.705 I slot print_timing: id  0 | task 0 |       total time =    1870.59 ms /   136 tokens
+0.03.872.708 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.03.906.977 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== D-mtp-kgl8 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 251.78170526153824
+predicted_per_second: 71.16464273681424
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=11098 max=11140 last=11140
+rss_mib: min=1370.1 max=1897.5 last=1897.5
+vmhwm_mib: max=10339.7
+server print_timing / memory breakdown:
+0.00.346.355 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.635.678 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.142.139 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.142.295 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.243.526 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.335.890 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.276.859 I slot print_timing: id  0 | task 0 | prompt eval time =     285.96 ms /    72 tokens (    3.97 ms per token,   251.78 tokens per second)
+0.04.276.861 I slot print_timing: id  0 | task 0 |        eval time =     899.32 ms /    64 tokens (   14.05 ms per token,    71.16 tokens per second)
+0.04.276.862 I slot print_timing: id  0 | task 0 |       total time =    1185.28 ms /   136 tokens
+0.04.276.864 I slot print_timing: id  0 | task 0 |    graphs reused =          3
+0.04.276.867 I slot print_timing: id  0 | task 0 | draft acceptance = 0.78947 (   45 accepted /    57 generated), mean len =  3.65
+0.04.276.867 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.276.868 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.276.868 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.276.882 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.301 ms)
+0.04.309.617 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-dspark-kgl8 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 187.28491498045216
+predicted_per_second: 16.955115570306507
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=11464 max=11504 last=11504
+rss_mib: min=2988.8 max=3711.4 last=3711.4
+vmhwm_mib: max=10340.3
+server print_timing / memory breakdown:
+0.00.636.923 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.417.950 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.303.877 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.03.425.829 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.07.248.874 I slot print_timing: id  0 | task 0 | prompt eval time =     384.44 ms /    72 tokens (    5.34 ms per token,   187.28 tokens per second)
+0.07.248.877 I slot print_timing: id  0 | task 0 |        eval time =    3774.67 ms /    64 tokens (   58.98 ms per token,    16.96 tokens per second)
+0.07.248.877 I slot print_timing: id  0 | task 0 |       total time =    4159.11 ms /   136 tokens
+0.07.248.880 I slot print_timing: id  0 | task 0 |    graphs reused =          6
+0.07.248.885 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.07.248.885 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.07.248.886 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.07.248.886 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.07.248.902 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 6.254 ms), draft 1 (0 grow / 0 shrink, 0.416 ms)
+0.07.276.254 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-baseline-kgl16 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 301.1027889645828
+predicted_per_second: 40.44916267073181
+predicted_n: 64
+vram/rss summary:
+samples: 4
+vram_mib: min=10268 max=10290 last=10290
+rss_mib: min=1052.4 max=1517.1 last=1517.1
+vmhwm_mib: max=10339.2
+server print_timing / memory breakdown:
+0.00.354.426 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.01.761.923 I srv    load_model: speculative decoding will use checkpoints
+0.01.761.997 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.123.415 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.198.137 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.626 MiB)
+0.03.820.721 I slot print_timing: id  0 | task 0 | prompt eval time =     239.12 ms /    72 tokens (    3.32 ms per token,   301.10 tokens per second)
+0.03.820.723 I slot print_timing: id  0 | task 0 |        eval time =    1582.23 ms /    64 tokens (   24.72 ms per token,    40.45 tokens per second)
+0.03.820.723 I slot print_timing: id  0 | task 0 |       total time =    1821.35 ms /   136 tokens
+0.03.820.726 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.03.848.935 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-mtp-kgl16 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 253.09247366256446
+predicted_per_second: 71.01579213677641
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=11336 max=11378 last=11378
+rss_mib: min=1097.1 max=1627.5 last=1627.5
+vmhwm_mib: max=10339.8
+server print_timing / memory breakdown:
+0.00.352.578 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.643.797 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.082.142 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.082.294 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.246.400 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.337.797 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.280.529 I slot print_timing: id  0 | task 0 | prompt eval time =     284.48 ms /    72 tokens (    3.95 ms per token,   253.09 tokens per second)
+0.04.280.531 I slot print_timing: id  0 | task 0 |        eval time =     901.21 ms /    64 tokens (   14.08 ms per token,    71.02 tokens per second)
+0.04.280.531 I slot print_timing: id  0 | task 0 |       total time =    1185.69 ms /   136 tokens
+0.04.280.534 I slot print_timing: id  0 | task 0 |    graphs reused =          3
+0.04.280.537 I slot print_timing: id  0 | task 0 | draft acceptance = 0.78947 (   45 accepted /    57 generated), mean len =  3.65
+0.04.280.538 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.280.538 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.280.539 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.280.553 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.293 ms)
+0.04.315.210 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== D-dspark-kgl16 ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 186.56136314169333
+predicted_per_second: 16.9787304260441
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=11702 max=11742 last=11742
+rss_mib: min=2726.2 max=3443.8 last=3443.8
+vmhwm_mib: max=10344.0
+server print_timing / memory breakdown:
+0.00.632.650 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.346.817 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.299.697 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.03.421.055 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.07.238.400 I slot print_timing: id  0 | task 0 | prompt eval time =     385.93 ms /    72 tokens (    5.36 ms per token,   186.56 tokens per second)
+0.07.238.402 I slot print_timing: id  0 | task 0 |        eval time =    3769.42 ms /    64 tokens (   58.90 ms per token,    16.98 tokens per second)
+0.07.238.402 I slot print_timing: id  0 | task 0 |       total time =    4155.35 ms /   136 tokens
+0.07.238.405 I slot print_timing: id  0 | task 0 |    graphs reused =          6
+0.07.238.409 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.07.238.409 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.07.238.410 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.07.238.410 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.07.238.426 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 10.007 ms), draft 1 (0 grow / 0 shrink, 0.419 ms)
+0.07.270.990 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== E-mtp-planes-full ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/E-mtp-planes-full.response.json'
+vram/rss summary:
+samples: 60
+vram_mib: min=10938 max=10980 last=10980
+rss_mib: min=1701.7 max=2334.4 last=2334.4
+vmhwm_mib: max=10342.4
+server print_timing / memory breakdown:
+0.00.350.801 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.645.386 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.217.676 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.217.829 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.258.765 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.811 MiB)
+0.03.382.621 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 150.160 MiB)
+0.06.439.887 I slot print_timing: id  0 | task 0 | n_decoded =    162, tg =  53.77 t/s, tg_3s =  53.77 t/s
+0.09.440.857 I slot print_timing: id  0 | task 0 | n_decoded =    287, tg =  47.72 t/s, tg_3s =  41.65 t/s
+0.12.445.343 I slot print_timing: id  0 | task 0 | n_decoded =    431, tg =  47.79 t/s, tg_3s =  47.93 t/s
+0.15.470.135 I slot print_timing: id  0 | task 0 | n_decoded =    554, tg =  46.00 t/s, tg_3s =  40.66 t/s
+0.18.477.367 I slot print_timing: id  0 | task 0 | n_decoded =    682, tg =  45.32 t/s, tg_3s =  42.56 t/s
+0.21.490.710 I slot print_timing: id  0 | task 0 | n_decoded =    806, tg =  44.62 t/s, tg_3s =  41.15 t/s
+0.24.508.043 I slot print_timing: id  0 | task 0 | n_decoded =    931, tg =  44.16 t/s, tg_3s =  41.43 t/s
+0.27.532.308 I slot print_timing: id  0 | task 0 | n_decoded =   1068, tg =  44.31 t/s, tg_3s =  45.30 t/s
+
+=== E-mtp-planes-capped4 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/E-mtp-planes-capped4.response.json'
+vram/rss summary:
+samples: 34
+vram_mib: min=10490 max=10532 last=10532
+rss_mib: min=1714.0 max=2340.0 last=2340.0
+vmhwm_mib: max=10343.3
+server print_timing / memory breakdown:
+0.00.346.117 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.634.928 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.202.829 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 4, direct rollback horizon = 2, recurrent allocation = 4 planes (4 per slot), full-shape GPU replay = enabled
+0.02.203.016 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.245.823 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.811 MiB)
+0.03.370.062 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 150.160 MiB)
+0.06.435.785 I slot print_timing: id  0 | task 0 | n_decoded =    161, tg =  53.27 t/s, tg_3s =  53.27 t/s
+0.09.457.476 I slot print_timing: id  0 | task 0 | n_decoded =    287, tg =  47.49 t/s, tg_3s =  41.70 t/s
+0.12.481.816 I slot print_timing: id  0 | task 0 | n_decoded =    429, tg =  47.31 t/s, tg_3s =  46.95 t/s
+0.15.500.920 I slot print_timing: id  0 | task 0 | n_decoded =    548, tg =  45.34 t/s, tg_3s =  39.42 t/s
+
+=== E-dspark-planes-rejected ===
+FAILED to start (see /tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/E-dspark-planes-rejected.log)
+=== F-mtp-phaseaware-off ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 422.26955811836683
+predicted_per_second: 43.40736845867235
+predicted_n: 1200
+vram/rss summary:
+samples: 54
+vram_mib: min=10826 max=10868 last=10868
+rss_mib: min=1675.3 max=2208.9 last=2208.9
+vmhwm_mib: max=10343.4
+server print_timing / memory breakdown:
+0.03.389.454 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.442.732 I slot print_timing: id  0 | task 0 | n_decoded =    164, tg =  54.50 t/s, tg_3s =  54.50 t/s
+0.09.442.732 I slot print_timing: id  0 | task 0 | n_decoded =    309, tg =  51.42 t/s, tg_3s =  48.33 t/s
+0.12.456.620 I slot print_timing: id  0 | task 0 | n_decoded =    431, tg =  47.77 t/s, tg_3s =  40.48 t/s
+0.15.467.478 I slot print_timing: id  0 | task 0 | n_decoded =    552, tg =  45.87 t/s, tg_3s =  40.19 t/s
+0.18.491.216 I slot print_timing: id  0 | task 0 | n_decoded =    687, tg =  45.62 t/s, tg_3s =  44.65 t/s
+0.21.510.631 I slot print_timing: id  0 | task 0 | n_decoded =    809, tg =  44.75 t/s, tg_3s =  40.41 t/s
+0.24.511.150 I slot print_timing: id  0 | task 0 | n_decoded =    921, tg =  43.70 t/s, tg_3s =  37.33 t/s
+0.27.518.456 I slot print_timing: id  0 | task 0 | n_decoded =   1040, tg =  43.18 t/s, tg_3s =  39.57 t/s
+0.30.537.732 I slot print_timing: id  0 | task 0 | n_decoded =   1180, tg =  43.54 t/s, tg_3s =  46.37 t/s
+0.31.078.710 I slot print_timing: id  0 | task 0 | prompt eval time =     319.70 ms /   135 tokens (    2.37 ms per token,   422.27 tokens per second)
+0.31.078.713 I slot print_timing: id  0 | task 0 |        eval time =   27645.08 ms /  1200 tokens (   23.04 ms per token,    43.41 tokens per second)
+0.31.078.714 I slot print_timing: id  0 | task 0 |       total time =   27964.78 ms /  1335 tokens
+0.31.078.716 I slot print_timing: id  0 | task 0 |    graphs reused =        430
+0.31.078.720 I slot print_timing: id  0 | task 0 | draft acceptance = 0.87665 (  398 accepted /   454 generated), mean len =  2.61
+0.31.078.720 I slot print_timing: id  0 | task 0 |      acc per pos = (0.919, 0.360, 0.178, 0.093, 0.061)
+0.31.078.721 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.31.078.721 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.31.078.754 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.291 ms)
+0.31.116.716 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== F-mtp-phaseaware-on ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 392.2491566643132
+predicted_per_second: 42.95039583621683
+predicted_n: 1200
+vram/rss summary:
+samples: 54
+vram_mib: min=10648 max=10702 last=10648
+rss_mib: min=1628.5 max=2168.9 last=2168.9
+vmhwm_mib: max=10343.3
+server print_timing / memory breakdown:
+0.03.391.752 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.448.994 I slot print_timing: id  0 | task 0 | n_decoded =    162, tg =  53.96 t/s, tg_3s =  53.96 t/s
+0.09.476.197 I slot print_timing: id  0 | task 0 | n_decoded =    307, tg =  50.92 t/s, tg_3s =  47.90 t/s
+0.12.483.703 I slot print_timing: id  0 | task 0 | n_decoded =    428, tg =  47.36 t/s, tg_3s =  40.23 t/s
+0.15.509.298 I slot print_timing: id  0 | task 0 | n_decoded =    545, tg =  45.18 t/s, tg_3s =  38.67 t/s
+0.18.513.935 I slot print_timing: id  0 | task 0 | n_decoded =    680, tg =  45.13 t/s, tg_3s =  44.93 t/s
+0.21.543.393 I slot print_timing: id  0 | task 0 | n_decoded =    802, tg =  44.32 t/s, tg_3s =  40.27 t/s
+0.24.543.788 I slot print_timing: id  0 | task 0 | n_decoded =    911, tg =  43.18 t/s, tg_3s =  36.33 t/s
+0.27.580.499 I slot print_timing: id  0 | task 0 | n_decoded =   1032, tg =  42.76 t/s, tg_3s =  39.85 t/s
+0.30.600.652 I slot print_timing: id  0 | task 0 | n_decoded =   1167, tg =  42.98 t/s, tg_3s =  44.70 t/s
+0.31.385.891 I slot print_timing: id  0 | task 0 | prompt eval time =     344.17 ms /   135 tokens (    2.55 ms per token,   392.25 tokens per second)
+0.31.385.894 I slot print_timing: id  0 | task 0 |        eval time =   27939.21 ms /  1200 tokens (   23.28 ms per token,    42.95 tokens per second)
+0.31.385.895 I slot print_timing: id  0 | task 0 |       total time =   28283.38 ms /  1335 tokens
+0.31.385.898 I slot print_timing: id  0 | task 0 |    graphs reused =        430
+0.31.385.901 I slot print_timing: id  0 | task 0 | draft acceptance = 0.87665 (  398 accepted /   454 generated), mean len =  2.61
+0.31.385.901 I slot print_timing: id  0 | task 0 |      acc per pos = (0.919, 0.360, 0.178, 0.093, 0.061)
+0.31.385.902 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.31.385.902 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.31.385.918 I slot print_timing: id  0 | task 0 | workspace transitions = target 2 (1 grow / 1 shrink, 16.938 ms), draft 2 (1 grow / 1 shrink, 6.220 ms)
+0.31.419.104 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== F-dspark-phaseaware-off ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 327.1513838503536
+predicted_per_second: 10.745307224361962
+predicted_n: 1200
+vram/rss summary:
+samples: 214
+vram_mib: min=11206 max=11258 last=11258
+rss_mib: min=3254.9 max=4046.6 last=4045.9
+vmhwm_mib: max=10344.0
+server print_timing / memory breakdown:
+1.26.481.831 I slot print_timing: id  0 | task 0 | n_decoded =    914, tg =  11.01 t/s, tg_3s =   9.96 t/s
+1.29.531.477 I slot print_timing: id  0 | task 0 | n_decoded =    940, tg =  10.93 t/s, tg_3s =   8.53 t/s
+1.32.540.810 I slot print_timing: id  0 | task 0 | n_decoded =    971, tg =  10.91 t/s, tg_3s =  10.30 t/s
+1.35.578.387 I slot print_timing: id  0 | task 0 | n_decoded =   1001, tg =  10.87 t/s, tg_3s =   9.88 t/s
+1.38.608.412 I slot print_timing: id  0 | task 0 | n_decoded =   1032, tg =  10.85 t/s, tg_3s =  10.23 t/s
+1.41.614.734 I slot print_timing: id  0 | task 0 | n_decoded =   1060, tg =  10.80 t/s, tg_3s =   9.31 t/s
+1.44.673.275 I slot print_timing: id  0 | task 0 | n_decoded =   1092, tg =  10.79 t/s, tg_3s =  10.46 t/s
+1.47.743.987 I slot print_timing: id  0 | task 0 | n_decoded =   1124, tg =  10.78 t/s, tg_3s =  10.42 t/s
+1.50.793.086 I slot print_timing: id  0 | task 0 | n_decoded =   1150, tg =  10.72 t/s, tg_3s =   8.53 t/s
+1.53.884.536 I slot print_timing: id  0 | task 0 | n_decoded =   1180, tg =  10.69 t/s, tg_3s =   9.70 t/s
+1.55.177.277 I slot print_timing: id  0 | task 0 | prompt eval time =     412.65 ms /   135 tokens (    3.06 ms per token,   327.15 tokens per second)
+1.55.177.280 I slot print_timing: id  0 | task 0 |        eval time =  111676.66 ms /  1200 tokens (   93.06 ms per token,    10.75 tokens per second)
+1.55.177.281 I slot print_timing: id  0 | task 0 |       total time =  112089.31 ms /  1335 tokens
+1.55.177.283 I slot print_timing: id  0 | task 0 |    graphs reused =        710
+1.55.177.287 I slot print_timing: id  0 | task 0 | draft acceptance = 0.95000 (  228 accepted /   240 generated), mean len =  2.40
+1.55.177.287 I slot print_timing: id  0 | task 0 |      acc per pos = (0.963, 0.337, 0.080, 0.018, 0.000, 0.000)
+1.55.177.288 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.55.177.288 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.55.177.303 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.372 ms), draft 1 (0 grow / 0 shrink, 0.493 ms)
+1.55.207.854 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== F-dspark-phaseaware-on ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 312.7700537732811
+predicted_per_second: 10.737834552447413
+predicted_n: 1200
+vram/rss summary:
+samples: 214
+vram_mib: min=11088 max=11206 last=11116
+rss_mib: min=3230.1 max=4020.6 last=4020.6
+vmhwm_mib: max=10348.8
+server print_timing / memory breakdown:
+1.26.707.702 I slot print_timing: id  0 | task 0 | n_decoded =    915, tg =  11.00 t/s, tg_3s =   9.66 t/s
+1.29.764.399 I slot print_timing: id  0 | task 0 | n_decoded =    943, tg =  10.94 t/s, tg_3s =   9.16 t/s
+1.32.874.499 I slot print_timing: id  0 | task 0 | n_decoded =    973, tg =  10.89 t/s, tg_3s =   9.65 t/s
+1.35.900.240 I slot print_timing: id  0 | task 0 | n_decoded =   1003, tg =  10.86 t/s, tg_3s =   9.91 t/s
+1.38.931.633 I slot print_timing: id  0 | task 0 | n_decoded =   1034, tg =  10.84 t/s, tg_3s =  10.23 t/s
+1.41.936.146 I slot print_timing: id  0 | task 0 | n_decoded =   1062, tg =  10.79 t/s, tg_3s =   9.32 t/s
+1.44.996.979 I slot print_timing: id  0 | task 0 | n_decoded =   1094, tg =  10.78 t/s, tg_3s =  10.45 t/s
+1.48.083.883 I slot print_timing: id  0 | task 0 | n_decoded =   1126, tg =  10.77 t/s, tg_3s =  10.37 t/s
+1.51.125.761 I slot print_timing: id  0 | task 0 | n_decoded =   1152, tg =  10.71 t/s, tg_3s =   8.55 t/s
+1.54.225.348 I slot print_timing: id  0 | task 0 | n_decoded =   1182, tg =  10.68 t/s, tg_3s =   9.68 t/s
+1.55.282.581 I slot print_timing: id  0 | task 0 | prompt eval time =     431.63 ms /   135 tokens (    3.20 ms per token,   312.77 tokens per second)
+1.55.282.583 I slot print_timing: id  0 | task 0 |        eval time =  111754.38 ms /  1200 tokens (   93.13 ms per token,    10.74 tokens per second)
+1.55.282.584 I slot print_timing: id  0 | task 0 |       total time =  112186.00 ms /  1335 tokens
+1.55.282.587 I slot print_timing: id  0 | task 0 |    graphs reused =        710
+1.55.282.591 I slot print_timing: id  0 | task 0 | draft acceptance = 0.95000 (  228 accepted /   240 generated), mean len =  2.40
+1.55.282.591 I slot print_timing: id  0 | task 0 |      acc per pos = (0.963, 0.337, 0.080, 0.018, 0.000, 0.000)
+1.55.282.592 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.55.282.592 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.55.282.608 I slot print_timing: id  0 | task 0 | workspace transitions = target 2 (1 grow / 1 shrink, 22.426 ms), draft 1 (0 grow / 0 shrink, 0.448 ms)
+1.55.309.515 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== smoke-mtp-ubatch-mismatch ===
+FAILED to start (see /tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/smoke-mtp-ubatch-mismatch.log)
+=== A2-baseline-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 253.59345447116962
+predicted_per_second: 39.6893563688704
+predicted_n: 64
+vram/rss summary:
+samples: 4
+vram_mib: min=9766 max=9800 last=9800
+rss_mib: min=1494.3 max=1959.2 last=1959.2
+vmhwm_mib: max=10266.3
+server print_timing / memory breakdown:
+0.00.390.987 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.07.483.875 I srv    load_model: speculative decoding will use checkpoints
+0.07.483.947 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.08.201.843 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.08.290.408 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.626 MiB)
+0.09.944.511 I slot print_timing: id  0 | task 0 | prompt eval time =     283.92 ms /    72 tokens (    3.94 ms per token,   253.59 tokens per second)
+0.09.944.514 I slot print_timing: id  0 | task 0 |        eval time =    1612.52 ms /    64 tokens (   25.20 ms per token,    39.69 tokens per second)
+0.09.944.514 I slot print_timing: id  0 | task 0 |       total time =    1896.44 ms /   136 tokens
+0.09.944.517 I slot print_timing: id  0 | task 0 |    graphs reused =         62
+0.10.014.321 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A2-mtp-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 251.8045996306866
+predicted_per_second: 70.58081392912364
+predicted_n: 64
+vram/rss summary:
+samples: 3
+vram_mib: min=10918 max=10966 last=10966
+rss_mib: min=1631.6 max=2125.5 last=2125.5
+vmhwm_mib: max=10265.8
+server print_timing / memory breakdown:
+0.00.356.076 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.654.140 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.273.614 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.273.773 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.313.559 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.405.931 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 149.788 MiB)
+0.04.356.097 I slot print_timing: id  0 | task 0 | prompt eval time =     285.94 ms /    72 tokens (    3.97 ms per token,   251.80 tokens per second)
+0.04.356.099 I slot print_timing: id  0 | task 0 |        eval time =     906.76 ms /    64 tokens (   14.17 ms per token,    70.58 tokens per second)
+0.04.356.099 I slot print_timing: id  0 | task 0 |       total time =    1192.70 ms /   136 tokens
+0.04.356.101 I slot print_timing: id  0 | task 0 |    graphs reused =          3
+0.04.356.104 I slot print_timing: id  0 | task 0 | draft acceptance = 0.78947 (   45 accepted /    57 generated), mean len =  3.65
+0.04.356.105 I slot print_timing: id  0 | task 0 |      acc per pos = (0.941, 0.706, 0.529, 0.294, 0.176)
+0.04.356.105 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.04.356.106 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.04.356.120 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.299 ms)
+0.04.392.003 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-dspark-short ===
+prompt_tokens: 72
+completion_tokens: 64
+prompt_per_second: 179.80491167083713
+predicted_per_second: 16.99933569783468
+predicted_n: 64
+vram/rss summary:
+samples: 8
+vram_mib: min=11224 max=11266 last=11266
+rss_mib: min=3177.1 max=3876.7 last=3876.7
+vmhwm_mib: max=10266.4
+server print_timing / memory breakdown:
+0.00.643.458 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.03.281.545 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.04.337.223 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 150.063 MiB)
+0.04.465.367 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 67, pos_max = 67, n_tokens = 68, size = 150.333 MiB)
+0.08.282.721 I slot print_timing: id  0 | task 0 | prompt eval time =     400.43 ms /    72 tokens (    5.56 ms per token,   179.80 tokens per second)
+0.08.282.724 I slot print_timing: id  0 | task 0 |        eval time =    3764.85 ms /    64 tokens (   58.83 ms per token,    17.00 tokens per second)
+0.08.282.724 I slot print_timing: id  0 | task 0 |       total time =    4165.29 ms /   136 tokens
+0.08.282.727 I slot print_timing: id  0 | task 0 |    graphs reused =          6
+0.08.282.731 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   30 accepted /    30 generated), mean len =  2.88
+0.08.282.731 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.500, 0.250, 0.125, 0.000, 0.000)
+0.08.282.732 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.08.282.732 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.08.282.748 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.207 ms), draft 1 (0 grow / 0 shrink, 0.434 ms)
+0.08.309.869 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-baseline-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 329.46245793800927
+predicted_per_second: 38.9231785874253
+predicted_n: 400
+vram/rss summary:
+samples: 21
+vram_mib: min=9776 max=9798 last=9798
+rss_mib: min=1513.1 max=1965.4 last=1965.4
+vmhwm_mib: max=10265.6
+server print_timing / memory breakdown:
+0.00.352.097 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.885.036 I srv    load_model: speculative decoding will use checkpoints
+0.01.885.111 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.140.023 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.231.560 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 84, pos_max = 84, n_tokens = 85, size = 149.626 MiB)
+0.05.288.099 I slot print_timing: id  0 | task 0 | n_decoded =    119, tg =  39.47 t/s, tg_3s =  39.47 t/s
+0.08.304.734 I slot print_timing: id  0 | task 0 | n_decoded =    236, tg =  39.13 t/s, tg_3s =  38.78 t/s
+0.11.307.331 I slot print_timing: id  0 | task 0 | n_decoded =    352, tg =  38.96 t/s, tg_3s =  38.63 t/s
+0.12.549.481 I slot print_timing: id  0 | task 0 | prompt eval time =     270.14 ms /    89 tokens (    3.04 ms per token,   329.46 tokens per second)
+0.12.549.483 I slot print_timing: id  0 | task 0 |        eval time =   10276.65 ms /   400 tokens (   25.69 ms per token,    38.92 tokens per second)
+0.12.549.484 I slot print_timing: id  0 | task 0 |       total time =   10546.79 ms /   489 tokens
+0.12.549.487 I slot print_timing: id  0 | task 0 |    graphs reused =        397
+0.12.583.743 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A2-mtp-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 307.0776216320658
+predicted_per_second: 46.85771572618741
+predicted_n: 400
+vram/rss summary:
+samples: 17
+vram_mib: min=10918 max=10964 last=10964
+rss_mib: min=1627.1 max=2127.6 last=2127.6
+vmhwm_mib: max=10266.0
+server print_timing / memory breakdown:
+0.00.345.309 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.636.815 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.218.531 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.218.716 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.258.277 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.353.219 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 84, pos_max = 84, n_tokens = 85, size = 149.824 MiB)
+0.06.403.794 I slot print_timing: id  0 | task 0 | n_decoded =    167, tg =  55.55 t/s, tg_3s =  55.55 t/s
+0.09.438.517 I slot print_timing: id  0 | task 0 | n_decoded =    298, tg =  49.33 t/s, tg_3s =  43.17 t/s
+0.11.933.839 I slot print_timing: id  0 | task 0 | prompt eval time =     289.83 ms /    89 tokens (    3.26 ms per token,   307.08 tokens per second)
+0.11.933.842 I slot print_timing: id  0 | task 0 |        eval time =    8536.48 ms /   400 tokens (   21.34 ms per token,    46.86 tokens per second)
+0.11.933.842 I slot print_timing: id  0 | task 0 |       total time =    8826.31 ms /   489 tokens
+0.11.933.845 I slot print_timing: id  0 | task 0 |    graphs reused =        105
+0.11.933.848 I slot print_timing: id  0 | task 0 | draft acceptance = 0.86740 (  157 accepted /   181 generated), mean len =  2.54
+0.11.933.849 I slot print_timing: id  0 | task 0 |      acc per pos = (0.912, 0.294, 0.157, 0.098, 0.078)
+0.11.933.849 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.11.933.849 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.11.933.864 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.318 ms)
+0.11.961.753 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-dspark-creative ===
+prompt_tokens: 89
+completion_tokens: 400
+prompt_per_second: 234.22531949386277
+predicted_per_second: 11.651532151718444
+predicted_n: 400
+vram/rss summary:
+samples: 67
+vram_mib: min=11224 max=11276 last=11276
+rss_mib: min=3186.6 max=3888.6 last=3888.6
+vmhwm_mib: max=10266.2
+server print_timing / memory breakdown:
+0.08.613.179 I slot print_timing: id  0 | task 0 | n_decoded =    104, tg =  20.28 t/s, tg_3s =  20.28 t/s
+0.11.716.014 I slot print_timing: id  0 | task 0 | n_decoded =    138, tg =  16.77 t/s, tg_3s =  10.96 t/s
+0.14.800.785 I slot print_timing: id  0 | task 0 | n_decoded =    170, tg =  15.02 t/s, tg_3s =  10.37 t/s
+0.17.805.453 I slot print_timing: id  0 | task 0 | n_decoded =    201, tg =  14.04 t/s, tg_3s =  10.32 t/s
+0.20.813.865 I slot print_timing: id  0 | task 0 | n_decoded =    231, tg =  13.33 t/s, tg_3s =   9.97 t/s
+0.23.846.751 I slot print_timing: id  0 | task 0 | n_decoded =    262, tg =  12.87 t/s, tg_3s =  10.22 t/s
+0.26.862.474 I slot print_timing: id  0 | task 0 | n_decoded =    291, tg =  12.45 t/s, tg_3s =   9.62 t/s
+0.29.896.354 I slot print_timing: id  0 | task 0 | n_decoded =    321, tg =  12.15 t/s, tg_3s =   9.89 t/s
+0.32.971.712 I slot print_timing: id  0 | task 0 | n_decoded =    352, tg =  11.94 t/s, tg_3s =  10.08 t/s
+0.36.003.799 I slot print_timing: id  0 | task 0 | n_decoded =    380, tg =  11.69 t/s, tg_3s =   9.23 t/s
+0.37.815.612 I slot print_timing: id  0 | task 0 | prompt eval time =     379.98 ms /    89 tokens (    4.27 ms per token,   234.23 tokens per second)
+0.37.815.615 I slot print_timing: id  0 | task 0 |        eval time =   34330.25 ms /   400 tokens (   85.83 ms per token,    11.65 tokens per second)
+0.37.815.616 I slot print_timing: id  0 | task 0 |       total time =   34710.23 ms /   489 tokens
+0.37.815.619 I slot print_timing: id  0 | task 0 |    graphs reused =        249
+0.37.815.623 I slot print_timing: id  0 | task 0 | draft acceptance = 0.95402 (   83 accepted /    87 generated), mean len =  2.98
+0.37.815.623 I slot print_timing: id  0 | task 0 |      acc per pos = (0.929, 0.381, 0.214, 0.214, 0.167, 0.071)
+0.37.815.624 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.37.815.624 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.37.815.641 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.376 ms), draft 1 (0 grow / 0 shrink, 0.452 ms)
+0.37.843.969 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-baseline-coding ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 453.4568527407268
+predicted_per_second: 37.69409158935504
+predicted_n: 1200
+vram/rss summary:
+samples: 62
+vram_mib: min=9776 max=9800 last=9800
+rss_mib: min=1519.1 max=1964.9 last=1958.3
+vmhwm_mib: max=10266.4
+server print_timing / memory breakdown:
+0.00.364.398 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.898.547 I srv    load_model: speculative decoding will use checkpoints
+0.01.898.636 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.02.137.703 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.626 MiB)
+0.02.255.367 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.626 MiB)
+0.05.321.450 I slot print_timing: id  0 | task 0 | n_decoded =    119, tg =  39.35 t/s, tg_3s =  39.35 t/s
+0.08.323.219 I slot print_timing: id  0 | task 0 | n_decoded =    234, tg =  38.83 t/s, tg_3s =  38.31 t/s
+0.11.341.737 I slot print_timing: id  0 | task 0 | n_decoded =    350, tg =  38.70 t/s, tg_3s =  38.43 t/s
+0.14.343.361 I slot print_timing: id  0 | task 0 | n_decoded =    464, tg =  38.52 t/s, tg_3s =  37.98 t/s
+0.17.349.830 I slot print_timing: id  0 | task 0 | n_decoded =    578, tg =  38.40 t/s, tg_3s =  37.92 t/s
+0.20.357.639 I slot print_timing: id  0 | task 0 | n_decoded =    691, tg =  38.26 t/s, tg_3s =  37.57 t/s
+0.23.359.746 I slot print_timing: id  0 | task 0 | n_decoded =    803, tg =  38.13 t/s, tg_3s =  37.31 t/s
+0.26.374.941 I slot print_timing: id  0 | task 0 | n_decoded =    915, tg =  38.00 t/s, tg_3s =  37.15 t/s
+0.29.388.177 I slot print_timing: id  0 | task 0 | n_decoded =   1026, tg =  37.87 t/s, tg_3s =  36.84 t/s
+0.32.399.319 I slot print_timing: id  0 | task 0 | n_decoded =   1137, tg =  37.77 t/s, tg_3s =  36.86 t/s
+0.34.132.759 I slot print_timing: id  0 | task 0 | prompt eval time =     297.71 ms /   135 tokens (    2.21 ms per token,   453.46 tokens per second)
+0.34.132.761 I slot print_timing: id  0 | task 0 |        eval time =   31835.23 ms /  1200 tokens (   26.53 ms per token,    37.69 tokens per second)
+0.34.132.762 I slot print_timing: id  0 | task 0 |       total time =   32132.94 ms /  1335 tokens
+0.34.132.764 I slot print_timing: id  0 | task 0 |    graphs reused =       1193
+0.34.160.113 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A2-mtp-coding ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 422.5841490250827
+predicted_per_second: 43.27329908347874
+predicted_n: 1200
+vram/rss summary:
+samples: 54
+vram_mib: min=10918 max=10958 last=10958
+rss_mib: min=1622.3 max=2132.0 last=2132.0
+vmhwm_mib: max=10267.4
+server print_timing / memory breakdown:
+0.03.388.212 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.440.075 I slot print_timing: id  0 | task 0 | n_decoded =    160, tg =  53.20 t/s, tg_3s =  53.20 t/s
+0.09.469.779 I slot print_timing: id  0 | task 0 | n_decoded =    285, tg =  47.21 t/s, tg_3s =  41.26 t/s
+0.12.484.998 I slot print_timing: id  0 | task 0 | n_decoded =    422, tg =  46.62 t/s, tg_3s =  45.44 t/s
+0.15.505.733 I slot print_timing: id  0 | task 0 | n_decoded =    562, tg =  46.55 t/s, tg_3s =  46.35 t/s
+0.18.518.631 I slot print_timing: id  0 | task 0 | n_decoded =    689, tg =  45.67 t/s, tg_3s =  42.15 t/s
+0.21.531.300 I slot print_timing: id  0 | task 0 | n_decoded =    810, tg =  44.75 t/s, tg_3s =  40.16 t/s
+0.24.558.159 I slot print_timing: id  0 | task 0 | n_decoded =    936, tg =  44.31 t/s, tg_3s =  41.63 t/s
+0.27.567.998 I slot print_timing: id  0 | task 0 | n_decoded =   1068, tg =  44.25 t/s, tg_3s =  43.86 t/s
+0.30.584.408 I slot print_timing: id  0 | task 0 | n_decoded =   1178, tg =  43.39 t/s, tg_3s =  36.47 t/s
+0.31.163.431 I slot print_timing: id  0 | task 0 | prompt eval time =     319.46 ms /   135 tokens (    2.37 ms per token,   422.58 tokens per second)
+0.31.163.433 I slot print_timing: id  0 | task 0 |        eval time =   27730.73 ms /  1200 tokens (   23.11 ms per token,    43.27 tokens per second)
+0.31.163.434 I slot print_timing: id  0 | task 0 |       total time =   28050.19 ms /  1335 tokens
+0.31.163.437 I slot print_timing: id  0 | task 0 |    graphs reused =        423
+0.31.163.441 I slot print_timing: id  0 | task 0 | draft acceptance = 0.84362 (  410 accepted /   486 generated), mean len =  2.47
+0.31.163.441 I slot print_timing: id  0 | task 0 |      acc per pos = (0.900, 0.301, 0.172, 0.057, 0.039)
+0.31.163.442 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.31.163.442 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.31.163.471 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.306 ms)
+0.31.198.341 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-dspark-coding ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 326.54048497309066
+predicted_per_second: 10.518075707531231
+predicted_n: 1200
+vram/rss summary:
+samples: 218
+vram_mib: min=11224 max=11278 last=11278
+rss_mib: min=3171.1 max=3949.9 last=3949.9
+vmhwm_mib: max=10267.8
+server print_timing / memory breakdown:
+1.29.566.521 I slot print_timing: id  0 | task 0 | n_decoded =    910, tg =  10.57 t/s, tg_3s =   8.79 t/s
+1.32.603.547 I slot print_timing: id  0 | task 0 | n_decoded =    943, tg =  10.58 t/s, tg_3s =  10.87 t/s
+1.35.685.462 I slot print_timing: id  0 | task 0 | n_decoded =    969, tg =  10.51 t/s, tg_3s =   8.44 t/s
+1.38.694.579 I slot print_timing: id  0 | task 0 | n_decoded =    997, tg =  10.47 t/s, tg_3s =   9.31 t/s
+1.41.790.071 I slot print_timing: id  0 | task 0 | n_decoded =   1033, tg =  10.51 t/s, tg_3s =  11.63 t/s
+1.44.807.058 I slot print_timing: id  0 | task 0 | n_decoded =   1065, tg =  10.51 t/s, tg_3s =  10.61 t/s
+1.47.853.951 I slot print_timing: id  0 | task 0 | n_decoded =   1093, tg =  10.47 t/s, tg_3s =   9.19 t/s
+1.50.932.681 I slot print_timing: id  0 | task 0 | n_decoded =   1122, tg =  10.44 t/s, tg_3s =   9.42 t/s
+1.54.009.353 I slot print_timing: id  0 | task 0 | n_decoded =   1163, tg =  10.52 t/s, tg_3s =  13.33 t/s
+1.57.058.072 I slot print_timing: id  0 | task 0 | n_decoded =   1195, tg =  10.52 t/s, tg_3s =  10.50 t/s
+1.57.587.066 I slot print_timing: id  0 | task 0 | prompt eval time =     413.43 ms /   135 tokens (    3.06 ms per token,   326.54 tokens per second)
+1.57.587.071 I slot print_timing: id  0 | task 0 |        eval time =  114089.31 ms /  1200 tokens (   95.07 ms per token,    10.52 tokens per second)
+1.57.587.071 I slot print_timing: id  0 | task 0 |       total time =  114502.74 ms /  1335 tokens
+1.57.587.074 I slot print_timing: id  0 | task 0 |    graphs reused =        744
+1.57.587.078 I slot print_timing: id  0 | task 0 | draft acceptance = 0.93778 (  211 accepted /   225 generated), mean len =  2.34
+1.57.587.078 I slot print_timing: id  0 | task 0 |      acc per pos = (0.943, 0.318, 0.064, 0.019, 0.000, 0.000)
+1.57.587.079 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.57.587.079 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.57.587.096 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.767 ms), draft 1 (0 grow / 0 shrink, 0.447 ms)
+1.57.622.174 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-baseline-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 22
+vram_mib: min=9766 max=9840 last=9840
+rss_mib: min=1499.0 max=2009.9 last=2009.9
+vmhwm_mib: max=10283.4
+server print_timing / memory breakdown:
+0.00.357.249 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.01.895.594 I srv    load_model: speculative decoding will use checkpoints
+0.01.895.683 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.05.375.083 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.36 s / 1218.22 tokens per second
+0.07.105.120 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.09 s / 1206.52 tokens per second
+0.08.881.948 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   6.87 s / 1192.58 tokens per second
+0.10.709.817 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   8.70 s / 1177.41 tokens per second
+0.11.874.190 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =   9.86 s / 1164.54 tokens per second
+0.11.903.132 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 149.626 MiB)
+0.12.374.132 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  10.36 s / 1157.77 tokens per second
+0.12.404.458 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 149.626 MiB)
+0.13.531.275 I slot print_timing: id  0 | task 0 | prompt eval time =   10454.49 ms / 12000 tokens (    0.87 ms per token,  1147.83 tokens per second)
+0.13.531.277 I slot print_timing: id  0 | task 0 |        eval time =    1063.99 ms /    25 tokens (   42.56 ms per token,    23.50 tokens per second)
+0.13.531.278 I slot print_timing: id  0 | task 0 |       total time =   11518.48 ms / 12025 tokens
+0.13.531.280 I slot print_timing: id  0 | task 0 |    graphs reused =         23
+0.13.558.560 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free    self   model   context   compute    unaccounted |
+
+=== A2-mtp-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 22
+vram_mib: min=10918 max=11012 last=11012
+rss_mib: min=1595.6 max=2310.0 last=2310.0
+vmhwm_mib: max=10281.8
+server print_timing / memory breakdown:
+0.02.216.692 I srv    load_model: MTP recurrent-plane policy: draft depth = 5, total planes = 6, direct rollback horizon = 5, recurrent allocation = 6 planes (6 per slot), full-shape GPU replay = disabled
+0.02.216.860 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.06.622.925 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.50 s / 1171.94 tokens per second
+0.08.411.424 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.28 s / 1162.85 tokens per second
+0.10.247.398 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   7.12 s / 1150.64 tokens per second
+0.12.140.529 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   9.01 s / 1136.18 tokens per second
+0.13.347.018 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =  10.22 s / 1123.77 tokens per second
+0.13.380.411 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 173.696 MiB)
+0.13.873.725 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  10.75 s / 1116.34 tokens per second
+0.13.907.927 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 174.769 MiB)
+0.14.317.169 I slot print_timing: id  0 | task 0 | prompt eval time =   10843.08 ms / 12000 tokens (    0.90 ms per token,  1106.70 tokens per second)
+0.14.317.172 I slot print_timing: id  0 | task 0 |        eval time =     346.22 ms /    25 tokens (   13.85 ms per token,    72.21 tokens per second)
+0.14.317.173 I slot print_timing: id  0 | task 0 |       total time =   11189.30 ms / 12025 tokens
+0.14.317.175 I slot print_timing: id  0 | task 0 |    graphs reused =          3
+0.14.317.177 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   20 accepted /    20 generated), mean len =  6.00
+0.14.317.178 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 1.000, 1.000, 1.000, 1.000)
+0.14.317.178 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.14.317.179 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.14.317.195 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.281 ms)
+0.14.348.472 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== A2-dspark-synth12k (synthetic, prefill=12000, predict=64) ===
+prompt_n: None
+prompt_per_second: None
+predicted_n: None
+predicted_per_second: None
+ERROR: {'code': 500, 'message': 'The model produced output that does not match the expected Content-only format', 'type': 'server_error'}
+vram/rss summary:
+samples: 37
+vram_mib: min=11160 max=11332 last=11332
+rss_mib: min=3157.8 max=4705.6 last=4705.6
+vmhwm_mib: max=10286.1
+server print_timing / memory breakdown:
+0.00.637.110 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.492.035 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.06.992.880 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   4096, progress = 0.34, t =   3.88 s / 1056.18 tokens per second
+0.08.925.952 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   6144, progress = 0.51, t =   5.81 s / 1057.27 tokens per second
+0.10.905.621 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =   8192, progress = 0.68, t =   7.79 s / 1051.49 tokens per second
+0.12.935.634 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  10240, progress = 0.85, t =   9.82 s / 1042.67 tokens per second
+0.14.238.120 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11484, progress = 0.96, t =  11.12 s / 1032.42 tokens per second
+0.14.286.083 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 11483, pos_max = 11483, n_tokens = 11484, size = 268.915 MiB)
+0.14.815.653 I slot print_timing: id  0 | task 0 | prompt processing, n_tokens =  11996, progress = 1.00, t =  11.70 s / 1025.22 tokens per second
+0.14.865.665 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 11995, pos_max = 11995, n_tokens = 11996, size = 274.234 MiB)
+0.22.039.653 I slot print_timing: id  0 | task 0 | prompt eval time =   11822.91 ms / 12000 tokens (    0.99 ms per token,  1014.98 tokens per second)
+0.22.039.657 I slot print_timing: id  0 | task 0 |        eval time =    7102.00 ms /    25 tokens (  284.08 ms per token,     3.52 tokens per second)
+0.22.039.657 I slot print_timing: id  0 | task 0 |       total time =   18924.91 ms / 12025 tokens
+0.22.039.660 I slot print_timing: id  0 | task 0 |    graphs reused =          5
+0.22.039.663 I slot print_timing: id  0 | task 0 | draft acceptance = 1.00000 (   11 accepted /    11 generated), mean len =  2.57
+0.22.039.664 I slot print_timing: id  0 | task 0 |      acc per pos = (1.000, 0.429, 0.143, 0.000, 0.000, 0.000)
+0.22.039.664 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.22.039.665 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.22.039.681 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.286 ms), draft 1 (0 grow / 0 shrink, 0.451 ms)
+0.22.069.657 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== G-mtp-coding-crashcheck-1 ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 422.9296808917237
+predicted_per_second: 43.47700066664734
+predicted_n: 1200
+vram/rss summary:
+samples: 54
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1638.9 max=2158.6 last=2158.6
+vmhwm_mib: max=10281.8
+server print_timing / memory breakdown:
+0.03.407.629 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.492.903 I slot print_timing: id  0 | task 0 | n_decoded =    166, tg =  54.60 t/s, tg_3s =  54.60 t/s
+0.09.509.413 I slot print_timing: id  0 | task 0 | n_decoded =    292, tg =  48.21 t/s, tg_3s =  41.77 t/s
+0.12.526.993 I slot print_timing: id  0 | task 0 | n_decoded =    427, tg =  47.06 t/s, tg_3s =  44.74 t/s
+0.15.568.374 I slot print_timing: id  0 | task 0 | n_decoded =    556, tg =  45.89 t/s, tg_3s =  42.41 t/s
+0.18.613.126 I slot print_timing: id  0 | task 0 | n_decoded =    689, tg =  45.45 t/s, tg_3s =  43.68 t/s
+0.21.631.575 I slot print_timing: id  0 | task 0 | n_decoded =    828, tg =  45.55 t/s, tg_3s =  46.05 t/s
+0.24.639.401 I slot print_timing: id  0 | task 0 | n_decoded =    957, tg =  45.17 t/s, tg_3s =  42.89 t/s
+0.27.663.128 I slot print_timing: id  0 | task 0 | n_decoded =   1069, tg =  44.15 t/s, tg_3s =  37.04 t/s
+0.30.670.646 I slot print_timing: id  0 | task 0 | n_decoded =   1185, tg =  43.54 t/s, tg_3s =  38.57 t/s
+0.31.053.319 I slot print_timing: id  0 | task 0 | prompt eval time =     319.20 ms /   135 tokens (    2.36 ms per token,   422.93 tokens per second)
+0.31.053.322 I slot print_timing: id  0 | task 0 |        eval time =   27600.80 ms /  1200 tokens (   23.00 ms per token,    43.48 tokens per second)
+0.31.053.322 I slot print_timing: id  0 | task 0 |       total time =   27920.00 ms /  1335 tokens
+0.31.053.325 I slot print_timing: id  0 | task 0 |    graphs reused =        400
+0.31.053.328 I slot print_timing: id  0 | task 0 | draft acceptance = 0.84337 (  420 accepted /   498 generated), mean len =  2.57
+0.31.053.329 I slot print_timing: id  0 | task 0 |      acc per pos = (0.910, 0.366, 0.172, 0.063, 0.034, 0.022)
+0.31.053.329 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.31.053.329 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.31.053.346 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.321 ms)
+0.31.088.059 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== G-mtp-coding-crashcheck-2 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-mtp-coding-crashcheck-2.response.json'
+vram/rss summary:
+samples: 51
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1644.9 max=2251.5 last=2251.5
+vmhwm_mib: max=10281.8
+server print_timing / memory breakdown:
+0.00.354.824 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.648.441 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.227.038 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.227.195 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.267.882 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.391.416 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.437.168 I slot print_timing: id  0 | task 0 | n_decoded =    164, tg =  54.64 t/s, tg_3s =  54.64 t/s
+0.09.465.384 I slot print_timing: id  0 | task 0 | n_decoded =    291, tg =  48.26 t/s, tg_3s =  41.94 t/s
+0.12.472.061 I slot print_timing: id  0 | task 0 | n_decoded =    423, tg =  46.81 t/s, tg_3s =  43.90 t/s
+0.15.484.683 I slot print_timing: id  0 | task 0 | n_decoded =    551, tg =  45.73 t/s, tg_3s =  42.49 t/s
+0.18.505.406 I slot print_timing: id  0 | task 0 | n_decoded =    683, tg =  45.32 t/s, tg_3s =  43.70 t/s
+0.21.540.119 I slot print_timing: id  0 | task 0 | n_decoded =    822, tg =  45.40 t/s, tg_3s =  45.80 t/s
+0.24.543.210 I slot print_timing: id  0 | task 0 | n_decoded =    954, tg =  45.20 t/s, tg_3s =  43.95 t/s
+
+=== G-mtp-coding-crashcheck-3 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-mtp-coding-crashcheck-3.response.json'
+vram/rss summary:
+samples: 52
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1639.4 max=2250.3 last=2250.3
+vmhwm_mib: max=10282.6
+server print_timing / memory breakdown:
+0.00.356.304 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.649.597 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.226.243 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.226.398 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.266.883 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.389.380 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.472.402 I slot print_timing: id  0 | task 0 | n_decoded =    166, tg =  54.64 t/s, tg_3s =  54.64 t/s
+0.09.495.026 I slot print_timing: id  0 | task 0 | n_decoded =    292, tg =  48.18 t/s, tg_3s =  41.69 t/s
+0.12.520.816 I slot print_timing: id  0 | task 0 | n_decoded =    427, tg =  46.99 t/s, tg_3s =  44.62 t/s
+0.15.521.703 I slot print_timing: id  0 | task 0 | n_decoded =    553, tg =  45.75 t/s, tg_3s =  41.99 t/s
+0.18.552.628 I slot print_timing: id  0 | task 0 | n_decoded =    686, tg =  45.37 t/s, tg_3s =  43.88 t/s
+0.21.590.916 I slot print_timing: id  0 | task 0 | n_decoded =    825, tg =  45.44 t/s, tg_3s =  45.75 t/s
+0.24.615.557 I slot print_timing: id  0 | task 0 | n_decoded =    956, tg =  45.13 t/s, tg_3s =  43.31 t/s
+
+=== G-mtp-crash-blocking ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 383.32017740625696
+predicted_per_second: 39.00914686475685
+predicted_n: 1200
+vram/rss summary:
+samples: 60
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1650.4 max=2166.1 last=2166.1
+vmhwm_mib: max=10281.9
+server print_timing / memory breakdown:
+0.06.487.018 I slot print_timing: id  0 | task 0 | n_decoded =    150, tg =  49.95 t/s, tg_3s =  49.95 t/s
+0.09.492.495 I slot print_timing: id  0 | task 0 | n_decoded =    266, tg =  44.27 t/s, tg_3s =  38.60 t/s
+0.12.520.526 I slot print_timing: id  0 | task 0 | n_decoded =    379, tg =  41.94 t/s, tg_3s =  37.32 t/s
+0.15.544.379 I slot print_timing: id  0 | task 0 | n_decoded =    498, tg =  41.29 t/s, tg_3s =  39.35 t/s
+0.18.566.010 I slot print_timing: id  0 | task 0 | n_decoded =    611, tg =  40.51 t/s, tg_3s =  37.40 t/s
+0.21.604.640 I slot print_timing: id  0 | task 0 | n_decoded =    740, tg =  40.84 t/s, tg_3s =  42.45 t/s
+0.24.607.923 I slot print_timing: id  0 | task 0 | n_decoded =    859, tg =  40.67 t/s, tg_3s =  39.62 t/s
+0.27.628.996 I slot print_timing: id  0 | task 0 | n_decoded =    971, tg =  40.22 t/s, tg_3s =  37.07 t/s
+0.30.643.749 I slot print_timing: id  0 | task 0 | n_decoded =   1072, tg =  39.47 t/s, tg_3s =  33.50 t/s
+0.33.699.042 I slot print_timing: id  0 | task 0 | n_decoded =   1180, tg =  39.05 t/s, tg_3s =  35.35 t/s
+0.34.246.201 I slot print_timing: id  0 | task 0 | prompt eval time =     352.19 ms /   135 tokens (    2.61 ms per token,   383.32 tokens per second)
+0.34.246.205 I slot print_timing: id  0 | task 0 |        eval time =   30762.02 ms /  1200 tokens (   25.64 ms per token,    39.01 tokens per second)
+0.34.246.205 I slot print_timing: id  0 | task 0 |       total time =   31114.20 ms /  1335 tokens
+0.34.246.207 I slot print_timing: id  0 | task 0 |    graphs reused =        394
+0.34.246.211 I slot print_timing: id  0 | task 0 | draft acceptance = 0.84263 (  423 accepted /   502 generated), mean len =  2.57
+0.34.246.211 I slot print_timing: id  0 | task 0 |      acc per pos = (0.907, 0.372, 0.175, 0.063, 0.033, 0.022)
+0.34.246.212 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.34.246.212 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.34.246.228 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.340 ms)
+0.34.278.316 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== verify-dspark-nmax-fix ===
+FAILED to start (see /tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/verify-dspark-nmax-fix.log)
+=== G-blocking-retry-1 ===
+FAILED to start (see /tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-blocking-retry-1.log)
+=== G-blocking-retry-2 ===
+FAILED to start (see /tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-blocking-retry-2.log)
+=== G-noblock-retry-1 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-noblock-retry-1.response.json'
+vram/rss summary:
+samples: 35
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1708.7 max=2334.9 last=2334.9
+vmhwm_mib: max=10349.7
+server print_timing / memory breakdown:
+0.00.363.363 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.654.053 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.226.798 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.226.951 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.269.289 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.391.554 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.474.713 I slot print_timing: id  0 | task 0 | n_decoded =    166, tg =  54.63 t/s, tg_3s =  54.63 t/s
+0.09.503.382 I slot print_timing: id  0 | task 0 | n_decoded =    292, tg =  48.13 t/s, tg_3s =  41.60 t/s
+0.12.529.177 I slot print_timing: id  0 | task 0 | n_decoded =    427, tg =  46.96 t/s, tg_3s =  44.62 t/s
+0.15.532.531 I slot print_timing: id  0 | task 0 | n_decoded =    553, tg =  45.72 t/s, tg_3s =  41.95 t/s
+
+=== G-noblock-retry-2 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-noblock-retry-2.response.json'
+vram/rss summary:
+samples: 31
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1708.8 max=2334.9 last=2334.9
+vmhwm_mib: max=10349.9
+server print_timing / memory breakdown:
+0.00.356.043 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.650.511 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.226.426 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.226.580 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.266.609 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.389.592 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.471.784 I slot print_timing: id  0 | task 0 | n_decoded =    166, tg =  54.65 t/s, tg_3s =  54.65 t/s
+0.09.488.801 I slot print_timing: id  0 | task 0 | n_decoded =    292, tg =  48.23 t/s, tg_3s =  41.76 t/s
+0.12.509.178 I slot print_timing: id  0 | task 0 | n_decoded =    427, tg =  47.05 t/s, tg_3s =  44.70 t/s
+
+=== G-noblock-retry-3 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-noblock-retry-3.response.json'
+vram/rss summary:
+samples: 49
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1709.5 max=2335.4 last=2335.4
+vmhwm_mib: max=10349.7
+server print_timing / memory breakdown:
+0.00.355.250 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.649.595 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.227.531 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.227.687 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.267.958 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.392.416 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.437.692 I slot print_timing: id  0 | task 0 | n_decoded =    164, tg =  54.66 t/s, tg_3s =  54.66 t/s
+0.09.471.817 I slot print_timing: id  0 | task 0 | n_decoded =    291, tg =  48.22 t/s, tg_3s =  41.86 t/s
+0.12.481.222 I slot print_timing: id  0 | task 0 | n_decoded =    423, tg =  46.77 t/s, tg_3s =  43.86 t/s
+0.15.495.717 I slot print_timing: id  0 | task 0 | n_decoded =    551, tg =  45.69 t/s, tg_3s =  42.46 t/s
+0.18.521.148 I slot print_timing: id  0 | task 0 | n_decoded =    683, tg =  45.28 t/s, tg_3s =  43.63 t/s
+0.21.522.515 I slot print_timing: id  0 | task 0 | n_decoded =    821, tg =  45.40 t/s, tg_3s =  45.98 t/s
+
+=== G-block-retry2-1 ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 382.5673956228622
+predicted_per_second: 38.99210984909176
+predicted_n: 1200
+vram/rss summary:
+samples: 60
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1713.0 max=2246.0 last=2246.0
+vmhwm_mib: max=10349.9
+server print_timing / memory breakdown:
+0.06.484.936 I slot print_timing: id  0 | task 0 | n_decoded =    151, tg =  49.90 t/s, tg_3s =  49.90 t/s
+0.09.498.766 I slot print_timing: id  0 | task 0 | n_decoded =    267, tg =  44.21 t/s, tg_3s =  38.49 t/s
+0.12.520.276 I slot print_timing: id  0 | task 0 | n_decoded =    380, tg =  41.94 t/s, tg_3s =  37.40 t/s
+0.15.545.998 I slot print_timing: id  0 | task 0 | n_decoded =    499, tg =  41.28 t/s, tg_3s =  39.33 t/s
+0.18.595.521 I slot print_timing: id  0 | task 0 | n_decoded =    615, tg =  40.63 t/s, tg_3s =  38.04 t/s
+0.21.618.545 I slot print_timing: id  0 | task 0 | n_decoded =    741, tg =  40.81 t/s, tg_3s =  41.68 t/s
+0.24.627.241 I slot print_timing: id  0 | task 0 | n_decoded =    860, tg =  40.63 t/s, tg_3s =  39.55 t/s
+0.27.661.185 I slot print_timing: id  0 | task 0 | n_decoded =    974, tg =  40.24 t/s, tg_3s =  37.57 t/s
+0.30.678.124 I slot print_timing: id  0 | task 0 | n_decoded =   1074, tg =  39.46 t/s, tg_3s =  33.15 t/s
+0.33.688.792 I slot print_timing: id  0 | task 0 | n_decoded =   1180, tg =  39.03 t/s, tg_3s =  35.21 t/s
+0.34.234.648 I slot print_timing: id  0 | task 0 | prompt eval time =     352.88 ms /   135 tokens (    2.61 ms per token,   382.57 tokens per second)
+0.34.234.651 I slot print_timing: id  0 | task 0 |        eval time =   30775.46 ms /  1200 tokens (   25.65 ms per token,    38.99 tokens per second)
+0.34.234.652 I slot print_timing: id  0 | task 0 |       total time =   31128.34 ms /  1335 tokens
+0.34.234.655 I slot print_timing: id  0 | task 0 |    graphs reused =        394
+0.34.234.659 I slot print_timing: id  0 | task 0 | draft acceptance = 0.84263 (  423 accepted /   502 generated), mean len =  2.57
+0.34.234.659 I slot print_timing: id  0 | task 0 |      acc per pos = (0.907, 0.372, 0.175, 0.063, 0.033, 0.022)
+0.34.234.660 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+0.34.234.660 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+0.34.234.675 I slot print_timing: id  0 | task 0 | workspace transitions = target 0 (0 grow / 0 shrink, 0.000 ms), draft 1 (0 grow / 0 shrink, 0.297 ms)
+0.34.269.754 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+
+=== G-block-retry2-2 ===
+parse error: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-piggidragon-Services-llama-cpp/83521a4c-01ef-4ab1-b46e-b9ce35655df5/scratchpad/kvoffload-bench/results/G-block-retry2-2.response.json'
+vram/rss summary:
+samples: 53
+vram_mib: min=11068 max=11108 last=11108
+rss_mib: min=1714.6 max=2339.4 last=2339.4
+vmhwm_mib: max=10349.8
+server print_timing / memory breakdown:
+0.00.359.782 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |
+0.00.655.550 I common_memory_breakdown_print: | memory breakdown [MiB] | total    free     self   model   context   compute    unaccounted |
+0.02.245.319 I srv    load_model: MTP recurrent-plane policy: draft depth = 6, total planes = 7, direct rollback horizon = 6, recurrent allocation = 7 planes (7 per slot), full-shape GPU replay = disabled
+0.02.245.476 I srv    load_model: context checkpoints enabled, max = 32, min spacing = 8192
+0.03.285.791 I slot create_check: id  0 | task 0 | created context checkpoint 1 of 32 (pos_min = 41, pos_max = 41, n_tokens = 42, size = 149.734 MiB)
+0.03.419.777 I slot create_check: id  0 | task 0 | created context checkpoint 2 of 32 (pos_min = 130, pos_max = 130, n_tokens = 131, size = 149.920 MiB)
+0.06.473.012 I slot print_timing: id  0 | task 0 | n_decoded =    150, tg =  49.99 t/s, tg_3s =  49.99 t/s
+0.09.478.818 I slot print_timing: id  0 | task 0 | n_decoded =    266, tg =  44.29 t/s, tg_3s =  38.59 t/s
+0.12.508.299 I slot print_timing: id  0 | task 0 | n_decoded =    379, tg =  41.94 t/s, tg_3s =  37.30 t/s
+0.15.531.958 I slot print_timing: id  0 | task 0 | n_decoded =    498, tg =  41.30 t/s, tg_3s =  39.36 t/s
+0.18.553.166 I slot print_timing: id  0 | task 0 | n_decoded =    611, tg =  40.52 t/s, tg_3s =  37.40 t/s
+0.21.553.380 I slot print_timing: id  0 | task 0 | n_decoded =    739, tg =  40.87 t/s, tg_3s =  42.66 t/s
+0.24.596.449 I slot print_timing: id  0 | task 0 | n_decoded =    859, tg =  40.66 t/s, tg_3s =  39.43 t/s
+
+=== H-dspark-fixed-default ===
+prompt_tokens: 135
+completion_tokens: 1200
+prompt_per_second: 325.7981451225604
+predicted_per_second: 10.52922933806552
+predicted_n: 1200
+vram/rss summary:
+samples: 218
+vram_mib: min=11224 max=11278 last=11278
+rss_mib: min=3268.0 max=4058.3 last=4058.3
+vmhwm_mib: max=10350.4
+server print_timing / memory breakdown:
+1.29.762.115 I slot print_timing: id  0 | task 0 | n_decoded =    912, tg =  10.58 t/s, tg_3s =   8.79 t/s
+1.32.799.713 I slot print_timing: id  0 | task 0 | n_decoded =    945, tg =  10.59 t/s, tg_3s =  10.86 t/s
+1.35.879.766 I slot print_timing: id  0 | task 0 | n_decoded =    971, tg =  10.51 t/s, tg_3s =   8.44 t/s
+1.38.885.898 I slot print_timing: id  0 | task 0 | n_decoded =    999, tg =  10.48 t/s, tg_3s =   9.31 t/s
+1.41.974.955 I slot print_timing: id  0 | task 0 | n_decoded =   1035, tg =  10.51 t/s, tg_3s =  11.65 t/s
+1.44.986.796 I slot print_timing: id  0 | task 0 | n_decoded =   1067, tg =  10.52 t/s, tg_3s =  10.62 t/s
+1.48.029.154 I slot print_timing: id  0 | task 0 | n_decoded =   1095, tg =  10.48 t/s, tg_3s =   9.20 t/s
+1.51.092.358 I slot print_timing: id  0 | task 0 | n_decoded =   1124, tg =  10.45 t/s, tg_3s =   9.47 t/s
+1.54.177.390 I slot print_timing: id  0 | task 0 | n_decoded =   1166, tg =  10.54 t/s, tg_3s =  13.61 t/s
+1.57.214.231 I slot print_timing: id  0 | task 0 | n_decoded =   1197, tg =  10.53 t/s, tg_3s =  10.21 t/s
+1.57.497.785 I slot print_timing: id  0 | task 0 | prompt eval time =     414.37 ms /   135 tokens (    3.07 ms per token,   325.80 tokens per second)
+1.57.497.787 I slot print_timing: id  0 | task 0 |        eval time =  113968.46 ms /  1200 tokens (   94.97 ms per token,    10.53 tokens per second)
+1.57.497.787 I slot print_timing: id  0 | task 0 |       total time =  114382.82 ms /  1335 tokens
+1.57.497.790 I slot print_timing: id  0 | task 0 |    graphs reused =        744
+1.57.497.794 I slot print_timing: id  0 | task 0 | draft acceptance = 0.93778 (  211 accepted /   225 generated), mean len =  2.34
+1.57.497.794 I slot print_timing: id  0 | task 0 |      acc per pos = (0.943, 0.318, 0.064, 0.019, 0.000, 0.000)
+1.57.497.795 I slot print_timing: id  0 | task 0 | spec checkpoints = 0 captures, 0 restores, capture = 0.000 ms, restore = 0.000 ms
+1.57.497.795 I slot print_timing: id  0 | task 0 | spec ckpt payload = 0 target + 0 draft + 0 state bytes (peak = 0), replay = 0 cycles / 0 batch tokens
+1.57.497.810 I slot print_timing: id  0 | task 0 | workspace transitions = target 1 (0 grow / 0 shrink, 5.227 ms), draft 1 (0 grow / 0 shrink, 0.480 ms)
+1.57.527.790 I common_memory_breakdown_print: | memory breakdown [MiB] | total   free     self   model   context   compute    unaccounted |
+

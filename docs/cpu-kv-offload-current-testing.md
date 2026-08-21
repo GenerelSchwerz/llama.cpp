@@ -8,6 +8,19 @@ binary identity. The retained local journal and Experiments 001-019 come from
 `6a20757854395309b32248dd4109d73e99c3e675`. Source and binary identities are
 authoritative if this document ever disagrees with behavior.
 
+PR 8 is refreshed onto the documentation-only base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3`. Its rebased production/source
+checkpoint is `107b926e5`; path, tree, and binary-delta comparison against the
+previous published head `0c8df007a504f16aa35fc5982303e3e1b9883331`
+shows that the live-context implementation, CLI, generated arguments, and
+tests are unchanged. That equivalence does not replace the exact source-level
+disabled-path gate: final PR 8 evidence compares this exact base with fresh
+candidate processes at measured runtime head
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`, using both omission and explicit
+off. The 2026-08-21 A/B/A gate passed exact output and PPL, full upfront
+reservation, identical allocation/VMM fields, and neutral repeated 4K/30K
+throughput; Experiment 021 owns the exact measurements and artifacts.
+
 The companion documents have deliberately separate roles:
 
 - [`cpu-kv-offload-development.md`](cpu-kv-offload-development.md) records
@@ -38,20 +51,29 @@ The published KV source contains these controls:
 | `--kv-gpu-layers N` | Keep the first `N` target-owned attention-KV layers on the accelerator. |
 | `--spec-draft-kv-gpu-layers N` | Override target placement for independently owned draft KV; omission inherits and zero explicitly selects host placement. |
 | `--phase-aware-workspace` | Share and resize sequential target/MTP compute backing between prompt and generation phases. |
+| `--live-context-workspace` | Independently and opt-in, bound supported standard-attention graph reservations by padded live physical KV extent. |
 | `--spec-mtp-rs-planes N` | Cap total target recurrent planes, including the current plane. |
 | `llama-bench --kv-memory` | Capture KV/component checkpoints, physical device/accelerator-host/ordinary-host allocation classes, and CUDA VMM live/mapped/high-water telemetry. |
+
+Live-context comparisons vary only
+`--no-live-context-workspace`/`--live-context-workspace` and keep phase-aware
+workspace disabled unless their interaction is the stated subject. The policy
+is default-off, does not resize persistent KV, and requires standard attention
+memory that advertises bounded reservation. KVarN, ISWA, recurrent-only, and
+other unsupported layouts intentionally retain the full plan. The server asks
+CUDA to trim transient-pool mappings only after all slots become idle and only
+when bounded sizing was effective.
 
 MTP must use the target physical ubatch. Omit
 `--spec-draft-ubatch-size`, or set it equal to `--ubatch-size` only when the
 explicit parser path is under test. A different MTP draft ubatch is rejected.
 
-The published KV source does **not** contain native quantized FlashAttention,
-compact causal masking, live-context workspace sizing, or bounded host-KV
-attention staging. Do not expect those later fields or use an associated later
-option in a current KV-base command. In particular,
-`--live-context-workspace` and its preset/generated argument documentation
-remain owned by PR 8 until its source lands. See the evidence index for the
-exact PR identities.
+The published KV base does **not** contain native quantized FlashAttention,
+compact causal masking, or bounded host-KV attention staging. Do not expect
+those later fields or use an associated later option in a current KV-base
+command. Live-context source and its preset/generated argument documentation
+remain owned by this PR 8 branch until it lands. See the evidence index for
+the exact PR identities.
 
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or
@@ -131,7 +153,9 @@ For a server lifecycle, use a harness that owns the lock, verifies the clean
 GPU, starts the server, waits for health, runs the client and samplers, stops
 the server gracefully, waits for every child, and only then exits. The
 maintained exactness runner already follows that fresh-process lifecycle; put
-the whole runner under the outer lock.
+the whole runner under the outer lock. It records health-ready elapsed time and
+a process/GPU startup sample before the first request, then preserves the
+request-level process, VRAM, timing, output, and progress artifacts.
 
 ## Preflight and binary identity
 
@@ -141,8 +165,6 @@ Run before a measurement:
 cd /home/gencoolpc/beellama-kv-offload
 git status --short --branch
 git rev-parse HEAD
-build-cuda-all/bin/llama-server --version
-build-cuda-all/bin/llama-bench --version
 llama-benchy --version
 sha256sum build-cuda-all/bin/llama-server \
   build-cuda-all/bin/llama-bench \
@@ -150,7 +172,11 @@ sha256sum build-cuda-all/bin/llama-server \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
   /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt
-nvidia-smi
+flock /tmp/beellama-single-gpu.lock -c '
+  build-cuda-all/bin/llama-server --version
+  build-cuda-all/bin/llama-bench --list-devices
+  nvidia-smi
+'
 ```
 
 Do not present an uncommitted or differently configured binary as evidence for
@@ -366,3 +392,6 @@ from `nvidia-smi` process VRAM: pinned CUDA-host allocation is system memory,
 and ordinary-host allocation is neither pinned memory nor device VRAM. This
 surface is measurement support only. It does not authorize pool trimming,
 workspace policy, staging changes, causal descriptors, or capacity changes.
+On PR 8, W02 observes the already-established live-policy server idle trim and
+reconciles mapped-current when mappings are released; it does not add a second
+trim caller, benchmark lifecycle, or telemetry policy.
