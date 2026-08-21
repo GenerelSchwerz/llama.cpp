@@ -3075,7 +3075,17 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
+        ggml_tensor * kq_mask_consumer = kq_mask;
+        if (kq_mask_consumer && kq_mask_consumer->type == GGML_TYPE_I64) {
+            // A compact mask is small enough to transfer per consumer. Giving
+            // each attention layer its own view keeps the scheduler's backend
+            // copy local to that split instead of extending one tiny copy
+            // across every full-attention layer and pinning an allocator hole.
+            kq_mask_consumer = ggml_view_tensor(ctx0, kq_mask_consumer);
+            ggml_format_name(kq_mask_consumer, "attn_inp_kq_mask_compact_l%d", il);
+        }
+
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask_consumer, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
