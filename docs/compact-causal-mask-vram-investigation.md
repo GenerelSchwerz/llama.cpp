@@ -743,3 +743,166 @@ All deep artifacts are under
 `/tmp/beellama-compact-deep-scaling-20260820`. The manifest contains 1,912
 files and verified all 1,912 before documentation. Its SHA-256 is
 `83ac78c7ea47b64a332c7dee441f4f74f8e800d301b216c5d2093275123af1ed`.
+
+## Composed validation on the merged KV-offload base
+
+### Identity and evidence boundary
+
+After the isolated c9 study above was committed and published, PR 5 and PR 6
+were merged into `beellama-kv-cpu-offload`. The feature commits were rebased
+onto exact base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. The composed source-validation
+tip was `ae60c7321d950937a36af096112525db777ae13f`; it reported build 11254 and
+was five commits ahead of, and directly based on, `4a7f9b496`.
+
+This is a composition gate, not a new baseline measurement. In particular,
+none of the c9 dense/Candidate 1/dense A/B/A resource or performance rows above
+are relabeled as measurements of the rebased commits. Their source identities
+remain c9 `c9f727c1e`, Candidate 1 `b3ce3a5c`, and isolated evidence tip
+`a71c9f6f`. The code-equivalent per-consumer-view commit after rebase is
+`94480dc99`, but no old result is attributed to that new hash.
+
+The rebase had one append-at-end textual conflict in
+`docs/cpu-kv-offload-experiments.md`. Resolution retained the merged-base W02
+CUDA VMM telemetry and W06 perplexity-capacity records, followed by the
+pre-existing compact-mask isolation record. No source conflict was hidden.
+
+### PR 5 and PR 6 semantic composition
+
+PR 5 changes the perplexity tool's output-capacity declaration and its focused
+plumbing test. The compact feature does not modify that tool. PR 6 adds dormant,
+opted-in VMM allocation counters in `ggml-cuda.cu`, exposes get/reset callbacks
+through backend proc lookup, and consumes them only from `llama-bench
+--kv-memory`. It does not change allocation, mapping, reuse, release, graph, or
+kernel policy.
+
+The only shared source file between PR 6 and the compact feature is
+`ggml/src/ggml-cuda/ggml-cuda.cu`. Relative to the merged base, the compact
+diff in that file is exactly 12 added lines: a
+`ggml_backend_cuda_flash_attn_causal_prefix_supported` capability callback and
+its proc-address entry. The merged VMM get/reset entries remain present and
+unchanged. The names and callers are disjoint: PR 6 measures the allocator when
+the benchmark explicitly resets telemetry, while compact selection queries a
+FlashAttention capability while building a representable graph. Neither path
+enables, disables, or conditions the other.
+
+### Composed build and focused commands
+
+The existing Unix Makefiles build directory was reconfigured and rebuilt with
+at most six jobs. Tests were already enabled in its cache:
+
+```bash
+cmake -S . -B build-compact-consumer-view-cuda \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DGGML_CUDA_KVARN=ON -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_COMMIT=ae60c7321d950937a36af096112525db777ae13f \
+  -DLLAMA_BUILD_NUMBER=11254
+cmake --build build-compact-consumer-view-cuda -j 6 \
+  --target llama-bench llama-perplexity llama-cli llama-server \
+           test-backend-ops test-perplexity-plumbing test-batch-alloc \
+           test-cuda-fattn-route-policy test-cuda-fattn-vec-policy test-alloc
+```
+
+The focused static/plumbing set passed 4/4, including both newly composed
+features:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'ctest --test-dir build-compact-consumer-view-cuda --output-on-failure \
+   -R "^(test-backend-ops-seed-static|test-cuda-graph-source-properties-static|test-vmm-allocation-telemetry-static|test-perplexity-plumbing)$"'
+```
+
+The fixed-seed compact-versus-dense oracle passed 3/3 on CPU and 3/3 on CUDA:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-consumer-view-cuda/bin/test-backend-ops test -b CPU \
+   -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+   --seed 0x6a09e667f3bcc909'
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-consumer-view-cuda/bin/test-backend-ops test -b CUDA0 \
+   -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+   --seed 0x6a09e667f3bcc909'
+```
+
+The seven adjacent graph, allocator, and FlashAttention guards passed 7/7:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'ctest --test-dir build-compact-consumer-view-cuda --output-on-failure \
+   -R "^(test-backend-ops-seed-static|test-cuda-graph-source-properties-static|test-fattn-vec-dispatch-generated|test-batch-alloc|test-cuda-fattn-route-policy|test-cuda-fattn-vec-policy|test-alloc)$"'
+```
+
+The exact matching-batch PPL command was rerun because the composed source now
+contains PR 5:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-consumer-view-cuda/bin/llama-perplexity \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   --file /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+   --ctx-size 4096 --batch-size 512 --ubatch-size 256 --chunks 4 \
+   --cache-type-k q8_0 --cache-type-v q8_0 --threads 3 --threads-batch 24 \
+   --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+   --n-gpu-layers 999 --split-mode none --main-gpu 0 \
+   --no-kv-offload --kv-cpu-pinned --flash-attn on'
+```
+
+It printed the same cumulative sequence `1.9315, 2.1279, 2.2498, 2.1674` and
+the same final `PPL = 2.1674 +/- 0.03849`; there is no measured increase. A
+fresh deterministic 16-token `llama-cli` run used the same prompt, seed 1234,
+temperature zero, context 4096, batch/ubatch 512/256, Q8_0/Q8_0 pinned CPU KV,
+native affinity, single-turn, and simple-I/O settings as the isolated bracket.
+After removing only its build and timing lines, its SHA-256 remained
+`cd35be773ca9520e5f79474c94ee1d07784433199b1c3c4f531dffbbcc353c6c`.
+
+Finally, one non-performance telemetry smoke used a fresh process:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-consumer-view-cuda/bin/llama-bench \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   -p 128 -n 16 -d 4096 -r 1 -b 512 -ub 256 \
+   -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 -nkvo 1 --kv-cpu-pinned \
+   -fa on -ctk q8_0 -ctv q8_0 --no-warmup --progress --kv-memory -o jsonl'
+```
+
+The prompt row reported VMM live/mapped peaks of 9,619,456/10,485,760 bytes;
+the decode row reported 421,120/2,097,152 bytes. Both reported zero VMM live,
+mapped, and active-pool state after context destruction. This proves the
+merged telemetry and compact graph coexist and reconcile; its one repetition
+is deliberately not used as performance or A/B memory evidence.
+
+### Artifacts, invalid probes, and disposition
+
+Relevant composed hashes are:
+
+| Artifact | SHA-256 |
+|---|---|
+| `libllama.so` | `99ec0be13a5b3aad8026bd684e7baefe8c1a66c331ac8e1362542d79eb405f63` |
+| `libggml-cuda.so` | `0fec68cd98a2985743b7970a28835d276a2023072a0c5772497b87081e708320` |
+| `libllama-bench-impl.so` | `68cd63ab53d92e64dcfc140c019c7ffde4ccf27468591468f3e740dbc4` |
+| `libllama-perplexity-impl.so` | `4e24cc9ddefa8033f975f9f77235b39d4b52135055f2d386acf8947011030635` |
+| `test-backend-ops` | `64b2bce276e629310a47f814a2cf9e50d4a58bfb1b3d29ba8e6cb5c3730471b3` |
+
+Nine composed logs are under `/tmp/beellama-compact-composed-ae60c7321`.
+Their manifest SHA-256 is
+`b346da4de0d14d8379f68465f0913827f9f1ad059a95fc174a888fcfcc99a5bf`.
+
+Two setup mistakes produced no evidence. A first reconfigure requested Ninja
+against the existing Unix Makefiles build directory and was rejected before
+generation; the accepted reconfigure omitted `-G`. A first build request named
+the Python CTest `test-fattn-vec-dispatch-generated` as a build target and was
+rejected before building; the accepted target list contains only executables,
+and the Python guard ran through CTest. In addition, an identity probe invoked
+`llama-bench --version` outside the GPU lock; that unsupported argument was
+rejected immediately after CUDA discovery and loaded no model or workload. It
+is invalid and unused. The accepted identity probe used `llama-cli --version`
+inside the lock and reported the exact composed SHA above.
+
+Disposition: the merged KV-offload base composes cleanly with the isolated
+compact causal-mask implementation. Exactness and PPL remain unchanged, PR 6
+telemetry remains functional and non-owning, and no new source change was
+needed. These checks establish source compatibility only; the isolated c9
+A/B/A and deep-scaling study remain the resource and performance evidence.
