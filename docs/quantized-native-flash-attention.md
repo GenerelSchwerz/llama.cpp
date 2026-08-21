@@ -63,6 +63,7 @@ selects nor converts the cache type. For example:
 | `q8_0 / q6_0` | on | Native mixed-pair MMA; K and V load different quant layouts into the same tile |
 | `q4_1 / q2_0` | on | Native; K carries a min and unpacks nibbles while V has none and unpacks two-bit fields |
 | `q4_0 / q8_0` | on | Native; a V more precise than its K is unusual but has a kernel like any other pair |
+| `q8_0 / q8_0`, `logit_softcap != 0` | on | Standard materializing fallback; the native route requires a zero softcap |
 | `q2_1 / q2_1` | on | Native MMA only in a `GGML_CUDA_FA_ALL_QUANTS` build; otherwise standard materializing fallback |
 
 This avoids a second K/V type selector that could disagree with the tensors in
@@ -264,9 +265,11 @@ and run-time defaults remain off.
   schedule has been found.
 - Compile time and CUDA-library size increase substantially when the family is
   built, because the pair matrix is quadratic in the number of compiled types:
-  768 explicit cases by default, 5,808 with `GGML_CUDA_FA_ALL_QUANTS`. This is
-  the dominant cost of the feature and the reason the build defaults stay off.
-  Default llama.cpp builds pay neither cost.
+  768 explicit cases by default, 5,808 with `GGML_CUDA_FA_ALL_QUANTS`. Each is
+  one device kernel rather than two, because the route requires a zero logit
+  softcap and so never names the softcap specialization. This is the dominant
+  cost of the feature and the reason the build defaults stay off. Default
+  llama.cpp builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 
@@ -279,6 +282,10 @@ CUDA FlashAttention backend:
 CUDA error: unspecified launch failure
 ggml/src/ggml-cuda/ggml-cuda.cu:109: CUDA error
 ```
+
+Since the pruning of the unreachable softcap kernels, the native route also
+declines a non-zero softcap outright and leaves it on the standard path, so the
+abort below is reached only through that path.
 
 **This is not caused by the native route and is not fixed by avoiding it.** It
 reproduces identically with `--flash-attn-native-quants` withheld, i.e. through

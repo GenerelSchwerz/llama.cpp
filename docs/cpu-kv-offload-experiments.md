@@ -6097,6 +6097,49 @@ pair saves what a symmetric pair of the same head dimension saves. The reason to
 support mixed pairs is that the configuration becomes eligible for that saving
 at all, not that the kernel runs faster once it is.
 
+#### Not compiling the unreachable softcap half
+
+Every quantized explicit case emitted two device kernels, one per
+`use_logit_softcap` specialization, because
+`ggml_cuda_flash_attn_ext_mma_f16_case()` names both unconditionally. The
+softcap-`true` half of that pair can never be selected: quantized K/V with a
+non-zero logit softcap aborts the CUDA backend on **both** the native and the
+materializing route, a pre-existing defect documented above. So half of
+everything this family compiled was unreachable code.
+
+The route now requires `logit_softcap == 0.0f` in
+`ggml_cuda_fattn_native_applies()`, and the quantized branch of the case
+function no longer names the softcap specialization. F16 and BF16 MMA softcap
+variants are untouched. This does not fix the underlying abort and does not
+claim to; it stops paying to compile a kernel that nothing can dispatch to.
+
+| | Every pair | With softcap pruned | Δ |
+|---|---:|---:|---:|
+| All-quants device kernels | 11,616 | **5,808** | −50% |
+| Default-tier device kernels | 1,536 | **768** | −50% |
+| Quant instance object code | 720,491,416 B | **489,731,256 B** | −32.0% |
+| `libggml-cuda.so` | 962,082,712 B | **736,400,096 B** | −23.5% |
+| Clean CUDA rebuild, `-j16` | 1 h 45 min 55 s | **1 h 00 min 15 s** | **−43.2%** |
+
+The kernel count is verified in the binary rather than inferred: `cuobjdump
+-symbols` on `fattn-mma-quant-instance-q8_0-ncols1_8-ncols2_8.cu.o` reports 33
+`flash_attn_ext_f16` kernels for the file's 33 explicit cases, exactly one
+each, and every mangled name carries `Lb0` for the `use_logit_softcap`
+template argument.
+
+Correctness is unchanged: `test-backend-ops -o FLASH_ATTN_EXT -p
+native_quants=1` gives the same **1695/1695** with the same 121 distinct
+ordered pairs audited in the launch log. That is the expected result — the
+change removes an unreachable specialization and does not alter generated
+hot-path code — and any throughput movement would have to be investigated as
+unexplained rather than banked.
+
+One gate from the plan could not be implemented as written. A backend test
+asserting that a quantized non-zero-softcap node takes zero native launches
+would have to execute that node, and doing so aborts the process on either
+route. The binary-level kernel audit above is the substitute, and it is the
+stronger check: it shows the kernel is not merely unselected but absent.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes

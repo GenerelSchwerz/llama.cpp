@@ -469,17 +469,26 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    const bool ok = ampere_mma_available(cc) &&
+    // A non-zero logit softcap keeps the standard path. Quantized K/V with a
+    // softcap is a pre-existing CUDA abort on both routes (see
+    // docs/quantized-native-flash-attention.md), so there is nothing to gain by
+    // routing it here, and excluding it lets the kernel drop the softcap
+    // specialization for every quantized case instead of compiling one that no
+    // dispatch can reach.
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const bool ok = ampere_mma_available(cc) && logit_softcap == 0.0f &&
         ggml_cuda_fattn_mma_quant_pair(K->type, V->type) &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
     if (!ok && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
         static std::once_flag warn_flag;
         std::call_once(warn_flag, [=] {
-            GGML_LOG_WARN("quantized-native CUDA FlashAttention has no kernel for K=%s V=%s DQ=%d DK=%d DV=%d; "
-                          "using the standard materializing path\n",
+            GGML_LOG_WARN("quantized-native CUDA FlashAttention has no kernel for K=%s V=%s DQ=%d DK=%d DV=%d "
+                          "softcap=%.1f; using the standard materializing path\n",
                 ggml_type_name(K->type), ggml_type_name(V->type),
-                (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0]);
+                (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0], logit_softcap);
         });
     }
 

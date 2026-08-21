@@ -2061,6 +2061,14 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             shared_memory_limit_raised[id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
+    } else if constexpr (is_quant_kv) {
+        // Unreachable: ggml_cuda_fattn_native_applies() requires a zero logit
+        // softcap before anything routes here. Not naming the softcap
+        // specialization in this branch is the point of the branch. Otherwise
+        // every quantized K/V pair and tile shape emits a second device kernel
+        // that no dispatch can ever select, which is half of everything this
+        // family compiles.
+        GGML_ABORT("quantized-native MMA reached with a non-zero logit softcap");
     } else {
         constexpr bool use_logit_softcap = true;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
