@@ -3588,6 +3588,136 @@ PR 8 source, generated arguments, presets, and feature-specific reproductions
 remain with that PR until source lands; shared protocol, research, roadmap,
 isolation, and identity indexing belong in the KV line.
 
+## Post-PR9 test-only regression: F32 GDN recurrent snapshot fusion
+
+Status: retained test-only correctness coverage on the merged PR 9 base.
+
+### Scope and provenance
+
+The exact merged base is
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3`; the old published feature head
+is `06cb666f8d07f345840881e9720d2a0756555f33`. The immutable recovery source
+is `refs/codex/pre-pr4-parallel-source` at
+`f52988ee150cd27a94d6897cc049326c1e77c3e2`. The rebased isolated test-source
+commit is `77aa9f640f97349cf04ca6a5f50a1a7910a496b0`.
+
+The recovered change adds one F32 `test_gated_delta_net_fused_cache` fixture
+and one decode-shaped registration to `tests/test-backend-ops.cpp`. It builds
+the same `GATED_DELTA_NET -> VIEW -> CPY` recurrent-cache write shape used by
+`llm_build_delta_net_base::build_recurrent_attn()`, expands the side-effecting
+copy before the attention output, and asks the existing whole-graph comparison
+helper to verify the cache-copy node. The production CUDA fusion was already
+present from upstream commit `5a460dea9`; the ordinary GDN matrix covers the
+packed operator but does not construct the eligible cache-copy graph.
+
+The candidate is 119 added test lines in one test file. Its diff contains no
+`src/`, `ggml/`, `common/`, `include/`, or tool change and imports no rejected
+or unrelated snapshot family. It changes no production source, public
+interface, allocation, kernel, or runtime behavior.
+
+### Builds and identities
+
+The merge-readiness builds were full clean Release builds at exact branch head
+`4b71f6370ef220c91f3641fc1ea4bb25ecb2674a`. They use Ninja's native step
+progress and no more than six parallel jobs:
+
+```bash
+cmake -S . -B build-cpu-f32-snapshot-pr10-ready -G Ninja \
+  -DGGML_CUDA=OFF -DGGML_NATIVE=ON -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF
+cmake --build build-cpu-f32-snapshot-pr10-ready --parallel 6
+
+cmake -S . -B build-cuda-f32-snapshot-pr10-ready -G Ninja \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_CURL=OFF
+cmake --build build-cuda-f32-snapshot-pr10-ready --parallel 6
+```
+
+Hardware was an Intel Core Ultra 9 285K with 63,633 MiB reported free to the
+CPU backend and an NVIDIA GeForce RTX 5070 Ti with compute capability 12.0,
+15,880 MiB usable process memory, and driver 610.57.04. CMake was 4.4.2,
+Ninja was 1.13.2, the project C/C++ compiler was GNU 16.2.1, and CUDA 13.3.73
+used GNU 15.3.0 as its host compiler. Both builds were Release with native CPU
+optimization; the CUDA build enabled FlashAttention and resolved architecture
+120 to `120a`.
+
+Both complete build trees were compiled at exact validation head
+`4b71f6370ef220c91f3641fc1ea4bb25ecb2674a`; CMake reported
+`ggml commit: 4b71f6370`, build 11259. The resulting `test-backend-ops`
+SHA-256 values were:
+
+- CPU: `6b27a7d6f739ef466822ffd60739119df182c716293289b5c3c7c7d7950a632c`
+- CUDA: `72f9713de6ec152f9c01d8dca47492193598dad4ca2590559e8511324ccbb593`
+
+### Correctness commands and results
+
+Every test invocation is a fresh process with deterministic seed `0x5eedf32`
+(decimal 99,540,786). The CPU commands are:
+
+```bash
+build-cpu-f32-snapshot-pr10-ready/bin/test-backend-ops test \
+  -b CPU -o GATED_DELTA_NET_FUSED_CACHE --seed 0x5eedf32
+build-cpu-f32-snapshot-pr10-ready/bin/test-backend-ops test \
+  -b CPU -o GATED_DELTA_NET --seed 0x5eedf32
+ctest --test-dir build-cpu-f32-snapshot-pr10-ready --output-on-failure --progress \
+  -R '^test-backend-ops-seed-static$'
+ctest --test-dir build-cpu-f32-snapshot-pr10-ready \
+  --output-on-failure --progress --parallel 6
+ctest --test-dir build-cpu-f32-snapshot-pr10-ready \
+  --output-on-failure --progress --parallel 6 \
+  -E '^test-tokenizers-ggml-vocabs$'
+```
+
+Every entire CUDA-linked invocation, including its clean-GPU probe, is inside
+the required lock and directly replaces the inner shell with the test process:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'if nvidia-smi --query-compute-apps=pid --format=csv,noheader | rg -q "[0-9]"; then echo "GPU compute process present; refusing test" >&2; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2; exit 75; fi; exec build-cuda-f32-snapshot-pr10-ready/bin/test-backend-ops test -b CUDA0 -o GATED_DELTA_NET_FUSED_CACHE --seed 0x5eedf32'
+flock /tmp/beellama-single-gpu.lock -c \
+  'if nvidia-smi --query-compute-apps=pid --format=csv,noheader | rg -q "[0-9]"; then echo "GPU compute process present; refusing test" >&2; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2; exit 75; fi; exec build-cuda-f32-snapshot-pr10-ready/bin/test-backend-ops test -b CUDA0 -o GATED_DELTA_NET --seed 0x5eedf32'
+flock /tmp/beellama-single-gpu.lock -c \
+  'if nvidia-smi --query-compute-apps=pid --format=csv,noheader | rg -q "[0-9]"; then echo "GPU compute process present; refusing test" >&2; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2; exit 75; fi; exec ctest --test-dir build-cuda-f32-snapshot-pr10-ready --output-on-failure --progress -R "^test-backend-ops-seed-static$"'
+flock /tmp/beellama-single-gpu.lock -c \
+  'if nvidia-smi --query-compute-apps=pid --format=csv,noheader | rg -q "[0-9]"; then echo "GPU compute process present; refusing test" >&2; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2; exit 75; fi; exec ctest --test-dir build-cuda-f32-snapshot-pr10-ready --output-on-failure --progress --parallel 1'
+flock /tmp/beellama-single-gpu.lock -c \
+  'if nvidia-smi --query-compute-apps=pid --format=csv,noheader | rg -q "[0-9]"; then echo "GPU compute process present; refusing test" >&2; nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader >&2; exit 75; fi; exec ctest --test-dir build-cuda-f32-snapshot-pr10-ready --output-on-failure --progress --parallel 1 -E "^(test-tokenizers-ggml-vocabs|test-backend-ops)$"'
+```
+
+The focused processes completed in under two seconds, so no additional
+long-run progress mechanism was needed. CTest's native completed-test counter
+exposed progress for the broad runs. The serialized CUDA suite kept its lock
+for the complete command and prevented GPU-linked test overlap.
+
+| Selection | CPU | CUDA |
+|---|---:|---:|
+| `GATED_DELTA_NET_FUSED_CACHE` | 1/1 passed | 1/1 passed |
+| Existing `GATED_DELTA_NET` matrix | 36/36 passed | 36/36 passed |
+| Backend-op deterministic-seed static guard | 1/1 passed | 1/1 passed |
+| Broad practical CTest | 96/96 passed | 95/95 passed |
+
+The attempted unfiltered CPU suite passed 96/97. Its only failure,
+`test-tokenizers-ggml-vocabs`, read six fetched Git LFS pointer files beginning
+with `version` instead of GGUF data. Excluding only that unavailable external
+data case produced the 96/96 practical result above.
+
+The attempted unfiltered serialized CUDA suite passed 95/97. It encountered
+the same LFS-data failure and the broad, unrelated `test-backend-ops` matrix
+aborted after 299.25 seconds in `ggml_cuda_flash_attn_ext_vec` at
+`ggml/src/ggml-cuda/fattn.cu:380` while exercising FlashAttention cases outside
+the focused GDN selection. Excluding exactly those two cases produced the
+95/95 practical result above. The separate CUDA GDN fixture and 36-case matrix
+are fresh passing processes and directly cover this change.
+
+### Disposition
+
+Retain the fixture. It closes a specific correctness gap around the upstream
+F32 recurrent snapshot-copy fusion without broadening the production fork
+surface. No PPL command was run: this diff changes only test and documentation
+sources and cannot affect model runtime behavior. No model, KLD, performance,
+profiler, VRAM, system-RAM, or pinned-memory run or claim is applicable.
+
 ## Experiment 020: opt-in live-context compute workspace
 
 ### Scope and identity

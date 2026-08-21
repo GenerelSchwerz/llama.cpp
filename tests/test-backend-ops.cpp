@@ -4306,6 +4306,120 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET + fused recurrent-cache snapshot copy
+struct test_gated_delta_net_fused_cache : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;
+
+    ggml_tensor * state_cpy = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_count, head_size, n_seq_tokens, n_seqs, K);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_FUSED_CACHE";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { state_cpy };
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_gated_delta_net_fused_cache(
+            int64_t head_count = 4, int64_t head_size = 16,
+            int64_t n_seq_tokens = 4, int64_t n_seqs = 1, int64_t K = 3)
+        : head_count(head_count), head_size(head_size),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {
+        GGML_ASSERT(K > 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(
+                ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+
+        const int64_t D                   = head_size * head_size * head_count;
+        const int64_t attn_score_elems    = head_size * head_count * n_seq_tokens * n_seqs;
+        const int64_t state_size_per_snap = D * n_seqs;
+        const int64_t n_written           = std::min(n_seq_tokens, K);
+
+        ggml_tensor * src = ggml_view_3d(
+                ctx, gdn_out, D, n_seqs, n_written,
+                ggml_row_size(GGML_TYPE_F32, D),
+                ggml_row_size(GGML_TYPE_F32, state_size_per_snap),
+                ggml_row_size(GGML_TYPE_F32, attn_score_elems));
+
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seqs, K);
+        ggml_set_name(cache, "state_cache");
+        ggml_tensor * dst = ggml_view_3d(
+                ctx, cache, D, n_seqs, n_written, cache->nb[1], cache->nb[2], 0);
+        state_cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(state_cpy, "state_cpy");
+
+        // The model graph schedules recurrent-cache writes as side effects and
+        // then expands the attention output. Reproduce that node order so the
+        // CUDA graph matcher exercises the direct F32 snapshot store.
+        if (gf != nullptr) {
+            ggml_build_forward_expand(gf, state_cpy);
+        }
+
+        return ggml_view_4d(
+                ctx, gdn_out, head_size, head_count, n_seq_tokens, n_seqs,
+                ggml_row_size(GGML_TYPE_F32, head_size),
+                ggml_row_size(GGML_TYPE_F32, head_size * head_count),
+                ggml_row_size(GGML_TYPE_F32, head_size * head_count * n_seq_tokens), 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10459,6 +10573,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // overflow: n_tokens > K — only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+
+    // Persistent recurrent-state snapshots and their cache remain F32. Keep a
+    // decode-shaped gate for the existing CUDA snapshot-copy fusion.
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(
+                4, 16, 1, 2, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

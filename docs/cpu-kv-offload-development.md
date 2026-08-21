@@ -1143,6 +1143,36 @@ allocation classes, and identical matched perplexity. Experiment 020 contains
 the exact commands and evidence. The result remains support instrumentation,
 not a VRAM optimization or permission to infer a trimming policy.
 
+## 2026-08-21: F32 GDN recurrent snapshot-fusion regression
+
+The old isolated feature head
+`06cb666f8d07f345840881e9720d2a0756555f33` recovered one useful test from
+the immutable `refs/codex/pre-pr4-parallel-source` snapshot: an F32
+whole-graph backend-op fixture for the existing CUDA gated-delta-net
+recurrent-cache copy fusion. The ordinary GDN matrix validates the packed
+operator result but does not construct the model graph's
+`GATED_DELTA_NET -> VIEW -> CPY` cache write and therefore cannot cover the
+direct snapshot store.
+
+After shared PR 9 merged, the same test patch was rebased without behavior
+changes onto exact `beellama-kv-cpu-offload` base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` as source commit
+`77aa9f640f97349cf04ca6a5f50a1a7910a496b0`. It continues to use the
+upstream-style `run_whole_graph()` and `fusion_test_nodes()` hooks and mirrors
+the cache view in `llm_build_delta_net_base::build_recurrent_attn()`. No F16
+state, compact masking, native Q8, live workspace, telemetry, staging, or
+unrelated snapshot code was imported.
+
+The appended post-PR9 test-only record owns the exact build and final-identity
+CPU/CUDA validation evidence. Merge-readiness validation used complete Release
+CPU and CUDA builds at `4b71f6370ef220c91f3641fc1ea4bb25ecb2674a`, capped
+at six build jobs. The focused fixture, existing 36-case GDN matrices, and seed
+guard passed on CPU and CUDA. Broad practical CTest passed 96/96 on CPU and
+95/95 on CUDA; the record identifies the excluded unavailable Git LFS vocab
+data case and unrelated unfiltered FlashAttention matrix abort. This change
+adds no production source, runtime behavior, performance claim, or perplexity
+claim.
+
 ## 2026-08-20: live-context workspace protocol edition
 
 The current-testing protocol now names live-context workspace sizing as an
