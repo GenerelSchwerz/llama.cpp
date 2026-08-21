@@ -5900,6 +5900,29 @@ normally. This is card-, model- and type-specific rather than a general claim:
 the option is not an optimization but the difference between a server that
 starts and one that does not.
 
+##### A unified cache does not shrink with slots, so the option matters more
+
+`--kv-unified` gives every slot the full context instead of `n_ctx / N`, and the
+reserved compute buffer stops depending on the slot count entirely:
+
+| Slots | `q8_0` off -> on | `q3_0` off -> on |
+|---:|---|---|
+| 1 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 2 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 4 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 8 | (out of memory) 1790.27 | (out of memory) 1490.27 |
+
+`n_ctx_slot` is 245,760 at every row. The saving is again exactly 972 MiB, but
+unlike the non-unified case the baseline does not fall as slots are added, so a
+unified cache is the memory-hungrier configuration and the one where removing
+the F16 copy is worth most.
+
+That also widens the failure found above. With a non-unified cache only `q8_0`
+failed to start at eight slots. With `--kv-unified` **both** types fail in the
+materializing arm — `q8_0` on 1790.27 MiB and `q3_0` on 1490.27 MiB, both
+`cudaMalloc failed: out of memory` — while the native arm starts both at
+818.27 MiB and 518.27 MiB.
+
 ##### Concurrent multi-slot output is bit-exact
 
 `--parallel 4 --cont-batching`, `-c 32768`, `q8_0`, four distinct prompts issued
@@ -5917,6 +5940,12 @@ that `--parallel 1` never generates: the recorded launches include
 `D=256 n_q=3 n_kv=2560`, a decode step covering three sequences in one launch,
 alongside the familiar `n_q=512` prefill shapes. The loader is exercised on
 those shapes and remains exact.
+
+Repeating the same test with `--kv-unified` gives the same four equal hashes,
+with 720 native launches against 0. Its recorded shapes reach further into
+multi-sequence territory — `n_q=4 n_kv=9984` and `n_q=8 n_kv=3328`, several
+sequences attending one shared window that is roughly four times the
+non-unified `n_kv` — and the output is unchanged.
 
 #### Revised disposition
 
