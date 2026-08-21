@@ -398,6 +398,7 @@ struct cmd_params {
     bool                             no_warmup;
     bool                             kv_cpu_pinned;
     bool                             recurrent_state_offload;
+    bool                             live_context_workspace;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -448,6 +449,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* kv_cpu_pinned        */ false,
     /* recurrent_state_offload */ false,
+    /* live_context_workspace  */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -468,6 +470,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --progress                                  print test progress indicators\n");
     printf("  --kv-memory                                capture synchronized KV component and device allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --live-context-workspace                    grow supported attention workspaces with the live KV extent\n");
     printf("  --kv-cpu-pinned                             route CPU-resident KV cache layers through pinned/host memory\n");
     printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident (default: %s)\n",
             join(cmd_params_defaults.kv_gpu_layers, ",").c_str());
@@ -692,6 +695,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.kv_cpu_pinned        = cmd_params_defaults.kv_cpu_pinned;
     params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
+    params.live_context_workspace = cmd_params_defaults.live_context_workspace;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1244,6 +1248,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.kv_cpu_pinned = true;
             } else if (arg == "--recurrent-state-offload") {
                 params.recurrent_state_offload = true;
+            } else if (arg == "--live-context-workspace") {
+                params.live_context_workspace = true;
+            } else if (arg == "--no-live-context-workspace") {
+                params.live_context_workspace = false;
             } else if (arg == "--kv-gpu-layers") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1429,6 +1437,7 @@ struct cmd_params_instance {
     bool               no_kv_offload;
     bool               kv_cpu_pinned;
     bool               recurrent_state_offload;
+    bool               live_context_workspace;
     int                kv_gpu_layers;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
@@ -1514,6 +1523,7 @@ struct cmd_params_instance {
         cparams.offload_kqv             = !no_kv_offload;
         cparams.kv_cpu_pinned           = kv_cpu_pinned;
         cparams.recurrent_state_offload = recurrent_state_offload;
+        cparams.live_context_workspace  = live_context_workspace;
         cparams.kv_gpu_layers           = (uint32_t) kv_gpu_layers;
         cparams.flash_attn_type         = flash_attn;
         cparams.embeddings              = embeddings;
@@ -1588,6 +1598,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1629,6 +1640,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1670,6 +1682,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
                 /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
                 /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1796,6 +1809,7 @@ struct test {
     bool                     no_kv_offload;
     bool                     kv_cpu_pinned;
     bool                     recurrent_state_offload;
+    bool                     live_context_workspace;
     int                      kv_gpu_layers;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
@@ -1848,6 +1862,7 @@ struct test {
         no_kv_offload  = inst.no_kv_offload;
         kv_cpu_pinned  = inst.kv_cpu_pinned;
         recurrent_state_offload = inst.recurrent_state_offload;
+        live_context_workspace = inst.live_context_workspace;
         kv_gpu_layers  = inst.kv_gpu_layers;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
@@ -1944,6 +1959,7 @@ struct test {
             "cuda_runtime_overhead_bytes", "cuda_teardown_delta_bytes",
             "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
+            "live_context_workspace",
             "kv_gpu_layers",  "flash_attn",     "devices",       "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1979,7 +1995,8 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_cpu_pinned" ||
-            field == "recurrent_state_offload" || field == "cpu_strict" || field == "embeddings" ||
+            field == "recurrent_state_offload" || field == "live_context_workspace" ||
+            field == "cpu_strict" || field == "embeddings" ||
             field == "no_host") {
             return BOOL;
         }
@@ -2135,6 +2152,7 @@ struct test {
                                             std::to_string(no_kv_offload),
                                             std::to_string(kv_cpu_pinned),
                                             std::to_string(recurrent_state_offload),
+                                            std::to_string(live_context_workspace),
                                             std::to_string(kv_gpu_layers),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
@@ -2315,6 +2333,9 @@ struct markdown_printer : public printer {
         if (field == "recurrent_state_offload") {
             return 3;
         }
+        if (field == "live_context_workspace") {
+            return 3;
+        }
         if (field == "n_threads") {
             return 7;
         }
@@ -2375,6 +2396,9 @@ struct markdown_printer : public printer {
         }
         if (field == "recurrent_state_offload") {
             return "rso";
+        }
+        if (field == "live_context_workspace") {
+            return "lcw";
         }
         if (field == "kv_gpu_layers") {
             return "kvgl";
@@ -2472,6 +2496,9 @@ struct markdown_printer : public printer {
         }
         if (params.recurrent_state_offload != cmd_params_defaults.recurrent_state_offload) {
             fields.emplace_back("recurrent_state_offload");
+        }
+        if (params.live_context_workspace != cmd_params_defaults.live_context_workspace) {
+            fields.emplace_back("live_context_workspace");
         }
         if (params.kv_gpu_layers.size() > 1 || params.kv_gpu_layers != cmd_params_defaults.kv_gpu_layers) {
             fields.emplace_back("kv_gpu_layers");

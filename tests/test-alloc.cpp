@@ -715,6 +715,47 @@ static void test_shared_buffers_track_maximum_plan() {
     GGML_ASSERT(backend.context->allocated_total() == 0);
 }
 
+static void test_shared_buffers_single_member_resize() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto make_add_graph = [](int64_t n_elements) {
+        auto result = make_context();
+        ggml_tensor * a = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * b = make_input_1d(result.ctx, n_elements);
+        ggml_build_forward_expand(result.graph, ggml_add(result.ctx, a, b));
+        return result;
+    };
+
+    auto small  = make_add_graph(4);
+    auto medium = make_add_graph(16);
+    auto large  = make_add_graph(24);
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(alloc.get(), shared);
+
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), large.graph));
+        const size_t large_size = backend.context->allocated_total();
+        const uint64_t large_generation = ggml_gallocr_shared_buffers_generation(shared);
+
+        ggml_gallocr_shared_buffers_request_shrink(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), small.graph));
+        const size_t small_size = backend.context->allocated_total();
+        GGML_ASSERT(small_size < large_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) > large_generation);
+
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), medium.graph));
+        const size_t medium_size = backend.context->allocated_total();
+        GGML_ASSERT(medium_size > small_size);
+        GGML_ASSERT(medium_size < large_size);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), medium.graph));
+        check_all_allocated(medium.graph);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
 static void test_shared_buffers_ignore_nonmembers() {
     dummy_backend first_backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
     dummy_backend second_backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
@@ -787,6 +828,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_shared_buffers_track_maximum_plan", test_shared_buffers_track_maximum_plan);
+    run("test_shared_buffers_single_member_resize", test_shared_buffers_single_member_resize);
     run("test_shared_buffers_ignore_nonmembers", test_shared_buffers_ignore_nonmembers);
     return 0;
 }

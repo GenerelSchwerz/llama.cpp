@@ -626,6 +626,34 @@ static void test(void) {
     assert(params.phase_aware_workspace);
     unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
 
+    unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.live_context_workspace);
+    assert(!common_context_params_to_llama(params).live_context_workspace);
+    assert(!llama_context_default_params().live_context_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--live-context-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.live_context_workspace);
+    assert(!params.phase_aware_workspace);
+    assert(common_context_params_to_llama(params).live_context_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--live-context-workspace", "--no-live-context-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.live_context_workspace);
+
+    set_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE", "1");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.live_context_workspace);
+    assert(!params.phase_aware_workspace);
+    unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
+
     // MTP recurrent-plane cap: zero preserves the full draft-depth reserve.
     params = common_params();
     argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};

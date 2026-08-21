@@ -123,9 +123,13 @@ struct llama_workspace_stats {
     uint32_t reserved_tokens = 0;
     uint32_t decode_tokens = 0;
     uint32_t prefill_tokens = 0;
+    uint32_t reserved_kv = 0;
+    uint32_t kv_capacity = 0;
     uint64_t reserve_count = 0;
     uint64_t grow_count = 0;
     uint64_t shrink_count = 0;
+    uint64_t kv_grow_count = 0;
+    uint64_t kv_shrink_count = 0;
     uint64_t reserve_us = 0;
     uint64_t device_bytes = 0;
     uint64_t host_bytes = 0;
@@ -135,6 +139,10 @@ LLAMA_API llama_workspace_stats llama_get_workspace_stats(const struct llama_con
 LLAMA_API bool llama_contexts_share_workspace(
         const struct llama_context * ctx_a,
         const struct llama_context * ctx_b);
+
+// Synchronize the context and ask capable backends to release cached transient
+// physical mappings. This is a no-op unless live-context sizing is effective.
+LLAMA_API uint64_t llama_trim_transient_memory(struct llama_context * ctx);
 
 //
 // model/context data extraction

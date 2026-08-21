@@ -109,10 +109,11 @@ MTP and composition with PR 4 and final PR 8 remain integration gates.
 
 [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) owns the default-off
 live physical-KV reservation policy and all-idle trim. Its source, presets,
-generated arguments, and user-facing documentation must merge together. It is
-final at `0c8df007a504f16aa35fc5982303e3e1b9883331`, directly based on
-`4a7f9b496` with six feature commits. Reconcile inherited PR 9 documentation
-and refresh merge metadata before feature integration. Until its source lands,
+generated arguments, and user-facing documentation must merge together. The
+enabled evidence head is `0c8df007a504f16aa35fc5982303e3e1b9883331`; the
+final disabled-source gate measured runtime head
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148` directly against exact refreshed
+base `8e858fcec39049fa028ce6fcb144a0c08b03abd3`. Until its source lands,
 `--live-context-workspace` is absent from current runnable commands and from
 current preset/generated argument documentation.
 
@@ -123,6 +124,10 @@ neutral repeated 4K/30K throughput, while separately exposing synchronized
 device-used prefill high-water costs. Treat those W02 device-used values as
 allocator evidence, not `nvidia-smi` process VRAM. Exact values and accepted
 Bash-wrapped provenance commands are indexed in the experiment record.
+The later exact-base A/B/A gate also proved that both omission and explicit
+off preserve upstream upfront reservation, exact output and PPL, identical
+W02 memory fields, and neutral repeated 4K/30K throughput. No disabled-path
+production fix was warranted.
 
 ## Later research, in priority order
 

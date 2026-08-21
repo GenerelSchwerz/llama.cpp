@@ -732,10 +732,18 @@ struct server_slot {
         timings.workspace_target_reserves = delta(workspace_end_tgt.reserve_count, workspace_start_tgt.reserve_count);
         timings.workspace_target_grows = delta(workspace_end_tgt.grow_count, workspace_start_tgt.grow_count);
         timings.workspace_target_shrinks = delta(workspace_end_tgt.shrink_count, workspace_start_tgt.shrink_count);
+        timings.workspace_target_kv_grows = delta(workspace_end_tgt.kv_grow_count, workspace_start_tgt.kv_grow_count);
+        timings.workspace_target_kv_shrinks = delta(workspace_end_tgt.kv_shrink_count, workspace_start_tgt.kv_shrink_count);
+        timings.workspace_target_reserved_kv = workspace_end_tgt.reserved_kv;
+        timings.workspace_target_kv_capacity = workspace_end_tgt.kv_capacity;
         timings.workspace_target_reserve_ms = delta(workspace_end_tgt.reserve_us, workspace_start_tgt.reserve_us) / 1000.0;
         timings.workspace_draft_reserves = delta(workspace_end_dft.reserve_count, workspace_start_dft.reserve_count);
         timings.workspace_draft_grows = delta(workspace_end_dft.grow_count, workspace_start_dft.grow_count);
         timings.workspace_draft_shrinks = delta(workspace_end_dft.shrink_count, workspace_start_dft.shrink_count);
+        timings.workspace_draft_kv_grows = delta(workspace_end_dft.kv_grow_count, workspace_start_dft.kv_grow_count);
+        timings.workspace_draft_kv_shrinks = delta(workspace_end_dft.kv_shrink_count, workspace_start_dft.kv_shrink_count);
+        timings.workspace_draft_reserved_kv = workspace_end_dft.reserved_kv;
+        timings.workspace_draft_kv_capacity = workspace_end_dft.kv_capacity;
         timings.workspace_draft_reserve_ms = delta(workspace_end_dft.reserve_us, workspace_start_dft.reserve_us) / 1000.0;
 
         return timings;
@@ -1626,6 +1634,18 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                const bool all_idle = std::all_of(slots.begin(), slots.end(),
+                    [](const server_slot & item) { return !item.is_processing(); });
+                if (all_idle) {
+                    const uint64_t target_released = llama_trim_transient_memory(ctx_tgt);
+                    const uint64_t draft_released = llama_trim_transient_memory(ctx_dft);
+                    if (target_released + draft_released > 0) {
+                        SRV_TRC("trimmed transient backend pools: target %.2f MiB, draft %.2f MiB\n",
+                                target_released/1024.0/1024.0,
+                                draft_released/1024.0/1024.0);
+                    }
+                }
             };
 
             slot.reset();

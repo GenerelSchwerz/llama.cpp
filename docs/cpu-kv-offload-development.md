@@ -1143,6 +1143,60 @@ allocation classes, and identical matched perplexity. Experiment 020 contains
 the exact commands and evidence. The result remains support instrumentation,
 not a VRAM optimization or permission to infer a trimming policy.
 
+## 2026-08-20: live-context workspace protocol edition
+
+The current-testing protocol now names live-context workspace sizing as an
+independent default-off control. The previous edition described only
+phase-aware token geometry and therefore could not reproduce W04/W05/W09 in
+isolation. Current live-sizing comparisons vary only the positive/negative
+live control, require a memory layout that explicitly publishes bounded
+attention reservation, and keep every other optional workspace policy fixed.
+Unsupported layouts retain full reservation and the established upfront
+decode order. CUDA transient-pool trimming is restricted to the all-slots-idle
+boundary after effective live sizing; it is not a per-decode reclamation path.
+
+## 2026-08-21: compose W02 telemetry with live idle trimming
+
+The published KV-offload base now contains W06 full-batch perplexity capacity
+and W02 allocation/VMM telemetry. Rebasing the isolated live-workspace work
+onto that base preserves both historical Experiment 020 entries as measured;
+neither prior source identity nor result is relabeled as composed evidence.
+
+The VMM pool now enrolls in W02 telemetry before an idle trim and subtracts
+only the released physical mapping from the current mapped-byte counter. Live
+bytes and mapped high-water remain unchanged by trim. No new benchmark trim
+caller or lifecycle checkpoint is shipped; composed validation observes the
+existing server all-idle boundary, and the default path remains dormant.
+
+## 2026-08-21: require the exact PR 8 disabled-source bracket
+
+The prior PR 8 refresh relied on production-path equivalence with its earlier
+measured head. That remains useful provenance for the enabled implementation,
+but it cannot prove that compiling the opt-in source leaves omission and
+explicit off neutral against the exact base. The final gate therefore uses
+identically configured exact-base and candidate builds with fresh base /
+candidate / base processes at both 4K and long context. Omission and explicit
+off are separate candidates, and every unrelated workspace/speculative option
+is fixed off or absent.
+
+The maintained exactness runner now captures a health-ready process/GPU sample
+before the first request. This makes startup time, process VRAM, ordinary RSS,
+shared/pinned-backed RSS, and later lifecycle peaks distinct artifacts rather
+than inferring startup from the first prefill. The current preflight template
+also places CUDA-linked version probes and `nvidia-smi` inside the whole-command
+GPU lock; the previous unlocked example was a protocol hazard, not evidence.
+
+The completed bracket compared exact base `8e858fcec39049fa028ce6fcb144a0c08b03abd3`
+with candidate runtime source
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`. Both omission and explicit off
+retained the same one-time upfront compute reservation as base, produced exact
+1K and 32K lifecycle output, matched PPL bit-for-reported-bit, and reproduced
+all W02 CUDA/VMM and physical allocation classes. Repeated 4K and 30K
+throughput stayed inside the three-sample base bracket. The candidate's lower
+sampled `RssShmem` is not claimed as a saving because it is outside W02's
+allocator-owned classification and is not an enabled feature effect. No
+disabled-path production change is justified by this evidence.
+
 ## Cross-hardware DSpark comparison and open issues
 
 Characterizations 020-026 preserve a historical protocol run from the PR 3
