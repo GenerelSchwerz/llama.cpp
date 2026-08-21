@@ -20,11 +20,11 @@ A combined tree can answer the second question only after the first is closed.
 
 | Lane | Exact identity observed during consolidation | Ownership | Current status |
 |---|---|---|---|
-| K: shared KV documentation | PR 9 on `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; retained journal base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | 2026-08-21 readiness audit passed; coordinator integration is independent of feature order. |
+| K: shared KV documentation | PR 9 merge `8e858fcec39049fa028ce6fcb144a0c08b03abd3` on source-bearing base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; retained journal base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | Merged documentation-only; production source is unchanged. |
 | N: native standard-quant attention | PR 4, `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native quantized FlashAttention source, tests, focused docs, archived composed manifests. | Published draft. |
 | W06: PPL capacity | PR 5 evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | `llama-perplexity` output-capacity fix and evidence. | Merged into the published base. |
 | W02: allocation telemetry | PR 6 merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Opt-in physical allocation/VMM telemetry. | Merged into the published base. |
-| W03: compact causal mask | PR 7 final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f` | Causal representation and branch-owned isolated/composed evidence. | Final evidence head; reconcile inherited PR 9 docs and refresh merge metadata before integration. |
+| W03: compact causal mask | PR 7 preserved evidence head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f`; inherited documentation base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Causal representation and branch-owned isolated/composed evidence. | Documentation-base reconciliation complete with identical causal source delta; draft remains unmerged. |
 | W04/W05/W09: live workspace | PR 8 final head `0c8df007a504f16aa35fc5982303e3e1b9883331` | Live reservation, exact plan publication, idle trim, source and user docs. | Final evidence head; reconcile inherited PR 9 docs and refresh merge metadata before integration. |
 
 An observed head is not a permanent evidence tag. PR 7 and PR 8 final

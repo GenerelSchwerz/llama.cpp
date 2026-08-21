@@ -906,3 +906,72 @@ compact causal-mask implementation. Exactness and PPL remain unchanged, PR 6
 telemetry remains functional and non-owning, and no new source change was
 needed. These checks establish source compatibility only; the isolated c9
 A/B/A and deep-scaling study remain the resource and performance evidence.
+
+## Documentation-base refresh at 8e858fcec
+
+PR 9 merged its documentation consolidation into
+`beellama-kv-cpu-offload` as exact commit
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3`. PR 7's previously published head
+was `d4183adb8b4902a125b9339cd39032a095fca013`; its preserved composed-source
+checkpoint remains `ae60c7321d950937a36af096112525db777ae13f`. The clean
+post-rebase, pre-reconciliation checkpoint was
+`ed9f889481621acd5de12d5db6b0dc010862c88a`, six commits directly ahead of the
+new documentation base.
+
+This refresh changes documentation inheritance and publication metadata only.
+The accepted read-only proof used:
+
+```bash
+git diff --name-status 4a7f9b496..8e858fcec
+for tree_path in CMakeLists.txt cmake ggml include src common tools examples tests; do
+  git rev-parse "4a7f9b496:$tree_path" "8e858fcec:$tree_path"
+done
+git diff --binary --full-index 4a7f9b496..d4183adb8 \
+  -- . ':(exclude)docs/**' | sha256sum
+git diff --binary --full-index 8e858fcec..ed9f88948 \
+  -- . ':(exclude)docs/**' | sha256sum
+git diff --name-status d4183adb8..ed9f88948
+git rev-parse d4183adb8:docs/compact-causal-mask-vram-investigation.md \
+  ed9f88948:docs/compact-causal-mask-vram-investigation.md \
+  d4183adb8:scripts/compact-mask-next-turn.sh \
+  ed9f88948:scripts/compact-mask-next-turn.sh
+```
+
+The old source-bearing base `4a7f9b496` and new documentation base `8e858fcec`
+have identical Git tree objects for `CMakeLists.txt`, `cmake`, `ggml`,
+`include`, `src`, `common`, `tools`, `examples`, and `tests`. Their only
+non-document changes are `AGENTS.md` and three added explanatory comment lines
+in `scripts/mtp-nsys-profile.sh`; removing comment-only lines from the old and
+new script yields identical SHA-256
+`7ba3085abce3d9b47faef75ae7725da9fd87e119ff7d5661e3c863b075df715d`.
+Neither path is built, linked, parsed by the llama CLI, or used by the compact
+runner.
+
+The complete full-index binary diff for all non-document paths, including the
+compact reproduction runner, has SHA-256
+`ffaeca4eff34e6d449184d724c6579828c91cbe070a464ba8db943c5c3bc4f92`
+both for `4a7f9b496..d4183adb8` and for
+`8e858fcec..ed9f88948`. The old and rebased trees also have identical blobs for
+the compact runner (`0c5aea501dfa85669c55882e437f721bf73c9d12`) and this
+investigation before the present append
+(`d04b0090c0900aba215898eef6ec68e31f48f93e`). The original 47,204 bytes of
+this investigation have content SHA-256
+`6a9f0738592988deb5ec5cfcabacc625f5ea9ff79eaf043c3fcbdb543ca8b79c`;
+therefore every isolated, deep, and composed measurement, command, exclusion,
+artifact identity, and manifest above is retained byte-for-byte.
+
+The sole rebase conflict was the independently appended experiment record. Its
+resolution keeps the complete shared PR 9 Experiments 001-020/W06 protocol and
+post-KV identity index once, followed by the branch-owned compact isolation
+record once. The compact record has unchanged content SHA-256
+`94f98fca92342cdb145c255c55e2f74ddbbe5fdc8c658e7fe656e4636506f72e`;
+both section headings occur exactly once. The only later edits to shared
+documents state the genuinely changed PR 9 merge identity, inherited
+documentation base, and completed PR 7 reconciliation status.
+
+Because the production/build/CLI/test trees and the complete causal source
+delta are identical, rebuilding or rerunning a CUDA binary could add no source
+coverage and would risk mislabeling a documentation-only refresh as new
+performance evidence. No GPU command was run. The isolated c9 A/B/A and the
+`ae60c7321` composed checks remain the accepted evidence boundaries; this
+section is a path/tree/diff proof only.

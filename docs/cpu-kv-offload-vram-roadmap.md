@@ -83,11 +83,13 @@ It is not evidence that any separate workspace or mask feature is correct.
 
 ### 3. Integrate compact causal masking only from final PR 7
 
-[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is final at
-`d4183adb8b4902a125b9339cd39032a095fca013`. Its evidence publication contained
-six feature commits over exact source baseline `4a7f9b496`; reconcile inherited
-PR 9 documentation and refresh merge metadata before feature integration. It
-automatically uses an I64 causal-prefix descriptor only for proved
+[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) has preserved
+evidence head `d4183adb8b4902a125b9339cd39032a095fca013`. Its evidence publication
+contained six feature commits over exact source baseline `4a7f9b496`; the
+current draft inherits merged PR 9 documentation base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` without changing the causal source
+delta or evidence identity. It automatically uses an I64 causal-prefix
+descriptor only for proved
 single-stream contiguous standard-KV layouts and otherwise retains the dense
 mask. Per-consumer views remove the measured allocator fragmentation without
 changing allocator policy, public controls, or attention-kernel ownership.
