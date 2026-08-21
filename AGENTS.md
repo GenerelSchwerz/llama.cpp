@@ -119,9 +119,10 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/cpu-kv-offload-development.md` - progress and decision journal. It
   records protocol transitions, durable rationale, and concise summaries of
   valid rejected paths. It is not a transcript of every attempted run.
-- `docs/cpu-kv-offload-experiments.md` - complete curated CPU KV Experiment
-  001-019 record plus the post-KV evidence/identity index. It contains only
-  valid, decision-relevant evidence; use Git history for superseded editions.
+- `docs/cpu-kv-offload-experiments.md` - complete curated CPU KV Experiments
+  001-020 and W06 record plus the post-KV evidence/identity index. It contains
+  only valid, decision-relevant evidence; use Git history for superseded
+  editions.
 - `docs/cpu-kv-offload-vram-roadmap.md` - ranked shared VRAM work, including
   integrated controls, independent PR lanes, rejected paths, and later research.
 - `docs/vram-feature-isolation-plan.md` - source, measurement, comparison, and

@@ -1,9 +1,9 @@
 # CPU KV-offload VRAM roadmap
 
 This roadmap ranks shared VRAM work for every future branch derived from the
-published KV base `c9f727c1e1995c4a871a719ab05b5f2478588efd`. Status refers to
-source actually present in that base. Independent PRs are candidates, not
-current features.
+published KV base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Status refers to
+source actually present in that base; remaining independent PRs are candidates,
+not current features.
 
 Use this together with the
 [`feature-isolation plan`](vram-feature-isolation-plan.md) and the
@@ -47,19 +47,25 @@ The base also keeps supported hybrid recurrent state independently on the GPU
 and canonicalizes host-resident standard-Q8 stores. Those are correctness and
 performance foundations, not optional VRAM-only experiments.
 
+Merged W06 support lets `llama-perplexity` declare full-batch output capacity
+before context creation, including phase-aware runs. Merged W02 support extends
+opt-in `llama-bench --kv-memory` with physical allocation classes and CUDA VMM
+live/mapped/high-water telemetry. W02 reports allocation behavior; it does not
+trim a pool or change allocation policy.
+
 ## Near-term integration lanes
 
-### 1. Land protocol support before using its measurements
+### 1. Use the merged protocol support as the measurement foundation
 
-[PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) fixes
-`llama-perplexity` output capacity for phase-aware contexts. Until it lands,
-base PPL runs must keep phase-aware workspace off. This is a correctness of the
-measurement tool prerequisite, not a VRAM feature.
+[PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) merged the
+`llama-perplexity` output-capacity correctness fix as
+`50ee5b2d765c91a0d9cd23728ac17a27ac510e3e`. It is a measurement-tool
+prerequisite, not a VRAM feature.
 
-[PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) extends the base's
-opt-in `llama-bench --kv-memory` with physical allocation classes and CUDA VMM
-telemetry. It should land before allocator-lifetime work whose acceptance
-depends on live/mapped high-water. It does not trim or change allocation policy.
+[PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) merged the W02
+telemetry as current base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`.
+Use it for allocator-lifetime acceptance that depends on live/mapped
+high-water, without treating it as a trimming policy.
 
 ### 2. Integrate native standard-quant attention as its own capability
 
@@ -76,8 +82,10 @@ It is not evidence that any separate workspace or mask feature is correct.
 ### 3. Review compact causal masking only from final PR 7 evidence
 
 [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is actively receiving
-a committed fix and deeper-context evidence. Do not copy intermediate speed,
-allocation, or causal conclusions into the KV base. Review the final head for:
+a committed fix and deeper-context evidence. Its currently observed head is
+`b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`; keep it pending and do not copy
+intermediate speed, allocation, or causal conclusions into the KV base. Review
+the final published head for:
 
 - a source-only comparison against unchanged KV base plus declared prerequisites;
 - explicit fallback for unrepresentable layouts;
@@ -102,9 +110,10 @@ memory, exact output, PPL, and repeated prompt/decode performance.
 
 ### A. Close cross-feature integration without losing isolation
 
-After PR 4-8 heads stabilize, simulate all pairwise comparisons and likely
-merge orders before touching the published base. Re-run default/off controls
-after composition; a runtime-disabled feature can still change template
+After the remaining PR 4, PR 7, and PR 8 heads stabilize, simulate all pairwise
+comparisons and likely merge orders on top of the merged W06/W02 base before
+touching the published branch again. Re-run default/off controls after
+composition; a runtime-disabled feature can still change template
 instantiation, graph signatures, or allocator geometry. The isolation plan is
 the gate.
 
@@ -170,7 +179,7 @@ churn, and report pinned bytes independently from device VRAM.
 ## Integration order rule
 
 There is no authorized merge order yet. The likely dependency shape is support
-fixes/telemetry, native quant attention, then independently accepted workspace
-and mask features, but final ordering must be chosen from simulated final PR
-heads and source overlap. Do not merge or fast-forward the published KV base
-while PR 7 and PR 8 are changing.
+fixes/telemetry already merged, then native quant attention and independently
+accepted workspace and mask features. Final ordering must be chosen from
+simulated final PR heads and source overlap. Do not merge or fast-forward the
+published KV base while PR 7 and PR 8 are changing.

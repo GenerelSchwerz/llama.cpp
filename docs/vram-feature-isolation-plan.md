@@ -1,7 +1,7 @@
 # VRAM feature-isolation and integration plan
 
 This plan applies to every VRAM or CPU-KV branch derived from published KV base
-`c9f727c1e1995c4a871a719ab05b5f2478588efd`. It replaces the cumulative
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. It replaces the cumulative
 parallel-tree workflow captured in the read-only snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`.
 
@@ -18,10 +18,10 @@ A combined tree can answer the second question only after the first is closed.
 
 | Lane | Exact identity observed during consolidation | Ownership | Current status |
 |---|---|---|---|
-| K: shared KV documentation | local base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | Documentation-only candidate. |
+| K: shared KV documentation | PR 9 on `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; retained journal base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | Documentation-only draft. |
 | N: native standard-quant attention | PR 4, `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native quantized FlashAttention source, tests, focused docs, archived composed manifests. | Published draft. |
-| W06: PPL capacity | PR 5, `8d2f8452eb140ba52d8472ecd791cc90212a9307` | `llama-perplexity` output-capacity fix and evidence. | Published draft. |
-| W02: allocation telemetry | PR 6, `e18e046dbbeeb72c52d3ed74a932147f6a68cda1` | Opt-in physical allocation/VMM telemetry. | Published draft. |
+| W06: PPL capacity | PR 5 evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | `llama-perplexity` output-capacity fix and evidence. | Merged into the published base. |
+| W02: allocation telemetry | PR 6 merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Opt-in physical allocation/VMM telemetry. | Merged into the published base. |
 | W03: compact causal mask | PR 7, observed `b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5` | Causal representation and branch-owned evidence. | Moving draft; final identity/evidence pending. |
 | W04/W05/W09: live workspace | PR 8, `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Live reservation, exact plan publication, idle trim, source and user docs. | Published draft; re-fetch before integration. |
 
@@ -82,8 +82,8 @@ Each independently accepted feature must satisfy:
    the named variable.
 4. Native llama worker affinity; no whole-process affinity wrapper.
 5. Observable progress and retained result/log/progress artifacts.
-6. PPL with matching `-b` and `-ub`, using PR 5 when phase-aware output capacity
-   is required.
+6. PPL with matching `-b` and `-ub`; the published base includes W06 full-batch
+   output capacity for phase-aware contexts.
 7. Deterministic output and same-MTP-geometry exactness when scheduling,
    workspace, placement, or recurrent state can affect output.
 8. Repeated prefill, 4K decode, and long-context decode.
@@ -148,23 +148,19 @@ their merge bases:
 ```bash
 git fetch --no-tags generel \
   refs/pull/4/head:refs/codex/consolidation-pr4 \
-  refs/pull/5/head:refs/codex/consolidation-pr5 \
-  refs/pull/6/head:refs/codex/consolidation-pr6 \
   refs/pull/7/head:refs/codex/consolidation-pr7 \
   refs/pull/8/head:refs/codex/consolidation-pr8
 
-git merge-base c9f727c1e refs/codex/consolidation-pr4
-git merge-base c9f727c1e refs/codex/consolidation-pr5
-git merge-base c9f727c1e refs/codex/consolidation-pr6
-git merge-base c9f727c1e refs/codex/consolidation-pr7
-git merge-base c9f727c1e refs/codex/consolidation-pr8
+git merge-base 4a7f9b496 refs/codex/consolidation-pr4
+git merge-base 4a7f9b496 refs/codex/consolidation-pr7
+git merge-base 4a7f9b496 refs/codex/consolidation-pr8
 ```
 
 Before changing the published base, simulate:
 
 - each PR against the base;
 - the shared-doc branch against the base and each PR;
-- every PR pair in both likely orders where source overlap exists; and
+- every remaining PR pair in both likely orders where source overlap exists;
 - the proposed full integration order.
 
 Use `git merge-tree` or disposable temporary worktrees. Do not merge,
@@ -188,25 +184,24 @@ authorizes merging or fast-forwarding `beellama-kv-cpu-offload`.
 
 ### Consolidation-time comparison matrix
 
-`git merge-tree --write-tree` was run against the exact observed heads above on
-2026-08-21. Every PR individually merged cleanly with `c9f727c1e`. Every PR
-pair conflicted at the common append point in
-`docs/cpu-kv-offload-experiments.md`. Resolve that documentation conflict by
-preserving Experiments 001-019 once and adding the accepted branch evidence to
-the shared post-KV index; it is not by itself evidence of source
-incompatibility.
+`git merge-tree --write-tree` was rerun on 2026-08-21 with published base
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`, the reconciled PR 9 tree, and the
+exact PR 4/7/8 heads above. Every comparison conflicts at the independent
+append point in `docs/cpu-kv-offload-experiments.md`. Resolve that documentation
+conflict by preserving Experiments 001-020 and W06 once and adding the accepted
+branch evidence to the shared post-KV index; it is not by itself evidence of
+source incompatibility.
 
-| Pair | Additional textual conflicts beyond the old experiment ledger |
+| Comparison | Additional textual conflicts beyond the experiment record |
 |---|---|
-| PR 4 + PR 5 | None. |
-| PR 4 + PR 6 | None; CUDA backend and benchmark files auto-merged and still require semantic review. |
+| Base + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged and still requires semantic review. |
+| Base + PR 7 | None; W02 CUDA-backend overlap auto-merged and still requires semantic review. |
+| Base + PR 8 | `docs/cpu-kv-offload-development.md` and `ggml/src/ggml-cuda/ggml-cuda.cu`; current-testing, benchmark, and test overlap auto-merged. |
+| PR 9 docs + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged. |
+| PR 9 docs + PR 7 | None; W02 CUDA-backend overlap auto-merged. |
+| PR 9 docs + PR 8 | `docs/cpu-kv-offload-current-testing.md`, `docs/cpu-kv-offload-development.md`, and `ggml/src/ggml-cuda/ggml-cuda.cu`; benchmark and test overlap auto-merged. |
 | PR 4 + PR 7 | `ggml/src/ggml-cuda/CMakeLists.txt`, `fattn-mma-f16.cuh`, and `tests/test-backend-ops.cpp`. |
 | PR 4 + PR 8 | `tools/llama-bench/llama-bench.cpp`. |
-| PR 5 + PR 6 | None; current-testing/development auto-merged. |
-| PR 5 + PR 7 | None. |
-| PR 5 + PR 8 | None; current-testing/development auto-merged. |
-| PR 6 + PR 7 | None; CUDA backend auto-merged and requires semantic review. |
-| PR 6 + PR 8 | `docs/cpu-kv-offload-development.md` and `ggml/src/ggml-cuda/ggml-cuda.cu`; benchmark/test files auto-merged. |
 | PR 7 + PR 8 | None; multiple KV/context/CUDA files auto-merged and require interaction testing. |
 
 This matrix is diagnostic only. PR 7 is moving, PR 8 may receive review
@@ -214,11 +209,10 @@ updates, and an automatic textual merge does not establish allocator, graph,
 or kernel compatibility. Re-fetch and repeat the matrix before choosing a
 merge order.
 
-The consolidation branch itself conflicts with every PR at the experiment
-append point; PR 5 also overlaps current-testing, while PR 6 and PR 8 overlap
-both current-testing and the development journal. Those resolutions must keep
-the consolidated protocol and complete Experiments 001-019, then retain
-feature-owned detail in the PR until its source lands. Do not resolve them by
+PR 8 overlaps the reconciled current protocol and development journal in
+addition to its source conflict with merged W02. Any later resolution must keep
+the consolidated protocol and complete Experiments 001-020 plus W06, then
+retain PR-owned detail until its source lands. Do not resolve conflicts by
 dropping either historical KV evidence or a PR's source-coupled documentation.
 
 ## Post-composition acceptance

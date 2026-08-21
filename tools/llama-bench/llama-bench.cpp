@@ -1760,6 +1760,26 @@ struct test {
     uint64_t                 cuda_used_peak_bytes = 0;
     uint64_t                 cuda_used_after_context_bytes = 0;
     uint64_t                 cuda_total_bytes = 0;
+    uint64_t                 cuda_vmm_live_model_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_model_bytes = 0;
+    uint64_t                 cuda_vmm_live_context_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_context_bytes = 0;
+    uint64_t                 cuda_vmm_live_after_workload_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_after_workload_bytes = 0;
+    uint64_t                 cuda_vmm_live_peak_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_peak_bytes = 0;
+    uint64_t                 cuda_vmm_live_after_context_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_after_context_bytes = 0;
+    uint64_t                 cuda_vmm_active_pools_model = 0;
+    uint64_t                 cuda_vmm_active_pools_context = 0;
+    uint64_t                 cuda_vmm_active_pools_after_workload = 0;
+    uint64_t                 cuda_vmm_active_pools_after_context = 0;
+    uint64_t                 cuda_device_context_buffer_bytes = 0;
+    uint64_t                 cuda_device_compute_buffer_bytes = 0;
+    uint64_t                 accelerator_host_context_buffer_bytes = 0;
+    uint64_t                 accelerator_host_compute_buffer_bytes = 0;
+    uint64_t                 host_context_buffer_bytes = 0;
+    uint64_t                 host_compute_buffer_bytes = 0;
     uint64_t                 cuda_context_buffer_bytes = 0;
     uint64_t                 cuda_non_kv_context_buffer_bytes = 0;
     uint64_t                 cuda_compute_buffer_bytes = 0;
@@ -1909,6 +1929,16 @@ struct test {
             "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
             "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
             "cuda_used_prefill_bytes", "cuda_used_peak_bytes", "cuda_used_after_context_bytes", "cuda_total_bytes",
+            "cuda_vmm_live_model_bytes", "cuda_vmm_mapped_model_bytes",
+            "cuda_vmm_live_context_bytes", "cuda_vmm_mapped_context_bytes",
+            "cuda_vmm_live_after_workload_bytes", "cuda_vmm_mapped_after_workload_bytes",
+            "cuda_vmm_live_peak_bytes", "cuda_vmm_mapped_peak_bytes",
+            "cuda_vmm_live_after_context_bytes", "cuda_vmm_mapped_after_context_bytes",
+            "cuda_vmm_active_pools_model", "cuda_vmm_active_pools_context",
+            "cuda_vmm_active_pools_after_workload", "cuda_vmm_active_pools_after_context",
+            "cuda_device_context_buffer_bytes", "cuda_device_compute_buffer_bytes",
+            "accelerator_host_context_buffer_bytes", "accelerator_host_compute_buffer_bytes",
+            "host_context_buffer_bytes", "host_compute_buffer_bytes",
             "cuda_context_buffer_bytes", "cuda_non_kv_context_buffer_bytes", "cuda_compute_buffer_bytes",
             "cuda_context_delta_bytes", "cuda_peak_delta_bytes", "cuda_reconciliation_delta_bytes",
             "cuda_runtime_overhead_bytes", "cuda_teardown_delta_bytes",
@@ -2070,6 +2100,26 @@ struct test {
                                              std::to_string(cuda_used_peak_bytes),
                                              std::to_string(cuda_used_after_context_bytes),
                                              std::to_string(cuda_total_bytes),
+                                             std::to_string(cuda_vmm_live_model_bytes),
+                                             std::to_string(cuda_vmm_mapped_model_bytes),
+                                             std::to_string(cuda_vmm_live_context_bytes),
+                                             std::to_string(cuda_vmm_mapped_context_bytes),
+                                             std::to_string(cuda_vmm_live_after_workload_bytes),
+                                             std::to_string(cuda_vmm_mapped_after_workload_bytes),
+                                             std::to_string(cuda_vmm_live_peak_bytes),
+                                             std::to_string(cuda_vmm_mapped_peak_bytes),
+                                             std::to_string(cuda_vmm_live_after_context_bytes),
+                                             std::to_string(cuda_vmm_mapped_after_context_bytes),
+                                             std::to_string(cuda_vmm_active_pools_model),
+                                             std::to_string(cuda_vmm_active_pools_context),
+                                             std::to_string(cuda_vmm_active_pools_after_workload),
+                                             std::to_string(cuda_vmm_active_pools_after_context),
+                                             std::to_string(cuda_device_context_buffer_bytes),
+                                             std::to_string(cuda_device_compute_buffer_bytes),
+                                             std::to_string(accelerator_host_context_buffer_bytes),
+                                             std::to_string(accelerator_host_compute_buffer_bytes),
+                                             std::to_string(host_context_buffer_bytes),
+                                             std::to_string(host_compute_buffer_bytes),
                                              std::to_string(cuda_context_buffer_bytes),
                                              std::to_string(cuda_non_kv_context_buffer_bytes),
                                              std::to_string(cuda_compute_buffer_bytes),
@@ -2704,6 +2754,17 @@ using bench_kv_memory_transient_stats_reset_fn = void (*)();
 using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
 using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
 
+struct bench_cuda_vmm_pool_stats {
+    uint64_t live_bytes;
+    uint64_t live_peak_bytes;
+    uint64_t mapped_bytes;
+    uint64_t mapped_peak_bytes;
+    uint64_t active_pools;
+};
+
+using bench_cuda_vmm_pool_stats_get_fn = bool (*)(int, bench_cuda_vmm_pool_stats *);
+using bench_cuda_vmm_pool_stats_reset_fn = bool (*)(int);
+
 static ggml_backend_dev_t bench_memory_device(const cmd_params_instance & inst) {
     if (inst.main_gpu >= 0 && size_t(inst.main_gpu) < inst.devices.size() &&
             inst.devices[inst.main_gpu] != nullptr) {
@@ -2876,6 +2937,7 @@ int llama_bench(int argc, char ** argv) {
         uint64_t cuda_used_model = 0;
         uint64_t cuda_free_model = 0;
         uint64_t cuda_total = 0;
+        bench_cuda_vmm_pool_stats cuda_vmm_model = {};
         ggml_backend_dev_t memory_dev = bench_memory_device(inst);
         const char * memory_device_name = memory_dev != nullptr ? ggml_backend_dev_name(memory_dev) : nullptr;
         const uint32_t route_stats_abi_version = memory_device_name != nullptr &&
@@ -2902,6 +2964,14 @@ int llama_bench(int argc, char ** argv) {
             reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
                 ggml_backend_reg_get_proc_address(
                     memory_reg, "ggml_backend_cuda_memory_checkpoint")) : nullptr;
+        auto cuda_vmm_pool_stats_get = memory_reg != nullptr ?
+            reinterpret_cast<bench_cuda_vmm_pool_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_get")) : nullptr;
+        auto cuda_vmm_pool_stats_reset = memory_reg != nullptr ?
+            reinterpret_cast<bench_cuda_vmm_pool_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_reset")) : nullptr;
         if (params.kv_memory) {
             if (kv_memory_transient_stats_reset == nullptr || kv_memory_transient_stats_get == nullptr ||
                     memory_dev == nullptr) {
@@ -2909,11 +2979,17 @@ int llama_bench(int argc, char ** argv) {
                 llama_model_free(lmodel);
                 return 1;
             }
+            if (cuda_vmm_pool_stats_reset != nullptr) {
+                cuda_vmm_pool_stats_reset(inst.main_gpu);
+            }
             if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, nullptr,
                     &cuda_used_model, &cuda_free_model, &cuda_total)) {
                 fprintf(stderr, "%s: error: failed to capture the synchronized model-only device checkpoint\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
+            }
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                cuda_vmm_pool_stats_get(inst.main_gpu, &cuda_vmm_model);
             }
         }
 
@@ -2949,23 +3025,44 @@ int llama_bench(int argc, char ** argv) {
             t.kv_tail_cpu_layers = kv_stats.tail_cpu_layers();
             t.cuda_used_model_bytes = cuda_used_model;
             t.cuda_total_bytes = cuda_total;
+            t.cuda_vmm_live_model_bytes = cuda_vmm_model.live_bytes;
+            t.cuda_vmm_mapped_model_bytes = cuda_vmm_model.mapped_bytes;
+            t.cuda_vmm_active_pools_model = cuda_vmm_model.active_pools;
 
             const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
             for (const auto & [buft, memory] : breakdown) {
                 ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    // Preserve the historical accelerator-owner totals for result compatibility.
+                    // Accelerator host buffers consume host RAM, not physical device memory.
                     t.cuda_context_buffer_bytes += memory.context;
                     t.cuda_compute_buffer_bytes += memory.compute;
                 }
+                if (ggml_backend_buft_is_host(buft)) {
+                    if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        t.accelerator_host_context_buffer_bytes += memory.context;
+                        t.accelerator_host_compute_buffer_bytes += memory.compute;
+                    } else {
+                        t.host_context_buffer_bytes += memory.context;
+                        t.host_compute_buffer_bytes += memory.compute;
+                    }
+                } else if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    t.cuda_device_context_buffer_bytes += memory.context;
+                    t.cuda_device_compute_buffer_bytes += memory.compute;
+                }
             }
-            if (t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
+            // The historical CUDA-owner total includes device KV and CUDA-pinned host KV,
+            // but deliberately excludes ordinary host buffers. Only subtract resident KV
+            // when its buffer type participates in that owner total.
+            const bool kv_in_cuda_owner_total = !inst.no_kv_offload || inst.kv_cpu_pinned;
+            if (kv_in_cuda_owner_total && t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
                 fprintf(stderr, "%s: error: GPU context buffers are smaller than categorized resident KV storage\n", __func__);
                 llama_free(ctx);
                 llama_model_free(lmodel);
                 return 1;
             }
-            t.cuda_non_kv_context_buffer_bytes =
-                t.cuda_context_buffer_bytes - t.kv_resident_bytes;
+            t.cuda_non_kv_context_buffer_bytes = t.cuda_context_buffer_bytes -
+                (kv_in_cuda_owner_total ? t.kv_resident_bytes : 0);
 
             uint64_t cuda_free_context = 0;
             uint64_t cuda_total_context = 0;
@@ -2977,6 +3074,14 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             t.cuda_context_delta_bytes = int64_t(t.cuda_used_context_bytes) - int64_t(t.cuda_used_model_bytes);
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats stats = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats)) {
+                    t.cuda_vmm_live_context_bytes = stats.live_bytes;
+                    t.cuda_vmm_mapped_context_bytes = stats.mapped_bytes;
+                    t.cuda_vmm_active_pools_context = stats.active_pools;
+                }
+            }
         }
 
         if (kvarn_route_stats_reset != nullptr) {
@@ -3042,6 +3147,9 @@ int llama_bench(int argc, char ** argv) {
 
         if (params.kv_memory) {
             kv_memory_transient_stats_reset();
+            if (cuda_vmm_pool_stats_reset != nullptr) {
+                cuda_vmm_pool_stats_reset(inst.main_gpu);
+            }
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -3183,11 +3291,22 @@ int llama_bench(int argc, char ** argv) {
             t.kv_peak_bytes = t.kv_resident_bytes + t.kv_transient_bytes;
             t.cuda_peak_delta_bytes = int64_t(t.cuda_used_peak_bytes) - int64_t(t.cuda_used_model_bytes);
             t.cuda_reconciliation_delta_bytes = t.cuda_peak_delta_bytes -
-                    int64_t(t.cuda_context_buffer_bytes + t.cuda_compute_buffer_bytes);
+                    int64_t(t.cuda_device_context_buffer_bytes + t.cuda_device_compute_buffer_bytes);
             // cudaMemGetInfo includes driver/runtime allocations and VMM pool
             // granularity that are not owned by a llama context buffer. Keep
             // that residual explicit instead of attributing it to KVarN.
             t.cuda_runtime_overhead_bytes = t.cuda_reconciliation_delta_bytes;
+
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats vmm_stats = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &vmm_stats)) {
+                    t.cuda_vmm_live_after_workload_bytes = vmm_stats.live_bytes;
+                    t.cuda_vmm_mapped_after_workload_bytes = vmm_stats.mapped_bytes;
+                    t.cuda_vmm_live_peak_bytes = vmm_stats.live_peak_bytes;
+                    t.cuda_vmm_mapped_peak_bytes = vmm_stats.mapped_peak_bytes;
+                    t.cuda_vmm_active_pools_after_workload = vmm_stats.active_pools;
+                }
+            }
 
             llama_perf_context_print(ctx);
             llama_free(ctx);
@@ -3203,6 +3322,14 @@ int llama_bench(int argc, char ** argv) {
             }
             t.cuda_teardown_delta_bytes = int64_t(t.cuda_used_after_context_bytes) -
                     int64_t(t.cuda_used_model_bytes);
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats stats_after = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats_after)) {
+                    t.cuda_vmm_live_after_context_bytes = stats_after.live_bytes;
+                    t.cuda_vmm_mapped_after_context_bytes = stats_after.mapped_bytes;
+                    t.cuda_vmm_active_pools_after_context = stats_after.active_pools;
+                }
+            }
         }
 
         if (p) {

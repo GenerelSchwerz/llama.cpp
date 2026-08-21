@@ -2,8 +2,9 @@
 
 This is the sole runnable protocol for the published CPU-KV line. The source
 under test is `beellama-kv-cpu-offload` at
-`c9f727c1e1995c4a871a719ab05b5f2478588efd`; the local documentation baseline
-is `6a20757854395309b32248dd4109d73e99c3e675`. Source and binary identities are
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; the retained local journal and
+Experiments 001-019 come from
+`6a20757854395309b32248dd4109d73e99c3e675`. Source and binary identities are
 authoritative if this document ever disagrees with behavior.
 
 The companion documents have deliberately separate roles:
@@ -11,7 +12,8 @@ The companion documents have deliberately separate roles:
 - [`cpu-kv-offload-development.md`](cpu-kv-offload-development.md) records
   durable decisions and protocol transitions.
 - [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md) preserves
-  valid Experiments 001-019 and indexes exact post-KV branch identities.
+  valid Experiments 001-020 plus W06 and indexes exact post-KV branch
+  identities.
 - [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md) ranks
   retained, pending, rejected, and research-only VRAM work.
 - [`vram-feature-isolation-plan.md`](vram-feature-isolation-plan.md) defines
@@ -36,19 +38,25 @@ The published KV source contains these controls:
 | `--spec-draft-kv-gpu-layers N` | Override target placement for independently owned draft KV; omission inherits and zero explicitly selects host placement. |
 | `--phase-aware-workspace` | Share and resize sequential target/MTP compute backing between prompt and generation phases. |
 | `--spec-mtp-rs-planes N` | Cap total target recurrent planes, including the current plane. |
-| `llama-bench --kv-memory` | Capture the KV/component and synchronized device-memory checkpoints implemented by the published base. |
+| `llama-bench --kv-memory` | Capture KV/component checkpoints, physical device/accelerator-host/ordinary-host allocation classes, and CUDA VMM live/mapped/high-water telemetry. |
 
 MTP must use the target physical ubatch. Omit
 `--spec-draft-ubatch-size`, or set it equal to `--ubatch-size` only when the
 explicit parser path is under test. A different MTP draft ubatch is rejected.
 
 The published KV source does **not** contain native quantized FlashAttention,
-PR 6's extended physical-buffer/VMM fields, compact causal masking,
-live-context workspace sizing, or bounded host-KV attention staging. Do not
-expect those later fields or use an associated later option in a current
-KV-base command. In particular, `--live-context-workspace` and its
-preset/generated argument documentation remain owned by PR 8 until its source
-lands. See the evidence index for the exact PR identities.
+compact causal masking, live-context workspace sizing, or bounded host-KV
+attention staging. Do not expect those later fields or use an associated later
+option in a current KV-base command. In particular,
+`--live-context-workspace` and its preset/generated argument documentation
+remain owned by PR 8 until its source lands. See the evidence index for the
+exact PR identities.
+
+`llama-perplexity` declares its full logical batch as the maximum output-row
+requirement before context creation. Therefore matched PPL runs may enable or
+disable `--phase-aware-workspace` without reducing the all-logits capacity the
+tool needs. Treat an output-capacity assertion as a failed run, not as quality
+evidence.
 
 ## Retired and historical controls
 
@@ -244,10 +252,12 @@ small performance claim.
 
 ## Perplexity and exactness gates
 
-PR 5 is not in the published KV source. Until its output-capacity fix lands,
-do not enable phase-aware workspace in a current `llama-perplexity` process.
-Use the source-supported full-workspace path and matching `-b`/`-ub` values for
-both sides:
+The merged W06/PR 5 fix declares the full logical batch as
+`llama-perplexity`'s output-row capacity before context creation. Matched runs
+may use phase-aware workspace on both sides when phase behavior is the named
+variable, but both sides must use the same setting and matching `-b`/`-ub`
+values. General isolated quality gates keep unrelated optional features
+explicitly disabled; the canonical baseline template is:
 
 ```bash
 flock /tmp/beellama-single-gpu.lock -c '
@@ -321,3 +331,37 @@ short reusable protocol correction when an invalid attempt exposes a hazard.
 Aggregate repetitions into one experiment; do not add a duplicate section for
 an otherwise identical rerun. Use Git history for forensic details from a
 superseded protocol edition.
+
+### Allocation and CUDA VMM telemetry
+
+`llama-bench --kv-memory` is the opt-in client for allocation classification
+and CUDA VMM transient-pool telemetry. It reports physical device, accelerator-
+owned host (normally CUDA-pinned), and ordinary-host context/compute buffers,
+plus VMM live, mapped, high-water, and active-pool checkpoints. The older
+CUDA-owner totals remain for result compatibility; they are not physical VRAM
+because they include accelerator-owned host buffers.
+
+The CUDA counters are dormant until this option resets them. Validate a change
+with fresh processes in this order: instrumented on, instrumented off,
+instrumented on. The off result must leave every new field zero, and the two on
+results must reproduce the allocation classes and high-water values. Also
+bracket an instrumented default-path run between two pristine-source runs.
+Use `--no-warmup --progress` so VMM growth is visible and progress remains
+inspectable. Every GPU invocation must remain wholly inside the single-GPU
+lock, for example:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  BUILD/bin/llama-bench -m MODEL -p 128 -n 16 -d 4096 -r 3 \
+    -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+    -ngl 999 -sm none -mg 0 -nkvo 0 -fa on -ctk q8_0 -ctv q8_0 \
+    --no-warmup --progress --kv-memory -o jsonl
+'
+```
+
+Repeat focused `-nkvo 1` rows without and with `--kv-cpu-pinned` when host
+classification changes. Record buffer bytes separately from process RSS and
+from `nvidia-smi` process VRAM: pinned CUDA-host allocation is system memory,
+and ordinary-host allocation is neither pinned memory nor device VRAM. This
+surface is measurement support only. It does not authorize pool trimming,
+workspace policy, staging changes, causal descriptors, or capacity changes.

@@ -5,9 +5,10 @@
 This is a source-backed capability inventory, not a performance report. It
 compares BeeLlama v0.4.3 at
 `ba27edad2a84ff045a556df06661e821285c2fab` with published CPU-KV source at
-`c9f727c1e1995c4a871a719ab05b5f2478588efd`. Local tip
-`6a20757854395309b32248dd4109d73e99c3e675` adds only documentation/profiling
-protocol corrections to that published source.
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. The retained journal and
+Experiments 001-019 derive from local tip
+`6a20757854395309b32248dd4109d73e99c3e675`; the published base also includes
+the merged W06 perplexity-capacity fix and W02 allocation telemetry.
 
 The evidence and limitations for each feature are indexed in
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md). This document
@@ -151,20 +152,24 @@ IDs and bytes, acceptance/replay work, commands, and identities. The maintained
 MTP oracle compares the same MTP geometry across placements; target-only output
 is not an MTP correctness reference.
 
-The published base already contains `llama-bench --kv-memory` component and
-device checkpoints. It does not contain PR 6's later physical-buffer classes
-and CUDA VMM live/mapped/high-water extension.
+The published base's opt-in `llama-bench --kv-memory` reports component and
+device checkpoints, physical device/accelerator-host/ordinary-host allocation
+classes, and CUDA VMM live/mapped/high-water state. The counters remain dormant
+without opt-in and do not change allocation or trimming policy.
+
+`llama-perplexity` declares `n_batch` as its maximum output-row requirement
+before context creation. This preserves the tool's full-logits contract when a
+phase-aware context would otherwise default to a serving-sized output reserve.
+It adds no new argument or performance policy.
 
 ## Behavior intentionally absent from the KV base
 
 The following were found in parallel or historical work but are not source
-features of `c9f727c1e`/`6a2075785`:
+features of `4a7f9b496`:
 
 | Absent behavior | Owner or disposition |
 |---|---|
 | Native standard-quantized FlashAttention and `--flash-attn-native-quants` | PR 4. |
-| Phase-aware `llama-perplexity` output-capacity fix | PR 5. |
-| Extended physical-buffer and CUDA VMM fields for existing `--kv-memory` | PR 6. |
 | Compact causal masking and any corresponding control | PR 7; moving draft. |
 | `--live-context-workspace`, preset spelling, generated/user docs, and idle trim | PR 8 until source lands. |
 | Positive bounded host-attention staging and `--kv-attn-staging-chunk` | Rejected for exact serving; unfinished research is not accepted source. |

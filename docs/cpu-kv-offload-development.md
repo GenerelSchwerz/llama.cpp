@@ -1014,6 +1014,21 @@ draft and used no replay. The cap remains a workload-dependent trade: the
 rejection-heavy two-plane rows were much slower, so production selection must
 be based on measured acceptance/replay behavior rather than VRAM alone.
 
+### Perplexity full-batch output contract
+
+Phase-aware contexts default to serving-shaped output capacity: one row per
+sequence. That is too small for `llama-perplexity`, which marks every scored
+token in a decode slice for logits. The allocator must continue to reject an
+undeclared request, so the correction belongs at the tool boundary. Perplexity
+now sets `params.n_outputs_max = params.n_batch` before context creation. This
+is exactly the capacity inherited by the ordinary non-phase-aware path and
+does not change graph arithmetic, cache placement, or server behavior.
+
+The focused plumbing test guards both the declaration and its ordering. A
+matched default/phase-aware/default GPU-PPL sequence reproduced the same
+cumulative estimate in every process; the isolated evidence is recorded in
+the experiment ledger below.
+
 1. Implement a fail-closed compact causal-mask descriptor for the supported
    single-slot contiguous layout and measure the predicted GPU and CUDA-host
    savings.
@@ -1057,21 +1072,23 @@ direct-target rerun before they support a current claim.
 ## 2026-08-21: shared VRAM documentation and publication lanes
 
 Shared documentation was consolidated from exact local KV tip
-`6a20757854395309b32248dd4109d73e99c3e675`, whose published source base is
-`c9f727c1e1995c4a871a719ab05b5f2478588efd`. The read-only parallel snapshot
-`refs/codex/pre-pr4-parallel-source` at
+`6a20757854395309b32248dd4109d73e99c3e675`. The published source base is now
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` after PR 5 and PR 6 merged. The
+read-only parallel snapshot `refs/codex/pre-pr4-parallel-source` at
 `f52988ee150cd27a94d6897cc049326c1e77c3e2` remains forensic research history,
 not an integration source. It combined multiple features in one uncommitted
 tree, so cumulative performance cannot establish an isolated feature claim.
 
-The independent publication lanes are PR 4 native standard-quant attention at
-`72ee96bbfcf91c17a7fb5b3b32703aae812af330`, PR 5 perplexity capacity at
-`8d2f8452eb140ba52d8472ecd791cc90212a9307`, PR 6 physical/VMM telemetry at
-`e18e046dbbeeb72c52d3ed74a932147f6a68cda1`, and PR 8 live-context workspace
-at `143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 was observed at
-`b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`, but its committed fix and
-deeper-context evidence are still being published; no intermediate causal or
-performance result is frozen here.
+Merged support lanes are PR 5 perplexity capacity at
+`8d2f8452eb140ba52d8472ecd791cc90212a9307`, merged as
+`50ee5b2d765c91a0d9cd23728ac17a27ac510e3e`, and PR 6 physical/VMM telemetry
+at `3bd7a088199922b1e5e20973cd8cb6d970cde111`, merged as the current base
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Remaining independent lanes are
+PR 4 native standard-quant attention at
+`72ee96bbfcf91c17a7fb5b3b32703aae812af330` and PR 8 live-context workspace at
+`143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 remains pending at the
+observed head `b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`; no intermediate causal or
+performance result is frozen while its final deep evidence is unpublished.
 
 PR 8 continues to own its source, presets, and every user-facing generated
 `--live-context-workspace` document until the source lands. The current
@@ -1079,6 +1096,27 @@ protocol, roadmap, feature-isolation plan, and source-backed feature delta are
 shared KV inheritance. Final heads and pairwise/source-overlap comparisons
 must be verified before choosing a merge order; this consolidation does not
 merge or fast-forward the published KV base.
+## 2026-08-20: pre-PR4 W02 telemetry isolation
+
+The allocation-classification and CUDA VMM high-water instrumentation from the
+immutable pre-PR4 source snapshot was migrated independently onto
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`. This migration intentionally does
+not depend on the snapshot's native-Q8 reporting field and does not carry its
+live-context workspace, later phase controls, causal descriptors, VMM trimming
+policy, host staging, or perplexity-capacity fix.
+
+The first ordinary-host runtime probe found that the snapshot's legacy
+reconciliation assertion still subtracted all resident KV from a CUDA-owner
+total that deliberately excludes ordinary CPU buffers. The migration was
+revised to subtract KV only when it is device-resident or CUDA-pinned. Physical
+device, accelerator-host, and ordinary-host fields remain classified by buffer
+capability and owning device type rather than architecture names.
+
+Fresh final-binary runs established a dormant zero-valued default path, neutral
+source and on/off performance screens, repeatable VMM peaks, all three physical
+allocation classes, and identical matched perplexity. Experiment 020 contains
+the exact commands and evidence. The result remains support instrumentation,
+not a VRAM optimization or permission to infer a trimming policy.
 
 ## Known non-goals
 
