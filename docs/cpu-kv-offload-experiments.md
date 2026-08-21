@@ -5853,6 +5853,71 @@ open. It was never a property of the cache type: `q8_0` reaches the ceiling at
 32,768 and the lower-bit types do not, because the smaller tail still leaves
 the allocator room to overlap.
 
+#### Parallel slots
+
+Every earlier allocation and exactness measurement on this branch used
+`--parallel 1`. That left two questions open: whether the saving survives more
+slots, and whether the multi-sequence graph shapes that continuous batching
+produces are still bit-exact. Both are answered here, same host and model.
+
+##### The saving is invariant under `--parallel N`
+
+Reserve-time, `-c 245760`, one clean process per point:
+
+| Slots | `n_ctx_slot` | `q8_0` off -> on | Saved | Reduction | `q3_0` off -> on | Saved | Reduction |
+|---:|---:|---|---:|---:|---|---:|---:|
+| 1 | 245,760 | 1790.27 -> 818.27 MiB | 972 | -54.3% | 1490.27 -> 518.27 MiB | 972 | -65.2% |
+| 2 | 122,880 | 1670.27 -> 698.27 MiB | 972 | -58.2% | 1370.27 -> 398.27 MiB | 972 | -70.9% |
+| 4 | 61,440 | 1610.27 -> 638.27 MiB | 972 | -60.4% | 1310.27 -> 338.27 MiB | 972 | -74.2% |
+| 8 | 30,720 | (out of memory) 1580.27 | 972 | -61.5% | 1280.27 -> 308.27 MiB | 972 | -75.9% |
+
+The saved figure is exactly 972 MiB at every slot count for both types, which
+follows from the closed form. With a non-unified cache `--parallel N` divides
+the per-slot context by N but presents N sequences, so `nelem(K)` and
+`nelem(V)` over the whole attention window are unchanged and so is the F16 tail
+appended to the attention output allocation.
+
+The baseline shrinks with N — a roughly 240 MiB term that scales as `1/N`, so
+818.27, 698.27, 638.27, 608.27 for `q8_0` — which means the *relative*
+reduction grows with slot count even though the absolute saving does not.
+
+##### At eight slots the option decides whether the server starts
+
+`q8_0` at `-c 245760 --parallel 8` cannot create a context on this 11,902 MiB
+card with the materializing path:
+
+```
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1580.27 MiB on device 0: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 1657037696
+graph_reserve: failed to allocate compute buffers
+llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers
+```
+
+The native arm reserves 608.27 MiB for the same configuration and starts
+normally. This is card-, model- and type-specific rather than a general claim:
+`q3_0` at the same slot count fits in both arms, because its baseline is
+300 MiB lower. It is recorded because it is the first configuration found where
+the option is not an optimization but the difference between a server that
+starts and one that does not.
+
+##### Concurrent multi-slot output is bit-exact
+
+`--parallel 4 --cont-batching`, `-c 32768`, `q8_0`, four distinct prompts issued
+concurrently, 64 forced tokens each, comparing the concatenated token IDs of all
+four slots. Two runs per arm:
+
+| Arm | Run a | Run b |
+|---|---|---|
+| materializing | `552aeeeb…` | `552aeeeb…` |
+| native | `552aeeeb…` | `552aeeeb…` |
+
+All four hashes are equal, with 448 audited native launches in the native arm
+and 0 in the materializing arm. This matters because batching produces shapes
+that `--parallel 1` never generates: the recorded launches include
+`D=256 n_q=3 n_kv=2560`, a decode step covering three sequences in one launch,
+alongside the familiar `n_q=512` prefill shapes. The loader is exercised on
+those shapes and remains exact.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes
