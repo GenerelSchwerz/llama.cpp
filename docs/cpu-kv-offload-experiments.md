@@ -3519,8 +3519,8 @@ are present there, while the remaining lanes stay independently published:
 | [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
-| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | Intermediate head observed at `b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5` | Compact causal masking; a committed fix and deeper-context evidence are pending, so no current numerical or causal claim is recorded here. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Default-off live-context workspace growth, all-idle trim, branch evidence, and source-coupled user/preset/generated argument documentation. |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | pending published head `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Default-off live-context workspace growth, all-idle trim, branch evidence, and source-coupled user/preset/generated argument documentation; await its final head. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
@@ -3530,7 +3530,17 @@ neutral trailing merge-barrier edit, and requiring direct-target profiler
 captures. Its cumulative throughput and allocation totals are interaction
 evidence for that uncommitted tree, not isolated KV-base or PR results.
 
-Re-fetch moving PR heads before review. Branch source, generated arguments,
-presets, and feature-specific reproductions remain with their PR until source
-lands; shared protocol, research, roadmap, isolation, and identity indexing
-belong in the KV line.
+PR 7's isolated c9 dense/Candidate-1/dense A/B/A showed exact serving output
+and matching-batch PPL, context-scaled serving VRAM savings through 128K, and no
+material decode regression in the focused repeated 128K screen. Its separate
+`4a7f9b496` composition gate passed the merged PR 5/PR 6 guards, compact
+CPU/CUDA exactness, adjacent graph/allocator/attention tests, repeated PPL and
+deterministic output, and a non-performance VMM telemetry smoke. It did not
+re-measure A/B/A performance or memory on the composed base. Failed setup and
+identity probes, unmatched launches, and rejected noisy timing are not evidence
+and are not copied here.
+
+Re-fetch PR 8 when its final head is published. Branch source, generated
+arguments, presets, and feature-specific reproductions remain with their PR
+until source lands; shared protocol, research, roadmap, isolation, and identity
+indexing belong in the KV line.

@@ -79,20 +79,28 @@ Native Q8 is an enabling route for later CPU-KV VRAM work: it can remove the
 full-source F16 materialization path where the exact PR capability applies.
 It is not evidence that any separate workspace or mask feature is correct.
 
-### 3. Review compact causal masking only from final PR 7 evidence
+### 3. Integrate compact causal masking only from final PR 7
 
-[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is actively receiving
-a committed fix and deeper-context evidence. Its currently observed head is
-`b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`; keep it pending and do not copy
-intermediate speed, allocation, or causal conclusions into the KV base. Review
-the final published head for:
+[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is final at
+`d4183adb8b4902a125b9339cd39032a095fca013`: draft, open, mergeable, clean, six
+commits ahead of exact base `4a7f9b496` and zero behind. It automatically uses
+an I64 causal-prefix descriptor only for proved single-stream contiguous
+standard-KV layouts and otherwise retains the dense mask. Per-consumer views
+remove the measured allocator fragmentation without changing allocator policy,
+public controls, or attention-kernel ownership.
 
-- a source-only comparison against unchanged KV base plus declared prerequisites;
-- explicit fallback for unrepresentable layouts;
-- target-only and target-plus-MTP exactness;
-- 4K and long-context memory, prefill, and decode A/B/A;
-- direct-target profiler evidence only when it explains a stable unprofiled result; and
-- no default-path compile contamination when the feature is absent or inactive.
+Keep its two evidence lanes distinct:
+
+- isolated c9 dense/Candidate-1/dense A/B/A owns the resource and performance
+  claims: exact output and PPL, serving savings of 20/30/34 MiB at 4K/30K/34K
+  and 64/96/128 MiB at 64K/98K/128K, plus a local 98 MiB 49K allocator-bin
+  result that must not be extrapolated; and
+- `ae60c7321d950937a36af096112525db777ae13f` on the merged base owns only the
+  composed build, correctness, PPL/output, and W02 telemetry coexistence gates.
+  It is not a replacement A/B/A performance or memory comparison.
+
+Do not copy invalid setup/probe results or rejected noisy timing. Target-plus-
+MTP and composition with PR 4 and the final PR 8 head remain integration gates.
 
 ### 4. Keep live-context workspace source and docs atomic in PR 8
 
@@ -110,9 +118,9 @@ memory, exact output, PPL, and repeated prompt/decode performance.
 
 ### A. Close cross-feature integration without losing isolation
 
-After the remaining PR 4, PR 7, and PR 8 heads stabilize, simulate all pairwise
-comparisons and likely merge orders on top of the merged W06/W02 base before
-touching the published branch again. Re-run default/off controls after
+PR 7 is now final. After PR 8's final head is published, simulate all remaining
+pairwise comparisons and likely merge orders on top of the merged W06/W02 base
+before touching the published branch again. Re-run default/off controls after
 composition; a runtime-disabled feature can still change template
 instantiation, graph signatures, or allocator geometry. The isolation plan is
 the gate.
@@ -180,6 +188,7 @@ churn, and report pinned bytes independently from device VRAM.
 
 There is no authorized merge order yet. The likely dependency shape is support
 fixes/telemetry already merged, then native quant attention and independently
-accepted workspace and mask features. Final ordering must be chosen from
+accepted mask and workspace features. Final ordering must be chosen from
 simulated final PR heads and source overlap. Do not merge or fast-forward the
-published KV base while PR 7 and PR 8 are changing.
+published KV base until PR 8's final head is available and its comparisons are
+repeated.

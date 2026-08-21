@@ -1086,16 +1086,29 @@ at `3bd7a088199922b1e5e20973cd8cb6d970cde111`, merged as the current base
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Remaining independent lanes are
 PR 4 native standard-quant attention at
 `72ee96bbfcf91c17a7fb5b3b32703aae812af330` and PR 8 live-context workspace at
-`143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 remains pending at the
-observed head `b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`; no intermediate causal or
-performance result is frozen while its final deep evidence is unpublished.
+the still-pending published head
+`143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 is final at
+`d4183adb8b4902a125b9339cd39032a095fca013`, directly based on `4a7f9b496` and
+six commits ahead. Its resource/performance evidence remains the isolated c9
+dense/Candidate-1/dense A/B/A study; the rebased source validation at
+`ae60c7321d950937a36af096112525db777ae13f` is a separate composition gate and
+does not relabel those measurements.
+
+The retained PR 7 result is fail-closed compact causal-prefix metadata with
+per-consumer views that remove the measured long-lived-copy allocator hole.
+Serving output and matching-batch PPL were exact, context-scaled VRAM savings
+were measured through 128K, and the focused repeated 128K decode screen rejected
+a material slowdown. Invalid setup/probe launches and noisy rejected timing are
+not shared evidence; exact identities, commands, exclusions, and limitations
+remain in PR 7's branch-owned investigation.
 
 PR 8 continues to own its source, presets, and every user-facing generated
 `--live-context-workspace` document until the source lands. The current
 protocol, roadmap, feature-isolation plan, and source-backed feature delta are
-shared KV inheritance. Final heads and pairwise/source-overlap comparisons
-must be verified before choosing a merge order; this consolidation does not
-merge or fast-forward the published KV base.
+shared KV inheritance. PR 7 comparisons have been refreshed at its final head;
+PR 8 and all comparisons involving it must be refreshed when its final head is
+published. This consolidation does not merge or fast-forward the published KV
+base.
 ## 2026-08-20: pre-PR4 W02 telemetry isolation
 
 The allocation-classification and CUDA VMM high-water instrumentation from the
