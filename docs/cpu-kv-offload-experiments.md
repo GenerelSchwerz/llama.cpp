@@ -3,19 +3,28 @@
 For the current runnable build, server arguments, exactness oracle, benchmark
 shape, progress mechanism, and required artifacts, use
 [`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). This
-ledger intentionally preserves the exact commands used by each historical
-experiment, including retired environment variables and execution geometries.
-Those commands explain their recorded results; they are not templates for a
-new run.
+is a curated evidence ledger, not a chronological attempt log. It retains only
+valid experiments that affected a decision, changed confidence, covered a
+materially different configuration, or prevent likely repeated work. Follow
+the current protocol and the explicit delta recorded by an older entry; its
+commands, when present, are historical rather than current templates.
+
+Every command block in this file is preserved verbatim as historical evidence,
+including retired controls and valid historical affinity wrappers. Do not run
+or normalize it for current evidence. Use the current-testing document and
+record an explicit protocol delta for any new reproduction.
 
 Candidate VRAM reductions and their complexity ordering are maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). This ledger
-remains the source of exact commands and measured acceptance or rejection.
+remains the source of curated measured acceptance or rejection.
 
-This document records changes made on the `exp/kv-cpu-offload` branch. Each
-accepted or rejected experiment should have its own commit so that its complete
-diff remains inspectable. Do not treat these measurements as portable benchmark
-claims; they apply only to the configuration recorded below.
+This document records decision-relevant changes made on the
+`exp/kv-cpu-offload` branch. Each valid accepted or rejected experiment should
+have its own commit so that its complete diff remains inspectable. Invalid runs
+contribute no measurements or artifact inventories. Required repetitions are
+aggregated into the existing experiment; redundant reruns are omitted. Do not
+treat these measurements as portable benchmark claims; they apply only to the
+configuration recorded below.
 
 ## Baseline
 
@@ -1958,13 +1967,9 @@ CUDA FlashAttention placement, and memory footprint support the intended
 architectural equivalence. This cleanup should not be used to claim a speedup;
 a repeated A/B run is required before making a performance conclusion.
 
-One earlier candidate attempt is excluded. A separate worktree was compiling
-CUDA and C++ with up to 24 jobs throughout that attempt; multiple `ptxas` and
-`fatbinary` processes saturated cores and system load exceeded 14. Its
-720.02 t/s context load and 422.38 t/s deep prefill are invalid and are not
-included in the table. The server was stopped, all build and CUDA processes
-were confirmed absent, and the candidate row above came from the subsequent
-clean process.
+The acceptance protocol excludes measurements collected while another build or
+GPU workload is active. The rows above came from clean processes after that
+preflight passed.
 
 ### Validation and artifacts
 
@@ -2874,12 +2879,8 @@ acceptance 2,077/2,435, and zero checkpoint counts/times/payloads.
 | MTP-6 lifecycle | `/tmp/qwen38-mtp6-lifecycle-q8-20260819` | `bd974faf394447b3d71eacf3ac2a3e4597dc9f9f75377b15e21ffff39387cf69` / `fe3a6781a81daf4d3e1b1a4da58921100c1f3eb74a57c83943f17b17fe18dc2d` / `4acf083d85b1ea64c1504ab2c043a5ec5ae481c0389da9cb6d61e4b195c43556` / `77d84efddc79f702978ecdeb4e2bf660941dc0aa970703a700e6b59e89d71723` |
 | MTP-6 router reload | `/tmp/qwen38-mtp6-router-reload-q8-20260819` | `94b47d3eac42696fb288124131703036ffad082d879976188e82e9e7ab683b0f` / `12f4f5744521a753633fedd2417e16903184fdf948b059c02dff8ffd875eeb90` / `5d194ac098b7aed6f63dab80d9832a06b58492771df79f4d9ca4b7ea328d2983` / `f6942b8ec35fac297f881eee50557e3970ce84dc79634505bc8484f4b0c0d40e` |
 
-The full hashes and complete chronology are in
+The retained matrix details and hashes are in
 [`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md).
-The first 5K attempt used an obsolete chat-message request shape that the
-runner intentionally rejected before generation; it is a setup error, not a
-benchmark result.
-
 After the final source freeze, `llama-server`, `llama-bench`,
 `test-arg-parser`, `test-backend-ops`, and `test-kv-cache-tail` rebuilt. CPU
 same-type/standard `SET_ROWS` passed 721/721 backend cases; CUDA passed 267/267.
@@ -3080,10 +3081,7 @@ Matched-performance artifacts and SHA-256 values:
 | Timestamped VRAM log | `e9e6c8fa805cd256d8c561e4bb95b431c5b9be94f720d6916917ee8ad26fe683` | `dcb8f2b4c2c111f44ecf1881c27ac3141b112602aef9e3b23e6c8cd5d8b65874` |
 
 All files are under
-`/tmp/draft-kv-residency-perf-matched-20260819`. The earlier mismatched
-`--no-cache` attempt is preserved separately under
-`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819` and is not evidence
-for a performance delta.
+`/tmp/draft-kv-residency-perf-matched-20260819`.
 
 ### Full 5K stochastic live decode
 
@@ -3508,3 +3506,84 @@ without weakening the allocator assertion. Identical A/B/A cumulative PPL
 shows no numerical increase, while the repeated default rows demonstrate that
 ordinary behavior remains stable. The focused `test-perplexity-plumbing` CTest
 passed 1/1 after the source comparison.
+
+## Shared post-KV evidence lanes
+
+This document preserves the complete valid integrated KV-line evidence record:
+Experiments 001-020 and W06. Its exact source-bearing baseline is
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; PR 5 and PR 6 source and evidence
+are present there. The 2026-08-21 readiness audit cleared PR 9 to carry this
+shared index into the KV line without changing that production-source identity,
+while the remaining feature lanes stay independently published:
+
+| Lane | Exact published or merged identity | Evidence ownership and status |
+|---|---|---|
+| [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
+| [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
+| [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | final head `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact source base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, final Experiment 021, and source-coupled user/preset/generated argument documentation; final evidence publication was six ahead/zero behind and clean, with merge metadata to be refreshed after PR 9 documentation lands. |
+
+The completed parallel-tree audit is preserved at snapshot
+`f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
+rejecting F16 persistent recurrent S state, rejecting positive independently
+normalized attention-staging partitions for exact serving, reverting the
+neutral trailing merge-barrier edit, and requiring direct-target profiler
+captures. Its cumulative throughput and allocation totals are interaction
+evidence for that uncommitted tree, not isolated KV-base or PR results.
+
+PR 7's isolated c9 dense/Candidate-1/dense A/B/A showed exact serving output
+and matching-batch PPL, context-scaled serving VRAM savings through 128K, and no
+material decode regression in the focused repeated 128K screen. Its separate
+`4a7f9b496` composition gate passed the merged PR 5/PR 6 guards, compact
+CPU/CUDA exactness, adjacent graph/allocator/attention tests, repeated PPL and
+deterministic output, and a non-performance VMM telemetry smoke. It did not
+re-measure A/B/A performance or memory on the composed base. Failed setup and
+identity probes, unmatched launches, and rejected noisy timing are not evidence
+and are not copied here.
+
+PR 8's final Experiment 021 validated the live workspace on the merged W02/W06
+base. Omitted/live/explicit-off produced exact 1K token SHA-256
+`cd8d20d1270ee556a5035994abe08e55fab1a38600a89208becbc9e348e8d283`
+and content SHA-256
+`8f92baeebe9a6e716d250ded940e15f02ce545d18fcc1b444a9a330a7d973b1a`.
+The complete 32K lifecycle produced exact combined token SHA-256
+`e1456f0e9d9b51c1dfaa5e96f84860b17b35b9fd8b51be2a89d85d659be94551`
+and content SHA-256
+`4acebc66ed87af64f6f46dde0cf58f3e470a4260e3446a2354a2ce66d7f85566`.
+All three four-chunk PPL runs were exactly `2.1674 +/- 0.03849`, with identical
+chunk values `1.9315`, `2.1279`, `2.2498`, and `2.1674`.
+
+| Final PR 8 32K lifecycle point | Omitted | Live | Explicit off |
+|---|---:|---:|---:|
+| startup process VRAM | 13,644 MiB | 13,444 MiB | 13,644 MiB |
+| long-prefill peak process VRAM | 13,658 MiB | 13,658 MiB | 13,658 MiB |
+| first next-turn peak process VRAM | 13,662 MiB | 13,648 MiB | 13,662 MiB |
+| post-shrink next-turn peak process VRAM | 13,662 MiB | 13,450 MiB | 13,662 MiB |
+
+Thus the live policy saved 200 MiB at startup and 212 MiB on the post-shrink
+next turn, while the active long-prefill process peak was unchanged. Repeated
+A/live/A throughput was 1799.8559/1792.1201/1798.5794 t/s at 4K prefill,
+42.7723/42.7469/42.7620 t/s at 4K decode,
+1223.5393/1227.3871/1224.8924 t/s at 30K prefill, and
+23.8681/23.8477/23.8683 t/s at 30K decode: neutral, with no stable regression.
+
+W02's synchronized CUDA device-used high-water was
+13,849.12/13,857.12/13,849.12 MiB at 4K prefill and
+13,851.12/13,907.12/13,851.12 MiB at 30K prefill: explicit candidate costs of
++8 MiB and +56 MiB. All three cases were 13,837.12 MiB at 4K decode and
+13,839.12 MiB at 30K decode, so there was no decode cost. These are synchronized
+`cudaMemGetInfo`-style device-used high-water measurements, not process VRAM;
+the separate `nvidia-smi` process-VRAM lifecycle is tabulated above.
+
+Experiment 021's two accepted process-substitution launches explicitly invoked
+Bash (`bash -lc 'python3 scripts/mtp-exactness.py <(sed ... MANIFEST)'`) inside
+the GPU lock and changed only the literal output directory. The complete valid
+commands and hashes remain branch-owned in PR 8. The unlocked CUDA version
+probe and the locked benchmark launch with an unsupported option exited before
+model load and are invalid/non-evidence; neither is copied as a command or
+claim here.
+
+PR 8 source, generated arguments, presets, and feature-specific reproductions
+remain with that PR until source lands; shared protocol, research, roadmap,
+isolation, and identity indexing belong in the KV line.

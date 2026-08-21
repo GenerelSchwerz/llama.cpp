@@ -1,10 +1,10 @@
-# Phase-aware target/MTP workspace: complete reproduction record
+# Phase-aware target/MTP workspace: retained reproduction record
 
-This document records the full design, implementation history, build setup,
-matched commands, measurements, failures, validation, and integration notes for
-the opt-in phase-aware compute-workspace experiment. It is intentionally more
-detailed than the user-facing argument documentation. The authoritative result
-row is also recorded as Experiment 016 in the merged CPU-KV ledger:
+This document records the retained design, decision-relevant implementation
+rationale, matched valid measurements, validation, and integration notes for
+the opt-in phase-aware compute-workspace experiment. Invalid setup attempts and
+redundant reruns are intentionally omitted. The authoritative result row is
+also recorded as Experiment 016 in the merged CPU-KV ledger:
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
 ## Exactness update: physical MTP ubatch

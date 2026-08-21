@@ -1,54 +1,57 @@
 # CPU KV-offload current testing and setup
 
-This is the sole runnable protocol for current work on `exp/kv-cpu-offload`.
-Use it before starting a build, correctness run, profiler capture, or
-performance comparison. The local source and each binary's recorded identity
-remain authoritative if this document ever disagrees with behavior.
+This is the sole runnable protocol for the published CPU-KV line. Its exact
+source-bearing baseline is
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; documentation-only descendants,
+including the PR 9 consolidation, do not change that production source or its
+binary identity. The retained local journal and Experiments 001-019 come from
+`6a20757854395309b32248dd4109d73e99c3e675`. Source and binary identities are
+authoritative if this document ever disagrees with behavior.
 
-The companion documents have different roles:
+The companion documents have deliberately separate roles:
 
-- [`cpu-kv-offload-development.md`](cpu-kv-offload-development.md) is the
-  progress and decision journal. It preserves earlier protocol editions,
-  rejected paths, and the evidence behind current choices.
-- [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md) is the
-  immutable evidence ledger. Commands in an older entry reproduce that entry;
-  they are not current command templates.
-- Focused reproduction documents explain their named investigation. Treat
-  their commands as historical unless this document references them.
+- [`cpu-kv-offload-development.md`](cpu-kv-offload-development.md) records
+  durable decisions and protocol transitions.
+- [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md) preserves
+  valid Experiments 001-020 plus W06 and indexes exact post-KV branch
+  identities.
+- [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md) ranks
+  retained, pending, rejected, and research-only VRAM work.
+- [`vram-feature-isolation-plan.md`](vram-feature-isolation-plan.md) defines
+  how independently published candidates must be compared before integration.
+- [`cpu-kv-offload-feature-delta.md`](cpu-kv-offload-feature-delta.md) lists
+  the source-backed difference from BeeLlama v0.4.3.
 
-When the protocol changes, update this document first. Add the reason and the
-superseded behavior to the development journal without rewriting old evidence.
+Update this document first when supported controls, the exactness oracle,
+benchmark shape, progress mechanism, or artifact contract changes. Old Git
+revisions are historical evidence, not runnable current protocol.
 
-## Current implementation under test
+## Current source surface
 
-The retained host-KV configuration uses the supported CLI controls below.
+The published KV source contains these controls:
 
 | Control | Current meaning |
 |---|---|
-| `--no-kv-offload` | Enables host-resident attention KV. |
-| `--kv-cpu-pinned` | Allocates supported host KV through accelerator-visible pinned host buffers. |
-| `--recurrent-state-offload` | Keeps supported hybrid-model recurrent state on the accelerator while attention KV remains on the host. |
-| `--kv-gpu-layers N` | Under host KV, keeps the first `N` target-owned attention-KV layers on the accelerator. Zero leaves all target-owned layers on the host. |
-| `--spec-draft-kv-gpu-layers N` | Overrides target KV residency for a separate draft context and keeps the first `N` independently owned draft attention-KV layers on the accelerator. Omission inherits the target policy; zero explicitly selects host residency. Shared layers follow their owner. |
-| `--phase-aware-workspace` | Uses compact generation reservations, grows them for prompt work, and shrinks them again for generation. |
-| `--spec-mtp-rs-planes N` | Caps total target recurrent planes for MTP, including the current plane. |
+| `--no-kv-offload` | Keep attention KV in host memory. |
+| `--kv-cpu-pinned` | Use supported accelerator-visible pinned host buffers for host KV. |
+| `--recurrent-state-offload` | Keep supported hybrid recurrent state on the accelerator while attention KV remains on the host. |
+| `--kv-gpu-layers N` | Keep the first `N` target-owned attention-KV layers on the accelerator. |
+| `--spec-draft-kv-gpu-layers N` | Override target placement for independently owned draft KV; omission inherits and zero explicitly selects host placement. |
+| `--phase-aware-workspace` | Share and resize sequential target/MTP compute backing between prompt and generation phases. |
+| `--spec-mtp-rs-planes N` | Cap total target recurrent planes, including the current plane. |
+| `llama-bench --kv-memory` | Capture KV/component checkpoints, physical device/accelerator-host/ordinary-host allocation classes, and CUDA VMM live/mapped/high-water telemetry. |
 
-The residency implementation consumes the common per-owned-layer KV placement
-plan; it is not tied to one model's owned-layer count. Determine `N` from the
-layout being tested and record it. The integrated Qwen MTP setup below happens
-to have one independently owned draft attention-KV layer, so its full
-draft-owned-GPU candidate uses `N=1`; that value is not a general
-recommendation.
+MTP must use the target physical ubatch. Omit
+`--spec-draft-ubatch-size`, or set it equal to `--ubatch-size` only when the
+explicit parser path is under test. A different MTP draft ubatch is rejected.
 
-MTP must retain the target's physical ubatch geometry. Omit
-`--spec-draft-ubatch-size`, or set it equal to the target `--ubatch-size` only
-when an explicit-value parser test requires that spelling. A different MTP
-draft ubatch is rejected. Use phase-aware workspace to reduce decode backing
-without changing physical ubatch geometry.
-
-Standard quantized host KV uses the canonical accelerator quant-store path.
-That keeps stored Q8 bytes independent of host versus device residency and is
-part of the current exactness contract.
+The published KV source does **not** contain native quantized FlashAttention,
+compact causal masking, live-context workspace sizing, or bounded host-KV
+attention staging. Do not expect those later fields or use an associated later
+option in a current KV-base command. In particular,
+`--live-context-workspace` and its preset/generated argument documentation
+remain owned by PR 8 until its source lands. See the evidence index for the
+exact PR identities.
 
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or
@@ -56,244 +59,279 @@ disable `--phase-aware-workspace` without reducing the all-logits capacity the
 tool needs. Treat an output-capacity assertion as a failed run, not as quality
 evidence.
 
-## Retired controls are historical only
+## Retired and historical controls
 
-Do not put removed controls into a current command, including defensive
-`env -u` entries. In particular, `GGML_KV_CPU_PINNED` and
-`GGML_RECURRENT_STATE_OFFLOAD` are retired historical environment variables.
-Use `--kv-cpu-pinned` and `--recurrent-state-offload` directly.
+Do not put retired controls into a current command, including defensive
+environment cleanup. `GGML_KV_CPU_PINNED` and
+`GGML_RECURRENT_STATE_OFFLOAD` are historical and removed. Use the supported
+CLI controls directly. Use a current `LLAMA_ARG_*` variable only when that
+environment path is the subject of the test.
 
-Prefer explicit CLI controls for every measured configuration. Use a current
-`LLAMA_ARG_*` environment variable only when the environment-variable path is
-itself under test, and record it as part of the configuration. Do not copy a
-legacy environment-clearing preamble from the journal or experiment ledger.
+Do not use `taskset` in a current benchmark, server, exactness, or profiler
+command. Express llama worker placement with `--cpu-range`,
+`--cpu-range-batch`, `--cpu-mask`, the corresponding batch control, and
+`--cpu-strict`; `llama-bench` uses `-C` for the worker mask. Historical
+native-Q8-composed manifests and commands are archived with their source
+branch and are not current KV-base templates.
 
-Also exclude the superseded MTP draft-ubatch 128 layout from current tests.
-Historical measurements that used it remain evidence for why the mismatch is
-now rejected, not evidence for the integrated implementation.
+## Current host and inputs
 
-## Current local layout
-
-- Experimental source: `/home/gencoolpc/beellama-kv-offload`, branch
+- Experimental worktree: `/home/gencoolpc/beellama-kv-offload`, branch
   `exp/kv-cpu-offload`.
-- Known baseline source: `/home/gencoolpc/beellama.cpp`. Keep it unchanged
-  unless a task explicitly changes the baseline.
+- Known BeeLlama baseline: `/home/gencoolpc/beellama.cpp`; keep it unchanged.
 - CUDA build: `build-cuda-all`, Release, native CPU, CUDA FlashAttention,
   compute architecture 120, default quant-pair matrix.
 - GPU: NVIDIA GeForce RTX 5070 Ti, 15,880 MiB usable process memory, compute
   capability 12.0.
-- CPU: Intel Core Ultra 9 285K. Controlled decode uses CPUs 0-2; batch work may
+- CPU: Intel Core Ultra 9 285K. Decode workers use CPUs 0-2; batch workers may
   use CPUs 0-23.
-- Target and integrated-MTP model:
+- Model:
   `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`.
-- Multimodal projector for the original serving layout:
+- Projector:
   `/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf`.
-- `llama-benchy` tokenizer source: `Qwen/Qwen3.5-27B`. Version 0.4.0 pulls or
-  reuses that tokenizer independently of the served alias.
-- Benchmark corpus URL:
-  `https://www.gutenberg.org/files/1661/1661-0.txt`. The current cached file is
+- Cached corpus:
   `/home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt`,
   606,662 bytes, SHA-256
   `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
 
-These paths describe this benchmark host, not portable project defaults.
-Recheck hardware and file identities instead of assuming they are unchanged.
+These paths describe the current benchmark host, not portable defaults.
+
+## Clean-process and GPU-serialization contract
+
+Every controlled GPU run must satisfy all of these rules:
+
+1. Record `git status --short --branch`, `git rev-parse HEAD`, binary version
+   and SHA-256, build options, model/input hashes, driver, and hardware.
+2. Refuse to start while an unrelated compute process is using the GPU.
+3. Acquire `/tmp/beellama-single-gpu.lock` before model load and hold it until
+   the llama process has exited and samplers/profiler reports have finalized.
+4. Start a fresh llama process for every A, B, and closing A case. Do not reuse
+   prompt cache or allocator state across configurations.
+5. Put the server, client, progress monitor, and samplers inside the same lock
+   owner for a server lifecycle. Locking only the server launch is insufficient.
+6. Expose progress for every duration-uncertain run and preserve the progress
+   artifact.
+
+Every runnable GPU template uses the exact outer form
+`flock /tmp/beellama-single-gpu.lock -c 'COMMAND'`. Do not use flock's
+direct-command form. The single-quoted command must contain the complete GPU
+process, pipelines/redirections, samplers, and teardown; use safe inner double
+quotes for shell variables or arguments that require quoting.
+
+For one-process tools the supported shape is:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  build-cuda-all/bin/llama-bench BENCH_ARGS \
+    -C 0x7 --cpu-strict 1 --progress
+'
+```
+
+For a server lifecycle, use a harness that owns the lock, verifies the clean
+GPU, starts the server, waits for health, runs the client and samplers, stops
+the server gracefully, waits for every child, and only then exits. The
+maintained exactness runner already follows that fresh-process lifecycle; put
+the whole runner under the outer lock.
 
 ## Preflight and binary identity
 
-Run these checks before a current measurement:
+Run before a measurement:
 
 ```bash
 cd /home/gencoolpc/beellama-kv-offload
 git status --short --branch
 git rev-parse HEAD
 build-cuda-all/bin/llama-server --version
+build-cuda-all/bin/llama-bench --version
 llama-benchy --version
 sha256sum build-cuda-all/bin/llama-server \
+  build-cuda-all/bin/llama-bench \
+  build-cuda-all/bin/llama-perplexity \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
   /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt
 nvidia-smi
 ```
 
-Confirm that the binary version corresponds to the source being measured.
-Documentation-only dirt does not change a binary, but an unbuilt source change
-does. Record the build options, compiler, model sizes and hashes, GPU driver,
-and relevant hardware. Do not start a controlled performance run while an
-unrelated GPU workload is active.
+Do not present an uncommitted or differently configured binary as evidence for
+the current commit. Documentation-only dirt does not change a binary; source
+or build changes do.
 
-## Canonical server layout
+## Canonical server lifecycle
 
-The original multimodal performance layout currently uses:
-
-```bash
-build-cuda-all/bin/llama-server \
-  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
-  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
-  --no-mmproj-offload \
-  --n-gpu-layers 999 --n-gpu-layers-draft 999 \
-  --fit off --split-mode none --main-gpu 0 --flash-attn on \
-  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
-  --kv-gpu-layers 0 \
-  --ctx-size 32768 --parallel 1 --cont-batching --kv-unified \
-  --batch-size 1024 --ubatch-size 512 \
-  --phase-aware-workspace \
-  --spec-type draft-mtp --spec-draft-n-max 6 \
-  --spec-mtp-rs-planes 3 --spec-draft-p-min 0.85 \
-  --cache-type-k q8_0 --cache-type-v q8_0 \
-  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
-  --threads 3 --threads-batch 24 \
-  --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
-  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
-  --alias qwen38-kv-test \
-  --host 127.0.0.1 --port 8080
-```
-
-For the inherited-host draft baseline, do not add a draft residency override.
-For a draft-owned-GPU candidate, add
-`--spec-draft-kv-gpu-layers N`, where `N` is the tested draft-owned layer
-count. Keep the same alias on both servers so the request payload is identical.
-Change only the intended variable; restart the server between configurations.
-
-Use a context size large enough for the largest requested depth, prompt, chat
-template overhead, and generated tokens. The 32,768 setting covers the current
-30K-depth, 512-prompt, 64-generation screen. Restore 140K only for a test that
-actually requires very deep context and has an explicit progress plan.
-
-## Matched `llama-benchy` performance protocol
-
-The current screen measures 512-token prefill and 64-token exact generation at
-depths 4,096 and 30,000, once per fresh server. The benchmark must expose
-progress with `--emit-progress` and preserve its result file.
-
-`llama-benchy` 0.4.0 has two prompt-randomization details that matter across
-separate invocations:
-
-1. `--no-cache` appends a fresh UUID to the prompt and can change tokenization.
-2. Corpus offsets use NumPy's process-random generator, for which the CLI has
-   no seed option.
-
-Therefore, do not use `--no-cache` for a matched cross-process pair. Seed NumPy
-before entering the same `llama-benchy` CLI in each process, and send
-`cache_prompt=false` as a request field instead. The server also has
-`--cache-ram 0`, and every configuration starts in a fresh process.
+This is the current source-supported target-plus-MTP layout and matched short
+serving screen. The outer shell owns the lock for clean-GPU preflight, server,
+client, progress, graceful teardown, and child reaping. Replace the result/log
+paths with new dated paths for each case.
 
 ```bash
-python3 -c \
-  'import numpy as np; np.random.seed(1234); from llama_benchy.__main__ import main; main()' \
-  --base-url http://127.0.0.1:8080/v1 \
-  --model Qwen/Qwen3.5-27B \
-  --served-model-name qwen38-kv-test \
-  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
-  --pp 512 --tg 64 --depth 4096 30000 \
-  --runs 1 --no-warmup --skip-coherence --no-adapt-prompt \
-  --latency-mode none --exact-tg \
-  --extra-body temperature=0,seed=1234,cache_prompt=false \
-  --emit-progress - \
-  --save-result RESULT.json --format json
+flock /tmp/beellama-single-gpu.lock -c '
+  set -eu
+  if nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits |
+      rg -q "^[[:space:]]*[0-9]+[[:space:]]*$"; then
+    echo "refusing to run while another GPU compute process is active" >&2
+    exit 1
+  fi
+
+  server_pid=
+  cleanup() {
+    if [ -n "${server_pid:-}" ] && kill -0 "$server_pid" 2>/dev/null; then
+      kill -INT "$server_pid"
+      wait "$server_pid" || true
+    fi
+  }
+  trap cleanup EXIT INT TERM
+
+  build-cuda-all/bin/llama-server \
+    --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+    --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+    --no-mmproj-offload \
+    --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+    --fit off --split-mode none --main-gpu 0 --flash-attn on \
+    --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+    --kv-gpu-layers 0 \
+    --ctx-size 32768 --parallel 1 --cont-batching --kv-unified \
+    --batch-size 1024 --ubatch-size 512 \
+    --phase-aware-workspace \
+    --spec-type draft-mtp --spec-draft-n-max 6 \
+    --spec-mtp-rs-planes 3 --spec-draft-p-min 0.85 \
+    --cache-type-k q8_0 --cache-type-v q8_0 \
+    --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
+    --threads 3 --threads-batch 24 \
+    --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+    --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+    --alias qwen38-kv-test --host 127.0.0.1 --port 8080 \
+    > CURRENT_CASE.server.log 2>&1 &
+  server_pid=$!
+
+  until curl -fsS http://127.0.0.1:8080/health >/dev/null; do
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      wait "$server_pid"
+      exit 1
+    fi
+    sleep 1
+  done
+
+  python3 -c \
+    "import numpy as np; np.random.seed(1234); from llama_benchy.__main__ import main; main()" \
+    --base-url http://127.0.0.1:8080/v1 \
+    --model Qwen/Qwen3.5-27B \
+    --served-model-name qwen38-kv-test \
+    --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
+    --pp 512 --tg 64 --depth 4096 30000 \
+    --runs 1 --no-warmup --skip-coherence --no-adapt-prompt \
+    --latency-mode none --exact-tg \
+    --extra-body temperature=0,seed=1234,cache_prompt=false \
+    --emit-progress CURRENT_CASE.progress.jsonl \
+    --save-result CURRENT_CASE.result.json --format json
+
+  kill -INT "$server_pid"
+  wait "$server_pid"
+  server_pid=
+  trap - EXIT INT TERM
+'
 ```
 
-Use the same seed, tokenizer revision/cache, corpus URL/cache, alias, CLI order,
-and request body for both configurations. Save or hash the corpus cache used by
-the accepted comparison. Before calculating a delta, require equal observed
-prompt-token counts at every depth. Also compare generated-token counts,
-acceptance/replay work, server timing fields, and errors. A nominally equal
-depth is not a matched input if the observed prompt count differs.
+For the inherited-host draft baseline, omit a draft residency override. For a
+draft-owned-GPU candidate, add `--spec-draft-kv-gpu-layers N`, where `N` is
+the independently owned draft-layer count confirmed for that model. Change
+only the intended variable and restart the server for every case.
 
-Record prefill throughput, decode throughput at 4K and the long-context depth,
-and peak process VRAM. Sample VRAM at least once per second from server startup
-through completion and retain the timestamped sample log. Record configured
-host and pinned-memory allocations separately; `nvidia-smi` process memory does
-not include page-locked host allocation.
+## Matched performance protocol
 
-A single run is acceptable for the requested long screen, but it is a screen,
-not a noise-resistant performance claim. Repeat clean alternating pairs before
-claiming a small improvement or regression.
+Use the complete locked lifecycle above for each clean A/B/A process when a
+difference may be small. The short screen measures 512-token prefill and
+64-token exact generation at depths 4,096 and 30,000. Seed NumPy before
+entering `llama-benchy`; do not use `--no-cache`, because it changes the
+request. Send `cache_prompt=false` and require equal observed prompt-token
+counts.
 
-## Full live MTP decode protocol
+Record prefill, decode at 4K and long depth, peak process VRAM, system RAM, and
+allocator-reported pinned memory. `nvidia-smi` process VRAM does not include
+page-locked host allocation. A single ordered pair is a screen, not a stable
+small performance claim.
 
-Use the maintained 5,000-token live matrix when the short `llama-benchy`
-generation is not representative enough. It sends one stochastic chat
-completion with the original host-resident multimodal projector, MTP depth 6,
-temperature 0.8, seed 1234, phase-aware workspace, three recurrent planes, and
-target/effective-draft physical ubatch 512. A fresh inherited-host-draft server
-is the live reference; a fresh draft-owned-GPU server is compared against it.
+## Perplexity and exactness gates
+
+The merged W06/PR 5 fix declares the full logical batch as
+`llama-perplexity`'s output-row capacity before context creation. Matched runs
+may use phase-aware workspace on both sides when phase behavior is the named
+variable, but both sides must use the same setting and matching `-b`/`-ub`
+values. General isolated quality gates keep unrelated optional features
+explicitly disabled; the canonical baseline template is:
 
 ```bash
-cd /home/gencoolpc/beellama-kv-offload
-python3 scripts/mtp-exactness.py \
-  scripts/mtp-exactness-manifests/qwen38-mtp6-draft-residency-live-mmproj-q8-5k.json
+flock /tmp/beellama-single-gpu.lock -c '
+  build-cuda-all/bin/llama-perplexity \
+    -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+    -f /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+    -c 4096 -b 512 -ub 256 --chunks 4 \
+    -t 3 -tb 24 --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+    -ngl 999 -sm none -mg 0 --flash-attn on \
+    --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+    --kv-gpu-layers 0 --no-phase-aware-workspace \
+    --cache-type-k q8_0 --cache-type-v q8_0
+'
 ```
 
-The runner reports decoded-token progress and process VRAM every five seconds,
-captures server timings and allocation logs, and requires exact prompt tokens,
-request semantics, output token IDs, and response bytes. The configured output
-directory must not already exist; use a new dated output-directory suffix for
-a later run rather than overwriting prior evidence.
-
-Use server-reported `predicted_per_second` for the decode comparison. Confirm
-equal acceptance, generated-draft count, replay cycles/tokens, token count, and
-hashes before attributing a throughput change to residency. This remains a
-single ordered pair unless the experiment explicitly repeats alternating
-configurations, so small differences are screens rather than stable claims.
-
-## Current exactness oracle
-
-MTP placement comparisons use a clean, same-MTP-geometry reference, not
-target-only decoding. Match model bytes, prompt, sampler and seed, MTP depth and
-threshold, cache formats, context, batch, target ubatch, effective draft
-ubatch, and request semantics. Residency, recurrent-plane count, and
-phase-aware backing may differ only when those are the variables being tested.
-
-The maintained draft-residency gates are:
+MTP correctness uses a same-MTP-geometry reference, never target-only decoding.
+Match model, prompt, sampler, seed, MTP depth and threshold, cache formats,
+context, batch, target/effective-draft ubatch, and request semantics. Change
+only the feature under test. The maintained gates are:
 
 ```bash
 cd /home/gencoolpc/beellama-kv-offload
-python3 scripts/mtp-exactness.py \
-  scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-1k.json
-python3 scripts/mtp-exactness.py \
-  scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-5k.json
+flock /tmp/beellama-single-gpu.lock -c '
+  python3 scripts/mtp-exactness.py \
+    scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-1k.json
+'
+flock /tmp/beellama-single-gpu.lock -c '
+  python3 scripts/mtp-exactness.py \
+    scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-5k.json
+'
 ```
 
-The runner provides native `/slots` token progress, starts every live case in a
-fresh sterile server process, captures request/response/log/progress artifacts,
-samples process VRAM, and verifies the manifest's identity contract. Do not use
-`--allow-mismatch` for an acceptance gate.
+The output directory must be new. Do not use `--allow-mismatch` for an
+acceptance gate. Preserve prompt IDs, request semantics, output token IDs and
+bytes, acceptance, replay work, logs, progress, VRAM samples, and summary.
 
-The current manifests are text-only exactness tests. The performance protocol
-above retains the original multimodal projector layout. Do not silently compare
-throughput across those layouts.
+## Profiler launch contract
 
-## Regression and artifact requirements
-
-Run coverage proportional to the change. The current draft-residency merge was
-gated by:
+Nsight must directly target the llama binary. Keep profiler helpers
+unrestricted and apply affinity only through llama options:
 
 ```bash
-python3 scripts/test-mtp-exactness.py
-ctest --test-dir build-cuda-all --output-on-failure \
-  -R 'test-(std-kv-tail-static|server-loop-guard-checkpoint-static|spec-cession-static|kvarn-rollback-static|batch-alloc|generate-models|recurrent-state-rollback|arg-parser|kv-cache-tail|server-loop-guard|server-prompt-checkpoint|backend-sampler)'
+flock /tmp/beellama-single-gpu.lock -c '
+  /usr/bin/ncu --target-processes application-only NCU_OPTIONS \
+    build-cuda-all/bin/llama-bench BENCH_ARGS \
+    -C 0x7 --cpu-strict 1 --progress
+'
+
+flock /tmp/beellama-single-gpu.lock -c '
+  nsys profile NSYS_OPTIONS \
+    build-cuda-all/bin/llama-server SERVER_ARGS_WITH_NATIVE_AFFINITY
+'
 ```
 
-Also run the relevant CPU and CUDA `SET_ROWS` matrices when cache store or
-quantization behavior changes, and the full maintained 1K/5K exactness gates
-when MTP scheduling, recurrent state, workspace geometry, or KV residency can
-affect output.
+For NCU, preflight performance-counter permission before a long replay and
+bound the kernel filter, skip count, and launch count. A no-kernel capture,
+wrapper-targeted capture, incomplete report, or profiler-timed throughput is
+not benchmark evidence. Profiler results explain a matched unprofiled result;
+they do not replace it.
 
-Every accepted experiment record must contain:
+## Evidence acceptance
 
-- base and candidate source commits plus binary versions and hashes;
-- exact commands, environment, model/projector/tokenizer/corpus identities,
-  request body, and prompt-token counts;
-- hardware, driver, compiler, and build configuration;
-- prefill, 4K decode, long-context decode, process VRAM, system-memory, and
-  pinned-memory measurements as applicable;
-- the progress mechanism and retained progress/log/result artifacts;
-- correctness coverage, resource tradeoffs, and disposition.
+Every retained result must identify base and candidate commits, binary hashes,
+build, hardware, model/input hashes, exact protocol plus deltas, observed
+prompt geometry, progress artifact, performance/resource measurements,
+correctness gates, and disposition. Allocation changes require both system-RAM
+and pinned-memory accounting.
 
-If a run violates the matching contract, preserve it as an invalid or
-diagnostic artifact and explain the failure in the development journal. Do not
-publish its directional numbers as a candidate-versus-baseline result.
+Invalid runs contribute no measurements or artifact inventory. Record only a
+short reusable protocol correction when an invalid attempt exposes a hazard.
+Aggregate repetitions into one experiment; do not add a duplicate section for
+an otherwise identical rerun. Use Git history for forensic details from a
+superseded protocol edition.
 
 ### Allocation and CUDA VMM telemetry
 
@@ -314,11 +352,12 @@ inspectable. Every GPU invocation must remain wholly inside the single-GPU
 lock, for example:
 
 ```bash
-flock /tmp/beellama-single-gpu.lock -c \
-  'BUILD/bin/llama-bench -m MODEL -p 128 -n 16 -d 4096 -r 3 \
-   -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
-   -ngl 999 -sm none -mg 0 -nkvo 0 -fa on -ctk q8_0 -ctv q8_0 \
-   --no-warmup --progress --kv-memory -o jsonl'
+flock /tmp/beellama-single-gpu.lock -c '
+  BUILD/bin/llama-bench -m MODEL -p 128 -n 16 -d 4096 -r 3 \
+    -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+    -ngl 999 -sm none -mg 0 -nkvo 0 -fa on -ctk q8_0 -ctv q8_0 \
+    --no-warmup --progress --kv-memory -o jsonl
+'
 ```
 
 Repeat focused `-nkvo 1` rows without and with `--kv-cpu-pinned` when host
@@ -327,20 +366,3 @@ from `nvidia-smi` process VRAM: pinned CUDA-host allocation is system memory,
 and ordinary-host allocation is neither pinned memory nor device VRAM. This
 surface is measurement support only. It does not authorize pool trimming,
 workspace policy, staging changes, causal descriptors, or capacity changes.
-
-## Reading previous editions
-
-Use the development journal to understand why a control or protocol changed,
-then follow its references into the experiment ledger or Git commits for exact
-evidence. Historical names and commands are intentionally searchable. Their
-presence does not make them supported today.
-
-When recovering an older experiment:
-
-1. Identify its dated journal section and ledger entry.
-2. Reproduce it only when historical reproduction is the task.
-3. For new evidence, translate the intended variable into this current
-   protocol and document every necessary deviation.
-4. If the translation changes the oracle, geometry, prompt, or measured
-   implementation, treat it as a new experiment rather than extending the old
-   result.

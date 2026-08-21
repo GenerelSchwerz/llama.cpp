@@ -1,10 +1,11 @@
-# MTP output exactness: complete investigation and reproduction record
+# MTP output exactness: retained investigation and reproduction record
 
-This document records the oracle decision, baseline checks, diagnostic
-sequence, rejected approaches, retained implementation, automated harness,
-exact commands, results, and limitations for making BeeLlama's MTP output
-independent of target/draft Q8 KV residency and phase-aware workspace policy.
-It complements the compact Experiment 017 and Experiment 018 entries in
+This document records the oracle decision, decision-relevant diagnostics,
+retained implementation, automated harness, reproducible valid results, and
+limitations for making BeeLlama's MTP output independent of target/draft Q8 KV
+residency and phase-aware workspace policy. Invalid setup attempts and
+redundant reruns are intentionally omitted. It complements the compact
+Experiment 017 and Experiment 018 entries in
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
 ## Final result
@@ -381,10 +382,7 @@ byte-identical to the original temporary input (file SHA-256
 `c91ffa3ff2ca9958a7835004e3d5a6ffa7a242a9f74bfce3e7935d52161dce4c`),
 so the older artifact remains reproducible without `/tmp`. The 5K manifest
 uses a rendered prompt request because the runner deliberately requires a
-prompt string or token list. An earlier attempt passed an obsolete
-chat-message object and was rejected before generation;
-`/tmp/qwen38-mtp6-cross-residency-q8-5k-20260819` is a setup-error artifact,
-not a performance result.
+prompt string or token list.
 
 ## Final result tables
 

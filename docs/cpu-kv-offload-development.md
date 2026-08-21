@@ -2,16 +2,32 @@
 
 The authoritative runnable setup is
 [`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). Read it
-before launching any current test. This journal deliberately preserves earlier
-protocol editions, superseded commands, rejected paths, and the evidence that
-changed the working theory. They are available for historical reasoning, but
-they are not current setup instructions unless the current-testing document
-explicitly adopts them.
+before launching any current test. This journal records protocol transitions,
+durable rationale, and concise summaries of valid rejected paths. It is not an
+attempt log: invalid measurements, redundant reruns, obsolete command copies,
+and temporary-artifact inventories belong neither here nor in the experiment
+ledger. Use Git history for forensic reconstruction of an older edition.
+
+All command text below is an exact historical record of the experiment that
+used it, including retired controls and whole-process affinity. It is not
+current runnable protocol and must not be normalized or reused for new
+evidence. Translate intent through the current-testing document instead.
 
 When the live protocol changes, update the current-testing document first and
-add the transition and rationale here. Do not silently rewrite old measurements
-to use new flags or geometry; their original commands remain part of their
-evidence. The companion experiment ledger records the exact per-change results.
+add the transition and rationale here. Do not rewrite valid old measurements to
+claim new flags or geometry. The companion experiment ledger records curated
+per-change evidence.
+
+## Evidence-curation transition: 2026-08-20
+
+Earlier editions asked agents to preserve invalid attempts and every historical
+command. That policy created runnable-looking conflicts and repeated results
+without adding evidence. Current documentation now retains only valid,
+decision-relevant measurements. A failed acceptance gate contributes no
+numbers; if it exposes a reusable hazard, this journal keeps only the cause and
+the corrective gate. Statistically useful repeats are aggregated into their
+existing experiment, while redundant repeats are omitted. Git history remains
+available when exact discarded text is needed for forensic work.
 
 ## Current protocol edition transition: 2026-08-19
 
@@ -30,45 +46,17 @@ entries retain them exactly where they were used. MTP draft ubatch 128 is also
 historical; current MTP omits the draft override or explicitly matches the
 target physical ubatch.
 
-The first post-merge `llama-benchy` 0.4.0 performance pair was rejected before
-publication because its prompts were not identical. At nominal depths 4,096
-and 30,000, the inherited-host-draft run reported 4,661 and 30,564 prompt
-tokens, while the draft-owned-GPU run reported 4,659 and 30,566. The attempted
-command used `--no-cache`, which adds a different UUID in every invocation;
-the stock prompt generator also chooses its corpus offset from an unseeded
-NumPy process RNG. Acceptance and replay work consequently differed, so the
-throughput values cannot isolate KV residency.
+An early post-merge `llama-benchy` pair failed prompt-identity validation:
+`--no-cache` varied the request and the stock prompt generator used an unseeded
+NumPy RNG. No measurements from that attempt are evidence. The replacement
+protocol seeds NumPy, omits `--no-cache`, sends `cache_prompt=false`, and
+requires identical observed prompt-token counts before accepting a pair.
 
-The replacement protocol explicitly seeds NumPy before invoking the same
-`llama-benchy` CLI, omits `--no-cache`, sends `cache_prompt=false` in the shared
-request body, uses the same served alias, and requires equal observed prompt
-token counts before accepting a pair. The servers remain fresh and use
-`--cache-ram 0`. The rejected result files were preserved as diagnostic
-artifacts at
-`/tmp/draft-kv-residency-perf-invalid-no-cache-20260819`; their directional
-performance numbers are intentionally not part of the experiment ledger.
-
-The corrected single-run screen then matched 4,661 prompt tokens at depth 4K
-and 30,565 at depth 30K, plus identical visible streamed tokens, MTP acceptance,
-and replay work. Moving all independently owned draft KV in this layout from
-pinned host memory to CUDA changed server-reported prefill by +0.81% at 4K and
--0.45% at 30K, while decode changed by +2.29% and +2.42%, respectively. Sampled
-peak process VRAM rose from 14,216 to 14,282 MiB. This supports a small decode
-benefit and a neutral-prefill working theory, but a single baseline/candidate
-pair is only a screen; repeat alternating pairs before treating a small delta
-as stable.
-
-A subsequent full 5,000-token stochastic live request retained the original
-host-resident multimodal projector and exercised 2,435 draft tokens plus 90
-replay cycles. Inherited host draft KV decoded at 54.56 t/s; moving the complete
-independently owned draft KV to CUDA decoded at 55.16 t/s, a +1.11% change.
-Prefill changed by -0.46%. The token IDs, response bytes, 2,077 accepted draft
-tokens, and 443 replay batch tokens were exact between configurations. At
-context 8,192, the trade moved 17.00 MiB of pinned draft KV onto CUDA, removed
-the 1.06 MiB store stage, and raised sampled process VRAM by 16 MiB. This
-confirms that realistic sustained MTP does not regress, but the benefit is
-small enough that repeated alternating pairs would be required before calling
-1.11% stable.
+The corrected short and 5,000-token live screens matched prompt, output, and
+MTP work across draft-KV residency. They support a small possible decode
+benefit at a modest VRAM cost, but not a stable speed claim without alternating
+repetitions. Experiment 019 owns the measurements and resource accounting; they
+are not duplicated in this journal.
 
 The ranked memory backlog is maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). Read it
@@ -119,11 +107,12 @@ The baseline worktree must remain usable as the known upstream-aligned Bee
 build. Experimental changes belong only in the experimental worktree. Do not
 commit unrelated files or reintroduce systems removed from BeeLlama v0.4.0.
 
-Each experiment should be one commit containing its implementation and an
-update to `cpu-kv-offload-experiments.md`. Rejected experiments should normally
-be reverted; their result should still be recorded here or in the experiment
-ledger. No benchmark result is portable unless its model, command, hardware,
-settings, and commit are recorded.
+Each valid, independently testable experiment should be one commit containing
+its implementation and an update to `cpu-kv-offload-experiments.md`. A valid
+rejected experiment should normally be reverted and recorded only when it tests
+a distinct hypothesis or prevents likely repeated work. Invalid and redundant
+runs are omitted. No benchmark result is portable unless its model, protocol,
+hardware, settings, and commit are recorded.
 
 ## Hardware and workload
 
@@ -1053,6 +1042,84 @@ the experiment ledger below.
    asymmetric K/V and token-window KV residency remain outside the current
    scope.
 
+## 2026-08-20: profiler affinity protocol correction
+
+A derived worktree's current-testing draft exposed that historical
+whole-process `taskset` commands were being reused around Nsight Compute.
+Putting `taskset` after `ncu` made the wrapper the application-only profiling
+target and produced a no-kernel capture. Moving it before `ncu` attached to the
+llama binary but restricted the profiler, replay machinery, helper processes,
+and target to the same small CPU set. A later all-process capture could follow
+the wrapper, but that was a workaround for the launch shape rather than a
+reason to retain it.
+
+The current protocol now forbids `taskset` in CPU-KV benchmark and profiler
+commands. Nsight launches the llama binary directly and remains unrestricted;
+only llama.cpp worker pools receive native affinity controls. For the former
+logical-CPU 0--2 `llama-bench` shape, the translation is `-C 0x7
+--cpu-strict 1`. Server and common-argument tools retain their explicit
+`--cpu-range`, `--cpu-range-batch`, and `--cpu-strict` controls. An outer GPU
+coordination lock may serialize runs but must not alter affinity.
+
+Historical ledger and reproduction commands remain unchanged so their exact
+measurements can still be reconstructed. Their `taskset` spelling is now
+explicitly superseded for new work. Existing Nsight hardware counters are not
+invalid merely because a profiler was CPU-restricted when it successfully
+captured the intended kernel, but profiler timing is not benchmark evidence;
+no-kernel captures and wrapper-dependent all-process captures require a clean
+direct-target rerun before they support a current claim.
+
+## 2026-08-21: shared VRAM documentation and publication lanes
+
+Shared documentation was consolidated from exact local KV tip
+`6a20757854395309b32248dd4109d73e99c3e675`. The published source base is now
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` after PR 5 and PR 6 merged. The
+read-only parallel snapshot `refs/codex/pre-pr4-parallel-source` at
+`f52988ee150cd27a94d6897cc049326c1e77c3e2` remains forensic research history,
+not an integration source. It combined multiple features in one uncommitted
+tree, so cumulative performance cannot establish an isolated feature claim.
+
+Merged support lanes are PR 5 perplexity capacity at
+`8d2f8452eb140ba52d8472ecd791cc90212a9307`, merged as
+`50ee5b2d765c91a0d9cd23728ac17a27ac510e3e`, and PR 6 physical/VMM telemetry
+at `3bd7a088199922b1e5e20973cd8cb6d970cde111`, merged as the current base
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Remaining independent lanes are
+PR 4 native standard-quant attention at
+`72ee96bbfcf91c17a7fb5b3b32703aae812af330` and PR 8 live-context workspace at
+final head `0c8df007a504f16aa35fc5982303e3e1b9883331`. PR 7 is final at
+`d4183adb8b4902a125b9339cd39032a095fca013`, directly based on `4a7f9b496` and
+six commits ahead. PR 8 is likewise directly based on `4a7f9b496`, six commits
+ahead, draft, open, mergeable, and clean. PR 7's resource/performance evidence
+remains the isolated c9 dense/Candidate-1/dense A/B/A study; the rebased source
+validation at
+`ae60c7321d950937a36af096112525db777ae13f` is a separate composition gate and
+does not relabel those measurements.
+
+The retained PR 7 result is fail-closed compact causal-prefix metadata with
+per-consumer views that remove the measured long-lived-copy allocator hole.
+Serving output and matching-batch PPL were exact, context-scaled VRAM savings
+were measured through 128K, and the focused repeated 128K decode screen rejected
+a material slowdown. Invalid setup/probe launches and noisy rejected timing are
+not shared evidence; exact identities, commands, exclusions, and limitations
+remain in PR 7's branch-owned investigation.
+
+PR 8's final Experiment 021 composes its default-off live-context workspace
+with merged W02/W06. Omitted/live/explicit-off serving output was byte-exact at
+1K and across the 32K lifecycle, and matching-geometry PPL was identical. At
+32K the live policy saved 200 MiB of startup process VRAM and 212 MiB on the
+post-shrink next turn; repeated 4K/30K prompt and decode throughput was neutral.
+Its separate synchronized CUDA device-used high-water exposed +8 MiB at 4K
+prefill and +56 MiB at 30K prefill, with no decode cost. Those values are
+`cudaMemGetInfo`-style device usage, not `nvidia-smi` process VRAM. Only the
+accepted explicit-Bash process-substitution launches are valid provenance;
+rejected version/setup probes are excluded.
+
+PR 8 continues to own its source, presets, and every user-facing generated
+`--live-context-workspace` document until the source lands. The current
+protocol, roadmap, feature-isolation plan, and source-backed feature delta are
+shared KV inheritance. PR 7 and PR 8 identities and all pairwise comparisons
+have been refreshed at their final heads. This consolidation does not merge or
+fast-forward the published KV base.
 ## 2026-08-20: pre-PR4 W02 telemetry isolation
 
 The allocation-classification and CUDA VMM high-water instrumentation from the

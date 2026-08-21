@@ -1,11 +1,10 @@
-# MTP recurrent-plane cap: complete implementation and reproduction record
+# MTP recurrent-plane cap: retained implementation and reproduction record
 
 This is the standalone reconstruction of the configurable MTP recurrent-plane
-cap work. It records source lineage, discarded designs, implementation
-decisions, build and ccache setup, exact test and benchmark protocols, profiler
-queries, artifacts, measurements, failures, and integration. Another developer
-should be able to reproduce the work without shell history or conversation
-context.
+cap work. It records source lineage, decision-relevant discarded designs,
+implementation decisions, valid test and benchmark protocols, measurements,
+and integration. Invalid setup attempts and redundant reruns are intentionally
+omitted; Git history remains available for forensic detail.
 
 ## Exactness update: physical MTP ubatch
 
@@ -281,9 +280,6 @@ extern "C" {
 GGML_API ggml_tensor * ggml_gated_delta_net_ext(...);
 }
 ```
-
-The first attempt, `extern "C" GGML_API`, was invalid because this platform's
-`GGML_API` expansion already includes linkage-related tokens.
 
 After confirming public-header content exactly matched Git, its timestamp was
 restored to the committed timestamp so the interrupted build did not rebuild
