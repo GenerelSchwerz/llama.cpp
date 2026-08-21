@@ -5958,27 +5958,20 @@ outside the kernel — the route gate, the dispatcher, one `static_assert`, the
 `DECL_FATTN_MMA_QUANT_CASE` macro, and the generator — each of which simply
 passed one type twice.
 
-##### The pair policy is borrowed, not invented
+##### Every ordered pair, and what that costs
 
-What actually bounds mixed support is the instantiation matrix: eleven types are
-121 ordered pairs against 11 symmetric ones. The policy adopted is the one the
-vector FlashAttention kernels already compile, defined by
-`ggml_cuda_get_fattn_vec_default_pairs()` in `ggml/CMakeLists.txt`. On the bit
-ladder 8-6-5-4-3-2 the V type sits at K's position or up to two positions below
-it, never above, and at equal position a `_1` K may pair with a `_0` V but not
-the reverse.
+An earlier revision compiled only the 48 ordered pairs the vector FlashAttention
+path admits, on the reasoning that K enters the softmax and is the more
+precision-sensitive side. That band was removed: the route now compiles **every
+ordered pair of native types**, so whatever the F16-casting path accepts for K
+and V, the native path accepts too and no cache configuration has to reason
+about eligibility.
 
-Reusing it rather than inventing a band means a cache configuration cannot gain
-or lose support by crossing the vector/MMA boundary, and it needs no new
-justification: K enters the softmax and is the more precision-sensitive side,
-which is why the band is one-sided. It admits 48 of the 121 ordered pairs, and
-9 of the 16 over the four default-tier types.
-
-The runtime mirror of that policy in `fattn.cu` was a second hand-written copy
-of the same band as a bit table. It is now a wrapper over the single shared
-definition. The rewritten form was checked to be pointwise identical to the bit
-table over all 121 ordered pairs before the old code was deleted, so the vector
-pair matrix is unchanged.
+`ggml_cuda_fattn_mma_quant_pair()` is therefore just "both types have a loader".
+The bit-ladder helpers survive only because the *vector* path still has a band
+and `fattn.cu` should not carry a second copy of it. The two coverage sets now
+intentionally diverge, and a newly admitted native pair outside the vector band
+has no compiled vector alternative.
 
 ##### Cost
 
@@ -5989,6 +5982,24 @@ pair matrix is unchanged.
 | Quant instance object code | 77 MB | 315 MB | 4.09x |
 | `libggml-cuda.so`, `GGML_CUDA_FA_ALL_QUANTS` | 348,042,208 B | 578,918,992 B | 1.66x |
 | Full CUDA rebuild, `-j16` | — | 50 min 53 s | — |
+
+Widening from that band to every ordered pair costs again, and this is now the
+dominant cost of the feature:
+
+| | 48-pair band | Every pair |
+|---|---:|---:|
+| All-quants ordered pairs | 48 | **121** |
+| All-quants explicit cases | 2,304 | **5,808** |
+| Default-tier explicit cases | 432 | **768** |
+| Quant instance object code | 315 MB | **688 MB** |
+| `libggml-cuda.so` | 578,918,992 B | **962,082,712 B** |
+| Clean CUDA rebuild, `-j16` | 50 min 53 s | **1 h 45 min 55 s** |
+
+Adding an nth native type costs `2n-1` new pairs, so the type list is not a
+place to add speculatively. Every pair duplicates the entire attention body;
+the intended fix is a K- or loader-family-specialized kernel with a uniform
+runtime V-loader switch, so coverage costs one loader per type rather than one
+body per pair.
 
 The library figures are both measured, the first from a worktree built at the
 parent commit with identical flags rather than estimated from the object delta.
@@ -6004,14 +6015,22 @@ full MMA header for an empty translation unit.
 
 ##### Correctness
 
-`test-backend-ops -o FLASH_ATTN_EXT -p native_quants=1`: **1332/1332**. That
-covers 185 new mixed-pair cases — all 37 admitted pairs at head sizes 64 and
-256, at `kv=512` and the unpadded `kv=113` that forces both loaders onto their
-bounds-checked tail path with K and V disagreeing about the row stride, plus one
-sinks geometry per pair at head size 128.
+`test-backend-ops -o FLASH_ATTN_EXT -p native_quants=1`: **1695/1695**. That
+covers 550 mixed-pair cases — all 110 non-symmetric ordered pairs at head sizes
+64 and 256, at `kv=512` and the unpadded `kv=113` that forces both loaders onto
+their bounds-checked tail path with K and V disagreeing about the row stride,
+plus one sinks geometry per pair at head size 128.
+
+Numerical success alone would be a false green, because a pair without a kernel
+falls back and still produces the right answer. The sweep was therefore run with
+`GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` and the launch log audited: **all 121
+distinct ordered pairs appear**, between 5 and 104 launches each. The only
+fallback warning in the run is `DQ=96`, an unsupported head dimension.
 
 Model-level byte identity, Qwen3.8-27B-UD-IQ2_M, `-c 8192`, GPU-resident KV,
 128 forced tokens, comparing the native arm against the materializing arm:
+
+Under the 48-pair band, with the prompt taken from a repository document:
 
 | K / V | Result | Launches off / on | CUDA0 KV |
 |---|---|---|---:|
@@ -6023,16 +6042,31 @@ Model-level byte identity, Qwen3.8-27B-UD-IQ2_M, `-c 8192`, GPU-resident KV,
 | `q4_1 / q2_0` | `3bbd082b…` identical | 0 / 128 | 120.00 MiB |
 | `q8_0 / q4_0` | `e31eea4d…` identical | 0 / **0** | 208.00 MiB |
 
-The last row is the control that matters. `q8_0 / q4_0` is three positions apart
-on the ladder, one more than the band allows, so with the option on it must take
-zero native launches — and it does. The gate holds at model level and not only
-in the unit tests. `test-backend-ops` covers the other rejection direction,
-`q4_0 / q4_1`, where V is more precise than K at equal bit width.
+The last row was the control for the band: `q8_0 / q4_0` sat three positions
+apart on the ladder, so with the option on it took zero native launches. After
+the band was removed it is an ordinary native pair, and the rows above remain
+valid identity evidence for their pairs.
 
-`q4_1 / q2_0` is the most demanding admitted pair and is worth calling out
-separately: K carries a min and V does not, K unpacks nibbles and V unpacks
-two-bit fields, and the two sides use different row strides into the same shared
-tile. It is exact.
+Repeated after the widening, for the pairs the band used to exclude:
+
+| K / V | | Result | Launches off / on |
+|---|---|---|---|
+| `q8_0 / q2_0` | widest precision gap | `f2636244…` identical | 0 / 128 |
+| `q2_0 / q8_0` | reverse direction, V more precise than K | `e83b3066…` identical | 0 / 128 |
+| `q4_0 / q4_1` | `_0`/`_1` reverse at equal bit width | `ee46dc15…` identical | 0 / 128 |
+| `q8_0 / q6_0` | control, admitted under both policies | `0baae9cf…` identical | 0 / 128 |
+
+`q4_1 / q2_0` and `q8_0 / q2_0` are the most demanding admitted pairs: K carries
+a min or eight-bit codes while V unpacks two-bit fields, and the two sides use
+different row strides into the same shared tile. Both are exact.
+
+A methodology note, because it produced a hash that looks like a regression and
+is not: the identity harness built its prompt from
+`docs/quantized-native-flash-attention.md`, a file this work edits. `q8_0/q6_0`
+therefore hashes `6e85f8fc…` in the first table and `0baae9cf…` in the second.
+Within a single build the off and on arms read the same file at the same moment,
+so every comparison above is sound, but hashes are **not** comparable across
+builds. The harness now reads a frozen corpus instead.
 
 ##### Where the benefit is, and where it is not
 

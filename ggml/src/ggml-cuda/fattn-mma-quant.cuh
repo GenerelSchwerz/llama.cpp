@@ -292,22 +292,21 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_type(ggml_ty
 //
 // K and V are independent template parameters of the kernel and reach the tile
 // loader through separate calls, so any ordered pair of native types is
-// expressible. What bounds the set is the instantiation matrix, which grows
-// quadratically: eleven types are 121 ordered pairs, and each pair costs three
-// head sizes times sixteen column shapes.
+// expressible. The route compiles all of them: whatever the F16-casting path
+// accepts for K and V, the native path accepts too, so no cache configuration
+// has to reason about a band.
 //
-// The policy applied here is not a new one. It is the pair policy the vector
-// FlashAttention kernels already compile, defined by
-// ggml_cuda_get_fattn_vec_default_pairs() in ggml/CMakeLists.txt and mirrored at
-// runtime by ggml_cuda_fattn_default_quant_pair() in fattn.cu: on the bit ladder
-// 8, 6, 5, 4, 3, 2 the V type may sit at K's position or up to two positions
-// below it, never above, and at equal position a _1 K may pair with a _0 V but
-// not the reverse. K carries into the softmax and is the more precision
-// sensitive of the two, which is why the band is one-sided.
+// That is a deliberate cost decision. Eleven types are 121 ordered pairs, each
+// costing three head sizes times sixteen column shapes, so the full matrix is
+// 5,808 explicit cases against the 121 the symmetric route needed. It falls
+// entirely on GGML_CUDA_FA_ALL_QUANTS builds, which are already the opt-in
+// tier; the default four-type tier is 16 pairs and 768 cases.
 //
-// Reusing it means a cache configuration never gains or loses support by
-// crossing the vector/MMA boundary. Over the eleven native types it admits 48 of
-// the 121 ordered pairs; over the four types of the default tier, 9 of 16.
+// The bit ladder below is retained because two things still need it: the
+// ordering it defines documents which side of a pair is the precision-sensitive
+// one, and ggml_cuda_fattn_quant_pair_policy() is the vector path's compiled
+// pair matrix, which is tiered separately in ggml/CMakeLists.txt and is not
+// widened by this.
 
 // Position on the bit ladder 8, 6, 5, 4, 3, 2. -1 for types that are not on it.
 static constexpr __host__ __device__ int ggml_cuda_fattn_quant_pair_rank(ggml_type type) {
@@ -325,7 +324,13 @@ static constexpr __host__ __device__ int ggml_cuda_fattn_quant_pair_variant(ggml
            type == GGML_TYPE_Q3_0 || type == GGML_TYPE_Q2_0S ? 1 : 0;
 }
 
-// The policy itself, independent of which types a given build compiles.
+// The vector FlashAttention pair matrix, defined by
+// ggml_cuda_get_fattn_vec_default_pairs() in ggml/CMakeLists.txt: on the bit
+// ladder the V type sits at K's position or up to two positions below it, never
+// above, and at equal position a _1 K may pair with a _0 V but not the reverse.
+// 48 of the 121 ordered pairs. The native MMA route does NOT use this; it is
+// here because fattn.cu's vector selection asks the same question and should
+// not carry a second copy of the band.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_pair_policy(ggml_type type_K, ggml_type type_V) {
     return ggml_cuda_fattn_quant_pair_rank(type_K) >= 0 && ggml_cuda_fattn_quant_pair_rank(type_V) >= 0 &&
         ggml_cuda_fattn_quant_pair_rank(type_V) >= ggml_cuda_fattn_quant_pair_rank(type_K) &&
@@ -334,13 +339,11 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_pair_policy(ggml
          ggml_cuda_fattn_quant_pair_variant(type_K) <= ggml_cuda_fattn_quant_pair_variant(type_V));
 }
 
-// The pairs this build actually has kernels for: the policy restricted to the
-// compiled type tier. Both the host-side route decision and the device-side
-// kernel selection ask this same question, so a pair can never be routable
-// without a kernel.
+// The pairs this build has native kernels for: every ordered pair of compiled
+// types. Both the host-side route decision and the device-side kernel selection
+// ask this same question, so a pair can never be routable without a kernel.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_pair(ggml_type type_K, ggml_type type_V) {
-    return ggml_cuda_fattn_mma_quant_type(type_K) && ggml_cuda_fattn_mma_quant_type(type_V) &&
-        ggml_cuda_fattn_quant_pair_policy(type_K, type_V);
+    return ggml_cuda_fattn_mma_quant_type(type_K) && ggml_cuda_fattn_mma_quant_type(type_V);
 }
 
 // Load quantized rows directly into the half2 shared-memory tile consumed by

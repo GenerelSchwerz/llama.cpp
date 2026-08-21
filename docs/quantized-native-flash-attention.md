@@ -14,37 +14,37 @@ the same type; which mixed pairs are covered is the pair policy below.
 Unsupported cache pairs, dimensions, devices, and builds keep the standard
 materializing path.
 
-## Pair policy
+## K/V pairing
 
 K and V are independent template parameters of the kernel and reach the tile
 loader through separate calls, so any ordered pair of native types is
-expressible. What bounds the compiled set is the instantiation matrix, which
-grows quadratically: eleven types are 121 ordered pairs, each costing three head
-sizes times sixteen tile shapes.
+expressible. **The route compiles all of them.** Whatever the F16-casting path
+accepts for K and V, the native path accepts too, so no cache configuration has
+to reason about which pairings are eligible: 121 ordered pairs over the eleven
+types with `GGML_CUDA_FA_ALL_QUANTS`, 16 over the four of the default tier.
 
-The policy applied is the one the vector FlashAttention kernels already compile,
-so a cache configuration never gains or loses support by crossing the vector/MMA
-boundary. On the bit ladder
+That is a deliberate cost decision rather than a free one. Each pair costs three
+head sizes times sixteen column shapes, so the full matrix is 5,808 explicit
+template cases against the 528 the symmetric route needed, and it falls entirely
+on `GGML_CUDA_FA_ALL_QUANTS` builds, which are already the opt-in tier. The
+numbers are in the limitations section below.
 
-    8 -> 6 -> 5 -> 4 -> 3 -> 2
+Nothing about a pair's direction is special-cased. `q8_0 / q2_0` and
+`q2_0 / q8_0` are both native, as are all the `_0`/`_1` crossings. Whether a
+given pairing is a *sensible* cache configuration is a separate question from
+whether it has a kernel, and the route does not answer the first one.
 
-the V type may sit at K's position or up to two positions below it, never above,
-and at equal position a `_1` K may pair with a `_0` V but not the reverse. K
-carries into the softmax and is the more precision-sensitive of the two, which
-is why the band is one-sided.
+One predicate drives all three consumers.
+`ggml_cuda_fattn_mma_quant_pair()` in `fattn-mma-quant.cuh` is asked by the
+host-side route decision and by the device-side kernel selection, and
+`generate_cu_files.py` emits the matching cross product. A disagreement is a
+missing-symbol link error naming the exact pair, not a silent gap.
 
-That admits 48 of the 121 ordered pairs over the eleven types, and 9 of the 16
-over the four default-tier types. `q8_0 / q6_0`, `q6_0 / q4_0` and `q5_0 / q4_0`
-are in; `q8_0 / q4_0` is three positions apart and is not; `q4_0 / q8_0` is the
-wrong direction and is not.
-
-One definition drives all three consumers.
-`ggml_cuda_fattn_quant_pair_policy()` in `fattn-mma-quant.cuh` states the band;
-`ggml_cuda_fattn_mma_quant_pair()` restricts it to the compiled type tier and is
-asked by both the host-side route decision and the device-side kernel selection;
-`generate_cu_files.py` mirrors it to decide what to define. A disagreement
-between the mirror and the definition is a missing-symbol link error naming the
-exact pair, not a silent gap.
+Note that the *vector* FlashAttention path is tiered separately and is not
+widened by this. `ggml_cuda_fattn_quant_pair_policy()` still describes its
+band — on the bit ladder 8-6-5-4-3-2 the V type sits at K's position or up to
+two below it, never above — and `ggml_cuda_get_fattn_vec_default_pairs()` in
+`ggml/CMakeLists.txt` is its build-side twin.
 
 ## Selection model
 
@@ -62,8 +62,7 @@ selects nor converts the cache type. For example:
 | `q6_0 / q6_0` | on | Native Q6 MMA when the build, device, and head size support it |
 | `q8_0 / q6_0` | on | Native mixed-pair MMA; K and V load different quant layouts into the same tile |
 | `q4_1 / q2_0` | on | Native; K carries a min and unpacks nibbles while V has none and unpacks two-bit fields |
-| `q8_0 / q4_0` | on | Standard materializing fallback; outside the pair policy band |
-| `q4_0 / q8_0` | on | Standard materializing fallback; V may not be more precise than K |
+| `q4_0 / q8_0` | on | Native; a V more precise than its K is unusual but has a kernel like any other pair |
 | `q2_1 / q2_1` | on | Native MMA only in a `GGML_CUDA_FA_ALL_QUANTS` build; otherwise standard materializing fallback |
 
 This avoids a second K/V type selector that could disagree with the tensors in
@@ -151,9 +150,10 @@ structure:
   `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
 
 There are 16 tile shapes and three supported head dimensions. The default
-four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) admits 9 ordered pairs
-and yields 432 explicit template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the
-remaining seven types, for 48 pairs and 2304 cases. A future native pair is not inferred from the standard quant
+four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) is 16 ordered pairs and
+768 explicit template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the remaining seven
+types, for 121 pairs and 5,808 cases. Adding an nth type costs `2n-1` new pairs,
+so the list is not a place to add speculatively. A future native pair is not inferred from the standard quant
 matrix. It requires an intentional loader/registration, a bounded generated
 inventory, route and fallback tests, output validation, and performance and
 memory evidence.
@@ -246,9 +246,10 @@ and run-time defaults remain off.
 
 ## Limitations
 
-- The registered pairs are those the pair policy admits: 9 of 16 over the four
-  default types, 48 of 121 with `GGML_CUDA_FA_ALL_QUANTS`. Pairs outside the
-  band, most notably any pair whose V is more precise than its K, use fallback.
+- Every ordered pair of compiled types is registered, so no quantized K/V
+  combination that the F16-casting path accepts falls back for lack of a pair.
+  What still falls back is an unsupported *type*, head dimension, device, or
+  build.
 - A mixed pair buys allocation, not throughput. Measured for `q8_0 / q6_0` at
   depth 32,768, prefill is `+0.22%` with `t = 0.877`, which is neutral; the
   reserve-time `CUDA0 compute` buffer falls 46.6% at that depth and 54.6% at
@@ -261,9 +262,11 @@ and run-time defaults remain off.
   performs synchronous dequantization into shared memory. That is a
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
-- Compile time and CUDA-library size increase when the family is built because
-  all explicit cases are emitted: 432 by default, 2304 with
-  `GGML_CUDA_FA_ALL_QUANTS`. Default builds pay neither cost.
+- Compile time and CUDA-library size increase substantially when the family is
+  built, because the pair matrix is quadratic in the number of compiled types:
+  768 explicit cases by default, 5,808 with `GGML_CUDA_FA_ALL_QUANTS`. This is
+  the dominant cost of the feature and the reason the build defaults stay off.
+  Default llama.cpp builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 
@@ -320,12 +323,13 @@ helper. The two do not always agree:
 
 A new type therefore needs a `fattn_quant_type_traits` specialization whose
 `dequant()` matches its cast kernel, an entry in `FATTN_MMA_QUANT_TYPES` in
-`fattn-mma-quant.cuh`, a rung in `ggml_cuda_fattn_quant_pair_rank` so the pair
-policy can place it, one line in each of `DECL_FATTN_MMA_QUANT_CASE_V` and
-`DECL_FATTN_MMA_QUANT_CASE_TYPES` in `fattn-mma-quant-decl.cuh`, entries in the
-generator's `FATTN_MMA_QUANT_TYPES` and `FATTN_MMA_QUANT_LADDER`, and a pass in
-the `test-backend-ops` sweep. The routing switch needs no change: it expands
-from the same type list. Tolerance-based tests are not
+`fattn-mma-quant.cuh`, one line in each of `DECL_FATTN_MMA_QUANT_CASE_V` and
+`DECL_FATTN_MMA_QUANT_CASE_TYPES` in `fattn-mma-quant-decl.cuh`, an entry in the
+generator's `FATTN_MMA_QUANT_TYPES`, and an entry in the `native_types` array in
+the `test-backend-ops` sweep, which pairs it against every existing type
+automatically. It also wants a rung in `ggml_cuda_fattn_quant_pair_rank` if the
+vector path should carry it. The routing switch needs no change: it expands from
+the same type list. Tolerance-based tests are not
 sufficient evidence on their own: with random inputs they would accept a loader
 that permuted elements within a block. A byte-identical generation comparison
 against the same build with the option off is what actually gates a

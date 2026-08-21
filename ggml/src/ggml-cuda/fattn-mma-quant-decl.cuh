@@ -10,13 +10,12 @@
 // fattn.cu needs them, so parsing that cross product is confined to one
 // translation unit instead of every generated instance file.
 //
-// The cross product is deliberately unfiltered. Pairs outside
-// ggml_cuda_fattn_mma_quant_pair() are declared but never defined and never
-// odr-used, because the dispatcher guards every call with the same predicate
-// that the generator uses to decide what to define. Declaring them costs
-// nothing and removes any chance of this list and the generator disagreeing
-// about the pair policy; if they ever did disagree, the result would be a
-// missing-symbol link error naming the exact pair rather than a silent gap.
+// Every ordered pair of the compiled types is declared, because every ordered
+// pair is defined: whatever the F16-casting path accepts for K and V, the
+// native path accepts too. The list is a plain cross product of the type list
+// against itself, so it cannot disagree with the generator about which pairs
+// exist; if it ever did, the result would be a missing-symbol link error naming
+// the exact pair rather than a silent gap.
 
 #ifdef GGML_CUDA_FATTN_Q8_NATIVE
 

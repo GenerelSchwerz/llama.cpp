@@ -282,10 +282,11 @@ static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cud
     }
 }
 
-// K and V are dispatched independently. The inner switch is guarded by the same
-// pair predicate the generator uses, so the compiler only reaches the kernel for
-// pairs that were actually instantiated; the rest collapse to an abort that
-// ggml_cuda_fattn_native_applies has already made unreachable.
+// K and V are dispatched independently over the full cross product of compiled
+// types. The inner switch is still guarded by the same pair predicate the route
+// gate asks, so the two can never disagree about what has a kernel, and a build
+// that narrows the compiled set would narrow the dispatcher with it rather than
+// emit a call to a missing instantiation.
 template <ggml_type type_K>
 static void ggml_cuda_flash_attn_ext_mma_quant_switch_type_V(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #define FATTN_MMA_QUANT_DISPATCH_CASE_V(tv)                                            \

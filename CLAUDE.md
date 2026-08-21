@@ -56,9 +56,10 @@ quantized K/V cache in place instead of casting it to F16 first, which removes
 the transient F16 copy of the attention window. It is off by default, output is
 unchanged, and it applies only where a native loader exists for the cache types
 and head dimension; every other case keeps the F16-casting path. K and V may be
-different types: the native route compiles the same ordered pair set as the
-vector path above, so `--cache-type-k q8_0 --cache-type-v q6_0` is native while
-`q8_0`/`q4_0` and any pair whose V outranks its K fall back. The kernels are
+different types, and every ordered pair of native types has a kernel — 16 pairs
+in the default tier, 121 with `GGML_CUDA_FA_ALL_QUANTS` — so no quantized K/V
+combination falls back merely for being mixed. The vector pair matrix above is
+tiered separately and is narrower. The kernels are
 compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
 the option keeps the standard path and reports a warning. The cache type still
 comes exclusively from `--cache-type-k` and `--cache-type-v`; the native option

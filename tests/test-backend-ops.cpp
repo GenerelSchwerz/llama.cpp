@@ -10274,58 +10274,47 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // check; the symmetric sweep above cannot, because it never puts two
     // layouts in one kernel.
     //
-    // The pairs are the ones the route admits, stated here independently of the
-    // backend so this is a check rather than a restatement: on the bit ladder
-    // 8, 6, 5, 4, 3, 2 the V type sits at K's position or up to two positions
-    // below it, and at equal position a _1 K may pair with a _0 V but not the
-    // reverse. Symmetric pairs are omitted, being covered above.
+    // Every ordered pair is covered, in both directions, because every ordered
+    // pair has a kernel. The list is built from the type array rather than
+    // written out so that adding a native type cannot silently leave its
+    // pairings untested.
     {
-        const std::pair<ggml_type, ggml_type> mixed_native[] = {
-            { GGML_TYPE_Q8_0, GGML_TYPE_Q6_1 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q6_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q5_1 },
-            { GGML_TYPE_Q8_0, GGML_TYPE_Q5_0 }, { GGML_TYPE_Q6_1, GGML_TYPE_Q6_0 }, { GGML_TYPE_Q6_1, GGML_TYPE_Q5_1 },
-            { GGML_TYPE_Q6_1, GGML_TYPE_Q5_0 }, { GGML_TYPE_Q6_1, GGML_TYPE_Q4_1 }, { GGML_TYPE_Q6_1, GGML_TYPE_Q4_0 },
-            { GGML_TYPE_Q6_0, GGML_TYPE_Q5_1 }, { GGML_TYPE_Q6_0, GGML_TYPE_Q5_0 }, { GGML_TYPE_Q6_0, GGML_TYPE_Q4_1 },
-            { GGML_TYPE_Q6_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q5_0 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q4_1 },
-            { GGML_TYPE_Q5_1, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q3_1 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q3_0 },
-            { GGML_TYPE_Q5_0, GGML_TYPE_Q4_1 }, { GGML_TYPE_Q5_0, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q5_0, GGML_TYPE_Q3_1 },
-            { GGML_TYPE_Q5_0, GGML_TYPE_Q3_0 }, { GGML_TYPE_Q4_1, GGML_TYPE_Q4_0 }, { GGML_TYPE_Q4_1, GGML_TYPE_Q3_1 },
-            { GGML_TYPE_Q4_1, GGML_TYPE_Q3_0 }, { GGML_TYPE_Q4_1, GGML_TYPE_Q2_1 }, { GGML_TYPE_Q4_1, GGML_TYPE_Q2_0S },
-            { GGML_TYPE_Q4_0, GGML_TYPE_Q3_1 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q3_0 }, { GGML_TYPE_Q4_0, GGML_TYPE_Q2_1 },
-            { GGML_TYPE_Q4_0, GGML_TYPE_Q2_0S }, { GGML_TYPE_Q3_1, GGML_TYPE_Q3_0 }, { GGML_TYPE_Q3_1, GGML_TYPE_Q2_1 },
-            { GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S }, { GGML_TYPE_Q3_0, GGML_TYPE_Q2_1 }, { GGML_TYPE_Q3_0, GGML_TYPE_Q2_0S },
-            { GGML_TYPE_Q2_1, GGML_TYPE_Q2_0S },
+        static const ggml_type native_types[] = {
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q6_1, GGML_TYPE_Q6_0,
+            GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+            GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q3_1, GGML_TYPE_Q3_0,
+            GGML_TYPE_Q2_1, GGML_TYPE_Q2_0S,
         };
 
-        for (const auto & [tk, tv] : mixed_native) {
-            for (int hs : { 64, 256 }) {
-                // kv=113 is unpadded, so both loaders take their bounds-checked
-                // tail path with K and V disagreeing about the row stride.
-                for (int kv : { 512, 113 }) {
-                    test_cases.emplace_back(new test_flash_attn_ext(
-                                hs, hs, 4, {4, 1}, kv, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                                tk, tv, true));
+        for (ggml_type tk : native_types) {
+            for (ggml_type tv : native_types) {
+                if (tk == tv) {
+                    continue; // covered by the symmetric sweep above
                 }
+                for (int hs : { 64, 256 }) {
+                    // kv=113 is unpadded, so both loaders take their
+                    // bounds-checked tail path with K and V disagreeing about
+                    // the row stride.
+                    for (int kv : { 512, 113 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                    hs, hs, 4, {4, 1}, kv, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                    tk, tv, true));
+                    }
+                }
+                // One geometry per pair through the variant-selecting parameters.
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 4, {2, 1}, 512, 8, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                            tk, tv, true));
             }
-            // One geometry per pair through the variant-selecting parameters.
-            test_cases.emplace_back(new test_flash_attn_ext(
-                        128, 128, 4, {2, 1}, 512, 8, true, true, 0.0f, 0.0f, GGML_PREC_F32,
-                        tk, tv, true));
         }
     }
 
-    // Pairs the policy rejects, and a head size it does not cover, must retain
-    // the established materializing path rather than silently selecting a
-    // mismatched kernel. Both rejected pairs are two types that each have a
-    // native loader, so these check the pairing rule rather than the absence of
-    // a loader: Q8_0/Q4_0 is three positions apart on the bit ladder, one more
-    // than the band allows, and Q4_0/Q4_1 is the disallowed direction of the
-    // equal-position variant rule, whose reverse Q4_1/Q4_0 is covered above.
-    test_cases.emplace_back(new test_flash_attn_ext(
-                64, 64, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, true));
-    test_cases.emplace_back(new test_flash_attn_ext(
-                64, 64, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
-                GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, true));
+    // A head size the route does not cover must retain the established
+    // materializing path rather than silently selecting a mismatched kernel.
+    // There is no rejected pair to check any more: every ordered pair of native
+    // types has a kernel, which is what the sweep above verifies.
     test_cases.emplace_back(new test_flash_attn_ext(
                 72, 72, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
