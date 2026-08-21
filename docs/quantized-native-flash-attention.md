@@ -217,6 +217,41 @@ and run-time defaults remain off.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 
+## Known limitation: quantized K/V with a logit softcap
+
+A non-zero `logit_softcap` combined with any quantized K/V cache aborts the
+CUDA FlashAttention backend:
+
+```
+CUDA error: unspecified launch failure
+ggml/src/ggml-cuda/ggml-cuda.cu:109: CUDA error
+```
+
+**This is not caused by the native route and is not fixed by avoiding it.** It
+reproduces identically with `--flash-attn-native-quants` withheld, i.e. through
+the ordinary F16-materializing path, and F16 K/V with the same softcap passes
+120/120. It affects models that apply attention logit softcapping, such as the
+Gemma-2 family, whenever their K/V cache is quantized.
+
+It went unnoticed because nothing exercised the combination: before the test
+additions described below, no `FLASH_ATTN_EXT` case in the suite paired a
+quantized K/V type with a non-zero softcap, with or without the native
+permission.
+
+`test-backend-ops` deliberately does not cover it. The failure is an abort
+rather than a wrong result, so a case for it would take down the entire
+`FLASH_ATTN_EXT` sweep instead of reporting one failure. Reproduce it by
+adding a case such as
+
+```cpp
+test_cases.emplace_back(new test_flash_attn_ext(
+            64, 64, 4, {4, 1}, 512, 16, true, false, 0.0f, 10.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, /* native_quants = */ false));
+```
+
+Fixing it is out of scope for the quantized-native work, which neither
+introduces nor worsens it.
+
 ## Adding a cache type
 
 Bit-identity is against the F16-casting route the option replaces, so the

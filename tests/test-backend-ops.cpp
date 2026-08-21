@@ -10232,6 +10232,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The sweep above pins mask=true, sinks=false, max_bias=0 and prec=F32, so
+    // it never reached the kernel variants those select. Cover them at one
+    // geometry per type rather than crossing them with the full sweep.
+    //
+    // A non-zero logit_softcap is deliberately NOT covered here. It selects the
+    // use_logit_softcap kernel, and that combination aborts the CUDA backend
+    // with "unspecified launch failure" for every quantized K/V type. The fault
+    // is not in the quantized-native route: it reproduces identically with the
+    // native permission withheld, and F16 K/V with the same softcap passes
+    // 120/120. Adding cases for it here would abort the whole FLASH_ATTN_EXT
+    // suite rather than report a failure, so it is documented in
+    // docs/quantized-native-flash-attention.md instead.
+    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
+                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
+                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+        for (int hs : { 64, 256 }) {
+            // attention sinks
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // ALiBi slopes
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, false, 8.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // no mask
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, false, false, 0.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // sinks at the default precision
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, true, 0.0f, 0.0f, GGML_PREC_DEFAULT,
+                        tkv, tkv, true));
+        }
+    }
+
     // An opted-in unsupported pair and head size must retain the established
     // materializing path rather than silently selecting a mismatched kernel.
     // The mixed pair is deliberately two types that each have a native loader:
