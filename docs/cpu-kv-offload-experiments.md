@@ -5775,6 +5775,84 @@ sweep against the CPU reference plus a host-side check of its extraction
 against `dequantize_q2_0s` over 200,000 random blocks; every other packed
 extraction was checked the same way against its own functor.
 
+#### Long-context exactness and the allocation ceiling
+
+Status: both gates closed. Same host, model and build as the packed-loader
+entry above.
+
+##### Long-context byte identity
+
+The earlier byte-identity gate used an 8,192-token context, which is not where
+the allocation benefit lives. This repeats it at 131,072 and 245,760 with a
+deterministic prompt built from repository text, `temperature 0`, `seed 1234`,
+`cache_prompt` off, and `ignore_eos` so the model cannot end the comparison
+early. Both the text and the returned token IDs are compared, and native
+launches are counted from `GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE` so a fallback
+cannot produce a false green.
+
+| Context | Prompt tokens | Types | Result | Native D=256 launches (off / on) |
+|---:|---:|---|---|---|
+| 131,072 | 106,549 | `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q3_0`, `q6_0`, `q6_1`, `q2_1` | all byte-identical | 0 / 3,360 |
+| 245,760 | 231,985 | `q8_0`, `q3_0` | all byte-identical | 0 / 7,280 |
+
+That is 26x and 57x the launch count of the original 8,192-token gate.
+
+`q2_0` is excluded on purpose. Its model-level output is not reproducible
+across processes in either arm, as recorded in the packed-loader entry, so
+there is nothing for a byte comparison to mean.
+
+##### A measurement artifact worth recording
+
+The first pass of this sweep reported `q4_0` and `q6_0` as differing at
+131,072, diverging at generated token 0 and 1 respectively. They do not.
+
+Both were native-arm runs from a batch that started each server immediately
+after killing the previous one. Re-running every arm twice under proper
+isolation produced one value per type across all four runs, with the native
+arm equal to the materializing arm, and re-running the two failures through the
+*same* verbose harness with a teardown wait reproduced byte identity. The
+batch's own reserve samples show device memory differing between arms of one
+pair (`peak_mib` 9,540 against 9,970), which is the likely route to a different
+kernel launch configuration and therefore a different reduction order.
+
+The lesson is procedural: an incompletely exited `llama-server` does not only
+cause loud "unable to allocate CUDA0 buffer" failures, it can also silently
+perturb a run that otherwise looks valid. Serialize GPU work and wait for
+teardown before trusting a long-context comparison.
+
+##### The allocation saving has a closed form
+
+The reserve-time saving was measured against context for `q8_0` and `q3_0`,
+one clean `llama-server --parallel 1 -v` process per point:
+
+| Context | `q8_0` saved | `q3_0` saved | `tail + dst` |
+|---:|---:|---:|---:|
+| 16,384 | 42 MiB | 8 MiB | 76 MiB |
+| 32,768 | 140 MiB | 106 MiB | 140 MiB |
+| 49,152 | 204 MiB | 170 MiB | 204 MiB |
+| 65,536 | 268 MiB | 268 MiB | 268 MiB |
+| 98,304 | 396 MiB | 396 MiB | 396 MiB |
+| 131,072 | 524 MiB | 524 MiB | 524 MiB |
+| 163,840 | 652 MiB | 652 MiB | 652 MiB |
+| 196,608 | 780 MiB | 780 MiB | 780 MiB |
+| 245,760 | 972 MiB | 972 MiB | 972 MiB |
+
+`tail` is the F16 copy, which `ggml_cuda_flash_attn_ext_get_alloc_size` appends
+to the FlashAttention output tensor rather than allocating separately, so it is
+`2*(nelem(K) + nelem(V))` and does not depend on the cache type. `dst` is that
+output tensor, `256 * 512 * 24 * 4 B` = 12 MiB here.
+
+From 65,536 upward both types hit `tail + dst` exactly, with no residual. Below
+it they fall short, because the allocator can still overlap the attention
+output allocation with other transients. So the saving is
+`min(tail + dst, what the allocator cannot overlap)`, and above roughly 64K the
+tail is too large for anything to overlap.
+
+This closes the 140-against-106 discrepancy at 32,768 that earlier entries left
+open. It was never a property of the cache type: `q8_0` reaches the ceiling at
+32,768 and the lower-bit types do not, because the smaller tail still leaves
+the allocator room to overlap.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes
