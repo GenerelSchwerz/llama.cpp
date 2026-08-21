@@ -330,7 +330,7 @@ RSS varied by less than approximately 2.5 MiB across each bracket.
 
 `llama-bench` deliberately uses a 512-output reserve. A serving graph with one
 requested output does not have that artificial logits floor, so it is the
-relevant next-turn resource check. The uncommitted reproducible runner is
+relevant next-turn resource check. The reproducible runner is
 `scripts/compact-mask-next-turn.sh`. Each entire runner invocation was inside
 the GPU lock and directly launched the selected `llama-server`. It used normal
 warmup, context/batch/ubatch `{depth}/1024/512`, pinned CPU Q8_0/Q8_0 KV,
@@ -479,3 +479,267 @@ remain under `/tmp/beellama-compact-root-audit-20260820`. Source and working
 documentation are published together at the Candidate 1 checkpoint. The
 candidate artifact hash manifest is `final-artifact-sha256.txt`, SHA-256
 `bbc68c69ee1f557f89a6f15f32b0b36a1f34d1116e462beb22324ee6c36114cf`.
+
+## Deep-context scaling after Candidate 1 publication
+
+### Isolated identities and scope
+
+This follow-up was run after Candidate 1 and the reproduction runner were
+published together at
+`b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`. Every baseline process still
+used the independently built dense source
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`; every candidate process used the
+committed `b3ce3a5c2` source. There were no source changes after that commit,
+so the accepted exact PPL gate above remains the applicable quality result.
+
+The coordinator subsequently reported that PR 5 and PR 6 moved the remote
+`beellama-kv-cpu-offload` base to `4a7f9b496`. That happened after this study
+was launched. None of the following measurements use that composed base, and
+they must not be relabeled as composed evidence when PR 7 is refreshed.
+
+The Release CUDA build configuration remained native CPU tuning, CUDA
+FlashAttention, CUDA architecture 120, default quant pairs, and tests enabled.
+The clean relink reported version `11247 (b3ce3a5c2)`. Artifact identities were:
+
+| Artifact | c9 dense SHA-256 | Candidate 1 SHA-256 |
+|---|---|---|
+| `llama-bench` | `1f6229604db5092e79b42b38579194423f0fe249f57366749f619465ec450071` | `44e9eebbb2a764330cda49d1d1b5e92e57dbabf4c55aa67e3de3f531902c8756` |
+| `llama-server` | `9b0283fb10f12e5d5317a79ddab3262602e1b218490123e2b9315092b6277346` | `eb6dd9e702078f5d1250a997da4449f8e842f670c9c8f0baa175023ead3f3660` |
+
+The model SHA-256 remained
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+All GPU-capable commands and entire runner invocations were fresh processes
+wholly inside `flock /tmp/beellama-single-gpu.lock -c`. Affinity used only
+llama controls (`-C 0x7 --cpu-strict 1` for `llama-bench`, and
+`--cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1` for the server).
+There was no `taskset`.
+
+### Context and request geometry
+
+The study used binary context capacities and ordinary repeated English. An
+independent committed-build `llama-tokenize --show-count --no-bos` process
+counted the JSON prompt plus its extraction newline; the server reports one
+fewer evaluated token because the JSON string has no terminal newline.
+
+| Context capacity | tokenizer count | server evaluated | headroom before 64 generated tokens | Request SHA-256 |
+|---:|---:|---:|---:|---|
+| 49,152 | 48,550 | 48,549 | 603 | `3ca474dd0e29b7f932679c2785f3f43595e3af2a2764f2fe9fde121bac0a6ff8` |
+| 65,536 | 64,929 | 64,928 | 608 | `a6f11cf3996d4d3c2afdd195ecebe86237bc29937b504e8cb94e5dc66ac01a42` |
+| 98,304 | 97,698 | 97,697 | 607 | `0eda5345b395bcb4488b1a5a053b9f54e1ff9ba892d25c11b4f76640a3f76eb0` |
+| 131,072 | 130,467 | 130,466 | 606 | `d590bb421096a647e1bcccb811cbc370bed078ca69150a0b622fb25f770dd952` |
+
+Each server request used `n_predict=64`, seed 1234, temperature zero,
+`cache_prompt=false`, `ignore_eos=true`, and `reasoning_format=none`. Each
+fresh server received the identical request twice. The runner polled `/slots`,
+sampled `nvidia-smi` and `/proc/PID/status` every 0.25 seconds, and captured
+startup plus explicit post-turn checkpoints. Every one of the 24 canonical
+final responses evaluated the expected prompt, generated 64 tokens, and was
+content-exact across both turns and all A/B/A processes at its depth. Content
+hashes were:
+
+- 49K and 64K: `1c9a72139ed1454f11f18575dd2b254769c7f584c0ae5b40e486f1d58ab988fa`
+- 98K: `1457824d8fa500e50f2606c7224cda9925380e857ac25a1b37056e556c59b593`
+- 128K: `b432e780dcf6c1f133a21c550c78b5e36308503b08dd5318bc556be01f3559f9`
+
+### Exact extension of the published runner
+
+The first server series deliberately preserved the published runner's exact
+runtime geometry, including its omission of
+`--recurrent-state-offload`. That provided a direct extension of the accepted
+4K/30K/34K evidence rather than silently changing placement. The command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'bash /tmp/beellama-compact-deep-scaling-20260820/run-server-depth-aba.sh \
+   {49152|65536|98304} {port}'
+```
+
+Each depth ran dense A1, Candidate 1, then dense A2. Both dense anchors had
+identical sampled process VRAM. Candidate values and deltas were also exact at
+startup, prefill/decode peak, and post-turn 2:
+
+| Context | dense startup / peak / post-2 | Candidate startup / peak / post-2 | process VRAM saving | dense / Candidate CUDA compute | dense / Candidate CUDA-host compute | pinned KV both |
+|---:|---:|---:|---:|---:|---:|---:|
+| 49K | 13,574 / 13,608 / 13,608 MiB | 13,526 / 13,560 / 13,560 MiB | 48 MiB | 422.27 / 374.27 MiB | 78.40 / 30.40 MiB | 1,632 MiB |
+| 64K | 13,688 / 13,722 / 13,722 MiB | 13,624 / 13,658 / 13,658 MiB | 64 MiB | 536.27 / 472.27 MiB | 94.40 / 30.40 MiB | 2,176 MiB |
+| 98K | 13,916 / 13,950 / 13,950 MiB | 13,820 / 13,854 / 13,854 MiB | 96 MiB | 764.27 / 668.27 MiB | 126.40 / 30.40 MiB | 3,264 MiB |
+
+The candidate's post-turn-2 current RSS was 40,900, 56,878, and 95,146 KiB
+below the corresponding dense midpoint. `VmHWM` remained the approximately
+14,596 MiB transient mapped-model loading high-water in every process, and
+`VmLck` remained zero because CUDA driver pinning is not represented there.
+Pinned KV was byte-identical and staging remained zero.
+
+Candidate prefill was faster on all six turns (+1.10% to +3.43%). Decode was
+between -2.28% and +1.95%; only the 64K second turn fell below -2%, while its
+first turn was neutral and the independent benchmark below was -0.70%.
+
+This series stopped before a no-recurrent 128K server bracket after review of
+the authoritative current protocol exposed that the published runner is not
+the canonical faster serving placement for this hybrid model. Its completed
+49K/64K/98K evidence remains valid and is retained. The separate
+`llama-bench` series did complete at 128K, and the canonical serving series
+below includes every requested deep point through 128K.
+
+### Canonical recurrent-state serving A/B/A
+
+The current CPU-KV protocol keeps attention KV pinned on the host but supplies
+`--recurrent-state-offload` so supported hybrid recurrent state remains on the
+GPU. A temporary, hashed copy of the published runner added only that flag:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'bash /tmp/beellama-compact-deep-scaling-20260820/run-server-recurrent-depth-aba.sh \
+   {49152|65536|98304|131072} {port}'
+```
+
+The runner SHA-256 was
+`86a4296ce853a652bbb96fb206ec444dab18b1a0231a72bbe5a82db4e353fba6`.
+All other model, batch/ubatch, cache, affinity, request, sampling, and runtime
+settings matched the prior series. No requested canonical depth was omitted.
+
+| Context | dense startup / peak / post-2 | Candidate startup / peak / post-2 | process VRAM saving | dense / Candidate CUDA compute | dense / Candidate CUDA-host compute | pinned KV both |
+|---:|---:|---:|---:|---:|---:|---:|
+| 49K | 13,774 / 13,792 / 13,792 MiB | 13,676 / 13,694 / 13,694 MiB | **98 MiB** | 473.27 / 374.27 MiB | 68.28 / 20.28 MiB | 1,632 MiB |
+| 64K | 13,838 / 13,856 / 13,856 MiB | 13,774 / 13,792 / 13,792 MiB | **64 MiB** | 536.27 / 472.27 MiB | 84.28 / 20.28 MiB | 2,176 MiB |
+| 98K | 14,066 / 14,084 / 14,084 MiB | 13,970 / 13,988 / 13,988 MiB | **96 MiB** | 764.27 / 668.27 MiB | 116.28 / 20.28 MiB | 3,264 MiB |
+| 128K | 14,294 / 14,312 / 14,312 MiB | 14,166 / 14,184 / 14,184 MiB | **128 MiB** | 992.27 / 864.27 MiB | 148.28 / 20.28 MiB | 4,352 MiB |
+
+The strict 64/96/128 MiB points follow the dense F16 logical-mask size and
+demonstrate a real scaling serving benefit, not a fixed allocator artifact.
+The 49K point crosses an additional best-fit allocation bin: CUDA-host compute
+saves the expected 48 MiB, while CUDA compute saves 99 MiB and sampled process
+VRAM saves 98 MiB. The next 64K point returns to the logical-mask slope, so the
+extra 49K saving is correctly treated as a local allocator discontinuity, not
+extrapolated.
+
+Ordinary current RSS also fell rather than moving the cost to pageable host
+memory:
+
+| Context | Candidate startup RSS delta vs dense midpoint | Candidate post-turn-2 RSS delta |
+|---:|---:|---:|
+| 49K | -45,836 KiB | -43,032 KiB |
+| 64K | -62,166 KiB | -59,342 KiB |
+| 98K | -93,988 KiB | -91,270 KiB |
+| 128K | -127,594 KiB | -124,866 KiB |
+
+As before, `VmHWM` is dominated by transient model mapping and `VmLck=0` is
+not a CUDA-pinning counter. Backend allocation logs and the direct NSYS trace
+below are the pinned-memory evidence. Pinned KV is unchanged at every depth;
+only CUDA-host compute falls.
+
+Canonical serving performance versus the arithmetic midpoint of dense A1/A2
+was:
+
+| Context | turn | prefill delta | decode delta |
+|---:|---:|---:|---:|
+| 49K | 1 / 2 | +0.654% / +0.639% | -1.032% / -2.138% |
+| 64K | 1 / 2 | +0.857% / +1.176% | +0.332% / +1.001% |
+| 98K | 1 / 2 | +1.390% / +1.694% | -0.177% / -0.817% |
+| 128K | 1 / 2 | +2.017% / +1.839% | +1.787% / -2.339% |
+
+The two isolated decode regressions beyond 2% did not form a monotonic trend, but
+the 128K second turn crossed the materiality screen. It was therefore not
+accepted on its own. A focused fresh-process A/B/A used the canonical
+placement, `p0,n128,d131072`, three timed repetitions, and the same remaining
+arguments:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'bash /tmp/beellama-compact-deep-scaling-20260820/run-recurrent-decode-128k-aba.sh'
+```
+
+| process | decode throughput | raw samples (t/s) |
+|---|---:|---|
+| dense A1 | 8.6562 +/- 0.0045 | 8.65104, 8.65921, 8.65822 |
+| Candidate 1 | 8.6036 +/- 0.0059 | 8.59687, 8.60610, 8.60780 |
+| dense A2 | 8.6312 +/- 0.0430 | 8.65106, 8.58187, 8.66080 |
+
+Candidate 1 is 0.46% below the dense midpoint in this higher-confidence
+screen. That is not a material decode regression. The graph also saved 130 MiB
+of measured process peak while retaining identical KV residency and zero
+staging.
+
+### Synthetic graph-shape scaling
+
+The direct `llama-bench` A/B/A command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'bash /tmp/beellama-compact-deep-scaling-20260820/run-bench-aba.sh'
+```
+
+It used `-pg 512,64 -d {49152,65536,98304,131072} -r 1 --no-warmup
+--progress --kv-memory`, pinned CPU Q8_0/Q8_0 KV, batch/ubatch 1024/512,
+single GPU/no split, and the native affinity above. The 512-output logits
+floor still hid process savings at 49K. At deeper points the mask allocation
+grew beyond that floor:
+
+| Context / graph | process-peak delta | Candidate throughput delta | disposition |
+|---:|---:|---:|---|
+| 49K `p512,n0` / `p0,n128` / `p512,n64` | 0 / 0 / 0 MiB | +3.61% / -0.70% / -0.43% | output floor |
+| 64K `p512,n0` / `p0,n128` / `p512,n64` | -34 / -34 / -36 MiB | +5.39% / -0.70% / +0.21% | strict device win |
+| 98K `p512,n0` / `p0,n128` / `p512,n64` | -96 / -98 / -96 MiB | +3.72% / +2.91% / +3.80% | strict device win |
+| 128K `p512,n0` / `p0,n128` / `p512,n64` | -128 / -130 / -128 MiB | noisy | strict device win; performance rejected as noisy |
+
+The 128K memory counters were exact in both dense anchors, but dense A1 had
+severe host-side timing interference: its rows were 346.8, 1.84, and 15.27
+t/s versus dense A2's 475.2, 5.94, and 48.90 t/s. Those timings are not
+converted into a candidate performance delta. The independent canonical
+server and focused decode brackets are the accepted 128K performance evidence.
+
+### Deep direct CUDA allocation and VMM evidence
+
+Nsight Systems 2026.1.3 directly targeted each `llama-bench` binary at
+`p512,n0,d131072` with canonical recurrent placement. It did not use an
+all-process capture or wrapper target:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'bash /tmp/beellama-compact-deep-scaling-20260820/run-nsys-recurrent-128k.sh'
+```
+
+The script expands to `nsys profile --trace=cuda,nvtx
+--cuda-memory-usage=true --sample=none --cpuctxsw=none
+--cuda-graph-trace=node -o REPORT /absolute/path/to/llama-bench ...` for each
+binary. Profiler throughput is not used as performance evidence.
+
+| traced allocation | c9 dense | Candidate 1 | Candidate delta |
+|---|---:|---:|---:|
+| model device allocation | 13,505,105,920 B | 13,505,105,920 B | 0 |
+| device KV allocation | 17,825,792 B | 17,825,792 B | 0 |
+| recurrent/device context allocation | 156,893,184 B | 156,893,184 B | 0 |
+| scheduler device allocation | 1,044,210,560 B | 909,468,544 B | -134,742,016 B |
+| CUDA VMM scratch sequence | 4+4+2+4 MiB | 4+4+2+4 MiB | 0 |
+| dynamic device-allocation high-water | 14,738,715,520 B | 14,603,973,504 B | -134,742,016 B (-128.5 MiB) |
+| scheduler pinned allocation | 156,012,576 B | 21,270,560 B | -134,742,016 B |
+| total traced pinned high-water | 4,738,234,400 B | 4,603,492,384 B | -134,742,016 B (-128.5 MiB) |
+
+Thus the deep scratch pool is byte-identical; the win is the dense mask's
+device and pinned scheduler backing, not a smaller CUDA scratch pool. D2H was
+identical at 4,866,254,848 B / 8,449 copies. H2D fell from 624,633,830,920 B /
+10,745 copies to 607,268,953,608 B / 14,600 copies. Per-consumer descriptors
+add tiny copies, but removing dense mask transfers reduces total H2D by
+17,364,877,312 B.
+
+The complete sorted kernel-name/count manifests are byte-identical, SHA-256
+`a029e149a89b4013e705fb8d74630f9a01a269adc8b01c9369101a074ce40beb`.
+Both contain 4,112 launches of the same F16 FlashAttention kernel. The earlier
+NCU register result remains applicable to the unchanged kernel source; a
+second NCU capture was unnecessary for this allocation-only depth check.
+
+### Deep disposition
+
+Candidate 1 has a defensible real serving benefit that grows with supported
+context: 64 MiB at 64K, 96 MiB at 98K, and 128 MiB at 128K in the canonical
+placement, plus a locally larger 98 MiB win at the measured 49K allocator
+discontinuity. The saving persists through startup, prefill/decode peak, and a
+second fully reprocessed next turn. It does not move bytes into KV staging,
+pinned KV, pageable RSS, or CUDA VMM scratch. Outputs remain exact; the source
+is unchanged from the exact PPL commit; and repeated 128K decode rejects a
+material slowdown.
+
+All deep artifacts are under
+`/tmp/beellama-compact-deep-scaling-20260820`. The manifest contains 1,912
+files and verified all 1,912 before documentation. Its SHA-256 is
+`83ac78c7ea47b64a332c7dee441f4f74f8e800d301b216c5d2093275123af1ed`.
