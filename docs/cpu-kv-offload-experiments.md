@@ -3627,9 +3627,9 @@ cmake --build build-compact-cuda \
   --target llama-perplexity llama-bench llama-cli test-backend-ops -j 6
 ```
 
-The baseline and candidate both report build `11243-c9f727c1e`; the latter is a
-working-tree build, so the executable and loaded-library hashes are the binary
-identity:
+The baseline reports build `11243-c9f727c1e`; the post-commit candidate reports
+build `11244-b05ddfdd8`. The executable and loaded-library hashes further pin the
+binary identity:
 
 | Artifact | baseline SHA-256 | candidate SHA-256 |
 |---|---|---|
@@ -3685,10 +3685,12 @@ one-chunk counter exposed progress.
 A deterministic 16-token CLI comparison used the same model and runtime
 placement, prompt `Write one concise sentence about causal attention.`, seed
 1234, temperature zero, context 4096, `--single-turn --simple-io`, and fresh
-locked baseline/candidate processes. After removing the timing-only
-`[ Prompt: ... | Generation: ... ]` line, both complete streams had SHA-256
-`c4501c0d6e7885e2a1d99632d04ed9a0a65554002f277da22e448a0ad332e981`
-and `diff` was empty.
+locked baseline/candidate processes. After removing the build-identity and
+timing-only `[ Prompt: ... | Generation: ... ]` lines, both complete streams
+had SHA-256
+`cd35be773ca9520e5f79474c94ee1d07784433199b1c3c4f531dffbbcc353c6c`
+and `diff` was empty. The only raw-output differences were the expected build
+identity and timing lines.
 
 ### Performance and resources
 
@@ -3709,20 +3711,20 @@ flock /tmp/beellama-single-gpu.lock -c \
 | depth | build | prompt 512 | decode 128 | combined 512/64 | peak process VRAM | pinned KV resident |
 |---:|---|---:|---:|---:|---:|---:|
 | 4,096 | c9 baseline | 1,336.39 t/s | 18.39 t/s | 150.82 t/s | 14,383,448,064 B | 187,170,816 B |
-| 4,096 | compact | 1,437.23 t/s | 19.19 t/s | 158.62 t/s | 14,410,711,040 B | 187,170,816 B |
+| 4,096 | compact | 1,417.56 t/s | 19.25 t/s | 158.00 t/s | 14,410,711,040 B | 187,170,816 B |
 | 30,000 | c9 baseline | 1,047.21 t/s | 13.83 t/s | 113.48 t/s | 14,381,350,912 B | 1,087,373,312 B |
-| 30,000 | compact | 1,071.64 t/s | 14.07 t/s | 112.49 t/s | 14,427,488,256 B | 1,087,373,312 B |
+| 30,000 | compact | 1,062.63 t/s | 13.92 t/s | 112.08 t/s | 14,427,488,256 B | 1,087,373,312 B |
 
-At 4K the candidate changed prompt, decode, and combined throughput by +7.55%,
-+4.32%, and +5.17%. At 30K the corresponding changes were +2.33%, +1.68%,
-and -0.87%; the one-run combined movement is neutral rather than a stable
+At 4K the candidate changed prompt, decode, and combined throughput by +6.07%,
++4.64%, and +4.76%. At 30K the corresponding changes were +1.47%, +0.63%,
+and -1.24%; the one-run combined movement is neutral rather than a stable
 regression claim. Peak process VRAM increased by 26 MiB at 4K and 44 MiB at
 30K. Pinned KV residency was identical and `kv_staging_bytes` was zero in all
 runs. A separate matched 30K resource-only pair reported maximum RSS of
-14,592,992 KiB baseline and 14,592,908 KiB candidate (-84 KiB, effectively
-identical). Pageable host memory was not separately attributable from process
-RSS; the patch does not alter model mapping, KV allocation, pinned-memory, or
-host-staging code.
+14,592,992 KiB baseline and 14,597,024 KiB candidate (+4,032 KiB, effectively
+identical at this process scale). Pageable host memory was not separately
+attributable from process RSS; the patch does not alter model mapping, KV
+allocation, pinned-memory, or host-staging code.
 
 ### Disposition
 
