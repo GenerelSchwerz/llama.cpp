@@ -3169,3 +3169,175 @@ the tested layout, and the GPU-draft split is output-exact after the merged MTP
 fixes. The empirical claim remains limited to the ownership split above;
 arbitrary partial target-layer mixes, lower/asymmetric formats, other models,
 multi-GPU, and other backends need separate gates.
+
+## W06: declare perplexity's full-batch output capacity
+
+**Date:** 2026-08-20
+
+**Base:** `c9f727c1e1995c4a871a719ab05b5f2478588efd`
+
+**Candidate:** this isolated migration commit
+
+**Disposition:** retained correctness fix
+
+### Implementation and scope
+
+Phase-aware contexts without an explicit output requirement use the compact
+serving maximum of `n_seq_max`. Perplexity instead requests logits for every
+scored token in a slice. With one sequence and a 256-token physical batch,
+that mismatch can reach the fail-closed `output_reserve()` assertion.
+
+Immediately before context creation, `llama-perplexity` now sets
+`params.n_outputs_max = params.n_batch`. The non-phase-aware default already
+resolves an unspecified capacity to `n_batch`, so ordinary behavior is
+unchanged. A focused source-plumbing test verifies that the declaration occurs
+before `common_init_from_params(params)`. No server, live-workspace, telemetry,
+causal-mask, host-staging, native-Q8, or argument-surface change is included.
+
+### Build and identities
+
+The candidate used a Release CUDA build with native CPU code, SM120, the
+default standard quant matrix, and dedicated KVarN kernels disabled because
+this tool contract does not exercise KVarN. The exact configure and focused
+build commands were:
+
+```bash
+cmake -S . -B build-w06-cuda -G Ninja \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=OFF \
+  -DGGML_CUDA_KVARN=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build-w06-cuda \
+  --target llama-perplexity test-perplexity-plumbing -j 6
+```
+
+The compiler was GNU 16.2.1 with CUDA 13.3.73; the CUDA host compiler was GNU
+15.3.0. The GPU was an NVIDIA GeForce RTX 5070 Ti, compute capability 12.0,
+with driver 610.57.04. Relevant identities were:
+
+- model SHA-256: `ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`;
+- corpus SHA-256: `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`;
+- `tools/perplexity/perplexity.cpp` SHA-256:
+  `ae9558ebb124ff3a6db8998b57fd53e27eb956c4310674505b7c5e1a0aaa6986`;
+- `llama-perplexity` SHA-256:
+  `84b3140cbb0b284d297ad0119bc265f59b06e0e23bcc3e690a8ac1a5e2b3f446`;
+- `libllama-perplexity-impl.so` SHA-256:
+  `5d8428e7b053e8960b819555a28141e6b0b1c79139870a7f62f9fe8c9b4f83d4`.
+
+### Matched PPL and resource validation
+
+The required source/default-path gate compared an exact in-worktree
+`git archive` of pristine `c9f727c1e` against candidate `5d26ab138`, then
+repeated pristine c9. The archive SHA-256 was
+`cc44bd22548584385bb758317bcce18702d4fb14e28fd7617c1cccdbfffa8b6b`.
+The base and candidate binaries reported `11243 (c9f727c1e)` and
+`11244 (5d26ab138)` respectively. Their `llama-perplexity` SHA-256 values were
+`2e617b5687c4e393bac5a5f54b2fe295dc4a1ee7acfea3ab370b9a68cbac4e42`
+and `84b3140cbb0b284d297ad0119bc265f59b06e0e23bcc3e690a8ac1a5e2b3f446`.
+The base/candidate implementation-library hashes were
+`736dec4f9a9700bcef516c2c8ac8cab3753e9b73c44b6faadc5407b351dad8da`
+and `5d8428e7b053e8960b819555a28141e6b0b1c79139870a7f62f9fe8c9b4f83d4`;
+their common-library hashes were
+`4e76f542fa8fac6388bceca2980ed31da952850cd9b98b8a45d7d73fa7a94589`
+and `967d0fa6e62a1392f62a975a790fa7f765f2f059230c90ee0cecc2b77002735b`.
+The base configure explicitly set `LLAMA_BUILD_COMMIT=c9f727c1e` and
+`LLAMA_BUILD_NUMBER=11243` so generated metadata could not inherit the
+enclosing candidate worktree identity.
+
+The source A/B/A used the same command below with
+`--no-phase-aware-workspace` and `--kv-gpu-layers 0`. Later native-Q8 and
+live-context flags were omitted because neither exists at the c9 base. Each
+binary ran in a fresh process.
+
+| Measurement | Pristine c9 A1 | Candidate B | Pristine c9 A2 |
+|---|---:|---:|---:|
+| cumulative PPL | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` |
+| scoring-pass time | 12.53 s | 12.30 s | 12.35 s |
+| sampled process VRAM peak | 13,682 MiB | 13,682 MiB | 13,682 MiB |
+| sampled `VmHWM` | 14,599,240 KiB | 14,597,892 KiB | 14,601,552 KiB |
+| sampled `RssAnon` peak | 344,696 KiB | 345,580 KiB | 344,056 KiB |
+| sampled `RssFile` peak | 14,346,324 KiB | 14,346,388 KiB | 14,346,360 KiB |
+| sampled `RssShmem` peak | 287,004 KiB | 287,004 KiB | 287,004 KiB |
+
+All three ordinary contexts resolved `n_outputs_max = 512` and had identical
+0.95 MiB output, 252.50 MiB CUDA compute, 27.78 MiB CUDA-host compute, 136.00
+MiB device KV, 149.62 MiB device recurrent-state, 12,879.47 MiB device model,
+and 644.14 MiB CPU-mapped model buffers. `VmPin` and `VmLck` remained zero.
+The exact A/B/A PPL and identical allocator sizes prove that the explicit tool
+declaration has no default-path quality or capacity effect relative to pristine
+c9. Timing and RSS differences are run-to-run noise; no performance claim is
+made for this correctness-only change.
+
+Raw source-gate logs and 200 ms samples are retained as
+`/tmp/w06-source-{base-a1,candidate-b,base-a2}{.log,-proc.csv,-vram.csv}`.
+Their log SHA-256 values in A/B/A order are
+`f925b7884bfe10f7d3c04443dc043ec008e681a0a6a9495ab2597d8b2137d869`,
+`9140a8e440fd0255cf9782caa0c5bba1a486459a583f359d68ad4105f5d6d6af`,
+and `5ba43c35fab4f5940201a89d19a8af6fbe56130faee265532be30321ef5130ff`.
+The corresponding process-sample hashes are
+`5849b997d36aaccf936b34e887322f98a2d58b1e04e39209f24064d9e696568d`,
+`990a61e5c6f6e34bc995d45d06fb1ded108cdbeeaded6391948c9a90462817ff`,
+and `7270ecdef5c3cdd60501737970fd99a2c75f02174b265ffbec8968dbb109ab77`;
+the VRAM-sample hashes are
+`3a99319847357b447a5689de6ff39d4c1d282060e16999fa69d49d8c1d95960a`,
+`a0906f51b76aede4dfc57aa638f3d43a906bb54577d423ddd17358275c093d8c`,
+and `318c36d4faea8bac5221a4b46fbb66bafd237c98b869a3d4831e44f246b7fddc`.
+
+The existing candidate-only default/phase-aware/default sequence remains the
+functional lane for the capacity fix. Its raw artifacts remain under
+`/tmp/w06-phase-{default-a1,on,default-a2}{.log,-proc.csv,-vram.csv}`.
+In default/phase/default order, log hashes are
+`204d230692d9dc88e29d6e5822bc83c301b1114985decc5861ea03a3e5e267ad`,
+`d4fdca9116ca791109f2e689dd93519cacdb4ba91eac4206afc5c90086f0f51d`,
+and `cbf56e58c8b38a7531c95b07b8cf2dd8a64e9e85dfebb46a22c77c7a96414551`;
+process-sample hashes are
+`0aac3169f7fb8edd030f0eb1ca8dda5ddc036c1e907e4303c5d5deb9cdaeb8bf`,
+`70b050b1bcdc6eab0a0b18e247212cecf7bfaa90fea8322cb49a1554a51cbaf1`,
+and `852ee8dcd7783cb80b607c7e9992465baa4dfc5db4b39ed54d3060e18246b93c`;
+VRAM-sample hashes are
+`a31823f371d90f39bf244748956988586185c466fdc51d2f63ed04f651f513b8`,
+`9b7e246683f61d7292eed97df69aa3291b7201b42d11e5adce247c68a4db2697`,
+and `63181ed540aef25be90a9276c4eb9e9d33607e42feb98842be01549d5e0c2dab`.
+
+Every model process was fresh and wholly enclosed by
+`flock /tmp/beellama-single-gpu.lock -c`. Native llama affinity exposed the
+three decode CPUs and 24 batch CPUs; no external affinity wrapper was used.
+The native `[1]` counter exposed progress. The exact inner command was:
+
+```bash
+build-w06-cuda/bin/llama-perplexity \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -f /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+  -c 4096 -b 512 -ub 256 --chunks 1 \
+  -t 3 -tb 24 --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+  -ngl 999 -sm none -mg 0 --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --no-kv-cpu-pinned --no-recurrent-state-offload --no-warmup -v \
+  [--phase-aware-workspace]
+```
+
+A 200 ms sampler recorded `/proc/PID/status` separately from
+`nvidia-smi --query-compute-apps=pid,used_memory`. Verbose logs recorded
+allocator component sizes.
+
+| Measurement | Default A1 | Phase-aware | Default A2 |
+|---|---:|---:|---:|
+| cumulative PPL | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` | `1.9295 +/- 0.06731` |
+| scoring-pass time | 23.40 s | 23.53 s | 21.26 s |
+| sampled process VRAM peak | 13,682 MiB | 13,682 MiB | 13,682 MiB |
+| sampled `VmHWM` | 14,594,868 KiB | 14,593,824 KiB | 14,593,752 KiB |
+| sampled `RssAnon` peak | 343,536 KiB | 346,664 KiB | 345,520 KiB |
+
+All three contexts reported `n_outputs_max = 512`, then reserved scoring graphs
+with 256 outputs. CUDA compute was 252.50 MiB, CUDA-host compute was 27.78 MiB,
+the CUDA-host output buffer was 0.95 MiB, device KV was 136.00 MiB, device
+recurrent state was 149.62 MiB, and ordinary CPU-mapped model storage was
+644.14 MiB in every run. `VmPin` and `VmLck` remained 0 KiB; those fields do
+not account for the 28.73 MiB of CUDA-host buffers above. Perplexity performs
+scoring passes rather than generated-token decode, so a decode throughput
+measurement is not applicable.
+
+The phase-aware process logged creation of phase-aware backing and completed
+without weakening the allocator assertion. Identical A/B/A cumulative PPL
+shows no numerical increase, while the repeated default rows demonstrate that
+ordinary behavior remains stable. The focused `test-perplexity-plumbing` CTest
+passed 1/1 after the source comparison.

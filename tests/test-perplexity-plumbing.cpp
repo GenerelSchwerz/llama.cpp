@@ -48,6 +48,8 @@ int main(int argc, char ** argv) {
     const std::string kl = slice_between(perplexity,
             "static bool kl_divergence(llama_context * ctx, const common_params & params)",
             "if (kld.count < 100) return true;");
+    const size_t output_capacity = perplexity.find("params.n_outputs_max = params.n_batch;");
+    const size_t context_creation = perplexity.find("auto llama_init = common_init_from_params(params);");
 
     ok &= expect(perplexity.find("static int ppl_max_logits_rows(int n_vocab, const common_params & params)") != std::string::npos,
         "perplexity must cap full-vocab logits rows to avoid multi-GiB output buffers");
@@ -61,6 +63,10 @@ int main(int argc, char ** argv) {
         "KLD must retain the upstream v1 probability cutoff");
     ok &= expect(perplexity.find("if (!kl_divergence(ctx, params))") != std::string::npos,
         "perplexity KL failures must propagate to a nonzero process exit");
+    ok &= expect(output_capacity != std::string::npos &&
+                 context_creation != std::string::npos &&
+                 output_capacity < context_creation,
+        "perplexity must declare its full-batch logits requirement before context creation");
     ok &= expect(kl.find("const int max_logits_rows = ppl_max_logits_rows(n_vocab, params)") != std::string::npos,
         "KL divergence must use the bounded logits-row cap");
     ok &= expect(kl.find("const int n_batch = std::max(1, std::min(n_ctx_i, std::min(params.n_batch, max_logits_rows)))") != std::string::npos,

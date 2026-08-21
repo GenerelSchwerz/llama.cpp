@@ -2072,6 +2072,11 @@ int llama_perplexity(int argc, char ** argv) {
     params.n_ctx = params.n_parallel * n_ctx;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
 
+    // Perplexity can request logits for every token in a decode slice. Declare
+    // that tool-level requirement explicitly so phase-aware contexts do not
+    // inherit the serving default of one output row per sequence.
+    params.n_outputs_max = params.n_batch;
+
     if (params.ppl_stride > 0) {
         LOG_INF("Will perform strided perplexity calculation -> adjusting context size from %d to %d\n",
                 params.n_ctx, params.n_ctx + params.ppl_stride/2);

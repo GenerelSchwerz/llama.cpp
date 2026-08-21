@@ -1025,6 +1025,21 @@ draft and used no replay. The cap remains a workload-dependent trade: the
 rejection-heavy two-plane rows were much slower, so production selection must
 be based on measured acceptance/replay behavior rather than VRAM alone.
 
+### Perplexity full-batch output contract
+
+Phase-aware contexts default to serving-shaped output capacity: one row per
+sequence. That is too small for `llama-perplexity`, which marks every scored
+token in a decode slice for logits. The allocator must continue to reject an
+undeclared request, so the correction belongs at the tool boundary. Perplexity
+now sets `params.n_outputs_max = params.n_batch` before context creation. This
+is exactly the capacity inherited by the ordinary non-phase-aware path and
+does not change graph arithmetic, cache placement, or server behavior.
+
+The focused plumbing test guards both the declaration and its ordering. A
+matched default/phase-aware/default GPU-PPL sequence reproduced the same
+cumulative estimate in every process; the isolated evidence is recorded in
+the experiment ledger below.
+
 1. Implement a fail-closed compact causal-mask descriptor for the supported
    single-slot contiguous layout and measure the predicted GPU and CUDA-host
    savings.
