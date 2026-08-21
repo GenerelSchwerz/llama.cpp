@@ -1,9 +1,10 @@
 # CPU KV-offload current testing and setup
 
-This is the sole runnable protocol for the published CPU-KV line. The source
-under test is `beellama-kv-cpu-offload` at
-`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; the retained local journal and
-Experiments 001-019 come from
+This is the sole runnable protocol for the published CPU-KV line. Its exact
+source-bearing baseline is
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; documentation-only descendants,
+including the PR 9 consolidation, do not change that production source or its
+binary identity. The retained local journal and Experiments 001-019 come from
 `6a20757854395309b32248dd4109d73e99c3e675`. Source and binary identities are
 authoritative if this document ever disagrees with behavior.
 

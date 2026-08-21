@@ -1,8 +1,10 @@
 # VRAM feature-isolation and integration plan
 
-This plan applies to every VRAM or CPU-KV branch derived from published KV base
-`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. It replaces the cumulative
-parallel-tree workflow captured in the read-only snapshot
+This plan applies to every VRAM or CPU-KV branch derived from exact
+source-bearing KV baseline
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` or its documentation-only
+descendants. It replaces the cumulative parallel-tree workflow captured in the
+read-only snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`.
 
 The goal is to answer two separate questions:
@@ -18,12 +20,12 @@ A combined tree can answer the second question only after the first is closed.
 
 | Lane | Exact identity observed during consolidation | Ownership | Current status |
 |---|---|---|---|
-| K: shared KV documentation | PR 9 on `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; retained journal base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | Documentation-only draft. |
+| K: shared KV documentation | PR 9 on `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; retained journal base `6a20757854395309b32248dd4109d73e99c3e675` | Current protocol, decisions, evidence index, roadmap, isolation plan, feature delta. | 2026-08-21 readiness audit passed; coordinator integration is independent of feature order. |
 | N: native standard-quant attention | PR 4, `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native quantized FlashAttention source, tests, focused docs, archived composed manifests. | Published draft. |
 | W06: PPL capacity | PR 5 evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | `llama-perplexity` output-capacity fix and evidence. | Merged into the published base. |
 | W02: allocation telemetry | PR 6 merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Opt-in physical allocation/VMM telemetry. | Merged into the published base. |
-| W03: compact causal mask | PR 7 final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f` | Causal representation and branch-owned isolated/composed evidence. | Draft, open, mergeable, clean; six ahead and zero behind exact base. |
-| W04/W05/W09: live workspace | PR 8 final head `0c8df007a504f16aa35fc5982303e3e1b9883331` | Live reservation, exact plan publication, idle trim, source and user docs. | Draft, open, mergeable, clean; six ahead and zero behind exact base. |
+| W03: compact causal mask | PR 7 final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f` | Causal representation and branch-owned isolated/composed evidence. | Final evidence head; reconcile inherited PR 9 docs and refresh merge metadata before integration. |
+| W04/W05/W09: live workspace | PR 8 final head `0c8df007a504f16aa35fc5982303e3e1b9883331` | Live reservation, exact plan publication, idle trim, source and user docs. | Final evidence head; reconcile inherited PR 9 docs and refresh merge metadata before integration. |
 
 An observed head is not a permanent evidence tag. PR 7 and PR 8 final
 identities and comparisons were refreshed on 2026-08-21. Verify each head and
@@ -167,7 +169,7 @@ git merge-base 4a7f9b496 refs/codex/consolidation-pr7-final
 git merge-base 4a7f9b496 refs/codex/consolidation-pr8-current
 ```
 
-Before changing the published base, simulate:
+Before integrating any feature PR into the published line, simulate:
 
 - each PR against the base;
 - the shared-doc branch against the base and each PR;
@@ -189,16 +191,18 @@ For each simulated combined tree, inspect:
 - tests/manifests that become invalid or redundant; and
 - documentation links and source identities.
 
-The integration proposal remains provisional until PR 8's final head is
-published and all comparisons involving it are repeated. No current instruction
-authorizes merging or fast-forwarding `beellama-kv-cpu-offload`.
+The 2026-08-21 readiness audit validated and authorized PR 9's
+documentation-only consolidation for coordinator merge into
+`beellama-kv-cpu-offload`. That authorization does not extend to PR 7 or PR 8
+feature source. Their integration and ordering remain provisional until the
+combined post-composition gates pass.
 
 ### Consolidation-time comparison matrix
 
 `git merge-tree --write-tree` was rerun in both directions on 2026-08-21 with
-published base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`, the final PR 9 refresh tree,
-final PR 7 `d4183adb8`, and final PR 8 `0c8df007a`. Base plus either feature PR
-is clean/fast-forwardable because both are directly based on it. Independently
+source baseline `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`, the final PR 9 refresh tree,
+final PR 7 `d4183adb8`, and final PR 8 `0c8df007a`. Baseline plus either feature
+PR is clean/fast-forwardable because both are directly based on it. Independently
 appended evidence comparisons conflict in `docs/cpu-kv-offload-experiments.md`;
 resolve those by preserving Experiments 001-020 and W06 once and retaining the
 shared post-KV index plus source-owned Experiment 021 where its source lands.
@@ -208,7 +212,7 @@ That append conflict is not by itself evidence of source incompatibility.
 |---|---|
 | Base + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged and still requires semantic review. |
 | Base + final PR 7 | Clean/fast-forwardable; the final branch already includes W06/W02 and its composed validation. |
-| Base + final PR 8 | Clean/fast-forwardable; PR 8 is directly based on the published base. |
+| Base + final PR 8 | Clean/fast-forwardable; PR 8 is directly based on the exact source baseline. |
 | PR 9 docs + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged. |
 | PR 9 docs + final PR 7 | None beyond the experiment record; CUDA-backend changes are already composed with W02. |
 | PR 9 docs + final PR 8 | `docs/cpu-kv-offload-current-testing.md` plus the experiment record; development auto-merges. |
@@ -218,9 +222,9 @@ That append conflict is not by itself evidence of source incompatibility.
 
 This matrix is diagnostic only. The final PR 7/PR 8/PR 9 simulations produced
 the same conflict paths in both orders. An automatic textual merge does not
-establish allocator, graph, or kernel compatibility; no full integration order
-is selected until the shared append conflicts and post-composition gates are
-resolved deliberately.
+establish allocator, graph, or kernel compatibility; no PR 7/PR 8 feature
+integration order is selected until the shared append conflicts and
+post-composition gates are resolved deliberately.
 
 PR 8 overlaps the reconciled current protocol and experiment append; its
 development journal auto-merges in the final PR 9 comparison. Any later

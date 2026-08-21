@@ -1,9 +1,11 @@
 # CPU KV-offload VRAM roadmap
 
-This roadmap ranks shared VRAM work for every future branch derived from the
-published KV base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Status refers to
-source actually present in that base; remaining independent PRs are candidates,
-not current features.
+This roadmap ranks shared VRAM work for every future branch derived from exact
+source-bearing KV baseline
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` or its documentation-only
+descendants. Status refers to production source actually present at that
+baseline; merging shared PR 9 documentation does not make an independent
+feature PR part of the source line.
 
 Use this together with the
 [`feature-isolation plan`](vram-feature-isolation-plan.md) and the
@@ -29,7 +31,7 @@ Pinned host KV consumes real unswappable system memory and CUDA mapping
 resources. `nvidia-smi` process VRAM, allocator counters, ordinary RSS, and
 page-locked allocation are separate measurements.
 
-## Available in the published KV base
+## Available in the source-bearing KV baseline
 
 These are current controls and should be exhausted before adding source:
 
@@ -82,12 +84,13 @@ It is not evidence that any separate workspace or mask feature is correct.
 ### 3. Integrate compact causal masking only from final PR 7
 
 [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is final at
-`d4183adb8b4902a125b9339cd39032a095fca013`: draft, open, mergeable, clean, six
-commits ahead of exact base `4a7f9b496` and zero behind. It automatically uses
-an I64 causal-prefix descriptor only for proved single-stream contiguous
-standard-KV layouts and otherwise retains the dense mask. Per-consumer views
-remove the measured allocator fragmentation without changing allocator policy,
-public controls, or attention-kernel ownership.
+`d4183adb8b4902a125b9339cd39032a095fca013`. Its evidence publication contained
+six feature commits over exact source baseline `4a7f9b496`; reconcile inherited
+PR 9 documentation and refresh merge metadata before feature integration. It
+automatically uses an I64 causal-prefix descriptor only for proved
+single-stream contiguous standard-KV layouts and otherwise retains the dense
+mask. Per-consumer views remove the measured allocator fragmentation without
+changing allocator policy, public controls, or attention-kernel ownership.
 
 Keep its two evidence lanes distinct:
 
@@ -108,9 +111,10 @@ MTP and composition with PR 4 and final PR 8 remain integration gates.
 live physical-KV reservation policy and all-idle trim. Its source, presets,
 generated arguments, and user-facing documentation must merge together. It is
 final at `0c8df007a504f16aa35fc5982303e3e1b9883331`, directly based on
-`4a7f9b496`, six commits ahead, draft, open, mergeable, and clean. Until its
-source lands, `--live-context-workspace` is absent from current commands and
-docs.
+`4a7f9b496` with six feature commits. Reconcile inherited PR 9 documentation
+and refresh merge metadata before feature integration. Until its source lands,
+`--live-context-workspace` is absent from current runnable commands and from
+current preset/generated argument documentation.
 
 Final Experiment 021 passed exact 1K and full 32K lifecycle output, identical
 PPL, W02 lifecycle reconciliation, and focused coverage on the merged W02/W06
@@ -126,10 +130,11 @@ Bash-wrapped provenance commands are indexed in the experiment record.
 
 PR 7 and PR 8 are now final. Their pairwise comparisons and comparisons with
 the shared documentation tree must be simulated on the merged W06/W02 base
-before touching the published branch again. Re-run default/off controls after
-composition; a runtime-disabled feature can still change template
-instantiation, graph signatures, or allocator geometry. The isolation plan is
-the gate.
+before integrating either feature source. PR 9's validated documentation-only
+consolidation was cleared for independent coordinator merge by the 2026-08-21
+readiness audit. Re-run default/off controls after feature composition; a
+runtime-disabled feature can still change template instantiation, graph
+signatures, or allocator geometry. The isolation plan is the gate.
 
 ### B. Bound attention staging without changing the native reduction
 
@@ -192,9 +197,10 @@ churn, and report pinned bytes independently from device VRAM.
 
 ## Integration order rule
 
-There is no authorized merge order yet. The likely dependency shape is support
+The 2026-08-21 readiness audit cleared PR 9 as a documentation-only inheritance
+update for immediate coordinator merge. That integration does not select or
+validate a feature-source order. The likely feature dependency shape is support
 fixes/telemetry already merged, then native quant attention and independently
-accepted mask and workspace features. Final ordering must be chosen from
-simulated final PR heads and source overlap. Do not merge or fast-forward the
-published KV base until the final-head comparisons and post-composition gates
-have been reviewed.
+accepted mask and workspace features. PR 7 and PR 8 integration/order remains
+held until their combined post-composition correctness, resource, and
+performance gates pass.

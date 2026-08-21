@@ -3510,9 +3510,11 @@ passed 1/1 after the source comparison.
 ## Shared post-KV evidence lanes
 
 This document preserves the complete valid integrated KV-line evidence record:
-Experiments 001-020 and W06. The published base is now
+Experiments 001-020 and W06. Its exact source-bearing baseline is
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; PR 5 and PR 6 source and evidence
-are present there, while the remaining lanes stay independently published:
+are present there. The 2026-08-21 readiness audit cleared PR 9 to carry this
+shared index into the KV line without changing that production-source identity,
+while the remaining feature lanes stay independently published:
 
 | Lane | Exact published or merged identity | Evidence ownership and status |
 |---|---|---|
@@ -3520,7 +3522,7 @@ are present there, while the remaining lanes stay independently published:
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
 | [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | final head `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, final Experiment 021, and source-coupled user/preset/generated argument documentation; draft/open/mergeable/clean, six ahead and zero behind. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | final head `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact source base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, final Experiment 021, and source-coupled user/preset/generated argument documentation; final evidence publication was six ahead/zero behind and clean, with merge metadata to be refreshed after PR 9 documentation lands. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
