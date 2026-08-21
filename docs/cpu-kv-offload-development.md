@@ -1154,6 +1154,19 @@ Unsupported layouts retain full reservation and the established upfront
 decode order. CUDA transient-pool trimming is restricted to the all-slots-idle
 boundary after effective live sizing; it is not a per-decode reclamation path.
 
+## 2026-08-21: compose W02 telemetry with live idle trimming
+
+The published KV-offload base now contains W06 full-batch perplexity capacity
+and W02 allocation/VMM telemetry. Rebasing the isolated live-workspace work
+onto that base preserves both historical Experiment 020 entries as measured;
+neither prior source identity nor result is relabeled as composed evidence.
+
+The VMM pool now enrolls in W02 telemetry before an idle trim and subtracts
+only the released physical mapping from the current mapped-byte counter. Live
+bytes and mapped high-water remain unchanged by trim. No new benchmark trim
+caller or lifecycle checkpoint is shipped; composed validation observes the
+existing server all-idle boundary, and the default path remains dormant.
+
 ## Known non-goals
 
 - Do not restore TurboQuant/TCQ, DDTree, CopySpec, the removed fork DFlash

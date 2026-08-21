@@ -42,8 +42,14 @@ def main() -> None:
     require("ggml_backend_cuda_trim_transient_pools" in cuda and
             "cudaStreamSynchronize" in cuda and "->trim()" in cuda,
             "CUDA trim capability must synchronize before releasing pool tails")
-    require("vmm_pool_stats_get" not in cuda and "vmm_pool_stats_reset" not in cuda,
-            "live workspace migration must not import VMM telemetry surfaces")
+    require("ggml_backend_cuda_vmm_pool_stats_get" in cuda and
+            "ggml_backend_cuda_vmm_pool_stats_reset" in cuda,
+            "published W02 telemetry must coexist with idle trimming")
+    trim = cuda[cuda.find("size_t trim() override"):
+                cuda.find("static bool ggml_backend_cuda_vmm_pool_stats_get")]
+    require("track_telemetry();" in trim and
+            "mapped_bytes.fetch_sub(released" in trim,
+            "idle trim must contract current mapped telemetry without discarding its peak")
 
 
 if __name__ == "__main__":
