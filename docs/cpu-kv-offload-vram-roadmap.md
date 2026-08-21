@@ -1,228 +1,176 @@
-# CPU KV-offload VRAM reduction roadmap
+# CPU KV-offload VRAM roadmap
 
-This document ranks VRAM-reduction options for the CPU-KV-offload branch by
-implementation complexity. It distinguishes real peak reductions from changes
-that only improve startup or steady-state decode residency.
+This roadmap ranks shared VRAM work for every future branch derived from the
+published KV base `c9f727c1e1995c4a871a719ab05b5f2478588efd`. Status refers to
+source actually present in that base. Independent PRs are candidates, not
+current features.
 
-Read this with the development journal and experiment ledger. MTP allocation
-experiments may use separate branches, but their memory categories remain here
-because target prefill and speculative decode must ultimately coexist.
+Use this together with the
+[`feature-isolation plan`](vram-feature-isolation-plan.md) and the
+[`evidence index`](cpu-kv-offload-experiments.md). Numerical claims belong in
+the evidence owner, not duplicated here.
 
-## Reference memory model
+## Capacity model
 
-Measure four phases separately:
+CPU attention-KV placement removes persistent target KV from device memory but
+does not make process VRAM independent of context. Device demand still
+includes:
 
-1. **Startup:** contexts allocated before a request.
-2. **Prefill peak:** target prompt workspace and speculative synchronization.
-3. **Decode resident:** memory retained during token generation.
-4. **Next-turn peak:** an established context ingests another prompt.
+- model and projector placement;
+- recurrent R/S state and MTP rollback planes;
+- partially resident target or draft KV layers;
+- prompt/generation scheduler workspace;
+- explicit masks or compact descriptors;
+- canonical store staging and host-to-device attention staging;
+- CUDA graphs, VMM pool retention, loaded modules, and driver context; and
+- temporary server/checkpoint state that may instead appear in system RAM.
 
-At 240,128 context cells, the measured non-MTP target uses 12,879.47 MiB for
-CUDA model weights, 149.62 MiB for active CUDA recurrent state, and 1,751.09
-MiB for CUDA compute. The Q8 KV itself is 7,973.00 MiB of CUDA-host memory.
+Pinned host KV consumes real unswappable system memory and CUDA mapping
+resources. `nvidia-smi` process VRAM, allocator counters, ordinary RSS, and
+page-locked allocation are separate measurements.
 
-The context-scaled CUDA-compute slope is exactly 7,296 bytes per cell:
+## Available in the published KV base
 
-- 4,096 bytes: prompt FlashAttention F16 K/V materialization.
-- 1,088 bytes: Q8 K device staging.
-- 1,088 bytes: Q8 V device staging.
-- 1,024 bytes: GPU F16 attention mask at target ubatch 512.
+These are current controls and should be exhausted before adding source:
 
-The source mask adds another 1,024 bytes per cell in pinned host memory.
+| Lever | Benefit | Cost / constraint |
+|---|---|---|
+| Keep the multimodal projector on CPU | Avoids a large optional device allocation. | CPU projector compute and ordinary RAM; only appropriate when the workload permits it. |
+| Configure only required context/parallel capacity | Avoids unused persistent KV and context-scaled workspace. | Reduces maximum request or concurrency. |
+| Use qualified homogeneous standard KV widths | Reduces host KV and repeated transfer volume. | Requires matched quality and backend qualification. |
+| `--kv-gpu-layers N` | Trades device memory for less target KV transfer. | Context-linear VRAM; selected by owned layer, not recency. |
+| `--spec-draft-kv-gpu-layers N` | Removes transfer for independently owned draft KV. | Smaller context-linear device cost; benefit is workload-specific. |
+| `--spec-mtp-rs-planes N` | Reduces fixed recurrent rollback storage without lowering draft maximum. | Rejection-dependent replay and capability requirements. |
+| `--phase-aware-workspace` | Removes inactive target/MTP prompt high-water during generation. | Synchronization, reserve transitions, and graph recapture; opt-in. |
 
-## Complexity 0: existing configuration choices
+The base also keeps supported hybrid recurrent state independently on the GPU
+and canonicalizes host-resident standard-Q8 stores. Those are correctness and
+performance foundations, not optional VRAM-only experiments.
 
-### Keep the multimodal projector off GPU
+## Near-term integration lanes
 
-Use `--no-mmproj-offload`, or omit the projector for text-only service. The
-Qwen projector is approximately 885 MiB. Text decode is unaffected, while image
-processing becomes CPU-bound.
+### 1. Land protocol support before using its measurements
 
-### Configure only the required context capacity
+[PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) fixes
+`llama-perplexity` output capacity for phase-aware contexts. Until it lands,
+base PPL runs must keep phase-aware workspace off. This is a correctness of the
+measurement tool prerequisite, not a VRAM feature.
 
-Reducing `--ctx-size` immediately reduces masks, staging, prompt workspace, and
-host KV. This is not a solution when a genuinely full 240K context is required.
+[PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) extends the base's
+opt-in `llama-bench --kv-memory` with physical allocation classes and CUDA VMM
+telemetry. It should land before allocator-lifetime work whose acceptance
+depends on live/mapped high-water. It does not trim or change allocation policy.
 
-### Use lower homogeneous KV precision
+### 2. Integrate native standard-quant attention as its own capability
 
-Q6/Q6 or Q4/Q4 reduces CPU KV, PCIe traffic, and device staging with existing
-code. It changes cache quality and requires matched KLD/perplexity validation.
-Asymmetric quantization is outside the current experiment scope.
+[PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) owns native
+same-type standard-quant FlashAttention. Its qualified compiled matrix,
+fallback behavior, exactness gates, and source identity must remain intact.
+Do not use the historical mega-tree composed manifests as a current KV
+protocol. Recreate only the combinations needed after the source is merged.
 
-### Selective model-layer CPU placement
+Native Q8 is an enabling route for later CPU-KV VRAM work: it can remove the
+full-source F16 materialization path where the exact PR capability applies.
+It is not evidence that any separate workspace or mask feature is correct.
 
-Existing placement controls can save hundreds of MiB, but repeating layers are
-used every token and are expected to damage decode. Treat this as a capacity
-fallback, not a preferred optimization.
+### 3. Review compact causal masking only from final PR 7 evidence
 
-## Complexity 1: small allocation controls
+[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) is actively receiving
+a committed fix and deeper-context evidence. Do not copy intermediate speed,
+allocation, or causal conclusions into the KV base. Review the final head for:
 
-### Independent draft ubatch (retained outside MTP; rejected for MTP)
+- a source-only comparison against unchanged KV base plus declared prerequisites;
+- explicit fallback for unrepresentable layouts;
+- target-only and target-plus-MTP exactness;
+- 4K and long-context memory, prefill, and decode A/B/A;
+- direct-target profiler evidence only when it explains a stable unprofiled result; and
+- no default-path compile contamination when the feature is absent or inactive.
 
-The control remains valid for other model-backed speculative modes. It is no
-longer a supported MTP memory lever. The original 64-token MTP-5 screen found
-the same visible output and acceptance counts at draft ubatches 512, 128, and
-32, but a 1,000-token MTP-2 audit first diverged at generated token 100 for
-both 128 and 32. The smaller physical ubatch split the 149-token recurrent
-prompt synchronization into different decode calls and changed later
-verification/acceptance geometry.
+### 4. Keep live-context workspace source and docs atomic in PR 8
 
-MTP now requires `--spec-draft-ubatch-size` to be omitted or equal to the
-target ubatch. `--phase-aware-workspace` is the supported replacement: it
-keeps clean Bee's physical prompt geometry while shrinking the retained decode
-reservation, and in the post-fix MTP-2 1K check reduced sampled peak VRAM from
-14,104 to 13,870 MiB with identical tokens and content.
+[PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) owns the default-off
+live physical-KV reservation policy and all-idle trim. Its source, presets,
+generated arguments, and user-facing documentation must merge together. Until
+then, `--live-context-workspace` is absent from current commands and docs.
 
-### Cap speculative recurrent rollback planes
+The acceptance question is lifecycle residency, not merely allocation at
+context creation. A valid comparison must include startup, full-depth growth,
+decode, a shorter following request, post-idle mapped residency, system/pinned
+memory, exact output, PPL, and repeated prompt/decode performance.
 
-Each MTP rollback plane costs approximately 149.625 MiB for this model. A cap
-can save multiples of that amount if the scheduler defines safe behavior when
-draft depth exceeds available planes. Checkpoint, rejection, prompt-cache, and
-sequence-removal correctness are mandatory. This work belongs on its dedicated
-MTP experiment branch.
+## Later research, in priority order
 
-### Remove padding and duplicate reservations
+### A. Close cross-feature integration without losing isolation
 
-Audit alignment, output buffers, scheduler copy slots, and rounded tensor
-extents. Expected savings are modest, but changes can be low risk when tensor
-lifetimes and graph topology remain unchanged.
+After PR 4-8 heads stabilize, simulate all pairwise comparisons and likely
+merge orders before touching the published base. Re-run default/off controls
+after composition; a runtime-disabled feature can still change template
+instantiation, graph signatures, or allocator geometry. The isolation plan is
+the gate.
 
-## Complexity 2: phase-aware allocation policy
+### B. Bound attention staging without changing the native reduction
 
-### Shrink to a decode-only scheduler after prefill (implemented)
+Independently normalized fixed windows are rejected: positive partitions
+changed arithmetic and deterministic output. Any renewed design must carry the
+native kernel's exact accumulator/reduction ownership across partitions or
+fail closed. The earlier vector-partition branch is unfinished research, not
+accepted source.
 
-The retained `--phase-aware-workspace` implementation rebuilds the scheduler
-reservation for the active geometry. It starts at a speculation-aware
-generation bound, grows to the full physical ubatch for prompt work, and
-shrinks when generation resumes. A second prompt on the same live server was
-verified to regrow and shrink both target and MTP contexts safely.
+Required gates include:
 
-The original 140K MTP-6 experiment used target ubatch 512 and the now-rejected
-draft ubatch 128; its allocator result remains historical characterization,
-not a supported current command. It reduced initialized/steady VRAM by 1,108
-MiB and measured peak VRAM by 902-926 MiB. The 138K prompt changed prefill by
--0.12%; the plain 5K run changed decode by -1.83%. Target plus draft transition
-work was 41.8 ms in the 5K run and 46.0 ms in the 138K run. The supported
-equal-ubatch long-run matrix must be remeasured before publishing replacement
-performance numbers.
+- chunk-zero source/build equivalence;
+- positive-partition PPL with matching batch geometry;
+- deterministic long-context output;
+- process VRAM and VMM live/mapped high-water;
+- pinned and ordinary host memory;
+- repeated prefill/decode; and
+- target-plus-MTP interaction where the full-source path may still dominate.
 
-- Reduces startup and steady generation residency.
-- Reduces coexistence peak by sharing sequential target/draft backing, but does
-  not shrink the active target prompt geometry itself.
-- Requires allocation, graph-address invalidation, and recapture at each phase
-  boundary.
-- Retains model weights, KV, recurrent state, rollback planes, samplers, and
-  checkpoints unchanged.
+Do not double-buffer large K/V windows unless the extra high-water is explicitly
+worth the overlap; capacity is the objective.
 
-### Grow workspace with live context
+### C. Reassess direct quantized prompt MMA after structural savings
 
-Reserve for current live KV and grow in bounded steps instead of allocating for
-maximum `--ctx-size` at startup.
+Only after native quant attention, compact mask, and live-workspace candidates
+have been integrated and remeasured should direct prompt MMA or broader tuning
+be reconsidered. The work has a large template/kernel test matrix and should
+be justified by the remaining measured prompt peak, not an old cumulative-tree
+profile.
 
-- Reduces startup and short-context residency.
-- Does not reduce a genuinely full-context peak.
-- Requires safe buffer relocation and graph invalidation at growth boundaries.
+### D. Explore lower homogeneous KV widths under quality gates
 
-### Phase MTP allocation against target prefill (implemented)
+Lower standard widths may reduce pinned RAM and context-linear transfer. Each
+candidate requires matching `llama-perplexity` `-b`/`-ub`, exact route
+validation, and performance/resource measurements. Asymmetric K/V, KVarN
+CPU-offload, multi-GPU, Vulkan, and HIP are separate qualification lanes.
 
-Target and integrated MTP schedulers now retain private allocation plans while
-using one physical backing group keyed by exact backend buffer type. The active
-allocation is the maximum requirement, not the sum, because execution is
-sequential. Explicit synchronization protects each target/MTP ownership
-handoff, and a coalesced shrink epoch waits for every active member to publish
-its current plan.
+### E. Revisit selective pinned allocation only with a resource policy
 
-- The 140K generation allocation was 840.82 MiB CUDA plus 2.41 MiB CUDA-host
-  backing, instead of retaining the full target 1,054.62/157.03 MiB and draft
-  892.05/39.46 MiB reservations concurrently.
-- Later-turn prompt ingestion passed with identical fixed-seed output.
-- Active recurrent state and checkpoints remain persistent; this policy only
-  phases transient graph workspace.
-- The allocator protocol is backend-type based and contains no Qwen or CUDA
-  architecture check.
+Pinning the full configured host KV is fast but consumes unswappable RAM and
+driver mappings. A later policy could distinguish active transfer windows or
+layers, but it must preserve fallback behavior, avoid repeated registration
+churn, and report pinned bytes independently from device VRAM.
 
-### Evict cold CUDA graphs
+## Closed or deferred directions
 
-Retain common decode graphs and evict uncommon prompt shapes. The 90K/240K
-startup trace showed that primary initial growth is the scheduler buffer rather
-than additional graph count, so this targets post-execution growth only.
+| Direction | Status |
+|---|---|
+| Forced CPU attention | Rejected: severe decode loss without the required memory outcome. |
+| Broad zero-copy CUDA reads from mapped host KV | Rejected: prompt and decode kernel slowdown. |
+| Lossless Q8 transfer compression | Rejected: insufficient measured redundancy for complexity. |
+| Smaller MTP draft ubatch | Rejected for MTP exactness; retained only as a generic non-MTP control. |
+| Host recurrent checkpoints | Rejected; selected full-geometry GPU replay replaced them. |
+| F16 persistent recurrent S state | Rejected by deterministic PPL increase. |
+| Independently normalized positive staging chunks | Rejected for exact serving; chunk zero only. |
+| Staging merge barrier removal | Neutral and reverted. |
+| Cold CUDA graph eviction as a Bee feature | Deferred: only a small shape-specific saving with mixed performance; upstream control already exists. |
+| Cross-context VMM pool sharing | Deferred pending explicit concurrency and lifetime ownership. |
+| Token-recency GPU KV | Research only; requires exact segmented attention reduction. |
 
-## Complexity 3: contained graph or kernel-interface changes
+## Integration order rule
 
-### Compact implicit causal mask
-
-At 240K and target ubatch 512, the explicit F16 mask occupies approximately
-234.5 MiB on GPU and another 234.5 MiB in pinned host memory. Pass compact query
-positions, sequence metadata, and KV bounds so CUDA derives validity instead of
-reading `[n_kv, 512]` values.
-
-- Potential saving: 234.5 MiB GPU and 234.5 MiB pinned host at 240K.
-- Also removes mask PCIe transfer and device mask reads.
-- Must support or fall back for multiple sequences, padding, unified KV,
-  sequence removal, non-contiguous positions, and sliding-window layouts.
-- Existing no-mask attention is insufficient because it loses causal/padding
-  semantics.
-
-Use a fail-closed descriptor only when the memory context proves its layout is
-representable. Retain the explicit mask as the general fallback.
-
-### Reduced-precision active recurrent state
-
-The non-speculative active F32 recurrent state is 149.62 MiB. BF16 or F16 could
-roughly halve it. This changes recurrent numerics and requires long-generation,
-restore, output-equivalence, quality, and conversion-overhead testing.
-
-### Compact or delta recurrent checkpoints
-
-If checkpoints duplicate unchanged recurrent regions, share immutable backing
-or store only modified data. First measure actual changed bytes; ownership and
-rollback semantics make speculative designs premature without that evidence.
-
-## Complexity 4: direct Q8 prompt MMA
-
-Prompt ubatch 512 selects the F16 MMA kernel. It materializes complete Q8 K and
-V as contiguous F16 so hundreds of query rows can efficiently reuse them. The
-direct quantized vector kernel is intended for one or two decode queries and
-would repeatedly read/dequantize KV if forced onto prefill.
-
-A real replacement must load Q8 blocks and scales, dequantize once into shared
-F16 tiles, and reuse each tile across prompt queries and GQA heads.
-
-- Potential saving at 240K: approximately 950 MiB of F16 K/V.
-- Remaining context-scaled allocation: approximately 498 MiB Q8 K/V staging.
-- Risks: tensor-core utilization, shared-memory pressure, supported layouts,
-  numerical differences, and architecture-specific performance.
-- Validate prefill, decode, peak VRAM, output tolerance, KLD, compiled cache
-  pairs, and fail-closed fallback behavior.
-
-## Complexity 5: fixed-window online-softmax streaming
-
-Stream bounded Q8 K/V windows from CPU through reusable device buffers and
-merge attention with numerically stable online-softmax state. Double buffering
-may overlap PCIe transfer with attention computation.
-
-- Caps Q8 staging, F16 tile storage, and mask storage independently of context.
-- Reduces full-context prefill and decode peaks, not merely post-prefill
-  residency.
-- Does not reduce the total PCIe bytes required to consume CPU KV.
-- Requires new scheduling, additional launches, online-softmax validation,
-  GQA/multi-sequence support, graph integration, and short-context tuning.
-
-This has not been implemented. Earlier rejected experiments were full CPU
-attention and CUDA zero-copy mapped-host attention; neither used bounded
-explicit staging with GPU online-softmax accumulation.
-
-## Recommended order
-
-1. Retained: capped MTP recurrent planes and phase-aware target/draft workspace
-   have separate controls and matched correctness/resource measurements.
-2. Implement a fail-closed compact mask for single-slot contiguous causality
-   and verify the predicted 1,024-byte-per-cell GPU and host reductions.
-3. Reassess peak pressure. Pursue direct-Q8 prompt MMA only if its approximately
-   950 MiB saving justifies the kernel-development and tuning cost.
-4. Treat fixed-window streaming as the long-term solution when VRAM must remain
-   approximately flat at genuinely full 90K-to-240K contexts.
-
-Every experiment must record model files, command, prompt, sampling settings,
-hardware, commit, target/draft batch geometry, prefill, decode, process and peak
-VRAM, pinned host memory, and correctness or quality results.
+There is no authorized merge order yet. The likely dependency shape is support
+fixes/telemetry, native quant attention, then independently accepted workspace
+and mask features, but final ordering must be chosen from simulated final PR
+heads and source overlap. Do not merge or fast-forward the published KV base
+while PR 7 and PR 8 are changing.

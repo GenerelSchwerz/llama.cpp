@@ -119,9 +119,15 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/cpu-kv-offload-development.md` - progress and decision journal. It
   records protocol transitions, durable rationale, and concise summaries of
   valid rejected paths. It is not a transcript of every attempted run.
-- `docs/cpu-kv-offload-experiments.md` - curated per-change CPU KV benchmark
-  and resource ledger. It contains only valid, decision-relevant evidence;
-  older commands are historical rather than current templates.
+- `docs/cpu-kv-offload-experiments.md` - complete curated CPU KV Experiment
+  001-019 record plus the post-KV evidence/identity index. It contains only
+  valid, decision-relevant evidence; use Git history for superseded editions.
+- `docs/cpu-kv-offload-vram-roadmap.md` - ranked shared VRAM work, including
+  integrated controls, independent PR lanes, rejected paths, and later research.
+- `docs/vram-feature-isolation-plan.md` - source, measurement, comparison, and
+  post-composition gates for every KV-derived VRAM feature branch.
+- `docs/cpu-kv-offload-feature-delta.md` - source-backed capability delta from
+  BeeLlama v0.4.3, including explicit features absent from the published KV base.
 
 ### Invariants
 
@@ -145,21 +151,30 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 ```bash
 # Unit and regression tests
-ctest --test-dir build --output-on-failure
+flock /tmp/beellama-single-gpu.lock -c '
+  ctest --test-dir build --output-on-failure
+'
 
 # KVarN quality at the intended serving cadence
-build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-perplexity \
+    -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
+'
 
 # Decode speed
-build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1 --progress
+'
 
 # Upstream DFlash with recommended standard q cache
-build/bin/llama-server -m target.gguf \
-  --spec-type draft-dflash \
-  --spec-draft-model drafter.gguf \
-  --spec-draft-n-max 8 \
-  --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
-  --port 8080
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-server -m target.gguf \
+    --spec-type draft-dflash \
+    --spec-draft-model drafter.gguf \
+    --spec-draft-n-max 8 \
+    --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
+    --port 8080
+'
 ```
 
 KLD comparisons use matching `-b` and `-ub` values for the baseline and
@@ -191,7 +206,7 @@ CPU-resident KV-cache investigation.
   the direct profiling target. Launch the llama binary directly under the
   profiler and express target worker placement with llama.cpp's own
   `--cpu-mask`/`--cpu-range`, batch-affinity, and `--cpu-strict` controls. Any
-  `taskset` command in the development journal, experiment ledger, or a
+  `taskset` command in the development journal, evidence index, or a
   reproduction document is historical evidence, not a current template.
 - Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
   build, profile, and documentation changes in the dedicated experimental
@@ -206,7 +221,7 @@ CPU-resident KV-cache investigation.
   was superseded in `docs/cpu-kv-offload-development.md`. Preserve durable
   rationale, not obsolete command copies or an attempt-by-attempt transcript.
   Pure result additions that do not change the protocol or working theory
-  belong only in the experiment ledger.
+  belong only in the experiment/evidence index.
 - Record a rejected or neutral experiment only when its run was valid and its
   result tests a distinct hypothesis or prevents likely repeated work. Prefer a
   clean revert or a separate revert commit when preserving the exact attempted
@@ -241,6 +256,11 @@ CPU-resident KV-cache investigation.
   debugger. State the progress mechanism in the launch update and preserve it
   in the recorded command. Do not start an unbounded or duration-uncertain run
   whose only observable states are running and finished.
+- Wrap every runnable GPU test, benchmark, profiler, or server lifecycle in
+  the exact whole-command form
+  `flock /tmp/beellama-single-gpu.lock -c 'COMMAND'`. Do not use flock's
+  direct-command form; the quoted command must own the complete lifecycle and
+  use safe inner quoting.
 - Every experiment entry must state its base and candidate commit IDs, the
   current protocol plus any explicit command/configuration delta, hardware,
   model path, measurements, resource tradeoffs, and disposition: retained,

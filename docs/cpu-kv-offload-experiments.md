@@ -9,6 +9,11 @@ materially different configuration, or prevent likely repeated work. Follow
 the current protocol and the explicit delta recorded by an older entry; its
 commands, when present, are historical rather than current templates.
 
+Every command block in this file is preserved verbatim as historical evidence,
+including retired controls and valid historical affinity wrappers. Do not run
+or normalize it for current evidence. Use the current-testing document and
+record an explicit protocol delta for any new reproduction.
+
 Candidate VRAM reductions and their complexity ordering are maintained in
 [`cpu-kv-offload-vram-roadmap.md`](cpu-kv-offload-vram-roadmap.md). This ledger
 remains the source of curated measured acceptance or rejection.
@@ -3162,3 +3167,31 @@ the tested layout, and the GPU-draft split is output-exact after the merged MTP
 fixes. The empirical claim remains limited to the ownership split above;
 arbitrary partial target-layer mixes, lower/asymmetric formats, other models,
 multi-GPU, and other backends need separate gates.
+
+## Shared post-KV evidence lanes
+
+Experiments 001-019 above remain the complete valid integrated KV-line
+evidence record. Later work is independently published from base
+`c9f727c1e1995c4a871a719ab05b5f2478588efd` and is not source present in that
+base:
+
+| Lane | Exact published identity observed during consolidation | Evidence ownership |
+|---|---|---|
+| [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
+| [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | `8d2f8452eb140ba52d8472ecd791cc90212a9307` | `llama-perplexity` output-capacity correction and exact A/B/A quality evidence. |
+| [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | `e18e046dbbeeb72c52d3ed74a932147f6a68cda1` | Physical buffer classes and CUDA VMM live/mapped/high-water extension to base `--kv-memory`; telemetry only, not a trim policy. |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | Intermediate head observed at `b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5` | Compact causal masking; a committed fix and deeper-context evidence are pending, so no current numerical or causal claim is recorded here. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Default-off live-context workspace growth, all-idle trim, branch evidence, and source-coupled user/preset/generated argument documentation. |
+
+The completed parallel-tree audit is preserved at snapshot
+`f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
+rejecting F16 persistent recurrent S state, rejecting positive independently
+normalized attention-staging partitions for exact serving, reverting the
+neutral trailing merge-barrier edit, and requiring direct-target profiler
+captures. Its cumulative throughput and allocation totals are interaction
+evidence for that uncommitted tree, not isolated KV-base or PR results.
+
+Re-fetch moving PR heads before review. Branch source, generated arguments,
+presets, and feature-specific reproductions remain with their PR until source
+lands; shared protocol, research, roadmap, isolation, and identity indexing
+belong in the KV line.

@@ -8,6 +8,11 @@ attempt log: invalid measurements, redundant reruns, obsolete command copies,
 and temporary-artifact inventories belong neither here nor in the experiment
 ledger. Use Git history for forensic reconstruction of an older edition.
 
+All command text below is an exact historical record of the experiment that
+used it, including retired controls and whole-process affinity. It is not
+current runnable protocol and must not be normalized or reused for new
+evidence. Translate intent through the current-testing document instead.
+
 When the live protocol changes, update the current-testing document first and
 add the transition and rationale here. Do not rewrite valid old measurements to
 claim new flags or geometry. The companion experiment ledger records curated
@@ -1048,6 +1053,32 @@ invalid merely because a profiler was CPU-restricted when it successfully
 captured the intended kernel, but profiler timing is not benchmark evidence;
 no-kernel captures and wrapper-dependent all-process captures require a clean
 direct-target rerun before they support a current claim.
+
+## 2026-08-21: shared VRAM documentation and publication lanes
+
+Shared documentation was consolidated from exact local KV tip
+`6a20757854395309b32248dd4109d73e99c3e675`, whose published source base is
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`. The read-only parallel snapshot
+`refs/codex/pre-pr4-parallel-source` at
+`f52988ee150cd27a94d6897cc049326c1e77c3e2` remains forensic research history,
+not an integration source. It combined multiple features in one uncommitted
+tree, so cumulative performance cannot establish an isolated feature claim.
+
+The independent publication lanes are PR 4 native standard-quant attention at
+`72ee96bbfcf91c17a7fb5b3b32703aae812af330`, PR 5 perplexity capacity at
+`8d2f8452eb140ba52d8472ecd791cc90212a9307`, PR 6 physical/VMM telemetry at
+`e18e046dbbeeb72c52d3ed74a932147f6a68cda1`, and PR 8 live-context workspace
+at `143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 was observed at
+`b3ce3a5c23f5ce3213d0ddb735a7e3bcd5b490e5`, but its committed fix and
+deeper-context evidence are still being published; no intermediate causal or
+performance result is frozen here.
+
+PR 8 continues to own its source, presets, and every user-facing generated
+`--live-context-workspace` document until the source lands. The current
+protocol, roadmap, feature-isolation plan, and source-backed feature delta are
+shared KV inheritance. Final heads and pairwise/source-overlap comparisons
+must be verified before choosing a merge order; this consolidation does not
+merge or fast-forward the published KV base.
 
 ## Known non-goals
 
