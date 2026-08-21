@@ -42,16 +42,23 @@ hardware rather than reusing the `sm_86` artifact names.
 
 CUDA FlashAttention vector cache coverage has two build modes:
 
-- Default: 103 pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`, `q5_1`,
-  `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's internal
-  q2 fallback type. It uses `rank(K) <= rank(V) || K == f16 || V == f16`.
+- Default: 50 of the 169 ordered pairs over `f16`, `bf16`, `q8_0`, `q6_1`,
+  `q6_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the
+  fork's internal q2 fallback type: the two homogeneous float pairs plus the
+  48 quant pairs admitted by `ggml_cuda_get_fattn_vec_default_pairs` in
+  `ggml/CMakeLists.txt`, which is also asserted there. On the bit ladder
+  8-6-5-4-3-2, V sits at K's position or up to two below it, never above, and
+  at equal position a `_1` K may pair with a `_0` V but not the reverse.
 - `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered vector pairs.
 
 `--flash-attn-native-quants` lets the CUDA MMA FlashAttention kernel read a
 quantized K/V cache in place instead of casting it to F16 first, which removes
 the transient F16 copy of the attention window. It is off by default, output is
-unchanged, and it applies only where a native loader exists for the cache type
-and head dimension; every other case keeps the F16-casting path. The kernels are
+unchanged, and it applies only where a native loader exists for the cache types
+and head dimension; every other case keeps the F16-casting path. K and V may be
+different types: the native route compiles the same ordered pair set as the
+vector path above, so `--cache-type-k q8_0 --cache-type-v q6_0` is native while
+`q8_0`/`q4_0` and any pair whose V outranks its K fall back. The kernels are
 compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
 the option keeps the standard path and reports a warning. The cache type still
 comes exclusively from `--cache-type-k` and `--cache-type-v`; the native option

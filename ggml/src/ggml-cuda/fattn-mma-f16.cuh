@@ -1,3 +1,5 @@
+#pragma once
+
 #include "common.cuh"
 #include "cp-async.cuh"
 #include "mma.cuh"
@@ -2002,8 +2004,8 @@ template <int DKQ, int DV, int ncols1, int ncols2,
     ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr bool is_quant_kv = ggml_cuda_fattn_mma_quant_type(type_K) || ggml_cuda_fattn_mma_quant_type(type_V);
-    static_assert(!is_quant_kv || type_K == type_V,
-            "quantized-native MMA requires the same cache type for K and V");
+    static_assert(!is_quant_kv || ggml_cuda_fattn_mma_quant_pair(type_K, type_V),
+            "quantized-native MMA requires a K/V cache type pair admitted by the pair policy");
     static_assert(!is_quant_kv || (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)),
             "quantized-native MMA requires equal K/V head dimensions of 64, 128 or 256");
 
@@ -2083,36 +2085,10 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     template void ggml_cuda_flash_attn_ext_mma_f16_case                           \
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst) \
 
-#define DECL_FATTN_MMA_QUANT_CASE(type, DKQ, DV, ncols1, ncols2)                              \
+#define DECL_FATTN_MMA_QUANT_CASE(type_K, type_V, DKQ, DV, ncols1, ncols2)                    \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                        \
-    <DKQ, DV, ncols1, ncols2, type, type>                                                      \
+    <DKQ, DV, ncols1, ncols2, type_K, type_V>                                                  \
     (ggml_backend_cuda_context & ctx, ggml_tensor * dst)                                       \
-
-// The compiled native cache types. Adding one is a line here plus its
-// fattn_quant_type_traits specialization; the generator emits the matching
-// definitions from the same list, so the two cannot drift apart.
-// Kept in step with FATTN_MMA_QUANT_TYPES in fattn-mma-quant.cuh: that list
-// drives the route predicate and this one the extern declarations, and the
-// generator emits the matching definitions. All three must name the same types.
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-#define DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)           \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_1,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q5_1,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q6_1,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q3_0,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q3_1,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q2_0S, DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q2_1,  DKQ, DV, ncols1, ncols2);
-#else
-#define DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)
-#endif // GGML_CUDA_FA_ALL_QUANTS
-
-#define DECL_FATTN_MMA_QUANT_CASE_TYPES(DKQ, DV, ncols1, ncols2)                 \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q5_0,  DKQ, DV, ncols1, ncols2);  \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q6_0,  DKQ, DV, ncols1, ncols2);  \
-    DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \
@@ -2149,26 +2125,6 @@ DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(112, 112,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(128, 128,  64)
 DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(256, 256,  64)
 
-#ifdef GGML_CUDA_FATTN_Q8_NATIVE
-#define DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(D, ncols)          \
-    DECL_FATTN_MMA_QUANT_CASE_TYPES(D, D, (ncols)/1, 1);        \
-    DECL_FATTN_MMA_QUANT_CASE_TYPES(D, D, (ncols)/2, 2);        \
-    DECL_FATTN_MMA_QUANT_CASE_TYPES(D, D, (ncols)/4, 4);        \
-    DECL_FATTN_MMA_QUANT_CASE_TYPES(D, D, (ncols)/8, 8);        \
-
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2( 64,  8)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2( 64, 16)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2( 64, 32)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2( 64, 64)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(128,  8)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(128, 16)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(128, 32)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(128, 64)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256,  8)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 16)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 32)
-DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 64)
-#endif // GGML_CUDA_FATTN_Q8_NATIVE
 
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  4,  2);
 extern DECL_FATTN_MMA_F16_CASE(512, 512,  8,  2);

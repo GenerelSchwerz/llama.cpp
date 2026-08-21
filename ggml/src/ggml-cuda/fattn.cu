@@ -3,6 +3,7 @@
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-quant-decl.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -258,25 +259,51 @@ static void ggml_cuda_flash_attn_ext_mma_quant_log_route(const ggml_tensor * dst
     }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
-    GGML_LOG_INFO("fattn-q8-native: D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
+    const ggml_tensor * V = dst->src[2];
+    GGML_LOG_INFO("fattn-q8-native: K=%s V=%s D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
+        ggml_type_name(K->type), ggml_type_name(V->type),
         (int) Q->ne[0], (int) Q->ne[1], (int) K->ne[1], (int) Q->ne[2], (int) K->ne[2]);
 }
 
-template <ggml_type type>
+template <ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (dst->src[0]->ne[0]) {
         case 64:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 64,  64, type, type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2< 64,  64, type_K, type_V>(ctx, dst);
             break;
         case 128:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, type, type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, type_K, type_V>(ctx, dst);
             break;
         case 256:
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, type, type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, type_K, type_V>(ctx, dst);
             break;
         default:
             GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
     }
+}
+
+// K and V are dispatched independently. The inner switch is guarded by the same
+// pair predicate the generator uses, so the compiler only reaches the kernel for
+// pairs that were actually instantiated; the rest collapse to an abort that
+// ggml_cuda_fattn_native_applies has already made unreachable.
+template <ggml_type type_K>
+static void ggml_cuda_flash_attn_ext_mma_quant_switch_type_V(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#define FATTN_MMA_QUANT_DISPATCH_CASE_V(tv)                                            \
+        case tv:                                                                       \
+            if constexpr (ggml_cuda_fattn_mma_quant_pair(type_K, tv)) {                \
+                ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<type_K, tv>        \
+                    (ctx, dst);                                                        \
+            } else {                                                                   \
+                GGML_ABORT("fatal error"); /* gated by the pair policy */              \
+            }                                                                          \
+            break;
+
+    switch (dst->src[2]->type) {
+        FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_DISPATCH_CASE_V)
+        default:
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
+    }
+#undef FATTN_MMA_QUANT_DISPATCH_CASE_V
 }
 
 static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -292,7 +319,7 @@ static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, 
     // extern declarations, so a type can never be routable without a kernel.
 #define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                       \
         case t:                                                                \
-            ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<t>(ctx, dst);  \
+            ggml_cuda_flash_attn_ext_mma_quant_switch_type_V<t>(ctx, dst);     \
             break;
 
     switch (K->type) {
@@ -346,54 +373,13 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static int ggml_cuda_fattn_quant_bits(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q8_0:                 return 8;
-        case GGML_TYPE_Q6_1:
-        case GGML_TYPE_Q6_0:                 return 6;
-        case GGML_TYPE_Q5_1:
-        case GGML_TYPE_Q5_0:                 return 5;
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q4_0:                 return 4;
-        case GGML_TYPE_Q3_1:
-        case GGML_TYPE_Q3_0:                 return 3;
-        case GGML_TYPE_Q2_1:
-        case GGML_TYPE_Q2_0S:                return 2;
-        default:                              return -1;
-    }
-}
-
-static int ggml_cuda_fattn_quant_variant(ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_Q6_0:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q3_0:
-        case GGML_TYPE_Q2_0S: return 1;
-        default:               return 0;
-    }
-}
-
+// The vector pair matrix and the quantized-native MMA pair matrix are the same
+// set, so both ask ggml_cuda_fattn_quant_pair_policy() rather than each carrying
+// its own copy of the band. Kept as a named wrapper because the vector selection
+// below reads better with it and because ggml/CMakeLists.txt names the same
+// policy on the build side.
 static bool ggml_cuda_fattn_default_quant_pair(ggml_type type_K, ggml_type type_V) {
-    const int bits_K = ggml_cuda_fattn_quant_bits(type_K);
-    const int bits_V = ggml_cuda_fattn_quant_bits(type_V);
-    if (bits_K < 0 || bits_V < 0) {
-        return false;
-    }
-
-    bool bit_pair = false;
-    switch (bits_K) {
-        case 8: bit_pair = bits_V == 8 || bits_V == 6 || bits_V == 5; break;
-        case 6: bit_pair = bits_V == 6 || bits_V == 5 || bits_V == 4; break;
-        case 5: bit_pair = bits_V == 5 || bits_V == 4 || bits_V == 3; break;
-        case 4: bit_pair = bits_V == 4 || bits_V == 3 || bits_V == 2; break;
-        case 3: bit_pair = bits_V == 3 || bits_V == 2;                break;
-        case 2: bit_pair = bits_V == 2;                               break;
-        default: break;
-    }
-
-    return bit_pair && (bits_K != bits_V ||
-        ggml_cuda_fattn_quant_variant(type_K) <= ggml_cuda_fattn_quant_variant(type_V));
+    return ggml_cuda_fattn_quant_pair_policy(type_K, type_V);
 }
 
 static bool ggml_cuda_fattn_pair_compiled(ggml_type type_K, ggml_type type_V) {
@@ -469,8 +455,10 @@ static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
 #endif // GGML_CUDA_FATTN_Q8_NATIVE
 }
 
-// The first registered native family is Q8_0/Q8_0 at the supported equal head
-// sizes on NVIDIA architectures that use the Ampere MMA implementation.
+// The native route covers the compiled K/V type pairs at the supported equal
+// head sizes on NVIDIA architectures that use the Ampere MMA implementation.
+// K and V need not be the same type; ggml_cuda_fattn_mma_quant_pair() decides,
+// and it is the same predicate the kernel generator used.
 static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst) {
     if (!ggml_cuda_fattn_native_enabled(dst)) {
         return false;
@@ -481,7 +469,7 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
     const ggml_tensor * V = dst->src[2];
 
     const bool ok = ampere_mma_available(cc) &&
-        K->type == V->type && ggml_cuda_fattn_mma_quant_type(K->type) &&
+        ggml_cuda_fattn_mma_quant_pair(K->type, V->type) &&
         (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
     if (!ok && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {

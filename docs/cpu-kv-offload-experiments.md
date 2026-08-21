@@ -5947,6 +5947,87 @@ multi-sequence territory — `n_q=4 n_kv=9984` and `n_q=8 n_kv=3328`, several
 sequences attending one shared window that is roughly four times the
 non-unified `n_kv` — and the output is unchanged.
 
+#### Mixed K/V cache types
+
+The route required `K->type == V->type`. That restriction was never a property
+of the kernel: `flash_attn_ext_f16` already carries `type_K` and `type_V` as
+separate template parameters, K and V reach the tile loader through separate
+`flash_attn_ext_quant_load_tile` calls, and the row strides are already derived
+per side from `nb11` and `nb21`. The symmetry was imposed in five places
+outside the kernel — the route gate, the dispatcher, one `static_assert`, the
+`DECL_FATTN_MMA_QUANT_CASE` macro, and the generator — each of which simply
+passed one type twice.
+
+##### The pair policy is borrowed, not invented
+
+What actually bounds mixed support is the instantiation matrix: eleven types are
+121 ordered pairs against 11 symmetric ones. The policy adopted is the one the
+vector FlashAttention kernels already compile, defined by
+`ggml_cuda_get_fattn_vec_default_pairs()` in `ggml/CMakeLists.txt`. On the bit
+ladder 8-6-5-4-3-2 the V type sits at K's position or up to two positions below
+it, never above, and at equal position a `_1` K may pair with a `_0` V but not
+the reverse.
+
+Reusing it rather than inventing a band means a cache configuration cannot gain
+or lose support by crossing the vector/MMA boundary, and it needs no new
+justification: K enters the softmax and is the more precision-sensitive side,
+which is why the band is one-sided. It admits 48 of the 121 ordered pairs, and
+9 of the 16 over the four default-tier types.
+
+The runtime mirror of that policy in `fattn.cu` was a second hand-written copy
+of the same band as a bit table. It is now a wrapper over the single shared
+definition. The rewritten form was checked to be pointwise identical to the bit
+table over all 121 ordered pairs before the old code was deleted, so the vector
+pair matrix is unchanged.
+
+##### Cost
+
+| | Symmetric | Paired | Factor |
+|---|---:|---:|---:|
+| Compiled cases, default tier | 192 | 432 | 2.25x |
+| Compiled cases, `GGML_CUDA_FA_ALL_QUANTS` | 528 | 2,304 | 4.36x |
+| Quant instance object code | 77 MB | 315 MB | 4.09x |
+| Full CUDA rebuild, `-j16` | — | 50 min 53 s | — |
+
+The generated instances are now split one file per K type as well as per
+`(ncols1, ncols2)` shape, 176 files instead of 16. Without that split the 4.4x
+would have landed inside 16 translation units and serialised the build behind
+them. In a default-tier build the seven extra-tier K files contribute no cases
+at all, so CMake excludes them rather than paying an nvcc invocation over the
+full MMA header for an empty translation unit.
+
+##### Correctness
+
+`test-backend-ops -o FLASH_ATTN_EXT -p native_quants=1`: **1332/1332**. That
+covers 185 new mixed-pair cases — all 37 admitted pairs at head sizes 64 and
+256, at `kv=512` and the unpadded `kv=113` that forces both loaders onto their
+bounds-checked tail path with K and V disagreeing about the row stride, plus one
+sinks geometry per pair at head size 128.
+
+Model-level byte identity, Qwen3.8-27B-UD-IQ2_M, `-c 8192`, GPU-resident KV,
+128 forced tokens, comparing the native arm against the materializing arm:
+
+| K / V | Result | Launches off / on | CUDA0 KV |
+|---|---|---|---:|
+| `q8_0 / q6_0` | `6e85f8fc…` identical | 0 / 128 | 240.00 MiB |
+| `q8_0 / q5_1` | `e7423afd…` identical | 0 / 128 | 232.00 MiB |
+| `q6_0 / q4_0` | `ba8184ad…` identical | 0 / 128 | 176.00 MiB |
+| `q5_0 / q4_0` | `8407576a…` identical | 0 / 128 | 160.00 MiB |
+| `q5_1 / q3_0` | `ea17cc51…` identical | 0 / 128 | 152.00 MiB |
+| `q4_1 / q2_0` | `3bbd082b…` identical | 0 / 128 | 120.00 MiB |
+| `q8_0 / q4_0` | `e31eea4d…` identical | 0 / **0** | 208.00 MiB |
+
+The last row is the control that matters. `q8_0 / q4_0` is three positions apart
+on the ladder, one more than the band allows, so with the option on it must take
+zero native launches — and it does. The gate holds at model level and not only
+in the unit tests. `test-backend-ops` covers the other rejection direction,
+`q4_0 / q4_1`, where V is more precise than K at equal bit width.
+
+`q4_1 / q2_0` is the most demanding admitted pair and is worth calling out
+separately: K carries a min and V does not, K unpacks nibbles and V unpacks
+two-bit fields, and the two sides use different row strides into the same shared
+tile. It is exact.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes

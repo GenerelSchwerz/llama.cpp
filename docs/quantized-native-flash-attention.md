@@ -6,12 +6,45 @@ materialization used by the standard MMA path. It does not change the
 persistent cache format, cache placement, or quantization policy.
 
 The feature is deliberately explicit at both build time and run time. Its
-current kernel inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, each
-with K and V of the same type and equal head dimensions 64, 128, or 256, on
-NVIDIA GPUs that use the Ampere MMA implementation. `GGML_CUDA_FA_ALL_QUANTS`
-adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, and `Q2_1` to the same
-head-dimension set. Unsupported cache pairs, dimensions, devices, and builds
-keep the standard materializing path.
+current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
+equal head dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
+implementation. `GGML_CUDA_FA_ALL_QUANTS` adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`,
+`Q3_1`, `Q2_0`, and `Q2_1` to the same head-dimension set. K and V need not be
+the same type; which mixed pairs are covered is the pair policy below.
+Unsupported cache pairs, dimensions, devices, and builds keep the standard
+materializing path.
+
+## Pair policy
+
+K and V are independent template parameters of the kernel and reach the tile
+loader through separate calls, so any ordered pair of native types is
+expressible. What bounds the compiled set is the instantiation matrix, which
+grows quadratically: eleven types are 121 ordered pairs, each costing three head
+sizes times sixteen tile shapes.
+
+The policy applied is the one the vector FlashAttention kernels already compile,
+so a cache configuration never gains or loses support by crossing the vector/MMA
+boundary. On the bit ladder
+
+    8 -> 6 -> 5 -> 4 -> 3 -> 2
+
+the V type may sit at K's position or up to two positions below it, never above,
+and at equal position a `_1` K may pair with a `_0` V but not the reverse. K
+carries into the softmax and is the more precision-sensitive of the two, which
+is why the band is one-sided.
+
+That admits 48 of the 121 ordered pairs over the eleven types, and 9 of the 16
+over the four default-tier types. `q8_0 / q6_0`, `q6_0 / q4_0` and `q5_0 / q4_0`
+are in; `q8_0 / q4_0` is three positions apart and is not; `q4_0 / q8_0` is the
+wrong direction and is not.
+
+One definition drives all three consumers.
+`ggml_cuda_fattn_quant_pair_policy()` in `fattn-mma-quant.cuh` states the band;
+`ggml_cuda_fattn_mma_quant_pair()` restricts it to the compiled type tier and is
+asked by both the host-side route decision and the device-side kernel selection;
+`generate_cu_files.py` mirrors it to decide what to define. A disagreement
+between the mirror and the definition is a missing-symbol link error naming the
+exact pair, not a silent gap.
 
 ## Selection model
 
@@ -27,7 +60,9 @@ selects nor converts the cache type. For example:
 | `q8_0 / q8_0` | on | Native Q8 MMA when the build, device, and head size support it |
 | `q4_0 / q4_0` | on | Native Q4 MMA when the build, device, and head size support it |
 | `q6_0 / q6_0` | on | Native Q6 MMA when the build, device, and head size support it |
-| `q8_0 / q4_0` | on | Standard materializing fallback; the route requires K and V to agree |
+| `q8_0 / q6_0` | on | Native mixed-pair MMA; K and V load different quant layouts into the same tile |
+| `q8_0 / q4_0` | on | Standard materializing fallback; outside the pair policy band |
+| `q4_0 / q8_0` | on | Standard materializing fallback; V may not be more precise than K |
 | `q2_1 / q2_1` | on | Native MMA only in a `GGML_CUDA_FA_ALL_QUANTS` build; otherwise standard materializing fallback |
 
 This avoids a second K/V type selector that could disagree with the tensors in
@@ -74,8 +109,11 @@ structure:
 - The normal MMA case and `ncols1`/`ncols2` selectors are templated on the K and
   V storage types. Their default remains F16, so existing call sites and
   generated F16 instances do not change behavior.
-- The native route specializes that shared case with one type for both K and V; it does not carry
-  a copied launcher or a copied selector tree.
+- The native route specializes that shared case with an independent type for K
+  and for V; it does not carry a copied launcher or a copied selector tree. The
+  dispatcher switches on the two types in sequence and guards the inner switch
+  with the pair predicate, so the compiler only reaches kernels that were
+  actually instantiated.
 - The per-type tile loaders are `fattn_quant_type_traits<GGML_TYPE_*>`
   specializations in `fattn-mma-quant.cuh`. Each dequantizes into the same
   shared-memory `half2` tiles consumed by the existing MMA math.
@@ -98,16 +136,23 @@ structure:
   `fattn-common.cuh`. The helper's historical name is V-specific, but its
   operation is a generic Q8_0 row dequantization and is also valid for K.
 - `template-instances/generate_cu_files.py` owns the supported head-size and
-  tile inventory. It emits one translation unit per `(ncols1, ncols2)` shape,
-  matching the existing F16 and KVarN convention and preserving incremental
-  parallel compilation.
+  tile inventory. It emits one translation unit per K type and `(ncols1,
+  ncols2)` shape. The extra K dimension relative to the F16 and KVarN convention
+  is what keeps each translation unit near its former size now that the pair
+  matrix is 4.4x the cases the symmetric matrix had, so the build still
+  parallelises instead of serialising behind a few very large files.
+- The explicit instantiation declarations live in `fattn-mma-quant-decl.cuh`
+  rather than in `fattn-mma-f16.cuh`, and only `fattn.cu` includes them. They are
+  the full unfiltered cross product; declaring the pairs the policy rejects costs
+  nothing because they are never odr-used, and it removes any chance of the
+  declaration list and the generator disagreeing.
 - CMake includes those generated sources only when
   `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
 
 There are 16 tile shapes and three supported head dimensions. The default
-four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) yields 192 explicit
-template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the remaining seven types for
-528 total. A future native pair is not inferred from the standard quant
+four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) admits 9 ordered pairs
+and yields 432 explicit template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the
+remaining seven types, for 48 pairs and 2304 cases. A future native pair is not inferred from the standard quant
 matrix. It requires an intentional loader/registration, a bounded generated
 inventory, route and fallback tests, output validation, and performance and
 memory evidence.
@@ -200,10 +245,9 @@ and run-time defaults remain off.
 
 ## Limitations
 
-- The registered pairs are same-type: `Q8_0/Q8_0`, `Q4_0/Q4_0`, `Q5_0/Q5_0`,
-  and `Q6_0/Q6_0` by default, plus `Q4_1/Q4_1`, `Q5_1/Q5_1`, `Q6_1/Q6_1`,
-  `Q3_0/Q3_0`, `Q3_1/Q3_1`, `Q2_0/Q2_0`, and `Q2_1/Q2_1` under
-  `GGML_CUDA_FA_ALL_QUANTS`; mixed and other quantized pairs use fallback.
+- The registered pairs are those the pair policy admits: 9 of 16 over the four
+  default types, 48 of 121 with `GGML_CUDA_FA_ALL_QUANTS`. Pairs outside the
+  band, most notably any pair whose V is more precise than its K, use fallback.
 - The only registered equal head dimensions are 64, 128, and 256.
 - Routing requires the NVIDIA Ampere MMA implementation. AMD, MUSA, older
   NVIDIA paths, and non-CUDA backends are unchanged.
@@ -212,7 +256,7 @@ and run-time defaults remain off.
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
 - Compile time and CUDA-library size increase when the family is built because
-  all explicit cases are emitted: 192 by default, 528 with
+  all explicit cases are emitted: 432 by default, 2304 with
   `GGML_CUDA_FA_ALL_QUANTS`. Default builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
@@ -269,10 +313,13 @@ helper. The two do not always agree:
   16-element run the tile loader issues.
 
 A new type therefore needs a `fattn_quant_type_traits` specialization whose
-`dequant()` matches its cast kernel, an entry in
-`ggml_cuda_fattn_mma_quant_type`, one line in `DECL_FATTN_MMA_QUANT_CASE_TYPES`
-and in the generator's `FATTN_MMA_QUANT_TYPES`, a case in the routing switch,
-and a pass in the `test-backend-ops` sweep. Tolerance-based tests are not
+`dequant()` matches its cast kernel, an entry in `FATTN_MMA_QUANT_TYPES` in
+`fattn-mma-quant.cuh`, a rung in `ggml_cuda_fattn_quant_pair_rank` so the pair
+policy can place it, one line in each of `DECL_FATTN_MMA_QUANT_CASE_V` and
+`DECL_FATTN_MMA_QUANT_CASE_TYPES` in `fattn-mma-quant-decl.cuh`, entries in the
+generator's `FATTN_MMA_QUANT_TYPES` and `FATTN_MMA_QUANT_LADDER`, and a pass in
+the `test-backend-ops` sweep. The routing switch needs no change: it expands
+from the same type list. Tolerance-based tests are not
 sufficient evidence on their own: with random inputs they would accept a loader
 that permuted elements within a block. A byte-identical generation comparison
 against the same build with the option off is what actually gates a
