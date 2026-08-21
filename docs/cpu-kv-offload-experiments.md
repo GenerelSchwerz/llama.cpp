@@ -3663,24 +3663,28 @@ HIP tail capability, and HIP runtime validation.
 Quality used the 606,662-byte corpus
 `/home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt`
 (SHA-256 `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`)
-and matching `-b 512 -ub 512`. Baseline and candidate both produced
-`PPL = 1.9312 +/- 0.06681`:
+and matching `-b 512 -ub 256`. A fresh baseline/candidate/baseline bracket
+printed the identical four-chunk sequence `1.9315, 2.1279, 2.2498, 2.1674`
+in all three processes and the identical final estimate
+`PPL = 2.1674 +/- 0.03849`:
 
 ```bash
 flock /tmp/beellama-single-gpu.lock -c \
   '{build}/bin/llama-perplexity \
    -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
    --file /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
-   --ctx-size 4096 --batch-size 512 --ubatch-size 512 --chunks 1 \
+   --ctx-size 4096 --batch-size 512 --ubatch-size 256 --chunks 4 \
    --cache-type-k q8_0 --cache-type-v q8_0 --threads 3 --threads-batch 24 \
    --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
    --n-gpu-layers 999 --split-mode none --main-gpu 0 \
    --no-kv-offload --kv-cpu-pinned --flash-attn on'
 ```
 
-Here `{build}` was independently replaced with `build-compact-baseline-cuda`
-and `build-compact-cuda`; each invocation was a fresh locked process. The native
-one-chunk counter exposed progress.
+Here `{build}` was replaced in order with `build-compact-baseline-cuda`,
+`build-compact-cuda`, and `build-compact-baseline-cuda`; every invocation was a
+fresh locked process. The native `[1]` through `[4]` chunk counter exposed
+progress. An earlier one-chunk baseline/candidate screen also matched at
+`1.9312 +/- 0.06681`, but it is not the acceptance evidence.
 
 A deterministic 16-token CLI comparison used the same model and runtime
 placement, prompt `Write one concise sentence about causal attention.`, seed
@@ -3708,30 +3712,48 @@ flock /tmp/beellama-single-gpu.lock -c \
    -b 1024 -ub 512 -o jsonl'
 ```
 
-| depth | build | prompt 512 | decode 128 | combined 512/64 | peak process VRAM | pinned KV resident |
-|---:|---|---:|---:|---:|---:|---:|
-| 4,096 | c9 baseline | 1,336.39 t/s | 18.39 t/s | 150.82 t/s | 14,383,448,064 B | 187,170,816 B |
-| 4,096 | compact | 1,417.56 t/s | 19.25 t/s | 158.00 t/s | 14,410,711,040 B | 187,170,816 B |
-| 30,000 | c9 baseline | 1,047.21 t/s | 13.83 t/s | 113.48 t/s | 14,381,350,912 B | 1,087,373,312 B |
-| 30,000 | compact | 1,062.63 t/s | 13.92 t/s | 112.08 t/s | 14,427,488,256 B | 1,087,373,312 B |
+The acceptance performance screen also used fresh baseline/candidate/baseline
+processes in that order at both depths. The delta uses the midpoint of the two
+reference samples; each candidate value remains a single sample and therefore
+supports only a no-large-regression screen, not a small throughput claim.
 
-At 4K the candidate changed prompt, decode, and combined throughput by +6.07%,
-+4.64%, and +4.76%. At 30K the corresponding changes were +1.47%, +0.63%,
-and -1.24%; the one-run combined movement is neutral rather than a stable
-regression claim. Peak process VRAM increased by 26 MiB at 4K and 44 MiB at
-30K. Pinned KV residency was identical and `kv_staging_bytes` was zero in all
-runs. A separate matched 30K resource-only pair reported maximum RSS of
+| depth | build/order | prompt 512 | decode 128 | combined 512/64 | peak process VRAM | pinned KV resident |
+|---:|---|---:|---:|---:|---:|---:|
+| 4,096 | c9 baseline A1 | 1,433.21 t/s | 19.877 t/s | 157.255 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | compact B | 1,439.86 t/s | 19.906 t/s | 159.015 t/s | 14,410,711,040 B | 187,170,816 B |
+| 4,096 | c9 baseline A2 | 1,434.06 t/s | 19.580 t/s | 158.740 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | B vs A midpoint | +0.43% | +0.90% | +0.64% | +20 MiB | 0 B |
+| 30,000 | c9 baseline A1 | 1,035.82 t/s | 13.975 t/s | 111.872 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | compact B | 1,054.77 t/s | 13.890 t/s | 112.029 t/s | 14,427,488,256 B | 1,087,373,312 B |
+| 30,000 | c9 baseline A2 | 1,061.78 t/s | 13.962 t/s | 112.077 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | B vs A midpoint | +0.57% | -0.56% | +0.05% | +44 MiB | 0 B |
+
+The bracket does not reproduce a material 30K performance loss. The one-sample
+`-0.56%` 30K decode movement is neutral at this resolution, while combined
+throughput is effectively unchanged. Peak process VRAM increased by 20 MiB at
+4K and 44 MiB at 30K. Pinned KV residency was identical and
+`kv_staging_bytes` was zero in all runs. A separate matched 30K resource-only
+pair reported maximum RSS of
 14,592,992 KiB baseline and 14,597,024 KiB candidate (+4,032 KiB, effectively
 identical at this process scale). Pageable host memory was not separately
 attributable from process RSS; the patch does not alter model mapping, KV
 allocation, pinned-memory, or host-staging code.
 
+The fresh bracket artifacts are retained at
+`/tmp/beellama-prepr4-compact-aba-20260820`. They include all three raw PPL
+logs, all six raw performance/progress logs, extracted JSONL, the GPU preflight,
+fresh CPU/CUDA 3/3 descriptor-oracle logs, the seven-test static regression log,
+and binary/library/model/corpus identities. `SHA256SUMS` covers every retained
+file other than itself and has SHA-256
+`17a19eb95b3d8f9af176017a8c4ac934392c2672b1e273abe8349208e152bb94`.
+
 ### Disposition
 
 Retain the compact descriptor. It is bit-exact in direct CPU/CUDA coverage and
-end-to-end generation, has exactly matching PPL, improves isolated prompt and
-decode throughput in both tested depths, and fails closed to the dense mask for
-unproved layouts or capabilities. The measured cost is up to 44 MiB additional
-peak process VRAM in this CUDA configuration. Other models, multi-sequence
-layouts, KVarN native attention, and non-CUDA accelerators remain dense and
-require separate evidence before enabling compact selection.
+end-to-end generation, has exactly matching four-chunk A/B/A PPL, shows no
+material performance regression in the fresh 4K/30K A/B/A screen, and fails
+closed to the dense mask for unproved layouts or capabilities. The measured
+cost is up to 44 MiB additional peak process VRAM in this CUDA configuration.
+Other models, multi-sequence layouts, KVarN native attention, and non-CUDA
+accelerators remain dense and require separate evidence before enabling compact
+selection.
