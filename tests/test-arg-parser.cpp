@@ -785,6 +785,11 @@ static void test(void) {
     assert(params.speculative.draft.n_max == 15);
 
     params = common_params();
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
+    assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
+    assert(params.speculative.draft.n_max == 15);
+
+    params = common_params();
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
     params.speculative.draft.n_max = 20;
     params.speculative.draft_n_max_explicit = true;

@@ -1,0 +1,3 @@
+timestamp_s,vram_mib,rss_kib,vmhwm_kib,vmlck_kib
+0.001,11276,1698396,10571912,0
+0.527,11300,2200736,10571912,0
