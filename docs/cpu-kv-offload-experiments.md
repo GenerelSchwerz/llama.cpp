@@ -5987,7 +5987,13 @@ pair matrix is unchanged.
 | Compiled cases, default tier | 192 | 432 | 2.25x |
 | Compiled cases, `GGML_CUDA_FA_ALL_QUANTS` | 528 | 2,304 | 4.36x |
 | Quant instance object code | 77 MB | 315 MB | 4.09x |
+| `libggml-cuda.so`, `GGML_CUDA_FA_ALL_QUANTS` | 348,042,208 B | 578,918,992 B | 1.66x |
 | Full CUDA rebuild, `-j16` | — | 50 min 53 s | — |
+
+The library figures are both measured, the first from a worktree built at the
+parent commit with identical flags rather than estimated from the object delta.
++220.2 MiB is a real cost and it falls entirely on `GGML_CUDA_FA_ALL_QUANTS`
+builds, which are already the opt-in tier.
 
 The generated instances are now split one file per K type as well as per
 `(ncols1, ncols2)` shape, 176 files instead of 16. Without that split the 4.4x
@@ -6027,6 +6033,35 @@ in the unit tests. `test-backend-ops` covers the other rejection direction,
 separately: K carries a min and V does not, K unpacks nibbles and V unpacks
 two-bit fields, and the two sides use different row strides into the same shared
 tile. It is exact.
+
+##### Where the benefit is, and where it is not
+
+Prefill throughput for a mixed pair is **neutral**. `q8_0 / q6_0` at depth
+32,768, `-p 512 -n 0 -r 5`, two reverse-order arm pairs so run order cannot
+carry the result:
+
+| Arm | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 823.575 t/s | 4.732 |
+| native | 10 | 825.419 t/s | 4.670 |
+
+`+1.844 t/s`, `+0.22%`, Welch `t = 0.877` on 18 degrees of freedom. That is not
+a result, and it should not be reported as one.
+
+The allocation saving is where mixed pairs pay, and it is large. Reserve-time
+`CUDA0 compute` from `llama-server --parallel 1 -v`, same pair:
+
+| Depth | Materializing | Native | Saved |
+|---:|---:|---:|---:|
+| 32,768 | 300.27 MiB | 160.27 MiB | **140.00 MiB, 46.6%** |
+| 131,072 | 960.27 MiB | 436.27 MiB | **524.00 MiB, 54.6%** |
+
+This is consistent with the mechanism established for the symmetric pairs: what
+the native route removes is the transient F16 copy of the attention window,
+whose size depends on the window and not on the source quantization. So a mixed
+pair saves what a symmetric pair of the same head dimension saves. The reason to
+support mixed pairs is that the configuration becomes eligible for that saving
+at all, not that the kernel runs faster once it is.
 
 #### Revised disposition
 

@@ -61,6 +61,7 @@ selects nor converts the cache type. For example:
 | `q4_0 / q4_0` | on | Native Q4 MMA when the build, device, and head size support it |
 | `q6_0 / q6_0` | on | Native Q6 MMA when the build, device, and head size support it |
 | `q8_0 / q6_0` | on | Native mixed-pair MMA; K and V load different quant layouts into the same tile |
+| `q4_1 / q2_0` | on | Native; K carries a min and unpacks nibbles while V has none and unpacks two-bit fields |
 | `q8_0 / q4_0` | on | Standard materializing fallback; outside the pair policy band |
 | `q4_0 / q8_0` | on | Standard materializing fallback; V may not be more precise than K |
 | `q2_1 / q2_1` | on | Native MMA only in a `GGML_CUDA_FA_ALL_QUANTS` build; otherwise standard materializing fallback |
@@ -248,6 +249,11 @@ and run-time defaults remain off.
 - The registered pairs are those the pair policy admits: 9 of 16 over the four
   default types, 48 of 121 with `GGML_CUDA_FA_ALL_QUANTS`. Pairs outside the
   band, most notably any pair whose V is more precise than its K, use fallback.
+- A mixed pair buys allocation, not throughput. Measured for `q8_0 / q6_0` at
+  depth 32,768, prefill is `+0.22%` with `t = 0.877`, which is neutral; the
+  reserve-time `CUDA0 compute` buffer falls 46.6% at that depth and 54.6% at
+  131,072. The removed transient is an F16 copy of the attention window, whose
+  size does not depend on the source quantization.
 - The only registered equal head dimensions are 64, 128, and 256.
 - Routing requires the NVIDIA Ampere MMA implementation. AMD, MUSA, older
   NVIDIA paths, and non-CUDA backends are unchanged.
