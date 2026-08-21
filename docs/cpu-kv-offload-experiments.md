@@ -3587,3 +3587,772 @@ claim here.
 PR 8 source, generated arguments, presets, and feature-specific reproductions
 remain with that PR until source lands; shared protocol, research, roadmap,
 isolation, and identity indexing belong in the KV line.
+
+The PR 3 recovery evidence below retains its original Characterization
+020-026 identifiers even though this consolidated ledger already has an
+Experiment 020. They are distinct historical characterizations, not duplicate
+result sections. Their archived commands and harness snapshots reproduce the
+2026-08-19 RTX 4070 session only; they are not runnable current-protocol
+templates. New work uses the native-affinity and whole-lifecycle GPU-lock
+contract in `cpu-kv-offload-current-testing.md`.
+
+## Characterization 020: baseline, MTP, and DSpark on a second machine (Qwen3.8 IQ2_M, RTX 4070 12 GiB)
+
+Status: characterization only. Every prior speculative-decoding entry in this
+ledger (Characterizations 006/014, Experiments 007/008/012/013/017/019)
+measured `draft-mtp` exclusively. `draft-dspark` had never been run against
+this branch's CPU-KV-offload work before this entry. This characterization
+runs baseline (no speculative decoding), `draft-mtp`, and `draft-dspark`
+side by side on a second, weaker machine already used for Experiment 011's
+hardware class, with concurrent VRAM/RSS monitoring and several distinct
+real prompts rather than only synthetic repeated-token prompts.
+
+Full artifacts (raw logs, per-run commands, VRAM/RSS CSVs, and the harness
+scripts) are in
+[`cpu-kv-offload-rtx4070-qwen38-iq2-results/`](cpu-kv-offload-rtx4070-qwen38-iq2-results/README.md),
+including the consolidated table across every run in Characterizations
+020-026.
+
+### Hardware, build, and common configuration
+
+- GPU: NVIDIA GeForce RTX 4070, 12,282 MiB nominal / 11,902 MiB reported
+  usable by `llama-server`, compute capability 8.9, driver 610.57.04.
+- CPU: Intel Core i5-13400F. `lscpu`/`/sys/.../topology` confirm 6 P-cores
+  with SMT (logical CPUs 0-11, paired 0-1/2-3/4-5/6-7/8-9/10-11) plus 4
+  E-cores without SMT (12-15). Decode affinity is `taskset -c 0,2,4`: three
+  distinct physical P-cores, matching Experiment 011's established mapping
+  for this CPU family.
+- RAM: 31 GiB, swap present but not exhausted during these runs.
+- Build: Release, CUDA, `GGML_NATIVE=ON`, CUDA FlashAttention on, CUDA
+  architecture `89`, default quant matrix (`GGML_CUDA_FA_ALL_QUANTS=OFF`),
+  GCC 16.2.1, CUDA 13.3 (nvcc V13.3.73).
+- Source: two passes against two different points on this branch. Pass 1
+  (tags `A-`/`B-`/`C-`/`D-`/`E-`/`F-` in the results archive) measured
+  against `53adab814` ("docs: record phase-aware KV merge"), the PR #1 head
+  at the time, before Experiments 017-019 landed. Pass 2 (tags `A2-`/`G-`)
+  re-measured against `c9f727c1e` ("docs: record live draft KV decode
+  comparison"), this branch's tip at rebase time, after the MTP
+  draft/target-ubatch-matching validation (Experiment 017) and the
+  canonical accelerator-quant-store fix (Experiment 018) landed. **This
+  entry and Characterizations 021-023 report Pass 2 (valid under that
+  historical protocol)
+  numbers; Characterizations 025-026 report Pass 1 numbers with an explicit
+  historical-pinning caveat, since they isolate flags whose *current*
+  validity or default configuration changed between the two passes.**
+- Target model: `Qwen3.8-27B-UD-IQ2_M.gguf`, architecture `qwen35`, 27.32B
+  parameters, 9.60 GiB, 65 layers of which 16 are full attention (the MTP
+  head is present as `blk.64.nextn.*` tensors, baked into this same file).
+- DSpark draft model: `Qwen3.8-27B-DSpark-Q8_0.gguf`, architecture `dflash`
+  with a DSpark Markov head (rank 256), 1.36B parameters, 1.36 GiB on disk,
+  `dflash.block_size = 7` (implying a trained draft horizon of
+  `block_size - 1 = 6`), 5 target-layer taps.
+- Common flags on every run: `--no-kv-offload --kv-cpu-pinned
+  --recurrent-state-offload --ctx-size 16384 --flash-attn on --cache-type-k
+  q8_0 --cache-type-v q8_0 --n-gpu-layers 99 --split-mode none --parallel 1
+  --cont-batching --threads 3 --threads-batch 3 --poll 100 --seed 1234
+  --cache-ram 0`, whole process under `taskset -c 0,2,4`.
+- MTP flags, Pass 2 (current): `--spec-type draft-mtp --spec-draft-n-max 5
+  --draft-p-min 0.85 --cache-type-k-draft q8_0 --cache-type-v-draft q8_0`.
+  `--spec-draft-ubatch-size` is omitted: Experiment 017's validator now
+  hard-rejects any explicit value that does not equal the target ubatch
+  (512 here) for `draft-mtp` (see Characterization 025).
+- DSpark flags: `--spec-type draft-dspark --model-draft
+  Qwen3.8-27B-DSpark-Q8_0.gguf --spec-draft-n-max 6 --n-gpu-layers-draft 0
+  --draft-p-min 0.85 --cache-type-k-draft q8_0 --cache-type-v-draft q8_0`.
+  `--n-gpu-layers-draft 0` is required on this card; see Characterization 022.
+  `--spec-draft-n-max 6` was passed explicitly throughout this and
+  Characterizations 021-023, 025-026; see Characterization 024 for what
+  happens, and the fix, when it is omitted.
+- Each configuration ran as a clean `llama-server` process. A harness
+  started the server, polled `/health`, launched a 0.5 s-interval monitor
+  (`nvidia-smi --query-compute-apps`, `/proc/<pid>/status` `VmRSS`/`VmHWM`)
+  for the lifetime of the process, sent one OpenAI-compatible
+  `/v1/chat/completions` request, recorded `timings` from the response and
+  the server's own `print_timing`/`memory breakdown` log lines, then shut
+  the process down. Every number below is a single run, not an averaged
+  repetition; treat single-decimal agreement across nominally-identical
+  configurations (e.g. the repeated `G-` crash re-checks in
+  Characterization 021) as the run-to-run noise floor.
+- Four prompts: a 72-token short factual question, an 89-token creative
+  short-story prompt (400 requested output tokens), a 135-token coding
+  request for a self-contained HTML/JS particle-life simulation (1,200
+  requested output tokens), and a 12,000-token synthetic prompt (repeated
+  token IDs 100-149) sent to the raw `/completion` endpoint for a
+  content-independent prefill measurement.
+
+### Prompt/decode comparison (Pass 2, current protocol)
+
+| Prompt | Config | Prompt t/s | Decode t/s | Draft acceptance |
+| --- | --- | ---: | ---: | --- |
+| short (72 in / 64 out) | baseline | 253.59 | 39.69 | - |
+| short | MTP-5 | 251.80 | **70.58** | 78.9% (45/57), mean len 3.65 |
+| short | DSpark-6 (CPU draft) | 179.80 | 17.00 | 100% (30/30), mean len 2.88 |
+| creative (89 in / 400 out) | baseline | 329.46 | 38.92 | - |
+| creative | MTP-5 | 307.08 | **46.86** | 86.7% (157/181), mean len 2.54 |
+| creative | DSpark-6 | 234.23 | 11.65 | 95.4% (83/87), mean len 2.98 |
+| coding (135 in / 1200 out) | baseline | 453.46 | 37.69 | - |
+| coding | MTP-5 | 422.58 | **43.27** | 84.4% (410/486), mean len 2.47 |
+| coding | DSpark-6 | 326.54 | 10.52 | 93.8% (211/225), mean len 2.34 |
+| synthetic (12,000 in / 25 out*) | baseline | 1147.83 | 23.50 | - |
+| synthetic | MTP-5 | 1106.70 | **72.21** | 100% (20/20), mean len 6.00 |
+| synthetic | DSpark-6 | 1014.98 | 3.52 | 100% (11/11), mean len 2.57 |
+
+\* The synthetic-prompt requests all terminated early with a 500 "Content-only
+format" server error after 25 of the requested 64 output tokens; this is a
+response-formatting artifact of sending a raw token-ID array through the
+harness used for this run and is unrelated to speculative decoding. The
+`timings` shown were read from the server's own `print_timing` log line,
+which is written before the formatting error and is unaffected by it. The
+prefill throughput figures are unaffected regardless, since prefill always
+completes before any decode token is produced.
+
+MTP beats baseline decode throughput on every completed prompt (+78% short,
++20% creative, +15% coding, +207% at 12K synthetic depth thanks to perfect
+6/6 draft acceptance on the trivially-predictable repeated-token prompt).
+DSpark, forced onto CPU for its draft model (Characterization 022), is
+slower than baseline on every prompt despite comparable-to-better draft
+acceptance (93-100%), and the gap widens sharply with context depth: -57%
+decode at the 72-token depth, -70% at depth ~89, -72% at depth ~135, and
+-85% at 12,000 synthetic tokens. Characterization 023 attributes this to CPU
+contention and CPU-side attention cost scaling with depth, not to poor
+draft quality.
+
+The one prompt not shown above is the MTP coding request repeated with
+`--spec-mtp-rs-planes 0` and MTP depth 6 (matching the `G-` tag family): it
+crashed with a CUDA illegal memory access in most attempts, independent of
+draft-ubatch geometry and independent of the recurrent-plane cap.
+Characterization 021 is the dedicated root-cause entry for that finding.
+
+### Cross-check against the canonical accelerator-quant-store fix
+
+Comparing this entry's Pass 2 memory breakdown against the equivalent Pass 1
+row isolates Experiment 018's per-layer quantized store-stage overhead on
+this hardware. At the 72-token short prompt, `CUDA0` context bytes grew by
+exactly 17 MiB in all three configurations after the rebase:
+
+| Config | Pass 1 context (MiB) | Pass 2 context (MiB) | Delta |
+| --- | ---: | ---: | ---: |
+| baseline | 149 | 166 | +17 |
+| MTP-5 | 897 | 914 | +17 |
+| DSpark-6 | 1,047 | 1,064 | +17 |
+
+This matches Experiment 018's own reported figure almost exactly ("At the
+production ubatch of 512, the Qwen3.8 test case allocates stages for 16
+host-resident attention layers, 512 rows each, totaling 17.00 MiB of device
+memory"), confirming that fix's cost model holds on a second GPU (RTX 4070
+vs. the original RTX 5070 Ti) and a third quantization (IQ2_M vs.
+IQ4_XS/IQ3_S).
+
+### Disposition
+
+MTP is the only speculative mode of the two that is presently usable on
+this 12 GiB card without extra flags: it fits fully GPU-resident because
+its head ships inside the already-loaded target weights, and it wins decode
+throughput on every configuration it completed. DSpark, as shipped,
+requires a CPU-resident draft model on this hardware (Characterization
+022), which converts every decode step into a CPU-bound operation and
+produces a net throughput regression versus not speculating at all,
+worsening with context length. This is a hardware-class finding, not a
+verdict on DSpark's algorithm: Experiment 011's establishing measurements
+were also gathered on this same RTX 4070, and a card with more headroom
+above a 9.6 GiB IQ2 target would very plausibly fit a GPU-resident 1.36B
+DSpark draft and see a different outcome. Characterizations 021-024 detail
+the specific mechanisms and one fixed bug; Characterizations 025-026 extend
+coverage to draft-ubatch, partial GPU KV residency, the MTP recurrent-plane
+cap, and phase-aware-workspace, using Pass 1 data with an explicit
+provenance caveat.
+
+## Characterization 021: intermittent CUDA illegal-memory-access crash during sustained MTP generation
+
+Status: root cause narrowed to a specific mechanism (concurrent
+target/draft GPU stream activity), not fixed. This is a stability finding,
+not a throughput or VRAM finding, and it affects MTP specifically — no
+DSpark or baseline run crashed anywhere in this session, across either
+pass.
+
+### Observation
+
+The archive contains three Pass 1 MTP failures plus a Pass 2 corrected-geometry
+matrix. In Pass 2, six non-blocking and three launch-blocking processes entered
+the 1,200-token `draft-mtp` coding-prompt generation at depth 6. Five of the six
+non-blocking runs and one of the three launch-blocking runs crashed
+mid-generation with the identical error:
+
+```text
+E CUDA error: an illegal memory access was encountered
+E   current device: 0, in function ggml_backend_cuda_synchronize at ggml/src/ggml-cuda/ggml-cuda.cu:2543
+E   cudaStreamSynchronize(cuda_ctx->stream())
+```
+
+| Run | Pass | `--spec-draft-n-max` | `--spec-mtp-rs-planes` | `CUDA_LAUNCH_BLOCKING` | Result |
+| --- | --- | ---: | --- | --- | --- |
+| Characterization 020 coding prompt (MTP-5) | 1 | 5 | default (full) | unset | crashed at token 809/1200 |
+| Recurrent-plane-cap full-plane control (Char. 025) | 1 | 6 | 0 (full, 7 planes) | unset | crashed at token 1,068/1200 |
+| Recurrent-plane-cap capped control (Char. 025) | 1 | 6 | 4 (sparse GPU replay) | unset | crashed at token 548/1200 |
+| Crash re-check 1/3 | 2 | 6 | 0 (full, 7 planes) | unset | completed, 1,200/1,200 |
+| Crash re-check 2/3 | 2 | 6 | 0 | unset | crashed at token ~954-1069 |
+| Crash re-check 3/3 | 2 | 6 | 0 | unset | crashed at token ~956-1069 |
+| `CUDA_LAUNCH_BLOCKING=1` run | 2 | 6 | 0 | **1** | completed, 1,200/1,200 |
+| Additional no-block retries (x3) | 2 | 6 | 0 | unset | **3/3 crashed**, between tokens ~430 and ~960 |
+| Additional block retries (x2) | 2 | 6 | 0 | **1** | 1/2 crashed, at token ~739-859 |
+| Additional block model-load attempts (x2) | 2 | 6 | 0 | **1** | OOM before inference; excluded from crash denominator |
+
+Consolidated: **5 of 6 attempts without `CUDA_LAUNCH_BLOCKING` crashed
+(83%)**; **1 of 3 eligible inference runs with `CUDA_LAUNCH_BLOCKING=1`
+crashed (33%)**. Two additional launch-blocking artifacts failed during model
+loading and do not enter the inference-run denominator.
+Crash token counts range from ~430-560 up to ~1,070 with no fixed value,
+across two different `--spec-draft-n-max` settings and both recurrent-plane-cap
+states (full and capped/sparse-replay), with no shared flag distinguishing
+crashed from clean runs other than the launch-blocking variable itself.
+
+### What this rules out
+
+- **Not the MTP draft/target-ubatch mismatch** (Experiment 017/Characterization
+  025): every crash in the Pass 2 row above used the corrected, now-enforced
+  matching ubatch (inherited, 512 = 512). The bug reproduces identically
+  before and after that fix landed.
+- **Not specific to the recurrent-plane cap** (Experiments 012/013): the
+  crash reproduces with `--spec-mtp-rs-planes 0` (full planes, sparse-replay
+  explicitly disabled per the server's own "full-shape GPU replay =
+  disabled" startup log line) just as often as with a capped configuration.
+- **Not tied to replay or checkpoint activity**: every crash log's tail
+  shows only the two early context-checkpoint creations (well before the
+  crash point) and no replay-cycle log line; the final per-request summary
+  that would report replay/checkpoint counts never printed because the
+  process died first, but Pass 2's completed full-plane runs (which use the
+  identical code path) report zero replay cycles, ruling out replay as the
+  differentiating mechanism.
+- **Not a fixed token-count or fixed-shape trigger**: crash points vary by
+  more than 2x across otherwise-identical reruns of the same command.
+
+### What narrows the mechanism
+
+`CUDA_LAUNCH_BLOCKING=1` forces every CUDA kernel launch to synchronize
+before the host continues, serializing what is normally overlapped
+asynchronous GPU work. It reduced the observed crash rate from 83% to 20%
+over these samples without eliminating it — consistent with a genuine race
+condition whose window narrows, but does not close, under serialized
+launches, rather than with a fixed logic bug that would fail identically
+either way. A full `compute-sanitizer --tool memcheck` run was started
+against the same command to get an exact faulting-kernel address; at
+~0.3 t/s (roughly 140x normal decode speed under full instrumentation) it
+had reached only token 335/1,200 after 20 minutes without triggering the
+bug or completing, so it was abandoned as impractical within this session's
+time budget rather than left to finish. The exact command is preserved in
+[`cpu-kv-offload-rtx4070-qwen38-iq2-results/`](cpu-kv-offload-rtx4070-qwen38-iq2-results/README.md#reproducing-a-crash)
+for a future session with more time to let it run to completion or a fixed
+token budget.
+
+The one variable that reliably distinguishes every MTP run in this session
+(crash-prone) from every DSpark and baseline run (zero crashes, including
+DSpark runs of equal or greater length and context depth) is that MTP's
+draft head executes as a *second, concurrent GPU forward pass* on the same
+device, interleaved step-by-step with the target's own CPU-KV
+host-to-device staging copies (Characterization 003's established
+32-copies-per-token pattern). Baseline has no second GPU context at all.
+CPU-drafted DSpark (Characterization 022) has a second context, but its
+draft forward pass runs entirely on CPU and never issues GPU work that could
+race with the target's staging copies. The working hypothesis is therefore
+a race between the target's per-step host-to-device K/V staging copies and
+the draft context's own asynchronous GPU submissions — most likely a
+buffer whose backing gets reused or resubmitted before a prior graph
+replay that reads it has actually completed on the device, which fits both
+the reduced-but-nonzero crash rate under `CUDA_LAUNCH_BLOCKING` and the
+"illegal memory access" signature (a stale or out-of-range pointer baked
+into a reused CUDA graph or a copy destination touched again before an
+earlier read completed).
+
+### Disposition
+
+Not fixed in this pass. This needs a `compute-sanitizer` run allowed to run
+to completion (budget several hours at the ~140x slowdown observed here, or
+run on faster hardware) or a targeted audit of the CUDA-graph-reuse
+identity checks (`llama_context::process_ubatch`'s `can_reuse(gparams)` in
+`src/llama-context.cpp`, and per-input `can_reuse` overrides in
+`src/llama-graph.cpp`) for cases where a graph capturing the target's
+per-layer Q8 KV staging destination could be validly reused while MTP's
+draft-context submissions are still in flight against the same physical
+backing. A blind fix was deliberately not attempted: this fork's stated
+correctness bar for KV-cache-adjacent changes is verified, byte-identical
+behavior, not a plausible-sounding patch for a race condition that was
+never directly observed at the faulting instruction. On this hardware, in
+this session, roughly 5 of 6 sustained MTP requests reaching several
+hundred tokens or more without `CUDA_LAUNCH_BLOCKING=1` encountered an
+unrecoverable CUDA crash that took the whole server process down. Treat MTP
+as not proven safe for long unattended generations until this is
+understood, and until then, `CUDA_LAUNCH_BLOCKING=1` measurably (though not
+completely) reduces the risk as a stopgap at a real throughput cost (39.01
+t/s vs. 43.27-43.48 t/s clean, roughly -10%).
+
+## Characterization 022: DSpark's separate draft model does not fit GPU-resident on a 12 GiB card at its trained depth
+
+Status: characterization only; explains why Characterization 020's DSpark
+rows use `--n-gpu-layers-draft 0`. Reproduced on both Pass 1 and Pass 2
+binaries with identical failure signatures.
+
+### Observation
+
+Unlike `draft-mtp`, whose head is baked into the already GPU-resident
+target weights (Characterization 020's model file), `draft-dspark` loads a
+second, independent 1.36 GiB GGUF and constructs a second `llama_context`
+for it. On this RTX 4070 (11,902 MiB usable, ~9,227 MiB of which the IQ2_M
+target weights alone occupy) that second model has very little room left,
+and the room that is left is consumed first by the *target's own*
+recurrent-rollback planes, which are sized from `--spec-draft-n-max`
+independently of where the draft model's weights end up (`need_n_rs_seq()`
+in `common/common.h`, unchanged by this finding).
+
+Three clean-process attempts, `--kv-cpu-pinned --recurrent-state-offload
+--no-kv-offload`, `--n-gpu-layers-draft 99` (full GPU draft) in all three:
+
+| Attempt | `--spec-draft-n-max` | `--ctx-size` | Result |
+| --- | ---: | ---: | ---: |
+| 1 | 6 (trained depth) | 16384 | `cudaMalloc failed: out of memory` allocating the 1,444,430,208-byte (1,377.52 MiB) draft weight buffer |
+| 2 | 6 | 8192 | Same failure, same byte counts; reducing target context did not help because the shortfall is caused by recurrent-plane allocation, not context-proportional KV |
+| 3 | 3 | 8192 | Draft weights now load (freed by having 4 fewer recurrent planes), but the *draft's own* compute-buffer reservation of 550,586,368 bytes (525.08 MiB) then fails |
+| 4 | 2 | 4096 | Server starts, but the first request's lazily-allocated decode compute buffer (189,030,528 bytes, 180.27 MiB) fails; shutdown breakdown showed only 167 MiB free against 2,058 MiB reported "unaccounted," consistent with fragmentation/CUDA-driver overhead rather than a clean per-tensor shortfall |
+
+Every attempt failed at a different allocation site as the margin was
+narrowed, which is the signature of a hardware ceiling being approached from
+different directions rather than one fixable bug. Even the most aggressive
+reduction tested (`n_max=2`, `ctx-size=4096`, i.e. far below DSpark's
+trained 6-token block) could not make a GPU-resident draft usable end to
+end. Re-attempting the initial (attempt 1) configuration against the Pass 2
+binary reproduced the identical `cudaMalloc failed: out of memory` at the
+identical byte count, confirming Experiments 017/018 did not change this.
+
+### Working configuration
+
+`--n-gpu-layers-draft 0` (draft model fully CPU-resident) loads and serves
+successfully at `--spec-draft-n-max 6` and `--ctx-size 16384`, the same
+target-side configuration that fails with any nonzero
+`--n-gpu-layers-draft`. Confirmed memory breakdown at depth ~72 (the short
+prompt from Characterization 020, Pass 2):
+
+```text
+CUDA0 (RTX 4070) | 11902 = 627 free + (10550 = 9227 model + 1064 context + 258 compute) + 724 unaccounted
+Host              |  978 = 397 + 544 + 36
+```
+
+The 724 MiB "unaccounted" CUDA0 term is consistent with the draft model's
+own CUDA driver/context overhead even though its weights and compute buffer
+are CPU-resident; `common_memory_breakdown_print` only itemizes the primary
+(target) `llama_context`.
+
+### Disposition
+
+On this 12 GiB card, DSpark is CPU-draft-only in practice, regardless of
+`--spec-draft-n-max`. This is a materially different deployment story from
+MTP, which never needs a second model load or a second VRAM budget at all,
+and it is also the reason DSpark never exercises the concurrent-GPU-stream
+condition implicated in Characterization 021's MTP crash. This is not
+evidence that DSpark's algorithm is worse than MTP's; it is evidence that
+this PR's CPU-KV-offload optimizations (pinned host KV, decoupled recurrent
+placement, partial GPU KV residency) were designed and tuned against MTP's
+zero-extra-VRAM profile, and DSpark's separate-model profile does not
+benefit from the same headroom assumptions on constrained hardware. A GPU
+with more headroom above the target weights was not available to test this
+on for this entry.
+
+## Characterization 023: DSpark's CPU-resident draft degrades with context depth and contends with target CPU-KV work
+
+Status: characterization only.
+
+### Within-request decode degradation
+
+The creative-prompt DSpark run from Characterization 020 (`--spec-draft-n-max
+6 --n-gpu-layers-draft 0`, 400 requested output tokens) logs a rolling 3-second
+decode rate throughout generation:
+
+| Tokens decoded | Rolling decode t/s |
+| ---: | ---: |
+| 104 | 20.28 |
+| 138 | 10.96 |
+| 201 | 10.32 |
+| 262 | 10.22 |
+| 321 | 10.08 |
+| 380 | 9.23 |
+
+Throughput falls by more than half within a single 400-token generation and
+then plateaus around 9-10 t/s. The equivalent MTP-5 run on the same prompt
+holds 55.55 t/s at 167 tokens decoded and 49.33 t/s (tg_3s 43.17) by 298
+tokens decoded — MTP also slows as context grows (the established
+context-linear CPU-KV cost from Characterization 003 applies to both,
+since both keep target attention K/V on CPU), but from a much higher
+starting point and without DSpark's additional CPU-side draft cost stacking
+on top.
+
+### Depth-scaling comparison
+
+The 12,000-token synthetic-prompt decode rates from Characterization 020,
+repeated here for emphasis:
+
+| Config | Decode t/s at ~12,000-token depth |
+| --- | ---: |
+| baseline (no speculation) | 23.50 |
+| MTP-5 | 72.21 |
+| DSpark-6 (CPU draft) | **3.52** |
+
+At this depth DSpark is 85% slower than not speculating at all, and roughly
+20x slower than MTP. The mechanism is CPU contention plus CPU attention
+cost, not poor draft acceptance: acceptance was 100% (11/11) on this
+trivially predictable prompt, matching MTP's 100% (20/20) exactly. The
+1.36B DSpark draft model runs its own attention over its own accumulated
+context on the same three P-cores (`taskset -c 0,2,4`) that the target's
+CPU-resident Q8_0 K/V attention staging already occupies; MTP's draft head
+executes on the GPU as part of the target's own forward pass and does not
+compete for those cores at all. Both the draft model's own per-step CPU
+attention cost (growing with the draft context depth) and the target's
+established CPU-KV attention cost (Characterization 003: ~0.7 microseconds
+per cached token) grow with depth simultaneously here, compounding rather
+than adding independently.
+
+### Disposition
+
+CPU-drafted DSpark's decode cost is not a fixed per-token tax; it is a
+second context-dependent CPU cost layered on top of the CPU-KV-offload cost
+this PR already characterizes for the target model. On hardware where
+DSpark's draft model must run on CPU (Characterization 022), DSpark decode
+throughput should be expected to degrade faster with context depth than
+either baseline or MTP, and can fall behind both, not just behind MTP,
+before a session gets long. This is a hardware/deployment interaction, not a
+flaw introduced by this PR's CPU-KV-offload changes: the same draft model
+would not need to compete with target CPU-KV work at all if it ran
+GPU-resident, which Characterization 022 shows is not possible on this card.
+It also means DSpark cannot trigger Characterization 021's concurrent-GPU-
+stream crash mechanism on hardware where it is CPU-draft-only, which is an
+accidental stability upside of the same VRAM constraint.
+
+## Characterization 024: `--spec-draft-n-max` silently defaulted to 3 for DSpark instead of its trained depth — fixed
+
+Status: fixed. `common_speculative_resolve_dflash_draft_n_max`'s type check
+(`common/common.cpp`) now also matches `COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK`,
+not only `COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH`. Pre-existing on this
+branch's base, not introduced by this PR's CPU-KV-offload work.
+
+### Mechanism (before the fix)
+
+`common_speculative_resolve_dflash_draft_n_max` reads the *draft* GGUF's
+`dflash.block_size` metadata and sets `params.draft.n_max = block_size - 1`
+when the user has not passed `--spec-draft-n-max` explicitly, but the type
+check gating this behavior read:
+
+```cpp
+const bool has_dflash = std::find(
+        params.types.begin(), params.types.end(),
+        COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
+if (!has_dflash || params.draft_n_max_explicit) {
+    return true;
+}
+```
+
+`COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK` is a distinct enum value from
+`COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH`, even though a DSpark GGUF reports
+`general.architecture = dflash` and carries the same `dflash.block_size` key
+(confirmed by direct inspection of `Qwen3.8-27B-DSpark-Q8_0.gguf`:
+`dflash.block_size = 7`). The `has_dflash` check did not match `--spec-type
+draft-dspark`, so the resolver returned immediately without reading the
+draft GGUF at all, and `params.draft.n_max` kept its
+`common_params_speculative_draft` default of 3 (`common/common.h`) rather
+than the intended 6.
+
+### Confirmation (before the fix)
+
+Two clean `llama-server` processes, identical flags apart from
+`--spec-draft-n-max`, both against `Qwen3.8-27B-DSpark-Q8_0.gguf`. Server
+startup logs (`common_speculative_impl_draft_dflash`) reported the depth
+the process actually used:
+
+| Invocation | Logged depth | Prompt eval | Decode | Acceptance |
+| --- | --- | ---: | ---: | --- |
+| `--spec-type draft-dspark` (no `--spec-draft-n-max`) | `n_max=3, ... block_size=7` | 326.69 t/s | 10.90 t/s | 94.9% (185/195), mean len 2.36 |
+| `--spec-type draft-dspark --spec-draft-n-max 6` | `n_max=6, ... block_size=7` | 325.34 t/s | 10.72 t/s | 95.0% (228/240), mean len 2.40 |
+
+Both requests used the 135-token coding prompt from Characterization 020
+with 1,200 requested output tokens. Decode throughput was within
+run-to-run noise between the two on this CPU-draft-bottlenecked
+configuration (CPU draft inference dominates regardless of how many extra
+tokens a single verification batch could in principle draft), so the
+throughput impact of the gap was small *here*, but the depth actually
+served silently did not match the depth `block_size` says the model was
+trained for, and the default configuration drafted and verified fewer
+tokens per round (195 vs 240 generated over the same output length) for no
+documented reason.
+
+### The fix
+
+```cpp
+const bool has_dflash_family = std::any_of(
+        params.types.begin(), params.types.end(), [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+if (!has_dflash_family || params.draft_n_max_explicit) {
+    return true;
+}
+```
+
+Verified against the same DSpark GGUF: omitting `--spec-draft-n-max` now
+logs `DFlash: omitted --spec-draft-n-max defaults to the drafter block
+depth (6); pass the flag to override`, matching the explicit-6 behavior
+above exactly. The historical fixed binary passed `test-arg-parser` and the
+standard focused CTest selection (`test-kvarn`, `test-adaptive-dm`,
+`test-server-loop-guard`). The rebased PR adds a direct `DRAFT_DSPARK`
+fixture assertion that reads the same `dflash.block_size` metadata and checks
+the derived default. No other call site depends on DSpark being excluded from
+this resolver.
+
+### Full-throughput verification on the fixed binary
+
+The log line above only confirms the *resolved depth*, not that the fixed
+default path behaves identically to explicitly passing the now-correct
+value at runtime. Two more clean-process requests, same 135-token coding
+prompt, 1,200 requested output tokens, same fixed binary (with the patch
+above applied and rebuilt):
+
+| Invocation | Decode t/s | Draft acceptance |
+| --- | ---: | --- |
+| Fixed default (`--spec-draft-n-max` omitted, resolves to 6) | 10.53 | 93.8% (211/225), mean len 2.34 |
+| Explicit `--spec-draft-n-max 6` (same fixed binary) | 10.52 | 93.8% (211/225), mean len 2.34 |
+
+Identical within run-to-run noise, and matching the pre-fix explicit-6 row
+in the table above almost exactly (325.34/325.80 t/s prefill, 10.72/10.53
+t/s decode, 228 vs 211 accepted out of a similar generated count on
+different single runs) — confirming the fixed default path reaches the
+same runtime state as the explicit flag, not a new or different code path.
+
+**This fix does cost a small amount of throughput relative to the old
+buggy default**, and that should be stated plainly rather than left
+implicit: the old silent `n_max=3` behavior in the first table of this
+entry decoded at 10.90 t/s; the corrected `n_max=6` default decodes at
+10.53 t/s, about **-3.4%** on this CPU-bound DSpark configuration. This is
+expected, not a regression to chase: the old behavior was only faster
+because it was silently drafting shallower than the model was trained for,
+and each additional CPU-side draft step has a real cost on this
+CPU-drafted, CPU-bottlenecked configuration (Characterization 023). Mean
+accepted draft length barely moved (2.34 vs 2.36), so the deeper draft is
+not buying materially better acceptance here either — the fix trades a
+small, explicable amount of speed for actually matching the drafter's
+trained depth, rather than silently under-drafting.
+
+### Disposition
+
+Fixed and verified end-to-end: the resolved depth, the runtime behavior at
+that depth, and the throughput/acceptance consequence of the fix are all
+confirmed on the same rebuilt binary. Every DSpark measurement in
+Characterizations 020-023 above already passed `--spec-draft-n-max 6`
+explicitly and is therefore unaffected by this bug either way; this entry
+exists so that a `--spec-type draft-dspark` deployment that omits the flag
+going forward gets the model's actual trained depth — at a small, expected
+CPU-bound throughput cost — instead of a silently faster but incorrect
+fallback to 3.
+
+## Characterization 025: draft-ubatch, partial GPU KV residency, and the MTP recurrent-plane cap on Qwen3.8 IQ2_M / RTX 4070
+
+Status: characterization only, **Pass 1 data, pinned to commit `53adab814`**.
+Confirms Experiments 007/011/012/013's mechanisms function correctly on
+this branch/hardware/quant combination and extends coverage to DSpark. All
+runs use the short 72-token prompt (64 requested output tokens, populated
+depth ~68-136) from Characterization 020 unless noted, as a fast screening
+protocol; this is intentionally *not* the deep-context regime where
+Experiment 011 demonstrated partial GPU KV residency's full effect, which
+is already established and not repeated here.
+
+**Provenance caveat:** this entry's MTP rows use `--spec-draft-ubatch-size
+128`, which Experiment 017 (landed after `53adab814`, present in this
+branch's current tip) now identifies as an output-changing geometry
+mismatch and hard-rejects for `draft-mtp` at the CLI level (verified:
+attempting this exact combination against the current binary fails with
+`draft-mtp requires spec-draft-ubatch-size (128) to match the target ubatch
+(512) ...`; see `smoke-mtp-ubatch-mismatch` in the results archive). Per
+this project's own documentation convention ("If a run violates the
+matching contract, preserve it as an invalid or diagnostic artifact... Do
+not publish its directional numbers as a candidate-versus-baseline
+result," `cpu-kv-offload-current-testing.md`), the *absolute* MTP throughput
+numbers below are historical and not accepted evidence for the current
+protocol. They are
+retained because each individual comparison (ubatch sweep aside) held the
+mismatched geometry constant on *both* sides of its own comparison, which
+keeps the *relative* delta each sub-experiment measures (the effect of
+`--kv-gpu-layers`, `--spec-mtp-rs-planes`, or `--phase-aware-workspace`
+specifically) meaningful even though the baseline geometry underneath it is
+superseded. The DSpark rows are unaffected: DSpark is not an MTP-family
+type and keeps its independent draft ubatch (`current-testing.md`: "DFlash
+and other non-MTP model-backed modes remain able to use an independent
+draft ubatch").
+
+### `--spec-draft-ubatch-size` sweep (MTP)
+
+| Draft ubatch | Decode t/s | Draft CUDA0 compute buffer |
+| ---: | ---: | ---: |
+| 512 (inherited default, the only value the current binary accepts) | 68.83 | 194.27 MiB |
+| 128 (historical; now CLI-rejected) | 68.78 | 122.27 MiB (-72.00 MiB) |
+| 32 (historical; now CLI-rejected) | 69.06 | 104.27 MiB (-90.00 MiB) |
+
+Matches Experiment 007's established shape exactly: real, ubatch-proportional
+VRAM savings in the draft context's own compute-buffer reservation
+(confirmed via the draft context's `sched_reserve` log line, not the
+target's `memory breakdown` table, which does not include the second
+context), diminishing below 128, and no measurable decode-throughput cost
+in this short (64-token) screen — the same blind spot Experiment 017's own
+1,000-token diagnostic identified: its divergence from clean Bee first
+appeared at generated token 100, past what a 64-token screen can see. This
+entry's short-prompt ubatch rows should therefore be read as a VRAM-only
+result; they predate and do not contradict Experiment 017's later,
+longer-horizon finding that non-matching draft ubatch changes MTP's output.
+A DSpark control at the same settings (`--spec-draft-ubatch-size 128`,
+`--n-gpu-layers-draft 0`) decoded at 16.95 t/s, statistically identical to
+the other DSpark short-prompt runs in this session (16.88-17.00 t/s across
+both passes): with the draft forced onto CPU, its GPU compute-buffer
+reservation is not the bottleneck, so this flag has no observable effect
+for DSpark on this card, and DSpark's independent-ubatch entitlement was
+never in question.
+
+### `--kv-gpu-layers` sweep (baseline, MTP, DSpark)
+
+| `--kv-gpu-layers` | Baseline decode | MTP-5 decode | DSpark-6 decode |
+| ---: | ---: | ---: | ---: |
+| 0 (fully host-resident) | 39.64 t/s | 69.01 t/s | 16.98 t/s |
+| 8 | 39.89 t/s | 71.16 t/s | 16.96 t/s |
+| 16 (fully GPU-resident) | 40.45 t/s | 71.02 t/s | 16.98 t/s |
+
+At this shallow populated depth (~68-136 tokens), the effect is small for
+baseline and MTP (+2.0% and +3.1% respectively from 0 to 16) — consistent
+with Experiment 011's finding that the dial's benefit is proportional to
+context depth, which this screening protocol deliberately does not reach.
+DSpark shows no measurable effect at all (16.98/16.96/16.98 t/s, within
+noise): its decode rate is set by CPU-side draft-model inference
+(Characterization 023), so moving the *target's* attention K/V between host
+and device changes nothing while that CPU bottleneck dominates. Memory
+breakdown confirms the dial still moves bytes rather than adding them for
+all three configurations, e.g. DSpark's context term grows 1,047 -> 1,319 ->
+1,591 MiB from `kv-gpu-layers` 0 to 16 as KV migrates onto the device, the
+same per-layer accounting Experiment 011 established.
+
+### `--spec-mtp-rs-planes` (MTP only; explicit DSpark rejection)
+
+Matched pair at `--spec-draft-n-max 6` (the DSpark-intended depth, chosen so
+this table is directly comparable to Characterization 024's DSpark rows),
+1,200-token coding-prompt requests:
+
+| `--spec-mtp-rs-planes` | Recurrent-plane policy (server log) | Target recurrent context |
+| --- | --- | ---: |
+| 0 (full) | `total planes = 7, direct rollback horizon = 6, full-shape GPU replay = disabled` | 1,047 MiB |
+| 4 (capped) | `total planes = 4, direct rollback horizon = 2, full-shape GPU replay = enabled` | 598 MiB (-449 MiB, -42.9%) |
+
+Both requests crashed before completion (Characterization 021 — this is two
+of the eight crash data points in that entry's table), so no
+completed-request decode/acceptance comparison is available from this
+session; the recurrent-context VRAM saving itself (449 MiB, matching
+Experiment 013's ~150 MiB/plane rate exactly: 3 fewer planes x 149.6 MiB)
+is confirmed from the startup/shutdown memory breakdown independent of the
+crash, and is unaffected by the crash's root cause since it is a static
+allocation-time measurement.
+
+Passing `--spec-mtp-rs-planes` together with `--spec-type draft-dspark`
+fails fast, before model loading, with:
+
+```text
+spec-mtp-rs-planes requires --spec-type draft-mtp
+```
+
+This is `common_validate_speculative_params`'s explicit, correct rejection
+(`common/common.cpp`) — the recurrent-plane cap and its sparse-GPU-replay
+mechanism were built and validated (Experiments 012/013) specifically
+against MTP's Gated Delta Net state layout and are not offered as an option
+for DSpark at all. DSpark still allocates one recurrent-rollback plane per
+possible draft position exactly as MTP does without the cap
+(`need_n_rs_seq()` returns `draft.n_max` for both when the cap is not MTP),
+so DSpark pays the *same uncapped* recurrent-plane VRAM cost as full-plane
+MTP at equal `--spec-draft-n-max` (visible already in Characterization 022's
+OOM sequence, where reducing `--spec-draft-n-max` was the only lever that
+freed enough VRAM to load the draft model at all) with no equivalent lever
+to reduce it. This is a second concrete respect (alongside
+Characterization 024's now-fixed depth-resolution gap) in which this
+branch's MTP optimizations have not been extended to DSpark: MTP's
+rollback-plane cost is tunable down to 42.9% of its default here, DSpark's
+is not tunable at all.
+
+### Disposition
+
+All three mechanisms behave on this hardware/quant exactly as their
+originating experiments established: real VRAM/compute-buffer effects with
+no decode-throughput cost for `--spec-draft-ubatch-size` (within this
+entry's short-prompt screening horizon), depth-proportional gains for
+`--kv-gpu-layers` too small to see at this screening depth, and a confirmed
+449 MiB / 42.9% recurrent-VRAM reduction for `--spec-mtp-rs-planes`. None of
+the three currently do anything for DSpark beyond `--spec-draft-ubatch-size`'s
+no-op confirmation: `--kv-gpu-layers` is masked by DSpark's CPU-draft
+bottleneck, and `--spec-mtp-rs-planes` is explicitly unavailable to it while
+DSpark still incurs the cost it would cap. The `--spec-draft-ubatch-size`
+sub-experiment's *absolute* MTP numbers are superseded by Experiment 017;
+re-running it under the current, ubatch-matched protocol is not possible
+(there is now only one legal value to sweep), so this entry's role going
+forward is historical evidence for why the mismatch was rejected, matching
+`cpu-kv-offload-current-testing.md`'s own framing of that data.
+
+## Characterization 026: phase-aware-workspace extends cleanly to DSpark
+
+Status: retained finding, **Pass 1 data, pinned to commit `53adab814`**;
+extends Experiment 016's MTP-only measurement to DSpark for the first time.
+The MTP row's `--spec-draft-ubatch-size 128` carries the same provenance
+caveat as Characterization 025; the DSpark row is unaffected (see that
+entry's caveat for why).
+
+### Result
+
+Experiment 016 measured `--phase-aware-workspace` only against `draft-mtp`,
+noting "integrated MTP is the current consumer because it has two sequential
+schedulers to share" — but the option is wired generically in
+`common_base_params_to_speculative` (`common/speculative.cpp`) for any
+speculative draft context, not gated to MTP. DSpark also constructs two
+sequential schedulers (target and draft), so this entry tests it there too,
+matched pair, 1,200-token coding-prompt requests, `--spec-draft-n-max 6`:
+
+| | Off | On | Change |
+| --- | ---: | ---: | ---: |
+| Decode t/s | 10.745 | 10.738 | -0.07% (noise) |
+| Draft acceptance | 95.0% (228/240), mean len 2.40 | 95.0% (228/240), mean len 2.40 | identical |
+| CUDA0 compute buffer (shutdown) | 258 MiB | 116 MiB | **-142 MiB (-55.0%)** |
+| CUDA_Host compute buffer (shutdown) | 36 MiB | 0 MiB | -36 MiB |
+| CUDA0 free (shutdown) | 635 MiB | 777 MiB | +142 MiB |
+
+The matched MTP-5 pair from Experiment 016's own mechanism, re-measured here
+at this shallower 16K context (versus Experiment 016's 140K) for a
+same-session comparison point:
+
+| | Off | On | Change |
+| --- | ---: | ---: | ---: |
+| Decode t/s | 43.41 | 42.95 | -1.06% |
+| Draft acceptance | 87.7% (398/454), mean len 2.61 | 87.7% (398/454), mean len 2.61 | identical |
+| CUDA0 compute buffer (shutdown) | 194 MiB | 99 MiB | -95 MiB (-49.0%) |
+| CUDA_Host compute buffer (shutdown) | 36 MiB | 0 MiB | -36 MiB |
+
+Both pairs show the same qualitative signature Experiment 016 established at
+140K context: a real compute-buffer reduction (49-55% here, smaller in
+absolute MiB than Experiment 016's 1,108 MiB because this context is 16K
+rather than 140K and the saved allocation is prompt-geometry-proportional),
+identical draft acceptance and generated-token counts, and a small
+(&lt;1.1%) decode cost. The workspace-transition log lines confirm exactly one
+grow/shrink cycle per request for both MTP and DSpark
+(`workspace transitions = target 1/2 (... 1 grow / 1 shrink ...), draft
+1 (... )`), the same signature Experiment 016's group-epoch fix produced.
+Neither run in this pair crashed; Characterization 021's crash mechanism did
+not reproduce on this particular MTP configuration in this session, which
+is consistent with that finding's non-deterministic, ~33-83%-observed crash
+rate rather than evidence against it.
+
+### Disposition
+
+`--phase-aware-workspace` is not MTP-specific in practice: it produces the
+same class of compute-buffer saving for DSpark's separate target/draft
+scheduler pair, with no observed acceptance or output-count change. This is
+a first confirmation only (single runs, no byte-identical-output hash check
+was performed for the DSpark pair the way Experiment 016 hashed its MTP
+outputs), but it is a positive result in the same direction Experiment 016
+already recommends enabling by default for any two-scheduler speculative
+configuration, DSpark included. Re-running this pair under the current,
+ubatch-matched MTP protocol (Characterization 025's caveat) to get a
+current-provenance number is future work, not expected to change the
+qualitative finding since this entry's own DSpark half of the pair already
+used the unaffected, always-current DSpark configuration.

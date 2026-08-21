@@ -541,10 +541,11 @@ std::string common_params_get_system_info(const common_params & params) {
 bool common_speculative_resolve_dflash_draft_n_max(
         common_params_speculative & params,
         const std::string & draft_model_path) {
-    const bool has_dflash = std::find(
-            params.types.begin(), params.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
-    if (!has_dflash || params.draft_n_max_explicit) {
+    const bool has_dflash_family = std::any_of(
+            params.types.begin(), params.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    if (!has_dflash_family || params.draft_n_max_explicit) {
         return true;
     }
 
