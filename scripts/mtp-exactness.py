@@ -1407,6 +1407,8 @@ def run_case(
     error: BaseException | None = None
     peak_vram_mib = 0
     peak_process_kib: dict[str, int] = {}
+    startup_seconds = 0.0
+    startup_sample: dict[str, Any] = {}
     completion_results: dict[str, dict[str, Any]] = {}
     ordered_results: list[dict[str, Any]] = []
     step_summaries: list[dict[str, Any]] = []
@@ -1414,7 +1416,19 @@ def run_case(
     try:
         health = wait_for_server(base_url, process, float(manifest.get("startup_timeout_seconds", 600)))
         json_dump(case_dir / "health.json", health)
-        print(f"[{name}] server ready after {time.monotonic() - started:.1f}s", flush=True)
+        startup_seconds = time.monotonic() - started
+        startup_sample = {
+            "elapsed_seconds": round(startup_seconds, 3),
+            "utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "process": process_sample(process.pid),
+            **gpu_sample(process.pid),
+        }
+        json_dump(case_dir / "startup-sample.json", startup_sample)
+        print(
+            f"[{name}] server ready after {startup_seconds:.1f}s "
+            f"vram={startup_sample.get('vram_mib', '?')} MiB",
+            flush=True,
+        )
 
         for index, step in enumerate(sequence):
             if legacy_layout:
@@ -1512,6 +1526,8 @@ def run_case(
         "identity": identity,
         "server": str(server_path),
         "server_sha256": sha256_file(server_path),
+        "startup_seconds": startup_seconds,
+        "startup_sample": startup_sample,
         "elapsed_seconds": elapsed,
         "peak_vram_mib": peak_vram_mib,
         "peak_process_kib": peak_process_kib,

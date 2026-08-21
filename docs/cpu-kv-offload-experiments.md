@@ -3522,7 +3522,7 @@ while the remaining feature lanes stay independently published:
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
 | [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | validated evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; refreshed source checkpoint `107b926e5`; documentation base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. PR 9 changed no relevant production/build/CLI/test tree, and the refreshed PR 8 source delta is identical, so the prior GPU evidence remains authoritative. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; refreshed source checkpoint `107b926e5`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; exact base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. The prior enabled evidence remains authoritative, and the fresh exact-base A/B/A gate separately proves omission and explicit off neutral. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
@@ -4005,7 +4005,119 @@ The prior published head was
 checkpoint is `107b926e5`. Their path-limited binary source/test/CLI delta is
 byte-identical against their respective bases, including the opt-in/default-
 off control, capability fallback, generated argument surfaces, manifests, and
-static/runtime tests. The complete Experiment 020/021 evidence above is copied
-verbatim from the old head; no identity, output, PPL, memory, or performance
-measurement is relabeled. Because neither the base nor candidate production
-behavior changed, this refresh needs no GPU rerun.
+static/runtime tests. The enabled Experiment 020/021 evidence above is copied
+verbatim from the old head; no enabled identity, output, PPL, memory, or
+performance measurement is relabeled. Production equivalence preserves that
+evidence but does not prove disabled-source isolation. The following fresh
+gate closes that separate requirement.
+
+### Exact-base disabled-source isolation gate
+
+The accepted gate compared exact base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` with PR 8 runtime source
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`. PR 4
+`591337d` and PR 7 `d4183adb` are not ancestors of either measured tree. No
+native-Q8, compact-mask, phase-aware, speculative, or MTP option was enabled.
+The two candidate forms were a literally omitted live-workspace argument and
+explicit `--no-live-context-workspace`. Base/candidate builds were clean,
+separate, identically configured Release CUDA 13.3 builds with
+`GGML_CUDA=ON`, `GGML_NATIVE=ON`, `GGML_CUDA_FA=ON`, default KVarN, the default
+quant matrix, sm_120a, build number 11253, and 804/804 build targets complete.
+The base source archive SHA-256 was
+`a244664dfb7ede7c8412a17e8723defbe0c7867261992e2e8f7a4f5f800b0497`.
+
+The hardware was one RTX 5070 Ti, 16,303 MiB, driver 610.57.04, with an Intel
+Core Ultra 9 285K host. The model and PPL corpus hashes remained
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`
+and `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
+Every CUDA-linked process, including preflight probes, was wholly inside
+`flock /tmp/beellama-single-gpu.lock -c`; no `taskset` was used. Native
+affinity, model, prompts, sampling, cache placement, q8_0/q8_0 cache formats,
+batch/ubatch, and every unrelated opt-in were matched. Every case was a fresh
+process in base-a1 / candidate-omitted / base-a2 / candidate-explicit-off /
+base-a3 order. Exactness exposed health-ready and per-request progress; bench
+used `--progress`; PPL printed every chunk. One locked benchmark setup attempt
+contained an unsupported bench-only option and exited before model load. Its
+partial output directory was removed and replaced by the accepted matrix below;
+it contributes no measurement or artifact entry.
+
+The maintained runner captured health-ready elapsed time and process/GPU
+startup state before the first request. All five 1K cases produced token hash
+`cd8d20d1270ee556a5035994abe08e55fab1a38600a89208becbc9e348e8d283`
+and content hash
+`8f92baeebe9a6e716d250ded940e15f02ce545d18fcc1b444a9a330a7d973b1a`.
+All five 32K lifecycles produced combined token hash
+`e1456f0e9d9b51c1dfaa5e96f84860b17b35b9fd8b51be2a89d85d659be94551`
+and content hash
+`4acebc66ed87af64f6f46dde0cf58f3e470a4260e3446a2354a2ce66d7f85566`;
+the long request and both next turns were individually exact.
+
+| 32K lifecycle | base a1 / a2 / a3 | PR 8 omitted | PR 8 explicit off |
+|---|---:|---:|---:|
+| health-ready startup | 2.214 / 2.348 / 2.308 s | 2.256 s | 2.343 s |
+| startup process VRAM | 13,644 / 13,644 / 13,644 MiB | 13,644 MiB | 13,644 MiB |
+| long-prefill peak VRAM | 13,658 / 13,658 / 13,658 MiB | 13,658 MiB | 13,658 MiB |
+| first next-turn peak VRAM | 13,662 / 13,662 / 13,662 MiB | 13,662 MiB | 13,662 MiB |
+| post-shrink next-turn peak VRAM | 13,662 / 13,662 / 13,662 MiB | 13,662 MiB | 13,662 MiB |
+| startup `RssAnon` | 315,204 / 317,236 / 317,248 KiB | 317,260 KiB | 315,204 KiB |
+| startup `RssShmem` | 1,197,800 / 1,197,868 / 1,197,868 KiB | 1,179,940 KiB | 1,179,940 KiB |
+| `VmLck` | 0 / 0 / 0 KiB | 0 KiB | 0 KiB |
+
+The lower candidate `RssShmem` sample is outside allocator-owned W02 classes
+and is not promoted as a feature saving. It is nevertheless non-regressive.
+Server logs prove all five 32K cases made exactly one upfront reservation of
+342.27 MiB CUDA plus 52.28 MiB `CUDA_Host`; reserve time was 16.74 / 19.16 /
+18.57 ms for base, 18.32 ms omitted, and 19.01 ms explicit off. At 1K every
+case likewise made one upfront reservation of 126.27 MiB plus 24.28 MiB. No
+disabled candidate logged a live grow, contraction, or idle trim.
+
+Repeated bench used `-p 512 -n 64 -b 1024 -ub 512 -t 3 -C 0x7
+--cpu-strict 1 --poll 100 -ngl 999 -sm none -mg 0 -nkvo 1
+--kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 -fa on
+-ctk q8_0 -ctv q8_0 --no-warmup --progress --kv-memory -o jsonl`, with ten
+repetitions at depth 4096 and five at depth 30000:
+
+| Depth / phase | base a1 / a2 / a3 | PR 8 omitted | PR 8 explicit off |
+|---|---:|---:|---:|
+| 4K prefill | 1793.907 / 1787.121 / 1787.803 t/s | 1790.580 t/s | 1786.349 t/s |
+| 4K decode | 42.6290 / 42.5958 / 42.7222 t/s | 42.6535 t/s | 42.6463 t/s |
+| 30K prefill | 1218.524 / 1219.400 / 1220.210 t/s | 1219.469 t/s | 1219.036 t/s |
+| 30K decode | 23.8030 / 23.8673 / 23.8621 t/s | 23.8008 t/s | 23.8676 t/s |
+
+Omitted and explicit off are within the base bracket or run-to-run dispersion;
+there is no stable throughput regression. Every base and candidate W02 field
+matched exactly at a given depth/phase. At 4K, prefill/decode synchronized
+CUDA high-water was 14,521,860,096 / 14,509,277,184 bytes; VMM live high-water
+was 14,632,960 / 421,120 and mapped high-water was 14,680,064 / 2,097,152
+bytes. At 30K the corresponding CUDA high-water was 14,523,957,248 /
+14,511,374,336 bytes with the same VMM values. Device context/compute was
+174,718,976 / 529,532,928 bytes throughout. Accelerator-host
+context/compute was 160,432,128 / 25,989,152 bytes for 4K prefill,
+151,519,232 / 25,727,008 for 4K decode, 1,069,547,520 / 52,727,840 for 30K
+prefill, and 1,051,721,728 / 52,203,552 for 30K decode. Ordinary-host context
+and compute were both zero. These classes are the pinned-versus-ordinary host
+accounting; process `VmLck` alone does not measure CUDA host registration.
+
+Matched PPL ran four chunks in all five clean processes. Every case reported
+the identical sequence `1.9315`, `2.1279`, `2.2498`, `2.1674` and final
+`2.1674 +/- 0.03849`; the candidate increase is exactly zero.
+
+Candidate Release CPU and CUDA builds completed. The full CPU CTest suite was
+97/98; the sole failure, `test-tokenizers-ggml-vocabs`, was environmental:
+six expected GGUF fixtures are Git-LFS pointer text. Seven proportional CUDA
+CTest targets passed 7/7, and the exactness runner passed 35/35 unit tests.
+The final documentation/harness commit is rebuilt and retested separately as
+the branch-head publication gate.
+
+| Disabled-gate artifact | Location | SHA-256 |
+|---|---|---|
+| 1K provenance / comparisons / summary | `/tmp/pr8-disabled-gate-1k-20260821-r1` | `f0c1be64cc4fb0890c7786f840b299927adae576e5c7a6a96501586e35b6c02d` / `a387c4d5508ce0af80772cb27b01c08307264d721c78f771cc414aaef2eccc5f` / `ceb1128f0053178a94d3b590bbb06ba0e81a316d741f001d03912769ed6f6d19` |
+| 32K provenance / comparisons / summary | `/tmp/pr8-disabled-gate-32k-20260821-r1` | `b40035e876eb6519d16e30550b621b4f9b9faeac0262adb2118fdc0831459f7f` / `bafcb7d321542e94ad0432014f761795313dd3adb2193483e61de5f7f3197f8e` / `4794c790519753ed00e5752ca74519e92cd006a3eba95478342ff314370dc800` |
+| PPL artifact inventory | `/tmp/pr8-disabled-ppl-20260821-r1` | `51cbc6abab0caca4a054ef45bb3a9ba22d39c8edbef39a265a72093e35e57523` |
+| bench artifact inventory | `/tmp/pr8-disabled-bench-20260821-r1` | `c04ece4755293da40acebfa7995d1fb8add0b39f5841f722668a91a39de472a6` |
+| full CPU / focused CUDA CTest logs | branch-local ignored evidence directory | `b51aa25abc579ec73d37006a2a1e7bb16d0ff59d2c40f441fb4c3deb6ae41920` / `4e1768f90aaef5347ee77a70195572b8e9a37c905fce2c2f48cd5ee3d8b3196b` |
+
+Disposition: retain PR 8 unchanged in production code. The exact disabled
+source gate preserves upstream upfront allocation, output, quality, allocator
+classes, process VRAM, and performance. No confirmed dormant-path overhead
+exists to justify a speculative cleanup.

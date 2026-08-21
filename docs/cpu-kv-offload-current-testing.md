@@ -13,8 +13,13 @@ PR 8 is refreshed onto the documentation-only base
 checkpoint is `107b926e5`; path, tree, and binary-delta comparison against the
 previous published head `0c8df007a504f16aa35fc5982303e3e1b9883331`
 shows that the live-context implementation, CLI, generated arguments, and
-tests are unchanged. The refresh therefore requires documentation/static
-validation, not a new GPU measurement claim.
+tests are unchanged. That equivalence does not replace the exact source-level
+disabled-path gate: final PR 8 evidence compares this exact base with fresh
+candidate processes at measured runtime head
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`, using both omission and explicit
+off. The 2026-08-21 A/B/A gate passed exact output and PPL, full upfront
+reservation, identical allocation/VMM fields, and neutral repeated 4K/30K
+throughput; Experiment 021 owns the exact measurements and artifacts.
 
 The companion documents have deliberately separate roles:
 
@@ -148,7 +153,9 @@ For a server lifecycle, use a harness that owns the lock, verifies the clean
 GPU, starts the server, waits for health, runs the client and samplers, stops
 the server gracefully, waits for every child, and only then exits. The
 maintained exactness runner already follows that fresh-process lifecycle; put
-the whole runner under the outer lock.
+the whole runner under the outer lock. It records health-ready elapsed time and
+a process/GPU startup sample before the first request, then preserves the
+request-level process, VRAM, timing, output, and progress artifacts.
 
 ## Preflight and binary identity
 
@@ -158,8 +165,6 @@ Run before a measurement:
 cd /home/gencoolpc/beellama-kv-offload
 git status --short --branch
 git rev-parse HEAD
-build-cuda-all/bin/llama-server --version
-build-cuda-all/bin/llama-bench --version
 llama-benchy --version
 sha256sum build-cuda-all/bin/llama-server \
   build-cuda-all/bin/llama-bench \
@@ -167,7 +172,11 @@ sha256sum build-cuda-all/bin/llama-server \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
   /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
   /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt
-nvidia-smi
+flock /tmp/beellama-single-gpu.lock -c '
+  build-cuda-all/bin/llama-server --version
+  build-cuda-all/bin/llama-bench --list-devices
+  nvidia-smi
+'
 ```
 
 Do not present an uncommitted or differently configured binary as evidence for
