@@ -3520,7 +3520,7 @@ are present there, while the remaining lanes stay independently published:
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
 | [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | pending published head `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Default-off live-context workspace growth, all-idle trim, branch evidence, and source-coupled user/preset/generated argument documentation; await its final head. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | final head `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, final Experiment 021, and source-coupled user/preset/generated argument documentation; draft/open/mergeable/clean, six ahead and zero behind. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
@@ -3540,7 +3540,48 @@ re-measure A/B/A performance or memory on the composed base. Failed setup and
 identity probes, unmatched launches, and rejected noisy timing are not evidence
 and are not copied here.
 
-Re-fetch PR 8 when its final head is published. Branch source, generated
-arguments, presets, and feature-specific reproductions remain with their PR
-until source lands; shared protocol, research, roadmap, isolation, and identity
-indexing belong in the KV line.
+PR 8's final Experiment 021 validated the live workspace on the merged W02/W06
+base. Omitted/live/explicit-off produced exact 1K token SHA-256
+`cd8d20d1270ee556a5035994abe08e55fab1a38600a89208becbc9e348e8d283`
+and content SHA-256
+`8f92baeebe9a6e716d250ded940e15f02ce545d18fcc1b444a9a330a7d973b1a`.
+The complete 32K lifecycle produced exact combined token SHA-256
+`e1456f0e9d9b51c1dfaa5e96f84860b17b35b9fd8b51be2a89d85d659be94551`
+and content SHA-256
+`4acebc66ed87af64f6f46dde0cf58f3e470a4260e3446a2354a2ce66d7f85566`.
+All three four-chunk PPL runs were exactly `2.1674 +/- 0.03849`, with identical
+chunk values `1.9315`, `2.1279`, `2.2498`, and `2.1674`.
+
+| Final PR 8 32K lifecycle point | Omitted | Live | Explicit off |
+|---|---:|---:|---:|
+| startup process VRAM | 13,644 MiB | 13,444 MiB | 13,644 MiB |
+| long-prefill peak process VRAM | 13,658 MiB | 13,658 MiB | 13,658 MiB |
+| first next-turn peak process VRAM | 13,662 MiB | 13,648 MiB | 13,662 MiB |
+| post-shrink next-turn peak process VRAM | 13,662 MiB | 13,450 MiB | 13,662 MiB |
+
+Thus the live policy saved 200 MiB at startup and 212 MiB on the post-shrink
+next turn, while the active long-prefill process peak was unchanged. Repeated
+A/live/A throughput was 1799.8559/1792.1201/1798.5794 t/s at 4K prefill,
+42.7723/42.7469/42.7620 t/s at 4K decode,
+1223.5393/1227.3871/1224.8924 t/s at 30K prefill, and
+23.8681/23.8477/23.8683 t/s at 30K decode: neutral, with no stable regression.
+
+W02's synchronized CUDA device-used high-water was
+13,849.12/13,857.12/13,849.12 MiB at 4K prefill and
+13,851.12/13,907.12/13,851.12 MiB at 30K prefill: explicit candidate costs of
++8 MiB and +56 MiB. All three cases were 13,837.12 MiB at 4K decode and
+13,839.12 MiB at 30K decode, so there was no decode cost. These are synchronized
+`cudaMemGetInfo`-style device-used high-water measurements, not process VRAM;
+the separate `nvidia-smi` process-VRAM lifecycle is tabulated above.
+
+Experiment 021's two accepted process-substitution launches explicitly invoked
+Bash (`bash -lc 'python3 scripts/mtp-exactness.py <(sed ... MANIFEST)'`) inside
+the GPU lock and changed only the literal output directory. The complete valid
+commands and hashes remain branch-owned in PR 8. The unlocked CUDA version
+probe and the locked benchmark launch with an unsupported option exited before
+model load and are invalid/non-evidence; neither is copied as a command or
+claim here.
+
+PR 8 source, generated arguments, presets, and feature-specific reproductions
+remain with that PR until source lands; shared protocol, research, roadmap,
+isolation, and identity indexing belong in the KV line.

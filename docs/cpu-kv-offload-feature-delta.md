@@ -171,7 +171,7 @@ features of `4a7f9b496`:
 |---|---|
 | Native standard-quantized FlashAttention and `--flash-attn-native-quants` | PR 4. |
 | Automatic compact causal-prefix masking | Final draft PR 7 at `d4183adb8b4902a125b9339cd39032a095fca013`; no user control, not yet in the base. |
-| `--live-context-workspace`, preset spelling, generated/user docs, and idle trim | PR 8 at pending published head `143cd6aee137e3a9974db64460e33e1de1f7d4bd` until source lands. |
+| `--live-context-workspace`, preset spelling, generated/user docs, and idle trim | Final draft PR 8 at `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact base `4a7f9b496`, six commits ahead, not yet in the base. |
 | Positive bounded host-attention staging and `--kv-attn-staging-chunk` | Rejected for exact serving; unfinished research is not accepted source. |
 | F16 persistent recurrent S state | Rejected by the quality gate. |
 | A Bee-specific CUDA graph-disable option | Not implemented; the audited upstream environment control is not a KV feature. |

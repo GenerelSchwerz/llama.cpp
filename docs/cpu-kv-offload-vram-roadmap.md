@@ -100,26 +100,32 @@ Keep its two evidence lanes distinct:
   It is not a replacement A/B/A performance or memory comparison.
 
 Do not copy invalid setup/probe results or rejected noisy timing. Target-plus-
-MTP and composition with PR 4 and the final PR 8 head remain integration gates.
+MTP and composition with PR 4 and final PR 8 remain integration gates.
 
 ### 4. Keep live-context workspace source and docs atomic in PR 8
 
 [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) owns the default-off
 live physical-KV reservation policy and all-idle trim. Its source, presets,
-generated arguments, and user-facing documentation must merge together. Until
-then, `--live-context-workspace` is absent from current commands and docs.
+generated arguments, and user-facing documentation must merge together. It is
+final at `0c8df007a504f16aa35fc5982303e3e1b9883331`, directly based on
+`4a7f9b496`, six commits ahead, draft, open, mergeable, and clean. Until its
+source lands, `--live-context-workspace` is absent from current commands and
+docs.
 
-The acceptance question is lifecycle residency, not merely allocation at
-context creation. A valid comparison must include startup, full-depth growth,
-decode, a shorter following request, post-idle mapped residency, system/pinned
-memory, exact output, PPL, and repeated prompt/decode performance.
+Final Experiment 021 passed exact 1K and full 32K lifecycle output, identical
+PPL, W02 lifecycle reconciliation, and focused coverage on the merged W02/W06
+base. It measured meaningful startup/post-shrink process-VRAM savings and
+neutral repeated 4K/30K throughput, while separately exposing synchronized
+device-used prefill high-water costs. Treat those W02 device-used values as
+allocator evidence, not `nvidia-smi` process VRAM. Exact values and accepted
+Bash-wrapped provenance commands are indexed in the experiment record.
 
 ## Later research, in priority order
 
 ### A. Close cross-feature integration without losing isolation
 
-PR 7 is now final. After PR 8's final head is published, simulate all remaining
-pairwise comparisons and likely merge orders on top of the merged W06/W02 base
+PR 7 and PR 8 are now final. Their pairwise comparisons and comparisons with
+the shared documentation tree must be simulated on the merged W06/W02 base
 before touching the published branch again. Re-run default/off controls after
 composition; a runtime-disabled feature can still change template
 instantiation, graph signatures, or allocator geometry. The isolation plan is
@@ -190,5 +196,5 @@ There is no authorized merge order yet. The likely dependency shape is support
 fixes/telemetry already merged, then native quant attention and independently
 accepted mask and workspace features. Final ordering must be chosen from
 simulated final PR heads and source overlap. Do not merge or fast-forward the
-published KV base until PR 8's final head is available and its comparisons are
-repeated.
+published KV base until the final-head comparisons and post-composition gates
+have been reviewed.

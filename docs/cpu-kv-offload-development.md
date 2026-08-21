@@ -1086,11 +1086,12 @@ at `3bd7a088199922b1e5e20973cd8cb6d970cde111`, merged as the current base
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. Remaining independent lanes are
 PR 4 native standard-quant attention at
 `72ee96bbfcf91c17a7fb5b3b32703aae812af330` and PR 8 live-context workspace at
-the still-pending published head
-`143cd6aee137e3a9974db64460e33e1de1f7d4bd`. PR 7 is final at
+final head `0c8df007a504f16aa35fc5982303e3e1b9883331`. PR 7 is final at
 `d4183adb8b4902a125b9339cd39032a095fca013`, directly based on `4a7f9b496` and
-six commits ahead. Its resource/performance evidence remains the isolated c9
-dense/Candidate-1/dense A/B/A study; the rebased source validation at
+six commits ahead. PR 8 is likewise directly based on `4a7f9b496`, six commits
+ahead, draft, open, mergeable, and clean. PR 7's resource/performance evidence
+remains the isolated c9 dense/Candidate-1/dense A/B/A study; the rebased source
+validation at
 `ae60c7321d950937a36af096112525db777ae13f` is a separate composition gate and
 does not relabel those measurements.
 
@@ -1102,13 +1103,23 @@ a material slowdown. Invalid setup/probe launches and noisy rejected timing are
 not shared evidence; exact identities, commands, exclusions, and limitations
 remain in PR 7's branch-owned investigation.
 
+PR 8's final Experiment 021 composes its default-off live-context workspace
+with merged W02/W06. Omitted/live/explicit-off serving output was byte-exact at
+1K and across the 32K lifecycle, and matching-geometry PPL was identical. At
+32K the live policy saved 200 MiB of startup process VRAM and 212 MiB on the
+post-shrink next turn; repeated 4K/30K prompt and decode throughput was neutral.
+Its separate synchronized CUDA device-used high-water exposed +8 MiB at 4K
+prefill and +56 MiB at 30K prefill, with no decode cost. Those values are
+`cudaMemGetInfo`-style device usage, not `nvidia-smi` process VRAM. Only the
+accepted explicit-Bash process-substitution launches are valid provenance;
+rejected version/setup probes are excluded.
+
 PR 8 continues to own its source, presets, and every user-facing generated
 `--live-context-workspace` document until the source lands. The current
 protocol, roadmap, feature-isolation plan, and source-backed feature delta are
-shared KV inheritance. PR 7 comparisons have been refreshed at its final head;
-PR 8 and all comparisons involving it must be refreshed when its final head is
-published. This consolidation does not merge or fast-forward the published KV
-base.
+shared KV inheritance. PR 7 and PR 8 identities and all pairwise comparisons
+have been refreshed at their final heads. This consolidation does not merge or
+fast-forward the published KV base.
 ## 2026-08-20: pre-PR4 W02 telemetry isolation
 
 The allocation-classification and CUDA VMM high-water instrumentation from the

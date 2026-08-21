@@ -23,11 +23,11 @@ A combined tree can answer the second question only after the first is closed.
 | W06: PPL capacity | PR 5 evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | `llama-perplexity` output-capacity fix and evidence. | Merged into the published base. |
 | W02: allocation telemetry | PR 6 merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Opt-in physical allocation/VMM telemetry. | Merged into the published base. |
 | W03: compact causal mask | PR 7 final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f` | Causal representation and branch-owned isolated/composed evidence. | Draft, open, mergeable, clean; six ahead and zero behind exact base. |
-| W04/W05/W09: live workspace | PR 8 pending published head `143cd6aee137e3a9974db64460e33e1de1f7d4bd` | Live reservation, exact plan publication, idle trim, source and user docs. | Published draft; await final head and re-fetch before integration. |
+| W04/W05/W09: live workspace | PR 8 final head `0c8df007a504f16aa35fc5982303e3e1b9883331` | Live reservation, exact plan publication, idle trim, source and user docs. | Draft, open, mergeable, clean; six ahead and zero behind exact base. |
 
-An observed head is not a permanent evidence tag. PR 7's final identity and
-comparisons were refreshed on 2026-08-21. Record PR 8's final head and
-`updatedAt` immediately before its review or merge simulation.
+An observed head is not a permanent evidence tag. PR 7 and PR 8 final
+identities and comparisons were refreshed on 2026-08-21. Verify each head and
+`updatedAt` again immediately before review or integration.
 
 ## What belongs in the shared KV line
 
@@ -139,9 +139,16 @@ but it cannot be promoted after the fact by subtracting unrelated changes.
 
 - Keep source, public arguments, presets, generated docs, and tests atomic in
   PR 8.
+- Use only final PR 8 head `0c8df007a504f16aa35fc5982303e3e1b9883331`.
 - Measure the full grow/full-depth/shrink/post-idle lifecycle.
 - Distinguish configured capacity, live physical extent, allocator high-water,
-  and mapped residency.
+  mapped residency, synchronized CUDA device-used high-water, and sampled
+  process VRAM.
+- Preserve Experiment 021's exact output/PPL, 32K startup/post-shrink savings,
+  neutral repeated throughput, and explicit +8 MiB 4K/+56 MiB 30K prefill
+  device-used costs as separate measurement classes.
+- Accept only explicit Bash-wrapped process substitution for its recorded
+  exactness provenance; do not import invalid setup or probe launches.
 - Require quality/output exactness and quantify reserve-transition cost.
 
 ## Comparison and merge simulation
@@ -188,36 +195,38 @@ authorizes merging or fast-forwarding `beellama-kv-cpu-offload`.
 
 ### Consolidation-time comparison matrix
 
-`git merge-tree --write-tree` was rerun on 2026-08-21 with published base
-`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`, the reconciled PR 9 tree, final PR
-7 `d4183adb8`, and PR 8's still-pending published head `143cd6aee`. Base plus
-final PR 7 is clean because PR 7 is directly based on it. Other independently
+`git merge-tree --write-tree` was rerun in both directions on 2026-08-21 with
+published base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`, the final PR 9 refresh tree,
+final PR 7 `d4183adb8`, and final PR 8 `0c8df007a`. Base plus either feature PR
+is clean/fast-forwardable because both are directly based on it. Independently
 appended evidence comparisons conflict in `docs/cpu-kv-offload-experiments.md`;
-resolve those by preserving Experiments 001-020 and W06 once and adding the
-accepted branch evidence to the shared post-KV index. That append conflict is
-not by itself evidence of source incompatibility.
+resolve those by preserving Experiments 001-020 and W06 once and retaining the
+shared post-KV index plus source-owned Experiment 021 where its source lands.
+That append conflict is not by itself evidence of source incompatibility.
 
 | Comparison | Additional textual conflicts beyond the experiment record |
 |---|---|
 | Base + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged and still requires semantic review. |
 | Base + final PR 7 | Clean/fast-forwardable; the final branch already includes W06/W02 and its composed validation. |
-| Base + PR 8 | `docs/cpu-kv-offload-development.md` and `ggml/src/ggml-cuda/ggml-cuda.cu`; current-testing, benchmark, and test overlap auto-merged. |
+| Base + final PR 8 | Clean/fast-forwardable; PR 8 is directly based on the published base. |
 | PR 9 docs + PR 4 | None; W02 CUDA-backend and benchmark overlap auto-merged. |
 | PR 9 docs + final PR 7 | None beyond the experiment record; CUDA-backend changes are already composed with W02. |
-| PR 9 docs + PR 8 | `docs/cpu-kv-offload-current-testing.md`, `docs/cpu-kv-offload-development.md`, and `ggml/src/ggml-cuda/ggml-cuda.cu`; benchmark and test overlap auto-merged. |
+| PR 9 docs + final PR 8 | `docs/cpu-kv-offload-current-testing.md` plus the experiment record; development auto-merges. |
 | PR 4 + final PR 7 | `ggml/src/ggml-cuda/CMakeLists.txt`, `fattn-mma-f16.cuh`, and `tests/test-backend-ops.cpp`. |
-| PR 4 + PR 8 | `tools/llama-bench/llama-bench.cpp`. |
-| Final PR 7 + pending PR 8 | `docs/cpu-kv-offload-development.md` and `ggml/src/ggml-cuda/ggml-cuda.cu`; current-testing and multiple KV/context/test/benchmark paths auto-merged and require interaction testing. |
+| PR 4 + final PR 8 | `tools/llama-bench/llama-bench.cpp`. |
+| Final PR 7 + final PR 8 | None beyond the experiment record; CUDA VMM and KV/context source overlap auto-merges and still requires interaction testing. |
 
-This matrix is diagnostic only. PR 7 is final; PR 8 is still pending and may
-receive review updates. An automatic textual merge does not establish
-allocator, graph, or kernel compatibility. Re-fetch PR 8 and repeat every
-comparison involving it before choosing a merge order.
+This matrix is diagnostic only. The final PR 7/PR 8/PR 9 simulations produced
+the same conflict paths in both orders. An automatic textual merge does not
+establish allocator, graph, or kernel compatibility; no full integration order
+is selected until the shared append conflicts and post-composition gates are
+resolved deliberately.
 
-PR 8 overlaps the reconciled current protocol and development journal in
-addition to its source conflict with merged W02. Any later resolution must keep
-the consolidated protocol and complete Experiments 001-020 plus W06, then
-retain PR-owned detail until its source lands. Do not resolve conflicts by
+PR 8 overlaps the reconciled current protocol and experiment append; its
+development journal auto-merges in the final PR 9 comparison. Any later
+resolution must keep the consolidated protocol and complete Experiments
+001-020 plus W06, then place PR 8's source-owned Experiment 021 after those
+sections while retaining the shared post-KV index. Do not resolve conflicts by
 dropping either historical KV evidence or a PR's source-coupled documentation.
 
 ## Post-composition acceptance
