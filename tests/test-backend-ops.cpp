@@ -7032,6 +7032,8 @@ struct test_flash_attn_ext : public test_case {
     const float scale;
     const int64_t n_tail_active;
     const int64_t n_tail_history_slots;
+    const bool compact_causal_prefix;
+    const bool compact_equivalence;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -7046,17 +7048,20 @@ struct test_flash_attn_ext : public test_case {
             " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
-            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
+            " compact_causal_prefix=" + std::to_string(int(compact_causal_prefix)) +
+            " compact_equivalence=" + std::to_string(int(compact_equivalence));
     }
 
     std::string op_desc(ggml_tensor * t) override {
-        return full_coverage_equivalence ? "KV_TAIL_EQUIVALENCE" :
+        return compact_equivalence ? "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE" :
+            (full_coverage_equivalence ? "KV_TAIL_EQUIVALENCE" :
             (segmented_equivalence ? "KV_TAIL_SEGMENTED_EQUIVALENCE" :
-             (split_equivalence ? "KV_TAIL_SPLIT_EQUIVALENCE" : test_case::op_desc(t)));
+             (split_equivalence ? "KV_TAIL_SPLIT_EQUIVALENCE" : test_case::op_desc(t))));
     }
 
     bool run_whole_graph() override {
-        return full_coverage_equivalence || split_equivalence || segmented_equivalence;
+        return full_coverage_equivalence || split_equivalence || segmented_equivalence || compact_equivalence;
     }
 
     bool requires_backend_support() override {
@@ -7074,12 +7079,18 @@ struct test_flash_attn_ext : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        if (!full_coverage_equivalence && !split_equivalence && !segmented_equivalence) {
+        if (!full_coverage_equivalence && !split_equivalence && !segmented_equivalence && !compact_equivalence) {
             return test_case::err(a, b, n);
         }
 
         GGML_ASSERT(n % 2 == 0);
         const size_t half = n/2;
+        if (compact_equivalence) {
+            return std::max({
+                    nmse(a, b, n),
+                    memcmp(a, a + half, half*sizeof(float)) == 0 ? 0.0 : 1.0,
+                    memcmp(b, b + half, half*sizeof(float)) == 0 ? 0.0 : 1.0 });
+        }
         if (split_equivalence || segmented_equivalence) {
             return std::max(
                     nmse(a, a + half, half),
@@ -7107,14 +7118,23 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0)
+                        int64_t n_tail_history_slots = 0,
+                        bool compact_causal_prefix = false, bool compact_equivalence = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots),
+          compact_causal_prefix(compact_causal_prefix), compact_equivalence(compact_equivalence) {}
+
+    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                        ggml_type type_K, ggml_type type_V, bool compact_causal_prefix, bool compact_equivalence)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
+              {0, 1, 2, 3}, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT, false, false, false, false, false, 0, false,
+              0.0f, -1, 0, compact_causal_prefix, compact_equivalence) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7161,9 +7181,19 @@ struct test_flash_attn_ext : public test_case {
         ggml_set_name(v, "v");
 
         ggml_tensor * m = nullptr;
+        ggml_tensor * m_explicit = nullptr;
         if (mask) {
-            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+            GGML_ASSERT(!compact_equivalence || compact_causal_prefix);
+            GGML_ASSERT(!compact_causal_prefix ||
+                (nr23[1] == 1 && max_bias == 0.0f && n_tail == 0));
+            m = compact_causal_prefix ?
+                ggml_new_tensor_4d(ctx, GGML_TYPE_I64, 1, nb, 1, 1) :
+                ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
+            if (compact_equivalence) {
+                m_explicit = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
+                ggml_set_name(m_explicit, "m_explicit");
+            }
         }
 
         ggml_tensor * s = nullptr;
@@ -7175,7 +7205,11 @@ struct test_flash_attn_ext : public test_case {
         const float attn_scale = scale > 0.0f ? scale : 1.0f/sqrtf(hsk);
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, attn_scale, max_bias, logit_softcap);
         ggml_tensor * exact = nullptr;
+        if (compact_equivalence) {
+            exact = ggml_flash_attn_ext(ctx, q, k, v, m_explicit, attn_scale, max_bias, logit_softcap);
+        }
         if (n_tail > 0) {
+            GGML_ASSERT(exact == nullptr);
             const int64_t n_tail_used = n_tail_active >= 0 ? n_tail_active : n_tail;
             GGML_ASSERT(!tail_interleaved || (nr23[1] == 1 && nb == 4));
             GGML_ASSERT(n_tail_used >= 0 && n_tail_used <= n_tail);
@@ -7312,8 +7346,27 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "m_explicit") == 0) {
+                std::vector<ggml_fp16_t> values(ggml_nelements(t));
+                const int64_t first = kv > nb ? kv - nb : 0;
+                for (int64_t is = 0; is < t->ne[3]; ++is) {
+                    for (int64_t iq = 0; iq < nb; ++iq) {
+                        for (int64_t ik = 0; ik < kv; ++ik) {
+                            values[(is*nb + iq)*kv + ik] = ggml_fp32_to_fp16(
+                                    ik < first + iq + 1 ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
             } else if (strcmp(t->name, "m") == 0) {
-                if (tail_only) {
+                if (compact_causal_prefix) {
+                    const int64_t first = kv > nb ? kv - nb : 0;
+                    std::vector<int64_t> values(ggml_nelements(t));
+                    for (int64_t iq = 0; iq < nb; ++iq) {
+                        values[iq] = std::min(kv, first + iq + 1) - 1;
+                    }
+                    ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
+                } else if (tail_only) {
                     std::vector<ggml_fp16_t> values(ggml_nelements(t), ggml_fp32_to_fp16(-INFINITY));
                     ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
                 } else {
@@ -10083,6 +10136,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Compare the compact I64 causal-prefix descriptor with an explicit F16
+    // causal mask in the same graph. These cover the generic vector, tile,
+    // and F16 MMA CUDA paths; native-Q8 coverage intentionally belongs to PR 4.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                64, 64, 4, {4, 1}, 512, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                40, 40, 4, {1, 1}, 512, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                128, 128, 4, {4, 1}, 512, 64, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

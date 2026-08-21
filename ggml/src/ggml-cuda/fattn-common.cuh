@@ -1256,6 +1256,32 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
+static __device__ __forceinline__ int32_t flash_attn_causal_prefix_bound(
+        const int64_t * write_indices, int64_t index) {
+    return int32_t(write_indices[index] + 1);
+}
+
+template <int ncols1>
+__launch_bounds__(1, 1)
+static __global__ void flash_attn_causal_prefix_to_KV_max(
+        const int64_t * write_indices_ptr, int * KV_max_ptr,
+        const int ne11, const int64_t s31, const int64_t s33) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    const int sequence = blockIdx.y;
+    const int jt = blockIdx.x;
+    const int64_t * write_indices = write_indices_ptr + sequence*s33 + jt*ncols1*s31;
+    int32_t bound = 0;
+#pragma unroll
+    for (int j = 0; j < ncols1; ++j) {
+        bound = max(bound, flash_attn_causal_prefix_bound(write_indices, j*s31));
+    }
+    const int rounded = ((bound + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE;
+    KV_max_ptr[sequence*gridDim.x + jt] = min(ne11, rounded);
+}
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1550,7 +1576,11 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I64);
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
+    GGML_ASSERT(!compact_causal_prefix ||
+        (mask->ne[0] == 1 && mask->ne[1] == Q->ne[1] && mask->ne[2] == 1 &&
+         mask->nb[1] == ggml_type_size(mask->type)));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1647,7 +1677,20 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    const bool use_KV_max = K->ne[1] % FATTN_KQ_STRIDE == 0 &&
+        (Q->ne[1] >= 1024 || Q->ne[3] > 1);
+    if (compact_causal_prefix && use_KV_max) {
+        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
+        const dim3 block_dim_KV_max(1, 1, 1);
+
+        KV_max.alloc(blocks_num_KV_max.x*blocks_num_KV_max.y);
+        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+            blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
+        ggml_cuda_kernel_launch(flash_attn_causal_prefix_to_KV_max<ncols1>, launch_params,
+            (const int64_t *) mask->data, KV_max.ptr, int(K->ne[1]),
+            mask->nb[1] / sizeof(int64_t), mask->nb[3] / sizeof(int64_t));
+        CUDA_CHECK(cudaGetLastError());
+    } else if (!compact_causal_prefix && mask && use_KV_max) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1705,31 +1748,30 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
+            // parallel_blocks must not be larger than what the tensor size allows:
+            parallel_blocks = std::min(parallel_blocks, ntiles_KV);
 
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+            // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+            // Test whether parallel_blocks can be set to a higher value for better efficiency.
+            const int blocks_per_wave = nsm * max_blocks_per_sm;
+            int nwaves_best = 0;
+            int efficiency_percent_best = 0;
+            for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+                const int nblocks_total = ntiles_dst * parallel_blocks_test;
+                const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+                const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
 
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
+                // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+                if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+                    break;
+                }
+
+                if (efficiency_percent > efficiency_percent_best) {
+                    nwaves_best = nwaves;
+                    efficiency_percent_best = efficiency_percent;
+                    parallel_blocks = parallel_blocks_test;
+                }
             }
-
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
-            }
-        }
-
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
@@ -1778,8 +1820,12 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0
+        compact_causal_prefix ? -int32_t(Q->ne[1]) : (mask ? int32_t(mask->ne[1]) : 0),
+        (mask ? int32_t(mask->ne[2]) : 0),
+        mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0,
+        (mask ? int32_t(mask->nb[2]) : 0),
+        mask ? mask->nb[3] : 0
     );
     CUDA_CHECK(cudaGetLastError());
 

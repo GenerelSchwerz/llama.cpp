@@ -51,7 +51,8 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     are put into the template specialization without GQA optimizations.
     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
+        if (t == nullptr || ggml_is_quantized(t->type) ||
+                (t == mask && t->type == GGML_TYPE_I64)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -418,7 +419,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
+        if (t == nullptr || ggml_is_quantized(t->type) ||
+                (t == mask && t->type == GGML_TYPE_I64)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -484,8 +486,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+    if (mask) {
+        if (mask->type == GGML_TYPE_I64) {
+            if (mask->ne[0] != 1 || mask->ne[1] != Q->ne[1] ||
+                    mask->ne[2] != 1 || mask->ne[3] != Q->ne[3] ||
+                    mask->nb[1] != ggml_type_size(mask->type) || max_bias != 0.0f) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        } else if (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -749,6 +759,15 @@ bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     const bool has_exact_tail = dst->src[5] != nullptr && dst->src[6] != nullptr && dst->src[7] != nullptr &&
         dst->src[8] != nullptr && dst->src[9] != nullptr;
     const bool uses_kvarn = ggml_cuda_flash_attn_ext_kvarn_uses_views(dst);
+    const bool compact_causal_prefix = dst->src[3] && dst->src[3]->type == GGML_TYPE_I64;
+#ifndef GGML_CUDA_COMPACT_CAUSAL_MASK
+    if (compact_causal_prefix) {
+        return false;
+    }
+#endif
+    if (compact_causal_prefix && (has_exact_tail || uses_kvarn)) {
+        return false;
+    }
     const bool portable_kvarn_tail = uses_kvarn && has_exact_tail &&
         ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported(device, dst);
     if (portable_kvarn_tail) {

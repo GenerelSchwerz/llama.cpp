@@ -5513,9 +5513,16 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I64);
         GGML_ASSERT(ggml_is_contiguous(mask));
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
+
+        if (mask->type == GGML_TYPE_I64) {
+            GGML_ASSERT(mask->ne[0] == 1);
+            GGML_ASSERT(mask->ne[1] == q->ne[1]);
+            GGML_ASSERT(mask->ne[2] == 1);
+            GGML_ASSERT(max_bias == 0.0f);
+        }
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
         GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);

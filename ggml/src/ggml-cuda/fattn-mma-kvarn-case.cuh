@@ -6,6 +6,12 @@
 
 #include <atomic>
 
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+#define GGML_CUDA_KVARN_COMPACT_ARG false,
+#else
+#define GGML_CUDA_KVARN_COMPACT_ARG
+#endif
+
 #if defined(GGML_USE_HIP)
 using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 #else
@@ -176,7 +182,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = true;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, GGML_CUDA_KVARN_COMPACT_ARG sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -243,7 +249,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, GGML_CUDA_KVARN_COMPACT_ARG sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -840,3 +846,5 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 #define DECL_FATTN_MMA_KVARN_CASE(DKQ, DV, ncols1, ncols2)                         \
     template void ggml_cuda_flash_attn_ext_mma_kvarn_case                          \
     <DKQ, DV, ncols1, ncols2>(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+
+#undef GGML_CUDA_KVARN_COMPACT_ARG
