@@ -18,6 +18,43 @@ add the transition and rationale here. Do not rewrite valid old measurements to
 claim new flags or geometry. The companion experiment ledger records curated
 per-change evidence.
 
+## KV-offload integration-base transition: 2026-08-22
+
+Feature investigations were initially launched from exact KV-offload commits
+to guarantee reproducible starting points. As the shared line became the
+effective main integration branch, treating those creation commits as permanent
+bases caused otherwise finished features to miss later protocol, tooling, and
+correctness fixes.
+
+The original commit remains required provenance, but active feature branches
+now incorporate the latest validated `beellama-kv-cpu-offload` head before new
+acceptance evidence and final handoff. Their PR base is KV-offload rather than
+the repository's general `main`. An integration update does not inherit old
+measurements by implication: source and binary provenance must be refreshed,
+binary-affecting updates rebuilt, and relevant gates rerun. Updates occur at
+clean measurement boundaries so a moving base cannot contaminate a matched
+pair. This keeps features current without continuously interrupting an active
+run for documentation-only movement.
+
+## CUDA build-concurrency transition: 2026-08-22
+
+The multi-worktree workflow already serialized CUDA builds with
+`/tmp/beellama-cuda-build.lock`, but its conservative six-job limit left most
+of this host idle during template-heavy CUDA builds. A live host audit found 24
+physical cores with one hardware thread per core, 64 GiB RAM, 39 GiB currently
+available, and no current CPU or memory pressure. Six active CUDA compiler
+workers produced a load near six; the largest observed `cicc`/`ptxas` worker
+was approximately 1.2 GiB RSS. Existing swap use and multiple interactive
+agents argued against immediately consuming all 24 cores.
+
+The current protocol therefore keeps cross-worktree CUDA builds serialized and
+raises the per-build cap from 6 to 12 jobs. Serialization and parallelism remain
+separate controls: a queued build must still use at most 12 jobs after it
+acquires the lock. Twelve leaves half the CPU topology and substantial memory
+headroom for the desktop, agents, and compiler-memory spikes. Raising the cap
+again requires a timed build with peak memory and responsiveness checked; old
+`-j24` reproduction commands are historical rather than current templates.
+
 ## Build-provenance sidecar transition: 2026-08-22
 
 An attention-staging screen selected a preserved binary whose directory name,

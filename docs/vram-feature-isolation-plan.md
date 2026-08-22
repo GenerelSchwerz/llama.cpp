@@ -1,10 +1,11 @@
 # VRAM feature-isolation and integration plan
 
-This plan applies to every VRAM or CPU-KV branch derived from exact
-source-bearing KV baseline
-`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` or its documentation-only
-descendants. It replaces the cumulative parallel-tree workflow captured in the
-read-only snapshot
+This plan applies to every VRAM or CPU-KV branch derived from the canonical
+`beellama-kv-cpu-offload` integration line. Each investigation records its
+exact starting commit, including historical source-bearing baseline
+`4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` where applicable, but that commit is
+provenance rather than a permanent pin. This plan replaces the cumulative
+parallel-tree workflow captured in the read-only snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`.
 
 The goal is to answer two separate questions:
@@ -30,6 +31,14 @@ A combined tree can answer the second question only after the first is closed.
 An observed head is not a permanent evidence tag. PR 7 and PR 8 final
 identities and comparisons were refreshed on 2026-08-21. Verify each head and
 `updatedAt` again immediately before review or integration.
+
+Before collecting new acceptance evidence or declaring merge readiness, update
+the feature branch to the latest validated KV-offload integration head at a
+clean process boundary. Preserve and report its original base as provenance,
+but do not keep working from it merely because it was named when the worktree
+was created. Refresh build registration, rebuild binary-affecting changes, and
+rerun coverage proportional to the incoming delta. Evidence collected against
+the older base remains evidence for that exact pair only.
 
 ## What belongs in the shared KV line
 

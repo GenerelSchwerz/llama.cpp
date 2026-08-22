@@ -65,7 +65,7 @@ ctest --test-dir build-tools-validation \
 Final result: 1/1 test passed in 8.38 seconds with `ResourceWarning` promoted
 to an error.
 No build was launched; therefore no
-parallel build wider than `-j6` occurred.
+parallel build wider than 12 jobs occurred.
 
 ## Merge-readiness checkpoint
 

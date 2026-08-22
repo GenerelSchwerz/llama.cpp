@@ -126,7 +126,8 @@ other opaque wrappers cannot be profiler targets.
 Every stage needs a finite timeout and a visible progress description. Use the
 target's native progress option where it has one. The runner also emits a
 five-second heartbeat for long or unexpectedly stalled processes. If preparing
-a build for a study, do not build wider than `-j6`.
+a build for a study on the current benchmark host, hold the shared CUDA build
+lock for the complete command and do not build wider than 12 parallel jobs.
 
 ## Ladder requirements
 
@@ -425,7 +426,7 @@ Manual and study-specific:
 - choosing representative workloads, layouts, capability declarations,
   thresholds, context depths, and real ubatch weights;
 - preparing clean matched builds and models (with build parallelism no wider
-  than `-j6`);
+  than 12 parallel jobs on the current benchmark host);
 - deciding whether direct pinned-memory instrumentation or a VMM/allocation
   trace is required;
 - reviewing raw logs, contamination flags, thermals/clocks, and host load;

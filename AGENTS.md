@@ -224,6 +224,14 @@ CPU-resident KV-cache investigation.
 - Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
   build, profile, and documentation changes in the dedicated experimental
   worktree and branch.
+- Treat the canonical `beellama-kv-cpu-offload` branch as the main integration
+  line for KV-offload feature work. An assigned starting commit is provenance,
+  not a permanent pin. Incorporate the latest validated integration head before
+  new acceptance measurements and final handoff, and target feature PRs at that
+  branch rather than general `main`. Update only at a clean measurement
+  boundary; refresh provenance, rebuild binary-affecting changes, and rerun
+  proportional coverage afterward. Preserve feature work and report conflicts
+  instead of dropping either side.
 - Give each independently testable optimization its own commit. Include the
   implementation and its corresponding update to
   `docs/cpu-kv-offload-experiments.md` in that commit so the code and evidence
@@ -269,6 +277,12 @@ CPU-resident KV-cache investigation.
   debugger. State the progress mechanism in the launch update and preserve it
   in the recorded command. Do not start an unbounded or duration-uncertain run
   whose only observable states are running and finished.
+- On the current 24-core benchmark host, serialize every CUDA build across
+  worktrees with `/tmp/beellama-cuda-build.lock` and keep the complete build
+  command inside the lock's safely quoted `-c` argument. Limit the one active
+  build to 12 parallel jobs. Queueing prevents builds from overlapping but does
+  not remove the per-build job cap. Follow the exact current template in
+  `docs/cpu-kv-offload-current-testing.md`.
 - Wrap every runnable GPU test, benchmark, profiler, or server lifecycle in
   the exact whole-command form
   `flock /tmp/beellama-single-gpu.lock -c 'COMMAND'`. Do not use flock's
