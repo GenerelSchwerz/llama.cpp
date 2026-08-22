@@ -18,6 +18,29 @@ add the transition and rationale here. Do not rewrite valid old measurements to
 claim new flags or geometry. The companion experiment ledger records curated
 per-change evidence.
 
+## Manifest-driven early-screen transition: 2026-08-22
+
+The prior current protocol defined exact provenance, clean-process GPU
+serialization, matched performance/resource fields, correctness, long-context,
+and profiler rules, but left each derived feature agent to assemble its own
+early launcher and artifact layout. That made early decisions unnecessarily
+slow and made otherwise similar feature investigations harder to compare.
+
+The current-testing protocol now requires the generic manifest runner for a
+new CPU-KV-derived performance or memory feature's early exactness,
+prefill/decode smoke, representative weighted screens, and resource telemetry.
+Optional regression diagnostics use independent direct-target NSYS discovery
+and verified filtered NCU capture for each variant; they remain explanatory
+rather than benchmark or acceptance evidence. Selection is by workload,
+layout, and backend capability, never by architecture or model name.
+
+This supersedes ad hoc early-screen orchestration only. It does not relabel
+historical measurements and does not relax the canonical server lifecycle,
+final long-context comparison, matching-batch perplexity and output exactness,
+clean-process proof, allocation accounting, or any feature-specific acceptance
+gate. A single matched fail-fast pair has no confidence claim; a clear signal
+authorizes deeper validation and nothing more.
+
 ## Evidence-curation transition: 2026-08-20
 
 Earlier editions asked agents to preserve invalid attempts and every historical

@@ -1,0 +1,478 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anbeeld.example/schemas/feature-performance-validation-v1.json",
+  "title": "BeeLlama feature/performance validation manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "study",
+    "artifact_root",
+    "variants",
+    "inputs",
+    "repetition_policy",
+    "stages"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "study": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "early_decision_target_seconds"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "description": { "type": "string" },
+        "early_decision_target_seconds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["minimum", "maximum"],
+          "properties": {
+            "minimum": { "const": 30 },
+            "maximum": { "const": 90 }
+          }
+        }
+      }
+    },
+    "artifact_root": { "type": "string", "pattern": "^/" },
+    "variants": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["baseline", "candidate"],
+      "properties": {
+        "baseline": { "$ref": "#/$defs/variant" },
+        "candidate": { "$ref": "#/$defs/variant" }
+      }
+    },
+    "inputs": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/hashedFile" }
+    },
+    "environment": { "$ref": "#/$defs/environment" },
+    "repetition_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum_pairs", "maximum_pairs", "order", "confidence_level", "extension_rule"],
+      "properties": {
+        "minimum_pairs": { "const": 3 },
+        "maximum_pairs": { "const": 5 },
+        "order": { "const": ["AB", "BA", "AB", "BA", "AB"] },
+        "confidence_level": { "const": 0.95 },
+        "extension_rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "thresholds"],
+          "properties": {
+            "kind": { "const": "extend_only_if_inconclusive" },
+            "thresholds": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["improvement_percent", "regression_percent", "equivalence_percent"],
+              "properties": {
+                "improvement_percent": { "type": "number", "minimum": 0 },
+                "regression_percent": { "type": "number", "minimum": 0 },
+                "equivalence_percent": { "type": "number", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "stages": {
+      "type": "array",
+      "minItems": 6,
+      "items": { "$ref": "#/$defs/stage" }
+    },
+    "profiler": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pattern", "profile_repetitions", "stage", "variant", "selector", "cuda_graph_trace"],
+      "properties": {
+        "pattern": { "const": "one_nsys_discovery_then_one_filtered_ncu" },
+        "profile_repetitions": { "const": 1 },
+        "stage": { "$ref": "#/$defs/slug" },
+        "variant": { "enum": ["baseline", "candidate"] },
+        "screen": { "$ref": "#/$defs/slug" },
+        "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
+        "selector": { "$ref": "#/$defs/profilerSelector" },
+        "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
+        "metrics": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "early_diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "trigger",
+          "on_clear",
+          "evidence_claim",
+          "pattern",
+          "profile_repetitions",
+          "stage",
+          "variants",
+          "screen_selection",
+          "selector",
+          "cuda_graph_trace"
+        ],
+        "properties": {
+          "id": { "$ref": "#/$defs/slug" },
+          "trigger": { "const": "regression_signal_only" },
+          "on_clear": { "const": "skip" },
+          "evidence_claim": { "const": "diagnostic_only" },
+          "pattern": { "const": "independent_nsys_then_filtered_ncu_per_variant" },
+          "profile_repetitions": { "const": 1 },
+          "stage": { "$ref": "#/$defs/slug" },
+          "variants": { "const": ["baseline", "candidate"] },
+          "screen_selection": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "screen"],
+                "properties": {
+                  "kind": { "const": "fixed" },
+                  "screen": { "$ref": "#/$defs/slug" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {
+                  "kind": { "const": "largest_observed_regression" }
+                }
+              }
+            ]
+          },
+          "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
+          "selector": { "$ref": "#/$defs/profilerSelector" },
+          "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
+          "metrics": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "slug": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "hashedFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "role": { "type": "string" },
+        "path": { "type": "string", "pattern": "^/" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean"] }
+    },
+    "build": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "const": "cmake_required" },
+            "cache": { "type": "string", "pattern": "^/" },
+            "expected_options": {
+              "type": "object",
+              "additionalProperties": { "type": ["string", "number", "boolean"] }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "reason"],
+          "properties": {
+            "mode": { "const": "not_applicable" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "directHarness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "native_llama_affinity", "source_files"],
+      "properties": {
+        "kind": { "const": "native_executable" },
+        "native_llama_affinity": { "const": true },
+        "source_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/hashedFile" }
+        }
+      }
+    },
+    "executable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "expected_sha256", "build"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "expected_sha256": { "$ref": "#/$defs/sha256" },
+        "build": { "$ref": "#/$defs/build" },
+        "direct_harness": { "$ref": "#/$defs/directHarness" }
+      }
+    },
+    "variant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_root", "expected_commit", "tree_policy", "executables"],
+      "properties": {
+        "source_root": { "type": "string", "pattern": "^/" },
+        "expected_commit": { "type": "string", "pattern": "^[0-9a-fA-F]{40}$" },
+        "tree_policy": { "enum": ["clean", "expected_dirty"] },
+        "expected_dirty_fingerprint": { "$ref": "#/$defs/sha256" },
+        "environment": { "$ref": "#/$defs/environment" },
+        "executables": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/slug" },
+          "additionalProperties": { "$ref": "#/$defs/executable" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "tree_policy": { "const": "expected_dirty" } } },
+          "then": { "required": ["expected_dirty_fingerprint"] }
+        }
+      ]
+    },
+    "selection": {
+      "type": "object",
+      "required": ["workload", "tensor_layout", "backend_capabilities", "execution_mode"],
+      "properties": {
+        "workload": { "enum": ["exactness", "prefill", "decode", "mixed"] },
+        "tensor_layout": { "type": "object", "minProperties": 1 },
+        "backend_capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "execution_mode": {
+          "enum": ["direct_process", "direct_command", "cuda_graph_replay", "production_binary"]
+        },
+        "duration_class": { "enum": ["short"] },
+        "context_depth_tokens": { "type": "integer", "minimum": 1 },
+        "acceptance_class": { "const": "long_context" },
+        "cuda_graph_replay": {
+          "type": "object",
+          "required": ["applicability"],
+          "properties": {
+            "applicability": { "enum": ["required", "not_applicable"] },
+            "reason": { "type": "string" }
+          }
+        }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["architecture"] },
+          { "required": ["architecture_name"] },
+          { "required": ["model_family"] },
+          { "required": ["model_name"] }
+        ]
+      }
+    },
+    "cliSchema": {
+      "type": "object",
+      "properties": {
+        "builtin": { "enum": ["llama", "none"] },
+        "allow_unknown_options": { "type": "boolean" },
+        "allow_positionals": { "type": "boolean" },
+        "max_positionals": { "type": "integer", "minimum": 0 },
+        "options": {
+          "type": "object",
+          "additionalProperties": { "enum": [0, 1] }
+        }
+      }
+    },
+    "controlledDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reason",
+        "baseline_args",
+        "candidate_args",
+        "baseline_environment",
+        "candidate_environment",
+        "allowed_options",
+        "allowed_environment"
+      ],
+      "properties": {
+        "reason": { "type": "string", "minLength": 1 },
+        "baseline_args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "candidate_args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "baseline_environment": { "$ref": "#/$defs/environment" },
+        "candidate_environment": { "$ref": "#/$defs/environment" },
+        "allowed_options": { "type": "array", "items": { "type": "string" } },
+        "allowed_environment": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "command": {
+      "type": "object",
+      "required": ["executable_role", "common_args", "baseline_args", "candidate_args", "cli_schema"],
+      "properties": {
+        "executable_role": { "$ref": "#/$defs/slug" },
+        "common_args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "baseline_args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "candidate_args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "environment": { "$ref": "#/$defs/environment" },
+        "baseline_environment": { "$ref": "#/$defs/environment" },
+        "candidate_environment": { "$ref": "#/$defs/environment" },
+        "cli_schema": { "$ref": "#/$defs/cliSchema" },
+        "controlled_delta": { "$ref": "#/$defs/controlledDelta" }
+      }
+    },
+    "screen": {
+      "type": "object",
+      "required": ["id", "args", "weight"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "args": { "type": "array", "items": { "type": ["string", "number"] } },
+        "weight": { "type": "number", "exclusiveMinimum": 0 },
+        "span_class": { "enum": ["low", "mid", "high"] },
+        "span_tokens": { "type": "integer", "minimum": 1 },
+        "ubatch_occurrences": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "metric": {
+      "type": "object",
+      "required": ["regex", "direction"],
+      "properties": {
+        "regex": { "type": "string", "minLength": 1 },
+        "direction": { "enum": ["higher", "lower"] },
+        "stream": { "enum": ["stdout", "stderr", "combined"] },
+        "match": { "enum": ["first", "last", "only"] },
+        "group": { "type": ["integer", "string"] }
+      }
+    },
+    "decisionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["acceptable_decisions", "regression", "inconclusive_after_maximum"],
+      "properties": {
+        "acceptable_decisions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["improvement", "equivalent"] }
+        },
+        "regression": { "const": "fail" },
+        "inconclusive_after_maximum": { "const": "unresolved_fail" }
+      }
+    },
+    "screeningPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "order", "regression_threshold_percent", "confidence_claim"],
+      "properties": {
+        "kind": { "const": "single_pair_fail_fast" },
+        "order": { "enum": ["AB", "BA"] },
+        "regression_threshold_percent": { "type": "number", "exclusiveMinimum": 0 },
+        "confidence_claim": { "const": "none" }
+      }
+    },
+    "shape": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "integer", "minimum": 1 }
+    },
+    "profilerSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kernel_regex"],
+      "properties": {
+        "kernel_regex": { "type": "string", "minLength": 1 },
+        "graph_only": { "type": "boolean" },
+        "grid": { "$ref": "#/$defs/shape" },
+        "block": { "$ref": "#/$defs/shape" },
+        "occurrence_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["all", "first", "middle", "last"] }
+          }
+        }
+      }
+    },
+    "cudaGraphTrace": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicability", "granularity", "launch_origin"],
+          "properties": {
+            "applicability": { "const": "required" },
+            "granularity": { "const": "node" },
+            "launch_origin": { "enum": ["host-only", "host-and-device"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicability", "reason"],
+          "properties": {
+            "applicability": { "const": "not_applicable" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "stage": {
+      "type": "object",
+      "required": ["id", "purpose", "resource", "timeout_seconds", "mandatory", "progress", "selection", "command"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "purpose": {
+          "enum": ["exactness", "smoke", "kernel_screen", "production_confirmation", "long_context_acceptance"]
+        },
+        "resource": { "enum": ["cpu", "gpu"] },
+        "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
+        "mandatory": { "type": "boolean" },
+        "progress": { "type": "string", "minLength": 1 },
+        "selection": { "$ref": "#/$defs/selection" },
+        "command": { "$ref": "#/$defs/command" },
+        "screens": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/screen" } },
+        "aggregation": {
+          "type": "object",
+          "properties": {
+            "mode": { "enum": ["weighted_mean", "weighted_harmonic"] },
+            "weight_source": { "const": "real_ubatch_geometry" }
+          }
+        },
+        "metric": { "$ref": "#/$defs/metric" },
+        "decision_policy": { "$ref": "#/$defs/decisionPolicy" },
+        "screening_policy": { "$ref": "#/$defs/screeningPolicy" },
+        "comparison": {
+          "type": "object",
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["stdout_sha256", "file_sha256"] },
+            "path": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

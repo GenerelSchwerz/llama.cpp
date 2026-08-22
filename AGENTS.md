@@ -129,6 +129,9 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   post-composition gates for every KV-derived VRAM feature branch.
 - `docs/cpu-kv-offload-feature-delta.md` - source-backed capability delta from
   BeeLlama v0.4.3, including explicit features absent from the published KV base.
+- `docs/feature-performance-validation.md` - manifest-driven early A/B
+  screening, telemetry, statistics, resume, and optional Nsight diagnostics for
+  KV-derived feature work.
 
 ### Invariants
 
@@ -190,6 +193,12 @@ CPU-resident KV-cache investigation.
   a test, or interpreting a current result. It is the only documentation source
   for the runnable current protocol; the local source remains authoritative if
   documentation and behavior disagree.
+- For a new CPU-KV-derived performance or memory feature, preregister and run
+  the manifest workflow in `docs/feature-performance-validation.md` for early
+  exactness, short prefill/decode, representative weighted screens, and
+  resource telemetry. A clear early signal only permits deeper validation;
+  it never replaces the current long-context, perplexity, clean-process,
+  allocation-lifecycle, or feature-specific acceptance gates.
 - Read the relevant sections of `docs/cpu-kv-offload-development.md` and
   `docs/cpu-kv-offload-experiments.md` when historical rationale, prior
   protocol editions, rejected approaches, or old measurements are needed.
