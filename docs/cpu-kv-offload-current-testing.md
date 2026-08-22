@@ -183,6 +183,45 @@ Do not present an uncommitted or differently configured binary as evidence for
 the current commit. Documentation-only dirt does not change a binary; source
 or build changes do.
 
+## Manifest-driven early feature screen
+
+Every new CPU-KV-derived performance or memory feature starts with a
+preregistered manifest based on
+[`feature-performance-validation.md`](feature-performance-validation.md) and
+the checked-in schema/example. Select screens by workload, tensor layout, and
+backend capability; do not select by model or architecture name. Before a
+deeper campaign, run:
+
+```bash
+python3 scripts/feature-performance-validation.py validate MANIFEST.json
+python3 scripts/feature-performance-validation.py run \
+  MANIFEST.json --through early
+```
+
+The early ladder runs exactness first, then short prefill/decode and
+representative low/mid/high screens with real-ubatch weighting and fresh clean
+processes. A preregistered `single_pair_fail_fast` stage is a screening signal
+with no confidence interval or acceptance claim. Preserve all raw samples and
+stop on a regression signal.
+
+When the manifest preregisters `early_diagnostics`, an agent may opt into
+direct-target Nsight discovery and filtered capture after a regression:
+
+```bash
+python3 scripts/feature-performance-validation.py run \
+  MANIFEST.json --through early --diagnose-regressions
+```
+
+This diagnostic independently discovers baseline and candidate launches and
+remains explanatory evidence only. It must follow the profiler launch contract
+below and cannot convert an early result into acceptance. A clear early screen
+only authorizes proportional production confirmation. The canonical
+long-context comparison, matching-batch perplexity and output exactness oracle,
+whole-lifecycle clean-process evidence, pinned/ordinary-host and process-VRAM
+accounting, allocation-lifecycle checks, and every feature-specific gate in
+this document remain mandatory. Keep large raw runner and profiler artifacts
+outside Git; record only reproducible manifests and concise valid summaries.
+
 ## Canonical server lifecycle
 
 This is the current source-supported target-plus-MTP layout and matched short
