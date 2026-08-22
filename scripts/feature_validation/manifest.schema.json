@@ -179,6 +179,15 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "provenanceSidecar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "environment": {
       "type": "object",
       "additionalProperties": { "type": ["string", "number", "boolean"] }
@@ -231,8 +240,21 @@
         "path": { "type": "string", "pattern": "^/" },
         "expected_sha256": { "$ref": "#/$defs/sha256" },
         "build": { "$ref": "#/$defs/build" },
+        "provenance_sidecar": { "$ref": "#/$defs/provenanceSidecar" },
         "direct_harness": { "$ref": "#/$defs/directHarness" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "build": {
+                "properties": { "mode": { "const": "cmake_required" } }
+              }
+            }
+          },
+          "then": { "required": ["provenance_sidecar"] }
+        }
+      ]
     },
     "variant": {
       "type": "object",

@@ -65,7 +65,7 @@ ctest --test-dir build-tools-validation \
 Final result: 1/1 test passed in 8.38 seconds with `ResourceWarning` promoted
 to an error.
 No build was launched; therefore no
-parallel build wider than `-j6` occurred.
+parallel build wider than 12 jobs occurred.
 
 ## Merge-readiness checkpoint
 
@@ -257,3 +257,49 @@ matched builds. Existing real-GPU and profiler evidence is not relabeled as a
 test of this new trigger. All actual NSYS/NCU target executions still use the
 whole-command GPU lock and direct llama affinity path shared with the production
 profiler.
+
+## Build-provenance contamination follow-up
+
+The attention-staging investigation exposed a preserved temporary executable
+whose embedded commit, binary hash, and cache policy looked like an exact
+baseline even though its nested source archive contained unrelated staging-
+pool and bounded-growth patches. No contaminated timing or memory value was
+accepted. This follow-up adds final-path CMake build registration and makes its
+hashed sidecar mandatory for every CMake executable role.
+
+The warning-as-error CPU-only suite used:
+
+```bash
+python3 -m json.tool scripts/feature_validation/manifest.schema.json >/dev/null
+python3 -m json.tool \
+  examples/feature-performance-validation/manifest.example.json >/dev/null
+PYTHONWARNINGS=error::ResourceWarning python3 -m py_compile \
+  scripts/feature_validation/*.py \
+  scripts/feature-performance-validation.py \
+  scripts/test-feature-validation.py
+PYTHONWARNINGS=error::ResourceWarning \
+  python3 scripts/test-feature-validation.py -v
+```
+
+Result: 76 tests passed. New tests cover successful
+registration, exact Git-root enforcement, CMake-home mismatch, missing
+manifest registration, missing sidecar file, altered external hash, invalid
+internal fingerprint, source drift after registration, copied binary plus
+copied sidecar, and rejection of a non-ignored sidecar that would change its
+own source identity. CMake registration combined with a declared direct harness
+is covered independently so its source-file list cannot replace the complete
+worktree inventory.
+
+A real CPU CMake tree built and registered
+`test-cuda-fattn-route-policy` from the exact worktree root. Registration
+hashed 3,874 source paths and produced an 808,463-byte sidecar in 0.19 seconds;
+the registered executable then passed. The same configured tree ran the
+checked-in CTest integration:
+
+```bash
+ctest --test-dir /tmp/beellama-build-provenance-real.CaTwAk/build \
+  -R '^test-feature-performance-validation$' --output-on-failure
+```
+
+Result: 1/1 passed. No CUDA target, model, GPU process, NSYS, or NCU command ran
+for this tooling-only hardening.

@@ -18,6 +18,10 @@
         "correctness": {
           "path": "/absolute/path/to/baseline/build/bin/llama-cli",
           "expected_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "provenance_sidecar": {
+            "path": "/absolute/path/to/baseline/build/bin/llama-cli.build-provenance.json",
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
           "build": {
             "mode": "cmake_required",
             "cache": "/absolute/path/to/baseline/build/CMakeCache.txt",
@@ -31,6 +35,10 @@
         "benchmark": {
           "path": "/absolute/path/to/baseline/build/bin/llama-bench",
           "expected_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+          "provenance_sidecar": {
+            "path": "/absolute/path/to/baseline/build/bin/llama-bench.build-provenance.json",
+            "sha256": "7777777777777777777777777777777777777777777777777777777777777777"
+          },
           "build": {
             "mode": "cmake_required",
             "cache": "/absolute/path/to/baseline/build/CMakeCache.txt",
@@ -51,6 +59,10 @@
         "correctness": {
           "path": "/absolute/path/to/candidate/build/bin/llama-cli",
           "expected_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "provenance_sidecar": {
+            "path": "/absolute/path/to/candidate/build/bin/llama-cli.build-provenance.json",
+            "sha256": "8888888888888888888888888888888888888888888888888888888888888888"
+          },
           "build": {
             "mode": "cmake_required",
             "cache": "/absolute/path/to/candidate/build/CMakeCache.txt",
@@ -64,6 +76,10 @@
         "benchmark": {
           "path": "/absolute/path/to/candidate/build/bin/llama-bench",
           "expected_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+          "provenance_sidecar": {
+            "path": "/absolute/path/to/candidate/build/bin/llama-bench.build-provenance.json",
+            "sha256": "9999999999999999999999999999999999999999999999999999999999999999"
+          },
           "build": {
             "mode": "cmake_required",
             "cache": "/absolute/path/to/candidate/build/CMakeCache.txt",

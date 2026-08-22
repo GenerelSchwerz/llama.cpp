@@ -39,6 +39,32 @@ Update this document first when supported controls, the exactness oracle,
 benchmark shape, progress mechanism, or artifact contract changes. Old Git
 revisions are historical evidence, not runnable current protocol.
 
+## Integration-base policy for feature worktrees
+
+Treat the canonical KV-offload integration branch (currently
+`beellama-kv-cpu-offload` and its configured remote-tracking branch) as the
+main integration line for this work. A feature worktree's original base commit
+records where the investigation started; it is not a reason to remain pinned
+there while the integration branch advances.
+
+Feature branches intended for KV-offload should incorporate the latest
+validated integration head before new acceptance measurements, final
+merge-readiness validation, and handoff. Prefer updating the feature branch to
+the integration line over carrying an avoidable old-base delta. Merge or rebase
+according to the branch's publication policy, preserve all feature work, and
+report substantive conflicts rather than resolving them by dropping either
+side. Open their PRs against the KV-offload integration branch, not the
+repository's general-purpose `main` branch.
+
+Every result must still record the exact base and candidate commits actually
+measured. After incorporating a newer integration head, invalidate the prior
+build registration, re-register the exact source and binary identities, rebuild
+when binary-affecting inputs changed, and rerun coverage proportional to the
+incoming delta. Do not relabel evidence from the older base as measurements of
+the updated branch. Avoid needless update churn during a running matched pair;
+finish or invalidate that pair, update at the next clean process boundary, and
+then collect evidence against the new base.
+
 ## Current source surface
 
 The published KV source contains these controls:
@@ -157,6 +183,32 @@ the whole runner under the outer lock. It records health-ready elapsed time and
 a process/GPU startup sample before the first request, then preserves the
 request-level process, VRAM, timing, output, and progress artifacts.
 
+## Shared CUDA build scheduling
+
+Serialize CUDA builds from every worktree on this host with the dedicated
+build lock. The lock and the per-build job limit address different resource
+constraints: the lock prevents separate builds from overlapping, while the job
+limit bounds CPU and memory pressure inside the one active build.
+
+This 24-core, 64-GiB benchmark host uses at most 12 parallel build jobs:
+
+```bash
+flock /tmp/beellama-cuda-build.lock -c \
+  'cmake --build build-cuda-all --target llama-server --parallel 12'
+```
+
+Keep the entire `cmake --build` command inside the safely quoted lock command.
+Queued builds wait on the lock and must retain the same 12-job cap when they
+start. Select only the targets required by the current gate. The build lock is
+separate from `/tmp/beellama-single-gpu.lock`; compiling does not acquire the
+GPU-run lock, and a benchmark or profiler must still follow its GPU locking
+contract.
+
+The 12-job value is host-specific. Do not copy it to a different machine
+without checking its CPU topology, available memory, and peak compiler-process
+memory. Historical reproduction documents may contain higher parallelism; they
+reproduce their named build and are not current scheduling templates.
+
 ## Preflight and binary identity
 
 Run before a measurement:
@@ -182,6 +234,25 @@ flock /tmp/beellama-single-gpu.lock -c '
 Do not present an uncommitted or differently configured binary as evidence for
 the current commit. Documentation-only dirt does not change a binary; source
 or build changes do.
+
+Before placing any CMake-built executable in a feature-validation manifest,
+register it at its final path:
+
+```bash
+python3 scripts/feature-performance-validation.py register-build \
+  --source-root /absolute/path/to/source \
+  --executable /absolute/path/to/build/bin/llama-bench \
+  --cache /absolute/path/to/build/CMakeCache.txt
+```
+
+This writes an adjacent `.build-provenance.json` sidecar. Record that absolute
+path and its SHA-256 in the executable's manifest entry. The validator requires
+the sidecar for every CMake-built role and rejects a missing, copied, stale, or
+mismatched sidecar. Registration also requires the declared source root to be
+the exact Git worktree root and to equal the cache's `CMAKE_HOME_DIRECTORY`;
+an ignored archive nested inside another worktree is not a source identity.
+Re-register after rebuilding, reconfiguring, changing source, or copying the
+binary to a new final path. Do not reuse a sidecar from another path.
 
 ## Manifest-driven early feature screen
 
