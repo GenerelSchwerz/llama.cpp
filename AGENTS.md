@@ -282,6 +282,11 @@ CPU-resident KV-cache investigation.
 - Do not present measurements from an uncommitted or differently configured
   binary as results for the current commit. Rebuild or verify the binary's build
   commit before benchmarking.
+- Before using a CMake-built executable with the feature-performance validation
+  toolkit, run its `register-build` command at the executable's final path and
+  pin the emitted sidecar path and SHA-256 in the manifest. Missing, copied, or
+  stale registrations fail closed; an embedded commit label is not sufficient
+  build provenance.
 
 ## Git Conventions
 

@@ -315,6 +315,71 @@ def _study_root(manifest: dict[str, Any], manifest_sha: str) -> pathlib.Path:
     )
 
 
+def _register_build(
+    source_root: pathlib.Path,
+    executable: pathlib.Path,
+    cache: pathlib.Path,
+    output: pathlib.Path | None,
+    *,
+    force: bool,
+) -> dict[str, Any]:
+    resolved_root = source_root.expanduser().resolve()
+    resolved_executable = executable.expanduser().resolve()
+    resolved_cache = cache.expanduser().resolve()
+    resolved_output = (
+        output.expanduser().resolve()
+        if output is not None
+        else pathlib.Path(f"{resolved_executable}.build-provenance.json")
+    )
+    if resolved_output in {resolved_executable, resolved_cache}:
+        raise core.ValidationError("build provenance sidecar cannot overwrite the executable or cache")
+    if resolved_output.exists() and not force:
+        raise core.ValidationError(
+            f"build provenance sidecar already exists; pass --force to replace it: {resolved_output}"
+        )
+    try:
+        resolved_output.relative_to(resolved_root)
+    except ValueError:
+        pass
+    else:
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(resolved_root),
+                "check-ignore",
+                "-q",
+                "--no-index",
+                str(resolved_output),
+            ],
+            check=False,
+        )
+        if ignored.returncode != 0:
+            raise core.ValidationError(
+                "a sidecar inside source_root must be Git-ignored so registration does not alter source identity"
+            )
+    sidecar = core.capture_cmake_build_provenance(
+        resolved_root,
+        resolved_executable,
+        resolved_cache,
+    )
+    core.write_json_atomic(resolved_output, sidecar)
+    return {
+        "status": "registered",
+        "sidecar": {
+            "path": str(resolved_output),
+            "sha256": core.sha256_file(resolved_output),
+        },
+        "identity_fingerprint": sidecar["identity_fingerprint"],
+        "source_root": sidecar["source"]["root"],
+        "source_commit": sidecar["source"]["head"],
+        "source_dirty_fingerprint": sidecar["source"]["dirty_fingerprint"],
+        "source_file_count": sidecar["source"]["source_files"]["count"],
+        "executable_sha256": sidecar["executable"]["sha256"],
+        "cache_sha256": sidecar["build"]["cache_sha256"],
+    }
+
+
 def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) -> dict[str, Any]:
     manifest, manifest_sha = core.load_and_validate_manifest(manifest_path)
     config = manifest.get("profiler")
@@ -439,6 +504,15 @@ def _diagnose(manifest_path: pathlib.Path, *, resume: bool) -> dict[str, Any]:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
+    register = subparsers.add_parser(
+        "register-build",
+        help="bind one CMake executable to its exact source, cache, libraries, and final path",
+    )
+    register.add_argument("--source-root", required=True, type=pathlib.Path)
+    register.add_argument("--executable", required=True, type=pathlib.Path)
+    register.add_argument("--cache", required=True, type=pathlib.Path)
+    register.add_argument("--output", type=pathlib.Path)
+    register.add_argument("--force", action="store_true")
     validate = subparsers.add_parser("validate", help="validate schema and fail-closed provenance")
     validate.add_argument("manifest", type=pathlib.Path)
     run = subparsers.add_parser("run", help="run validation stages")
@@ -473,7 +547,16 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = _parser().parse_args()
     try:
-        if args.command == "validate":
+        if args.command == "register-build":
+            registration = _register_build(
+                args.source_root,
+                args.executable,
+                args.cache,
+                args.output,
+                force=args.force,
+            )
+            print(json.dumps(registration, indent=2, sort_keys=True))
+        elif args.command == "validate":
             manifest, manifest_sha = core.load_and_validate_manifest(args.manifest)
             provenance = core.capture_provenance(manifest, manifest_sha)
             print(

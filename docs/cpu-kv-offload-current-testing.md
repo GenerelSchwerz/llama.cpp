@@ -183,6 +183,25 @@ Do not present an uncommitted or differently configured binary as evidence for
 the current commit. Documentation-only dirt does not change a binary; source
 or build changes do.
 
+Before placing any CMake-built executable in a feature-validation manifest,
+register it at its final path:
+
+```bash
+python3 scripts/feature-performance-validation.py register-build \
+  --source-root /absolute/path/to/source \
+  --executable /absolute/path/to/build/bin/llama-bench \
+  --cache /absolute/path/to/build/CMakeCache.txt
+```
+
+This writes an adjacent `.build-provenance.json` sidecar. Record that absolute
+path and its SHA-256 in the executable's manifest entry. The validator requires
+the sidecar for every CMake-built role and rejects a missing, copied, stale, or
+mismatched sidecar. Registration also requires the declared source root to be
+the exact Git worktree root and to equal the cache's `CMAKE_HOME_DIRECTORY`;
+an ignored archive nested inside another worktree is not a source identity.
+Re-register after rebuilding, reconfiguring, changing source, or copying the
+binary to a new final path. Do not reuse a sidecar from another path.
+
 ## Manifest-driven early feature screen
 
 Every new CPU-KV-derived performance or memory feature starts with a

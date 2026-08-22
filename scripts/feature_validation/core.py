@@ -23,6 +23,8 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = 1
+BUILD_PROVENANCE_SCHEMA_VERSION = 1
+BUILD_PROVENANCE_KIND = "beellama-feature-validation-cmake-build"
 GPU_LOCK = "/tmp/beellama-single-gpu.lock"
 PURPOSE_ORDER = {
     "exactness": 0,
@@ -666,6 +668,21 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                 )
             if build["mode"] == "not_applicable" and not build.get("reason"):
                 raise ManifestError(f"variant {name} executable role {role} non-CMake build requires a reason")
+            sidecar = executable.get("provenance_sidecar")
+            if build["mode"] == "cmake_required" and not isinstance(sidecar, dict):
+                raise ManifestError(
+                    f"variant {name} executable role {role} CMake build requires provenance_sidecar"
+                )
+            if sidecar is not None:
+                if not isinstance(sidecar, dict) or set(sidecar) != {"path", "sha256"}:
+                    raise ManifestError(
+                        f"variant {name} executable role {role} provenance_sidecar requires only path and sha256"
+                    )
+                if not pathlib.Path(sidecar["path"]).is_absolute():
+                    raise ManifestError(
+                        f"variant {name} executable role {role} provenance_sidecar path must be absolute"
+                    )
+                validate_sha256(sidecar["sha256"], f"variant {name}/{role} provenance_sidecar sha256")
         try:
             pathlib.Path(artifact_root).resolve().relative_to(pathlib.Path(variant["source_root"]).resolve())
         except ValueError:
@@ -1044,7 +1061,15 @@ def _git_text(root: pathlib.Path, *args: str) -> str:
 
 
 def git_snapshot(root: pathlib.Path) -> dict[str, Any]:
-    resolved = pathlib.Path(_git_text(root, "rev-parse", "--show-toplevel").strip()).resolve()
+    requested = root.expanduser().resolve()
+    if not requested.is_dir():
+        raise ProvenanceError(f"source_root is not a directory: {requested}")
+    resolved = pathlib.Path(_git_text(requested, "rev-parse", "--show-toplevel").strip()).resolve()
+    if resolved != requested:
+        raise ProvenanceError(
+            "source_root must be the exact Git worktree root: "
+            f"declared {requested}, git reported {resolved}"
+        )
     status = _git_text(resolved, "status", "--porcelain=v1", "--untracked-files=all")
     unstaged = subprocess.run(
         ["git", "-C", str(resolved), "diff", "--binary", "HEAD", "--"],
@@ -1085,6 +1110,68 @@ def git_snapshot(root: pathlib.Path) -> dict[str, Any]:
     }
 
 
+def git_source_file_manifest(root: pathlib.Path) -> dict[str, Any]:
+    """Hash every tracked or untracked, non-ignored path in one exact worktree."""
+    resolved = root.expanduser().resolve()
+    discovered = pathlib.Path(_git_text(resolved, "rev-parse", "--show-toplevel").strip()).resolve()
+    if discovered != resolved:
+        raise ProvenanceError(
+            "source_root must be the exact Git worktree root before source hashing: "
+            f"declared {resolved}, git reported {discovered}"
+        )
+    listed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(resolved),
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    records: list[dict[str, Any]] = []
+    for raw in sorted({item for item in listed.split(b"\0") if item}):
+        relative = pathlib.Path(os.fsdecode(raw))
+        source = resolved / relative
+        if source.is_symlink():
+            target = os.fsencode(os.readlink(source))
+            record = {
+                "path": str(relative),
+                "kind": "symlink",
+                "sha256": sha256_bytes(target),
+            }
+        elif source.is_file():
+            record = {
+                "path": str(relative),
+                "kind": "file",
+                "sha256": sha256_file(source),
+            }
+        elif source.is_dir():
+            head = _git_text(source, "rev-parse", "HEAD").strip()
+            record = {
+                "path": str(relative),
+                "kind": "gitlink",
+                "head": head,
+                "sha256": sha256_bytes(head.encode("ascii")),
+            }
+        else:
+            record = {
+                "path": str(relative),
+                "kind": "missing",
+                "sha256": None,
+            }
+        records.append(record)
+    return {
+        "count": len(records),
+        "sha256": canonical_sha256(records),
+        "files": records,
+    }
+
+
 def _find_cmake_cache(executable: pathlib.Path, build: dict[str, Any]) -> pathlib.Path | None:
     if build.get("cache"):
         candidate = pathlib.Path(build["cache"]).expanduser().resolve()
@@ -1096,7 +1183,11 @@ def _find_cmake_cache(executable: pathlib.Path, build: dict[str, Any]) -> pathli
     return None
 
 
-def cmake_snapshot(executable: pathlib.Path, build: dict[str, Any]) -> dict[str, Any]:
+def cmake_snapshot(
+    executable: pathlib.Path,
+    build: dict[str, Any],
+    source_root: pathlib.Path | None = None,
+) -> dict[str, Any]:
     if build["mode"] == "not_applicable":
         return {"mode": "not_applicable", "reason": build["reason"]}
     cache = _find_cmake_cache(executable, build)
@@ -1116,11 +1207,35 @@ def cmake_snapshot(executable: pathlib.Path, build: dict[str, Any]) -> dict[str,
     }
     if mismatches:
         raise ProvenanceError(f"CMake option mismatch for {executable}: {mismatches}")
+    home_directory = entries.get("CMAKE_HOME_DIRECTORY")
+    if source_root is not None:
+        expected_root = source_root.expanduser().resolve()
+        if not home_directory:
+            raise ProvenanceError(f"CMake cache has no CMAKE_HOME_DIRECTORY: {cache}")
+        observed_home = pathlib.Path(home_directory).expanduser()
+        if not observed_home.is_absolute() or observed_home.resolve() != expected_root:
+            raise ProvenanceError(
+                "CMAKE_HOME_DIRECTORY does not match source_root: "
+                f"cache {cache} reports {home_directory!r}, source_root is {expected_root}"
+            )
+    cache_directory = entries.get("CMAKE_CACHEFILE_DIR")
+    if cache_directory:
+        observed_cache_directory = pathlib.Path(cache_directory).expanduser()
+        if (
+            not observed_cache_directory.is_absolute()
+            or observed_cache_directory.resolve() != cache.parent.resolve()
+        ):
+            raise ProvenanceError(
+                "CMAKE_CACHEFILE_DIR does not match the selected cache location: "
+                f"cache {cache} reports {cache_directory!r}"
+            )
     return {
         "mode": "cmake",
         "cache": str(cache),
         "cache_sha256": sha256_file(cache),
         "cache_stat": stat_identity(cache),
+        "home_directory": home_directory,
+        "cache_directory": cache_directory,
         "entries": entries,
     }
 
@@ -1174,8 +1289,120 @@ def binary_snapshot(executable: pathlib.Path) -> dict[str, Any]:
     return record
 
 
+def capture_cmake_build_provenance(
+    source_root: pathlib.Path,
+    executable: pathlib.Path,
+    cache: pathlib.Path,
+) -> dict[str, Any]:
+    resolved_root = source_root.expanduser().resolve()
+    resolved_executable = executable.expanduser().resolve()
+    resolved_cache = cache.expanduser().resolve()
+    source_snapshot = git_snapshot(resolved_root)
+    source_files = git_source_file_manifest(resolved_root)
+    source_after_hashing = git_snapshot(resolved_root)
+    if canonical_sha256(source_snapshot) != canonical_sha256(source_after_hashing):
+        raise ProvenanceError("source identity changed while registering the CMake build")
+    source = {
+        **source_after_hashing,
+        "source_files": source_files,
+    }
+    identity = {
+        "schema_version": BUILD_PROVENANCE_SCHEMA_VERSION,
+        "kind": BUILD_PROVENANCE_KIND,
+        "source": source,
+        "executable": binary_snapshot(resolved_executable),
+        "build": cmake_snapshot(
+            resolved_executable,
+            {
+                "mode": "cmake_required",
+                "cache": str(resolved_cache),
+                "expected_options": {},
+            },
+            resolved_root,
+        ),
+    }
+    return {
+        **identity,
+        "registered_utc": utc_now(),
+        "identity_fingerprint": canonical_sha256(identity),
+    }
+
+
+def verify_cmake_build_provenance(
+    name: str,
+    role: str,
+    sidecar_spec: dict[str, Any],
+    source: dict[str, Any],
+    source_files: dict[str, Any],
+    binary: dict[str, Any],
+    build: dict[str, Any],
+) -> dict[str, Any]:
+    sidecar_path = pathlib.Path(sidecar_spec["path"]).expanduser().resolve()
+    if not sidecar_path.is_file():
+        raise ProvenanceError(f"{name}/{role} build provenance sidecar is missing: {sidecar_path}")
+    observed_sha256 = sha256_file(sidecar_path)
+    if observed_sha256 != sidecar_spec["sha256"]:
+        raise ProvenanceError(
+            f"{name}/{role} build provenance sidecar SHA-256 mismatch: "
+            f"expected {sidecar_spec['sha256']}, observed {observed_sha256}"
+        )
+    try:
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ProvenanceError(
+            f"{name}/{role} build provenance sidecar is unreadable: {sidecar_path}: {error}"
+        ) from error
+    if not isinstance(sidecar, dict):
+        raise ProvenanceError(f"{name}/{role} build provenance sidecar must be an object")
+    expected_fields = {
+        "schema_version",
+        "kind",
+        "source",
+        "executable",
+        "build",
+        "registered_utc",
+        "identity_fingerprint",
+    }
+    if set(sidecar) != expected_fields:
+        raise ProvenanceError(
+            f"{name}/{role} build provenance sidecar has unknown or missing fields"
+        )
+    if (
+        sidecar.get("schema_version") != BUILD_PROVENANCE_SCHEMA_VERSION
+        or sidecar.get("kind") != BUILD_PROVENANCE_KIND
+    ):
+        raise ProvenanceError(f"{name}/{role} build provenance sidecar has an unsupported schema")
+    identity = {
+        "schema_version": sidecar.get("schema_version"),
+        "kind": sidecar.get("kind"),
+        "source": sidecar.get("source"),
+        "executable": sidecar.get("executable"),
+        "build": sidecar.get("build"),
+    }
+    if sidecar.get("identity_fingerprint") != canonical_sha256(identity):
+        raise ProvenanceError(f"{name}/{role} build provenance sidecar fingerprint is invalid")
+    current = {
+        "source": {**source, "source_files": source_files},
+        "executable": binary,
+        "build": build,
+    }
+    for key in ("source", "executable", "build"):
+        if canonical_sha256(sidecar.get(key)) != canonical_sha256(current[key]):
+            raise ProvenanceError(
+                f"{name}/{role} build provenance {key} mismatch; re-register the executable"
+            )
+    return {
+        "path": str(sidecar_path),
+        "sha256": observed_sha256,
+        **stat_identity(sidecar_path),
+        "registered_utc": sidecar.get("registered_utc"),
+        "identity_fingerprint": sidecar["identity_fingerprint"],
+    }
+
+
 def verify_variant(name: str, variant: dict[str, Any]) -> dict[str, Any]:
-    source = git_snapshot(pathlib.Path(variant["source_root"]))
+    source_root = pathlib.Path(variant["source_root"]).expanduser().resolve()
+    source = git_snapshot(source_root)
     if source["head"] != variant["expected_commit"]:
         raise ProvenanceError(
             f"{name} source commit mismatch: expected {variant['expected_commit']}, observed {source['head']}"
@@ -1189,8 +1416,10 @@ def verify_variant(name: str, variant: dict[str, Any]) -> dict[str, Any]:
                 f"{name} dirty-tree fingerprint mismatch: expected {expected}, observed {source['dirty_fingerprint']}"
             )
     executables: dict[str, Any] = {}
+    source_file_manifest: dict[str, Any] | None = None
     for role, executable in variant_executables(variant).items():
-        binary = binary_snapshot(pathlib.Path(executable["path"]))
+        executable_path = pathlib.Path(executable["path"]).expanduser().resolve()
+        binary = binary_snapshot(executable_path)
         if binary["sha256"] != executable["expected_sha256"]:
             raise ProvenanceError(
                 f"{name}/{role} binary SHA-256 mismatch: expected {executable['expected_sha256']}, "
@@ -1199,22 +1428,37 @@ def verify_variant(name: str, variant: dict[str, Any]) -> dict[str, Any]:
         harness = executable.get("direct_harness")
         if harness:
             validate_direct_target(pathlib.Path(binary["resolved_path"]), direct_harness=harness)
-            source_files: list[dict[str, Any]] = []
+            harness_source_files: list[dict[str, Any]] = []
             for item in harness["source_files"]:
                 source_path = pathlib.Path(item["path"]).expanduser().resolve()
                 if not source_path.is_file() or sha256_file(source_path) != item["sha256"]:
                     raise ProvenanceError(f"direct-harness source identity mismatch: {source_path}")
-                source_files.append(
+                harness_source_files.append(
                     {
                         "path": str(source_path),
                         "sha256": item["sha256"],
                         **stat_identity(source_path),
                     }
                 )
-            harness = {**harness, "source_files": source_files}
+            harness = {**harness, "source_files": harness_source_files}
+        build = cmake_snapshot(executable_path, executable["build"], source_root)
+        build_provenance = None
+        if executable["build"]["mode"] == "cmake_required":
+            if source_file_manifest is None:
+                source_file_manifest = git_source_file_manifest(source_root)
+            build_provenance = verify_cmake_build_provenance(
+                name,
+                role,
+                executable["provenance_sidecar"],
+                source,
+                source_file_manifest,
+                binary,
+                build,
+            )
         executables[role] = {
             "binary": binary,
-            "build": cmake_snapshot(pathlib.Path(binary["resolved_path"]), executable["build"]),
+            "build": build,
+            "build_provenance": build_provenance,
             "direct_harness": harness,
         }
     return {"source": source, "executables": executables}
@@ -1325,6 +1569,17 @@ def provenance_identity_spec(
                 "path": build["cache"],
                 "sha256": build["cache_sha256"],
                 **build["cache_stat"],
+                "rehash": False,
+                "verification": "stat_against_initial_sha256_capture",
+            }
+        build_provenance = executable.get("build_provenance")
+        if build_provenance:
+            files[build_provenance["path"]] = {
+                "path": build_provenance["path"],
+                **{
+                    key: build_provenance[key]
+                    for key in ("sha256", "size", "mtime_ns", "ctime_ns", "device", "inode")
+                },
                 "rehash": False,
                 "verification": "stat_against_initial_sha256_capture",
             }

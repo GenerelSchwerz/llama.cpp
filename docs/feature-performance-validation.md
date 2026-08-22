@@ -45,25 +45,58 @@ Keep the manifest small and preregister it before collecting measurements.
 Large outputs must go to the absolute `artifact_root`, which the runner rejects
 if it is inside either source repository.
 
+Register every CMake-built executable after its final build, reconfiguration,
+or copy and before adding it to a manifest:
+
+```bash
+python3 scripts/feature-performance-validation.py register-build \
+  --source-root /absolute/path/to/exact/worktree \
+  --executable /absolute/path/to/build/bin/llama-bench \
+  --cache /absolute/path/to/build/CMakeCache.txt
+```
+
+The default output is adjacent to the executable as
+`llama-bench.build-provenance.json`. Use `--output /absolute/path` only when an
+explicit location is needed and `--force` only after intentionally rebuilding,
+reconfiguring, or changing source. The command prints the exact sidecar path
+and SHA-256 for the manifest:
+
+```json
+"provenance_sidecar": {
+  "path": "/absolute/path/to/build/bin/llama-bench.build-provenance.json",
+  "sha256": "..."
+}
+```
+
+Registration fails unless `source_root` is the exact Git worktree root and the
+cache's `CMAKE_HOME_DIRECTORY` names that same root. It binds the final binary
+path and hash, resolved ELF libraries, full CMake cache, Git commit/tree/dirty
+fingerprint, and content hashes for every tracked or untracked non-ignored
+source path. A sidecar copied with a binary remains bound to the old path and
+is rejected; re-register the copy at its final path. Every CMake executable
+role requires a sidecar, and validation rejects missing, stale, altered, or
+mismatched registrations before launching a process.
+
 For each baseline and candidate, record:
 
 - the source root, exact commit, and either a clean-tree requirement or one
   exact dirty-tree fingerprint;
 - one or more executable roles with an expected SHA-256;
-- a discoverable CMake cache plus expected important options, or an explicit
-  reason CMake does not apply;
+- a registered build-provenance sidecar plus a discoverable CMake cache and
+  expected important options, or an explicit reason CMake does not apply;
 - every shared model, prompt file, library-like input, or other material input
   as a hashed `inputs` entry.
 
-The runner hashes the executable, all ELF libraries reported by `ldd`, inputs,
-harness sources, the CMake cache, and `nvidia-smi` once at fresh-study or resume
-provenance capture. Each child then compares size, mtime, ctime, device, and inode to
-that cryptographic capture, while source commit/tree identity is rechecked for
-every process. This avoids repeatedly hashing a large model and shared-library
-set without allowing a changed file to pass silently; every new invocation or
-resume performs the full hashes again. Host provenance records tool versions,
-CPU and OS identity, and starting load. Profiler executions additionally hash
-the `nsys` or `ncu` binary actually launched.
+The runner verifies the sidecar and hashes the executable, all ELF libraries
+reported by `ldd`, inputs, harness sources, the CMake cache, the sidecar, and
+`nvidia-smi` once at fresh-study or resume provenance capture. Each child then
+compares size, mtime, ctime, device, and inode to that cryptographic capture,
+while source commit/tree identity is rechecked for every process. This avoids
+repeatedly hashing a large model and shared-library set without allowing a
+changed file to pass silently; every new invocation or resume performs the
+full hashes again. Host provenance records tool versions, CPU and OS identity,
+and starting load. Profiler executions additionally hash the `nsys` or `ncu`
+binary actually launched.
 
 Place all matched workload settings in `command.common_args`. If the feature
 requires different arguments or environment between variants, copy the exact

@@ -18,6 +18,26 @@ add the transition and rationale here. Do not rewrite valid old measurements to
 claim new flags or geometry. The companion experiment ledger records curated
 per-change evidence.
 
+## Build-provenance sidecar transition: 2026-08-22
+
+An attention-staging screen selected a preserved binary whose directory name,
+embedded Git ancestry, binary hash, and CMake options appeared to identify an
+exact baseline. The temporary source archive had actually inherited its parent
+worktree's Git identity and had received unrelated staging-pool and bounded-
+growth patches. The mismatch was found before the contaminated timing and
+memory values were promoted, so no historical result is relabeled here.
+
+Current feature-validation protocol now registers each CMake executable at its
+final path and requires the resulting hashed sidecar in the study manifest.
+Registration binds the executable and resolved libraries, cache, exact Git
+root/tree/dirty fingerprint, and content hashes for every tracked or untracked
+non-ignored source path. Live validation rejects nested pseudo-roots, a cache
+whose `CMAKE_HOME_DIRECTORY` differs from the declared worktree, missing or
+copied sidecars, and any source/build/binary drift since registration. This
+supersedes commit-label-plus-binary-hash as sufficient baseline provenance; it
+does not invalidate a result whose earlier independent artifact set already
+proved complete source identity.
+
 ## Manifest-driven early-screen transition: 2026-08-22
 
 The prior current protocol defined exact provenance, clean-process GPU

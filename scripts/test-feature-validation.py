@@ -12,6 +12,7 @@ import io
 import json
 import pathlib
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -56,6 +57,7 @@ class FixtureMixin:
             encoding="utf-8",
         )
         self.executable.chmod(0o755)
+        (self.repo / ".gitignore").write_text("build/\n", encoding="utf-8")
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.email", "tests@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Feature Tests"], cwd=self.repo, check=True)
@@ -253,6 +255,56 @@ class FixtureMixin:
                 stage["decision_policy"] = copy.deepcopy(decision_policy)
         return manifest
 
+    def cmake_manifest(
+        self,
+    ) -> tuple[dict, pathlib.Path, pathlib.Path, pathlib.Path]:
+        build = self.repo / "build"
+        built_executable = build / "bin" / "fake bench"
+        built_executable.parent.mkdir(parents=True)
+        built_executable.write_text(
+            "#!/usr/bin/env python3\nprint('metric=100.0')\n",
+            encoding="utf-8",
+        )
+        built_executable.chmod(0o755)
+        cache = build / "CMakeCache.txt"
+        cache.write_text(
+            "\n".join(
+                [
+                    f"CMAKE_HOME_DIRECTORY:INTERNAL={self.repo}",
+                    f"CMAKE_CACHEFILE_DIR:INTERNAL={build}",
+                    "CMAKE_BUILD_TYPE:STRING=Release",
+                    "GGML_CUDA:BOOL=OFF",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        sidecar = pathlib.Path(f"{built_executable}.build-provenance.json")
+        core.write_json_atomic(
+            sidecar,
+            core.capture_cmake_build_provenance(self.repo, built_executable, cache),
+        )
+        manifest = self.manifest()
+        executable = {
+            "path": str(built_executable),
+            "expected_sha256": file_sha256(built_executable),
+            "provenance_sidecar": {
+                "path": str(sidecar),
+                "sha256": file_sha256(sidecar),
+            },
+            "build": {
+                "mode": "cmake_required",
+                "cache": str(cache),
+                "expected_options": {
+                    "CMAKE_BUILD_TYPE": "Release",
+                    "GGML_CUDA": "OFF",
+                },
+            },
+        }
+        for variant in manifest["variants"].values():
+            variant["executables"] = {"default": copy.deepcopy(executable)}
+        return manifest, built_executable, cache, sidecar
+
 
 class QuotingAndArityTest(unittest.TestCase):
     def test_safe_quoting_round_trips_spaces_quotes_and_metacharacters(self) -> None:
@@ -315,7 +367,12 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
     def test_checked_in_example_is_structurally_valid_and_schema_is_json(self) -> None:
         schema_path = SCRIPTS / "feature_validation" / "manifest.schema.json"
         example_path = SCRIPTS.parent / "examples" / "feature-performance-validation" / "manifest.example.json"
-        self.assertEqual(json.loads(schema_path.read_text(encoding="utf-8"))["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        schema = json.loads(schema_path.read_text(encoding="utf-8"))
+        self.assertEqual(schema["$schema"], "https://json-schema.org/draft/2020-12/schema")
+        self.assertIn(
+            "provenance_sidecar",
+            schema["$defs"]["executable"]["allOf"][0]["then"]["required"],
+        )
         core.validate_manifest(json.loads(example_path.read_text(encoding="utf-8")))
 
     def test_valid_manifest_and_balanced_schedule(self) -> None:
@@ -526,6 +583,164 @@ class ProvenanceTest(FixtureMixin, unittest.TestCase):
             "expected_sha256"
         ] = "0" * 64
         with self.assertRaisesRegex(core.ProvenanceError, "binary SHA-256 mismatch"):
+            core.capture_provenance(manifest, "manifest-hash")
+
+    def test_registered_cmake_build_succeeds(self) -> None:
+        manifest, _, _, sidecar = self.cmake_manifest()
+        core.validate_manifest(manifest)
+        provenance = core.capture_provenance(manifest, "manifest-hash")
+        registered = provenance["variants"]["baseline"]["executables"]["default"][
+            "build_provenance"
+        ]
+        self.assertEqual(registered["path"], str(sidecar.resolve()))
+        sidecar_body = json.loads(sidecar.read_text(encoding="utf-8"))
+        self.assertEqual(sidecar_body["source"]["root"], str(self.repo.resolve()))
+        self.assertEqual(
+            sidecar_body["build"]["home_directory"],
+            str(self.repo.resolve()),
+        )
+        self.assertGreater(sidecar_body["source"]["source_files"]["count"], 0)
+        files, _ = core.provenance_identity_spec(
+            provenance, [("baseline", "default")]
+        )
+        self.assertIn(str(sidecar.resolve()), {item["path"] for item in files})
+
+    def test_registered_cmake_build_with_direct_harness_succeeds(self) -> None:
+        manifest, _, _, _ = self.cmake_manifest()
+        harness = {
+            "kind": "native_executable",
+            "native_llama_affinity": True,
+            "source_files": [
+                {
+                    "path": str(self.executable.resolve()),
+                    "sha256": file_sha256(self.executable),
+                }
+            ],
+        }
+        for variant in manifest["variants"].values():
+            variant["executables"]["default"]["direct_harness"] = copy.deepcopy(
+                harness
+            )
+        provenance = core.capture_provenance(manifest, "manifest-hash")
+        observed = provenance["variants"]["baseline"]["executables"]["default"]
+        self.assertEqual(
+            observed["direct_harness"]["source_files"][0]["sha256"],
+            file_sha256(self.executable),
+        )
+
+    def test_register_build_command_writes_manifest_ready_sidecar(self) -> None:
+        _, built_executable, cache, sidecar = self.cmake_manifest()
+        sidecar.unlink()
+        result = CLI._register_build(
+            self.repo,
+            built_executable,
+            cache,
+            None,
+            force=False,
+        )
+        self.assertEqual(result["status"], "registered")
+        self.assertEqual(result["sidecar"]["path"], str(sidecar.resolve()))
+        self.assertEqual(result["sidecar"]["sha256"], file_sha256(sidecar))
+        with self.assertRaisesRegex(core.ValidationError, "already exists"):
+            CLI._register_build(
+                self.repo,
+                built_executable,
+                cache,
+                None,
+                force=False,
+            )
+
+    def test_register_build_rejects_nonignored_sidecar_inside_source(self) -> None:
+        _, built_executable, cache, _ = self.cmake_manifest()
+        with self.assertRaisesRegex(core.ValidationError, "must be Git-ignored"):
+            CLI._register_build(
+                self.repo,
+                built_executable,
+                cache,
+                self.repo / "tracked-sidecar.json",
+                force=False,
+            )
+
+    def test_cmake_manifest_without_sidecar_fails_closed(self) -> None:
+        manifest, _, _, _ = self.cmake_manifest()
+        del manifest["variants"]["candidate"]["executables"]["default"][
+            "provenance_sidecar"
+        ]
+        with self.assertRaisesRegex(core.ManifestError, "requires provenance_sidecar"):
+            core.validate_manifest(manifest)
+
+    def test_missing_sidecar_file_fails_closed(self) -> None:
+        manifest, _, _, sidecar = self.cmake_manifest()
+        sidecar.unlink()
+        with self.assertRaisesRegex(core.ProvenanceError, "sidecar is missing"):
+            core.capture_provenance(manifest, "manifest-hash")
+
+    def test_nested_source_root_fails_closed(self) -> None:
+        nested = self.repo / "ignored archive"
+        nested.mkdir()
+        with self.assertRaisesRegex(core.ProvenanceError, "exact Git worktree root"):
+            core.git_snapshot(nested)
+
+    def test_cmake_home_directory_mismatch_fails_closed(self) -> None:
+        _, built_executable, cache, _ = self.cmake_manifest()
+        cache.write_text(
+            cache.read_text(encoding="utf-8").replace(
+                str(self.repo), str(self.root / "different source")
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(core.ProvenanceError, "CMAKE_HOME_DIRECTORY"):
+            core.capture_cmake_build_provenance(self.repo, built_executable, cache)
+
+    def test_source_change_after_registration_fails_sidecar(self) -> None:
+        manifest, _, _, _ = self.cmake_manifest()
+        self.executable.write_text(
+            self.executable.read_text(encoding="utf-8").replace("100.0", "101.0"),
+            encoding="utf-8",
+        )
+        dirty = core.git_snapshot(self.repo)["dirty_fingerprint"]
+        for variant in manifest["variants"].values():
+            variant["tree_policy"] = "expected_dirty"
+            variant["expected_dirty_fingerprint"] = dirty
+        with self.assertRaisesRegex(core.ProvenanceError, "provenance source mismatch"):
+            core.capture_provenance(manifest, "manifest-hash")
+
+    def test_copied_binary_and_sidecar_require_reregistration(self) -> None:
+        manifest, built_executable, _, sidecar = self.cmake_manifest()
+        copied = self.root / "copied" / "fake bench"
+        copied.parent.mkdir()
+        shutil.copy2(built_executable, copied)
+        copied_sidecar = pathlib.Path(f"{copied}.build-provenance.json")
+        shutil.copy2(sidecar, copied_sidecar)
+        for variant in manifest["variants"].values():
+            executable = variant["executables"]["default"]
+            executable["path"] = str(copied)
+            executable["expected_sha256"] = file_sha256(copied)
+            executable["provenance_sidecar"] = {
+                "path": str(copied_sidecar),
+                "sha256": file_sha256(copied_sidecar),
+            }
+        with self.assertRaisesRegex(core.ProvenanceError, "provenance executable mismatch"):
+            core.capture_provenance(manifest, "manifest-hash")
+
+    def test_wrong_sidecar_hash_fails_closed(self) -> None:
+        manifest, _, _, _ = self.cmake_manifest()
+        manifest["variants"]["candidate"]["executables"]["default"][
+            "provenance_sidecar"
+        ]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(core.ProvenanceError, "sidecar SHA-256 mismatch"):
+            core.capture_provenance(manifest, "manifest-hash")
+
+    def test_sidecar_internal_fingerprint_fails_closed(self) -> None:
+        manifest, _, _, sidecar = self.cmake_manifest()
+        body = json.loads(sidecar.read_text(encoding="utf-8"))
+        body["source"]["head"] = "0" * 40
+        core.write_json_atomic(sidecar, body)
+        for variant in manifest["variants"].values():
+            variant["executables"]["default"]["provenance_sidecar"][
+                "sha256"
+            ] = file_sha256(sidecar)
+        with self.assertRaisesRegex(core.ProvenanceError, "fingerprint is invalid"):
             core.capture_provenance(manifest, "manifest-hash")
 
     def test_dirty_tree_fails_closed(self) -> None:

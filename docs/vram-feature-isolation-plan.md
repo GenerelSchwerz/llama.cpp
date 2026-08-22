@@ -74,7 +74,9 @@ closed.
 
 Each independently accepted feature must satisfy:
 
-1. Exact base and candidate commits plus binary/library hashes.
+1. Exact base and candidate commits plus registered build-provenance sidecars
+   binding binary/library hashes, the CMake source root/cache, and complete
+   tracked/untracked non-ignored source content.
 2. Clean GPU preflight and a shared lock held for the full process lifecycle,
    using exactly `flock /tmp/beellama-single-gpu.lock -c 'COMMAND'` with safe
    inner quoting, never flock's direct-command form.
