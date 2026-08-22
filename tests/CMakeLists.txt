@@ -88,6 +88,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
 
     add_test(
+        NAME test-live-context-workspace-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-live-context-workspace-static.py)
+    set_property(TEST test-live-context-workspace-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-spec-cession-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-spec-cession-static.py)

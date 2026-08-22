@@ -510,6 +510,8 @@ extern "C" {
                                        // Trades device memory for host-to-device KV traffic; 0 keeps every layer on host.
         bool phase_aware_workspace;   // resize compute schedulers between prompt processing and token generation.
                                       // Fit/no-alloc contexts still measure the full prompt reservation.
+        bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent.
+                                      // false preserves the full-context reservation and initialization order.
     };
 
     struct llama_model_tensor_override {

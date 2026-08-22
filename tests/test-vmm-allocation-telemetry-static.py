@@ -29,8 +29,18 @@ def main() -> None:
         "if (telemetry_tracked || !stats.enabled.load(std::memory_order_relaxed))",
         "CUDA VMM allocation accounting must stay dormant until explicitly enabled",
     )
-    if "ggml_backend_cuda_trim_transient_pools" in cuda:
-        raise AssertionError("W02 must not import transient-pool trimming policy")
+    require(
+        cuda,
+        "ggml_backend_cuda_trim_transient_pools",
+        "published W02 telemetry must coexist with live-policy idle trimming",
+    )
+    trim = cuda.split("size_t trim() override", 1)[1].split(
+        "static bool ggml_backend_cuda_vmm_pool_stats_get", 1)[0]
+    require(
+        trim,
+        "mapped_bytes.fetch_sub(released",
+        "idle trim must subtract released mappings from current VMM telemetry",
+    )
 
     for field in (
         '"cuda_vmm_live_peak_bytes"',
@@ -70,11 +80,12 @@ def main() -> None:
     if "cuda_vmm_pool_stats_reset(" in prefix:
         raise AssertionError("VMM telemetry must not be enabled on the default benchmark path")
 
-    for excluded in (
-        "phase_aware_workspace",
+    require(
+        bench,
         "live_context_workspace",
-        "flash_attn_native_quants",
-    ):
+        "composed telemetry benchmark must publish the selected live-workspace policy",
+    )
+    for excluded in ("phase_aware_workspace", "flash_attn_native_quants"):
         if excluded in bench:
             raise AssertionError(f"W02 must not depend on later feature field {excluded}")
 

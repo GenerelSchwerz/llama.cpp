@@ -1120,6 +1120,7 @@ protocol, roadmap, feature-isolation plan, and source-backed feature delta are
 shared KV inheritance. PR 7 and PR 8 identities and all pairwise comparisons
 have been refreshed at their final heads. This consolidation does not merge or
 fast-forward the published KV base.
+
 ## 2026-08-20: pre-PR4 W02 telemetry isolation
 
 The allocation-classification and CUDA VMM high-water instrumentation from the
@@ -1141,6 +1142,146 @@ source and on/off performance screens, repeatable VMM peaks, all three physical
 allocation classes, and identical matched perplexity. Experiment 020 contains
 the exact commands and evidence. The result remains support instrumentation,
 not a VRAM optimization or permission to infer a trimming policy.
+
+## 2026-08-21: F32 GDN recurrent snapshot-fusion regression
+
+The old isolated feature head
+`06cb666f8d07f345840881e9720d2a0756555f33` recovered one useful test from
+the immutable `refs/codex/pre-pr4-parallel-source` snapshot: an F32
+whole-graph backend-op fixture for the existing CUDA gated-delta-net
+recurrent-cache copy fusion. The ordinary GDN matrix validates the packed
+operator result but does not construct the model graph's
+`GATED_DELTA_NET -> VIEW -> CPY` cache write and therefore cannot cover the
+direct snapshot store.
+
+After shared PR 9 merged, the same test patch was rebased without behavior
+changes onto exact `beellama-kv-cpu-offload` base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` as source commit
+`77aa9f640f97349cf04ca6a5f50a1a7910a496b0`. It continues to use the
+upstream-style `run_whole_graph()` and `fusion_test_nodes()` hooks and mirrors
+the cache view in `llm_build_delta_net_base::build_recurrent_attn()`. No F16
+state, compact masking, native Q8, live workspace, telemetry, staging, or
+unrelated snapshot code was imported.
+
+The appended post-PR9 test-only record owns the exact build and final-identity
+CPU/CUDA validation evidence. Merge-readiness validation used complete Release
+CPU and CUDA builds at `4b71f6370ef220c91f3641fc1ea4bb25ecb2674a`, capped
+at six build jobs. The focused fixture, existing 36-case GDN matrices, and seed
+guard passed on CPU and CUDA. Broad practical CTest passed 96/96 on CPU and
+95/95 on CUDA; the record identifies the excluded unavailable Git LFS vocab
+data case and unrelated unfiltered FlashAttention matrix abort. This change
+adds no production source, runtime behavior, performance claim, or perplexity
+claim.
+
+## 2026-08-20: live-context workspace protocol edition
+
+The current-testing protocol now names live-context workspace sizing as an
+independent default-off control. The previous edition described only
+phase-aware token geometry and therefore could not reproduce W04/W05/W09 in
+isolation. Current live-sizing comparisons vary only the positive/negative
+live control, require a memory layout that explicitly publishes bounded
+attention reservation, and keep every other optional workspace policy fixed.
+Unsupported layouts retain full reservation and the established upfront
+decode order. CUDA transient-pool trimming is restricted to the all-slots-idle
+boundary after effective live sizing; it is not a per-decode reclamation path.
+
+## 2026-08-21: compose W02 telemetry with live idle trimming
+
+The published KV-offload base now contains W06 full-batch perplexity capacity
+and W02 allocation/VMM telemetry. Rebasing the isolated live-workspace work
+onto that base preserves both historical Experiment 020 entries as measured;
+neither prior source identity nor result is relabeled as composed evidence.
+
+The VMM pool now enrolls in W02 telemetry before an idle trim and subtracts
+only the released physical mapping from the current mapped-byte counter. Live
+bytes and mapped high-water remain unchanged by trim. No new benchmark trim
+caller or lifecycle checkpoint is shipped; composed validation observes the
+existing server all-idle boundary, and the default path remains dormant.
+
+## 2026-08-21: require the exact PR 8 disabled-source bracket
+
+The prior PR 8 refresh relied on production-path equivalence with its earlier
+measured head. That remains useful provenance for the enabled implementation,
+but it cannot prove that compiling the opt-in source leaves omission and
+explicit off neutral against the exact base. The final gate therefore uses
+identically configured exact-base and candidate builds with fresh base /
+candidate / base processes at both 4K and long context. Omission and explicit
+off are separate candidates, and every unrelated workspace/speculative option
+is fixed off or absent.
+
+The maintained exactness runner now captures a health-ready process/GPU sample
+before the first request. This makes startup time, process VRAM, ordinary RSS,
+shared/pinned-backed RSS, and later lifecycle peaks distinct artifacts rather
+than inferring startup from the first prefill. The current preflight template
+also places CUDA-linked version probes and `nvidia-smi` inside the whole-command
+GPU lock; the previous unlocked example was a protocol hazard, not evidence.
+
+The completed bracket compared exact base `8e858fcec39049fa028ce6fcb144a0c08b03abd3`
+with candidate runtime source
+`4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`. Both omission and explicit off
+retained the same one-time upfront compute reservation as base, produced exact
+1K and 32K lifecycle output, matched PPL bit-for-reported-bit, and reproduced
+all W02 CUDA/VMM and physical allocation classes. Repeated 4K and 30K
+throughput stayed inside the three-sample base bracket. The candidate's lower
+sampled `RssShmem` is not claimed as a saving because it is outside W02's
+allocator-owned classification and is not an enabled feature effect. No
+disabled-path production change is justified by this evidence.
+
+## Cross-hardware DSpark comparison and open issues
+
+Characterizations 020-026 preserve a historical protocol run from the PR 3
+recovery line. They compare baseline, `draft-mtp`, and for the first time
+`draft-dspark` on a second,
+weaker machine (RTX 4070 12 GiB, Qwen3.8 IQ2_M) already used for
+Experiment 011, in two passes: once against `53adab814` and again after
+rebasing onto `c9f727c1e` (Experiments 017-019). These measurements and their
+archived command snapshots are not the current runnable protocol; current work
+must follow `cpu-kv-offload-current-testing.md`, including native affinity and
+the whole-lifecycle GPU lock. One bug found there is fixed by PR 3; two items
+need follow-up before this branch's MTP-oriented optimizations should be
+described as covering DSpark too, and one is an unresolved stability issue
+independent of DSpark:
+
+6. **Fixed.** `common_speculative_resolve_dflash_draft_n_max`'s type check
+   (`common/common.cpp`) now also matches `COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK`,
+   so `--spec-type draft-dspark` without an explicit `--spec-draft-n-max`
+   resolves the drafter's actual trained block depth from
+   `dflash.block_size` instead of silently using the generic default of 3
+   (Characterization 024).
+7. Investigate whether the recurrent-plane-cap mechanism
+   (`--spec-mtp-rs-planes`, Experiments 012/013) can be generalized to
+   DSpark's rollback planes, or document explicitly that DSpark is expected
+   to keep paying the full uncapped `draft.n_max`-plane cost indefinitely
+   (Characterization 025).
+8. **Not fixed; root cause narrowed but not pinpointed.** An intermittent
+   `ggml_backend_cuda_synchronize` "illegal memory access" crash was
+   reproduced in 5 of 6 sustained (500+ token) MTP generations without
+   `CUDA_LAUNCH_BLOCKING=1`, and 1 of 3 eligible inference runs with it,
+   across both the pre- and
+   post-`c9f727c1e` binaries — ruling out the MTP draft/target-ubatch
+   mismatch (Experiment 017) and the recurrent-plane cap (Experiments
+   012/013) as the cause. The leading hypothesis is a race between the
+   target's per-step CPU-KV host-to-device staging copies and MTP's
+   concurrent draft-context GPU submissions, since MTP is the only
+   configuration in this session with two GPU-active contexts running
+   per decode step; DSpark's CPU-resident draft (item 9) never creates
+   that condition and never crashed. A `compute-sanitizer --tool memcheck`
+   run was started but abandoned after 20 minutes at ~140x slowdown without
+   reaching a crash. Two other launch-blocking artifacts failed during model
+   loading and are not part of the inference-run denominator. A future session
+   should either budget several hours
+   for that tool or instrument
+   `llama_context::process_ubatch`'s `can_reuse(gparams)`
+   (`src/llama-context.cpp`) and the per-input `can_reuse` overrides in
+   `src/llama-graph.cpp` directly. Treat MTP as not proven safe for long
+   unattended generations until this is understood, independent of any
+   DSpark-related work (Characterization 021).
+9. Before recommending DSpark for VRAM-constrained hardware, characterize a
+   GPU-resident DSpark draft on a card with more headroom above the target
+   weights than this RTX 4070 had (Characterization 022 could not get a
+   GPU-resident draft to load at any tested depth down to 2). The CPU-draft
+   throughput regression measured here (Characterization 023) may not
+   generalize to hardware where the draft model fits on-device.
 
 ## Known non-goals
 

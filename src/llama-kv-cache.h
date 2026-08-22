@@ -148,6 +148,10 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     uint32_t get_kv_n_stream() const override;
@@ -219,6 +223,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -584,6 +589,11 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
+    // used to create a bounded reservation context
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv);
+
     // used to create an update context
     llama_kv_cache_context(
             llama_kv_cache * kv,
@@ -610,6 +620,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_kv_cache_context specific API
@@ -737,5 +748,6 @@ private:
 
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
-    int32_t n_kv;
+    int32_t n_kv = 0;
+    uint32_t reserve_n_kv = 0;
 };

@@ -53,10 +53,11 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve(uint32_t n_tokens = 0);
+    void sched_reserve(uint32_t n_tokens = 0, uint32_t n_kv = 0);
     llama_workspace_stats get_workspace_stats() const;
     bool shares_workspace_with(const llama_context & other) const;
     void record_backend_private_workspace(ggml_cgraph * gf);
+    uint64_t trim_transient_memory();
 
     void synchronize();
 
@@ -78,6 +79,7 @@ struct llama_context {
 
     // return true if the memory was updated
     llama_memory_status memory_update(bool optimize);
+    llama_memory_status memory_update(bool optimize, uint32_t n_tokens_req);
 
     enum llama_pooling_type pooling_type() const;
 
@@ -356,10 +358,13 @@ private:
 
     bool sched_need_reserve = true;
     uint32_t sched_reserved_tokens = 0;
+    uint32_t sched_reserved_kv = 0;
 
     uint64_t workspace_reserve_count = 0;
     uint64_t workspace_grow_count    = 0;
     uint64_t workspace_shrink_count  = 0;
+    uint64_t workspace_kv_grow_count = 0;
+    uint64_t workspace_kv_shrink_count = 0;
     int64_t  workspace_reserve_us    = 0;
 
     ggml_backend_t backend_cpu = nullptr;

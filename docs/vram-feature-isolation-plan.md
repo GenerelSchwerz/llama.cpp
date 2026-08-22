@@ -24,8 +24,8 @@ A combined tree can answer the second question only after the first is closed.
 | N: native standard-quant attention | PR 4, `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native quantized FlashAttention source, tests, focused docs, archived composed manifests. | Published draft. |
 | W06: PPL capacity | PR 5 evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | `llama-perplexity` output-capacity fix and evidence. | Merged into the published base. |
 | W02: allocation telemetry | PR 6 merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Opt-in physical allocation/VMM telemetry. | Merged into the published base. |
-| W03: compact causal mask | PR 7 preserved evidence head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source `ae60c7321d950937a36af096112525db777ae13f`; inherited documentation base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Causal representation and branch-owned isolated/composed evidence. | Documentation-base reconciliation complete with identical causal source delta; draft remains unmerged. |
-| W04/W05/W09: live workspace | PR 8 final head `0c8df007a504f16aa35fc5982303e3e1b9883331` | Live reservation, exact plan publication, idle trim, source and user docs. | Final evidence head; reconcile inherited PR 9 docs and refresh merge metadata before integration. |
+| W03: compact causal mask | PR 7 published head `565233f79faebb5bace9e41f0e2d0ba9c70930cf`; preserved evidence head `d4183adb8b4902a125b9339cd39032a095fca013`; this investigation composes locally onto `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Causal representation and branch-owned isolated/composed evidence. | New test-only screening phase is uncommitted; draft remains unmerged. |
+| W04/W05/W09: live workspace | PR 8 enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; merged through `35e179272` and present in current KV base `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Live reservation, exact plan publication, idle trim, source and user docs. | Merged; it remains an unrelated opt-in and is omitted from compact-mask causal commands. |
 
 An observed head is not a permanent evidence tag. PR 7 and PR 8 final
 identities and comparisons were refreshed on 2026-08-21. Verify each head and
@@ -141,7 +141,10 @@ but it cannot be promoted after the fact by subtracting unrelated changes.
 
 - Keep source, public arguments, presets, generated docs, and tests atomic in
   PR 8.
-- Use only final PR 8 head `0c8df007a504f16aa35fc5982303e3e1b9883331`.
+- Preserve enabled evidence at `0c8df007a504f16aa35fc5982303e3e1b9883331`
+  and disabled-source evidence at runtime head
+  `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; verify the published PR head
+  contains only source-equivalent implementation plus evidence/harness updates.
 - Measure the full grow/full-depth/shrink/post-idle lifecycle.
 - Distinguish configured capacity, live physical extent, allocator high-water,
   mapped residency, synchronized CUDA device-used high-water, and sampled
@@ -152,6 +155,9 @@ but it cannot be promoted after the fact by subtracting unrelated changes.
 - Accept only explicit Bash-wrapped process substitution for its recorded
   exactness provenance; do not import invalid setup or probe launches.
 - Require quality/output exactness and quantify reserve-transition cost.
+- Require exact-base A/B/A at both omission and explicit off. The 2026-08-21
+  gate passed upstream upfront reservation, exact output/PPL, identical W02
+  allocation/VMM fields, and neutral repeated 4K/30K throughput.
 
 ## Comparison and merge simulation
 
