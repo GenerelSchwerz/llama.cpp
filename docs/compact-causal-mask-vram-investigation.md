@@ -2736,3 +2736,70 @@ the exact current base is now inherited and its default-off/explicit-on CUDA
 policy is verified. No remaining validation result requires PR 7 to stay
 draft; draft removal is appropriate once the pushed head is cleanly mergeable
 and its remote checks pass.
+
+## Internal CUDA guard containment
+
+The compact CUDA implementation still needs one internal compile-time
+availability distinction. CUDA builds compile the compact consumer, while the
+shared CUDA/HIP/MUSA source surface must not advertise an implementation that
+has not been validated on HIP or MUSA. `GGML_CUDA_COMPACT_CAUSAL_MASK` is that
+backend-private distinction: it is defined by the CUDA backend build, is not a
+CMake option, is not user configurable, and is not a runtime opt-in. Automatic
+graph selection remains governed by the registered backend capability and the
+standard-KV layout proof.
+
+The original implementation allowed that guard to change function signatures
+through the vector and MMA call stacks. That produced 31 production references
+and made dense-only and KVarN compilation structurally different from the
+compact CUDA build. The direct containment refactor removes the transitional
+signature macros instead of adding a rename or compatibility layer:
+
+- vector and MMA helpers now always accept the compact-causal boolean;
+- feature-disabled MMA entry code supplies a compile-time `false`, so the
+  compact branches optimize away;
+- feature-disabled vector dispatch instantiates only the existing dense
+  specialization and asserts that no compact descriptor reached it;
+- KVarN calls the shared MMA interface with explicit `false`; and
+- the CUDA capability callback now requires both FlashAttention and the
+  compiled compact implementation.
+
+This reduces the production macro surface from 31 occurrences to five. Those
+five are the intended boundary: the CUDA build definition, capability
+registration, unsupported-backend route rejection, vector entry selection,
+and MMA entry selection. `fattn-mma-kvarn-case.cuh` contains no feature guard.
+A focused static regression enforces that containment so future CUDA changes
+do not reintroduce conditional signatures.
+
+At the canonical-base refresh boundary, the exact five-file implementation
+and initial regression test had SHA-256
+`ba13d3f8b4cabe64faef574648a48dc50bf143e2a13b8ede124de6b3e202d987`
+as a binary diff and stable patch ID
+`c83b1a5b10db6b0609d55c575ae6450a7287e3af`. Before that refresh, the four
+production files compiled the Q8_0/Q8_0 vector object both with and without the
+feature definition, compiled dense-only MMA without the definition, compiled a
+representative KVarN MMA object, and passed all four fixed-seed
+compact-versus-dense cases on CPU and CUDA. After restoration on merge
+`571204dd059086fcf9e9d1ba4509be1deb0d293f`, the aggregate diff, stable patch
+ID, and every resulting file hash remained identical.
+
+The final test-only strengthening counts the build, capability, support,
+vector, and MMA boundaries individually. It does not change those four
+production files. The resulting five-file diff has SHA-256
+`c2780c6a43ad24f07d3f3299876de80e301b3e8039230497e04474d7de0c4e60`
+and stable patch ID `6969fbd3033ecff909f2e3282fc74d24fa06b70e`.
+The route-policy target was rebuilt at `--parallel 6` under
+`/tmp/beellama-cuda-build.lock`; because of the existing CMake dependency
+graph this also recompiled the KVarN-off CUDA library through ccache. Fresh
+route and vector policy processes then passed wholly under
+`/tmp/beellama-single-gpu.lock`. Their SHA-256 values were
+`7aab5c7cba519b515a9b5b3b8e372552f7dbe73b0bfbccd814366c35284b822a`
+and `3acbf09d881e06ffcf8d3b1e33f9eb5534376268d1c810b2f467e35eafcfffb5`.
+The inherited `775450a68..c2ea686d6` delta changes only shared documentation
+and validation-tooling files, so it does not invalidate the prior compile or
+exactness results and does not justify another CUDA correctness run.
+
+As a future suggestion, if HIP or MUSA gains and validates the same compact
+consumer semantics, retire the backend-private build distinction in favor of
+those backends registering the capability directly. This is not current
+guidance to expose an option or to claim cross-backend support: until that work
+exists, the contained five-use guard is the honest capability boundary.

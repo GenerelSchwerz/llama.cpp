@@ -67,6 +67,7 @@ int main(int argc, char ** argv) {
     const std::string kvarn_view = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
     const std::string fattn_mma_f16 = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-f16.cuh");
+    const std::string fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
     const std::string kvarn_dispatch_header = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cuh");
     const std::string kvarn_wht = read_file(root + "/ggml/src/ggml-cuda/kvarn-wht.cu");
@@ -310,6 +311,22 @@ int main(int argc, char ** argv) {
         "structural KVarN view validation must not reject portable pre-Turing CUDA routes");
     ok &= expect(cuda_backend.find("\"ggml_backend_kvarn_capabilities\"") != std::string::npos,
         "CUDA must expose the versioned KVarN capability record through the backend registry");
+    const std::string compact_causal_capability = slice_between(cuda_backend,
+            "static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(",
+            "static void * ggml_backend_cuda_reg_get_proc_address(");
+    ok &= expect(compact_causal_capability.find(
+                     "defined(FLASH_ATTN_AVAILABLE) && defined(GGML_CUDA_COMPACT_CAUSAL_MASK)") != std::string::npos &&
+                 cuda_cmake.find("add_compile_definitions(GGML_CUDA_COMPACT_CAUSAL_MASK)") != std::string::npos &&
+                 count_occurrences(cuda_backend, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
+                 count_occurrences(cuda_cmake, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
+                 count_occurrences(fattn, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
+                 hip_cmake.find("GGML_CUDA_COMPACT_CAUSAL_MASK") == std::string::npos &&
+                 musa_cmake.find("GGML_CUDA_COMPACT_CAUSAL_MASK") == std::string::npos,
+        "compact causal-prefix capability must follow the backend's compiled implementation");
+    ok &= expect(count_occurrences(fattn_vec, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
+                 count_occurrences(fattn_mma_f16, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
+                 kvarn_mma_case.find("GGML_CUDA_COMPACT_CAUSAL_MASK") == std::string::npos,
+        "compact causal-prefix kernels must keep one shared interface and guard only backend entry selection");
     ok &= expect(kvarn.find("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != std::string::npos,
         "CUDA tests must be able to simulate a portable-only pre-Turing capability on current hardware");
     ok &= expect(fattn.find("ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") != std::string::npos &&

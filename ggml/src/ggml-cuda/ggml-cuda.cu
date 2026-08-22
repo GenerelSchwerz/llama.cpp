@@ -5924,7 +5924,7 @@ static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_
 
 static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(ggml_backend_dev_t dev) {
     GGML_UNUSED(dev);
-#if defined(FLASH_ATTN_AVAILABLE)
+#if defined(FLASH_ATTN_AVAILABLE) && defined(GGML_CUDA_COMPACT_CAUSAL_MASK)
     return true;
 #else
     return false;
