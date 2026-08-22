@@ -19,8 +19,9 @@ the runner's fail-closed checks are authoritative.
 The validation ladder deliberately has three boundaries:
 
 1. **Early screening** runs output exactness first, short prefill and decode
-   smoke, then low/mid/high direct-command prefill screens. It is designed so a
-   typical tuned manifest can make an early decision in about 30-90 seconds.
+   smoke, then low/mid/high direct-command prefill screens. Early-only stages
+   may preregister one matched fail-fast pair with no confidence claim; this is
+   the recommended way to keep a typical tuned manifest near 30-90 seconds.
 2. **Production confirmation** adds the production binary at a preregistered
    selected context depth. NSYS discovery and the one filtered production NCU
    capture attach here, not to every repetition.
@@ -114,6 +115,28 @@ weighted harmonic aggregate for throughput and a weighted arithmetic aggregate
 for latency-like quantities. Do not invent weights to favor a result; derive
 them from the preregistered production prompt/ubatch geometry.
 
+For a fast ladder, add `screening_policy` to the two smoke stages and the
+kernel screen:
+
+```json
+{
+  "kind": "single_pair_fail_fast",
+  "order": "AB",
+  "regression_threshold_percent": 2.0,
+  "confidence_claim": "none"
+}
+```
+
+This executes exactly one fresh base/candidate pair. Alternate `AB` and `BA`
+between adjacent early stages to limit systematic order bias. The result keeps
+the raw pair, weighted per-screen values, point change, and preregistered
+regression signal. It deliberately records `confidence_interval=null` and
+cannot claim improvement, equivalence, or acceptance. A regression signal
+stops the ladder; a clear signal only authorizes moving to the statistical
+production gate. `screening_policy` is rejected on production confirmation or
+long-context acceptance, and it is mutually exclusive with statistical
+`decision_policy`.
+
 ## Validate and run
 
 Validation includes live provenance, so the untouched example intentionally
@@ -165,8 +188,10 @@ than combining unlike runs.
 
 ## Statistics
 
-Performance stages start with three independent matched pairs in balanced
-order `AB, BA, AB`. Each observation is a new process. The runner calculates
+Statistical stages start with three independent matched pairs in balanced order
+`AB, BA, AB`. This includes production confirmation and final acceptance, and
+any early stage that intentionally omits `screening_policy`. Each observation
+is a new process. The runner calculates
 candidate/baseline paired log ratios, their geometric percent change, and a
 two-sided Student-t 95% interval. The report includes every raw per-screen and
 per-pair sample.
@@ -216,8 +241,15 @@ an acceptance requirement.
 
 ## NSYS discovery and NCU capture
 
-The optional profiler section must target the selected-depth production stage
-and sets `profile_repetitions` to one. For the established CPU 0-2
+Two profiler paths share the same fail-closed direct-target implementation:
+
+- `profiler` answers one preregistered production-stage investigation.
+- `early_diagnostics` is an opt-in response to a preserved early
+  `regression_signal`. It never runs after a clear screen and cannot change the
+  failed screening result.
+
+The optional production profiler must target the selected-depth production
+stage and sets `profile_repetitions` to one. For the established CPU 0-2
 `llama-bench` shape, the direct target must carry `-C 0x7 --cpu-strict 1`.
 Other direct llama tools must carry `--cpu-strict 1` plus both native
 `--cpu-range` and `--cpu-range-batch` controls. Never put `taskset` before or
@@ -262,6 +294,65 @@ Profiler output is a kernel investigation, not a benchmark repetition. The
 intended pattern is one production NSYS discovery followed by one filtered
 production NCU capture for a preregistered question.
 
+### Regression-triggered agent diagnostics
+
+An early diagnostic entry must name a smoke or direct-kernel stage that uses
+`single_pair_fail_fast`, declare `trigger=regression_signal_only`,
+`on_clear=skip`, `evidence_claim=diagnostic_only`, and target both variants in
+baseline/candidate order. It also preregisters the kernel-family selector,
+metrics, graph-trace applicability, and one of these screen policies:
+
+- `fixed` names the one screen to inspect.
+- `largest_observed_regression` deterministically selects the most negative
+  benefit among the preserved raw matched screen observations. The report
+  retains every span and the selection calculation; it does not select a
+  favorable subset.
+
+The checked-in manifest example contains the complete schema. To opt in while
+running the early ladder:
+
+```bash
+python3 scripts/feature-performance-validation.py run \
+  /absolute/path/to/manifest.json --through early --diagnose-regressions
+```
+
+A clear early result pays no profiler or extra provenance-hashing cost. If the
+stage reports a regression, the runner remains failed and launches a diagnostic
+phase. It performs an independent NSYS discovery and one discovery-derived,
+verified NCU capture for baseline, then repeats that sequence independently for
+candidate. Kernel spelling, shapes, graph-node IDs, occurrences, and launch
+indices are never transferred between binaries. This costs more than the fast
+screen by design and is reported separately from its 30-90 second budget.
+
+If the screen was run without the flag, or a partial diagnostic must be safely
+resumed, use:
+
+```bash
+python3 scripts/feature-performance-validation.py diagnose \
+  /absolute/path/to/manifest.json
+
+python3 scripts/feature-performance-validation.py diagnose \
+  /absolute/path/to/manifest.json --resume
+```
+
+The deterministic
+`early-diagnostics/agent-diagnostic-report.json` exposes, for each variant:
+
+- NSYS total/matching/selected launch counts, exact kernel, discovery indices,
+  same-name occurrences, shapes, and graph-node IDs;
+- verified NCU capture count, raw per-capture requested metric values, and any
+  verification issues;
+- NSYS/NCU target and locked-lifecycle timing plus paths to the raw reports,
+  inventory, plan, stdout/stderr, and verification record.
+
+Graph-replay diagnostics must request node tracing explicitly and verify
+nonzero graph-node IDs under the exact NSYS version. Missing tools, unsupported
+graph tracing, empty/mismatched exports, contamination, or cross-process
+launch-order drift fail the diagnostic and remain visible in its report. The
+compact report is intended to give an optimization agent an immediate lead; it
+does not convert Nsight counters into correctness, equivalence, end-to-end
+speed, memory, production, or long-context evidence.
+
 ## Direct harnesses
 
 A normal executable role is already a pluggable direct-command path. A small
@@ -293,6 +384,8 @@ Automated:
 - persistent GPU/proc telemetry and sampler cleanup;
 - explicit NSYS graph-node capability/capture verification, the derived
   one-command NCU plan, and post-NCU report verification.
+- opt-in early-regression diagnostics with deterministic span selection,
+  independent per-variant discovery/capture, and a compact agent-facing report.
 
 Manual and study-specific:
 

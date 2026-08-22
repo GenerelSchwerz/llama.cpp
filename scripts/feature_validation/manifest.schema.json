@@ -93,42 +93,69 @@
         "variant": { "enum": ["baseline", "candidate"] },
         "screen": { "$ref": "#/$defs/slug" },
         "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
-        "selector": {
-          "type": "object",
-          "required": ["kernel_regex"],
-          "properties": {
-            "kernel_regex": { "type": "string", "minLength": 1 },
-            "graph_only": { "type": "boolean" },
-            "grid": { "$ref": "#/$defs/shape" },
-            "block": { "$ref": "#/$defs/shape" }
-          }
-        },
-        "cuda_graph_trace": {
-          "oneOf": [
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["applicability", "granularity", "launch_origin"],
-              "properties": {
-                "applicability": { "const": "required" },
-                "granularity": { "const": "node" },
-                "launch_origin": { "enum": ["host-only", "host-and-device"] }
-              }
-            },
-            {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["applicability", "reason"],
-              "properties": {
-                "applicability": { "const": "not_applicable" },
-                "reason": { "type": "string", "minLength": 1 }
-              }
-            }
-          ]
-        },
+        "selector": { "$ref": "#/$defs/profilerSelector" },
+        "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
         "metrics": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "early_diagnostics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "trigger",
+          "on_clear",
+          "evidence_claim",
+          "pattern",
+          "profile_repetitions",
+          "stage",
+          "variants",
+          "screen_selection",
+          "selector",
+          "cuda_graph_trace"
+        ],
+        "properties": {
+          "id": { "$ref": "#/$defs/slug" },
+          "trigger": { "const": "regression_signal_only" },
+          "on_clear": { "const": "skip" },
+          "evidence_claim": { "const": "diagnostic_only" },
+          "pattern": { "const": "independent_nsys_then_filtered_ncu_per_variant" },
+          "profile_repetitions": { "const": 1 },
+          "stage": { "$ref": "#/$defs/slug" },
+          "variants": { "const": ["baseline", "candidate"] },
+          "screen_selection": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "screen"],
+                "properties": {
+                  "kind": { "const": "fixed" },
+                  "screen": { "$ref": "#/$defs/slug" }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind"],
+                "properties": {
+                  "kind": { "const": "largest_observed_regression" }
+                }
+              }
+            ]
+          },
+          "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
+          "selector": { "$ref": "#/$defs/profilerSelector" },
+          "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
+          "metrics": {
+            "type": "array",
+            "items": { "type": "string", "minLength": 1 }
+          }
         }
       }
     }
@@ -353,11 +380,64 @@
         "inconclusive_after_maximum": { "const": "unresolved_fail" }
       }
     },
+    "screeningPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "order", "regression_threshold_percent", "confidence_claim"],
+      "properties": {
+        "kind": { "const": "single_pair_fail_fast" },
+        "order": { "enum": ["AB", "BA"] },
+        "regression_threshold_percent": { "type": "number", "exclusiveMinimum": 0 },
+        "confidence_claim": { "const": "none" }
+      }
+    },
     "shape": {
       "type": "array",
       "minItems": 3,
       "maxItems": 3,
       "items": { "type": "integer", "minimum": 1 }
+    },
+    "profilerSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kernel_regex"],
+      "properties": {
+        "kernel_regex": { "type": "string", "minLength": 1 },
+        "graph_only": { "type": "boolean" },
+        "grid": { "$ref": "#/$defs/shape" },
+        "block": { "$ref": "#/$defs/shape" },
+        "occurrence_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "enum": ["all", "first", "middle", "last"] }
+          }
+        }
+      }
+    },
+    "cudaGraphTrace": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicability", "granularity", "launch_origin"],
+          "properties": {
+            "applicability": { "const": "required" },
+            "granularity": { "const": "node" },
+            "launch_origin": { "enum": ["host-only", "host-and-device"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["applicability", "reason"],
+          "properties": {
+            "applicability": { "const": "not_applicable" },
+            "reason": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
     },
     "stage": {
       "type": "object",
@@ -383,6 +463,7 @@
         },
         "metric": { "$ref": "#/$defs/metric" },
         "decision_policy": { "$ref": "#/$defs/decisionPolicy" },
+        "screening_policy": { "$ref": "#/$defs/screeningPolicy" },
         "comparison": {
           "type": "object",
           "required": ["mode"],

@@ -39,24 +39,25 @@ def _tool_identity(name: str) -> dict[str, Any]:
     }
 
 
-def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) -> dict[str, Any]:
-    manifest, manifest_sha = core.load_and_validate_manifest(manifest_path)
-    config = manifest.get("profiler")
-    if not isinstance(config, dict):
-        raise core.ManifestError("manifest has no profiler section")
-    provenance = core.capture_provenance(manifest, manifest_sha)
+def _profile_one(
+    manifest: dict[str, Any],
+    manifest_sha: str,
+    provenance: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    variant_name: str,
+    screen_id: str,
+    profile_base: pathlib.Path,
+    resume: bool,
+    execute_ncu: bool,
+) -> dict[str, Any]:
     stage = core.stage_by_id(manifest, config["stage"])
     if stage["resource"] != "gpu":
         raise core.ManifestError("profiler stage must use resource=gpu")
-    variant_name = config["variant"]
     screens = stage.get("screens", [{"id": "default", "args": [], "weight": 1.0}])
-    screen_id = config.get("screen", screens[0]["id"])
     if screen_id not in {item["id"] for item in screens}:
         raise core.ManifestError(f"profiler screen {screen_id!r} is not in stage {stage['id']!r}")
-    study_root = pathlib.Path(manifest["artifact_root"]) / (
-        f"{core.safe_slug(manifest['study']['id'])}-{manifest_sha[:12]}"
-    )
-    profile_root = study_root / "profiles" / f"{stage['id']}-{variant_name}-{screen_id}"
+    profile_root = profile_base / f"{stage['id']}-{variant_name}-{screen_id}"
     state_path = profile_root / "profile-state.json"
     plan_path = profile_root / "ncu-plan.json"
     if state_path.exists():
@@ -86,6 +87,7 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
             "stage": stage["id"],
             "variant": variant_name,
             "screen": screen_id,
+            "evidence_claim": config.get("evidence_claim", "kernel_investigation_only"),
             "nsys_discovery_completed": False,
             "ncu_plan_completed": False,
             "ncu_executed": False,
@@ -113,7 +115,9 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
         executable_role
     ].get("direct_harness")
     profiler.validate_native_affinity(target_argv, direct_harness)
-    identity_files, source_identities = core.provenance_identity_spec(provenance)
+    identity_files, source_identities = core.provenance_identity_spec(
+        provenance, [(variant_name, executable_role)]
+    )
     nvidia_smi_identity = provenance.get("runtime_tools", {}).get("nvidia-smi")
     nvidia_smi = nvidia_smi_identity["path"] if nvidia_smi_identity else "nvidia-smi"
 
@@ -224,6 +228,7 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
     plan["variant"] = variant_name
     plan["screen"] = screen_id
     plan["profile_repetitions"] = 1
+    plan["evidence_claim"] = config.get("evidence_claim", "kernel_investigation_only")
     core.write_json_atomic(plan_path, plan)
     state["ncu_plan_completed"] = True
     core.write_json_atomic(state_path, state)
@@ -304,6 +309,133 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
     return plan
 
 
+def _study_root(manifest: dict[str, Any], manifest_sha: str) -> pathlib.Path:
+    return pathlib.Path(manifest["artifact_root"]) / (
+        f"{core.safe_slug(manifest['study']['id'])}-{manifest_sha[:12]}"
+    )
+
+
+def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) -> dict[str, Any]:
+    manifest, manifest_sha = core.load_and_validate_manifest(manifest_path)
+    config = manifest.get("profiler")
+    if not isinstance(config, dict):
+        raise core.ManifestError("manifest has no profiler section")
+    provenance = core.capture_provenance(manifest, manifest_sha)
+    stage = core.stage_by_id(manifest, config["stage"])
+    screens = stage.get("screens", [{"id": "default"}])
+    return _profile_one(
+        manifest,
+        manifest_sha,
+        provenance,
+        config,
+        variant_name=str(config["variant"]),
+        screen_id=str(config.get("screen", screens[0]["id"])),
+        profile_base=_study_root(manifest, manifest_sha) / "profiles",
+        resume=resume,
+        execute_ncu=execute_ncu,
+    )
+
+
+def _diagnose(manifest_path: pathlib.Path, *, resume: bool) -> dict[str, Any]:
+    manifest, manifest_sha = core.load_and_validate_manifest(manifest_path)
+    configs = manifest.get("early_diagnostics")
+    if not isinstance(configs, list) or not configs:
+        raise core.ManifestError("manifest has no early_diagnostics section")
+    provenance = core.capture_provenance(manifest, manifest_sha)
+    study_root = _study_root(manifest, manifest_sha)
+    state_path = study_root / "state.json"
+    if not state_path.is_file():
+        raise core.ValidationError("early diagnostics require a preserved screening study state")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("manifest_sha256") != manifest_sha:
+        raise core.ProvenanceError("diagnostic study manifest identity mismatch")
+    if state.get("provenance_identity_fingerprint") != provenance["identity_fingerprint"]:
+        raise core.ProvenanceError("diagnostic study provenance identity mismatch")
+
+    diagnostic_root = study_root / "early-diagnostics"
+    report_path = diagnostic_root / "agent-diagnostic-report.json"
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "not_triggered",
+        "generated_utc": core.utc_now(),
+        "manifest_sha256": manifest_sha,
+        "provenance_identity_fingerprint": provenance["identity_fingerprint"],
+        "trigger_policy": "regression_signal_only",
+        "profiles": [],
+        "investigations": [],
+        "normal_early_screen_profiler_cost": "zero when no regression signal is emitted",
+        "evidence_boundary": (
+            "These profiles are diagnostic-only and cannot pass correctness, statistical "
+            "performance, resource, production, or long-context acceptance gates."
+        ),
+    }
+    diagnostic_root.mkdir(parents=True, exist_ok=True)
+    core.write_json_atomic(report_path, report)
+    for config in configs:
+        stage = core.stage_by_id(manifest, str(config["stage"]))
+        trigger = profiler.select_regression_diagnostic(
+            stage,
+            state.get("stages", {}).get(stage["id"]),
+            config["screen_selection"],
+        )
+        investigation = {
+            "id": config["id"],
+            "stage": stage["id"],
+            "trigger": trigger,
+            "status": "not_triggered",
+            "variant_profiles": {},
+        }
+        report["investigations"].append(investigation)
+        core.write_json_atomic(report_path, report)
+        if not trigger["triggered"]:
+            continue
+        report["status"] = "running"
+        investigation["status"] = "running"
+        screen_id = str(trigger["selected_screen"]["screen"])
+        profile_base = diagnostic_root / str(config["id"])
+        for variant_name in config["variants"]:
+            profile_root = profile_base / f"{stage['id']}-{variant_name}-{screen_id}"
+            try:
+                _profile_one(
+                    manifest,
+                    manifest_sha,
+                    provenance,
+                    config,
+                    variant_name=str(variant_name),
+                    screen_id=screen_id,
+                    profile_base=profile_base,
+                    resume=resume and profile_root.exists(),
+                    execute_ncu=True,
+                )
+                compact = profiler.agent_profile_summary(profile_root)
+                if compact["status"] != "verified":
+                    raise core.ValidationError(
+                        f"{variant_name} diagnostic profile is {compact['status']}"
+                    )
+                investigation["variant_profiles"][variant_name] = compact
+                report["profiles"].append(compact)
+                core.write_json_atomic(report_path, report)
+            except Exception as error:
+                investigation["status"] = "failed"
+                investigation["error"] = f"{type(error).__name__}: {error}"
+                report["status"] = "failed"
+                core.write_json_atomic(report_path, report)
+                raise
+        investigation["status"] = "verified"
+        investigation["cross_variant_discovery"] = (
+            "independent; no launch index, kernel spelling, or shape was reused across variants"
+        )
+        investigation["agent_comparison"] = profiler.compare_agent_profiles(
+            investigation["variant_profiles"]["baseline"],
+            investigation["variant_profiles"]["candidate"],
+        )
+        report["status"] = "verified"
+        core.write_json_atomic(report_path, report)
+    report["generated_utc"] = core.utc_now()
+    core.write_json_atomic(report_path, report)
+    return report
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -314,10 +446,25 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--through", choices=("early", "production", "acceptance"), default="early")
     run.add_argument("--resume", action="store_true")
     run.add_argument("--retry-failed", action="store_true")
-    profile = subparsers.add_parser("profile", help="one NSYS discovery and one filtered NCU plan/capture")
+    run.add_argument(
+        "--diagnose-regressions",
+        action="store_true",
+        help=(
+            "after a preregistered early regression, run independent "
+            "baseline/candidate NSYS+NCU diagnostics"
+        ),
+    )
+    profile = subparsers.add_parser(
+        "profile", help="one NSYS discovery and one filtered NCU plan/capture"
+    )
     profile.add_argument("manifest", type=pathlib.Path)
     profile.add_argument("--resume", action="store_true")
     profile.add_argument("--execute-ncu", action="store_true")
+    diagnose = subparsers.add_parser(
+        "diagnose", help="run preregistered NSYS+NCU diagnostics for a preserved early regression"
+    )
+    diagnose.add_argument("manifest", type=pathlib.Path)
+    diagnose.add_argument("--resume", action="store_true")
     internal = subparsers.add_parser("_execute-run", help=argparse.SUPPRESS)
     internal.add_argument("spec", type=pathlib.Path)
     return parser
@@ -342,15 +489,30 @@ def main() -> int:
             )
         elif args.command == "run":
             runner = StudyRunner(args.manifest, TOOL_SCRIPT)
-            summary = runner.run(
-                through=args.through,
-                resume=args.resume,
-                retry_failed=args.retry_failed,
-            )
+            try:
+                summary = runner.run(
+                    through=args.through,
+                    resume=args.resume,
+                    retry_failed=args.retry_failed,
+                )
+            except core.ValidationError as run_error:
+                if args.diagnose_regressions:
+                    try:
+                        diagnostic = _diagnose(args.manifest, resume=args.resume)
+                        print(json.dumps(diagnostic, indent=2, sort_keys=True))
+                    except Exception as diagnostic_error:
+                        raise core.ValidationError(
+                            f"{run_error}; regression diagnostic failed: "
+                            f"{type(diagnostic_error).__name__}: {diagnostic_error}"
+                        ) from diagnostic_error
+                raise
             print(json.dumps(summary, indent=2, sort_keys=True))
         elif args.command == "profile":
             plan = _profile(args.manifest, resume=args.resume, execute_ncu=args.execute_ncu)
             print(json.dumps(plan, indent=2, sort_keys=True))
+        elif args.command == "diagnose":
+            report = _diagnose(args.manifest, resume=args.resume)
+            print(json.dumps(report, indent=2, sort_keys=True))
         else:
             result = execute_run_spec(_load_spec(args.spec))
             return 0 if result["status"] == "success" else 1

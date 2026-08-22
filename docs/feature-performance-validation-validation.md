@@ -187,3 +187,73 @@ series. Use a fresh manifest outside the source tree for the first real feature,
 validate a matched clean build/model identity, tune the early stages to the
 30-90 second target, then keep production confirmation and final long-context
 acceptance as separate recorded gates.
+
+## Fast early-screen follow-up
+
+The first compact-causal application showed that applying the full 3-to-5
+statistical policy to every smoke and every low/mid/high screen produced 32
+fresh model processes and a 292.91-second cold early ladder. The runner now
+supports an explicit `single_pair_fail_fast` policy only for smoke and kernel-
+screen stages. It emits a raw point observation, `confidence_interval=null`,
+and `confidence_claim=none`; it cannot be used on production confirmation or
+long-context acceptance and cannot coexist with a statistical decision policy.
+
+The revised causal manifest ran 12 clean locked processes in 76.27 seconds.
+Its target processes used 67.81 seconds, preparation 6.20 seconds, recorded
+runner overhead 1.65 seconds, and lock-wrapper handoff 0.46 seconds. A warm
+resume completed in 6.24 seconds. Exactness passed, all samplers were reaped,
+and the three preregistered one-pair signals cleared their 1% fail-fast
+threshold. These signals are screening workflow evidence, not new confidence
+intervals or acceptance results.
+
+Final validation after this addition:
+
+```bash
+PYTHONWARNINGS=error::ResourceWarning \
+  python3 scripts/test-feature-validation.py -v
+```
+
+Result: 54 tests passed in 8.757 seconds.
+
+## Regression-triggered Nsight diagnostics follow-up
+
+The optional agent-diagnostic path adds no work to a passing early screen. With
+`--diagnose-regressions`, only a preserved preregistered
+`regression_signal` starts profiling; the screening command still exits
+nonzero. The diagnostic independently performs NSYS discovery and one filtered,
+post-export-verified NCU capture for baseline and candidate. It writes a compact
+side-by-side report while retaining raw launches, shapes, graph IDs, requested
+NCU metrics, timing, commands, and artifact paths. The report is explicitly
+diagnostic-only.
+
+Focused validation used:
+
+```bash
+PYTHONWARNINGS=error::ResourceWarning \
+  python3 scripts/test-feature-validation.py -v \
+  ManifestAndScheduleTest ProfilerTest DiagnosticCliTest
+```
+
+Result: 34 tests passed in 0.512 seconds. This covers schema/runtime
+preregistration, graph-node requirements, deterministic largest-regression
+span selection, zero profiler calls after a clear result, independent
+baseline/candidate orchestration, raw NCU metric exposure, agent-facing
+inventory/comparison output, preservation of the failed screening exit status,
+and fail-closed unverifiable capture handling.
+
+The final warning-as-error suite used:
+
+```bash
+PYTHONWARNINGS=error::ResourceWarning \
+  python3 scripts/test-feature-validation.py -v
+```
+
+Result: 64 tests passed in 9.515 seconds. Static Python compilation, all three
+checked-in manifest examples, JSON schema parsing, and `git diff --check` also
+passed. The registered CTest invocation also passed 1/1 in 9.68 seconds. No new
+GPU or Nsight capture was run for this follow-up: doing so would
+require deliberately producing a real preregistered regression in exact
+matched builds. Existing real-GPU and profiler evidence is not relabeled as a
+test of this new trigger. All actual NSYS/NCU target executions still use the
+whole-command GPU lock and direct llama affinity path shared with the production
+profiler.
