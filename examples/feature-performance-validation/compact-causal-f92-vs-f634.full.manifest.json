@@ -1,0 +1,404 @@
+{
+  "schema_version": 1,
+  "study": {
+    "id": "compact-causal-f92-vs-f634-r2",
+    "description": "Preregistered causal-only validation of frozen compact causal-mask PR 7 f92c2de62 against exact KV-offload base f6341a157. Both builds are Release SM120 CUDA-FA native builds with KVarN disabled; CPU-KV placement, pinned KV, recurrent offload, workspace policies, native-Q8 permission, speculation, and all other optional policies are omitted or explicitly off.",
+    "early_decision_target_seconds": {
+      "minimum": 30,
+      "maximum": 90
+    }
+  },
+  "artifact_root": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/artifacts",
+  "variants": {
+    "baseline": {
+      "source_root": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/base-src",
+      "expected_commit": "f6341a15779eb58fe6ad9e1b890e331c32b676c7",
+      "tree_policy": "clean",
+      "executables": {
+        "correctness": {
+          "path": "/tmp/beellama-pr7-f634-base-build.VCr0BF/bin/llama-cli",
+          "expected_sha256": "fc26d0198eef19a21f8f79cd585178dc7feb497f656df2ff05442e78366ad5f0",
+          "build": {
+            "mode": "cmake_required",
+            "cache": "/tmp/beellama-pr7-f634-base-build.VCr0BF/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        },
+        "benchmark": {
+          "path": "/tmp/beellama-pr7-f634-base-build.VCr0BF/bin/llama-bench",
+          "expected_sha256": "497de09c880d0c0c9539f6e8347ce789023b3de76a25bcf45c211672f43ad1d2",
+          "build": {
+            "mode": "cmake_required",
+            "cache": "/tmp/beellama-pr7-f634-base-build.VCr0BF/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        },
+        "perplexity": {
+          "path": "/tmp/beellama-pr7-f634-base-build.VCr0BF/bin/llama-perplexity",
+          "expected_sha256": "40c809576713eb7d82a29a418dd3a471bc8496894362f10b0dd203480d576b6b",
+          "build": {
+            "mode": "cmake_required",
+            "cache": "/tmp/beellama-pr7-f634-base-build.VCr0BF/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        }
+      }
+    },
+    "candidate": {
+      "source_root": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-src",
+      "expected_commit": "f92c2de62bcc11abed0cff8b10a848fc8d97f29d",
+      "tree_policy": "clean",
+      "executables": {
+        "correctness": {
+        "path": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/bin/llama-cli",
+          "expected_sha256": "2e832f8f79106315cd22a8cbd34debed1b7cb24136ec5b13d578e0bd26a97469",
+          "build": {
+            "mode": "cmake_required",
+          "cache": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        },
+        "benchmark": {
+        "path": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/bin/llama-bench",
+          "expected_sha256": "990139351acda670b8867e919401245d1086ade3d553e6a04e4f95c4e611e4d7",
+          "build": {
+            "mode": "cmake_required",
+          "cache": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        },
+        "perplexity": {
+        "path": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/bin/llama-perplexity",
+          "expected_sha256": "43c86f0f65813b4cd5f2a1ba7b31121ab54fa30d14bd6f3b5eb8744a0200a195",
+          "build": {
+            "mode": "cmake_required",
+          "cache": "/tmp/beellama-fpv-causal-f92-vs-f634-20260821/candidate-build/CMakeCache.txt",
+            "expected_options": {
+              "CMAKE_BUILD_TYPE": "Release",
+              "CMAKE_CUDA_ARCHITECTURES": "120",
+              "GGML_CUDA": "ON",
+              "GGML_CUDA_FA": "ON",
+              "GGML_CUDA_KVARN": "OFF",
+              "GGML_NATIVE": "ON"
+            }
+          }
+        }
+      }
+    }
+  },
+  "inputs": [
+    {
+      "role": "shared-model",
+      "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+      "sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"
+    },
+    {
+      "role": "perplexity-corpus",
+      "path": "/home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt",
+      "sha256": "8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c"
+    }
+  ],
+  "environment": {
+    "CUDA_VISIBLE_DEVICES": "0"
+  },
+  "repetition_policy": {
+    "minimum_pairs": 3,
+    "maximum_pairs": 5,
+    "order": ["AB", "BA", "AB", "BA", "AB"],
+    "confidence_level": 0.95,
+    "extension_rule": {
+      "kind": "extend_only_if_inconclusive",
+      "thresholds": {
+        "improvement_percent": 0.25,
+        "regression_percent": 0.5,
+        "equivalence_percent": 1.0
+      }
+    }
+  },
+  "stages": [
+    {
+      "id": "deterministic-output-exactness",
+      "purpose": "exactness",
+      "resource": "gpu",
+      "timeout_seconds": 180,
+      "mandatory": true,
+      "progress": "fixed 16-token llama-cli generation with output written to the attempt artifact",
+      "selection": {
+        "workload": "exactness",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 1, "causal_descriptor": "capability_selected"},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix"],
+        "execution_mode": "direct_process"
+      },
+      "command": {
+        "executable_role": "correctness",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "Write one concise sentence about causal attention.", "-n", "16",
+          "--seed", "1234", "--temp", "0", "-c", "4096", "-b", "512", "-ub", "256",
+          "-t", "3", "-tb", "24", "--cpu-range", "0-2", "--cpu-range-batch", "0-23",
+          "--cpu-strict", "1", "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0",
+          "-fa", "on", "-ctk", "q8_0", "-ctv", "q8_0", "--kv-offload",
+          "--no-kv-cpu-pinned", "--no-recurrent-state-offload", "--no-phase-aware-workspace",
+          "--no-live-context-workspace", "--single-turn", "--simple-io", "--no-display-prompt",
+          "--no-warmup", "-o", "{artifact_dir}/generated.txt"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {
+          "builtin": "llama",
+          "allow_positionals": false,
+          "options": {
+            "-c": 1,
+            "--temp": 1,
+            "--single-turn": 0,
+            "--simple-io": 0,
+            "--no-display-prompt": 0
+          }
+        }
+      },
+      "comparison": {"mode": "file_sha256", "path": "{artifact_dir}/generated.txt"}
+    },
+    {
+      "id": "short-prefill-smoke",
+      "purpose": "smoke",
+      "resource": "gpu",
+      "timeout_seconds": 180,
+      "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
+      "progress": "llama-bench --progress plus five-second toolkit heartbeat",
+      "selection": {
+        "workload": "prefill",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 128, "ubatch_tokens": 512},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix"],
+        "execution_mode": "direct_process",
+        "duration_class": "short"
+      },
+      "command": {
+        "executable_role": "benchmark",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "128", "-n", "0", "-r", "3", "--no-warmup", "--progress", "--kv-memory",
+          "-ctk", "q8_0", "-ctv", "q8_0", "-t", "3", "-C", "0x7", "--cpu-strict", "1",
+          "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0", "-nkvo", "0",
+          "-fa", "on", "-b", "1024", "-ub", "512", "-o", "jsonl"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {"builtin": "llama", "allow_positionals": false}
+      },
+      "metric": {"stream": "stdout", "regex": "\"avg_ts\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)", "match": "last", "direction": "higher"}
+    },
+    {
+      "id": "short-decode-graph-smoke",
+      "purpose": "smoke",
+      "resource": "gpu",
+      "timeout_seconds": 240,
+      "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
+      "progress": "llama-bench --progress plus five-second toolkit heartbeat",
+      "selection": {
+        "workload": "decode",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 1, "context_depth_tokens": 4096},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix", "cuda_graphs"],
+        "execution_mode": "cuda_graph_replay",
+        "duration_class": "short",
+        "cuda_graph_replay": {"applicability": "required"}
+      },
+      "command": {
+        "executable_role": "benchmark",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "0", "-n", "16", "-d", "4096", "-r", "3", "--no-warmup", "--progress", "--kv-memory",
+          "-ctk", "q8_0", "-ctv", "q8_0", "-t", "3", "-C", "0x7", "--cpu-strict", "1",
+          "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0", "-nkvo", "0",
+          "-fa", "on", "-b", "1024", "-ub", "512", "-o", "jsonl"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {"builtin": "llama", "allow_positionals": false}
+      },
+      "metric": {"stream": "stdout", "regex": "\"avg_ts\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)", "match": "last", "direction": "higher"}
+    },
+    {
+      "id": "weighted-prefill-context-screen",
+      "purpose": "kernel_screen",
+      "resource": "gpu",
+      "timeout_seconds": 600,
+      "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
+      "progress": "llama-bench --progress, one runner line per context span, and five-second heartbeat",
+      "selection": {
+        "workload": "prefill",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 512, "ubatch_tokens": 512, "production_prompt_tokens": 29398},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix", "cuda_graphs"],
+        "execution_mode": "direct_command"
+      },
+      "command": {
+        "executable_role": "benchmark",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "512", "-n", "0", "-r", "3", "--no-warmup", "--progress", "--kv-memory",
+          "-ctk", "q8_0", "-ctv", "q8_0", "-t", "3", "-C", "0x7", "--cpu-strict", "1",
+          "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0", "-nkvo", "0",
+          "-fa", "on", "-b", "1024", "-ub", "512", "-o", "jsonl"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {"builtin": "llama", "allow_positionals": false}
+      },
+      "screens": [
+        {"id": "low-4k", "span_class": "low", "span_tokens": 4096, "ubatch_occurrences": 16, "args": ["-d", "4096"], "weight": 16},
+        {"id": "mid-16k", "span_class": "mid", "span_tokens": 16384, "ubatch_occurrences": 24, "args": ["-d", "16384"], "weight": 24},
+        {"id": "high-28k", "span_class": "high", "span_tokens": 28672, "ubatch_occurrences": 18, "args": ["-d", "28672"], "weight": 18}
+      ],
+      "aggregation": {"mode": "weighted_harmonic", "weight_source": "real_ubatch_geometry"},
+      "metric": {"stream": "stdout", "regex": "\"avg_ts\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)", "match": "last", "direction": "higher"}
+    },
+    {
+      "id": "production-full-prefill-29398",
+      "purpose": "production_confirmation",
+      "resource": "gpu",
+      "timeout_seconds": 600,
+      "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
+      "progress": "llama-bench native warmup/progress plus five-second toolkit heartbeat",
+      "selection": {
+        "workload": "prefill",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 29398, "ubatch_tokens": 512},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix", "cuda_graphs"],
+        "execution_mode": "production_binary",
+        "context_depth_tokens": 29398
+      },
+      "command": {
+        "executable_role": "benchmark",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "29398", "-n", "0", "-r", "3", "--progress", "--kv-memory",
+          "-ctk", "q8_0", "-ctv", "q8_0", "-t", "3", "-C", "0x7", "--cpu-strict", "1",
+          "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0", "-nkvo", "0",
+          "-fa", "on", "-b", "1024", "-ub", "512", "-o", "jsonl"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {"builtin": "llama", "allow_positionals": false}
+      },
+      "metric": {"stream": "stdout", "regex": "\"avg_ts\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)", "match": "last", "direction": "higher"}
+    },
+    {
+      "id": "final-plain-gpu-decode-30k",
+      "purpose": "long_context_acceptance",
+      "resource": "gpu",
+      "timeout_seconds": 900,
+      "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
+      "progress": "llama-bench --progress through the 30K fill and 128-token decode plus five-second heartbeat",
+      "selection": {
+        "workload": "decode",
+        "tensor_layout": {"k": "q8_0", "v": "q8_0", "query_width": 1},
+        "backend_capabilities": ["direct_standard_quant_attention", "compact_causal_prefix", "cuda_graphs"],
+        "execution_mode": "production_binary",
+        "context_depth_tokens": 30000,
+        "acceptance_class": "long_context"
+      },
+      "command": {
+        "executable_role": "benchmark",
+        "common_args": [
+          "-m", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+          "-p", "0", "-n", "128", "-d", "30000", "-r", "5", "--no-warmup", "--progress", "--kv-memory",
+          "-ctk", "q8_0", "-ctv", "q8_0", "-t", "3", "-C", "0x7", "--cpu-strict", "1",
+          "--poll", "100", "-ngl", "999", "-sm", "none", "-mg", "0", "-nkvo", "0",
+          "-fa", "on", "-b", "1024", "-ub", "512", "-o", "jsonl"
+        ],
+        "baseline_args": [],
+        "candidate_args": [],
+        "cli_schema": {"builtin": "llama", "allow_positionals": false}
+      },
+      "metric": {"stream": "stdout", "regex": "\"avg_ts\"\\s*:\\s*([0-9]+(?:\\.[0-9]+)?)", "match": "last", "direction": "higher"}
+    }
+  ],
+  "profiler": {
+    "pattern": "one_nsys_discovery_then_one_filtered_ncu",
+    "profile_repetitions": 1,
+    "stage": "production-full-prefill-29398",
+    "variant": "candidate",
+    "screen": "default",
+    "timeout_seconds": 900,
+    "cuda_graph_trace": {
+      "applicability": "not_applicable",
+      "reason": "The frozen required-node discovery explicitly requested node tracing under NSYS 2026.1.3 but observed zero graph-node IDs for this full-prefill workload; profile direct kernel launches."
+    },
+    "selector": {
+      "kernel_regex": "flash_attn_ext_f16<\\(int\\)256, \\(int\\)256, \\(int\\)8, \\(int\\)8",
+      "graph_only": false,
+      "grid": [
+        140,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        4,
+        1
+      ],
+      "occurrence_policy": {
+        "kind": "last"
+      }
+    },
+    "metrics": ["gpu__time_duration.sum"]
+  }
+}
