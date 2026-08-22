@@ -1975,7 +1975,6 @@ struct test {
             "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
             "live_context_workspace",
-            "kv_gpu_layers",  "flash_attn",     "devices",       "tensor_split",
             "kv_gpu_layers",  "flash_attn",     "flash_attn_native_quants", "devices", "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",

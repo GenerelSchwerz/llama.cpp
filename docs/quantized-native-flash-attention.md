@@ -226,7 +226,7 @@ enable or disable the route and is not part of a serving configuration.
 The structural revision at source commit `afaf37c31` was tested on an NVIDIA
 GeForce RTX 5070 Ti (compute capability 12.0, driver 610.57.04) with the
 Qwen3.8 27B model and homogeneous Q8_0 target and MTP cache types. The detailed
-commands, hashes, and artifacts are recorded in Experiment 020 of
+commands, hashes, and artifacts are recorded in Experiment 022 of
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
 - Both CMake modes built from the same commit. The disabled build contained no

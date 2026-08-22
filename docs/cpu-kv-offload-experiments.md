@@ -5020,7 +5020,7 @@ ubatch-matched MTP protocol (Characterization 025's caveat) to get a
 current-provenance number is future work, not expected to change the
 qualitative finding since this entry's own DSpark half of the pair already
 used the unaffected, always-current DSpark configuration.
-## Experiment 021: quantized-native Q8_0 K/V in the MMA FlashAttention kernel
+## Experiment 022: quantized-native quantized K/V in the MMA FlashAttention kernel
 
 Status: retained, behind an off-by-default build flag. The CUDA MMA kernel can
 read a `Q8_0` cache in place instead of casting it to F16 first. Output is
