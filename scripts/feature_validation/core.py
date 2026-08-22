@@ -485,6 +485,128 @@ def _validate_repetitions(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"extension threshold {key} must be non-negative")
 
 
+def _validate_screening_policy(stage: dict[str, Any]) -> None:
+    policy = stage.get("screening_policy")
+    if policy is None:
+        return
+    if stage.get("purpose") not in {"smoke", "kernel_screen"}:
+        raise ManifestError("screening_policy is limited to smoke and kernel_screen stages")
+    if not isinstance(policy, dict) or policy.get("kind") != "single_pair_fail_fast":
+        raise ManifestError("screening_policy.kind must be single_pair_fail_fast")
+    required = {
+        "kind",
+        "order",
+        "regression_threshold_percent",
+        "confidence_claim",
+    }
+    if set(policy) != required:
+        raise ManifestError(f"screening_policy requires exactly {sorted(required)}")
+    if policy.get("order") not in {"AB", "BA"}:
+        raise ManifestError("single-pair screening order must be AB or BA")
+    threshold = policy.get("regression_threshold_percent")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool) or threshold <= 0:
+        raise ManifestError("single-pair screening requires a positive regression_threshold_percent")
+    if policy.get("confidence_claim") != "none":
+        raise ManifestError("single-pair screening must declare confidence_claim=none")
+    if "decision_policy" in stage:
+        raise ManifestError(
+            "single-pair screening cannot declare a statistical decision_policy"
+        )
+
+
+def _validate_profiler_details(
+    config: dict[str, Any], stage: dict[str, Any], *, label: str
+) -> None:
+    if stage.get("resource") != "gpu":
+        raise ManifestError(f"{label} must target a GPU stage")
+    selector = config.get("selector")
+    if not isinstance(selector, dict) or not selector.get("kernel_regex"):
+        raise ManifestError(f"{label} requires a discovery selector with kernel_regex")
+    selector_keys = {"kernel_regex", "graph_only", "grid", "block", "occurrence_policy"}
+    if set(selector) - selector_keys:
+        unknown = sorted(set(selector) - selector_keys)
+        raise ManifestError(f"{label} selector has unknown keys {unknown}")
+    try:
+        re.compile(str(selector["kernel_regex"]))
+    except re.error as error:
+        raise ManifestError(f"{label} kernel_regex is invalid: {error}") from error
+    if "graph_only" in selector and not isinstance(selector["graph_only"], bool):
+        raise ManifestError(f"{label} selector.graph_only must be boolean")
+    for shape_name in ("grid", "block"):
+        shape = selector.get(shape_name)
+        if shape is not None and (
+            not isinstance(shape, list)
+            or len(shape) != 3
+            or any(
+                not isinstance(value, int) or isinstance(value, bool) or value <= 0
+                for value in shape
+            )
+        ):
+            raise ManifestError(f"{label} selector.{shape_name} must have three positive integers")
+    occurrence_policy = selector.get("occurrence_policy", {"kind": "all"})
+    if (
+        not isinstance(occurrence_policy, dict)
+        or set(occurrence_policy) != {"kind"}
+        or occurrence_policy.get("kind") not in {"all", "first", "middle", "last"}
+    ):
+        raise ManifestError(
+            f"{label} selector occurrence_policy.kind must be all, first, middle, or last"
+        )
+    graph_trace = config.get("cuda_graph_trace")
+    if not isinstance(graph_trace, dict) or graph_trace.get("applicability") not in {
+        "required",
+        "not_applicable",
+    }:
+        raise ManifestError(
+            f"{label}.cuda_graph_trace must preregister required or not_applicable"
+        )
+    selection = stage["selection"]
+    graph_replay = selection.get("cuda_graph_replay", {})
+    graph_applicable = (
+        selection.get("execution_mode") == "cuda_graph_replay"
+        or (
+            isinstance(graph_replay, dict)
+            and graph_replay.get("applicability") == "required"
+        )
+        or selector.get("graph_only")
+    )
+    if graph_applicable and graph_trace["applicability"] != "required":
+        raise ManifestError(
+            "CUDA-graph-replay or graph-only profiling requires graph-node tracing"
+        )
+    if graph_trace["applicability"] == "required":
+        if set(graph_trace) != {"applicability", "granularity", "launch_origin"}:
+            raise ManifestError("required CUDA graph tracing has unknown or missing fields")
+        if graph_trace.get("granularity") != "node":
+            raise ManifestError("required CUDA graph tracing must use granularity=node")
+        if graph_trace.get("launch_origin") not in {"host-only", "host-and-device"}:
+            raise ManifestError(
+                "required CUDA graph tracing needs host-only or host-and-device launch_origin"
+            )
+    else:
+        if set(graph_trace) != {"applicability", "reason"} or not graph_trace.get("reason"):
+            raise ManifestError("not-applicable CUDA graph tracing requires exactly a reason")
+    metrics = config.get("metrics", [])
+    if not isinstance(metrics, list) or any(
+        not isinstance(value, str) or not value for value in metrics
+    ):
+        raise ManifestError(f"{label} metrics must be non-empty strings")
+    timeout = config.get("timeout_seconds")
+    if timeout is not None and (
+        not isinstance(timeout, (int, float))
+        or isinstance(timeout, bool)
+        or not (0 < float(timeout) <= 86400)
+    ):
+        raise ManifestError(f"{label} timeout_seconds must be in (0, 86400]")
+
+
+def _stage_screen_ids(stage: dict[str, Any]) -> set[str]:
+    return {
+        str(item["id"])
+        for item in stage.get("screens", [{"id": "default"}])
+    }
+
+
 def variant_executables(variant: dict[str, Any]) -> dict[str, dict[str, Any]]:
     executables = variant.get("executables")
     if not isinstance(executables, dict) or not executables:
@@ -568,6 +690,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     seen: set[str] = set()
     purpose_counts = {purpose: 0 for purpose in PURPOSE_ORDER}
     smoke_workloads: set[str] = set()
+    screening_orders: list[str] = []
     last_order = -1
     for index, stage in enumerate(stages):
         if not isinstance(stage, dict):
@@ -579,6 +702,9 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         purpose = stage.get("purpose")
         if purpose not in PURPOSE_ORDER:
             raise ManifestError(f"stage {stage_id!r} has unknown purpose {purpose!r}")
+        _validate_screening_policy(stage)
+        if stage.get("screening_policy") is not None:
+            screening_orders.append(stage["screening_policy"]["order"])
         purpose_counts[purpose] += 1
         order = PURPOSE_ORDER[purpose]
         if order < last_order:
@@ -740,27 +866,28 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         if purpose != "exactness":
             if not isinstance(stage.get("metric"), dict):
                 raise ManifestError(f"performance stage {stage_id!r} requires a metric extractor")
-            policy = stage.get("decision_policy")
-            if not isinstance(policy, dict):
-                raise ManifestError(
-                    f"performance stage {stage_id!r} requires an explicit decision_policy"
-                )
-            acceptable = policy.get("acceptable_decisions")
-            if (
-                not isinstance(acceptable, list)
-                or not acceptable
-                or not set(acceptable).issubset({"improvement", "equivalent"})
-            ):
-                raise ManifestError(
-                    "decision_policy.acceptable_decisions must be a non-empty subset of "
-                    "improvement/equivalent"
-                )
-            if policy.get("regression") != "fail":
-                raise ManifestError("decision_policy.regression must be fail")
-            if policy.get("inconclusive_after_maximum") != "unresolved_fail":
-                raise ManifestError(
-                    "decision_policy.inconclusive_after_maximum must be unresolved_fail"
-                )
+            if stage.get("screening_policy") is None:
+                policy = stage.get("decision_policy")
+                if not isinstance(policy, dict):
+                    raise ManifestError(
+                        f"performance stage {stage_id!r} requires an explicit decision_policy"
+                    )
+                acceptable = policy.get("acceptable_decisions")
+                if (
+                    not isinstance(acceptable, list)
+                    or not acceptable
+                    or not set(acceptable).issubset({"improvement", "equivalent"})
+                ):
+                    raise ManifestError(
+                        "decision_policy.acceptable_decisions must be a non-empty subset of "
+                        "improvement/equivalent"
+                    )
+                if policy.get("regression") != "fail":
+                    raise ManifestError("decision_policy.regression must be fail")
+                if policy.get("inconclusive_after_maximum") != "unresolved_fail":
+                    raise ManifestError(
+                        "decision_policy.inconclusive_after_maximum must be unresolved_fail"
+                    )
         if purpose == "exactness" and stage.get("comparison", {}).get("mode") not in (
             "stdout_sha256",
             "file_sha256",
@@ -773,11 +900,34 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ManifestError(f"the ladder requires exactly one {purpose} stage")
     if smoke_workloads != {"prefill", "decode"}:
         raise ManifestError("the ladder requires short prefill and short decode smoke stages")
+    if any(first == second for first, second in zip(screening_orders, screening_orders[1:])):
+        raise ManifestError("adjacent single-pair screening stages must alternate AB/BA order")
 
     profiler = manifest.get("profiler")
     if profiler is not None:
         if not isinstance(profiler, dict):
             raise ManifestError("profiler must be an object")
+        profiler_keys = {
+            "pattern",
+            "profile_repetitions",
+            "stage",
+            "variant",
+            "screen",
+            "timeout_seconds",
+            "selector",
+            "cuda_graph_trace",
+            "metrics",
+        }
+        profiler_required = {
+            "pattern",
+            "profile_repetitions",
+            "stage",
+            "variant",
+            "selector",
+            "cuda_graph_trace",
+        }
+        if profiler_required - set(profiler) or set(profiler) - profiler_keys:
+            raise ManifestError("profiler has unknown or missing fields")
         if profiler.get("pattern") != "one_nsys_discovery_then_one_filtered_ncu":
             raise ManifestError("profiler pattern must preregister one NSYS discovery then one filtered NCU")
         if profiler.get("profile_repetitions") != 1:
@@ -785,37 +935,92 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         stage_id = profiler.get("stage")
         if stage_id not in seen:
             raise ManifestError(f"profiler references unknown stage {stage_id!r}")
-        if stage_by_id(manifest, str(stage_id))["purpose"] != "production_confirmation":
+        profiled_stage = stage_by_id(manifest, str(stage_id))
+        if profiled_stage["purpose"] != "production_confirmation":
             raise ManifestError("profiler discovery/capture must target production_confirmation")
         target_variant = profiler.get("variant")
         if target_variant not in variants:
             raise ManifestError("profiler variant must be baseline or candidate")
-        if not isinstance(profiler.get("selector"), dict) or not profiler["selector"].get("kernel_regex"):
-            raise ManifestError("profiler requires a discovery selector with kernel_regex")
-        graph_trace = profiler.get("cuda_graph_trace")
-        if not isinstance(graph_trace, dict) or graph_trace.get("applicability") not in {
-            "required",
-            "not_applicable",
+        if profiler.get("screen", "default") not in _stage_screen_ids(profiled_stage):
+            raise ManifestError("profiler screen is absent from its target stage")
+        _validate_profiler_details(profiler, profiled_stage, label="profiler")
+
+    diagnostics = manifest.get("early_diagnostics", [])
+    if not isinstance(diagnostics, list):
+        raise ManifestError("early_diagnostics must be an array")
+    diagnostic_ids: set[str] = set()
+    diagnostic_stages: set[str] = set()
+    for config in diagnostics:
+        if not isinstance(config, dict):
+            raise ManifestError("each early diagnostic must be an object")
+        diagnostic_required = {
+            "id",
+            "trigger",
+            "on_clear",
+            "evidence_claim",
+            "pattern",
+            "profile_repetitions",
+            "stage",
+            "variants",
+            "screen_selection",
+            "selector",
+            "cuda_graph_trace",
+        }
+        diagnostic_keys = diagnostic_required | {"timeout_seconds", "metrics"}
+        if diagnostic_required - set(config) or set(config) - diagnostic_keys:
+            raise ManifestError("early diagnostic has unknown or missing fields")
+        diagnostic_id = safe_slug(str(config.get("id", "")))
+        if diagnostic_id in diagnostic_ids:
+            raise ManifestError(f"duplicate early diagnostic id {diagnostic_id!r}")
+        diagnostic_ids.add(diagnostic_id)
+        if config.get("trigger") != "regression_signal_only":
+            raise ManifestError("early diagnostic trigger must be regression_signal_only")
+        if config.get("on_clear") != "skip":
+            raise ManifestError("early diagnostic on_clear policy must be skip")
+        if config.get("evidence_claim") != "diagnostic_only":
+            raise ManifestError("early diagnostic evidence_claim must be diagnostic_only")
+        if config.get("pattern") != "independent_nsys_then_filtered_ncu_per_variant":
+            raise ManifestError(
+                "early diagnostic must independently discover and capture each variant"
+            )
+        if config.get("profile_repetitions") != 1:
+            raise ManifestError("early diagnostic profiling must run once per variant")
+        if config.get("variants") != ["baseline", "candidate"]:
+            raise ManifestError("early diagnostic variants must be baseline then candidate")
+        stage_id = config.get("stage")
+        if stage_id not in seen:
+            raise ManifestError(f"early diagnostic references unknown stage {stage_id!r}")
+        if stage_id in diagnostic_stages:
+            raise ManifestError("only one early diagnostic is allowed per screening stage")
+        diagnostic_stages.add(str(stage_id))
+        profiled_stage = stage_by_id(manifest, str(stage_id))
+        if profiled_stage.get("purpose") not in {"smoke", "kernel_screen"}:
+            raise ManifestError("early diagnostics are limited to smoke and kernel_screen stages")
+        if profiled_stage.get("screening_policy") is None:
+            raise ManifestError("early diagnostics require a single-pair screening_policy")
+        screen_selection = config.get("screen_selection")
+        if not isinstance(screen_selection, dict) or screen_selection.get("kind") not in {
+            "fixed",
+            "largest_observed_regression",
         }:
             raise ManifestError(
-                "profiler.cuda_graph_trace must preregister required or not_applicable"
+                "early diagnostic screen_selection.kind must be fixed or "
+                "largest_observed_regression"
             )
-        profiled_stage = stage_by_id(manifest, str(stage_id))
-        graph_capable = "cuda_graphs" in profiled_stage["selection"]["backend_capabilities"]
-        if graph_capable or profiler["selector"].get("graph_only"):
-            if graph_trace["applicability"] != "required":
+        if screen_selection["kind"] == "fixed":
+            if set(screen_selection) != {"kind", "screen"}:
                 raise ManifestError(
-                    "CUDA-graph-capable or graph-only profiling requires graph-node tracing"
+                    "fixed diagnostic screen selection requires exactly kind and screen"
                 )
-        if graph_trace["applicability"] == "required":
-            if graph_trace.get("granularity") != "node":
-                raise ManifestError("required CUDA graph tracing must use granularity=node")
-            if graph_trace.get("launch_origin") not in {"host-only", "host-and-device"}:
-                raise ManifestError(
-                    "required CUDA graph tracing needs host-only or host-and-device launch_origin"
-                )
-        elif not graph_trace.get("reason"):
-            raise ManifestError("not-applicable CUDA graph tracing requires a reason")
+            if screen_selection.get("screen") not in _stage_screen_ids(profiled_stage):
+                raise ManifestError("fixed diagnostic screen is absent from its target stage")
+        elif set(screen_selection) != {"kind"}:
+            raise ManifestError(
+                "largest-observed-regression screen selection requires exactly kind"
+            )
+        _validate_profiler_details(
+            config, profiled_stage, label=f"early_diagnostics[{diagnostic_id}]"
+        )
 
 
 def load_and_validate_manifest(path: pathlib.Path) -> tuple[dict[str, Any], str]:
@@ -951,7 +1156,15 @@ def binary_snapshot(executable: pathlib.Path) -> dict[str, Any]:
                 {"path": str(library), **stat_identity(library), "sha256": sha256_file(library)}
             )
         record["format"] = "elf"
-        record["ldd"] = ldd
+        # Raw ldd output contains ASLR load addresses, so retaining it in the
+        # provenance identity would make every resume differ despite identical
+        # binaries and libraries.  Preserve the stable invocation/result and
+        # the fully hashed resolved library inventory instead.
+        record["ldd"] = {
+            "argv": ldd["argv"],
+            "returncode": ldd["returncode"],
+            "resolved_library_count": len(libraries),
+        }
         record["libraries"] = libraries
     else:
         with resolved.open("rb") as source:
@@ -1148,6 +1361,8 @@ def build_schedule(manifest: dict[str, Any], stage: dict[str, Any]) -> list[dict
     policy = manifest["repetition_policy"]
     if stage["purpose"] == "exactness":
         orientations = ["AB"]
+    elif stage.get("screening_policy") is not None:
+        orientations = [stage["screening_policy"]["order"]]
     else:
         orientations = list(policy["order"])
     screens = stage.get("screens", [{"id": "default", "args": [], "weight": 1.0}])
@@ -1281,6 +1496,49 @@ def paired_log_report(
     }
 
 
+def single_pair_screen_report(
+    pair: dict[str, Any], *, direction: str, regression_threshold_percent: float
+) -> dict[str, Any]:
+    """Report one fail-fast screening pair without claiming statistical confidence."""
+    if direction not in ("higher", "lower"):
+        raise ValidationError("metric direction must be 'higher' or 'lower'")
+    baseline = float(pair["baseline"])
+    candidate = float(pair["candidate"])
+    if baseline <= 0 or candidate <= 0:
+        raise ValidationError("single-pair screening ratios require positive observations")
+    log_ratio = math.log(candidate / baseline)
+    percent = 100.0 * math.expm1(log_ratio)
+    benefit_percent = percent if direction == "higher" else -percent
+    signal = (
+        "regression_signal"
+        if benefit_percent <= -float(regression_threshold_percent)
+        else "clear_to_continue"
+    )
+    return {
+        "pair_count": 1,
+        "method": "single matched-pair fail-fast screen",
+        "direction": direction,
+        "geometric_ratio": math.exp(log_ratio),
+        "percent_change": percent,
+        "benefit_percent": benefit_percent,
+        "confidence_interval": None,
+        "confidence_claim": "none",
+        "signal": signal,
+        "regression_threshold_percent": float(regression_threshold_percent),
+        "raw_pairs": [
+            {
+                **pair,
+                "log_ratio": log_ratio,
+                "percent_change": percent,
+            }
+        ],
+        "evidence_boundary": (
+            "A single-pair screen is a preregistered fail-fast signal only; it is not "
+            "a confidence interval, equivalence result, or performance acceptance claim."
+        ),
+    }
+
+
 def performance_outcome(decision: str, policy: dict[str, Any]) -> str:
     """Map an executed statistical decision to a fail-closed gate outcome."""
     if decision in policy["acceptable_decisions"]:
@@ -1326,7 +1584,7 @@ def command_for_run(
     ]
     reject_forbidden_tokens(argv)
     validate_direct_target(pathlib.Path(argv[0]), direct_harness=executable.get("direct_harness"))
-    validate_argv(argv[1:], command.get("cli_schema"))
+    validate_argv(argv[1:], command.get("cli_schema"), argv[0])
     environment = sterile_environment(
         manifest.get("environment", {}),
         variant.get("environment", {}),

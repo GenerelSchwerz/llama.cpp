@@ -526,6 +526,34 @@ class StudyRunner:
     ) -> dict[str, Any]:
         schedule = core.build_schedule(self.manifest, stage)
         results: dict[str, dict[str, Any]] = {}
+        screening_policy = stage.get("screening_policy")
+        if screening_policy is not None:
+            for item in schedule:
+                results[item["run_id"]] = self._execute(
+                    stage, item, retry_failed=retry_failed
+                )
+            pair = self._pair_values(stage, schedule, results, 1)
+            observation = core.single_pair_screen_report(
+                pair,
+                direction=stage["metric"]["direction"],
+                regression_threshold_percent=screening_policy[
+                    "regression_threshold_percent"
+                ],
+            )
+            passed = observation["signal"] == "clear_to_continue"
+            return {
+                "purpose": stage["purpose"],
+                "execution_status": "completed",
+                "status": "passed" if passed else "failed",
+                "screening_policy": screening_policy,
+                "screening_observation": observation,
+                "adaptive_repetition": {
+                    "applicable": False,
+                    "reason": "single_pair_fail_fast_screen",
+                    "statistical_pairs": "not_applicable_by_preregistered_screening_policy",
+                },
+                "raw_run_ids": [result["run_id"] for result in results.values()],
+            }
         pairs: list[dict[str, Any]] = []
         thresholds = self.manifest["repetition_policy"]["extension_rule"]["thresholds"]
         for pair in range(1, 4):

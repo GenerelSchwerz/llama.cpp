@@ -308,6 +308,83 @@ def verify_graph_node_discovery(
     return result
 
 
+def select_regression_diagnostic(
+    stage: dict[str, Any],
+    stage_report: dict[str, Any] | None,
+    screen_selection: dict[str, Any],
+) -> dict[str, Any]:
+    """Resolve a preregistered diagnostic target only after a regression signal."""
+    if not stage_report:
+        return {"triggered": False, "reason": "screening_stage_not_executed"}
+    observation = stage_report.get("screening_observation")
+    if not isinstance(observation, dict):
+        return {"triggered": False, "reason": "stage_has_no_screening_observation"}
+    if observation.get("signal") != "regression_signal":
+        return {"triggered": False, "reason": "no_regression_signal"}
+    raw_pairs = observation.get("raw_pairs")
+    if not isinstance(raw_pairs, list) or len(raw_pairs) != 1:
+        raise ValidationError("early diagnostic requires exactly one preserved screening pair")
+    pair = raw_pairs[0]
+    raw_screens = pair.get("raw_screens")
+    if not isinstance(raw_screens, dict):
+        raise ValidationError("screening report lacks raw per-screen observations")
+    values: dict[str, dict[str, float]] = {}
+    for variant in ("baseline", "candidate"):
+        rows = raw_screens.get(variant)
+        if not isinstance(rows, list):
+            raise ValidationError(f"screening report lacks {variant} per-screen observations")
+        for row in rows:
+            screen = str(row["screen"])
+            values.setdefault(screen, {})[variant] = float(row["value"])
+    stage_screens = [
+        str(item["id"])
+        for item in stage.get("screens", [{"id": "default"}])
+    ]
+    for screen in stage_screens:
+        if set(values.get(screen, {})) != {"baseline", "candidate"}:
+            raise ValidationError(f"screening report lacks a matched pair for screen {screen!r}")
+    direction = str(observation.get("direction", stage["metric"]["direction"]))
+
+    def details(screen: str) -> dict[str, Any]:
+        baseline = values[screen]["baseline"]
+        candidate = values[screen]["candidate"]
+        if baseline <= 0 or candidate <= 0:
+            raise ValidationError("diagnostic screen selection requires positive observations")
+        percent = 100.0 * (candidate / baseline - 1.0)
+        benefit = percent if direction == "higher" else -percent
+        return {
+            "screen": screen,
+            "baseline": baseline,
+            "candidate": candidate,
+            "percent_change": percent,
+            "benefit_percent": benefit,
+            "regression_severity_percent": -benefit,
+        }
+
+    candidates = [details(screen) for screen in stage_screens]
+    if screen_selection["kind"] == "fixed":
+        selected = next(
+            item for item in candidates if item["screen"] == screen_selection["screen"]
+        )
+    else:
+        selected = max(
+            candidates,
+            key=lambda item: (
+                item["regression_severity_percent"],
+                -stage_screens.index(item["screen"]),
+            ),
+        )
+    return {
+        "triggered": True,
+        "reason": "preregistered_regression_signal",
+        "stage": stage["id"],
+        "selection_policy": screen_selection,
+        "selected_screen": selected,
+        "all_screen_observations": candidates,
+        "confidence_claim": "none",
+    }
+
+
 def _selector_matches(launch: dict[str, Any], selector: dict[str, Any]) -> bool:
     pattern = selector.get("kernel_regex")
     if not isinstance(pattern, str) or not pattern:
@@ -338,9 +415,18 @@ def build_ncu_plan(
     Every value is derived from this discovery, never carried across builds.
     """
     validate_native_affinity(target_argv, direct_harness)
-    selected = [launch for launch in discovery["launches"] if _selector_matches(launch, selector)]
-    if not selected:
+    matches = [launch for launch in discovery["launches"] if _selector_matches(launch, selector)]
+    if not matches:
         raise ValidationError("profiler selector matched no discovered kernel launches")
+    occurrence_kind = selector.get("occurrence_policy", {"kind": "all"}).get("kind", "all")
+    if occurrence_kind == "first":
+        selected = matches[:1]
+    elif occurrence_kind == "middle":
+        selected = matches[(len(matches) - 1) // 2 : (len(matches) - 1) // 2 + 1]
+    elif occurrence_kind == "last":
+        selected = matches[-1:]
+    else:
+        selected = matches
     names = {launch["name"] for launch in selected}
     if len(names) != 1:
         raise ValidationError("one filtered NCU capture requires one discovered kernel name")
@@ -385,6 +471,8 @@ def build_ncu_plan(
         "selected_launches": selected,
         "derivation": {
             "kernel_name": kernel_name,
+            "matching_launch_count": len(matches),
+            "occurrence_policy": occurrence_kind,
             "name_occurrences": occurrences,
             "launch_skip": launch_skip,
             "launch_count": launch_count,
@@ -442,17 +530,33 @@ def parse_ncu_raw_csv(text: str) -> dict[str, Any]:
                 "kernel_name": name,
                 "grid": _normalize_shape(row.get("Grid Size")),
                 "block": _normalize_shape(row.get("Block Size")),
+                "metrics": [],
                 "raw_row_numbers": [],
             },
         )
         if capture["kernel_name"] != name:
             raise ValidationError(f"NCU capture ID {capture_key} has conflicting kernel names")
+        metric_name = (row.get("Metric Name") or "").strip()
+        metric_value = (row.get("Metric Value") or "").strip()
+        if metric_name and metric_value:
+            metric = {
+                "name": metric_name,
+                "unit": (row.get("Metric Unit") or "").strip() or None,
+                "value": metric_value,
+            }
+            if metric not in capture["metrics"]:
+                capture["metrics"].append(metric)
         capture["raw_row_numbers"].append(row_number)
     return {
         "captures": list(captures.values()),
         "columns": columns,
         "parse_status": "parsed" if captures else "unverifiable_no_captures",
     }
+
+
+def _canonical_kernel_name(name: str) -> str:
+    """Normalize only known NSYS/NCU template-constant demangler differences."""
+    return re.sub(r"\((?:int|bool|ggml_type)\)([-+]?[0-9]+)", r"\1", name)
 
 
 def verify_ncu_capture(plan: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
@@ -473,7 +577,9 @@ def verify_ncu_capture(plan: dict[str, Any], parsed: dict[str, Any]) -> dict[str
     if len(captures) != expected_count:
         issues.append(f"expected {expected_count} captures, observed {len(captures)}")
     observed_names = sorted({item["kernel_name"] for item in captures})
-    if observed_names != [expected_name]:
+    canonical_expected_name = _canonical_kernel_name(expected_name)
+    canonical_observed_names = sorted({_canonical_kernel_name(item) for item in observed_names})
+    if canonical_observed_names != [canonical_expected_name]:
         issues.append(f"expected kernel {expected_name!r}, observed {observed_names!r}")
     expected_shapes = {
         json.dumps(item, sort_keys=True) for item in derivation.get("expected_shapes", [])
@@ -496,10 +602,157 @@ def verify_ncu_capture(plan: dict[str, Any], parsed: dict[str, Any]) -> dict[str
         "status": "verified" if not issues else "failed",
         "issues": issues,
         "expected_kernel": expected_name,
+        "canonical_expected_kernel": canonical_expected_name,
+        "observed_kernel_names": observed_names,
+        "canonical_observed_kernel_names": canonical_observed_names,
+        "kernel_name_normalization": (
+            "known NSYS/NCU integral template-cast spelling only; raw names retained"
+        ),
         "expected_capture_count": expected_count,
         "observed_capture_count": len(captures),
         "observed_captures": captures,
         "cross_process_launch_order": (
             "not assumed; report kernel/count/shapes were checked after the separate NCU process"
+        ),
+    }
+
+
+def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
+    """Expose a compact, machine-readable view while retaining all raw artifacts."""
+    root = profile_root.resolve()
+
+    def read_json(name: str) -> dict[str, Any] | None:
+        path = root / name
+        if not path.is_file():
+            return None
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict):
+            raise ValidationError(f"profiler artifact is not an object: {path}")
+        return value
+
+    plan = read_json("ncu-plan.json")
+    discovery = read_json("discovery-inventory.json")
+    verification = read_json("ncu-verification.json")
+    state = read_json("profile-state.json")
+    if plan is None or discovery is None or state is None:
+        raise ValidationError(f"profiler artifacts are incomplete: {root}")
+    derivation = plan["command"]["derivation"]
+    selected = plan["command"]["selected_launches"]
+    timings: dict[str, Any] = {}
+    for kind, filename in (("nsys", "nsys-result.json"), ("ncu", "ncu-result.json")):
+        result = read_json(filename)
+        if result is not None:
+            timing = result.get("timing", {})
+            timings[kind] = {
+                "target_process_seconds": timing.get("target_process_seconds"),
+                "locked_lifecycle_wall_seconds": timing.get("locked_lifecycle_wall_seconds"),
+                "toolkit_overhead_seconds": timing.get("toolkit_overhead_seconds"),
+            }
+    captures = (
+        verification.get("parsed_export", {}).get("captures", [])
+        if verification is not None
+        else []
+    )
+    return {
+        "status": (
+            "verified"
+            if verification is not None and verification.get("status") == "verified"
+            else state.get("ncu_verification_status", "not_executed")
+        ),
+        "stage": plan["stage"],
+        "variant": plan["variant"],
+        "screen": plan["screen"],
+        "nsys": {
+            "total_launch_count": discovery["launch_count"],
+            "graph_node_trace": discovery["graph_node_trace"],
+            "selected_kernel": derivation["kernel_name"],
+            "matching_launch_count": derivation["matching_launch_count"],
+            "selected_launch_count": derivation["launch_count"],
+            "selected_launch_indices": derivation["discovery_launch_indices"],
+            "selected_name_occurrences": derivation["name_occurrences"],
+            "selected_shapes": derivation.get("expected_shapes", []),
+            "selected_graph_node_ids": sorted(
+                {
+                    str(item["graph_node_id"])
+                    for item in selected
+                    if item.get("graph_node_id") not in {None, 0, "0"}
+                }
+            ),
+        },
+        "ncu": {
+            "verification_status": (
+                verification.get("status") if verification is not None else "not_executed"
+            ),
+            "issues": verification.get("issues", []) if verification is not None else [],
+            "observed_capture_count": (
+                verification.get("observed_capture_count") if verification is not None else None
+            ),
+            "captures": captures,
+        },
+        "timing_seconds": timings,
+        "artifacts": {
+            "root": str(root),
+            "discovery_inventory": str(root / "discovery-inventory.json"),
+            "nsys_report": str(root / "discovery.nsys-rep"),
+            "nsys_stdout": str(root / "nsys-stdout.log"),
+            "nsys_stderr": str(root / "nsys-stderr.log"),
+            "ncu_plan": str(root / "ncu-plan.json"),
+            "ncu_report": plan["command"]["report_path"],
+            "ncu_stdout": str(root / "ncu-stdout.log"),
+            "ncu_stderr": str(root / "ncu-stderr.log"),
+            "ncu_verification": str(root / "ncu-verification.json"),
+        },
+        "evidence_boundary": (
+            "Diagnostic-only NSYS/NCU evidence; it is not a statistical performance, "
+            "correctness, resource, production, or long-context acceptance result."
+        ),
+    }
+
+
+def compare_agent_profiles(
+    baseline: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Place independently discovered evidence side by side without inventing statistics."""
+    if baseline.get("variant") != "baseline" or candidate.get("variant") != "candidate":
+        raise ValidationError("agent profile comparison requires baseline then candidate")
+
+    def metric_inventory(profile: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "capture_id": capture.get("id"),
+                "kernel_name": capture.get("kernel_name"),
+                "metrics": capture.get("metrics", []),
+            }
+            for capture in profile.get("ncu", {}).get("captures", [])
+        ]
+
+    return {
+        "status": "diagnostic_side_by_side_only",
+        "same_selected_kernel": (
+            baseline["nsys"]["selected_kernel"] == candidate["nsys"]["selected_kernel"]
+        ),
+        "same_selected_shapes": (
+            baseline["nsys"]["selected_shapes"] == candidate["nsys"]["selected_shapes"]
+        ),
+        "launch_inventory": {
+            variant: {
+                "total": profile["nsys"]["total_launch_count"],
+                "matching": profile["nsys"]["matching_launch_count"],
+                "selected": profile["nsys"]["selected_launch_count"],
+            }
+            for variant, profile in (("baseline", baseline), ("candidate", candidate))
+        },
+        "raw_ncu_metrics": {
+            "baseline": metric_inventory(baseline),
+            "candidate": metric_inventory(candidate),
+        },
+        "timing_seconds": {
+            "baseline": baseline.get("timing_seconds", {}),
+            "candidate": candidate.get("timing_seconds", {}),
+        },
+        "comparison_boundary": (
+            "Raw one-capture diagnostics are shown side by side; no paired interval, "
+            "equivalence, acceptance decision, or generic aggregation across metric kinds "
+            "is inferred."
         ),
     }

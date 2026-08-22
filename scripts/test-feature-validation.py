@@ -7,6 +7,8 @@ from __future__ import annotations
 import copy
 import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import pathlib
 import shlex
@@ -23,6 +25,14 @@ sys.path.insert(0, str(SCRIPTS))
 
 from feature_validation import core, profiler, telemetry  # noqa: E402
 from feature_validation.runner import StudyRunner, _verify_spec_identity  # noqa: E402
+
+
+CLI_SPEC = importlib.util.spec_from_file_location(
+    "feature_performance_validation_cli", SCRIPTS / "feature-performance-validation.py"
+)
+assert CLI_SPEC is not None and CLI_SPEC.loader is not None
+CLI = importlib.util.module_from_spec(CLI_SPEC)
+CLI_SPEC.loader.exec_module(CLI)
 
 
 def file_sha256(path: pathlib.Path) -> str:
@@ -250,6 +260,13 @@ class QuotingAndArityTest(unittest.TestCase):
         rendered = core.quote_argv(argv)
         self.assertEqual(shlex.split(rendered), argv)
 
+    def test_elf_snapshot_is_stable_across_ldd_aslr_addresses(self) -> None:
+        first = core.binary_snapshot(pathlib.Path("/bin/true"))
+        second = core.binary_snapshot(pathlib.Path("/bin/true"))
+
+        self.assertEqual(core.canonical_sha256(first), core.canonical_sha256(second))
+        self.assertNotIn("stdout", first["ldd"])
+
     def test_zero_arity_option_rejects_separate_value(self) -> None:
         with self.assertRaisesRegex(core.ValidationError, "unexpected positional"):
             core.validate_argv(["--no-kv-offload", "1"])
@@ -313,6 +330,71 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
             self.assertEqual(len({item["variant"] for item in pair_runs}), 2)
         self.assertEqual(orientations, ["AB", "BA", "AB", "BA", "AB"])
 
+    def test_single_pair_screening_is_explicit_and_limited_to_early_stages(self) -> None:
+        manifest = self.manifest()
+        stage = next(item for item in manifest["stages"] if item["purpose"] == "kernel_screen")
+        del stage["decision_policy"]
+        stage["screening_policy"] = {
+            "kind": "single_pair_fail_fast",
+            "order": "BA",
+            "regression_threshold_percent": 2.0,
+            "confidence_claim": "none",
+        }
+
+        core.validate_manifest(manifest)
+        schedule = core.build_schedule(manifest, stage)
+
+        self.assertEqual(len(schedule), 6)
+        self.assertEqual({item["pair"] for item in schedule}, {1})
+        self.assertEqual({item["orientation"] for item in schedule}, {"BA"})
+        production = next(
+            item for item in manifest["stages"] if item["purpose"] == "production_confirmation"
+        )
+        del production["decision_policy"]
+        production["screening_policy"] = copy.deepcopy(stage["screening_policy"])
+        with self.assertRaisesRegex(core.ManifestError, "limited to smoke and kernel_screen"):
+            core.validate_manifest(manifest)
+
+    def test_single_pair_screening_rejects_statistical_claims(self) -> None:
+        manifest = self.manifest()
+        stage = manifest["stages"][1]
+        stage["screening_policy"] = {
+            "kind": "single_pair_fail_fast",
+            "order": "AB",
+            "regression_threshold_percent": 2.0,
+            "confidence_claim": "none",
+        }
+        with self.assertRaisesRegex(core.ManifestError, "statistical decision_policy"):
+            core.validate_manifest(manifest)
+
+    def test_adjacent_single_pair_screens_must_alternate_order(self) -> None:
+        manifest = self.manifest()
+        for stage in manifest["stages"][1:3]:
+            del stage["decision_policy"]
+            stage["screening_policy"] = {
+                "kind": "single_pair_fail_fast",
+                "order": "AB",
+                "regression_threshold_percent": 2.0,
+                "confidence_claim": "none",
+            }
+        with self.assertRaisesRegex(core.ManifestError, "must alternate AB/BA"):
+            core.validate_manifest(manifest)
+
+    def test_command_for_run_preserves_bench_specific_arity(self) -> None:
+        manifest = self.manifest()
+        bench = self.repo / "llama-bench"
+        self.executable.rename(bench)
+        for variant in manifest["variants"].values():
+            variant["executables"]["default"]["path"] = str(bench)
+        stage = manifest["stages"][1]
+        stage["command"]["common_args"] = ["--no-kv-offload", "0"]
+        stage["command"]["cli_schema"] = {"builtin": "llama", "allow_positionals": False}
+        scheduled = core.build_schedule(manifest, stage)[0]
+
+        argv, _ = core.command_for_run(manifest, stage, scheduled)
+
+        self.assertEqual(argv[-2:], ["--no-kv-offload", "0"])
+
     def test_architecture_selector_is_rejected(self) -> None:
         manifest = self.manifest()
         manifest["stages"][1]["selection"]["architecture"] = "forbidden"
@@ -343,7 +425,7 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
         with self.assertRaisesRegex(core.ManifestError, "decision_policy"):
             core.validate_manifest(manifest)
 
-    def test_graph_capable_profiler_requires_node_trace(self) -> None:
+    def test_graph_replay_profiler_requires_node_trace(self) -> None:
         example_path = (
             SCRIPTS.parent
             / "examples"
@@ -353,8 +435,56 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
         manifest = json.loads(example_path.read_text(encoding="utf-8"))
         manifest["profiler"]["cuda_graph_trace"] = {
             "applicability": "not_applicable",
-            "reason": "invalid for this graph-capable stage",
+            "reason": "invalid for this graph-replay stage",
         }
+        stage = core.stage_by_id(manifest, manifest["profiler"]["stage"])
+        stage["selection"]["cuda_graph_replay"] = {"applicability": "required"}
+        with self.assertRaisesRegex(core.ManifestError, "requires graph-node tracing"):
+            core.validate_manifest(manifest)
+
+    def test_cuda_graph_capability_alone_does_not_claim_graph_replay(self) -> None:
+        example_path = (
+            SCRIPTS.parent
+            / "examples"
+            / "feature-performance-validation"
+            / "manifest.example.json"
+        )
+        manifest = json.loads(example_path.read_text(encoding="utf-8"))
+        manifest["profiler"]["cuda_graph_trace"] = {
+            "applicability": "not_applicable",
+            "reason": "production prefill launches kernels directly despite backend support",
+        }
+        manifest["profiler"]["selector"]["graph_only"] = False
+        core.validate_manifest(manifest)
+
+    def test_early_diagnostic_is_explicitly_regression_gated_and_paired(self) -> None:
+        example_path = (
+            SCRIPTS.parent
+            / "examples"
+            / "feature-performance-validation"
+            / "manifest.example.json"
+        )
+        manifest = json.loads(example_path.read_text(encoding="utf-8"))
+        diagnostic = manifest["early_diagnostics"][0]
+        diagnostic["trigger"] = "always"
+        with self.assertRaisesRegex(core.ManifestError, "regression_signal_only"):
+            core.validate_manifest(manifest)
+        diagnostic["trigger"] = "regression_signal_only"
+        diagnostic["variants"] = ["candidate"]
+        with self.assertRaisesRegex(core.ManifestError, "baseline then candidate"):
+            core.validate_manifest(manifest)
+
+    def test_graph_replay_early_diagnostic_requires_node_trace(self) -> None:
+        example_path = (
+            SCRIPTS.parent
+            / "examples"
+            / "feature-performance-validation"
+            / "manifest.example.json"
+        )
+        manifest = json.loads(example_path.read_text(encoding="utf-8"))
+        diagnostic = manifest["early_diagnostics"][0]
+        diagnostic["stage"] = "short-graph-decode-smoke"
+        diagnostic["screen_selection"] = {"kind": "fixed", "screen": "default"}
         with self.assertRaisesRegex(core.ManifestError, "requires graph-node tracing"):
             core.validate_manifest(manifest)
 
@@ -473,6 +603,24 @@ class StatisticsTest(unittest.TestCase):
         )
         self.assertEqual(report["decision"], "inconclusive")
 
+    def test_single_pair_screen_has_no_confidence_claim(self) -> None:
+        report = core.single_pair_screen_report(
+            {"pair": 1, "orientation": "BA", "baseline": 100.0, "candidate": 97.0},
+            direction="higher",
+            regression_threshold_percent=2.0,
+        )
+
+        self.assertEqual(report["signal"], "regression_signal")
+        self.assertIsNone(report["confidence_interval"])
+        self.assertEqual(report["confidence_claim"], "none")
+        self.assertEqual(len(report["raw_pairs"]), 1)
+        clear = core.single_pair_screen_report(
+            {"pair": 1, "orientation": "AB", "baseline": 100.0, "candidate": 99.0},
+            direction="higher",
+            regression_threshold_percent=2.0,
+        )
+        self.assertEqual(clear["signal"], "clear_to_continue")
+
     def test_weighted_harmonic_matches_prefill_throughput_geometry(self) -> None:
         value = core.aggregate_screen_values([(100.0, 1.0), (200.0, 3.0)], "weighted_harmonic")
         self.assertAlmostEqual(value, 160.0)
@@ -493,6 +641,48 @@ class StatisticsTest(unittest.TestCase):
 
 
 class ProfilerTest(unittest.TestCase):
+    def test_regression_diagnostic_selects_preregistered_largest_screen(self) -> None:
+        stage = {
+            "id": "spans",
+            "metric": {"direction": "higher"},
+            "screens": [{"id": "low"}, {"id": "mid"}, {"id": "high"}],
+        }
+        report = {
+            "screening_observation": {
+                "signal": "regression_signal",
+                "direction": "higher",
+                "raw_pairs": [
+                    {
+                        "raw_screens": {
+                            "baseline": [
+                                {"screen": "low", "value": 100},
+                                {"screen": "mid", "value": 100},
+                                {"screen": "high", "value": 100},
+                            ],
+                            "candidate": [
+                                {"screen": "low", "value": 99},
+                                {"screen": "mid", "value": 91},
+                                {"screen": "high", "value": 96},
+                            ],
+                        }
+                    }
+                ],
+            }
+        }
+
+        selected = profiler.select_regression_diagnostic(
+            stage, report, {"kind": "largest_observed_regression"}
+        )
+
+        self.assertTrue(selected["triggered"])
+        self.assertEqual(selected["selected_screen"]["screen"], "mid")
+        self.assertEqual(len(selected["all_screen_observations"]), 3)
+        report["screening_observation"]["signal"] = "clear_to_continue"
+        skipped = profiler.select_regression_diagnostic(
+            stage, report, {"kind": "largest_observed_regression"}
+        )
+        self.assertEqual(skipped, {"triggered": False, "reason": "no_regression_signal"})
+
     def test_nsys_explicitly_requests_and_verifies_graph_node_trace(self) -> None:
         config = {
             "applicability": "required",
@@ -586,6 +776,10 @@ class ProfilerTest(unittest.TestCase):
             verified = profiler.verify_ncu_capture(plan, parsed)
             self.assertEqual(verified["status"], "verified")
             self.assertEqual(verified["observed_capture_count"], 2)
+            self.assertEqual(
+                parsed["captures"][0]["metrics"],
+                [{"name": "gpu__time_duration.sum", "unit": None, "value": "10"}],
+            )
 
     def test_ncu_report_count_mismatch_and_missing_columns_do_not_verify(self) -> None:
         plan = {
@@ -607,6 +801,149 @@ class ProfilerTest(unittest.TestCase):
         )
         self.assertEqual(
             profiler.verify_ncu_capture(plan, missing_shapes)["status"], "unverifiable"
+        )
+
+    def test_agent_summary_surfaces_discovery_ncu_metrics_timing_and_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            core.write_json_atomic(
+                root / "ncu-plan.json",
+                {
+                    "stage": "screen",
+                    "variant": "candidate",
+                    "screen": "mid",
+                    "command": {
+                        "selected_launches": [
+                            {
+                                "launch_index": 12,
+                                "name_occurrence": 3,
+                                "graph_node_id": 9,
+                            }
+                        ],
+                        "derivation": {
+                            "kernel_name": "kernel",
+                            "matching_launch_count": 4,
+                            "launch_count": 1,
+                            "discovery_launch_indices": [12],
+                            "name_occurrences": [3],
+                            "expected_shapes": [
+                                {"grid": [2, 1, 1], "block": [32, 1, 1]}
+                            ],
+                        },
+                        "report_path": str(root / "capture.ncu-rep"),
+                    },
+                },
+            )
+            core.write_json_atomic(
+                root / "discovery-inventory.json",
+                {
+                    "launch_count": 20,
+                    "graph_node_trace": {
+                        "launches_with_graph_node": 5,
+                        "distinct_graph_node_ids": ["9"],
+                    },
+                },
+            )
+            core.write_json_atomic(
+                root / "profile-state.json", {"ncu_verification_status": "verified"}
+            )
+            core.write_json_atomic(
+                root / "ncu-verification.json",
+                {
+                    "status": "verified",
+                    "issues": [],
+                    "observed_capture_count": 1,
+                    "parsed_export": {
+                        "captures": [
+                            {
+                                "kernel_name": "kernel",
+                                "metrics": [
+                                    {
+                                        "name": "gpu__time_duration.sum",
+                                        "unit": "nsecond",
+                                        "value": "1234",
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                },
+            )
+            core.write_json_atomic(
+                root / "nsys-result.json",
+                {"timing": {"target_process_seconds": 2.5}},
+            )
+            core.write_json_atomic(
+                root / "ncu-result.json",
+                {"timing": {"target_process_seconds": 3.5}},
+            )
+
+            summary = profiler.agent_profile_summary(root)
+
+        self.assertEqual(summary["status"], "verified")
+        self.assertEqual(summary["nsys"]["selected_kernel"], "kernel")
+        self.assertEqual(summary["nsys"]["selected_graph_node_ids"], ["9"])
+        self.assertEqual(
+            summary["ncu"]["captures"][0]["metrics"][0]["value"], "1234"
+        )
+        self.assertEqual(summary["timing_seconds"]["nsys"]["target_process_seconds"], 2.5)
+        self.assertIn("diagnostic-only", summary["evidence_boundary"].lower())
+
+    def test_agent_comparison_keeps_raw_metrics_without_acceptance_claim(self) -> None:
+        def profile(variant: str, value: str) -> dict[str, object]:
+            return {
+                "variant": variant,
+                "nsys": {
+                    "selected_kernel": "kernel",
+                    "selected_shapes": [{"grid": [1, 1, 1], "block": [32, 1, 1]}],
+                    "total_launch_count": 10,
+                    "matching_launch_count": 2,
+                    "selected_launch_count": 1,
+                },
+                "ncu": {
+                    "captures": [
+                        {
+                            "id": "1",
+                            "kernel_name": "kernel",
+                            "metrics": [{"name": "duration", "value": value}],
+                        }
+                    ]
+                },
+                "timing_seconds": {},
+            }
+
+        comparison = profiler.compare_agent_profiles(
+            profile("baseline", "10"), profile("candidate", "12")
+        )
+
+        self.assertEqual(comparison["status"], "diagnostic_side_by_side_only")
+        self.assertEqual(
+            comparison["raw_ncu_metrics"]["candidate"][0]["metrics"][0]["value"],
+            "12",
+        )
+        self.assertIn("no paired interval", comparison["comparison_boundary"].lower())
+
+    def test_nsys_ncu_template_cast_spelling_normalizes_for_verification(self) -> None:
+        plan = {
+            "command": {
+                "derivation": {
+                    "kernel_name": "kernel<(int)256, (bool)0, (ggml_type)1>",
+                    "launch_count": 1,
+                    "expected_shapes": [{"grid": [1, 1, 1], "block": [32, 1, 1]}],
+                }
+            }
+        }
+        parsed = profiler.parse_ncu_raw_csv(
+            '"ID","Kernel Name","Grid Size","Block Size"\n'
+            '"1","kernel<256, 0, 1>","1 1 1","32 1 1"\n'
+        )
+
+        verified = profiler.verify_ncu_capture(plan, parsed)
+
+        self.assertEqual(verified["status"], "verified")
+        self.assertNotEqual(verified["expected_kernel"], verified["observed_kernel_names"][0])
+        self.assertEqual(
+            verified["canonical_expected_kernel"], verified["canonical_observed_kernel_names"][0]
         )
 
     def test_fake_nsys_sqlite_parses_names_shapes_counts_and_indices(self) -> None:
@@ -660,6 +997,230 @@ class ProfilerTest(unittest.TestCase):
                 ["/tmp/llama-bench", "-C", "0x7", "--cpu-strict", "1"],
                 pathlib.Path(temporary),
             )
+
+    def test_semantic_last_occurrence_is_derived_from_discovery(self) -> None:
+        discovery = {
+            "source": "fake",
+            "launches": [
+                {
+                    "name": "kernel",
+                    "name_occurrence": occurrence,
+                    "launch_index": occurrence * 10,
+                    "graph_node_id": None,
+                    "grid": [1, 1, 1],
+                    "block": [32, 1, 1],
+                }
+                for occurrence in range(1, 4)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            plan = profiler.build_ncu_plan(
+                discovery,
+                {
+                    "kernel_regex": "kernel",
+                    "graph_only": False,
+                    "occurrence_policy": {"kind": "last"},
+                },
+                ["/tmp/llama-bench", "-C", "0x7", "--cpu-strict", "1"],
+                pathlib.Path(temporary),
+            )
+        derivation = plan["command"]["derivation"]
+        self.assertEqual(derivation["matching_launch_count"], 3)
+        self.assertEqual(derivation["occurrence_policy"], "last")
+        self.assertEqual(derivation["launch_skip"], 2)
+        self.assertEqual(derivation["launch_count"], 1)
+        self.assertEqual(derivation["discovery_launch_indices"], [30])
+
+
+class DiagnosticCliTest(FixtureMixin, unittest.TestCase):
+    def _manifest_with_diagnostic(self, signal: str) -> pathlib.Path:
+        manifest = self.manifest()
+        stage = next(item for item in manifest["stages"] if item["purpose"] == "kernel_screen")
+        stage["resource"] = "gpu"
+        del stage["decision_policy"]
+        stage["screening_policy"] = {
+            "kind": "single_pair_fail_fast",
+            "order": "BA",
+            "regression_threshold_percent": 2.0,
+            "confidence_claim": "none",
+        }
+        manifest["early_diagnostics"] = [
+            {
+                "id": "kernel-regression",
+                "trigger": "regression_signal_only",
+                "on_clear": "skip",
+                "evidence_claim": "diagnostic_only",
+                "pattern": "independent_nsys_then_filtered_ncu_per_variant",
+                "profile_repetitions": 1,
+                "stage": stage["id"],
+                "variants": ["baseline", "candidate"],
+                "screen_selection": {"kind": "largest_observed_regression"},
+                "selector": {
+                    "kernel_regex": "kernel",
+                    "graph_only": False,
+                    "occurrence_policy": {"kind": "last"},
+                },
+                "cuda_graph_trace": {
+                    "applicability": "not_applicable",
+                    "reason": "direct fake prefill",
+                },
+                "metrics": ["gpu__time_duration.sum"],
+            }
+        ]
+        manifest_path = self.root / "diagnostic.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_sha = file_sha256(manifest_path)
+        provenance = core.capture_provenance(manifest, manifest_sha)
+        study_root = pathlib.Path(manifest["artifact_root"]) / (
+            f"{manifest['study']['id']}-{manifest_sha[:12]}"
+        )
+        study_root.mkdir(parents=True)
+        candidate = {"low": 99.0, "mid": 91.0, "high": 96.0}
+        stage_report = {
+            "purpose": "kernel_screen",
+            "execution_status": "completed",
+            "status": "failed" if signal == "regression_signal" else "passed",
+            "screening_observation": {
+                "signal": signal,
+                "direction": "higher",
+                "raw_pairs": [
+                    {
+                        "raw_screens": {
+                            "baseline": [
+                                {"screen": name, "value": 100.0, "weight": 1}
+                                for name in ("low", "mid", "high")
+                            ],
+                            "candidate": [
+                                {"screen": name, "value": candidate[name], "weight": 1}
+                                for name in ("low", "mid", "high")
+                            ],
+                        }
+                    }
+                ],
+            },
+        }
+        core.write_json_atomic(
+            study_root / "state.json",
+            {
+                "schema_version": 1,
+                "manifest_sha256": manifest_sha,
+                "provenance_identity_fingerprint": provenance["identity_fingerprint"],
+                "runs": {},
+                "stages": {stage["id"]: stage_report},
+            },
+        )
+        return manifest_path
+
+    def test_diagnostic_runs_independent_profiles_for_both_variants(self) -> None:
+        manifest_path = self._manifest_with_diagnostic("regression_signal")
+
+        def compact(path: pathlib.Path) -> dict[str, object]:
+            variant = "baseline" if "-baseline-" in path.name else "candidate"
+            return {
+                "status": "verified",
+                "variant": variant,
+                "nsys": {
+                    "selected_kernel": "kernel",
+                    "selected_shapes": [],
+                    "total_launch_count": 1,
+                    "matching_launch_count": 1,
+                    "selected_launch_count": 1,
+                },
+                "ncu": {"captures": []},
+                "timing_seconds": {},
+                "artifacts": {"root": str(path)},
+                "evidence_boundary": "diagnostic only",
+            }
+
+        with mock.patch.object(CLI, "_profile_one") as profile_one, mock.patch.object(
+            CLI.profiler, "agent_profile_summary", side_effect=compact
+        ):
+            report = CLI._diagnose(manifest_path, resume=False)
+
+        self.assertEqual(report["status"], "verified")
+        self.assertEqual(profile_one.call_count, 2)
+        self.assertEqual(
+            [call.kwargs["variant_name"] for call in profile_one.call_args_list],
+            ["baseline", "candidate"],
+        )
+        self.assertTrue(all(call.kwargs["execute_ncu"] for call in profile_one.call_args_list))
+        trigger = report["investigations"][0]["trigger"]
+        self.assertEqual(trigger["selected_screen"]["screen"], "mid")
+        roots = [item["artifacts"]["root"] for item in report["profiles"]]
+        self.assertNotEqual(roots[0], roots[1])
+        self.assertEqual(
+            report["investigations"][0]["agent_comparison"]["status"],
+            "diagnostic_side_by_side_only",
+        )
+
+    def test_clear_screen_skips_all_profiler_work(self) -> None:
+        manifest_path = self._manifest_with_diagnostic("clear_to_continue")
+        with mock.patch.object(CLI, "_profile_one") as profile_one:
+            report = CLI._diagnose(manifest_path, resume=False)
+        self.assertEqual(report["status"], "not_triggered")
+        profile_one.assert_not_called()
+
+    def test_unverifiable_profile_fails_closed_and_is_preserved(self) -> None:
+        manifest_path = self._manifest_with_diagnostic("regression_signal")
+        with mock.patch.object(CLI, "_profile_one"), mock.patch.object(
+            CLI.profiler,
+            "agent_profile_summary",
+            return_value={"status": "unverifiable", "variant": "baseline"},
+        ), self.assertRaisesRegex(core.ValidationError, "unverifiable"):
+            CLI._diagnose(manifest_path, resume=False)
+        manifest_sha = file_sha256(manifest_path)
+        report_path = (
+            self.root
+            / "artifacts"
+            / f"unit-fixture-{manifest_sha[:12]}"
+            / "early-diagnostics"
+            / "agent-diagnostic-report.json"
+        )
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["investigations"][0]["status"], "failed")
+
+    def test_run_flag_does_not_invoke_diagnostics_after_a_pass(self) -> None:
+        manifest_path = self.root / "passing.json"
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        summary = {"status": "early_screen_only_not_production_or_final_acceptance"}
+        with mock.patch.object(StudyRunner, "run", return_value=summary), mock.patch.object(
+            CLI, "_diagnose"
+        ) as diagnose, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "feature-performance-validation.py",
+                "run",
+                str(manifest_path),
+                "--diagnose-regressions",
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()):
+            returncode = CLI.main()
+        self.assertEqual(returncode, 0)
+        diagnose.assert_not_called()
+
+    def test_run_flag_profiles_a_regression_but_preserves_nonzero_status(self) -> None:
+        manifest_path = self.root / "regression.json"
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        diagnostic = {"status": "verified", "evidence_boundary": "diagnostic only"}
+        with mock.patch.object(
+            StudyRunner, "run", side_effect=core.ValidationError("screen failed")
+        ), mock.patch.object(
+            CLI, "_diagnose", return_value=diagnostic
+        ) as diagnose, mock.patch.object(
+            sys,
+            "argv",
+            [
+                "feature-performance-validation.py",
+                "run",
+                str(manifest_path),
+                "--diagnose-regressions",
+            ],
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            returncode = CLI.main()
+        self.assertEqual(returncode, 2)
+        diagnose.assert_called_once_with(manifest_path, resume=False)
 
 
 class TelemetryTest(unittest.TestCase):
@@ -742,6 +1303,36 @@ class TelemetryTest(unittest.TestCase):
 
 
 class RunnerTest(FixtureMixin, unittest.TestCase):
+    def test_single_pair_screen_runs_once_and_fails_on_preregistered_signal(self) -> None:
+        manifest = self.manifest()
+        manifest_path = self.root / "single-pair-screen.json"
+        stage = next(item for item in manifest["stages"] if item["purpose"] == "kernel_screen")
+        del stage["decision_policy"]
+        stage["screening_policy"] = {
+            "kind": "single_pair_fail_fast",
+            "order": "BA",
+            "regression_threshold_percent": 2.0,
+            "confidence_claim": "none",
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+
+        def fake_execute(_stage: dict, scheduled: dict, **_kwargs: object) -> dict:
+            return {
+                "run_id": scheduled["run_id"],
+                "metric_value": 97.0 if scheduled["variant"] == "candidate" else 100.0,
+            }
+
+        with mock.patch.object(runner, "_execute", side_effect=fake_execute) as execute:
+            report = runner._run_performance(stage, retry_failed=False)
+
+        self.assertEqual(execute.call_count, 6)
+        self.assertEqual(report["status"], "failed")
+        observation = report["screening_observation"]
+        self.assertEqual(observation["signal"], "regression_signal")
+        self.assertIsNone(observation["confidence_interval"])
+        self.assertFalse(report["adaptive_repetition"]["applicable"])
+
     def test_final_gate_execution_is_not_acceptance_without_a_pass(self) -> None:
         manifest_path = self.root / "gate-status.json"
         manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")

@@ -142,10 +142,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
-      "decision_policy": {
-        "acceptable_decisions": ["improvement", "equivalent"],
-        "regression": "fail",
-        "inconclusive_after_maximum": "unresolved_fail"
+      "screening_policy": {
+        "kind": "single_pair_fail_fast",
+        "order": "AB",
+        "regression_threshold_percent": 5.0,
+        "confidence_claim": "none"
       },
       "progress": "llama-bench --progress",
       "selection": {
@@ -187,10 +188,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
-      "decision_policy": {
-        "acceptable_decisions": ["improvement", "equivalent"],
-        "regression": "fail",
-        "inconclusive_after_maximum": "unresolved_fail"
+      "screening_policy": {
+        "kind": "single_pair_fail_fast",
+        "order": "BA",
+        "regression_threshold_percent": 5.0,
+        "confidence_claim": "none"
       },
       "progress": "llama-bench --progress",
       "selection": {
@@ -233,10 +235,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
-      "decision_policy": {
-        "acceptable_decisions": ["improvement", "equivalent"],
-        "regression": "fail",
-        "inconclusive_after_maximum": "unresolved_fail"
+      "screening_policy": {
+        "kind": "single_pair_fail_fast",
+        "order": "AB",
+        "regression_threshold_percent": 5.0,
+        "confidence_claim": "none"
       },
       "progress": "llama-bench --progress and one runner line per low/mid/high screen",
       "selection": {
@@ -367,6 +370,38 @@
         "match": "last",
         "direction": "higher"
       }
+    }
+  ],
+  "early_diagnostics": [
+    {
+      "id": "prefill-regression-kernel",
+      "trigger": "regression_signal_only",
+      "on_clear": "skip",
+      "evidence_claim": "diagnostic_only",
+      "pattern": "independent_nsys_then_filtered_ncu_per_variant",
+      "profile_repetitions": 1,
+      "stage": "weighted-prefill-screen",
+      "variants": ["baseline", "candidate"],
+      "screen_selection": {
+        "kind": "largest_observed_regression"
+      },
+      "timeout_seconds": 300,
+      "cuda_graph_trace": {
+        "applicability": "not_applicable",
+        "reason": "this prefill screen uses direct kernel launches rather than CUDA graph replay"
+      },
+      "selector": {
+        "kernel_regex": "replace-with-preregistered-kernel-family-regex",
+        "graph_only": false,
+        "occurrence_policy": {
+          "kind": "last"
+        }
+      },
+      "metrics": [
+        "gpu__time_duration.sum",
+        "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+        "dram__throughput.avg.pct_of_peak_sustained_elapsed"
+      ]
     }
   ],
   "profiler": {
