@@ -28,23 +28,119 @@ def _environment_command(environment: dict[str, str], argv: list[str]) -> list[s
     return ["env", "-i", *[f"{key}={environment[key]}" for key in sorted(environment)], *argv]
 
 
-def _kill_group(process: subprocess.Popen[Any]) -> None:
-    if process.poll() is not None:
-        return
+def _process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        process.terminate()
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_group_disappearance(
+    process: subprocess.Popen[Any], pgid: int, timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        # poll() also reaps an exited direct child so its zombie cannot keep the
+        # process group observable while descendants are being checked.
+        process.poll()
+        if not _process_group_exists(pgid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+
+
+def _cleanup_process_group(
+    process: subprocess.Popen[Any],
+    pgid: int,
+    *,
+    term_timeout: float = 3.0,
+    kill_timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Terminate an entire tracked group and always reap its direct leader.
+
+    A leader may exit while descendants keep its process group alive.  Group
+    existence, rather than leader status, therefore controls TERM/KILL
+    escalation.  Cleanup failures are returned as evidence instead of raised so
+    callers can still stop telemetry and serialize the attempt result.
+    """
+    report: dict[str, Any] = {
+        "pgid": pgid,
+        "term_sent": False,
+        "kill_sent": False,
+        "group_gone": False,
+        "leader_reaped": False,
+        "errors": [],
+    }
+    if pgid == os.getpgrp():
+        report["errors"].append("refusing to signal the executor's own process group")
+    else:
+        try:
+            group_exists = _process_group_exists(pgid)
+        except (Exception, KeyboardInterrupt) as caught:
+            group_exists = True
+            report["errors"].append(
+                f"process-group existence check: {type(caught).__name__}: {caught}"
+            )
+        if group_exists:
+            try:
+                os.killpg(pgid, signal.SIGTERM)
+                report["term_sent"] = True
+            except ProcessLookupError:
+                pass
+            except (Exception, KeyboardInterrupt) as caught:
+                report["errors"].append(
+                    f"process-group SIGTERM: {type(caught).__name__}: {caught}"
+                )
+            try:
+                report["group_gone"] = _wait_for_group_disappearance(
+                    process, pgid, term_timeout
+                )
+            except (Exception, KeyboardInterrupt) as caught:
+                report["errors"].append(
+                    f"process-group TERM wait: {type(caught).__name__}: {caught}"
+                )
+        else:
+            report["group_gone"] = True
+        if not report["group_gone"]:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+                report["kill_sent"] = True
+            except ProcessLookupError:
+                pass
+            except (Exception, KeyboardInterrupt) as caught:
+                report["errors"].append(
+                    f"process-group SIGKILL: {type(caught).__name__}: {caught}"
+                )
+            try:
+                report["group_gone"] = _wait_for_group_disappearance(
+                    process, pgid, kill_timeout
+                )
+            except (Exception, KeyboardInterrupt) as caught:
+                report["errors"].append(
+                    f"process-group KILL wait: {type(caught).__name__}: {caught}"
+                )
+        if not report["group_gone"]:
+            report["errors"].append(f"process group {pgid} remained after SIGKILL")
+
     try:
-        process.wait(timeout=3.0)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        process.kill()
-    process.wait(timeout=3.0)
+        if process.poll() is None:
+            process.wait(timeout=max(0.1, kill_timeout))
+        else:
+            process.wait(timeout=0)
+        report["leader_reaped"] = True
+    except (Exception, KeyboardInterrupt) as caught:
+        report["errors"].append(f"leader reap: {type(caught).__name__}: {caught}")
+    return report
+
+
+def _append_error(error: str | None, label: str, caught: BaseException | str) -> str:
+    detail = caught if isinstance(caught, str) else f"{type(caught).__name__}: {caught}"
+    addition = f"{label}: {detail}"
+    return f"{error}; {addition}" if error else addition
 
 
 def _drain(stream: Any, chunks: list[bytes], label: str, output_lock: threading.Lock) -> None:
@@ -113,6 +209,8 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     target_started: float | None = None
     target_finished: float | None = None
     cleanup_seconds: float | None = None
+    process_group_id: int | None = None
+    process_group_cleanup: dict[str, Any] | None = None
     try:
         phase_start = time.monotonic()
         _verify_spec_identity(spec)
@@ -131,6 +229,9 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        # start_new_session makes the direct target the leader of a new process
+        # group.  Keep this identity even if that leader exits before cleanup.
+        process_group_id = process.pid
         telemetry.attach(process.pid)
         print(
             f"[feature-validation] started run={spec['run_id']} pid={process.pid} "
@@ -159,7 +260,6 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
             elapsed = time.monotonic() - start_monotonic
             if elapsed > timeout:
                 timed_out = True
-                _kill_group(process)
                 break
             if time.monotonic() >= next_heartbeat:
                 print(
@@ -168,29 +268,56 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 )
                 next_heartbeat += 5.0
             time.sleep(0.05)
-        returncode = process.wait()
+        returncode = process.poll()
         target_finished = time.monotonic()
-    except Exception as caught:  # the result must preserve every failed attempt
+    except (Exception, KeyboardInterrupt) as caught:  # preserve failures and reap on user interrupt
         if target_started is not None and target_finished is None:
             target_finished = time.monotonic()
         error = f"{type(caught).__name__}: {caught}"
-        if process is not None:
-            _kill_group(process)
-            returncode = process.poll()
     finally:
         cleanup_started = time.monotonic()
+        if process is not None and process_group_id is not None:
+            try:
+                process_group_cleanup = _cleanup_process_group(
+                    process,
+                    process_group_id,
+                    term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
+                    kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
+                )
+                returncode = process.returncode
+                for cleanup_error in process_group_cleanup["errors"]:
+                    error = _append_error(error, "process cleanup", cleanup_error)
+            except (Exception, KeyboardInterrupt) as caught:
+                # The cleanup primitive is intended to report rather than raise,
+                # but preserve the result even if an unforeseen cleanup failure
+                # escapes it.
+                error = _append_error(error, "process cleanup", caught)
+                try:
+                    returncode = process.poll()
+                except (Exception, KeyboardInterrupt) as poll_error:
+                    error = _append_error(error, "process status", poll_error)
         for thread in threads:
-            thread.join(timeout=3.0)
+            try:
+                thread.join(timeout=3.0)
+                if thread.is_alive():
+                    error = _append_error(error, "output cleanup", "drain thread did not stop")
+            except (Exception, KeyboardInterrupt) as caught:
+                error = _append_error(error, "output cleanup", caught)
         if process is not None:
             if process.stdout is not None:
-                process.stdout.close()
+                try:
+                    process.stdout.close()
+                except (Exception, KeyboardInterrupt) as caught:
+                    error = _append_error(error, "stdout cleanup", caught)
             if process.stderr is not None:
-                process.stderr.close()
+                try:
+                    process.stderr.close()
+                except (Exception, KeyboardInterrupt) as caught:
+                    error = _append_error(error, "stderr cleanup", caught)
         try:
             telemetry_report = telemetry.stop()
-        except Exception as caught:
-            telemetry_error = f"{type(caught).__name__}: {caught}"
-            error = f"{error}; telemetry cleanup: {telemetry_error}" if error else telemetry_error
+        except (Exception, KeyboardInterrupt) as caught:
+            error = _append_error(error, "telemetry cleanup", caught)
         cleanup_seconds = time.monotonic() - cleanup_started
     stdout = b"".join(stdout_chunks)
     stderr = b"".join(stderr_chunks)
@@ -232,6 +359,8 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
             ),
         },
         "pid": process.pid if process is not None else None,
+        "process_group_id": process_group_id,
+        "process_group_cleanup": process_group_cleanup,
         "returncode": returncode,
         "timed_out": timed_out,
         "error": error,
@@ -286,6 +415,66 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _run_launcher_with_interrupt_forwarding(
+    wrapper: list[str], spec: dict[str, Any]
+) -> tuple[int | None, bool, dict[str, Any] | None, list[str]]:
+    """Run an isolated wrapper and forward outer SIGINT to its whole group."""
+    process = subprocess.Popen(wrapper, start_new_session=True)
+    pgid = process.pid
+    interrupted = False
+    errors: list[str] = []
+    while process.poll() is None:
+        try:
+            process.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            continue
+        except KeyboardInterrupt:
+            interrupted = True
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            except Exception as caught:
+                errors.append(f"SIGINT forward: {type(caught).__name__}: {caught}")
+
+    cleanup: dict[str, Any] | None = None
+    if interrupted:
+        # flock may exit before the internal executor finishes recording its
+        # interrupted target.  Give that executor its own TERM/KILL cleanup
+        # window, then force down any remaining launcher descendants.
+        grace = (
+            float(spec.get("cleanup_term_timeout_seconds", 3.0))
+            + float(spec.get("cleanup_kill_timeout_seconds", 3.0))
+            + 2.0
+        )
+        try:
+            group_gone = _wait_for_group_disappearance(process, pgid, grace)
+        except KeyboardInterrupt:
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            except Exception as caught:
+                errors.append(f"repeated SIGINT forward: {type(caught).__name__}: {caught}")
+            group_gone = False
+        except Exception as caught:
+            errors.append(f"launcher group wait: {type(caught).__name__}: {caught}")
+            group_gone = False
+        if not group_gone:
+            cleanup = _cleanup_process_group(
+                process,
+                pgid,
+                term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
+                kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
+            )
+            errors.extend(str(item) for item in cleanup["errors"])
+    try:
+        process.wait(timeout=0)
+    except Exception as caught:
+        errors.append(f"launcher reap: {type(caught).__name__}: {caught}")
+    return process.returncode, interrupted, cleanup, errors
+
+
 def launch_locked_spec(
     spec: dict[str, Any], spec_path: pathlib.Path, tool_script: pathlib.Path
 ) -> dict[str, Any]:
@@ -306,7 +495,9 @@ def launch_locked_spec(
     spec["launcher_requested_monotonic"] = time.monotonic()
     core.write_json_atomic(spec_path, spec)
     print(f"[feature-validation] launch {core.quote_argv(wrapper)}", flush=True)
-    completed = subprocess.run(wrapper, check=False)
+    returncode, interrupted, launcher_cleanup, launcher_errors = (
+        _run_launcher_with_interrupt_forwarding(wrapper, spec)
+    )
     if result_path.is_file():
         result = json.loads(result_path.read_text(encoding="utf-8"))
         launcher_seconds = time.monotonic() - spec["launcher_requested_monotonic"]
@@ -315,14 +506,40 @@ def launch_locked_spec(
             0.0,
             launcher_seconds - float(result["timing"].get("target_process_seconds", 0.0)),
         )
+        result["launcher"] = {
+            "returncode": returncode,
+            "interrupted": interrupted,
+            "process_group_cleanup": launcher_cleanup,
+            "errors": launcher_errors,
+        }
+        if interrupted:
+            result["status"] = "failed"
+            result["error"] = _append_error(
+                result.get("error"), "outer launcher", "KeyboardInterrupt"
+            )
+        for launcher_error in launcher_errors:
+            result["status"] = "failed"
+            result["error"] = _append_error(
+                result.get("error"), "launcher cleanup", launcher_error
+            )
         core.write_json_atomic(result_path, result)
         return result
     result = {
         "run_id": spec["run_id"],
         "attempt": spec["attempt"],
         "status": "failed",
-        "error": f"flock/internal executor returned {completed.returncode} without result",
+        "error": (
+            "outer launcher KeyboardInterrupt produced no internal result"
+            if interrupted
+            else f"flock/internal executor returned {returncode} without result"
+        ),
         "gpu_lock": spec["gpu_lock"],
+        "launcher": {
+            "returncode": returncode,
+            "interrupted": interrupted,
+            "process_group_cleanup": launcher_cleanup,
+            "errors": launcher_errors,
+        },
     }
     core.write_json_atomic(result_path, result)
     return result
@@ -344,6 +561,8 @@ class StudyRunner:
         self.resume_mode = False
 
     def prepare(self, *, resume: bool) -> None:
+        if self.study_root.exists():
+            core.validate_artifact_directory_isolation(self.manifest, self.study_root)
         provenance = core.capture_provenance(self.manifest, self.manifest_sha256)
         if self.state_path.exists():
             if not resume:
@@ -360,6 +579,7 @@ class StudyRunner:
             if resume:
                 raise core.ValidationError(f"no resumable study exists at {self.study_root}")
             self.study_root.mkdir(parents=True, exist_ok=False)
+            core.validate_artifact_directory_isolation(self.manifest, self.study_root)
             core.write_json_atomic(self.study_root / "manifest.snapshot.json", self.manifest)
             core.write_json_atomic(self.study_root / "provenance.json", provenance)
             self.state = {
@@ -400,6 +620,7 @@ class StudyRunner:
         attempt = len(prior) + 1
         run_root = self.study_root / "runs" / stage["id"] / scheduled["run_id"] / f"attempt-{attempt:02d}"
         run_root.mkdir(parents=True, exist_ok=False)
+        core.validate_artifact_directory_isolation(self.manifest, run_root)
         argv, environment = core.command_for_run(self.manifest, stage, scheduled)
         context = {
             "artifact_dir": run_root,
@@ -450,10 +671,12 @@ class StudyRunner:
             "host_load_before": core.host_load_snapshot(),
         }
         if stage["resource"] == "gpu":
+            core.validate_artifact_directory_isolation(self.manifest, run_root)
             result = launch_locked_spec(spec, spec_path, self.tool_script)
         else:
             spec["gpu_lock"] = None
             core.write_json_atomic(spec_path, spec)
+            core.validate_artifact_directory_isolation(self.manifest, run_root)
             result = execute_run_spec(spec)
         prior.append(result)
         self.state["runs"][run_id] = prior

@@ -616,6 +616,74 @@ def variant_executables(variant: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return executables
 
 
+def validate_artifact_directory_isolation(
+    manifest: dict[str, Any], directory: pathlib.Path
+) -> None:
+    """Fail closed unless one exact artifact directory satisfies source isolation.
+
+    The default policy keeps artifacts physically outside every declared source
+    worktree.  The opt-in policy permits an in-source directory only when Git
+    reports that directory itself ignored from every variant source root that
+    contains it.  Checking the exact path is intentional: an ignored synthetic
+    child says nothing about whether real files directly below the directory
+    would be untracked.
+    """
+    artifact_root = pathlib.Path(str(manifest["artifact_root"])).expanduser().resolve()
+    resolved_directory = directory.expanduser().resolve()
+    try:
+        resolved_directory.relative_to(artifact_root)
+    except ValueError as error:
+        raise ManifestError(
+            f"artifact directory must remain below artifact_root: {resolved_directory}"
+        ) from error
+
+    policy = str(manifest.get("artifact_root_policy", "outside_sources"))
+    seen_roots: set[pathlib.Path] = set()
+    for variant in manifest["variants"].values():
+        source_root = pathlib.Path(str(variant["source_root"])).expanduser().resolve()
+        if source_root in seen_roots:
+            continue
+        seen_roots.add(source_root)
+        try:
+            relative = resolved_directory.relative_to(source_root)
+        except ValueError:
+            continue
+        if policy != "git_ignored_inside_sources":
+            raise ManifestError(
+                "artifact_root must be outside every variant source repository unless "
+                "artifact_root_policy=git_ignored_inside_sources"
+            )
+        if not relative.parts or ".git" in relative.parts:
+            raise ManifestError("an in-source artifact directory cannot be the source root or .git")
+        ignored = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(source_root),
+                "check-ignore",
+                "--quiet",
+                "--no-index",
+                "--",
+                f"{resolved_directory}{os.sep}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if ignored.returncode == 1:
+            raise ManifestError(
+                "artifact_root_policy=git_ignored_inside_sources requires the exact "
+                f"artifact directory to be Git-ignored by every containing variant "
+                f"source repository: {resolved_directory} is not ignored by {source_root}"
+            )
+        if ignored.returncode != 0:
+            detail = ignored.stderr.strip() or f"exit status {ignored.returncode}"
+            raise ManifestError(
+                f"cannot verify Git-ignore isolation for {resolved_directory} in "
+                f"{source_root}: {detail}"
+            )
+
+
 def validate_manifest(manifest: dict[str, Any]) -> None:
     if manifest.get("schema_version") != SCHEMA_VERSION:
         raise ManifestError(f"schema_version must be {SCHEMA_VERSION}")
@@ -628,7 +696,12 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         raise ManifestError("study must state the 30-90 second early-decision target")
     artifact_root = manifest.get("artifact_root")
     if not isinstance(artifact_root, str) or not pathlib.Path(artifact_root).is_absolute():
-        raise ManifestError("artifact_root must be an absolute path outside the repository")
+        raise ManifestError("artifact_root must be an absolute path")
+    artifact_root_policy = manifest.get("artifact_root_policy", "outside_sources")
+    if artifact_root_policy not in {"outside_sources", "git_ignored_inside_sources"}:
+        raise ManifestError(
+            "artifact_root_policy must be outside_sources or git_ignored_inside_sources"
+        )
 
     variants = manifest.get("variants")
     if not isinstance(variants, dict) or set(variants) != {"baseline", "candidate"}:
@@ -683,12 +756,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                         f"variant {name} executable role {role} provenance_sidecar path must be absolute"
                     )
                 validate_sha256(sidecar["sha256"], f"variant {name}/{role} provenance_sidecar sha256")
-        try:
-            pathlib.Path(artifact_root).resolve().relative_to(pathlib.Path(variant["source_root"]).resolve())
-        except ValueError:
-            pass
-        else:
-            raise ManifestError("artifact_root must be outside every variant source repository")
+    validate_artifact_directory_isolation(manifest, pathlib.Path(artifact_root))
 
     inputs = manifest.get("inputs", [])
     if not isinstance(inputs, list):

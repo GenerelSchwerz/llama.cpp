@@ -34,6 +34,9 @@
       }
     },
     "artifact_root": { "type": "string", "pattern": "^/" },
+    "artifact_root_policy": {
+      "enum": ["outside_sources", "git_ignored_inside_sources"]
+    },
     "variants": {
       "type": "object",
       "additionalProperties": false,

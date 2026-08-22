@@ -10,12 +10,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -24,8 +27,13 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
-from feature_validation import core, profiler, telemetry  # noqa: E402
-from feature_validation.runner import StudyRunner, _verify_spec_identity  # noqa: E402
+from feature_validation import core, profiler, runner as validation_runner, telemetry  # noqa: E402
+from feature_validation.runner import (  # noqa: E402
+    StudyRunner,
+    _verify_spec_identity,
+    execute_run_spec,
+    launch_locked_spec,
+)
 
 
 CLI_SPEC = importlib.util.spec_from_file_location(
@@ -306,6 +314,96 @@ class FixtureMixin:
         return manifest, built_executable, cache, sidecar
 
 
+class ArtifactLifecycleTest(FixtureMixin, unittest.TestCase):
+    def _in_source_manifest(self) -> tuple[dict, pathlib.Path]:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        (self.repo / ".git" / "info" / "exclude").write_text(
+            "/build-validation-artifacts/\n", encoding="utf-8"
+        )
+        manifest_path = self.root / "in-source.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest, manifest_path
+
+    def test_run_and_resume_recheck_actual_ignored_directories(self) -> None:
+        _manifest, manifest_path = self._in_source_manifest()
+        runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        runner.prepare(resume=False)
+        stage = core.stage_by_id(runner.manifest, "exactness")
+        scheduled = core.build_schedule(runner.manifest, stage)[0]
+
+        result = runner._execute(stage, scheduled, retry_failed=False)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        core.validate_artifact_directory_isolation(
+            runner.manifest, pathlib.Path(result["stdout"]["path"]).parent
+        )
+
+        (self.repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            runner.prepare(resume=True)
+
+    def test_profile_rechecks_created_directory_immediately_before_target(self) -> None:
+        manifest, manifest_path = self._in_source_manifest()
+        stage = core.stage_by_id(manifest, "production")
+        stage["resource"] = "gpu"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        config = {
+            "stage": "production",
+            "selector": {
+                "kernel_regex": "kernel",
+                "graph_only": False,
+                "occurrence_policy": {"kind": "last"},
+            },
+            "cuda_graph_trace": {
+                "applicability": "not_applicable",
+                "reason": "CPU-only isolation test",
+            },
+            "metrics": ["gpu__time_duration.sum"],
+        }
+        manifest_sha = file_sha256(manifest_path)
+        provenance = core.capture_provenance(manifest, manifest_sha)
+        profile_base = pathlib.Path(manifest["artifact_root"]) / "profiles"
+
+        def tool_identity(_name: str) -> dict[str, object]:
+            (self.repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+            return {"path": "/bin/true", "sha256": file_sha256(pathlib.Path("/bin/true"))}
+
+        with mock.patch.object(
+            CLI.profiler, "validate_native_affinity"
+        ), mock.patch.object(
+            CLI, "_tool_identity", side_effect=tool_identity
+        ), mock.patch.object(
+            CLI.core,
+            "command_capture",
+            return_value={"returncode": 0, "stdout": "", "stderr": ""},
+        ), mock.patch.object(
+            CLI.profiler,
+            "verify_nsys_graph_trace_capability",
+            return_value={"status": "not_applicable"},
+        ), mock.patch.object(
+            CLI.profiler, "nsys_discovery_argv", return_value=["/bin/true"]
+        ), mock.patch.object(
+            CLI, "launch_locked_spec"
+        ) as launch, self.assertRaisesRegex(
+            core.ManifestError, "exact artifact directory"
+        ):
+            CLI._profile_one(
+                manifest,
+                manifest_sha,
+                provenance,
+                config,
+                variant_name="baseline",
+                screen_id="default",
+                profile_base=profile_base,
+                resume=False,
+                execute_ncu=False,
+            )
+        launch.assert_not_called()
+
+
 class QuotingAndArityTest(unittest.TestCase):
     def test_safe_quoting_round_trips_spaces_quotes_and_metacharacters(self) -> None:
         argv = ["/tmp/a b", "single'quote", 'double"quote', "$(do-not-run)", "semi;colon"]
@@ -364,6 +462,25 @@ class QuotingAndArityTest(unittest.TestCase):
 
 
 class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
+    @staticmethod
+    def _set_exclude(repo: pathlib.Path, contents: str) -> None:
+        (repo / ".git" / "info" / "exclude").write_text(contents, encoding="utf-8")
+
+    def _new_repo(self, name: str) -> pathlib.Path:
+        repo = self.root / name
+        repo.mkdir()
+        (repo / "tracked").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.invalid"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Feature Tests"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=repo, check=True)
+        return repo
+
     def test_checked_in_example_is_structurally_valid_and_schema_is_json(self) -> None:
         schema_path = SCRIPTS / "feature_validation" / "manifest.schema.json"
         example_path = SCRIPTS.parent / "examples" / "feature-performance-validation" / "manifest.example.json"
@@ -386,6 +503,133 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
             orientations.append(pair_runs[0]["orientation"])
             self.assertEqual(len({item["variant"] for item in pair_runs}), 2)
         self.assertEqual(orientations, ["AB", "BA", "AB", "BA", "AB"])
+
+    def test_in_source_artifacts_require_explicit_git_ignored_policy(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+
+        with self.assertRaisesRegex(core.ManifestError, "outside every variant source"):
+            core.validate_manifest(manifest)
+
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        with self.assertRaisesRegex(core.ManifestError, "Git-ignored"):
+            core.validate_manifest(manifest)
+
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(
+            exclude.read_text(encoding="utf-8") + "\n/build-validation-artifacts/\n",
+            encoding="utf-8",
+        )
+        core.validate_manifest(manifest)
+
+    def test_ignored_synthetic_probe_does_not_authorize_unignored_root(self) -> None:
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(self.repo / "build-validation-artifacts")
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(
+            self.repo,
+            "/build-validation-artifacts/.feature-validation-artifact-root-probe\n",
+        )
+
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            core.validate_manifest(manifest)
+
+    def test_ignore_negation_fails_closed_for_exact_artifact_root(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        artifact_root.mkdir()
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(
+            self.repo,
+            "/build-validation-artifacts/\n!/build-validation-artifacts/\n",
+        )
+
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            core.validate_manifest(manifest)
+
+    def test_distinct_variant_roots_check_only_the_containing_root(self) -> None:
+        other = self._new_repo("other source")
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(self.repo, "/build-validation-artifacts/\n")
+        candidate = manifest["variants"]["candidate"]
+        candidate["source_root"] = str(other)
+        candidate["expected_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=other,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        core.validate_manifest(manifest)
+
+    def test_nested_variant_roots_must_both_ignore_the_exact_root(self) -> None:
+        nested = self.repo / "nested-source"
+        nested.mkdir()
+        (nested / "tracked").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.invalid"], cwd=nested, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Feature Tests"], cwd=nested, check=True
+        )
+        subprocess.run(["git", "add", "."], cwd=nested, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=nested, check=True)
+        artifact_root = nested / "build-validation-artifacts"
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        candidate = manifest["variants"]["candidate"]
+        candidate["source_root"] = str(nested)
+        candidate["expected_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=nested,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self._set_exclude(
+            self.repo, "/nested-source/\n!/nested-source/\n/nested-source/build-validation-artifacts/\n"
+        )
+        self._set_exclude(nested, "")
+
+        with self.assertRaisesRegex(core.ManifestError, str(nested)):
+            core.validate_manifest(manifest)
+
+        self._set_exclude(nested, "/build-validation-artifacts/\n")
+        core.validate_manifest(manifest)
+
+    def test_ignored_in_source_artifacts_do_not_change_provenance_identity(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(self.repo, "/build-validation-artifacts/\n")
+        manifest_path = self.root / "provenance.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_sha = file_sha256(manifest_path)
+        before = core.capture_provenance(manifest, manifest_sha)
+        artifact_root.mkdir()
+        (artifact_root / "raw-profile.sqlite").write_text("ignored\n", encoding="utf-8")
+        core.validate_artifact_directory_isolation(manifest, artifact_root)
+        after = core.capture_provenance(manifest, manifest_sha)
+
+        self.assertEqual(before["identity_fingerprint"], after["identity_fingerprint"])
+        self.assertEqual(before["variants"], after["variants"])
+
+    def test_in_source_artifacts_never_allow_git_metadata(self) -> None:
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(self.repo / ".git" / "validation-artifacts")
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+
+        with self.assertRaisesRegex(core.ManifestError, "cannot be the source root or .git"):
+            core.validate_manifest(manifest)
 
     def test_single_pair_screening_is_explicit_and_limited_to_early_stages(self) -> None:
         manifest = self.manifest()
@@ -1518,6 +1762,213 @@ class TelemetryTest(unittest.TestCase):
 
 
 class RunnerTest(FixtureMixin, unittest.TestCase):
+    def _spec(self, attempt: pathlib.Path, argv: list[str], run_id: str) -> dict:
+        return {
+            "schema_version": 1,
+            "run_id": run_id,
+            "attempt": 1,
+            "resource": "cpu",
+            "argv": argv,
+            "environment": {},
+            "cwd": str(attempt),
+            "timeout_seconds": 60.0,
+            "progress": "CPU-only real-signal lifecycle test",
+            "result_path": str(attempt / "result.json"),
+            "stdout_path": str(attempt / "stdout.log"),
+            "stderr_path": str(attempt / "stderr.log"),
+            "identity_files": [],
+            "source_identities": [],
+            "host_load_before": {},
+            "cleanup_term_timeout_seconds": 0.2,
+            "cleanup_kill_timeout_seconds": 1.0,
+        }
+
+    def test_exited_leader_does_not_hide_sigterm_ignoring_descendant(self) -> None:
+        attempt = self.root / "leader-exited"
+        attempt.mkdir()
+        descendant_pid_path = attempt / "descendant.pid"
+        target = attempt / "spawn-descendant.py"
+        descendant_code = (
+            "import os, pathlib, signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib, subprocess, sys, time\n"
+            f"ready = pathlib.Path({str(descendant_pid_path)!r})\n"
+            f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "for _ in range(200):\n"
+            "    if ready.is_file():\n"
+            "        break\n"
+            "    time.sleep(.01)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+
+        result = execute_run_spec(self._spec(attempt, [str(target)], "leader-exited"))
+
+        descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "success")
+        cleanup = result["process_group_cleanup"]
+        self.assertTrue(cleanup["term_sent"])
+        self.assertTrue(cleanup["kill_sent"])
+        self.assertTrue(cleanup["group_gone"])
+        self.assertTrue(cleanup["leader_reaped"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+
+    def test_real_sigint_reaps_target_group_and_preserves_failure(self) -> None:
+        attempt = self.root / "interrupted-attempt"
+        attempt.mkdir()
+        descendant_pid_path = attempt / "descendant.pid"
+        ready_path = attempt / "target-ready.json"
+        target = attempt / "interrupt-target.py"
+        descendant_code = (
+            "import os, pathlib, signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"descendant = pathlib.Path({str(descendant_pid_path)!r})\n"
+            "for _ in range(200):\n"
+            "    if descendant.is_file():\n"
+            "        break\n"
+            "    time.sleep(.01)\n"
+            f"pathlib.Path({str(ready_path)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+        spec = self._spec(attempt, [str(target)], "interrupt-cleanup")
+        spec_path = attempt / "spec.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+        with subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "feature-performance-validation.py"),
+                "_execute-run",
+                str(spec_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) as executor:
+            deadline = time.monotonic() + 5.0
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready_path.is_file())
+            os.kill(executor.pid, signal.SIGINT)
+            self.assertEqual(executor.wait(timeout=5.0), 1)
+
+        target_pid, descendant_pid = json.loads(ready_path.read_text(encoding="utf-8"))
+        result = json.loads(pathlib.Path(spec["result_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("KeyboardInterrupt", result["error"])
+        self.assertEqual(result["process_group_id"], target_pid)
+        self.assertTrue(result["process_group_cleanup"]["kill_sent"])
+        self.assertTrue(result["process_group_cleanup"]["group_gone"])
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        for pid in (target_pid, descendant_pid):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_cleanup_errors_preserve_result_and_telemetry(self) -> None:
+        attempt = self.root / "cleanup-error"
+        attempt.mkdir()
+        spec = self._spec(attempt, ["/bin/true"], "cleanup-error")
+        original_cleanup = validation_runner._cleanup_process_group
+
+        def cleanup_with_error(*args: object, **kwargs: object) -> dict[str, object]:
+            report = original_cleanup(*args, **kwargs)
+            report["errors"].append("injected cleanup failure")
+            return report
+
+        with mock.patch.object(
+            validation_runner, "_cleanup_process_group", side_effect=cleanup_with_error
+        ):
+            result = execute_run_spec(spec)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("injected cleanup failure", result["error"])
+        self.assertIsNotNone(result["telemetry"])
+        self.assertTrue(pathlib.Path(spec["result_path"]).is_file())
+
+    def test_outer_launcher_real_sigint_persists_state_and_retry_semantics(self) -> None:
+        ready = self.root / "outer-ready"
+        allow = self.root / "outer-allow"
+        self.executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, time\n"
+            f"ready = pathlib.Path({str(ready)!r})\n"
+            f"allow = pathlib.Path({str(allow)!r})\n"
+            "if allow.is_file():\n"
+            "    print('metric=100.0')\n"
+            "else:\n"
+            "    ready.write_text('ready')\n"
+            "    time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        self.executable.chmod(0o755)
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "interrupt fixture"], cwd=self.repo, check=True
+        )
+        manifest_path = self.root / "outer-interrupt.json"
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        runner.prepare(resume=False)
+        stage = core.stage_by_id(runner.manifest, "exactness")
+        stage["resource"] = "gpu"
+        scheduled = core.build_schedule(runner.manifest, stage)[0]
+
+        def cpu_locked(spec: dict, spec_path: pathlib.Path, tool_script: pathlib.Path) -> dict:
+            spec["resource"] = "cpu"
+            spec["cleanup_term_timeout_seconds"] = 0.2
+            spec["cleanup_kill_timeout_seconds"] = 1.0
+            return launch_locked_spec(spec, spec_path, tool_script)
+
+        def interrupt_when_ready() -> None:
+            deadline = time.monotonic() + 5.0
+            while not ready.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if ready.is_file():
+                os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = threading.Thread(target=interrupt_when_ready)
+        interrupter.start()
+        with mock.patch.object(
+            validation_runner, "launch_locked_spec", side_effect=cpu_locked
+        ), self.assertRaisesRegex(core.ValidationError, "preserved"):
+            runner._execute(stage, scheduled, retry_failed=False)
+        interrupter.join(timeout=5.0)
+        self.assertFalse(interrupter.is_alive())
+
+        run_id = f"{stage['id']}--{scheduled['run_id']}"
+        attempts = runner.state["runs"][run_id]
+        self.assertEqual([item["status"] for item in attempts], ["failed"])
+        self.assertTrue(attempts[0]["launcher"]["interrupted"])
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            runner._execute(stage, scheduled, retry_failed=False)
+
+        allow.write_text("go", encoding="utf-8")
+        with mock.patch.object(
+            validation_runner, "launch_locked_spec", side_effect=cpu_locked
+        ):
+            retried = runner._execute(stage, scheduled, retry_failed=True)
+        self.assertEqual(retried["status"], "success")
+        self.assertEqual(
+            [item["status"] for item in runner.state["runs"][run_id]],
+            ["failed", "success"],
+        )
+
     def test_single_pair_screen_runs_once_and_fails_on_preregistered_signal(self) -> None:
         manifest = self.manifest()
         manifest_path = self.root / "single-pair-screen.json"

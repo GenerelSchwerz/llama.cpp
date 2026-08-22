@@ -42,8 +42,21 @@ work, CPU KV placement, and future features.
 ## Prepare a manifest
 
 Keep the manifest small and preregister it before collecting measurements.
-Large outputs must go to the absolute `artifact_root`, which the runner rejects
-if it is inside either source repository.
+Large outputs must go to the absolute `artifact_root`. By default the runner
+rejects a root inside either source repository. A worktree-confined study may
+set `artifact_root_policy` to `git_ignored_inside_sources`; this opt-in is
+accepted only when the root is below (and not equal to) every containing source
+root, is outside `.git`, and `git check-ignore --no-index` proves that the exact
+artifact directory itself—not a synthetic child—is ignored by every containing
+variant root. The runner repeats this check on each actual study, attempt,
+diagnostic, and profile directory immediately before a target starts, including
+on resume.
+
+This opt-in deliberately relaxes physical isolation: ignored artifacts can
+share a worktree filesystem with source and may be visible to build scripts or
+other tools that traverse ignored paths. It protects Git source identity and
+accidental commits, but is not equivalent to the default cross-worktree
+boundary. Prefer an outside-source root unless worktree confinement is required.
 
 Register every CMake-built executable after its final build, reconfiguration,
 or copy and before adding it to a manifest:
@@ -210,6 +223,15 @@ A successful run is skipped on `--resume`. A failed, timed-out, contaminated,
 or incomplete attempt is retained and stops the study. It is never dropped or
 overwritten. After correcting an external prerequisite, an explicit
 `--retry-failed` creates the next numbered attempt:
+
+If the user interrupts an active run, the outer launcher forwards the interrupt
+to its isolated wrapper group and waits for the internal executor to persist the
+attempt. The executor tracks the direct target's process-group ID independently
+of its leader, waits for the whole group to disappear, escalates from SIGTERM to
+SIGKILL when descendants remain, always reaps the direct child, and then stops
+telemetry. Cleanup errors are recorded without discarding telemetry or the
+result. The attempt is failed in `state.json` and is never resumable as
+successful evidence; a later attempt still requires `--resume --retry-failed`.
 
 ```bash
 python3 scripts/feature-performance-validation.py run \

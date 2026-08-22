@@ -61,6 +61,7 @@ def _profile_one(
     state_path = profile_root / "profile-state.json"
     plan_path = profile_root / "ncu-plan.json"
     if state_path.exists():
+        core.validate_artifact_directory_isolation(manifest, profile_root)
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if not resume:
             raise core.ValidationError(f"profile artifacts already exist; use --resume: {profile_root}")
@@ -80,6 +81,7 @@ def _profile_one(
         if resume:
             raise core.ValidationError(f"no resumable profile exists at {profile_root}")
         profile_root.mkdir(parents=True, exist_ok=False)
+        core.validate_artifact_directory_isolation(manifest, profile_root)
         state = {
             "schema_version": 1,
             "manifest_sha256": manifest_sha,
@@ -177,6 +179,7 @@ def _profile_one(
             "nvidia_smi": nvidia_smi,
             "host_load_before": core.host_load_snapshot(),
         }
+        core.validate_artifact_directory_isolation(manifest, profile_root)
         result = launch_locked_spec(spec, spec_path, TOOL_SCRIPT)
         if result.get("status") != "success":
             raise core.ValidationError(f"NSYS command failed: {result.get('error')}")
@@ -256,6 +259,7 @@ def _profile_one(
             "nvidia_smi": nvidia_smi,
             "host_load_before": core.host_load_snapshot(),
         }
+        core.validate_artifact_directory_isolation(manifest, profile_root)
         result = launch_locked_spec(spec, spec_path, TOOL_SCRIPT)
         if result.get("status") != "success":
             raise core.ValidationError(f"NCU command failed: {result.get('error')}")
@@ -435,6 +439,7 @@ def _diagnose(manifest_path: pathlib.Path, *, resume: bool) -> dict[str, Any]:
         ),
     }
     diagnostic_root.mkdir(parents=True, exist_ok=True)
+    core.validate_artifact_directory_isolation(manifest, diagnostic_root)
     core.write_json_atomic(report_path, report)
     for config in configs:
         stage = core.stage_by_id(manifest, str(config["stage"]))
