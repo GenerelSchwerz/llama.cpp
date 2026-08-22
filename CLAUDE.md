@@ -6,6 +6,7 @@ keeps a small set of maintained extensions:
 - KVarN target-context KV-cache compression (`kvarn2` through `kvarn8`).
 - Low-bit standard KV cache types (`q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and
   `q6_1`).
+- Quantized-native CUDA MMA FlashAttention (`--flash-attn-native-quants`).
 - Profit-only adaptive draft depth for upstream `draft-dflash` speculation.
 - Server-side reasoning-loop protection.
 - KLD save/load support in `llama-perplexity` for KVarN validation.
@@ -41,10 +42,30 @@ hardware rather than reusing the `sm_86` artifact names.
 
 CUDA FlashAttention vector cache coverage has two build modes:
 
-- Default: 50 standard pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`,
-  `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's
-  internal q2 fallback type.
-- `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered standard vector pairs.
+- Default: 50 of the 169 ordered pairs over `f16`, `bf16`, `q8_0`, `q6_1`,
+  `q6_0`, `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the
+  fork's internal q2 fallback type: the two homogeneous float pairs plus the
+  48 quant pairs admitted by `ggml_cuda_get_fattn_vec_default_pairs` in
+  `ggml/CMakeLists.txt`, which is also asserted there. On the bit ladder
+  8-6-5-4-3-2, V sits at K's position or up to two below it, never above, and
+  at equal position a `_1` K may pair with a `_0` V but not the reverse.
+- `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered vector pairs.
+
+`--flash-attn-native-quants` lets the CUDA MMA FlashAttention kernel read a
+quantized K/V cache in place instead of casting it to F16 first, which removes
+the transient F16 copy of the attention window. It is off by default, output is
+unchanged, and it applies only where a native loader exists for the cache types
+and head dimension; every other case keeps the F16-casting path. K and V may be
+different types, and every ordered pair of native types has a kernel — 16 pairs
+in the default tier, 121 with `GGML_CUDA_FA_ALL_QUANTS` — so no quantized K/V
+combination falls back merely for being mixed. The vector pair matrix above is
+tiered separately and is narrower. The kernels are
+compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
+the option keeps the standard path and reports a warning. The cache type still
+comes exclusively from `--cache-type-k` and `--cache-type-v`; the native option
+does not select a second layout. See
+[`docs/quantized-native-flash-attention.md`](docs/quantized-native-flash-attention.md)
+for the exact kernel inventory, architecture, tradeoffs, and validation gates.
 
 There is no `GGML_CUDA_FA_HALF_QUANTS` tier. Fresh CMake caches omit KVarN.
 `-DGGML_CUDA_KVARN=ON` explicitly adds its kernels and 15 balanced fast-decode
