@@ -1221,6 +1221,13 @@ llama_kv_cache::llama_kv_cache(
                     spec.layer_id, ggml_backend_buft_name(k_buft)));
         }
         spec.buft = k_buft;
+        if (!gpu_window) {
+            // The tail probe must see the realized owner too. Outside the GPU
+            // window the tail always shares the owner of the tensor probed
+            // above, so refresh it here; the GPU window keeps its separate
+            // device tail buffer type, which is validated just above.
+            spec.tail_buft = k_buft;
+        }
 
         const bool k_meta = buft_is_meta(k_buft);
         const bool v_meta = buft_is_meta(v_buft);
