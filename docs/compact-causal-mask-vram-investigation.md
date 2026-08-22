@@ -2454,3 +2454,285 @@ end-to-end gain; the direct and 128K results show the added tail retirement's
 specific merit. The strongest remaining limitation is cross-generation GPU
 performance, which is still unmeasured and must not be inferred from SM120
 alone.
+
+## 2026-08-22: PR 11 toolkit inheritance and final interaction gates
+
+This section records the final PR validation and base refresh. The user first
+authorized one published source-history change: merge exact shared KV-offload tip
+`748c1df5bad4dae0d1f59f65997cc7e1f3f3125b` into the existing PR 7 history
+without rebasing or rewriting its causal commits. The resulting merge is
+`d71ddf93215be824dd3e4f7ef5c7551fbc32af37`, with parents `3fd817df9` and
+`748c1df5b`, and is published as the head of PR 7.
+
+### Base classification and source identity
+
+The previously tested shared base was
+`f6341a1572e54206a025bc376dd32958a5d33cbb`. The complete `f6341a..748c1d`
+delta consists of AGENTS/protocol documentation, the manifest-driven feature
+validation toolkit, its example manifest and tests, and CTest registration: 15
+paths and 7,336 insertions. Direct tree comparison found no change to PR 7's
+production, CUDA-kernel, public API, CLI, or build-option behavior. The
+non-document causal delta against the shared base retained SHA-256
+`3c4854dd89fcab72ad1c561da0be272cb1e045a5c0461ba632f53ffb4f5a1dbb`
+before and after the merge. It was therefore valid to retain the exact-source
+PPL, clean-process performance/resource, deterministic-output, VMM, and NCU
+evidence above rather than relabeling or repeating it.
+
+The inherited toolkit passed `py_compile`, its 64 Python unit tests, its
+focused CTest registration, and the eight adjacent static regressions. The
+merged Release CUDA/FA/native/SM120/KVarN-on configuration built
+`llama-server`, `llama-bench`, `llama-perplexity`, and `test-backend-ops` at no
+more than six parallel jobs. CPU and CUDA compact-versus-dense fixed-seed
+oracles each remained 4/4 bit-exact for `nb=1,3,17,65`. Cold CUDA compilation
+was serialized with `/tmp/beellama-cuda-build.lock`; GPU-linked tests and
+runners owned `/tmp/beellama-single-gpu.lock` for their complete lifecycles.
+
+The production fallback audit also remains source-proven. Compact construction
+in `build_attn_inp_kq_mask()` requires FlashAttention, offloaded attention,
+scheduler-wide backend support for the causal-prefix capability, and
+`can_use_compact_causal_mask()` layout proof. The latter rejects non-causal
+attention, ALiBi, SWA/tails, multiple streams/sequences, empty or malformed
+batches, explicit attention bias, nonmonotonic positions/cells, cache holes,
+wrong sequence ownership, and nonconsecutive physical writes. Failure of any
+condition constructs the established dense F16/F32 mask. KVarN's context
+returns false explicitly, so it also receives dense fallback. There is no
+public control, context threshold, model name, or architecture-name routing.
+
+### Same-geometry target-plus-MTP and merged live workspace
+
+The PR-owned interaction gate compared exact dense `748c1df5b` with compact
+`d71ddf932`, with the merged opt-in live-context workspace enabled equally on
+both sides. It used one-slot MTP6, `p_min=0.85`, fixed seed 1234,
+Q8_0/Q8_0 CPU-pinned target and draft caches, target and draft effective
+ubatch 512, full recurrent planes, phase-aware workspace off, and 1,000
+generated tokens. The entire exact runner invocation was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'python3 scripts/mtp-exactness.py \
+   tmp/pr7-validation-20260822/mtp-live-1k-manifest.json'
+```
+
+The manifest and each case's `server-command.txt` are the exact executable and
+argument record. Contract, prompt tokens, token stream, and content were exact.
+Dense and compact both made 470 draft attempts and accepted 428. Both output
+token SHA-256 values were
+`842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`;
+content SHA-256 was
+`41dd817295f51516f3750049cfe3ecd2b5de9ae0f4d08df7a58a1408318f3bb2`.
+
+| PR-owned MTP/live case | startup / peak VRAM | RssAnon / RssFile / RssShmem | VmHWM / VmRSS / VmLck |
+|---|---:|---:|---:|
+| dense `748c1d` | 14,704 / 14,736 MiB | 606,480 / 878,200 / 235,024 KiB | 14,551,004 / 1,719,704 / 0 KiB |
+| compact `d71d` | 14,704 / 14,734 MiB | 619,120 / 880,556 / 230,928 KiB | 14,553,616 / 1,730,604 / 0 KiB |
+
+The compact path saved 2 MiB at the sampled peak. CUDA-host compute remained
+fixed at 20.28 MiB for compact while dense grew from 20.53 to 22.28 MiB as the
+live reserve crossed 256/512/1,024/2,048 KV rows. Both sides reported the same
+target/draft capacity transitions. The one-process prompt/decode point values
+are not performance evidence; only exactness, attempts/accepts, topology, and
+resource telemetry are claimed from this screen.
+
+### Temporary canonical pool/growth interaction
+
+For interaction evidence only, the exact uncommitted production diffs from
+`/home/gencoolpc/beellama-kv-store-stage-pool` and
+`/home/gencoolpc/beellama-live-context-bounded-growth` were applied temporarily
+and identically to the dense and compact build sources. Their source diff
+SHA-256 values were
+`017c71898e54aef9ea0b8cc8047c233374fbed5c30daabcab0d9d6035b3107af`
+and `6ede48268965459654d922ea24c417473478573965b46497d7805bf59a673609`.
+Neither named worktree was modified. Both borrowed diffs were removed from PR
+7 afterward, and its tracked production files again match `d71ddf932` exactly.
+
+The same MTP/live gate was rerun under the whole-command GPU lock with:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'python3 scripts/mtp-exactness.py \
+   tmp/pr7-validation-20260822/mtp-combined-live-1k-manifest.json'
+```
+
+It again produced exact contract, prompt, 1,000-token stream, and content, with
+470 attempts and 428 accepts on both sides. Startup was 14,688 MiB for both;
+peak process VRAM was 14,720 MiB dense and 14,716 MiB compact. The single-run
+prompt/decode point values are not used as performance claims.
+
+One deeper interaction used a 97,697-token prompt at context capacity 140,000,
+followed by an independent fully reprocessed short next turn. The only enabled
+extras were the CPU-KV placement necessities, merged live-context workspace,
+and the two canonical staging/growth candidate sources. Phase-aware workspace,
+native-Q8 permission, speculation, and unrelated policies were absent. Exact
+commands reside in the manifest and case `server-command.txt` files; the
+whole-run command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'python3 scripts/mtp-exactness.py \
+   tmp/pr7-validation-20260822/combined-98k-manifest.json'
+```
+
+Both 64-token responses and content were exact. Long-turn token SHA-256 was
+`8dc2caa05af802d4e381119257cabe2e5917269a89b84e685635d5a5f95c4181`,
+next-turn SHA-256 was
+`0cb5eb25dd4a69ef1e8fd89cdfdd349c6c80449508e9a1c132964f5878715b51`,
+and aggregate SHA-256 was
+`e4875a1fda5fcfbfe6e73c0efec901c5cb890b29d41cebeccd7f277d00ebcfd0`.
+
+| 98K pool+growth+live case | startup / prefill peak / next-turn resident VRAM | peak RssAnon / RssFile / RssShmem | peak VmHWM / VmRSS / VmLck |
+|---|---:|---:|---:|
+| dense | 13,428 / 14,068 / 14,054 MiB | 735,584 / 916,472 / 4,892,452 KiB | 14,590,476 / 6,544,508 / 0 KiB |
+| compact | 13,428 / 13,982 / 13,968 MiB | 743,208 / 917,432 / 4,794,148 KiB | 14,590,556 / 6,454,788 / 0 KiB |
+
+Thus compact saved 86 MiB of process VRAM at both full-prefill peak and the
+next-turn resident sample. `RssShmem`, the page-locked CUDA-host mapping here,
+fell by exactly 98,304 KiB; ordinary anonymous RSS rose by 7,624 KiB and file
+RSS by 960 KiB. `VmLck=0` is recorded but is not treated as a CUDA pinned-memory
+counter. At the 98,304-row reserve, dense/compact device compute was
+764.27/678.27 MiB and CUDA-host compute was 116.28/20.28 MiB. Both reported the
+same 4,649.50 MiB CUDA-host KV buffer. The dense reserve took 96.724 ms over
+eight transitions versus 22.189 ms for compact, but this one pair does not
+establish a performance distribution. Prompt point values were 988.719 and
+1,005.344 token/s; decode point values were 11.1070 and 11.1482 token/s.
+
+This interaction run did not enable separate CUDA VMM instrumentation, so no
+new combined-source VMM claim is made. For exact PR-owned source, the already
+settled 128K evidence remains applicable: dense/compact device compute was
+1,042,342,784/918,348,672 B, CUDA-host compute was
+155,750,432/21,270,560 B, pinned KV was identical at 4,572,315,648 B, ordinary
+host context/compute was zero, and CUDA VMM live/mapped high-water was
+byte-identical at 14,632,960/14,680,064 B. The unchanged-source 240K load-only
+evidence remains a startup/resident result, not a prefill peak claim.
+
+### Matched quality after temporary composition
+
+The temporary three-feature composition received one fresh matched PPL pair,
+because this tested interaction quality rather than changing PR-owned source.
+Each binary ran as a separate whole command under the GPU lock with this exact
+argument shape (substitute the dense or compact build path):
+
+```bash
+{build}/bin/llama-perplexity \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -f /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+  -c 4096 -b 512 -ub 256 --chunks 4 -t 3 -tb 24 \
+  --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  -ngl 999 -sm none -mg 0 --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers 0 --no-phase-aware-workspace --live-context-workspace \
+  --cache-type-k q8_0 --cache-type-v q8_0
+```
+
+Dense and compact printed the exact same chunk sequence
+`1.9315, 2.1279, 2.2498, 2.1674` and final
+`PPL = 2.1674 +/- 0.03849`. Log SHA-256 values are
+`61e4ea65852aed4d31dda2beb36ade54c3f746ac624609159e12cf6a7897414b`
+and `50f1e0f5bec42903d5a8c20f7c0c4ffa43d3d4549da1f6ef796aa2bc073f0f14`.
+There is no PPL increase.
+
+No profiler was launched for these gates. The PR-owned CUDA consumer and its
+stable long-context effect were already directly profiled above. The two
+temporary candidates change host-side staging ownership and reserve growth,
+not the compact consumer kernel; exact interaction output and non-regressive
+single-pair points exposed no new stable kernel question. Profiling would not
+have been timed evidence.
+
+### Artifacts and restoration
+
+All new artifacts are under `tmp/pr7-validation-20260822`. Its 126-file
+`SHA256SUMS` has SHA-256
+`8f2f0ddec5bed15cca6eed7a0612a386045f87206053c17b105f471be4617db5`.
+The principal manifest/provenance/summary/comparison hashes are:
+
+| gate | manifest | provenance | summary | comparisons |
+|---|---|---|---|---|
+| PR-owned MTP/live | `e3482af6...` | `5d9129f0...` | `9f51b92e...` | `eafef1fc...` |
+| combined MTP/live | `67c444ed...` | `98905f87...` | `f3262d7b...` | `96015dad...` |
+| combined 98K | `23580e21...` | `2a818ce0...` | `6f263e03...` | `c9dd3298...` |
+
+After restoring exact PR-owned source, the KVarN-off compact build was relinked
+under `/tmp/beellama-cuda-build.lock`. Its `llama-server`, `llama-bench`,
+`llama-perplexity`, `libllama.so`, `libggml-cuda.so`, and CMake cache SHA-256
+values are respectively `6c1aec47...`, `99013935...`, `43c86f0f...`,
+`b7bc98a7...`, `91bb0b23...`, and `12eee7b2...`; these match the accepted PR
+source rather than the temporary interaction build.
+
+### Exact `775450a6` policy refresh
+
+At the first publication checkpoint, PR 7 was open, draft, cleanly mergeable,
+based at `748c1df5b`, and headed by `d71ddf932`; its labeler check passed. The
+remote base then advanced to
+`775450a688437e8e9d32bb77ae466f7acb5d3577`, commit `build: make KVarN
+compilation explicitly opt-in`. A later authorization closed that one-commit
+gap with merge `aa6532b68c1e4b15bbd05d8f0aadef36c4979f9d`, whose parents are exact old
+head `d71ddf932` and exact new base `775450a68`. Published causal commits were
+not rewritten.
+
+The incoming delta changes KVarN's fresh-cache CMake default, configure
+messages, policy documentation, and two static tests. It changes no `.cpp`,
+`.cu`, or `.cuh` runtime implementation. The only path modified on both sides
+was `ggml/src/ggml-cuda/CMakeLists.txt`; it merged automatically. Relative to
+the new base, that file differs by exactly PR 7's existing
+`add_compile_definitions(GGML_CUDA_COMPACT_CAUSAL_MASK)` line. The root
+`ggml/CMakeLists.txt` is byte-identical to the new base. A per-path blob audit
+found every other causal production source identical to `d71ddf932`; its log
+SHA-256 is
+`9e723703d19920ce71384184c7d4d8a151c9a7bef1a95e7a04759f983437acd0`.
+
+Three fresh configuration directories used Release, CUDA/FA on, explicit
+SM120, native/NCCL/tests/examples/server/tools off, and no optional causal
+feature controls. The default case omitted `GGML_CUDA_KVARN`; the other two
+set it explicitly. All configuration compiler probes ran serially under
+`/tmp/beellama-cuda-build.lock`:
+
+| fresh build graph | cache values | native / portable / fast-decode KVarN sources | configure output |
+|---|---|---:|---|
+| default | `KVARN=OFF`, `ALL_QUANTS=OFF` | 0 / 0 / 0 | `OFF (minimal fresh-cache default)` |
+| explicit default tier | `KVARN=ON`, `ALL_QUANTS=OFF` | 2 / 17 / 15 | `ON (15 fast-decode pairs)` |
+| explicit expanded tier | `KVARN=ON`, `ALL_QUANTS=ON` | 2 / 17 / 36 | `ON (36 fast-decode pairs)` |
+
+The graph-count record SHA-256 is
+`fa6378e9daaedb38645297f7402dae029a4286512c4352ce19e1ff1522d978af`.
+Default/15/36 configure-log SHA-256 values are respectively
+`e235b9ed48806877d0a51b936b204de3d02e7047ac4c8242fa7fae7323e59848`,
+`527968060df48718b4172c049957b90ed7c5e1682fbceedc66bf3e8bfa08dbd2`,
+and `93694ec904256ed42120f86eca5083c67a61b9a715ca5e391d2be11afd475073`.
+
+The existing isolated performance build was then reconfigured explicitly with
+KVarN and all-quants off. Only the route/vector policy targets were requested,
+at `--parallel 6`, under the CUDA build lock. The whole focused CTest process
+ran under `/tmp/beellama-single-gpu.lock`:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'ctest --test-dir build-compact-fast-screen-cuda --output-on-failure \
+   -R "^(test-cuda-fattn-route-policy|test-cuda-fattn-vec-policy|test-std-kv-tail-static|test-fattn-vec-dispatch-generated)$"'
+```
+
+All four tests passed. Configure, build, and CTest log SHA-256 values are
+`990a8e097f1b84411a3e2f8b4740541245a9e38def1d12c12d0abfe16e5bb4cd`,
+`f6154efbd9b2d49511d2bce4537cbde982715a41d1be5544ae58cd6ce6a40e6e`,
+and `352ef4ee33bc9891556ffb1ec7f138298015a5cc7b0d995657e8d2a2f1260134`.
+No CUDA device object was recompiled: the relevant object mtimes remain from
+the accepted pre-refresh build. The relinked `libggml-cuda.so` and
+`libllama.so` remain byte-identical at
+`91bb0b23abb604178f13c2da2ffdac9aa0c033d32ebeea9fe7b1e2848127d5ee`
+and `b7bc98a79d7a6bd8d40ab0f8fb45b50488fed2ba92d2a21e351d437490ee31c2`.
+The CMake cache hash changed, as expected, because it now records the inherited
+policy text/configuration; this is not a runtime-object change.
+
+The 98K/128K, MTP, PPL, NCU, and NSYS campaigns were not repeated. Their exact
+runtime sources and KVarN-off runtime libraries are unchanged, so another run
+would duplicate settled evidence. Refresh artifacts are under
+`tmp/pr7-refresh-775450a6`; the pre-merge ledger copy and patch remain there as
+recovery evidence.
+
+The evidence disposition remains positive for the tested SM120 hardware:
+exact quality/output, positive repeated 4K/30K/128K decode, neutral production
+prefill, depth-scaled device-memory savings, safe dense fallback, exact MTP
+attempts/accepts, merged-live composition, and clean interaction with both
+named future candidates. Cross-generation performance remains unmeasured, but
+the exact current base is now inherited and its default-off/explicit-on CUDA
+policy is verified. No remaining validation result requires PR 7 to stay
+draft; draft removal is appropriate once the pushed head is cleanly mergeable
+and its remote checks pass.
