@@ -40,15 +40,17 @@ PYTHONWARNINGS=error::ResourceWarning \
   python3 scripts/test-feature-validation.py -v
 ```
 
-Result after the implementation/test commits: 31 tests passed in 8.379 seconds.
-The tests use temporary Git
+Merge-readiness result: 44 tests passed in 8.334 seconds with
+`ResourceWarning` promoted to an error. The tests use temporary Git
 repositories, fake direct binaries, fake NVIDIA XML streams, fake profiler
 JSONL, and fake NSYS SQLite. They cover safe quoting, zero/one option arity,
-`--no-kv-offload` misuse, fail-closed provenance, workload-only selectors,
+common-versus-`llama-bench` `--no-kv-offload` arity, fail-closed provenance,
+same-size/mtime-restored identity changes, workload-only selectors,
 controlled A/B settings, balanced fresh processes, three-to-five adaptive
 repetition, all raw paired statistics, persistent telemetry cleanup and
-contamination, profiler discovery/filters, resume, preserved failed attempts,
-and taskset/wrapper rejection.
+contamination, executed-versus-passed acceptance states, explicit NSYS
+graph-node support/capture checks, post-NCU report/count/shape verification,
+resume, preserved failed attempts, and taskset/wrapper rejection.
 
 CTest registration was checked without compiling a production target:
 
@@ -60,9 +62,69 @@ ctest --test-dir build-tools-validation \
   -R '^test-feature-performance-validation$' --output-on-failure
 ```
 
-Result after the implementation/test commits: 1/1 test passed in 8.50 seconds.
+Final result: 1/1 test passed in 8.38 seconds with `ResourceWarning` promoted
+to an error.
 No build was launched; therefore no
 parallel build wider than `-j6` occurred.
+
+## Merge-readiness checkpoint
+
+The coordinator review points are resolved as follows:
+
+- every performance stage has an explicit acceptable-decision policy;
+  `execution_status=completed` is separate from
+  `status=passed|failed|unresolved`, and regression/inconclusive final-gate
+  tests prove neither can emit `acceptance_complete`;
+- graph-capable profiling explicitly requests NSYS graph-node tracing, checks
+  exact-tool help/version support, and requires nonzero graph-node IDs in the
+  export;
+- the separate NCU report is required, hashed, re-imported, and checked for
+  discovery-derived kernel, unique capture count, and available shapes;
+  missing fields are unverifiable and cross-process launch order is never
+  assumed stable;
+- the local source-backed arity schema treats common-tool
+  `-nkvo`/`--no-kv-offload` as bare and both `llama-bench` spellings as valued;
+- large identity files are hashed once per fresh/resumed provenance capture,
+  while every child checks size, mtime, ctime, device, and inode; a test changes
+  content at the same size and restores mtime and confirms ctime fails closed;
+- duplicate identity-spec and GPU-lock launcher implementations and the legacy
+  single-executable manifest form were removed. The remaining modules have
+  one contract each: CLI orchestration, manifest/provenance/statistics,
+  lifecycle/state, telemetry ownership, and profiler parsing/planning.
+
+Read-only host capability verification used:
+
+```bash
+nsys profile --help=cuda
+nsys --version
+ncu --help
+ncu --version
+```
+
+The installed NSYS 2026.1.3 advertised `--cuda-graph-trace` with node
+granularity, and the toolkit capability check returned `status=supported` for
+`node:host-only`. NCU 2026.2.1 advertised graph-node profiling, report import,
+raw-page CSV, demangled print names, and kernel-name filtering. No profiler
+capture was claimed from these read-only checks.
+
+### Early-screen overhead
+
+A temporary clean Git fixture ran the complete fresh early ladder with all
+early stages marked `resource=gpu`. The target itself was the tiny fake direct
+binary; GPU integration here means the real flock/telemetry/clean-process
+lifecycle, not a CUDA performance result. The invocation promoted
+`ResourceWarning` to an error and preserved visible output in
+`/tmp/beellama-fperf-overhead-review.log`.
+
+Result: 32/32 separately locked processes passed in 38.932 seconds, inside the
+30-90 second target. All 32 persistent samplers were reaped, all clean-process
+checks passed, and the run retained 32 GPU XML plus 64 proc samples. Aggregate
+target time was 1.221 seconds; sampler startup was 3.383 seconds (about 0.106
+seconds/run on this host); per-run identity checks were 0.198 seconds; initial
+full provenance preparation was 0.064 seconds; and honest wall-minus-target
+overhead was 37.711 seconds. The runner now records locked-wrapper timing too,
+so future studies can separate lock/interpreter launch from in-executor time.
+No unmeasured cause is assigned to the remaining orchestration time.
 
 ## Small real-GPU integration smoke
 

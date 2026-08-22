@@ -142,6 +142,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
       "progress": "llama-bench --progress",
       "selection": {
         "workload": "prefill",
@@ -157,12 +162,12 @@
           "-b", "512", "-ub", "256", "-t", "1", "-C", "0x7", "--cpu-strict", "1", "--progress"
         ],
         "baseline_args": [],
-        "candidate_args": ["--no-kv-offload"],
+        "candidate_args": ["--no-kv-offload", "1"],
         "cli_schema": {"builtin": "llama", "allow_positionals": false},
         "controlled_delta": {
           "reason": "the preregistered feature toggle is the only runtime difference",
           "baseline_args": [],
-          "candidate_args": ["--no-kv-offload"],
+          "candidate_args": ["--no-kv-offload", "1"],
           "baseline_environment": {},
           "candidate_environment": {},
           "allowed_options": ["--no-kv-offload"],
@@ -182,6 +187,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
       "progress": "llama-bench --progress",
       "selection": {
         "workload": "decode",
@@ -198,12 +208,12 @@
           "-b", "512", "-ub", "256", "-t", "1", "-C", "0x7", "--cpu-strict", "1", "--progress"
         ],
         "baseline_args": [],
-        "candidate_args": ["--no-kv-offload"],
+        "candidate_args": ["--no-kv-offload", "1"],
         "cli_schema": {"builtin": "llama", "allow_positionals": false},
         "controlled_delta": {
           "reason": "the preregistered feature toggle is the only runtime difference",
           "baseline_args": [],
-          "candidate_args": ["--no-kv-offload"],
+          "candidate_args": ["--no-kv-offload", "1"],
           "baseline_environment": {},
           "candidate_environment": {},
           "allowed_options": ["--no-kv-offload"],
@@ -223,6 +233,11 @@
       "resource": "gpu",
       "timeout_seconds": 20,
       "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
       "progress": "llama-bench --progress and one runner line per low/mid/high screen",
       "selection": {
         "workload": "prefill",
@@ -237,12 +252,12 @@
           "-t", "1", "-C", "0x7", "--cpu-strict", "1", "--progress"
         ],
         "baseline_args": [],
-        "candidate_args": ["--no-kv-offload"],
+        "candidate_args": ["--no-kv-offload", "1"],
         "cli_schema": {"builtin": "llama", "allow_positionals": false},
         "controlled_delta": {
           "reason": "the preregistered feature toggle is the only runtime difference",
           "baseline_args": [],
-          "candidate_args": ["--no-kv-offload"],
+          "candidate_args": ["--no-kv-offload", "1"],
           "baseline_environment": {},
           "candidate_environment": {},
           "allowed_options": ["--no-kv-offload"],
@@ -268,6 +283,11 @@
       "resource": "gpu",
       "timeout_seconds": 45,
       "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
       "progress": "llama-bench --progress",
       "selection": {
         "workload": "decode",
@@ -283,12 +303,12 @@
           "-b", "512", "-ub", "256", "-t", "1", "-C", "0x7", "--cpu-strict", "1", "--progress"
         ],
         "baseline_args": [],
-        "candidate_args": ["--no-kv-offload"],
+        "candidate_args": ["--no-kv-offload", "1"],
         "cli_schema": {"builtin": "llama", "allow_positionals": false},
         "controlled_delta": {
           "reason": "the preregistered feature toggle is the only runtime difference",
           "baseline_args": [],
-          "candidate_args": ["--no-kv-offload"],
+          "candidate_args": ["--no-kv-offload", "1"],
           "baseline_environment": {},
           "candidate_environment": {},
           "allowed_options": ["--no-kv-offload"],
@@ -308,6 +328,11 @@
       "resource": "gpu",
       "timeout_seconds": 1800,
       "mandatory": true,
+      "decision_policy": {
+        "acceptable_decisions": ["improvement", "equivalent"],
+        "regression": "fail",
+        "inconclusive_after_maximum": "unresolved_fail"
+      },
       "progress": "llama-bench --progress",
       "selection": {
         "workload": "decode",
@@ -324,12 +349,12 @@
           "-b", "512", "-ub", "256", "-t", "1", "-C", "0x7", "--cpu-strict", "1", "--progress"
         ],
         "baseline_args": [],
-        "candidate_args": ["--no-kv-offload"],
+        "candidate_args": ["--no-kv-offload", "1"],
         "cli_schema": {"builtin": "llama", "allow_positionals": false},
         "controlled_delta": {
           "reason": "the preregistered feature toggle is the only runtime difference",
           "baseline_args": [],
-          "candidate_args": ["--no-kv-offload"],
+          "candidate_args": ["--no-kv-offload", "1"],
           "baseline_environment": {},
           "candidate_environment": {},
           "allowed_options": ["--no-kv-offload"],
@@ -351,6 +376,11 @@
     "variant": "candidate",
     "screen": "default",
     "timeout_seconds": 300,
+    "cuda_graph_trace": {
+      "applicability": "required",
+      "granularity": "node",
+      "launch_origin": "host-only"
+    },
     "selector": {
       "kernel_regex": "replace-with-discovered-production-kernel-regex",
       "graph_only": true

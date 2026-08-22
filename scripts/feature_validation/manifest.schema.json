@@ -85,7 +85,7 @@
     "profiler": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["pattern", "profile_repetitions", "stage", "variant", "selector"],
+      "required": ["pattern", "profile_repetitions", "stage", "variant", "selector", "cuda_graph_trace"],
       "properties": {
         "pattern": { "const": "one_nsys_discovery_then_one_filtered_ncu" },
         "profile_repetitions": { "const": 1 },
@@ -102,6 +102,29 @@
             "grid": { "$ref": "#/$defs/shape" },
             "block": { "$ref": "#/$defs/shape" }
           }
+        },
+        "cuda_graph_trace": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["applicability", "granularity", "launch_origin"],
+              "properties": {
+                "applicability": { "const": "required" },
+                "granularity": { "const": "node" },
+                "launch_origin": { "enum": ["host-only", "host-and-device"] }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["applicability", "reason"],
+              "properties": {
+                "applicability": { "const": "not_applicable" },
+                "reason": { "type": "string", "minLength": 1 }
+              }
+            }
+          ]
         },
         "metrics": {
           "type": "array",
@@ -315,6 +338,21 @@
         "group": { "type": ["integer", "string"] }
       }
     },
+    "decisionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["acceptable_decisions", "regression", "inconclusive_after_maximum"],
+      "properties": {
+        "acceptable_decisions": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["improvement", "equivalent"] }
+        },
+        "regression": { "const": "fail" },
+        "inconclusive_after_maximum": { "const": "unresolved_fail" }
+      }
+    },
     "shape": {
       "type": "array",
       "minItems": 3,
@@ -344,6 +382,7 @@
           }
         },
         "metric": { "$ref": "#/$defs/metric" },
+        "decision_policy": { "$ref": "#/$defs/decisionPolicy" },
         "comparison": {
           "type": "object",
           "required": ["mode"],

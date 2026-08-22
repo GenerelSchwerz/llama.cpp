@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 from feature_validation import core, profiler
-from feature_validation.runner import StudyRunner, execute_run_spec
+from feature_validation.runner import StudyRunner, execute_run_spec, launch_locked_spec
 
 
 TOOL_SCRIPT = pathlib.Path(__file__).resolve()
@@ -24,42 +24,6 @@ def _load_spec(path: pathlib.Path) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise core.ValidationError("run spec must be a schema_version 1 object")
     return value
-
-
-def _identity_files(provenance: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    files: dict[str, dict[str, Any]] = {}
-    sources: list[dict[str, str]] = []
-    for variant in provenance["variants"].values():
-        for executable in variant["executables"].values():
-            binary = executable["binary"]
-            files[binary["resolved_path"]] = {
-                "path": binary["resolved_path"],
-                **{key: binary[key] for key in ("sha256", "size", "mtime_ns", "device", "inode")},
-                "rehash": True,
-            }
-            for library in binary.get("libraries", []):
-                files[library["path"]] = {"path": library["path"], **library}
-            if executable["build"].get("cache"):
-                build = executable["build"]
-                files[build["cache"]] = {
-                    "path": build["cache"],
-                    "sha256": build["cache_sha256"],
-                    **build["cache_stat"],
-                }
-        source = variant["source"]
-        sources.append(
-            {
-                "root": source["root"],
-                "head": source["head"],
-                "dirty_fingerprint": source["dirty_fingerprint"],
-            }
-        )
-    for item in provenance["inputs"]:
-        files[item["path"]] = {
-            "path": item["path"],
-            **{key: item[key] for key in ("sha256", "size", "mtime_ns", "device", "inode")},
-        }
-    return ([files[key] for key in sorted(files)], sources)
 
 
 def _tool_identity(name: str) -> dict[str, Any]:
@@ -73,33 +37,6 @@ def _tool_identity(name: str) -> dict[str, Any]:
         **core.stat_identity(path),
         "rehash": True,
     }
-
-
-def _launch_locked(spec: dict[str, Any], spec_path: pathlib.Path) -> dict[str, Any]:
-    result_path = pathlib.Path(spec["result_path"])
-    if spec_path.exists() or result_path.exists():
-        raise core.ValidationError(
-            f"refusing to overwrite an existing profiler attempt: {spec_path} / {result_path}"
-        )
-    inner = [sys.executable, str(TOOL_SCRIPT), "_execute-run", str(spec_path)]
-    wrapper = core.flock_argv(inner)
-    spec["gpu_lock"] = {
-        "path": core.GPU_LOCK,
-        "whole_command_argv": wrapper,
-        "whole_command": core.quote_argv(wrapper),
-        "inner_lifecycle": "telemetry preflight, direct profiler lifecycle, telemetry cleanup",
-    }
-    core.write_json_atomic(spec_path, spec)
-    print(f"[feature-validation] launch {core.quote_argv(wrapper)}", flush=True)
-    completed = subprocess.run(wrapper, check=False)
-    if not result_path.is_file():
-        raise core.ValidationError(
-            f"locked profiler command returned {completed.returncode} without result artifact"
-        )
-    result = json.loads(result_path.read_text(encoding="utf-8"))
-    if result.get("status") != "success":
-        raise core.ValidationError(f"profiler command failed: {result.get('error')}")
-    return result
 
 
 def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) -> dict[str, Any]:
@@ -130,7 +67,13 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
             raise core.ProvenanceError("profile resume manifest identity mismatch")
         if state.get("provenance_identity_fingerprint") != provenance["identity_fingerprint"]:
             raise core.ProvenanceError("profile resume provenance identity mismatch")
-        if state.get("ncu_executed") or not execute_ncu:
+        if state.get("ncu_executed"):
+            if state.get("ncu_verification_status") != "verified":
+                raise core.ValidationError(
+                    "the preserved NCU capture is failed or unverifiable; start a new profile identity"
+                )
+            return json.loads(plan_path.read_text(encoding="utf-8"))
+        if not execute_ncu and state.get("ncu_plan_completed"):
             return json.loads(plan_path.read_text(encoding="utf-8"))
     else:
         if resume:
@@ -146,6 +89,7 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
             "nsys_discovery_completed": False,
             "ncu_plan_completed": False,
             "ncu_executed": False,
+            "ncu_verification_status": "not_executed",
         }
         core.write_json_atomic(profile_root / "provenance.json", provenance)
         core.write_json_atomic(state_path, state)
@@ -169,14 +113,46 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
         executable_role
     ].get("direct_harness")
     profiler.validate_native_affinity(target_argv, direct_harness)
-    identity_files, source_identities = _identity_files(provenance)
+    identity_files, source_identities = core.provenance_identity_spec(provenance)
+    nvidia_smi_identity = provenance.get("runtime_tools", {}).get("nvidia-smi")
+    nvidia_smi = nvidia_smi_identity["path"] if nvidia_smi_identity else "nvidia-smi"
 
     sqlite_path = profile_root / "discovery.sqlite"
     if not state["nsys_discovery_completed"]:
         nsys_identity = _tool_identity("nsys")
+        nsys_help = core.command_capture(
+            [nsys_identity["path"], "profile", "--help=cuda"]
+        )
+        nsys_version = core.command_capture([nsys_identity["path"], "--version"])
+        if (
+            nsys_help.get("returncode") != 0
+            and config["cuda_graph_trace"]["applicability"] == "required"
+        ):
+            raise core.ValidationError(
+                f"cannot inspect NSYS CUDA tracing support: {nsys_help.get('stderr', nsys_help.get('error'))}"
+            )
+        graph_capability = profiler.verify_nsys_graph_trace_capability(
+            config["cuda_graph_trace"],
+            help_text=str(nsys_help.get("stdout", "")) + str(nsys_help.get("stderr", "")),
+            version_text=str(nsys_version.get("stdout", "")) + str(nsys_version.get("stderr", "")),
+        )
+        core.write_json_atomic(
+            profile_root / "nsys-graph-trace-capability.json",
+            {
+                **graph_capability,
+                "help_command": nsys_help,
+                "version_command": nsys_version,
+            },
+        )
         identity_files_with_nsys = [*identity_files, nsys_identity]
         prefix = profile_root / "discovery"
-        nsys_argv = profiler.nsys_discovery_argv(target_argv, prefix, direct_harness)
+        nsys_argv = profiler.nsys_discovery_argv(
+            target_argv,
+            prefix,
+            direct_harness,
+            cuda_graph_trace=config["cuda_graph_trace"],
+            nsys_executable=nsys_identity["path"],
+        )
         spec_path = profile_root / "nsys-run-spec.json"
         spec = {
             "schema_version": 1,
@@ -193,14 +169,18 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
             "stderr_path": str(profile_root / "nsys-stderr.log"),
             "identity_files": identity_files_with_nsys,
             "source_identities": source_identities,
+            "nvidia_smi_identity": nvidia_smi_identity,
+            "nvidia_smi": nvidia_smi,
             "host_load_before": core.host_load_snapshot(),
         }
-        _launch_locked(spec, spec_path)
+        result = launch_locked_spec(spec, spec_path, TOOL_SCRIPT)
+        if result.get("status") != "success":
+            raise core.ValidationError(f"NSYS command failed: {result.get('error')}")
         report_path = prefix.with_suffix(".nsys-rep")
         if not report_path.is_file():
             raise core.ValidationError(f"NSYS report is missing: {report_path}")
         export_argv = [
-            "nsys",
+            nsys_identity["path"],
             "export",
             "--type",
             "sqlite",
@@ -228,6 +208,9 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
         core.write_json_atomic(state_path, state)
 
     discovery = profiler.parse_discovery(sqlite_path)
+    discovery["graph_node_verification"] = profiler.verify_graph_node_discovery(
+        discovery, config["cuda_graph_trace"]
+    )
     core.write_json_atomic(profile_root / "discovery-inventory.json", discovery)
     plan = profiler.build_ncu_plan(
         discovery,
@@ -247,7 +230,7 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
 
     if execute_ncu and not state["ncu_executed"]:
         ncu_identity = _tool_identity("ncu")
-        command = plan["command"]["direct_argv"]
+        command = [ncu_identity["path"], *plan["command"]["direct_argv"][1:]]
         spec_path = profile_root / "ncu-run-spec.json"
         spec = {
             "schema_version": 1,
@@ -264,11 +247,60 @@ def _profile(manifest_path: pathlib.Path, *, resume: bool, execute_ncu: bool) ->
             "stderr_path": str(profile_root / "ncu-stderr.log"),
             "identity_files": [*identity_files, ncu_identity],
             "source_identities": source_identities,
+            "nvidia_smi_identity": nvidia_smi_identity,
+            "nvidia_smi": nvidia_smi,
             "host_load_before": core.host_load_snapshot(),
         }
-        _launch_locked(spec, spec_path)
+        result = launch_locked_spec(spec, spec_path, TOOL_SCRIPT)
+        if result.get("status") != "success":
+            raise core.ValidationError(f"NCU command failed: {result.get('error')}")
         state["ncu_executed"] = True
+        report_path = pathlib.Path(plan["command"]["report_path"])
+        verification: dict[str, Any]
+        if not report_path.is_file() or report_path.stat().st_size == 0:
+            verification = {
+                "status": "unverifiable",
+                "issues": [f"NCU report is missing or empty: {report_path}"],
+                "report_path": str(report_path),
+            }
+        else:
+            import_argv = [
+                ncu_identity["path"],
+                "--import",
+                str(report_path),
+                "--csv",
+                "--page",
+                "raw",
+                "--print-kernel-base",
+                "demangled",
+            ]
+            imported = core.command_capture(import_argv, cwd=profile_root, timeout=120.0)
+            if imported.get("returncode") != 0:
+                verification = {
+                    "status": "unverifiable",
+                    "issues": ["NCU report import failed"],
+                }
+            else:
+                parsed = profiler.parse_ncu_raw_csv(
+                    str(imported.get("stdout", "")) + "\n" + str(imported.get("stderr", ""))
+                )
+                verification = profiler.verify_ncu_capture(plan, parsed)
+                verification["parsed_export"] = parsed
+            verification.update(
+                {
+                    "report_path": str(report_path),
+                    "report_sha256": core.sha256_file(report_path),
+                    "report_size": report_path.stat().st_size,
+                    "import_command": imported,
+                }
+            )
+        core.write_json_atomic(profile_root / "ncu-verification.json", verification)
+        state["ncu_verification_status"] = verification["status"]
         core.write_json_atomic(state_path, state)
+        if verification["status"] != "verified":
+            raise core.ValidationError(
+                f"NCU capture is {verification['status']}: {verification.get('issues')}"
+            )
     return plan
 
 

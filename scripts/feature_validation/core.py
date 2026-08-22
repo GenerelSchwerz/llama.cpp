@@ -16,6 +16,7 @@ import pathlib
 import platform
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 from typing import Any, Iterable
@@ -84,7 +85,7 @@ IMMUTABLE_AB_OPTIONS = {
 
 # This is deliberately a validation schema, not an invocation generator.  A
 # manifest may extend it with explicit option arities for a local harness.
-LLAMA_OPTION_ARITY: dict[str, int] = {
+LLAMA_COMMON_OPTION_ARITY: dict[str, int] = {
     "-m": 1,
     "--model": 1,
     "-p": 1,
@@ -122,7 +123,7 @@ LLAMA_OPTION_ARITY: dict[str, int] = {
     "--cache-type-k": 1,
     "-ctv": 1,
     "--cache-type-v": 1,
-    "-nkvo": 1,
+    "-nkvo": 0,
     "--kv-offload": 0,
     "--no-kv-offload": 0,
     "--kv-cpu-pinned": 0,
@@ -161,6 +162,14 @@ LLAMA_OPTION_ARITY: dict[str, int] = {
     "--host": 1,
     "--port": 1,
     "--alias": 1,
+}
+
+# llama-bench has its own argument parser.  Unlike common_arg, both of its
+# no-KV-offload spellings consume an explicit 0/1 value.
+LLAMA_BENCH_OPTION_ARITY = {
+    **LLAMA_COMMON_OPTION_ARITY,
+    "-nkvo": 1,
+    "--no-kv-offload": 1,
 }
 
 
@@ -205,6 +214,7 @@ def stat_identity(path: pathlib.Path) -> dict[str, int]:
     return {
         "size": observed.st_size,
         "mtime_ns": observed.st_mtime_ns,
+        "ctime_ns": observed.st_ctime_ns,
         "device": observed.st_dev,
         "inode": observed.st_ino,
     }
@@ -308,12 +318,30 @@ def validate_direct_target(
             raise ManifestError("direct-harness source paths must be absolute")
 
 
-def option_arities(schema: dict[str, Any] | None) -> tuple[dict[str, int], bool, int | None]:
+def option_arities(
+    schema: dict[str, Any] | None,
+    target_executable: str | pathlib.Path | None = None,
+) -> tuple[dict[str, int], bool, int | None]:
     schema = schema or {"builtin": "llama", "allow_positionals": False}
     builtin = schema.get("builtin", "llama")
     if builtin not in ("llama", "none"):
         raise ManifestError(f"unknown CLI schema builtin {builtin!r}")
-    options = dict(LLAMA_OPTION_ARITY if builtin == "llama" else {})
+    if builtin == "llama":
+        if target_executable is None:
+            options = dict(LLAMA_COMMON_OPTION_ARITY)
+        else:
+            target_name = pathlib.Path(str(target_executable)).name
+            if target_name == "llama-bench":
+                options = dict(LLAMA_BENCH_OPTION_ARITY)
+            elif re.fullmatch(r"llama-(server|cli|perplexity)", target_name):
+                options = dict(LLAMA_COMMON_OPTION_ARITY)
+            else:
+                raise ManifestError(
+                    f"builtin llama CLI schema cannot identify target {target_name!r}; "
+                    "use builtin=none with explicit option arities for a harness"
+                )
+    else:
+        options = {}
     for option, raw_arity in schema.get("options", {}).items():
         arity = int(raw_arity)
         if arity not in (0, 1):
@@ -326,9 +354,13 @@ def option_arities(schema: dict[str, Any] | None) -> tuple[dict[str, int], bool,
     return options, allow_unknown, 0
 
 
-def validate_argv(argv: list[str], schema: dict[str, Any] | None = None) -> None:
+def validate_argv(
+    argv: list[str],
+    schema: dict[str, Any] | None = None,
+    target_executable: str | pathlib.Path | None = None,
+) -> None:
     reject_forbidden_tokens(argv)
-    options, allow_unknown, positional_limit = option_arities(schema)
+    options, allow_unknown, positional_limit = option_arities(schema, target_executable)
     positionals = 0
     index = 0
     while index < len(argv):
@@ -363,9 +395,13 @@ def validate_argv(argv: list[str], schema: dict[str, Any] | None = None) -> None
         index += 1
 
 
-def option_names(argv: list[str], schema: dict[str, Any] | None = None) -> list[str]:
+def option_names(
+    argv: list[str],
+    schema: dict[str, Any] | None = None,
+    target_executable: str | pathlib.Path | None = None,
+) -> list[str]:
     """Return option names while respecting arity, so negative values are values."""
-    options, allow_unknown, _ = option_arities(schema)
+    options, allow_unknown, _ = option_arities(schema, target_executable)
     names: list[str] = []
     index = 0
     while index < len(argv):
@@ -450,22 +486,10 @@ def _validate_repetitions(manifest: dict[str, Any]) -> None:
 
 
 def variant_executables(variant: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """Normalize a variant's executable roles (legacy single role is useful in tests)."""
-    if "executables" in variant:
-        executables = variant["executables"]
-        if not isinstance(executables, dict) or not executables:
-            raise ManifestError("variant executables must be a non-empty role object")
-        return executables
-    if variant.get("executable"):
-        return {
-            "default": {
-                "path": variant["executable"],
-                "expected_sha256": variant.get("expected_sha256"),
-                "build": variant.get("build"),
-                "direct_harness": variant.get("direct_harness"),
-            }
-        }
-    raise ManifestError("variant requires executable roles")
+    executables = variant.get("executables")
+    if not isinstance(executables, dict) or not executables:
+        raise ManifestError("variant executables must be a non-empty role object")
+    return executables
 
 
 def validate_manifest(manifest: dict[str, Any]) -> None:
@@ -608,17 +632,25 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
         if command.get("cli_schema", {}).get("allow_unknown_options", False):
             raise ManifestError("allow_unknown_options is not fail-closed; declare every option arity")
         executable_role = str(command.get("executable_role", "default"))
+        target_paths: dict[str, str] = {}
         for variant_name, variant in variants.items():
             if executable_role not in variant_executables(variant):
                 raise ManifestError(
                     f"stage {stage_id!r} executable role {executable_role!r} is absent from {variant_name}"
                 )
+            target_paths[variant_name] = str(
+                variant_executables(variant)[executable_role]["path"]
+            )
         common_args = [str(value) for value in command.get("common_args", [])]
         baseline_args = [str(value) for value in command.get("baseline_args", [])]
         candidate_args = [str(value) for value in command.get("candidate_args", [])]
         for variant_name in ("baseline", "candidate"):
             delta = baseline_args if variant_name == "baseline" else candidate_args
-            validate_argv(common_args + delta, command.get("cli_schema"))
+            validate_argv(
+                common_args + delta,
+                command.get("cli_schema"),
+                target_paths[variant_name],
+            )
         baseline_environment = {
             str(key): str(value) for key, value in command.get("baseline_environment", {}).items()
         }
@@ -638,8 +670,20 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             ) != candidate_environment:
                 raise ManifestError("controlled_delta must reproduce exact baseline/candidate environments")
             observed_options = sorted(
-                set(option_names(baseline_args, command.get("cli_schema")))
-                | set(option_names(candidate_args, command.get("cli_schema")))
+                set(
+                    option_names(
+                        baseline_args,
+                        command.get("cli_schema"),
+                        target_paths["baseline"],
+                    )
+                )
+                | set(
+                    option_names(
+                        candidate_args,
+                        command.get("cli_schema"),
+                        target_paths["candidate"],
+                    )
+                )
             )
             if sorted(controlled.get("allowed_options", [])) != observed_options:
                 raise ManifestError("controlled_delta.allowed_options must exactly name every delta option")
@@ -661,8 +705,16 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             if float(screen.get("weight", 0)) <= 0:
                 raise ManifestError("every screen weight must be positive")
             screen_args = [str(value) for value in screen.get("args", [])]
-            validate_argv(common_args + screen_args + baseline_args, command.get("cli_schema"))
-            validate_argv(common_args + screen_args + candidate_args, command.get("cli_schema"))
+            validate_argv(
+                common_args + screen_args + baseline_args,
+                command.get("cli_schema"),
+                target_paths["baseline"],
+            )
+            validate_argv(
+                common_args + screen_args + candidate_args,
+                command.get("cli_schema"),
+                target_paths["candidate"],
+            )
         if purpose == "kernel_screen":
             if selection["workload"] != "prefill" or selection["execution_mode"] != "direct_command":
                 raise ManifestError("kernel screens must use a direct-command prefill workload")
@@ -685,8 +737,30 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
                     raise ManifestError("kernel screens require positive ubatch_occurrences")
                 if float(screen["weight"]) != float(occurrences):
                     raise ManifestError("kernel screen weight must equal its real ubatch_occurrences")
-        if purpose != "exactness" and not isinstance(stage.get("metric"), dict):
-            raise ManifestError(f"performance stage {stage_id!r} requires a metric extractor")
+        if purpose != "exactness":
+            if not isinstance(stage.get("metric"), dict):
+                raise ManifestError(f"performance stage {stage_id!r} requires a metric extractor")
+            policy = stage.get("decision_policy")
+            if not isinstance(policy, dict):
+                raise ManifestError(
+                    f"performance stage {stage_id!r} requires an explicit decision_policy"
+                )
+            acceptable = policy.get("acceptable_decisions")
+            if (
+                not isinstance(acceptable, list)
+                or not acceptable
+                or not set(acceptable).issubset({"improvement", "equivalent"})
+            ):
+                raise ManifestError(
+                    "decision_policy.acceptable_decisions must be a non-empty subset of "
+                    "improvement/equivalent"
+                )
+            if policy.get("regression") != "fail":
+                raise ManifestError("decision_policy.regression must be fail")
+            if policy.get("inconclusive_after_maximum") != "unresolved_fail":
+                raise ManifestError(
+                    "decision_policy.inconclusive_after_maximum must be unresolved_fail"
+                )
         if purpose == "exactness" and stage.get("comparison", {}).get("mode") not in (
             "stdout_sha256",
             "file_sha256",
@@ -718,6 +792,30 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             raise ManifestError("profiler variant must be baseline or candidate")
         if not isinstance(profiler.get("selector"), dict) or not profiler["selector"].get("kernel_regex"):
             raise ManifestError("profiler requires a discovery selector with kernel_regex")
+        graph_trace = profiler.get("cuda_graph_trace")
+        if not isinstance(graph_trace, dict) or graph_trace.get("applicability") not in {
+            "required",
+            "not_applicable",
+        }:
+            raise ManifestError(
+                "profiler.cuda_graph_trace must preregister required or not_applicable"
+            )
+        profiled_stage = stage_by_id(manifest, str(stage_id))
+        graph_capable = "cuda_graphs" in profiled_stage["selection"]["backend_capabilities"]
+        if graph_capable or profiler["selector"].get("graph_only"):
+            if graph_trace["applicability"] != "required":
+                raise ManifestError(
+                    "CUDA-graph-capable or graph-only profiling requires graph-node tracing"
+                )
+        if graph_trace["applicability"] == "required":
+            if graph_trace.get("granularity") != "node":
+                raise ManifestError("required CUDA graph tracing must use granularity=node")
+            if graph_trace.get("launch_origin") not in {"host-only", "host-and-device"}:
+                raise ManifestError(
+                    "required CUDA graph tracing needs host-only or host-and-device launch_origin"
+                )
+        elif not graph_trace.get("reason"):
+            raise ManifestError("not-applicable CUDA graph tracing requires a reason")
 
 
 def load_and_validate_manifest(path: pathlib.Path) -> tuple[dict[str, Any], str]:
@@ -888,10 +986,19 @@ def verify_variant(name: str, variant: dict[str, Any]) -> dict[str, Any]:
         harness = executable.get("direct_harness")
         if harness:
             validate_direct_target(pathlib.Path(binary["resolved_path"]), direct_harness=harness)
+            source_files: list[dict[str, Any]] = []
             for item in harness["source_files"]:
                 source_path = pathlib.Path(item["path"]).expanduser().resolve()
                 if not source_path.is_file() or sha256_file(source_path) != item["sha256"]:
                     raise ProvenanceError(f"direct-harness source identity mismatch: {source_path}")
+                source_files.append(
+                    {
+                        "path": str(source_path),
+                        "sha256": item["sha256"],
+                        **stat_identity(source_path),
+                    }
+                )
+            harness = {**harness, "source_files": source_files}
         executables[role] = {
             "binary": binary,
             "build": cmake_snapshot(pathlib.Path(binary["resolved_path"]), executable["build"]),
@@ -922,6 +1029,15 @@ def capture_provenance(manifest: dict[str, Any], manifest_sha256: str) -> dict[s
                 "sha256": observed,
             }
         )
+    runtime_tools: dict[str, Any] = {}
+    nvidia_smi_path = shutil.which("nvidia-smi")
+    if nvidia_smi_path:
+        resolved_tool = pathlib.Path(nvidia_smi_path).resolve()
+        runtime_tools["nvidia-smi"] = {
+            "path": str(resolved_tool),
+            "sha256": sha256_file(resolved_tool),
+            **stat_identity(resolved_tool),
+        }
     host = {
         "captured_utc": utc_now(),
         "platform": platform.platform(),
@@ -935,12 +1051,14 @@ def capture_provenance(manifest: dict[str, Any], manifest_sha256: str) -> dict[s
         "nvidia_smi_version": command_capture(["nvidia-smi", "--version"]),
         "nsys_version": command_capture(["nsys", "--version"]),
         "ncu_version": command_capture(["ncu", "--version"]),
+        "runtime_tools": runtime_tools,
     }
     identity = {
         "manifest_sha256": manifest_sha256,
         "runner_schema_version": SCHEMA_VERSION,
         "variants": variants,
         "inputs": inputs,
+        "runtime_tools": runtime_tools,
     }
     body = {
         **identity,
@@ -949,6 +1067,81 @@ def capture_provenance(manifest: dict[str, Any], manifest_sha256: str) -> dict[s
     body["identity_fingerprint"] = canonical_sha256(identity)
     body["fingerprint"] = canonical_sha256(body)
     return body
+
+
+def provenance_identity_spec(
+    provenance: dict[str, Any],
+    selections: list[tuple[str, str]] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Build per-process identity guards from one fully hashed provenance capture.
+
+    Large binaries, libraries, inputs, and harness sources are hashed once when
+    provenance is captured.  Fresh processes recheck their size/mtime/device/
+    inode tuple; a new invocation or resume recaptures and rehashes provenance.
+    """
+    if selections is None:
+        selections = [
+            (variant_name, role)
+            for variant_name, variant in provenance["variants"].items()
+            for role in variant["executables"]
+        ]
+    files: dict[str, dict[str, Any]] = {}
+    sources: dict[str, dict[str, str]] = {}
+    for variant_name, role in selections:
+        variant = provenance["variants"][variant_name]
+        executable = variant["executables"][role]
+        binary = executable["binary"]
+        for item in [
+            binary,
+            *binary.get("libraries", []),
+            *(executable.get("direct_harness") or {}).get("source_files", []),
+        ]:
+            identity_path = item.get("resolved_path", item["path"])
+            files[identity_path] = {
+                "path": identity_path,
+                **{
+                    key: item[key]
+                    for key in ("sha256", "size", "mtime_ns", "ctime_ns", "device", "inode")
+                },
+                "rehash": False,
+                "verification": "stat_against_initial_sha256_capture",
+            }
+        build = executable["build"]
+        if build.get("cache"):
+            files[build["cache"]] = {
+                "path": build["cache"],
+                "sha256": build["cache_sha256"],
+                **build["cache_stat"],
+                "rehash": False,
+                "verification": "stat_against_initial_sha256_capture",
+            }
+        source = variant["source"]
+        sources[source["root"]] = {
+            "root": source["root"],
+            "head": source["head"],
+            "dirty_fingerprint": source["dirty_fingerprint"],
+        }
+    for item in provenance["inputs"]:
+        files[item["path"]] = {
+            "path": item["path"],
+            **{
+                key: item[key]
+                for key in ("sha256", "size", "mtime_ns", "ctime_ns", "device", "inode")
+            },
+            "rehash": False,
+            "verification": "stat_against_initial_sha256_capture",
+        }
+    for item in provenance.get("runtime_tools", {}).values():
+        files[item["path"]] = {
+            "path": item["path"],
+            **{
+                key: item[key]
+                for key in ("sha256", "size", "mtime_ns", "ctime_ns", "device", "inode")
+            },
+            "rehash": False,
+            "verification": "stat_against_initial_sha256_capture",
+        }
+    return ([files[key] for key in sorted(files)], [sources[key] for key in sorted(sources)])
 
 
 def build_schedule(manifest: dict[str, Any], stage: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1086,6 +1279,17 @@ def paired_log_report(
         "thresholds": {key: float(value) for key, value in thresholds.items()},
         "raw_pairs": raw,
     }
+
+
+def performance_outcome(decision: str, policy: dict[str, Any]) -> str:
+    """Map an executed statistical decision to a fail-closed gate outcome."""
+    if decision in policy["acceptable_decisions"]:
+        return "passed"
+    if decision == "inconclusive":
+        return "unresolved"
+    if decision == "regression":
+        return "failed"
+    raise ValidationError(f"unknown performance decision {decision!r}")
 
 
 def sterile_environment(*parts: dict[str, Any]) -> dict[str, str]:

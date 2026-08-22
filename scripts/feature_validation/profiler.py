@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import pathlib
 import re
@@ -181,6 +183,18 @@ def parse_discovery(path: pathlib.Path) -> dict[str, Any]:
     return {
         "source": str(resolved),
         "launch_count": len(normalized),
+        "graph_node_trace": {
+            "launches_with_graph_node": sum(
+                item["graph_node_id"] not in {None, 0, "0"} for item in normalized
+            ),
+            "distinct_graph_node_ids": sorted(
+                {
+                    str(item["graph_node_id"])
+                    for item in normalized
+                    if item["graph_node_id"] not in {None, 0, "0"}
+                }
+            ),
+        },
         "launches": normalized,
         "groups": sorted(groups.values(), key=lambda item: item["launch_indices"][0]),
     }
@@ -223,10 +237,13 @@ def nsys_discovery_argv(
     target_argv: list[str],
     output_prefix: pathlib.Path,
     direct_harness: dict[str, Any] | None = None,
+    *,
+    cuda_graph_trace: dict[str, Any] | None = None,
+    nsys_executable: str = "nsys",
 ) -> list[str]:
     validate_native_affinity(target_argv, direct_harness)
-    return [
-        "nsys",
+    argv = [
+        nsys_executable,
         "profile",
         "--trace=cuda,nvtx,osrt",
         "--sample=none",
@@ -234,8 +251,61 @@ def nsys_discovery_argv(
         "--force-overwrite=true",
         "--output",
         str(output_prefix),
-        *target_argv,
     ]
+    if cuda_graph_trace and cuda_graph_trace["applicability"] == "required":
+        argv.append(
+            "--cuda-graph-trace="
+            f"{cuda_graph_trace['granularity']}:{cuda_graph_trace['launch_origin']}"
+        )
+    return [*argv, *target_argv]
+
+
+def verify_nsys_graph_trace_capability(
+    config: dict[str, Any],
+    *,
+    help_text: str,
+    version_text: str,
+) -> dict[str, Any]:
+    """Fail before capture when required node tracing is unavailable."""
+    required = config["applicability"] == "required"
+    evidence = {
+        "applicability": config["applicability"],
+        "requested": (
+            f"{config.get('granularity')}:{config.get('launch_origin')}" if required else None
+        ),
+        "nsys_version": version_text.strip(),
+        "help_mentions_cuda_graph_trace": "--cuda-graph-trace" in help_text,
+        "help_mentions_node_granularity": bool(re.search(r"\bnode\b", help_text)),
+    }
+    if required and not (
+        evidence["help_mentions_cuda_graph_trace"]
+        and evidence["help_mentions_node_granularity"]
+    ):
+        raise ValidationError(
+            "this NSYS version does not advertise required --cuda-graph-trace node support"
+        )
+    evidence["status"] = "supported" if required else "not_applicable"
+    return evidence
+
+
+def verify_graph_node_discovery(
+    discovery: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    observed = int(discovery["graph_node_trace"]["launches_with_graph_node"])
+    result = {
+        "applicability": config["applicability"],
+        "requested": config.get("granularity"),
+        "observed_launches_with_graph_node": observed,
+        "status": "not_applicable",
+    }
+    if config["applicability"] == "required":
+        if observed == 0:
+            raise ValidationError(
+                "NSYS graph-node tracing was required and explicitly requested, but the export "
+                "contains no nonzero graph node IDs"
+            )
+        result["status"] = "verified"
+    return result
 
 
 def _selector_matches(launch: dict[str, Any], selector: dict[str, Any]) -> bool:
@@ -289,6 +359,8 @@ def build_ncu_plan(
         "ncu",
         "--target-processes",
         "all",
+        "--graph-profiling",
+        "node",
         "--kernel-name-base",
         "demangled",
         "--kernel-name",
@@ -302,6 +374,13 @@ def build_ncu_plan(
         argv.extend(["--metrics", ",".join(metrics)])
     prefix = output_root / f"capture-launch-{selected[0]['launch_index']:06d}"
     argv.extend(["--export", str(prefix), "--force-overwrite", *target_argv])
+    report_path = pathlib.Path(f"{prefix}.ncu-rep")
+    expected_shapes = sorted(
+        {
+            json.dumps({"grid": item.get("grid"), "block": item.get("block")}, sort_keys=True)
+            for item in selected
+        }
+    )
     command = {
         "selected_launches": selected,
         "derivation": {
@@ -310,7 +389,9 @@ def build_ncu_plan(
             "launch_skip": launch_skip,
             "launch_count": launch_count,
             "discovery_launch_indices": [item["launch_index"] for item in selected],
+            "expected_shapes": [json.loads(item) for item in expected_shapes],
         },
+        "report_path": str(report_path),
         "direct_argv": argv,
         "direct_command": quote_argv(argv),
         "flock_argv": flock_argv(argv),
@@ -324,7 +405,101 @@ def build_ncu_plan(
         "selected_count": len(selected),
         "command": command,
         "limitations": [
-            "Kernel and occurrence filters are valid only for the recorded discovery identity.",
+            "Cross-process launch order can drift; the exported report must be verified against kernel, count, and available shapes before it is usable.",
             "Filtered kernel evidence does not prove end-to-end performance, resource use, output exactness, or long-context behavior.",
         ],
+    }
+
+
+def parse_ncu_raw_csv(text: str) -> dict[str, Any]:
+    """Extract unique kernel captures from ``ncu --import --csv --page raw``."""
+    lines = text.splitlines()
+    header_index = next(
+        (index for index, line in enumerate(lines) if "Kernel Name" in line and "ID" in line),
+        None,
+    )
+    if header_index is None:
+        return {"captures": [], "columns": [], "parse_status": "unverifiable_no_header"}
+    reader = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+    columns = reader.fieldnames or []
+    captures: dict[str, dict[str, Any]] = {}
+    for row_number, row in enumerate(reader, start=1):
+        name = (row.get("Kernel Name") or "").strip()
+        capture_id = (row.get("ID") or "").strip()
+        if not name or not capture_id:
+            continue
+        capture_key = "|".join(
+            (row.get(column) or "").strip()
+            for column in ("Process ID", "Context", "Stream", "ID")
+        )
+        capture = captures.setdefault(
+            capture_key,
+            {
+                "id": capture_id,
+                "process_id": (row.get("Process ID") or "").strip() or None,
+                "context": (row.get("Context") or "").strip() or None,
+                "stream": (row.get("Stream") or "").strip() or None,
+                "kernel_name": name,
+                "grid": _normalize_shape(row.get("Grid Size")),
+                "block": _normalize_shape(row.get("Block Size")),
+                "raw_row_numbers": [],
+            },
+        )
+        if capture["kernel_name"] != name:
+            raise ValidationError(f"NCU capture ID {capture_key} has conflicting kernel names")
+        capture["raw_row_numbers"].append(row_number)
+    return {
+        "captures": list(captures.values()),
+        "columns": columns,
+        "parse_status": "parsed" if captures else "unverifiable_no_captures",
+    }
+
+
+def verify_ncu_capture(plan: dict[str, Any], parsed: dict[str, Any]) -> dict[str, Any]:
+    """Verify a fresh NCU report and expose launch-order drift instead of assuming it away."""
+    derivation = plan["command"]["derivation"]
+    expected_name = str(derivation["kernel_name"])
+    expected_count = int(derivation["launch_count"])
+    captures = parsed["captures"]
+    issues: list[str] = []
+    if parsed["parse_status"] != "parsed":
+        return {
+            "status": "unverifiable",
+            "issues": [parsed["parse_status"]],
+            "expected_kernel": expected_name,
+            "expected_capture_count": expected_count,
+            "observed_captures": captures,
+        }
+    if len(captures) != expected_count:
+        issues.append(f"expected {expected_count} captures, observed {len(captures)}")
+    observed_names = sorted({item["kernel_name"] for item in captures})
+    if observed_names != [expected_name]:
+        issues.append(f"expected kernel {expected_name!r}, observed {observed_names!r}")
+    expected_shapes = {
+        json.dumps(item, sort_keys=True) for item in derivation.get("expected_shapes", [])
+    }
+    observed_shapes = {
+        json.dumps({"grid": item["grid"], "block": item["block"]}, sort_keys=True)
+        for item in captures
+    }
+    if expected_shapes and any(item["grid"] is None or item["block"] is None for item in captures):
+        return {
+            "status": "unverifiable",
+            "issues": [*issues, "NCU raw export lacks grid/block shape data"],
+            "expected_kernel": expected_name,
+            "expected_capture_count": expected_count,
+            "observed_captures": captures,
+        }
+    if expected_shapes and not observed_shapes.issubset(expected_shapes):
+        issues.append("observed NCU launch shape was absent from NSYS discovery selection")
+    return {
+        "status": "verified" if not issues else "failed",
+        "issues": issues,
+        "expected_kernel": expected_name,
+        "expected_capture_count": expected_count,
+        "observed_capture_count": len(captures),
+        "observed_captures": captures,
+        "cross_process_launch_order": (
+            "not assumed; report kernel/count/shapes were checked after the separate NCU process"
+        ),
     }

@@ -15,13 +15,14 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 from feature_validation import core, profiler, telemetry  # noqa: E402
-from feature_validation.runner import StudyRunner  # noqa: E402
+from feature_validation.runner import StudyRunner, _verify_spec_identity  # noqa: E402
 
 
 def file_sha256(path: pathlib.Path) -> str:
@@ -63,12 +64,16 @@ class FixtureMixin:
             text=True,
         ).stdout.strip()
         variant = {
-            "executable": str(self.executable),
-            "expected_sha256": file_sha256(self.executable),
             "source_root": str(self.repo),
             "expected_commit": head,
             "tree_policy": "clean",
-            "build": {"mode": "not_applicable", "reason": "test script"},
+            "executables": {
+                "default": {
+                    "path": str(self.executable),
+                    "expected_sha256": file_sha256(self.executable),
+                    "build": {"mode": "not_applicable", "reason": "test script"},
+                }
+            },
         }
         selection = {
             "workload": "decode",
@@ -82,7 +87,7 @@ class FixtureMixin:
             "candidate_args": [],
             "cli_schema": {"builtin": "none", "allow_positionals": False},
         }
-        return {
+        manifest = {
             "schema_version": 1,
             "study": {
                 "id": "unit-fixture",
@@ -228,6 +233,15 @@ class FixtureMixin:
                 },
             ],
         }
+        decision_policy = {
+            "acceptable_decisions": ["improvement", "equivalent"],
+            "regression": "fail",
+            "inconclusive_after_maximum": "unresolved_fail",
+        }
+        for stage in manifest["stages"]:
+            if stage["purpose"] != "exactness":
+                stage["decision_policy"] = copy.deepcopy(decision_policy)
+        return manifest
 
 
 class QuotingAndArityTest(unittest.TestCase):
@@ -243,6 +257,30 @@ class QuotingAndArityTest(unittest.TestCase):
     def test_zero_arity_option_rejects_equals_value(self) -> None:
         with self.assertRaisesRegex(core.ValidationError, "zero-arity"):
             core.validate_argv(["--no-kv-offload=1"])
+
+    def test_common_no_kv_offload_is_bare(self) -> None:
+        core.validate_argv(
+            ["--no-kv-offload"],
+            {"builtin": "llama", "allow_positionals": False},
+            "/tmp/llama-cli",
+        )
+        with self.assertRaisesRegex(core.ValidationError, "unexpected positional"):
+            core.validate_argv(
+                ["--no-kv-offload", "1"],
+                {"builtin": "llama", "allow_positionals": False},
+                "/tmp/llama-cli",
+            )
+
+    def test_bench_no_kv_offload_short_and_long_aliases_take_values(self) -> None:
+        schema = {"builtin": "llama", "allow_positionals": False}
+        core.validate_argv(["-nkvo", "1"], schema, "/tmp/llama-bench")
+        core.validate_argv(["--no-kv-offload", "0"], schema, "/tmp/llama-bench")
+        with self.assertRaisesRegex(core.ValidationError, "requires one value"):
+            core.validate_argv(["--no-kv-offload"], schema, "/tmp/llama-bench")
+
+    def test_llama_schema_rejects_unidentified_harness_without_override(self) -> None:
+        with self.assertRaisesRegex(core.ManifestError, "cannot identify target"):
+            core.validate_argv([], {"builtin": "llama"}, "/tmp/custom-harness")
 
     def test_value_option_accepts_negative_numeric_value(self) -> None:
         core.validate_argv(["--kv-gpu-layers", "-1"])
@@ -299,11 +337,36 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
         with self.assertRaisesRegex(core.ManifestError, "prefill and short decode"):
             core.validate_manifest(manifest)
 
+    def test_performance_stage_requires_fail_closed_decision_policy(self) -> None:
+        manifest = self.manifest()
+        del manifest["stages"][1]["decision_policy"]
+        with self.assertRaisesRegex(core.ManifestError, "decision_policy"):
+            core.validate_manifest(manifest)
+
+    def test_graph_capable_profiler_requires_node_trace(self) -> None:
+        example_path = (
+            SCRIPTS.parent
+            / "examples"
+            / "feature-performance-validation"
+            / "manifest.example.json"
+        )
+        manifest = json.loads(example_path.read_text(encoding="utf-8"))
+        manifest["profiler"]["cuda_graph_trace"] = {
+            "applicability": "not_applicable",
+            "reason": "invalid for this graph-capable stage",
+        }
+        with self.assertRaisesRegex(core.ManifestError, "requires graph-node tracing"):
+            core.validate_manifest(manifest)
+
     def test_workload_setting_cannot_hide_in_candidate_delta(self) -> None:
         manifest = self.manifest()
         stage = next(item for item in manifest["stages"] if item["purpose"] == "kernel_screen")
         stage["command"]["candidate_args"] = ["-ub", "128"]
-        stage["command"]["cli_schema"] = {"builtin": "llama", "allow_positionals": False}
+        stage["command"]["cli_schema"] = {
+            "builtin": "none",
+            "allow_positionals": False,
+            "options": {"-ub": 1},
+        }
         stage["command"]["controlled_delta"] = {
             "reason": "invalid test delta",
             "baseline_args": [],
@@ -329,7 +392,9 @@ class ProvenanceTest(FixtureMixin, unittest.TestCase):
 
     def test_wrong_binary_hash_fails_closed(self) -> None:
         manifest = self.manifest()
-        manifest["variants"]["candidate"]["expected_sha256"] = "0" * 64
+        manifest["variants"]["candidate"]["executables"]["default"][
+            "expected_sha256"
+        ] = "0" * 64
         with self.assertRaisesRegex(core.ProvenanceError, "binary SHA-256 mismatch"):
             core.capture_provenance(manifest, "manifest-hash")
 
@@ -338,6 +403,36 @@ class ProvenanceTest(FixtureMixin, unittest.TestCase):
         (self.repo / "untracked").write_text("dirt", encoding="utf-8")
         with self.assertRaisesRegex(core.ProvenanceError, "dirty"):
             core.capture_provenance(manifest, "manifest-hash")
+
+    def test_fresh_runs_use_stat_guards_without_rehashing_large_identity_files(self) -> None:
+        provenance = core.capture_provenance(self.manifest(), "manifest-hash")
+        files, _ = core.provenance_identity_spec(
+            provenance, [("baseline", "default")]
+        )
+        self.assertTrue(files)
+        self.assertTrue(all(item["rehash"] is False for item in files))
+        with mock.patch.object(
+            core,
+            "sha256_file",
+            side_effect=AssertionError("per-run rehash should not occur"),
+        ):
+            _verify_spec_identity({"identity_files": files, "source_identities": []})
+
+    def test_stat_cache_rejects_same_size_change_with_restored_mtime(self) -> None:
+        provenance = core.capture_provenance(self.manifest(), "manifest-hash")
+        files, _ = core.provenance_identity_spec(
+            provenance, [("baseline", "default")]
+        )
+        original = self.executable.stat()
+        changed = self.executable.read_text(encoding="utf-8").replace("100.0", "999.9")
+        self.executable.write_text(changed, encoding="utf-8")
+        self.executable.chmod(0o755)
+        __import__("os").utime(
+            self.executable,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+        with self.assertRaisesRegex(core.ProvenanceError, "ctime_ns"):
+            _verify_spec_identity({"identity_files": files, "source_identities": []})
 
 
 class StatisticsTest(unittest.TestCase):
@@ -386,8 +481,54 @@ class StatisticsTest(unittest.TestCase):
         with self.assertRaisesRegex(core.ValidationError, "did not match"):
             core.extract_metric({"regex": r"metric=([0-9.]+)"}, "nothing", "")
 
+    def test_gate_outcome_distinguishes_completed_from_acceptable(self) -> None:
+        policy = {
+            "acceptable_decisions": ["improvement", "equivalent"],
+            "regression": "fail",
+            "inconclusive_after_maximum": "unresolved_fail",
+        }
+        self.assertEqual(core.performance_outcome("improvement", policy), "passed")
+        self.assertEqual(core.performance_outcome("regression", policy), "failed")
+        self.assertEqual(core.performance_outcome("inconclusive", policy), "unresolved")
+
 
 class ProfilerTest(unittest.TestCase):
+    def test_nsys_explicitly_requests_and_verifies_graph_node_trace(self) -> None:
+        config = {
+            "applicability": "required",
+            "granularity": "node",
+            "launch_origin": "host-only",
+        }
+        evidence = profiler.verify_nsys_graph_trace_capability(
+            config,
+            help_text="--cuda-graph-trace graph|node",
+            version_text="Nsight Systems 2026.1",
+        )
+        self.assertEqual(evidence["status"], "supported")
+        argv = profiler.nsys_discovery_argv(
+            ["/tmp/llama-bench", "-C", "0x7", "--cpu-strict", "1"],
+            pathlib.Path("/tmp/discovery"),
+            cuda_graph_trace=config,
+        )
+        self.assertIn("--cuda-graph-trace=node:host-only", argv)
+
+    def test_nsys_unsupported_or_missing_graph_nodes_fails_closed(self) -> None:
+        config = {
+            "applicability": "required",
+            "granularity": "node",
+            "launch_origin": "host-only",
+        }
+        with self.assertRaisesRegex(core.ValidationError, "does not advertise"):
+            profiler.verify_nsys_graph_trace_capability(
+                config,
+                help_text="old help without graph node tracing",
+                version_text="Nsight Systems old",
+            )
+        with self.assertRaisesRegex(core.ValidationError, "contains no nonzero"):
+            profiler.verify_graph_node_discovery(
+                {"graph_node_trace": {"launches_with_graph_node": 0}}, config
+            )
+
     def test_jsonl_discovery_and_one_filtered_ncu_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -432,7 +573,41 @@ class ProfilerTest(unittest.TestCase):
             self.assertEqual(plan["selected_count"], 2)
             self.assertEqual(plan["command"]["derivation"]["launch_skip"], 0)
             self.assertEqual(plan["command"]["derivation"]["launch_count"], 2)
+            self.assertIn("--graph-profiling", plan["command"]["direct_argv"])
             self.assertIn("flock /tmp/beellama-single-gpu.lock -c", plan["command"]["flock_command"])
+
+            csv_text = (
+                '==PROF== fake\n'
+                '"ID","Kernel Name","Grid Size","Block Size","Metric Name","Metric Value"\n'
+                '"1","kernel<q8>","1 2 3","32 1 1","gpu__time_duration.sum","10"\n'
+                '"2","kernel<q8>","1 2 3","32 1 1","gpu__time_duration.sum","11"\n'
+            )
+            parsed = profiler.parse_ncu_raw_csv(csv_text)
+            verified = profiler.verify_ncu_capture(plan, parsed)
+            self.assertEqual(verified["status"], "verified")
+            self.assertEqual(verified["observed_capture_count"], 2)
+
+    def test_ncu_report_count_mismatch_and_missing_columns_do_not_verify(self) -> None:
+        plan = {
+            "command": {
+                "derivation": {
+                    "kernel_name": "kernel",
+                    "launch_count": 2,
+                    "expected_shapes": [{"grid": [1, 1, 1], "block": [32, 1, 1]}],
+                }
+            }
+        }
+        one = profiler.parse_ncu_raw_csv(
+            '"ID","Kernel Name","Grid Size","Block Size"\n'
+            '"1","kernel","1 1 1","32 1 1"\n'
+        )
+        self.assertEqual(profiler.verify_ncu_capture(plan, one)["status"], "failed")
+        missing_shapes = profiler.parse_ncu_raw_csv(
+            '"ID","Kernel Name"\n"1","kernel"\n"2","kernel"\n'
+        )
+        self.assertEqual(
+            profiler.verify_ncu_capture(plan, missing_shapes)["status"], "unverifiable"
+        )
 
     def test_fake_nsys_sqlite_parses_names_shapes_counts_and_indices(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -567,6 +742,58 @@ class TelemetryTest(unittest.TestCase):
 
 
 class RunnerTest(FixtureMixin, unittest.TestCase):
+    def test_final_gate_execution_is_not_acceptance_without_a_pass(self) -> None:
+        manifest_path = self.root / "gate-status.json"
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        for gate_status, expected in (
+            ("failed", "acceptance_failed"),
+            ("unresolved", "acceptance_unresolved"),
+        ):
+            runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+            runner.state = {
+                "runs": {},
+                "stages": {
+                    "long": {
+                        "purpose": "long_context_acceptance",
+                        "execution_status": "completed",
+                        "status": gate_status,
+                    }
+                }
+            }
+            summary = runner._summary("acceptance", None)
+            self.assertEqual(summary["status"], expected)
+            self.assertTrue(summary["final_long_context_acceptance_executed"])
+            self.assertFalse(summary["final_long_context_acceptance_passed"])
+
+    def test_final_gate_regression_and_inconclusive_statistics_fail_closed(self) -> None:
+        manifest = self.manifest()
+        manifest_path = self.root / "statistical-gate.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        stage = manifest["stages"][-1]
+        scenarios = {
+            "failed": [90, 90, 90, 90, 90],
+            "unresolved": [98, 102, 100, 99, 101],
+        }
+        for expected_status, candidates in scenarios.items():
+            runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+
+            def fake_execute(_stage: dict, scheduled: dict, **_kwargs: object) -> dict:
+                value = (
+                    candidates[scheduled["pair"] - 1]
+                    if scheduled["variant"] == "candidate"
+                    else 100
+                )
+                return {"run_id": scheduled["run_id"], "metric_value": value}
+
+            with mock.patch.object(runner, "_execute", side_effect=fake_execute):
+                report = runner._run_performance(stage, retry_failed=False)
+            self.assertEqual(report["execution_status"], "completed")
+            self.assertEqual(report["status"], expected_status)
+            runner.state = {"stages": {"long": report}, "runs": {}}
+            summary = runner._summary("acceptance", None)
+            self.assertNotEqual(summary["status"], "acceptance_complete")
+            self.assertFalse(summary["final_long_context_acceptance_passed"])
+
     def test_resume_rejects_changed_binary_provenance(self) -> None:
         manifest = self.manifest()
         manifest_path = self.root / "resume-provenance.json"
@@ -586,6 +813,10 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
         first = StudyRunner(manifest_path, tool_script)
         summary = first.run(through="early", resume=False, retry_failed=False)
         self.assertEqual(summary["status"], "early_screen_only_not_production_or_final_acceptance")
+        self.assertEqual(summary["early_timing"]["mode"], "fresh")
+        self.assertEqual(summary["early_timing"]["run_count"], 32)
+        self.assertGreater(summary["early_timing"]["target_process_seconds"], 0)
+        self.assertGreater(summary["early_timing"]["identity_verification_seconds"], 0)
         state = json.loads(first.state_path.read_text(encoding="utf-8"))
         attempts = [attempt for values in state["runs"].values() for attempt in values]
         self.assertEqual(len(attempts), 32)
@@ -639,12 +870,15 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
         manifest_path = self.root / "adaptive.json"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
-        runner.run(through="early", resume=False, retry_failed=False)
+        with self.assertRaisesRegex(core.ValidationError, "not acceptable: unresolved"):
+            runner.run(through="early", resume=False, retry_failed=False)
         state = json.loads(runner.state_path.read_text(encoding="utf-8"))
         report = state["stages"]["kernel"]
         self.assertTrue(report["adaptive_repetition"]["extended"])
         self.assertEqual(report["statistics"]["pair_count"], 5)
         self.assertEqual(len(report["statistics"]["raw_pairs"]), 5)
+        self.assertEqual(report["execution_status"], "completed")
+        self.assertEqual(report["status"], "unresolved")
 
     def test_failed_attempt_is_preserved_and_retry_requires_opt_in(self) -> None:
         flag = self.root / "allow-run"

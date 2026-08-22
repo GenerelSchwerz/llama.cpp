@@ -66,7 +66,7 @@ def _verify_spec_identity(spec: dict[str, Any]) -> None:
         if not path.is_file():
             raise core.ProvenanceError(f"run identity file disappeared: {path}")
         stat = core.stat_identity(path)
-        for key in ("size", "mtime_ns", "device", "inode"):
+        for key in ("size", "mtime_ns", "ctime_ns", "device", "inode"):
             if key in item and stat[key] != item[key]:
                 raise core.ProvenanceError(
                     f"run identity metadata changed for {path}: {key} expected {item[key]}, observed {stat[key]}"
@@ -99,6 +99,7 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         spec["resource"],
         nvidia_smi=spec.get("nvidia_smi", "nvidia-smi"),
         first_sample_timeout=float(spec.get("telemetry_first_sample_timeout", 12.0)),
+        sampler_identity=spec.get("nvidia_smi_identity"),
     )
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
@@ -107,11 +108,21 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     timed_out = False
     returncode: int | None = None
     telemetry_report: dict[str, Any] | None = None
+    identity_seconds: float | None = None
+    telemetry_startup_seconds: float | None = None
+    target_started: float | None = None
+    target_finished: float | None = None
+    cleanup_seconds: float | None = None
     try:
+        phase_start = time.monotonic()
         _verify_spec_identity(spec)
+        identity_seconds = time.monotonic() - phase_start
+        phase_start = time.monotonic()
         telemetry.start()
+        telemetry_startup_seconds = time.monotonic() - phase_start
         argv = [str(value) for value in spec["argv"]]
         environment = {str(key): str(value) for key, value in spec["environment"].items()}
+        target_started = time.monotonic()
         process = subprocess.Popen(
             argv,
             cwd=spec.get("cwd"),
@@ -158,12 +169,16 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 next_heartbeat += 5.0
             time.sleep(0.05)
         returncode = process.wait()
+        target_finished = time.monotonic()
     except Exception as caught:  # the result must preserve every failed attempt
+        if target_started is not None and target_finished is None:
+            target_finished = time.monotonic()
         error = f"{type(caught).__name__}: {caught}"
         if process is not None:
             _kill_group(process)
             returncode = process.poll()
     finally:
+        cleanup_started = time.monotonic()
         for thread in threads:
             thread.join(timeout=3.0)
         if process is not None:
@@ -176,6 +191,7 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         except Exception as caught:
             telemetry_error = f"{type(caught).__name__}: {caught}"
             error = f"{error}; telemetry cleanup: {telemetry_error}" if error else telemetry_error
+        cleanup_seconds = time.monotonic() - cleanup_started
     stdout = b"".join(stdout_chunks)
     stderr = b"".join(stderr_chunks)
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +205,12 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if contamination and error is None:
         error = "GPU clean-process evidence was contaminated"
     status = "success" if returncode == 0 and not timed_out and error is None else "failed"
+    total_seconds = time.monotonic() - start_monotonic
+    target_seconds = (
+        target_finished - target_started
+        if target_started is not None and target_finished is not None
+        else 0.0
+    )
     result: dict[str, Any] = {
         "run_id": spec["run_id"],
         "status": status,
@@ -196,7 +218,19 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "schedule": spec.get("schedule"),
         "started_utc": started,
         "finished_utc": core.utc_now(),
-        "elapsed_seconds": time.monotonic() - start_monotonic,
+        "elapsed_seconds": total_seconds,
+        "timing": {
+            "identity_verification_seconds": identity_seconds,
+            "telemetry_startup_seconds": telemetry_startup_seconds,
+            "target_process_seconds": target_seconds,
+            "cleanup_seconds": cleanup_seconds,
+            "toolkit_overhead_seconds": max(0.0, total_seconds - target_seconds),
+            "locked_wrapper_to_executor_seconds": (
+                max(0.0, start_monotonic - float(spec["launcher_requested_monotonic"]))
+                if spec.get("launcher_requested_monotonic") is not None
+                else None
+            ),
+        },
         "pid": process.pid if process is not None else None,
         "returncode": returncode,
         "timed_out": timed_out,
@@ -252,6 +286,48 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def launch_locked_spec(
+    spec: dict[str, Any], spec_path: pathlib.Path, tool_script: pathlib.Path
+) -> dict[str, Any]:
+    """Launch one internal lifecycle under the required whole-command GPU lock."""
+    result_path = pathlib.Path(spec["result_path"])
+    if spec_path.exists() or result_path.exists():
+        raise core.ValidationError(
+            f"refusing to overwrite an existing attempt: {spec_path} / {result_path}"
+        )
+    inner = [sys.executable, str(tool_script), "_execute-run", str(spec_path)]
+    wrapper = core.flock_argv(inner)
+    spec["gpu_lock"] = {
+        "path": core.GPU_LOCK,
+        "whole_command_argv": wrapper,
+        "whole_command": core.quote_argv(wrapper),
+        "inner_lifecycle": "telemetry preflight, direct target, telemetry cleanup",
+    }
+    spec["launcher_requested_monotonic"] = time.monotonic()
+    core.write_json_atomic(spec_path, spec)
+    print(f"[feature-validation] launch {core.quote_argv(wrapper)}", flush=True)
+    completed = subprocess.run(wrapper, check=False)
+    if result_path.is_file():
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+        launcher_seconds = time.monotonic() - spec["launcher_requested_monotonic"]
+        result.setdefault("timing", {})["locked_lifecycle_wall_seconds"] = launcher_seconds
+        result["timing"]["locked_lifecycle_overhead_seconds"] = max(
+            0.0,
+            launcher_seconds - float(result["timing"].get("target_process_seconds", 0.0)),
+        )
+        core.write_json_atomic(result_path, result)
+        return result
+    result = {
+        "run_id": spec["run_id"],
+        "attempt": spec["attempt"],
+        "status": "failed",
+        "error": f"flock/internal executor returned {completed.returncode} without result",
+        "gpu_lock": spec["gpu_lock"],
+    }
+    core.write_json_atomic(result_path, result)
+    return result
+
+
 class StudyRunner:
     def __init__(self, manifest_path: pathlib.Path, tool_script: pathlib.Path) -> None:
         self.manifest_path = manifest_path.expanduser().resolve()
@@ -264,6 +340,8 @@ class StudyRunner:
         self.state_path = self.study_root / "state.json"
         self.provenance: dict[str, Any] | None = None
         self.state: dict[str, Any] | None = None
+        self.preparation_elapsed_seconds = 0.0
+        self.resume_mode = False
 
     def prepare(self, *, resume: bool) -> None:
         provenance = core.capture_provenance(self.manifest, self.manifest_sha256)
@@ -302,49 +380,6 @@ class StudyRunner:
         self.state["updated_utc"] = core.utc_now()
         core.write_json_atomic(self.state_path, self.state)
 
-    def _identity_spec(
-        self, stage: dict[str, Any], scheduled: dict[str, Any]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-        assert self.provenance is not None
-        files: dict[str, dict[str, Any]] = {}
-        sources: list[dict[str, str]] = []
-        variant_name = scheduled["variant"]
-        variant = self.provenance["variants"][variant_name]
-        role = str(stage["command"].get("executable_role", "default"))
-        executable = variant["executables"][role]
-        binary = executable["binary"]
-        files[binary["resolved_path"]] = {
-            "path": binary["resolved_path"],
-            **{key: binary[key] for key in ("sha256", "size", "mtime_ns", "device", "inode")},
-            "rehash": True,
-        }
-        for library in binary.get("libraries", []):
-            files[library["path"]] = {"path": library["path"], **library}
-        build = executable["build"]
-        if build.get("cache"):
-            files[build["cache"]] = {
-                "path": build["cache"],
-                "sha256": build["cache_sha256"],
-                **build["cache_stat"],
-            }
-        source = variant["source"]
-        sources.append(
-            {
-                "root": source["root"],
-                "head": source["head"],
-                "dirty_fingerprint": source["dirty_fingerprint"],
-            }
-        )
-        for item in self.provenance["inputs"]:
-            files[item["path"]] = {
-                "path": item["path"],
-                **{key: item[key] for key in ("sha256", "size", "mtime_ns", "device", "inode")},
-            }
-        return (
-            [files[path] for path in sorted(files)],
-            sources,
-        )
-
     def _execute(
         self,
         stage: dict[str, Any],
@@ -375,7 +410,11 @@ class StudyRunner:
         }
         argv = [_render(value, context) for value in argv]
         environment = {key: _render(value, context) for key, value in environment.items()}
-        identity_files, source_identities = self._identity_spec(stage, scheduled)
+        assert self.provenance is not None
+        role = str(stage["command"].get("executable_role", "default"))
+        identity_files, source_identities = core.provenance_identity_spec(
+            self.provenance, [(scheduled["variant"], role)]
+        )
         result_path = run_root / "result.json"
         spec_path = run_root / "run-spec.json"
         comparison = stage.get("comparison", {})
@@ -402,31 +441,16 @@ class StudyRunner:
             "comparison_path": comparison_path,
             "identity_files": identity_files,
             "source_identities": source_identities,
+            "nvidia_smi_identity": self.provenance.get("runtime_tools", {}).get("nvidia-smi"),
+            "nvidia_smi": (
+                self.provenance.get("runtime_tools", {})
+                .get("nvidia-smi", {})
+                .get("path", "nvidia-smi")
+            ),
             "host_load_before": core.host_load_snapshot(),
         }
         if stage["resource"] == "gpu":
-            inner = [sys.executable, str(self.tool_script), "_execute-run", str(spec_path)]
-            wrapper = core.flock_argv(inner)
-            spec["gpu_lock"] = {
-                "path": core.GPU_LOCK,
-                "whole_command_argv": wrapper,
-                "whole_command": core.quote_argv(wrapper),
-                "inner_lifecycle": "telemetry preflight, direct target, telemetry cleanup",
-            }
-            core.write_json_atomic(spec_path, spec)
-            print(f"[feature-validation] launch {core.quote_argv(wrapper)}", flush=True)
-            launch = subprocess.run(wrapper, check=False)
-            if result_path.exists():
-                result = json.loads(result_path.read_text(encoding="utf-8"))
-            else:
-                result = {
-                    "run_id": run_id,
-                    "attempt": attempt,
-                    "status": "failed",
-                    "error": f"flock/internal executor returned {launch.returncode} without result",
-                    "gpu_lock": spec["gpu_lock"],
-                }
-                core.write_json_atomic(result_path, result)
+            result = launch_locked_spec(spec, spec_path, self.tool_script)
         else:
             spec["gpu_lock"] = None
             core.write_json_atomic(spec_path, spec)
@@ -488,17 +512,13 @@ class StudyRunner:
         }
         report = {
             "purpose": stage["purpose"],
+            "execution_status": "completed",
             "status": "passed" if not mismatches else "failed",
             "comparison_mode": mode,
             "hashes": hashes,
             "mismatches": mismatches,
             "raw_run_ids": [result["run_id"] for result in results],
         }
-        if mismatches:
-            assert self.state is not None
-            self.state["stages"][stage["id"]] = report
-            self._save_state()
-            raise core.ValidationError(f"exactness gate {stage['id']} failed: {mismatches}")
         return report
 
     def _run_performance(
@@ -548,19 +568,132 @@ class StudyRunner:
             ]
         return {
             "purpose": stage["purpose"],
-            "status": "completed",
+            "execution_status": "completed",
+            "status": core.performance_outcome(report["decision"], stage["decision_policy"]),
+            "decision_policy": stage["decision_policy"],
             "statistics": report,
             "adaptive_repetition": extension,
             "raw_run_ids": [result["run_id"] for result in results.values()],
         }
 
+    def _summary(self, through: str, early_elapsed: float | None) -> dict[str, Any]:
+        assert self.state is not None
+        final_gate = next(
+            item
+            for item in self.manifest["stages"]
+            if item["purpose"] == "long_context_acceptance"
+        )
+        final_report = self.state["stages"].get(final_gate["id"])
+        final_executed = bool(
+            final_report and final_report.get("execution_status") == "completed"
+        )
+        final_passed = bool(final_report and final_report.get("status") == "passed")
+        blocking = next(
+            (
+                (stage, self.state["stages"][stage["id"]])
+                for stage in self.manifest["stages"]
+                if self.state["stages"].get(stage["id"], {}).get("status")
+                in {"failed", "unresolved"}
+            ),
+            None,
+        )
+        if blocking:
+            blocking_stage, blocking_report = blocking
+            prefix = (
+                "acceptance"
+                if blocking_stage["purpose"] == "long_context_acceptance"
+                else blocking_stage["purpose"]
+            )
+            status = f"{prefix}_{blocking_report['status']}"
+        elif through == "acceptance" and final_report:
+            status = {
+                "passed": "acceptance_complete",
+                "failed": "acceptance_failed",
+                "unresolved": "acceptance_unresolved",
+            }.get(final_report.get("status"), "acceptance_not_completed")
+        elif through == "production":
+            status = "production_confirmation_only_not_final_acceptance"
+        else:
+            status = "early_screen_only_not_production_or_final_acceptance"
+        early_stage_ids = {
+            stage["id"]
+            for stage in self.manifest["stages"]
+            if core.PURPOSE_ORDER[stage["purpose"]] <= core.PURPOSE_ORDER["kernel_screen"]
+        }
+        early_attempts = [
+            attempts[-1]
+            for run_id, attempts in self.state["runs"].items()
+            if run_id.split("--", 1)[0] in early_stage_ids and attempts
+        ]
+        target_seconds = sum(
+            float(item.get("timing", {}).get("target_process_seconds", 0.0))
+            for item in early_attempts
+        )
+        per_run_overhead = sum(
+            float(item.get("timing", {}).get("toolkit_overhead_seconds", 0.0))
+            for item in early_attempts
+        )
+        locked_lifecycle = sum(
+            float(
+                item.get("timing", {}).get(
+                    "locked_lifecycle_wall_seconds", item.get("elapsed_seconds", 0.0)
+                )
+            )
+            for item in early_attempts
+        )
+        return {
+            "study_id": self.manifest["study"]["id"],
+            "artifact_root": str(self.study_root),
+            "through": through,
+            "early_elapsed_seconds": early_elapsed,
+            "early_target_seconds": self.manifest["study"]["early_decision_target_seconds"],
+            "early_timing": {
+                "mode": "resume" if self.resume_mode else "fresh",
+                "run_count": len(early_attempts),
+                "preparation_seconds": self.preparation_elapsed_seconds,
+                "target_process_seconds": target_seconds,
+                "recorded_per_run_toolkit_overhead_seconds": per_run_overhead,
+                "locked_lifecycle_wall_seconds": locked_lifecycle,
+                "locked_wrapper_to_executor_seconds": sum(
+                    float(
+                        item.get("timing", {}).get("locked_wrapper_to_executor_seconds")
+                        or 0.0
+                    )
+                    for item in early_attempts
+                ),
+                "identity_verification_seconds": sum(
+                    float(item.get("timing", {}).get("identity_verification_seconds") or 0.0)
+                    for item in early_attempts
+                ),
+                "telemetry_startup_seconds": sum(
+                    float(item.get("timing", {}).get("telemetry_startup_seconds") or 0.0)
+                    for item in early_attempts
+                ),
+                "wall_minus_target_seconds": (
+                    max(0.0, early_elapsed - target_seconds)
+                    if early_elapsed is not None and not self.resume_mode
+                    else None
+                ),
+            },
+            "final_long_context_acceptance_executed": final_executed,
+            "final_long_context_acceptance_passed": final_passed,
+            "status": status,
+            "evidence_boundary": (
+                "Early/direct-kernel/Nsight evidence does not prove end-to-end performance, resource use, "
+                "output exactness, or long-context behavior; each has its own gate."
+            ),
+            "stages": self.state["stages"],
+        }
+
     def run(self, *, through: str, resume: bool, retry_failed: bool) -> dict[str, Any]:
+        start = time.monotonic()
+        self.resume_mode = resume
         self.prepare(resume=resume)
+        self.preparation_elapsed_seconds = time.monotonic() - start
         assert self.state is not None
         limits = {"early": 2, "production": 3, "acceptance": 4}
         if through not in limits:
             raise core.ValidationError(f"unknown validation phase {through!r}")
-        start = time.monotonic()
         early_elapsed: float | None = None
         for stage in self.manifest["stages"]:
             if core.PURPOSE_ORDER[stage["purpose"]] > limits[through]:
@@ -578,25 +711,12 @@ class StudyRunner:
             self._save_state()
             if stage["purpose"] == "kernel_screen":
                 early_elapsed = time.monotonic() - start
-        final_gate = next(item for item in self.manifest["stages"] if item["purpose"] == "long_context_acceptance")
-        final_passed = self.state["stages"].get(final_gate["id"], {}).get("status") == "completed"
-        summary = {
-            "study_id": self.manifest["study"]["id"],
-            "artifact_root": str(self.study_root),
-            "through": through,
-            "early_elapsed_seconds": early_elapsed,
-            "early_target_seconds": self.manifest["study"]["early_decision_target_seconds"],
-            "final_long_context_acceptance_completed": final_passed,
-            "status": "acceptance_complete" if final_passed else (
-                "production_confirmation_only_not_final_acceptance"
-                if through == "production"
-                else "early_screen_only_not_production_or_final_acceptance"
-            ),
-            "evidence_boundary": (
-                "Early/direct-kernel/Nsight evidence does not prove end-to-end performance, resource use, "
-                "output exactness, or long-context behavior; each has its own gate."
-            ),
-            "stages": self.state["stages"],
-        }
+            if report["status"] != "passed":
+                summary = self._summary(through, early_elapsed)
+                core.write_json_atomic(self.study_root / "summary.json", summary)
+                raise core.ValidationError(
+                    f"stage {stage['id']} executed but is not acceptable: {report['status']}"
+                )
+        summary = self._summary(through, early_elapsed)
         core.write_json_atomic(self.study_root / "summary.json", summary)
         return summary
