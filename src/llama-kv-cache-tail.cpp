@@ -324,7 +324,9 @@ llama_kv_tail_storage_plan llama_kv_tail_storage_plan_for(
         result.effective_tokens = 0;
         return result;
     }
-    if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16) {
+    if (request.exact_type != GGML_TYPE_F16 && request.exact_type != GGML_TYPE_BF16 &&
+            !(request.same_format_gpu_window && request.exact_type == request.requested_body_type_k &&
+              request.exact_type == request.requested_body_type_v && request.exact_type == GGML_TYPE_Q8_0)) {
         throw std::invalid_argument("standard KV tail type must be F16 or BF16");
     }
 

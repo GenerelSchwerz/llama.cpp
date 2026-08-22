@@ -295,6 +295,7 @@ struct llama_kv_tail_storage_request {
     bool compact_current_source_capable = false;
     bool compact_ordered_commit_capable = false;
     bool full_window_body_can_be_omitted = false;
+    bool same_format_gpu_window = false;
 };
 
 struct llama_kv_tail_storage_plan {

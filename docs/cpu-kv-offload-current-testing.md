@@ -49,6 +49,7 @@ The published KV source contains these controls:
 | `--kv-cpu-pinned` | Use supported accelerator-visible pinned host buffers for host KV. |
 | `--recurrent-state-offload` | Keep supported hybrid recurrent state on the accelerator while attention KV remains on the host. |
 | `--kv-gpu-layers N` | Keep the first `N` target-owned attention-KV layers on the accelerator. |
+| `--kv-gpu-window N` | Experimental, default-off CUDA Q8_0/Q8_0 prototype (`256 <= N < n_ctx`): retain the newest `N` same-format rows per layer in device memory and omit those rows from mapped pinned-host body reads. The full host body remains authoritative for state and rollback. |
 | `--spec-draft-kv-gpu-layers N` | Override target placement for independently owned draft KV; omission inherits and zero explicitly selects host placement. |
 | `--phase-aware-workspace` | Share and resize sequential target/MTP compute backing between prompt and generation phases. |
 | `--live-context-workspace` | Independently and opt-in, bound supported standard-attention graph reservations by padded live physical KV extent. |
@@ -75,6 +76,25 @@ command. Live-context source and its preset/generated argument documentation
 remain owned by this PR 8 branch until it lands. See the evidence index for
 the exact PR identities.
 
+The `--kv-gpu-window` source in this experimental worktree is not yet a
+published or measured result. It is intentionally narrower than general
+bounded host-KV staging: it requires standard non-SWA attention, CUDA Flash
+Attention, operation offload, `--no-kv-offload`, `--kv-cpu-pinned`, one
+sequence, a default target context, and no separate precision tail,
+layer-residency policy, or tensor split. Every attention layer must resolve to
+the same CUDA registry device 0. Its first edition requires Q8_0/Q8_0 and
+`256 <= N < n_ctx`, keeps the complete canonical body in pinned host RAM, and
+adds a same-format Q8_0 device suffix; therefore it
+deduplicates repeated host-to-device traffic, not system-RAM allocation. Do not
+add it to the canonical commands below until its build, exactness, state, and
+matched A/B/A gates have passed and an experiment entry owns the evidence.
+The current transport-correctness milestone intentionally retains a temporary
+packed-body capacity based on the complete `kv_size`. Bounding that capacity by
+the cold region (`kv_size - N`, with required alignment and reserve) remains a
+separate next implementation and measurement milestone; the first authorized
+focused debug/correctness smoke has completed, but it does not supply the
+matched evidence required for that optimization.
+
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or
 disable `--phase-aware-workspace` without reducing the all-logits capacity the
@@ -96,7 +116,7 @@ command. Express llama worker placement with `--cpu-range`,
 native-Q8-composed manifests and commands are archived with their source
 branch and are not current KV-base templates.
 
-## Current host and inputs
+## Published reference host and inputs
 
 - Experimental worktree: `/home/gencoolpc/beellama-kv-offload`, branch
   `exp/kv-cpu-offload`.
@@ -117,6 +137,37 @@ branch and are not current KV-base templates.
   `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
 
 These paths describe the current benchmark host, not portable defaults.
+
+## Current GPU-window PR host and inputs
+
+The isolated `--kv-gpu-window` lane is measured on this local host. Its paths
+and build are intentionally separate from the published reference host above:
+
+- Worktree: `/home/piggidragon/Services/llama.cpp-kv-chunk-exp`, branch
+  `exp/kv-gpu-window`.
+- CUDA build: `build-cuda-kv-window`, Release, native CPU, CUDA
+  FlashAttention, compute architecture 89, default quant-pair matrix.
+- GPU: NVIDIA GeForce RTX 4070, 11,902 MiB usable process memory, compute
+  capability 8.9. The current kernel module reports driver 610.57.04.
+- CPU: Intel Core i5-13400F, 10 cores and 16 logical CPUs. Decode workers use
+  logical CPUs 0-2 through `-C 0x7 --cpu-strict 1`.
+- System memory: 31 GiB RAM and 31 GiB swap.
+- Model:
+  `/home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf`,
+  10,319,907,904 bytes, SHA-256
+  `04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`.
+- The deterministic PPL input is selected and hashed in the owning experiment
+  before use; it is not inherited from the published reference host.
+
+For this target-only window experiment, use fresh `llama-bench` processes and
+vary only `--kv-gpu-window 0` versus the selected candidate window. The common
+performance shape is `-p 512 -n 64`, depths 4096 and 30000, `-b 512 -ub 256`,
+Q8_0/Q8_0, full model offload, CPU-pinned host KV, and no target KV layers
+resident by layer policy. Run A/B/A under the complete GPU lock, retain JSONL
+and progress logs, and sample process RSS plus process VRAM inside the same lock
+owner. A direct benchmark is the performance/resource gate; deterministic
+server output, PPL, state, and prompt-cache tests remain separate correctness
+gates.
 
 ## Clean-process and GPU-serialization contract
 

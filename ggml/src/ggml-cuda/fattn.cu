@@ -363,9 +363,11 @@ bool ggml_cuda_flash_attn_ext_tail_supported(
         ggml_type body_k, ggml_type body_v, ggml_type tail_k, ggml_type tail_v, int64_t d_k, int64_t d_v) {
     const bool body_supported = ggml_cuda_fattn_pair_compiled(body_k, body_v) ||
         (body_k == GGML_TYPE_IQ4_NL && body_v == GGML_TYPE_IQ4_NL);
+    const auto tail_type_supported = [](ggml_type type) {
+        return type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 || type == GGML_TYPE_Q8_0;
+    };
     return body_supported &&
-        (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
-        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
+        tail_type_supported(tail_k) && tail_type_supported(tail_v) &&
         ggml_cuda_fattn_pair_compiled(tail_k, tail_v) &&
         d_k > 0 && d_k <= 512 && d_v > 0 && d_v <= 512;
 }
@@ -670,9 +672,9 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     ggml_tensor q = *dst->src[0];
     ggml_cuda_tail_make_contiguous(q, q.ne[0], qo->ne[0], q.ne[2], qo->ne[1], sizeof(float));
     ggml_tensor k = *kt;
-    ggml_cuda_tail_make_contiguous(k, k.ne[0], compute_stride, k.ne[2], qo->ne[1], ggml_type_size(k.type));
+    ggml_cuda_tail_make_contiguous_type(k, k.ne[0], compute_stride, k.ne[2], qo->ne[1]);
     ggml_tensor v = *vt;
-    ggml_cuda_tail_make_contiguous(v, v.ne[0], compute_stride, v.ne[2], qo->ne[1], ggml_type_size(v.type));
+    ggml_cuda_tail_make_contiguous_type(v, v.ne[0], compute_stride, v.ne[2], qo->ne[1]);
     ggml_tensor mask = *dst->src[7];
     ggml_cuda_tail_make_contiguous(mask, compute_stride, qo->ne[0], 1, qo->ne[1], sizeof(half));
     ggml_tensor pass = *dst;

@@ -454,6 +454,8 @@ extern "C" {
         GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN = 4,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
         GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
+        // Slot 7 is reserved by CUDA's private FORCE_VEC hint.
+        GGML_FLASH_ATTN_EXT_OP_PARAM_GPU_KV_WINDOW = 8,
     };
 
     enum ggml_flash_attn_ext_kvarn_domain {
@@ -2517,6 +2519,12 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_kv_tail_history_slots(
             struct ggml_tensor * a,
             int32_t              history_slots);
+
+    // The body K/V inputs are CUDA-mapped pinned-host tensors. The attached
+    // compact tail is device-resident and run_desc must contain a packed body
+    // map, allowing the scheduler/backend to transfer only non-tail rows.
+    GGML_API void ggml_flash_attn_ext_set_gpu_kv_window(
+            struct ggml_tensor * a);
 
     GGML_API struct ggml_tensor * ggml_kv_tail_attention_merge(
             struct ggml_context * ctx,

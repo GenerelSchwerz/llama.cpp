@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-kv-cache-kvarn.h"
+#include "llama-kv-cache-placement.h"
 #include "llama-kv-cache-tail.h"
 #include "llama-kv-tail-request.h"
 #include "llama-kvarn.h"
@@ -303,8 +304,9 @@ llama_context::llama_context(
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
+    cparams.kv_gpu_window           = params.kv_gpu_window;
     cparams.offload_attn_compute    = params.offload_kqv ||
-        (params.op_offload && (params.kv_cpu_pinned || params.kv_gpu_layers > 0));
+        (params.op_offload && (params.kv_cpu_pinned || params.kv_gpu_layers > 0 || params.kv_gpu_window > 0));
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -445,7 +447,8 @@ llama_context::llama_context(
                     swa_policy.native_exact ? "native_exact" : "overlay");
         }
     }
-    if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0) &&
+    if ((cparams.kv_tail_tokens > 0 || cparams.kv_tail_tokens_swa > 0 ||
+            cparams.kv_gpu_window > 0) &&
             cparams.kv_tail_rollback_tokens == 0) {
         // The common capability probe removes one suffix token. Compact
         // transformer caches retain that row explicitly instead of relying on
@@ -4534,6 +4537,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_gpu_layers               =*/ 0,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
+        /*.kv_gpu_window               =*/ 0,
     };
 
     return result;
@@ -4621,6 +4625,66 @@ llama_context * llama_init_from_model(
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && model->arch == LLM_ARCH_GROK) {
         LLAMA_LOG_WARN("%s: flash_attn is not compatible with Grok - forcing off\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    }
+
+    if (params.kv_gpu_window > 0) {
+        const bool standard_attention = model->hparams.n_layer_kv() > 0 &&
+                !model->hparams.is_mla() && !model->hparams.is_swa_any() &&
+                model->arch != LLM_ARCH_DEEPSEEK32 && model->arch != LLM_ARCH_DFLASH;
+        const uint32_t resolved_n_ctx = params.n_ctx > 0 ? params.n_ctx : model->hparams.n_ctx_train;
+        const llama_kv_gpu_window_requirements requirements = {
+            /*.requested_tokens        =*/ params.kv_gpu_window,
+            /*.n_ctx                   =*/ resolved_n_ctx,
+            /*.n_seq_max               =*/ params.n_seq_max,
+            /*.kv_gpu_layers           =*/ params.kv_gpu_layers,
+            /*.default_context         =*/ params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
+            /*.standard_attention      =*/ standard_attention,
+            /*.kv_offload              =*/ params.offload_kqv,
+            /*.pinned_host             =*/ params.kv_cpu_pinned,
+            /*.op_offload              =*/ params.op_offload,
+            /*.flash_attn              =*/ params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_ENABLED,
+            /*.q8_0_kv                 =*/ params.type_k == GGML_TYPE_Q8_0 && params.type_v == GGML_TYPE_Q8_0,
+            /*.kvarn_disabled          =*/ params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED,
+            /*.precision_tail_disabled =*/ params.kv_tail_tokens == 0 &&
+                    !params.kv_tail_config && !params.kv_tail_request,
+            /*.tensor_split            =*/ model->split_mode() == LLAMA_SPLIT_MODE_TENSOR,
+        };
+        const auto config_error = llama_kv_gpu_window_validate_config(requirements);
+        if (config_error != LLAMA_KV_GPU_WINDOW_CONFIG_OK) {
+            LLAMA_LOG_ERROR("%s: cannot enable --kv-gpu-window=%u: %s\n", __func__,
+                    params.kv_gpu_window, llama_kv_gpu_window_config_error_string(config_error));
+            return nullptr;
+        }
+
+        std::vector<llama_kv_gpu_window_device_placement> placements;
+        placements.reserve(model->hparams.n_layer_kv());
+        for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+            if (!model->hparams.has_kv(il)) {
+                continue;
+            }
+            auto * dev = model->dev_layer(il);
+            auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            size_t registry_index = std::numeric_limits<size_t>::max();
+            if (reg) {
+                for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+                    if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                        registry_index = i;
+                        break;
+                    }
+                }
+            }
+            placements.push_back({
+                reinterpret_cast<uintptr_t>(dev),
+                registry_index,
+                reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0,
+            });
+        }
+        const auto device_error = llama_kv_gpu_window_validate_devices(placements);
+        if (device_error != LLAMA_KV_GPU_WINDOW_DEVICE_OK) {
+            LLAMA_LOG_ERROR("%s: cannot enable --kv-gpu-window=%u: %s\n", __func__,
+                    params.kv_gpu_window, llama_kv_gpu_window_device_error_string(device_error));
+            return nullptr;
+        }
     }
 
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {

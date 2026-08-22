@@ -317,6 +317,25 @@ int main() {
     CHECK(storage.compact_rollback_bytes == uint64_t(8)*16384);
     CHECK(storage.physical_body_rows == 1536);
 
+    auto gpu_window = compact_partial;
+    gpu_window.requested_body_type_k = GGML_TYPE_Q8_0;
+    gpu_window.requested_body_type_v = GGML_TYPE_Q8_0;
+    gpu_window.exact_type = GGML_TYPE_Q8_0;
+    gpu_window.same_format_gpu_window = true;
+    storage = llama_kv_tail_storage_plan_for(gpu_window);
+    CHECK(storage.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY);
+    CHECK(storage.shadow_type_k == GGML_TYPE_Q8_0);
+    CHECK(storage.shadow_type_v == GGML_TYPE_Q8_0);
+
+    gpu_window.same_format_gpu_window = false;
+    bool quantized_tail_rejected = false;
+    try {
+        (void) llama_kv_tail_storage_plan_for(gpu_window);
+    } catch (const std::invalid_argument &) {
+        quantized_tail_rejected = true;
+    }
+    CHECK(quantized_tail_rejected);
+
     auto compact_partial_larger_ubatch = compact_partial;
     compact_partial_larger_ubatch.n_ubatch = 1024;
     const auto compact_larger_ubatch_plan = llama_kv_tail_storage_plan_for(compact_partial_larger_ubatch);

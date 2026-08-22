@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -39,3 +40,64 @@ std::vector<int64_t> llama_tensor_split_counts(
         int64_t n_elements,
         const std::vector<float> & weights,
         int64_t granularity);
+
+enum llama_kv_gpu_window_config_error {
+    LLAMA_KV_GPU_WINDOW_CONFIG_OK,
+    LLAMA_KV_GPU_WINDOW_CONFIG_TOO_SMALL,
+    LLAMA_KV_GPU_WINDOW_CONFIG_NOT_SMALLER_THAN_CONTEXT,
+    LLAMA_KV_GPU_WINDOW_CONFIG_CONTEXT_TYPE,
+    LLAMA_KV_GPU_WINDOW_CONFIG_ATTENTION_LAYOUT,
+    LLAMA_KV_GPU_WINDOW_CONFIG_KV_OFFLOAD,
+    LLAMA_KV_GPU_WINDOW_CONFIG_PINNED_HOST,
+    LLAMA_KV_GPU_WINDOW_CONFIG_OP_OFFLOAD,
+    LLAMA_KV_GPU_WINDOW_CONFIG_GPU_LAYERS,
+    LLAMA_KV_GPU_WINDOW_CONFIG_SEQUENCE_COUNT,
+    LLAMA_KV_GPU_WINDOW_CONFIG_FLASH_ATTN,
+    LLAMA_KV_GPU_WINDOW_CONFIG_CACHE_TYPES,
+    LLAMA_KV_GPU_WINDOW_CONFIG_KVARN,
+    LLAMA_KV_GPU_WINDOW_CONFIG_PRECISION_TAIL,
+    LLAMA_KV_GPU_WINDOW_CONFIG_TENSOR_SPLIT,
+};
+
+struct llama_kv_gpu_window_requirements {
+    uint32_t requested_tokens;
+    uint32_t n_ctx;
+    uint32_t n_seq_max;
+    uint32_t kv_gpu_layers;
+    bool default_context;
+    bool standard_attention;
+    bool kv_offload;
+    bool pinned_host;
+    bool op_offload;
+    bool flash_attn;
+    bool q8_0_kv;
+    bool kvarn_disabled;
+    bool precision_tail_disabled;
+    bool tensor_split;
+};
+
+llama_kv_gpu_window_config_error llama_kv_gpu_window_validate_config(
+        const llama_kv_gpu_window_requirements & requirements);
+
+const char * llama_kv_gpu_window_config_error_string(
+        llama_kv_gpu_window_config_error error);
+
+enum llama_kv_gpu_window_device_error {
+    LLAMA_KV_GPU_WINDOW_DEVICE_OK,
+    LLAMA_KV_GPU_WINDOW_DEVICE_NO_ATTENTION_LAYER,
+    LLAMA_KV_GPU_WINDOW_DEVICE_NOT_CUDA,
+    LLAMA_KV_GPU_WINDOW_DEVICE_NOT_PRIMARY,
+    LLAMA_KV_GPU_WINDOW_DEVICE_MULTIPLE,
+};
+
+struct llama_kv_gpu_window_device_placement {
+    uintptr_t identity;
+    size_t registry_index;
+    bool is_cuda;
+};
+
+llama_kv_gpu_window_device_error llama_kv_gpu_window_validate_devices(
+        const std::vector<llama_kv_gpu_window_device_placement> & devices);
+
+const char * llama_kv_gpu_window_device_error_string(
+        llama_kv_gpu_window_device_error error);

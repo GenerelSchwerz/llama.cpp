@@ -5020,3 +5020,42 @@ ubatch-matched MTP protocol (Characterization 025's caveat) to get a
 current-provenance number is future work, not expected to change the
 qualitative finding since this entry's own DSpark half of the pair already
 used the unaffected, always-current DSpark configuration.
+
+## Experiment 022: mapped-host Q8 GPU-window transport milestone
+
+Status: revised implementation milestone; performance and full correctness
+disposition pending. The exact source base is
+`f6341a15779eb58fe6ad9e1b890e331c32b676c7`; the candidate is the implementation
+commit containing this entry. This entry is intentionally extended rather than
+duplicated when matched evidence is accepted.
+
+The candidate adds the default-off `--kv-gpu-window N` lane for the narrow
+single-sequence CUDA Q8_0/Q8_0 host-KV configuration. The complete canonical KV
+body remains in CUDA-mapped pinned host memory for state, rollback, and prompt
+cache ownership. A same-format device suffix retains the newest `N` rows, and
+the split attention route excludes those rows from the mapped-host body read.
+This milestone therefore tests transport deduplication; it does not claim
+system-RAM deduplication.
+
+Release CPU and CUDA builds completed on the RTX 4070 host described by the
+current protocol. Six focused parser, placement, tail, static, and scheduled
+graph CTests passed on both backends, as did the required seeded Q8_0
+segmented-current backend cases at 256 and 257 rows. Broader practical CTest
+sets passed 87/87 on CPU and CUDA. The real
+`Qwen3.8-27B-UD-IQ2_M.gguf` smoke completed prompt plus decode for window 0,
+256, 257, and 1024. Those single-process, single-repetition values are not
+performance evidence.
+
+The model smoke exposed and closed a scheduler correctness gap: bufferless
+view/permute chains had hidden the mapped-host owner and triggered a full body
+copy to CUDA. The scheduled regression now reproduces that graph shape and
+requires preservation of the mapped K/V sources. The temporary packed-body
+capacity is still based on full `kv_size`; cold-region capacity bounding is a
+separate follow-up milestone.
+
+### Disposition
+
+Revised/pending. The transport path is retained for matched A/B/A measurement,
+but no throughput, VRAM, pinned-memory, PPL, deterministic-output, state, or
+prompt-cache claim is accepted yet. Publication requires those gates on a
+committed candidate binary.

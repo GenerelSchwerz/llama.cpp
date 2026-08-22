@@ -751,9 +751,9 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
             // [sources,queries] graph gather despite the direct path already
             // supporting the stored body representation.
             const bool body_ok = row_convertible(body_k) && row_convertible(body_v);
-            const bool tail_ok =
-                (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
-                (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+            // The scalar standard attached-tail oracle converts complete tail
+            // rows through the same ordinary type traits as body rows.
+            const bool tail_ok = row_convertible(tail_k) && row_convertible(tail_v);
             const bool dims_ok = d_k == d_v &&
                 (d_k == 128 || d_k == 256 || d_k == 512);
             return body_ok && tail_ok && dims_ok;

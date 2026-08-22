@@ -1894,6 +1894,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.phase_aware_workspace = params.phase_aware_workspace;
     cparams.live_context_workspace = params.live_context_workspace;
     cparams.kv_gpu_layers     = (uint32_t) params.kv_gpu_layers;
+    cparams.kv_gpu_window     = (uint32_t) params.kv_gpu_window;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;

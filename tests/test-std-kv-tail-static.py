@@ -385,6 +385,9 @@ def main() -> None:
     ggml_header = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
     ggml_core = (ROOT / "ggml/src/ggml.c").read_text(encoding="utf-8")
+    cpu_backend = (ROOT / "ggml/src/ggml-cpu/ggml-cpu.cpp").read_text(encoding="utf-8")
+    scheduler = (ROOT / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
+    cuda_backend = (ROOT / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     graph = (ROOT / "src/llama-graph.cpp").read_text(encoding="utf-8")
     cache_header = (ROOT / "src/llama-kv-cache.h").read_text(encoding="utf-8")
     route_header = (ROOT / "src/llama-kv-cache-tail.h").read_text(encoding="utf-8")
@@ -435,6 +438,58 @@ def main() -> None:
         raise AssertionError("model graph does not use native tail attention")
     if "ggml_cuda_flash_attn_ext_tail" not in cuda_fattn:
         raise AssertionError("CUDA lacks the native tail-attention dispatch")
+
+    kvarn_cpu_cap = cpu_backend.split(
+        'if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0)', 1
+    )[1].split('if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0', 1)[0]
+    if "row_convertible" in kvarn_cpu_cap or "GGML_TYPE_Q8_0" in kvarn_cpu_cap:
+        raise AssertionError("standard Q8 tail support leaked into the independent KVarN CPU capability")
+    kvarn_cuda_cap = cuda_backend.split(
+        "static bool ggml_backend_cuda_kvarn_tail_attention_supported", 1
+    )[1].split("static bool ggml_backend_cuda_kv_tail_segmented_attention_supported", 1)[0]
+    if kvarn_cuda_cap.count("tail_k == GGML_TYPE_F16") < 2 or \
+            kvarn_cuda_cap.count("tail_v == GGML_TYPE_F16") < 2:
+        raise AssertionError("standard Q8 tail support leaked into the independent KVarN CUDA capability")
+    standard_cpu_cap = cpu_backend.split(
+        'if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0', 1
+    )[1].split('if (strcmp(name, "ggml_backend_set_n_threads") == 0)', 1)[0]
+    if "tail_ok = row_convertible(tail_k) && row_convertible(tail_v)" not in standard_cpu_cap:
+        raise AssertionError("CPU standard attached-tail oracle does not advertise convertible Q8 rows")
+
+    add_tail = ggml_core.split("void ggml_flash_attn_ext_add_kv_tail(", 1)[1].split(
+        "void ggml_flash_attn_ext_set_kv_tail_bodyless(", 1
+    )[0]
+    if "GGML_TYPE_Q8_0" not in add_tail or "ggml_is_quantized" in add_tail:
+        raise AssertionError("standard quantized-tail API is not narrowly limited to Q8_0")
+    if "type == GGML_TYPE_Q8_0" not in cuda_fattn:
+        raise AssertionError("CUDA standard tail capability does not explicitly admit Q8_0")
+
+    mapped_alloc = cuda_backend.split(
+        "ggml_backend_cuda_mapped_host_buffer_type_alloc_buffer", 1
+    )[1].split("static ggml_backend_buffer_type_t ggml_backend_cuda_mapped_host_buffer_type()", 1)[0]
+    if mapped_alloc.find("cudaHostGetDevicePointer") > mapped_alloc.find("ggml_backend_buffer_init"):
+        raise AssertionError("mapped-host device alias is not validated before buffer publication")
+    for required in (
+        "ggml_cuda_mapped_host_buffer_context",
+        "cudaHostAllocMapped",
+        "cudaHostGetDevicePointer",
+        "ggml_cuda_mapped_host_buffer_device_base",
+    ):
+        if required not in mapped_alloc:
+            raise AssertionError(f"CUDA mapped-host allocation lacks {required}")
+    if scheduler.count("ggml_backend_sched_allows_mapped_host_kv_src") < 3:
+        raise AssertionError("scheduler does not preserve mapped K/V sources in both split phases")
+
+    graph_test = (ROOT / "tests/test-std-kv-tail-graph.cpp").read_text(encoding="utf-8")
+    for required in (
+        "test_same_format_gpu_window_mapped_scheduler",
+        "ggml_backend_buft_alloc_buffer(mapped_buft, 0)",
+        "ggml_flash_attn_ext_set_gpu_kv_window(out)",
+        "scheduler copied the mapped Q8_0 body",
+        "same-format mapped GPU-window RMSE",
+    ):
+        if required not in graph_test:
+            raise AssertionError(f"mapped-host scheduler integration coverage lacks {required}")
 
     for required in (
         "ggml_kv_tail_attention_merge_segmented",

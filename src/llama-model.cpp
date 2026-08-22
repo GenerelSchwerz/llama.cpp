@@ -2407,11 +2407,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                 /* filter_attn       */ std::move(filter_attn),
                                 /* filter_recr       */ std::move(filter_recr),
                                 /* n_ubatch          */ cparams.n_ubatch,
-                                /* tail_tokens       */ params.kv_tail_tokens,
-                                /* tail_type         */ params.kv_tail_type,
-                                /* tail requested    */ params.kv_tail_tokens_requested,
+                                /* tail_tokens       */ cparams.kv_gpu_window > 0 ? cparams.kv_gpu_window : params.kv_tail_tokens,
+                                /* tail_type         */ cparams.kv_gpu_window > 0 ? params.type_k : params.kv_tail_type,
+                                /* tail requested    */ cparams.kv_gpu_window > 0 ? cparams.kv_gpu_window : params.kv_tail_tokens_requested,
                                 /* rollback reserve  */ params.kv_tail_rollback_tokens,
-                                /* attn_n_gpu_layers */ cparams.kv_gpu_layers);
+                                /* attn_n_gpu_layers */ cparams.kv_gpu_layers,
+                                /* attn_gpu_window   */ cparams.kv_gpu_window > 0);
                         }
                     }
                 } else {
@@ -2559,15 +2560,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     nullptr,
                                     cparams.n_ubatch,
-                                    params.kv_tail_tokens,
-                                    params.kv_tail_type,
-                                    params.kv_tail_tokens_requested,
+                                    cparams.kv_gpu_window > 0 ? cparams.kv_gpu_window : params.kv_tail_tokens,
+                                    cparams.kv_gpu_window > 0 ? params.type_k : params.kv_tail_type,
+                                    cparams.kv_gpu_window > 0 ? cparams.kv_gpu_window : params.kv_tail_tokens_requested,
                                     false,
                                     params.kv_tail_rollback_tokens,
                                     /* tail_visibility_window */ 0,
                                     cparams.kv_cpu_pinned,
                                     cparams.kv_gpu_layers,
-                                    cparams.offload_attn_compute);
+                                    cparams.offload_attn_compute,
+                                    cparams.kv_gpu_window > 0);
                         }
                     }
                 }

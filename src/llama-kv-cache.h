@@ -133,7 +133,8 @@ public:
                  uint32_t   tail_visibility_window = 0,
                      bool   cpu_pinned = false,
                  uint32_t   gpu_resident_layers = 0,
-                     bool   offload_attn_compute = false);
+                     bool   offload_attn_compute = false,
+                     bool   gpu_window = false);
 
     ~llama_kv_cache() = default;
 
@@ -259,6 +260,7 @@ public:
         return tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ||
                 tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT;
     }
+    bool is_gpu_window() const { return gpu_window; }
     uint32_t get_tail_attention_stride(uint32_t n_query_tokens = 0) const;
     uint32_t get_tail_body_execution_stride() const;
     uint32_t get_tail_body_execution_rows(int32_t il) const;
@@ -414,6 +416,7 @@ private:
     // deep suffix removal therefore only shrinks coverage to PARTIAL until the
     // tail refills, so no persistent rollback reserve is required.
     const bool tail_metadata_only = false;
+    const bool gpu_window = false;
     ggml_type tail_type = GGML_TYPE_COUNT;
     llama_kv_tail_storage_plan tail_plan {
         LLAMA_KV_TAIL_STORAGE_DISABLED,
@@ -643,6 +646,7 @@ public:
     virtual uint32_t get_tail_body_execution_stride() const;
     virtual uint32_t get_tail_body_execution_rows(int32_t il) const;
     virtual bool has_compact_tail() const;
+    virtual bool is_gpu_window() const;
     virtual bool has_kv_body() const;
     virtual bool has_kv_body(int32_t il) const;
     virtual bool has_tail_current(int32_t il) const;

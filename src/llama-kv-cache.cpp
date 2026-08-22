@@ -54,6 +54,7 @@ using backend_kv_tail_attention_supported_t = bool (*)(
 struct kv_tail_backend_probe_spec {
     uint32_t layer_id;
     ggml_backend_buffer_type_t buft;
+    ggml_backend_buffer_type_t tail_buft;
     ggml_backend_dev_t execution_backend;
     ggml_type body_type_k;
     ggml_type body_type_v;
@@ -101,8 +102,9 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     }
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     auto * storage_dev = llama_kv_cache_get_backend(spec.buft);
+    auto * tail_storage_dev = llama_kv_cache_get_backend(spec.tail_buft ? spec.tail_buft : spec.buft);
     auto * execution_dev = spec.execution_backend;
-    if (!storage_dev || !execution_dev || !cpu) {
+    if (!storage_dev || !tail_storage_dev || !execution_dev || !cpu) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
 
@@ -131,6 +133,9 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     const auto storage_supports = [&](ggml_tensor * op) {
         return op && ggml_backend_dev_supports_op(storage_dev, op);
     };
+    const auto tail_storage_supports = [&](ggml_tensor * op) {
+        return op && ggml_backend_dev_supports_op(tail_storage_dev, op);
+    };
     const auto execution_supports = [&](ggml_tensor * op) {
         return op && ggml_backend_dev_supports_op(execution_dev, op);
     };
@@ -144,14 +149,14 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     if (segmented) {
         requirements.write_k = storage_supports(ggml_set_rows(
                 ctx.get(), body_k, src_k, idx64)) &&
-            storage_supports(ggml_set_rows_ordered(
+            tail_storage_supports(ggml_set_rows_ordered(
                 ctx.get(), tail_k, src_k, tail_idx64, commit_dependency));
     } else if (fused_k) {
         requirements.write_k = storage_supports(ggml_set_rows_with_shadow(
                 ctx.get(), body_k, src_k, idx64, tail_k, tail_idx64));
     } else {
         requirements.write_k = storage_supports(ggml_set_rows(ctx.get(), body_k, src_k, idx64)) &&
-                storage_supports(ggml_set_rows(ctx.get(), tail_k, src_k, tail_idx64));
+                tail_storage_supports(ggml_set_rows(ctx.get(), tail_k, src_k, tail_idx64));
     }
 
     const bool fused_v = !v_transposed && ggml_is_quantized(spec.body_type_v) &&
@@ -159,7 +164,7 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     if (segmented && !v_transposed) {
         requirements.write_v = storage_supports(ggml_set_rows(
                 ctx.get(), body_v, src_v, idx64)) &&
-            storage_supports(ggml_set_rows_ordered(
+            tail_storage_supports(ggml_set_rows_ordered(
                 ctx.get(), tail_v, src_v, tail_idx64, commit_dependency));
     } else if (fused_v) {
         requirements.write_v = storage_supports(ggml_set_rows_with_shadow(
@@ -177,7 +182,20 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
             body_write = ggml_set_rows(ctx.get(), body_v, src_v, idx64);
         }
         requirements.write_v = storage_supports(body_write) &&
-                storage_supports(ggml_set_rows(ctx.get(), tail_v, src_v, tail_idx64));
+                tail_storage_supports(ggml_set_rows(ctx.get(), tail_v, src_v, tail_idx64));
+    }
+
+    requirements.native_attention = flash_attn && !spec.explicit_bias &&
+            backend_supports_native_kv_tail(execution_dev,
+                    spec.body_type_k, spec.body_type_v, exact_k, exact_v,
+                    spec.head_dim_k, spec.head_dim_v, segmented);
+    if (ggml_is_quantized(exact_k) || ggml_is_quantized(exact_v)) {
+        // Quantized same-format GPU windows are native-only. GET_ROWS cannot
+        // produce a quantized destination, so do not construct the generic
+        // oracle after the native capability has already been established.
+        requirements.gather_k = false;
+        requirements.gather_v = false;
+        return llama_kv_tail_select_route(requirements);
     }
 
     requirements.gather_k = read_supports(ggml_get_rows_as(ctx.get(), tail_k, idx32, exact_k));
@@ -214,10 +232,6 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     auto * merged = ggml_add(ctx.get(), body_value, exact_value);
     requirements.generic_merge = execution_supports(scores) &&
             execution_supports(normalized) && execution_supports(merged);
-    requirements.native_attention = flash_attn && !spec.explicit_bias &&
-            backend_supports_native_kv_tail(execution_dev,
-                    spec.body_type_k, spec.body_type_v, exact_k, exact_v,
-                    spec.head_dim_k, spec.head_dim_v, segmented);
     return llama_kv_tail_select_route(requirements);
 }
 
@@ -345,6 +359,16 @@ ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
     return ggml_backend_cpu_buffer_type();
 }
 
+static ggml_backend_buffer_type_t llama_kv_cache_get_mapped_host_buft(
+        const llama_model & model, uint32_t il) {
+    using get_mapped_host_buft_t = ggml_backend_buffer_type_t (*)();
+    auto * dev = model.dev_layer(il);
+    auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    const auto fn = reg ? reinterpret_cast<get_mapped_host_buft_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_host_buffer_type")) : nullptr;
+    return fn ? fn() : nullptr;
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -415,11 +439,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_visibility_window,
                      bool   cpu_pinned,
                  uint32_t   gpu_resident_layers,
-                     bool   offload_attn_compute) :
+                     bool   offload_attn_compute,
+                     bool   gpu_window) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
-    tail_metadata_only(tail_metadata_only),
+    tail_metadata_only(tail_metadata_only), gpu_window(gpu_window),
     tail_type(tail_type_requested), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
@@ -438,6 +463,12 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+
+    if (gpu_window && (offload || !cpu_pinned || gpu_resident_layers > 0 || n_seq_max != 1 ||
+            n_swa > 0 || v_trans || other || tail_tokens < 256 ||
+            tail_type_requested != type_k || type_k != type_v || type_k != GGML_TYPE_Q8_0)) {
+        throw std::invalid_argument("GPU KV window received an unsupported cache layout");
+    }
 
     std::vector<int32_t> layer_share_ids(n_layer, -1);
     std::vector<ggml_backend_buffer_type_t> layer_buft(n_layer, nullptr);
@@ -459,7 +490,12 @@ llama_kv_cache::llama_kv_cache(
         const bool layer_offload = offload || n_gpu_resident < gpu_resident_layers;
         layer_buft[il] = layer_offload ?
                 ggml_backend_dev_buffer_type(model.dev_layer(il)) :
+                gpu_window ? llama_kv_cache_get_mapped_host_buft(model, il) :
                 llama_kv_cache_get_host_buft(model, il, cpu_pinned);
+        if (gpu_window && layer_buft[il] == nullptr) {
+            throw std::runtime_error(format(
+                    "GPU KV window layer %u has no CUDA mapped-host buffer type", il));
+        }
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
@@ -474,7 +510,8 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
 
     if (tail_tokens > 0 && tail_type != GGML_TYPE_COUNT &&
-            tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16) {
+            tail_type != GGML_TYPE_F16 && tail_type != GGML_TYPE_BF16 &&
+            !(gpu_window && tail_type == type_k && type_k == type_v && tail_type == GGML_TYPE_Q8_0)) {
         throw std::invalid_argument("standard KV tail type must be F16 or BF16");
     }
     const bool tail_type_auto = tail_type == GGML_TYPE_COUNT;
@@ -598,8 +635,20 @@ llama_kv_cache::llama_kv_cache(
             if (!execution_backend) {
                 execution_backend = storage_backend;
             }
+            const auto tail_buft = gpu_window ?
+                    ggml_backend_dev_buffer_type(model.dev_layer(il)) : route_buft;
+            if (gpu_window) {
+                auto * reg = ggml_backend_dev_backend_reg(execution_backend);
+                auto * primary = reg && ggml_backend_reg_dev_count(reg) > 0 ?
+                        ggml_backend_reg_dev_get(reg, 0) : nullptr;
+                if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0 ||
+                        execution_backend != primary || llama_kv_cache_get_backend(tail_buft) != execution_backend) {
+                    throw std::invalid_argument(format(
+                            "GPU KV window layer %u requires one primary CUDA execution/tail device", il));
+                }
+            }
             route_probe_specs.push_back({
-                    il, route_buft, execution_backend, actual_type_k, actual_type_v,
+                    il, route_buft, tail_buft, execution_backend, actual_type_k, actual_type_v,
                     int64_t(hparams.n_embd_head_k(il)),
                     int64_t(has_v ? hparams.n_embd_head_v(il) : 0), has_v,
                     model.self_attention_uses_explicit_bias(il),
@@ -646,6 +695,7 @@ llama_kv_cache::llama_kv_cache(
         true,
         true,
         n_swa > 0 && !has_shared_layer,
+        gpu_window,
     };
     tail_plan = llama_kv_tail_storage_plan_for(storage_request);
 
@@ -674,7 +724,7 @@ llama_kv_cache::llama_kv_cache(
             const uint32_t body_execution_rows = !has_body ? 0 :
                     tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ?
                         llama_kv_tail_packed_body_stride(
-                                tail_plan.compact_layout.history_stride, 256) :
+                                gpu_window ? kv_size : tail_plan.compact_layout.history_stride, 256) :
                         tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ?
                             tail_plan.layout.arena_stride : 0;
             auto * dev = spec.execution_backend;
@@ -1162,6 +1212,11 @@ llama_kv_cache::llama_kv_cache(
                     "standard KV body layer %u places K and V on different owners; exact-tail routing requires one layer owner",
                     spec.layer_id));
         }
+        if (gpu_window && strcmp(ggml_backend_buft_name(k_buft), "CUDA_MappedHost") != 0) {
+            throw std::runtime_error(format(
+                    "GPU KV window layer %u requires a realized CUDA_MappedHost body, got %s",
+                    spec.layer_id, ggml_backend_buft_name(k_buft)));
+        }
         spec.buft = k_buft;
 
         const bool k_meta = buft_is_meta(k_buft);
@@ -1205,6 +1260,18 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    if (gpu_window) {
+        const auto unsupported = std::find_if(tail_plan.layer_routes.begin(), tail_plan.layer_routes.end(),
+                [](const llama_kv_tail_layer_route & route) {
+                    return route.capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE;
+                });
+        if (unsupported != tail_plan.layer_routes.end()) {
+            throw std::runtime_error(format(
+                    "GPU KV window layer %u requires native CUDA exact-tail attention; selected backend=%s route=%d",
+                    unsupported->layer_id, unsupported->backend.c_str(), int(unsupported->capability.route)));
+        }
+    }
+
     if (has_tail_overlay() && !tail_metadata_only) {
         finalize_tail_overlay_metadata();
 
@@ -1237,8 +1304,10 @@ llama_kv_cache::llama_kv_cache(
             if (!layer_has_quant) {
                 continue;
             }
-            const auto k_buft = tensor_buft(layer.k);
-            const auto v_buft = tensor_buft(layer.v);
+            const auto k_buft = gpu_window ?
+                    ggml_backend_dev_buffer_type(model.dev_layer(layer.il)) : tensor_buft(layer.k);
+            const auto v_buft = gpu_window ?
+                    ggml_backend_dev_buffer_type(model.dev_layer(layer.il)) : tensor_buft(layer.v);
             if (tail_plan.shadow_k && (ggml_is_quantized(layer.k->type) ||
                     layer.k->type == GGML_TYPE_F16 || layer.k->type == GGML_TYPE_BF16 || layer.k->type == GGML_TYPE_F32)) {
                 auto * ctx = tail_ctx_for_buft(k_buft);
@@ -1291,8 +1360,15 @@ llama_kv_cache::llama_kv_cache(
                     layer.il, k_owner, v_owner, layer.k_tail != nullptr, layer.v_tail != nullptr);
             ownership.shadow_k_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.k_tail));
             ownership.shadow_v_owner = reinterpret_cast<uintptr_t>(tensor_buft(layer.v_tail));
+            // A GPU window intentionally splits ownership: the complete body is
+            // canonical pinned-host state, while only the compact suffix lives
+            // on the layer device. Ordinary precision tails retain the stricter
+            // same-owner invariant.
             const auto error = llama_kv_tail_validate_layer_ownership(ownership);
-            if (error != LLAMA_KV_TAIL_OWNERSHIP_OK) {
+            const bool expected_split_owner = gpu_window &&
+                    (error == LLAMA_KV_TAIL_OWNERSHIP_SHADOW_K ||
+                     error == LLAMA_KV_TAIL_OWNERSHIP_SHADOW_V);
+            if (error != LLAMA_KV_TAIL_OWNERSHIP_OK && !expected_split_owner) {
                 throw std::runtime_error(format("standard KV tail ownership validation failed for layer %u (error %d)",
                         layer.il, int(error)));
             }
@@ -1312,6 +1388,11 @@ llama_kv_cache::llama_kv_cache(
                 (unsigned long long) tail_plan.physical_body_rows,
                 tail_plan.layout.arena_stride, tail_plan.layout.sink_slots, tail_plan.layout.total_slots,
                 tail_plan.promotion_increment/1024.0/1024.0, tail_plan.overlay_increment/1024.0/1024.0);
+        if (gpu_window) {
+            LLAMA_LOG_INFO("%s: GPU KV window: Q8_0 rows=%u, canonical body=CUDA_MappedHost, "
+                    "device suffix=Q8_0, transfer route=sparse-packed native CUDA\n",
+                    __func__, tail_plan.effective_tokens);
+        }
     }
 
     {
@@ -6652,6 +6733,10 @@ bool llama_kv_cache_context::has_compact_tail() const {
     return kv->has_compact_tail();
 }
 
+bool llama_kv_cache_context::is_gpu_window() const {
+    return kv->is_gpu_window();
+}
+
 bool llama_kv_cache_context::has_kv_body() const {
     return kv->has_kv_body();
 }
@@ -7164,7 +7249,8 @@ bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
         // occupancy or coverage: a graph selected while the cache is small
         // must remain valid at its full physical capacity.  When the complete
         // stream fits, every possible visible-body subset fits as well.
-        if (!llama_kv_tail_sparse_body_capacity_safe(cells.size(), tail_arena_stride)) {
+        const uint32_t body_capacity = gpu_window ? get_tail_body_execution_stride() : tail_arena_stride;
+        if (!llama_kv_tail_sparse_body_capacity_safe(cells.size(), body_capacity)) {
             return false;
         }
     }
@@ -7280,13 +7366,14 @@ void llama_kv_cache::set_input_tail_body_plan(
     GGML_ASSERT(ggml_backend_buffer_is_host(run_desc->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(body_mask->buffer));
     GGML_ASSERT(query_order->ne[1] == run_desc->ne[1]);
+    const uint32_t body_capacity = gpu_window ? get_tail_body_execution_stride() : tail_arena_stride;
     if (body_mask->type == GGML_TYPE_F16) {
         set_input_tail_body_plan_impl(*tail, v_cells, seq_to_stream,
                 static_cast<const int32_t *>(query_order->data), static_cast<int32_t *>(run_desc->data),
                 static_cast<const ggml_fp16_t *>(body_mask->data), ubatch,
                 query_order->ne[0], query_order->ne[1], run_desc->ne[0],
                 body_mask->ne[0], body_mask->ne[1], body_mask->ne[3],
-                attention_stride, tail_arena_stride, n_swa, swa_type, causal_attn);
+                attention_stride, body_capacity, n_swa, swa_type, causal_attn);
     } else {
         GGML_ASSERT(body_mask->type == GGML_TYPE_F32);
         set_input_tail_body_plan_impl(*tail, v_cells, seq_to_stream,
@@ -7294,7 +7381,7 @@ void llama_kv_cache::set_input_tail_body_plan(
                 static_cast<const float *>(body_mask->data), ubatch,
                 query_order->ne[0], query_order->ne[1], run_desc->ne[0],
                 body_mask->ne[0], body_mask->ne[1], body_mask->ne[3],
-                attention_stride, tail_arena_stride, n_swa, swa_type, causal_attn);
+                attention_stride, body_capacity, n_swa, swa_type, causal_attn);
     }
 }
 

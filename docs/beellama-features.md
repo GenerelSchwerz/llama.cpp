@@ -559,6 +559,7 @@ of the phase-aware compute allocator.
 ### Key arguments
 
 - [`--kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
+- [`--kv-gpu-window`](beellama-args.md#cpu-kv-placement)
 - [`--spec-draft-kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
 - [`--kv-cpu-pinned`](beellama-args.md#cpu-kv-placement)
 
@@ -569,9 +570,17 @@ still use `--kv-cpu-pinned` when enabled.
 
 ### Known limitations
 
-Residency is selected per owned layer, not per token window, and there is no
-automatic VRAM sizing. The option does not create independent placement for a
-cache that the draft context shares with another owner.
+Layer residency has no automatic VRAM sizing. The separate experimental
+`--kv-gpu-window N` path adds token-window residency only for a narrow CUDA,
+single-sequence, standard non-SWA Q8_0/Q8_0 target configuration with
+`256 <= N < n_ctx`. It requires operation offload and every attention layer to
+resolve to the same CUDA registry device 0; tensor-split and cross-device
+placements fail closed.
+It retains the complete host body for state and rollback and therefore reduces
+repeated transfer, not host allocation. The initial transport-correctness
+milestone also retains a full-`kv_size` temporary packed-body capacity; bounding
+that temporary capacity by the cold region is a separate milestone. Neither option creates independent
+placement for a cache that the draft context shares with another owner.
 
 The retained Q8/CUDA MTP validation covers pinned-CPU target KV with the
 independently owned draft cache on CUDA, including a 5,000-token stochastic

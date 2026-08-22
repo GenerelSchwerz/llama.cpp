@@ -48,7 +48,8 @@ public:
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   attn_n_gpu_layers = 0);
+                 uint32_t   attn_n_gpu_layers = 0,
+                     bool   attn_gpu_window = false);
 
     llama_memory_hybrid(
         const llama_model & model,

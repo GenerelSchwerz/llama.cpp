@@ -1262,7 +1262,10 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
-    virtual bool requires_backend_support() { return false; }
+    virtual bool requires_backend_support(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return false;
+    }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1417,7 +1420,7 @@ struct test_case {
 
             print_test_result_locked(output_printer, result);
 
-            return requires_backend_support() ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
+            return requires_backend_support(backend1) ? test_status_t::FAIL : test_status_t::NOT_SUPPORTED;
         }
 
         // post-graph sentinel
@@ -7146,6 +7149,7 @@ struct test_flash_attn_ext : public test_case {
     const float scale;
     const int64_t n_tail_active;
     const int64_t n_tail_history_slots;
+    const bool require_cpu_cuda_support;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -7160,7 +7164,8 @@ struct test_flash_attn_ext : public test_case {
             " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
-            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
+            " require_cpu_cuda_support=" + std::to_string(int(require_cpu_cuda_support));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7173,14 +7178,24 @@ struct test_flash_attn_ext : public test_case {
         return full_coverage_equivalence || split_equivalence || segmented_equivalence;
     }
 
-    bool requires_backend_support() override {
+    bool requires_backend_support(ggml_backend_t backend) override {
         // This is the exact mixed Gemma global-layer regression.  It is not
         // optional coverage: planning advertises the composite as executable,
         // so silently reporting NOT_SUPPORTED would recreate a scheduler CPU
         // fallback in the model graph.
-        return hsk == 512 && hsv == 512 && nr23[0] == 8 &&
+        const bool gemma_required = hsk == 512 && hsv == 512 && nr23[0] == 8 &&
             type_K == GGML_TYPE_Q4_0 && type_V == GGML_TYPE_Q4_0 &&
             canonical_body && n_tail_current > 0;
+        if (gemma_required) {
+            return true;
+        }
+        if (!require_cpu_cuda_support) {
+            return false;
+        }
+        auto * dev = ggml_backend_get_device(backend);
+        auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        return dev && (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU ||
+                (reg && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0));
     }
 
     double max_nmse_err() override {
@@ -7221,14 +7236,15 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0)
+                        int64_t n_tail_history_slots = 0, bool require_cpu_cuda_support = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots),
+          require_cpu_cuda_support(require_cpu_cuda_support) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -10423,6 +10439,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {2, 1}, 256, 16, true, false, 0.0f, 0.0f,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 256, false,
         GGML_TYPE_F16, GGML_TYPE_F16, false, false, true, false, false, 16, true));
+    // Required CPU/CUDA attached-tail route coverage around the indexed-small
+    // cutoff. This checks Q8_0 segmented-current arithmetic and packed routing,
+    // not mapped-host allocation or scheduler transport.
+    for (int64_t tail_stride : { 256, 257 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {2, 1}, 512, 4,
+            true, false, 0.0f, 0.0f, GGML_PREC_F32,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, tail_stride, false,
+            GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true, false, false,
+            4, false, 0.0f, -1, 0, true));
+    }
     // Serving-size exact-tail reductions. With a 512-token ubatch, configured
     // tails of 1024 and 2048 use union strides of 1536 and 2560 respectively.
     // A fully covering overlay must still equal one ordinary exact FA pass at

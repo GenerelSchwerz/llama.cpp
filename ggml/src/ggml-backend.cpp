@@ -772,6 +772,39 @@ static bool ggml_backend_sched_allows_bufferless_kvarn_src(
         ggml_backend_sched_kvarn_view_base(src) != NULL;
 }
 
+static bool ggml_backend_sched_allows_mapped_host_kv_src(
+        const struct ggml_tensor * node,
+        int src_index,
+        const struct ggml_tensor * src,
+        ggml_backend_t target_backend) {
+    const struct ggml_tensor * owner = src;
+    while (owner != NULL && owner->buffer == NULL && owner->view_src != NULL) {
+        owner = owner->view_src;
+    }
+    ggml_backend_buffer_t owner_buffer = owner ? owner->buffer : NULL;
+    if (node->op != GGML_OP_FLASH_ATTN_EXT || (src_index != 1 && src_index != 2) ||
+            ggml_get_op_params_i32(node, GGML_FLASH_ATTN_EXT_OP_PARAM_GPU_KV_WINDOW) == 0 ||
+            owner_buffer == NULL || node->src[7] == NULL || node->src[9] == NULL ||
+            target_backend == NULL) {
+        return false;
+    }
+    ggml_backend_dev_t target_dev = ggml_backend_get_device(target_backend);
+    ggml_backend_reg_t target_reg = target_dev ? ggml_backend_dev_backend_reg(target_dev) : NULL;
+    if (!target_reg || strcmp(ggml_backend_reg_name(target_reg), "CUDA") != 0 ||
+            ggml_backend_reg_dev_count(target_reg) == 0 ||
+            target_dev != ggml_backend_reg_dev_get(target_reg, 0)) {
+        return false;
+    }
+    const int64_t body_map_offset = 6 + node->src[7]->ne[0];
+    if (node->src[9]->ne[0] <= body_map_offset) {
+        return false;
+    }
+    // Only the feature-specific CUDA_MappedHost type is allocated with
+    // cudaHostAllocMapped and is therefore a legal direct source for the CUDA
+    // gather kernel. Ordinary CUDA_Host buffers keep their existing copy path.
+    return strcmp(ggml_backend_buffer_name(owner_buffer), "CUDA_MappedHost") == 0;
+}
+
 // scheduler
 
 #ifndef GGML_SCHED_MAX_BACKENDS
@@ -1381,6 +1414,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         continue;
                     }
+                    if (ggml_backend_sched_allows_mapped_host_kv_src(
+                                node, j, src, sched->backends[node_backend_id])) {
+                        continue;
+                    }
                     if (check_new_split_src(src)) {
                         need_new_split = true;
                         break;
@@ -1459,6 +1496,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     for (int ks = 0; ks < 3; ++ks) {
                         move_src_to_split(&kvarn_view->src[ks]);
                     }
+                    continue;
+                }
+                if (ggml_backend_sched_allows_mapped_host_kv_src(
+                            node, j, src, sched->backends[cur_backend_id])) {
                     continue;
                 }
 

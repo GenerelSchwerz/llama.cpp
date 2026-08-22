@@ -115,3 +115,127 @@ std::vector<int64_t> llama_tensor_split_counts(
     }
     return result;
 }
+
+llama_kv_gpu_window_config_error llama_kv_gpu_window_validate_config(
+        const llama_kv_gpu_window_requirements & requirements) {
+    if (requirements.requested_tokens == 0) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_OK;
+    }
+    if (requirements.requested_tokens < 256) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_TOO_SMALL;
+    }
+    if (requirements.requested_tokens >= requirements.n_ctx) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_NOT_SMALLER_THAN_CONTEXT;
+    }
+    if (!requirements.default_context) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_CONTEXT_TYPE;
+    }
+    if (!requirements.standard_attention) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_ATTENTION_LAYOUT;
+    }
+    if (requirements.kv_offload) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_KV_OFFLOAD;
+    }
+    if (!requirements.pinned_host) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_PINNED_HOST;
+    }
+    if (!requirements.op_offload) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_OP_OFFLOAD;
+    }
+    if (requirements.kv_gpu_layers != 0) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_GPU_LAYERS;
+    }
+    if (requirements.n_seq_max != 1) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_SEQUENCE_COUNT;
+    }
+    if (!requirements.flash_attn) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_FLASH_ATTN;
+    }
+    if (!requirements.q8_0_kv) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_CACHE_TYPES;
+    }
+    if (!requirements.kvarn_disabled) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_KVARN;
+    }
+    if (!requirements.precision_tail_disabled) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_PRECISION_TAIL;
+    }
+    if (requirements.tensor_split) {
+        return LLAMA_KV_GPU_WINDOW_CONFIG_TENSOR_SPLIT;
+    }
+    return LLAMA_KV_GPU_WINDOW_CONFIG_OK;
+}
+
+const char * llama_kv_gpu_window_config_error_string(
+        llama_kv_gpu_window_config_error error) {
+    switch (error) {
+        case LLAMA_KV_GPU_WINDOW_CONFIG_OK:
+            return nullptr;
+        case LLAMA_KV_GPU_WINDOW_CONFIG_TOO_SMALL:
+            return "the requested window must contain at least 256 rows";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_NOT_SMALLER_THAN_CONTEXT:
+            return "the requested window must be smaller than the resolved context size";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_CONTEXT_TYPE:
+            return "only the default target context is supported";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_ATTENTION_LAYOUT:
+            return "only standard non-SWA attention is supported";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_KV_OFFLOAD:
+            return "--no-kv-offload is required";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_PINNED_HOST:
+            return "--kv-cpu-pinned is required";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_OP_OFFLOAD:
+            return "operation offload must remain enabled";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_GPU_LAYERS:
+            return "--kv-gpu-layers must be 0";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_SEQUENCE_COUNT:
+            return "exactly one sequence/stream is required";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_FLASH_ATTN:
+            return "--flash-attn on is required";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_CACHE_TYPES:
+            return "both standard cache types must be Q8_0";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_KVARN:
+            return "KVarN must be disabled";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_PRECISION_TAIL:
+            return "a separate precision-tail request cannot be combined with the GPU window";
+        case LLAMA_KV_GPU_WINDOW_CONFIG_TENSOR_SPLIT:
+            return "tensor-split model placement is not supported";
+    }
+    return "unknown GPU KV window configuration error";
+}
+
+llama_kv_gpu_window_device_error llama_kv_gpu_window_validate_devices(
+        const std::vector<llama_kv_gpu_window_device_placement> & devices) {
+    if (devices.empty()) {
+        return LLAMA_KV_GPU_WINDOW_DEVICE_NO_ATTENTION_LAYER;
+    }
+    const uintptr_t expected = devices.front().identity;
+    for (const auto & device : devices) {
+        if (!device.is_cuda) {
+            return LLAMA_KV_GPU_WINDOW_DEVICE_NOT_CUDA;
+        }
+        if (device.registry_index != 0) {
+            return LLAMA_KV_GPU_WINDOW_DEVICE_NOT_PRIMARY;
+        }
+        if (device.identity != expected) {
+            return LLAMA_KV_GPU_WINDOW_DEVICE_MULTIPLE;
+        }
+    }
+    return LLAMA_KV_GPU_WINDOW_DEVICE_OK;
+}
+
+const char * llama_kv_gpu_window_device_error_string(
+        llama_kv_gpu_window_device_error error) {
+    switch (error) {
+        case LLAMA_KV_GPU_WINDOW_DEVICE_OK:
+            return nullptr;
+        case LLAMA_KV_GPU_WINDOW_DEVICE_NO_ATTENTION_LAYER:
+            return "no attention-layer device was found";
+        case LLAMA_KV_GPU_WINDOW_DEVICE_NOT_CUDA:
+            return "every attention layer must execute on CUDA";
+        case LLAMA_KV_GPU_WINDOW_DEVICE_NOT_PRIMARY:
+            return "the first prototype requires CUDA registry device 0";
+        case LLAMA_KV_GPU_WINDOW_DEVICE_MULTIPLE:
+            return "all attention layers must use the same CUDA device";
+    }
+    return "unknown GPU KV window device-placement error";
+}

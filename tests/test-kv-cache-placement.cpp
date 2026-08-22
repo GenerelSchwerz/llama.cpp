@@ -114,6 +114,90 @@ int main() {
     }
     CHECK(rejected);
 
+    const llama_kv_gpu_window_requirements valid_window = {
+        /*.requested_tokens        =*/ 256,
+        /*.n_ctx                   =*/ 4096,
+        /*.n_seq_max               =*/ 1,
+        /*.kv_gpu_layers           =*/ 0,
+        /*.default_context         =*/ true,
+        /*.standard_attention      =*/ true,
+        /*.kv_offload              =*/ false,
+        /*.pinned_host             =*/ true,
+        /*.op_offload              =*/ true,
+        /*.flash_attn              =*/ true,
+        /*.q8_0_kv                 =*/ true,
+        /*.kvarn_disabled          =*/ true,
+        /*.precision_tail_disabled =*/ true,
+        /*.tensor_split            =*/ false,
+    };
+    CHECK(llama_kv_gpu_window_validate_config(valid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_OK);
+    CHECK(llama_kv_gpu_window_config_error_string(LLAMA_KV_GPU_WINDOW_CONFIG_OK) == nullptr);
+
+    auto invalid_window = valid_window;
+    invalid_window.requested_tokens = 0;
+    invalid_window.default_context = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_OK);
+    invalid_window = valid_window;
+    invalid_window.requested_tokens = 255;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_TOO_SMALL);
+    invalid_window = valid_window;
+    invalid_window.requested_tokens = invalid_window.n_ctx;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) ==
+            LLAMA_KV_GPU_WINDOW_CONFIG_NOT_SMALLER_THAN_CONTEXT);
+    invalid_window.requested_tokens = invalid_window.n_ctx + 1;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) ==
+            LLAMA_KV_GPU_WINDOW_CONFIG_NOT_SMALLER_THAN_CONTEXT);
+    invalid_window = valid_window;
+    invalid_window.op_offload = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_OP_OFFLOAD);
+    invalid_window = valid_window;
+    invalid_window.default_context = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_CONTEXT_TYPE);
+    invalid_window = valid_window;
+    invalid_window.standard_attention = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_ATTENTION_LAYOUT);
+    invalid_window = valid_window;
+    invalid_window.kv_offload = true;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_KV_OFFLOAD);
+    invalid_window = valid_window;
+    invalid_window.pinned_host = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_PINNED_HOST);
+    invalid_window = valid_window;
+    invalid_window.kv_gpu_layers = 1;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_GPU_LAYERS);
+    invalid_window = valid_window;
+    invalid_window.n_seq_max = 2;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_SEQUENCE_COUNT);
+    invalid_window = valid_window;
+    invalid_window.flash_attn = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_FLASH_ATTN);
+    invalid_window = valid_window;
+    invalid_window.q8_0_kv = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_CACHE_TYPES);
+    invalid_window = valid_window;
+    invalid_window.kvarn_disabled = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_KVARN);
+    invalid_window = valid_window;
+    invalid_window.precision_tail_disabled = false;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_PRECISION_TAIL);
+    invalid_window = valid_window;
+    invalid_window.tensor_split = true;
+    CHECK(llama_kv_gpu_window_validate_config(invalid_window) == LLAMA_KV_GPU_WINDOW_CONFIG_TENSOR_SPLIT);
+
+    const std::vector<llama_kv_gpu_window_device_placement> one_cuda0 = {
+        { 101, 0, true },
+        { 101, 0, true },
+    };
+    CHECK(llama_kv_gpu_window_validate_devices(one_cuda0) == LLAMA_KV_GPU_WINDOW_DEVICE_OK);
+    CHECK(llama_kv_gpu_window_device_error_string(LLAMA_KV_GPU_WINDOW_DEVICE_OK) == nullptr);
+    CHECK(llama_kv_gpu_window_validate_devices({}) == LLAMA_KV_GPU_WINDOW_DEVICE_NO_ATTENTION_LAYER);
+    CHECK(llama_kv_gpu_window_validate_devices({ { 101, 0, false } }) ==
+            LLAMA_KV_GPU_WINDOW_DEVICE_NOT_CUDA);
+    CHECK(llama_kv_gpu_window_validate_devices({ { 101, 1, true } }) ==
+            LLAMA_KV_GPU_WINDOW_DEVICE_NOT_PRIMARY);
+    CHECK(llama_kv_gpu_window_validate_devices({ { 101, 0, true }, { 202, 0, true } }) ==
+            LLAMA_KV_GPU_WINDOW_DEVICE_MULTIPLE);
+
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     CHECK(cpu != nullptr);
     ggml_backend_dev_t logical_devices[] = { cpu, cpu };

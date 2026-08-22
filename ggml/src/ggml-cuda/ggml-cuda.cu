@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mapped-host.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1518,6 +1519,138 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 
     return &ggml_backend_cuda_buffer_type_host;
 }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+struct ggml_cuda_mapped_host_buffer_context {
+    void * host_ptr;
+    void * device_ptr;
+};
+
+static const char * ggml_backend_cuda_mapped_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return GGML_CUDA_NAME "_MappedHost";
+}
+
+static void * ggml_backend_cuda_mapped_host_buffer_get_base(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer && buffer->context);
+    return static_cast<ggml_cuda_mapped_host_buffer_context *>(buffer->context)->host_ptr;
+}
+
+static void ggml_backend_cuda_mapped_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer && buffer->context);
+    auto * ctx = static_cast<ggml_cuda_mapped_host_buffer_context *>(buffer->context);
+    CUDA_CHECK(cudaFreeHost(ctx->host_ptr));
+    delete ctx;
+}
+
+static void ggml_backend_cuda_mapped_host_buffer_memset_tensor(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        uint8_t value, size_t offset, size_t size) {
+    GGML_ASSERT(buffer && tensor);
+    memset(static_cast<char *>(tensor->data) + offset, value, size);
+}
+
+static void ggml_backend_cuda_mapped_host_buffer_set_tensor(
+        ggml_backend_buffer_t buffer, ggml_tensor * tensor,
+        const void * data, size_t offset, size_t size) {
+    GGML_ASSERT(buffer && tensor);
+    memcpy(static_cast<char *>(tensor->data) + offset, data, size);
+}
+
+static void ggml_backend_cuda_mapped_host_buffer_get_tensor(
+        ggml_backend_buffer_t buffer, const ggml_tensor * tensor,
+        void * data, size_t offset, size_t size) {
+    GGML_ASSERT(buffer && tensor);
+    memcpy(data, static_cast<const char *>(tensor->data) + offset, size);
+}
+
+static bool ggml_backend_cuda_mapped_host_buffer_cpy_tensor(
+        ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    GGML_ASSERT(buffer && src && dst);
+    if (!ggml_backend_buffer_is_host(src->buffer)) {
+        return false;
+    }
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    return true;
+}
+
+static void ggml_backend_cuda_mapped_host_buffer_clear(
+        ggml_backend_buffer_t buffer, uint8_t value) {
+    GGML_ASSERT(buffer && buffer->context);
+    auto * ctx = static_cast<ggml_cuda_mapped_host_buffer_context *>(buffer->context);
+    memset(ctx->host_ptr, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_mapped_host_buffer_i = {
+    /* .free_buffer     = */ ggml_backend_cuda_mapped_host_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_mapped_host_buffer_get_base,
+    /* .init_tensor     = */ nullptr,
+    /* .memset_tensor   = */ ggml_backend_cuda_mapped_host_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_mapped_host_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_mapped_host_buffer_get_tensor,
+    /* .set_tensor_2d   = */ nullptr,
+    /* .get_tensor_2d   = */ nullptr,
+    /* .cpy_tensor      = */ ggml_backend_cuda_mapped_host_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_mapped_host_buffer_clear,
+    /* .reset           = */ nullptr,
+};
+
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_host_buffer_type_alloc_buffer(
+        ggml_backend_buffer_type_t buft, size_t size) {
+    // ggml_backend_buft_alloc_buffer() returns a type-preserving dummy before
+    // invoking this callback for zero-sized no-alloc/Fit reservations.
+    GGML_ASSERT(size > 0);
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        GGML_LOG_ERROR("%s: mapped pinned memory is disabled by GGML_CUDA_NO_PINNED\n", __func__);
+        return nullptr;
+    }
+    ggml_cuda_set_device(0);
+    void * host_ptr = nullptr;
+    cudaError_t error = cudaHostAlloc(&host_ptr, size, cudaHostAllocPortable | cudaHostAllocMapped);
+    if (error != cudaSuccess || host_ptr == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of mapped pinned memory: %s\n",
+                __func__, size/1024.0/1024.0, cudaGetErrorString(error));
+        return nullptr;
+    }
+    void * device_ptr = nullptr;
+    error = cudaHostGetDevicePointer(&device_ptr, host_ptr, 0);
+    if (error != cudaSuccess || device_ptr == nullptr) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocated %.2f MiB but could not map it on CUDA device 0: %s\n",
+                __func__, size/1024.0/1024.0, cudaGetErrorString(error));
+        CUDA_CHECK(cudaFreeHost(host_ptr));
+        return nullptr;
+    }
+    auto * ctx = new ggml_cuda_mapped_host_buffer_context { host_ptr, device_ptr };
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_host_buffer_i, ctx, size);
+}
+
+void * ggml_cuda_mapped_host_buffer_device_base(ggml_backend_buffer_t buffer) {
+    if (!buffer || buffer->size == 0 ||
+            buffer->buft->iface.get_name != ggml_backend_cuda_mapped_host_buffer_type_name ||
+            !buffer->context) {
+        return nullptr;
+    }
+    return static_cast<ggml_cuda_mapped_host_buffer_context *>(buffer->context)->device_ptr;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_mapped_host_buffer_type() {
+    static struct ggml_backend_buffer_type buft = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_mapped_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_mapped_host_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL,
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+    return &buft;
+}
+#endif
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
@@ -5887,8 +6020,10 @@ static bool ggml_backend_cuda_kvarn_tail_attention_supported(
         (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
         (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
 #else
-    return ggml_cuda_flash_attn_ext_tail_supported(
-        body_k, body_v, tail_k, tail_v, d_k, d_v);
+    return (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+        (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16) &&
+        ggml_cuda_flash_attn_ext_tail_supported(
+            body_k, body_v, tail_k, tail_v, d_k, d_v);
 #endif
 }
 
@@ -5939,6 +6074,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, "ggml_backend_cuda_mapped_host_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_mapped_host_buffer_type;
+    }
+#endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }

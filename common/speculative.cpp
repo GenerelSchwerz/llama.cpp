@@ -2432,6 +2432,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     }
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
+    result.kv_gpu_window  = 0;
     if (params.phase_aware_workspace) {
         // Phase-aware schedulers use n_outputs_max as the largest
         // generation-side graph geometry. MTP chained heads can submit the
@@ -2481,6 +2482,7 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.ctx_other = ctx_tgt;
     cparams.kv_tail_tokens = 0;
     cparams.kv_tail_type   = GGML_TYPE_F16;
+    cparams.kv_gpu_window  = 0;
 
     std::string model_path;
     if (has_draft) {

@@ -5586,8 +5586,10 @@ void ggml_flash_attn_ext_add_kv_tail(
     GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(k_tail != NULL && v_tail != NULL && mask_tail != NULL && query_order != NULL && run_desc != NULL);
     GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[7] == NULL && a->src[8] == NULL && a->src[9] == NULL);
-    GGML_ASSERT((k_tail->type == GGML_TYPE_F32 || k_tail->type == GGML_TYPE_F16 || k_tail->type == GGML_TYPE_BF16) &&
-                (v_tail->type == GGML_TYPE_F32 || v_tail->type == GGML_TYPE_F16 || v_tail->type == GGML_TYPE_BF16));
+    GGML_ASSERT((k_tail->type == GGML_TYPE_F32 || k_tail->type == GGML_TYPE_F16 ||
+                 k_tail->type == GGML_TYPE_BF16 || k_tail->type == GGML_TYPE_Q8_0) &&
+                (v_tail->type == GGML_TYPE_F32 || v_tail->type == GGML_TYPE_F16 ||
+                 v_tail->type == GGML_TYPE_BF16 || v_tail->type == GGML_TYPE_Q8_0));
     GGML_ASSERT(mask_tail->type == GGML_TYPE_F16);
     GGML_ASSERT(query_order->type == GGML_TYPE_I32 && query_order->ne[1] == run_desc->ne[1]);
     GGML_ASSERT(run_desc->type == GGML_TYPE_I32 &&
@@ -5615,6 +5617,12 @@ void ggml_flash_attn_ext_set_kv_tail_history_slots(
     GGML_ASSERT(history_slots > 0 && history_slots <= a->src[5]->ne[1] &&
             history_slots <= a->src[6]->ne[1]);
     ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS, history_slots);
+}
+
+void ggml_flash_attn_ext_set_gpu_kv_window(struct ggml_tensor * a) {
+    GGML_ASSERT(a != NULL && a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] != NULL && a->src[6] != NULL && a->src[9] != NULL);
+    ggml_set_op_params_i32(a, GGML_FLASH_ATTN_EXT_OP_PARAM_GPU_KV_WINDOW, 1);
 }
 
 struct ggml_tensor * ggml_kv_tail_attention_merge(

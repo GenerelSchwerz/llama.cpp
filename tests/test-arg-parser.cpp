@@ -603,6 +603,17 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-kv-gpu-layers", "-1"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-window", "1024"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.kv_gpu_window == 1024);
+    assert(common_context_params_to_llama(params).kv_gpu_window == 1024);
+    assert(llama_context_default_params().kv_gpu_window == 0);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-window", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
     unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf"};
@@ -1060,10 +1071,12 @@ static void test_draft_kv_gpu_layers_override() {
     common_params params;
     params.no_kv_offload = true;
     params.kv_gpu_layers = 7;
+    params.kv_gpu_window = 1024;
 
     const common_params inherited = common_base_params_to_speculative(params);
     assert(inherited.no_kv_offload);
     assert(inherited.kv_gpu_layers == 7);
+    assert(inherited.kv_gpu_window == 0);
 
     params.speculative.draft.kv_gpu_layers = 3;
     const common_params overridden = common_base_params_to_speculative(params);

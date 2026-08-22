@@ -38,7 +38,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
                  uint32_t   tail_rollback_tokens,
-                 uint32_t   attn_n_gpu_layers) :
+                 uint32_t   attn_n_gpu_layers,
+                     bool   attn_gpu_window) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -68,7 +69,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         /* tail_visibility_window */ 0,
         attn_cpu_pinned,
         attn_n_gpu_layers,
-        attn_offload_compute
+        attn_offload_compute,
+        attn_gpu_window
     )),
     mem_recr(new llama_memory_recurrent(
         model,

@@ -1,4 +1,5 @@
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "llama-kv-cache-tail.h"
 
@@ -632,6 +633,208 @@ static void test_bounded_attached_tail_attention(ggml_backend_t gpu, ggml_backen
     }
 }
 
+static std::vector<float> run_same_format_gpu_window_attention(
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t body_buft,
+        bool scheduled_cuda) {
+    constexpr int64_t d = 128;
+    constexpr int64_t n_query = 1;
+    constexpr int64_t n_q_head = 2;
+    constexpr int64_t n_kv_head = 1;
+    constexpr int64_t n_body = 64;
+    constexpr int64_t tail_stride = 256;
+    constexpr int64_t n_tail_active = 8;
+    constexpr int64_t body_stride = 256;
+    constexpr int64_t body_map_offset = 6 + tail_stride;
+    ggml_init_params params = { 16*1024*1024, nullptr, true };
+
+    ggml_context * body_ctx = ggml_init(params);
+    ggml_tensor * kb = ggml_new_tensor_4d(
+            body_ctx, GGML_TYPE_Q8_0, d, n_body, n_kv_head, 1);
+    ggml_tensor * vb = ggml_new_tensor_4d(
+            body_ctx, GGML_TYPE_Q8_0, d, n_body, n_kv_head, 1);
+    ggml_backend_buffer_t body_buffer = ggml_backend_alloc_ctx_tensors_from_buft(
+            body_ctx, body_buft);
+    if (!body_buffer || (scheduled_cuda &&
+            std::strcmp(ggml_backend_buffer_name(body_buffer), "CUDA_MappedHost") != 0)) {
+        fail("same-format GPU-window body allocation used the wrong buffer type");
+    }
+
+    ggml_context * input_ctx = ggml_init(params);
+    ggml_tensor * q = ggml_new_tensor_4d(
+            input_ctx, GGML_TYPE_F32, d, n_query, n_q_head, 1);
+    ggml_tensor * body_mask = ggml_new_tensor_4d(
+            input_ctx, GGML_TYPE_F16, n_body, n_query, 1, 1);
+    ggml_tensor * kt_storage = ggml_new_tensor_4d(
+            input_ctx, GGML_TYPE_Q8_0, d, n_kv_head, tail_stride, 1);
+    ggml_tensor * vt_storage = ggml_new_tensor_4d(
+            input_ctx, GGML_TYPE_Q8_0, d, n_kv_head, tail_stride, 1);
+    ggml_tensor * tail_mask = ggml_new_tensor_4d(
+            input_ctx, GGML_TYPE_F16, tail_stride, n_query, 1, 1);
+    ggml_tensor * query_order = ggml_new_tensor_2d(
+            input_ctx, GGML_TYPE_I32, n_query, 1);
+    ggml_tensor * run_desc = ggml_new_tensor_2d(
+            input_ctx, GGML_TYPE_I32, body_map_offset + body_stride, 1);
+    ggml_backend_buffer_t input_buffer = ggml_backend_alloc_ctx_tensors(
+            input_ctx, backend);
+    if (!input_buffer) {
+        fail("same-format GPU-window input allocation failed");
+    }
+
+    ggml_context * compute_ctx = ggml_init(params);
+    // Model graphs feed the persistent cache through view/permute chains.  The
+    // scheduler must recognize the mapped owner behind those bufferless views
+    // instead of materializing a full device copy of the canonical body.
+    ggml_tensor * kb_view = ggml_view_4d(
+            compute_ctx, kb, d, n_body, n_kv_head, 1,
+            kb->nb[1], kb->nb[2], kb->nb[3], 0);
+    ggml_tensor * vb_view = ggml_view_4d(
+            compute_ctx, vb, d, n_body, n_kv_head, 1,
+            vb->nb[1], vb->nb[2], vb->nb[3], 0);
+    ggml_tensor * kb_graph = ggml_permute(compute_ctx, kb_view, 0, 1, 2, 3);
+    ggml_tensor * vb_graph = ggml_permute(compute_ctx, vb_view, 0, 1, 2, 3);
+    ggml_tensor * kt = ggml_permute(compute_ctx, kt_storage, 0, 2, 1, 3);
+    ggml_tensor * vt = ggml_permute(compute_ctx, vt_storage, 0, 2, 1, 3);
+    ggml_tensor * out = ggml_flash_attn_ext(
+            compute_ctx, q, kb_graph, vb_graph, body_mask,
+            1.0f/std::sqrt(float(d)), 0.0f, 0.0f);
+    out = ggml_kv_tail_attention_merge(
+            compute_ctx, out, kt, vt, tail_mask, query_order, run_desc);
+    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_gpu_kv_window(out);
+    if (!ggml_backend_supports_op(backend, out)) {
+        fail("backend rejected the same-format Q8_0 GPU-window graph");
+    }
+    ggml_cgraph * graph = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(graph, out);
+
+    std::vector<float> q_data(ggml_nelements(q));
+    std::vector<float> kb_data(ggml_nelements(kb));
+    std::vector<float> vb_data(ggml_nelements(vb));
+    std::vector<float> kt_data(ggml_nelements(kt_storage));
+    std::vector<float> vt_data(ggml_nelements(vt_storage));
+    for (size_t i = 0; i < q_data.size(); ++i) {
+        q_data[i] = 0.003f*float(int(i%17) - 8);
+    }
+    for (size_t i = 0; i < kb_data.size(); ++i) {
+        kb_data[i] = 0.004f*float(int(i%23) - 11);
+        vb_data[i] = 0.005f*float(int(i%29) - 14);
+    }
+    for (size_t i = 0; i < kt_data.size(); ++i) {
+        kt_data[i] = 0.006f*float(int(i%19) - 9);
+        vt_data[i] = 0.007f*float(int(i%31) - 15);
+    }
+    set_matrix_data(q, q_data, n_query*n_q_head, d);
+    set_matrix_data(kb, kb_data, n_body*n_kv_head, d);
+    set_matrix_data(vb, vb_data, n_body*n_kv_head, d);
+    set_matrix_data(kt_storage, kt_data, tail_stride*n_kv_head, d);
+    set_matrix_data(vt_storage, vt_data, tail_stride*n_kv_head, d);
+    std::vector<ggml_fp16_t> body_mask_data(
+            ggml_nelements(body_mask), ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> tail_mask_data(
+            ggml_nelements(tail_mask), ggml_fp32_to_fp16(0.0f));
+    std::vector<int32_t> query_order_data(n_query, 0);
+    std::vector<int32_t> run_data(body_map_offset + body_stride, -1);
+    run_data[4] = n_tail_active;
+    run_data[5] = n_body;
+    for (int32_t i = 0; i < n_tail_active; ++i) {
+        run_data[size_t(6 + i)] = i;
+    }
+    for (int32_t i = 0; i < n_body; ++i) {
+        run_data[size_t(body_map_offset + i)] = i;
+    }
+    ggml_backend_tensor_set(body_mask, body_mask_data.data(), 0,
+            body_mask_data.size()*sizeof(body_mask_data[0]));
+    ggml_backend_tensor_set(tail_mask, tail_mask_data.data(), 0,
+            tail_mask_data.size()*sizeof(tail_mask_data[0]));
+    ggml_backend_tensor_set(query_order, query_order_data.data(), 0,
+            query_order_data.size()*sizeof(query_order_data[0]));
+    ggml_backend_tensor_set(run_desc, run_data.data(), 0,
+            run_data.size()*sizeof(run_data[0]));
+
+    ggml_backend_buffer_t compute_buffer = nullptr;
+    ggml_backend_t fallback = nullptr;
+    ggml_backend_sched_t sched = nullptr;
+    if (scheduled_cuda) {
+        fallback = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!fallback) {
+            fail("failed to initialize same-format GPU-window CPU fallback");
+        }
+        ggml_backend_t backends[] = { backend, fallback };
+        sched = ggml_backend_sched_new(backends, nullptr, 2, 32, false, true);
+        if (!sched) {
+            fail("failed to initialize same-format GPU-window scheduler");
+        }
+        ggml_backend_sched_set_tensor_backend(sched, out, backend);
+        if (!ggml_backend_sched_alloc_graph(sched, graph)) {
+            fail("same-format GPU-window scheduler allocation failed");
+        }
+        if (out->src[1] != kb_graph || out->src[2] != vb_graph ||
+                std::strcmp(ggml_backend_buffer_name(out->src[1]->buffer), "CUDA_MappedHost") != 0 ||
+                std::strcmp(ggml_backend_buffer_name(out->src[2]->buffer), "CUDA_MappedHost") != 0) {
+            fail("scheduler copied the mapped Q8_0 body instead of preserving direct CUDA access");
+        }
+        if (ggml_backend_sched_graph_compute(sched, graph) != GGML_STATUS_SUCCESS) {
+            fail("same-format GPU-window scheduled compute failed");
+        }
+    } else {
+        compute_buffer = ggml_backend_alloc_ctx_tensors(compute_ctx, backend);
+        if (!compute_buffer ||
+                ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            fail("same-format GPU-window CPU reference compute failed");
+        }
+    }
+
+    std::vector<float> result(ggml_nelements(out));
+    ggml_backend_tensor_get(out, result.data(), 0, result.size()*sizeof(float));
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(fallback);
+    ggml_backend_buffer_free(compute_buffer);
+    ggml_free(compute_ctx);
+    ggml_backend_buffer_free(input_buffer);
+    ggml_free(input_ctx);
+    ggml_backend_buffer_free(body_buffer);
+    ggml_free(body_ctx);
+    return result;
+}
+
+static void test_same_format_gpu_window_mapped_scheduler(
+        ggml_backend_t cuda_backend,
+        ggml_backend_buffer_type_t mapped_buft) {
+    ggml_backend_buffer_t zero = ggml_backend_buft_alloc_buffer(mapped_buft, 0);
+    if (!zero || ggml_backend_buffer_get_size(zero) != 0 ||
+            ggml_backend_buffer_get_base(zero) != nullptr ||
+            ggml_backend_buffer_get_type(zero) != mapped_buft ||
+            std::strcmp(ggml_backend_buffer_name(zero), "CUDA_MappedHost") != 0) {
+        fail("zero-sized mapped-host reservation lost its buffer type or dummy semantics");
+    }
+    ggml_backend_buffer_free(zero);
+
+    ggml_backend_t cpu = ggml_backend_init_by_type(
+            GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (!cpu) {
+        fail("failed to initialize same-format GPU-window CPU oracle");
+    }
+    const auto expected = run_same_format_gpu_window_attention(
+            cpu, ggml_backend_get_default_buffer_type(cpu), false);
+    const auto actual = run_same_format_gpu_window_attention(
+            cuda_backend, mapped_buft, true);
+    ggml_backend_free(cpu);
+    if (actual.size() != expected.size()) {
+        fail("same-format GPU-window result size mismatch");
+    }
+    double mse = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const double diff = double(actual[i]) - expected[i];
+        mse += diff*diff;
+    }
+    const double rmse = std::sqrt(mse/std::max<size_t>(actual.size(), 1));
+    if (rmse > 3e-3) {
+        std::fprintf(stderr, "same-format mapped GPU-window RMSE %.8f\n", rmse);
+        std::exit(1);
+    }
+}
+
 static void test_mixed_side_generic_attention(
         ggml_backend_t backend,
         ggml_type body_k_type,
@@ -939,6 +1142,23 @@ int main() {
     }
     test_meta_shadow_roundtrip(meta_backend);
     ggml_backend_free(meta_backend);
+
+    if (ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_name("CUDA0")) {
+        ggml_backend_reg_t cuda_reg = ggml_backend_dev_backend_reg(cuda_dev);
+        using mapped_buft_fn = ggml_backend_buffer_type_t (*)();
+        auto mapped_buft = reinterpret_cast<mapped_buft_fn>(
+                ggml_backend_reg_get_proc_address(
+                    cuda_reg, "ggml_backend_cuda_mapped_host_buffer_type"));
+        if (!mapped_buft) {
+            fail("CUDA backend did not expose its mapped-host buffer type");
+        }
+        ggml_backend_t cuda_backend = ggml_backend_dev_init(cuda_dev, nullptr);
+        if (!cuda_backend) {
+            fail("failed to initialize CUDA0 for mapped-host GPU-window test");
+        }
+        test_same_format_gpu_window_mapped_scheduler(cuda_backend, mapped_buft());
+        ggml_backend_free(cuda_backend);
+    }
 
     backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (backend) {

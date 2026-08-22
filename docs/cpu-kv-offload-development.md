@@ -41,6 +41,96 @@ clean-process proof, allocation accounting, or any feature-specific acceptance
 gate. A single matched fail-fast pair has no confidence claim; a clear signal
 authorizes deeper validation and nothing more.
 
+## 2026-08-22: GPU-window source consolidation, milestone 1
+
+The same-format Q8_0 mapped-host design remains the sole candidate. The
+alternate worktree contributed only reusable safety and observability pieces:
+the second speculative-context reset, separate body/tail backend capability
+probing, strict placement validation, and complete `llama-bench` parameter and
+result plumbing. Its CPU `GET_ROWS` plus H2D transport, F16/BF16 device tail,
+prepacked-body switch, and competing operation-parameter meaning were not
+merged.
+
+Validation now applies to the requested window before any effective-size
+normalization and requires `256 <= N < n_ctx`, operation offload, a default
+single-sequence target context, Q8_0/Q8_0, standard non-SWA attention, mapped
+pinned-host storage, no independent precision tail or KV-layer policy, no
+tensor split, and one actual CUDA registry device 0 across every attention
+layer. The Q8_0 `N=256` boundary is routed through the same packed quantized
+CUDA path as `N=257`; focused validation and backend cases cover both sides of
+the former indexed-small collision.
+
+This remains a transport-correctness milestone. The temporary packed body is
+still sized from the full `kv_size`; reducing it to the aligned maximum cold
+region remains a separate optimization and measurement step. At initial
+consolidation there was no commit, matched performance evidence,
+state/prompt-cache gate, or experiment disposition; Experiment 022 now owns the
+committed milestone and its pending evidence work.
+
+Static review then exposed an accidental capability edit and gaps between the
+claimed and actual test surface. KVarN CPU tail capability is again restricted
+to its implemented F16/BF16 contract; Q8_0 row conversion is advertised only
+by the independent standard attached-tail CPU oracle. The public standard-tail
+and CUDA capability additions are explicitly Q8_0 rather than an untested
+all-quantized promise. The 256/257 Q8_0 backend cases are now required on CPU
+and CUDA and are described only as segmented-current arithmetic/routing
+coverage.
+
+The mapped-host allocator now resolves and caches CUDA device 0's alias before
+publishing a non-empty buffer, so an expected mapping failure returns through
+cache/context allocation rather than first appearing during decode. The common
+backend allocator already returns a type-preserving empty buffer before a
+buffer-type allocator is invoked for a zero-byte reservation; no CUDA-specific
+zero-allocation workaround is needed. Source coverage now exercises that empty
+reservation and defines a CUDA-only scheduled graph with a real
+`CUDA_MappedHost` Q8_0 body, a device Q8_0 suffix, the GPU-window operation
+parameter, preservation of the mapped K/V sources, and a CPU numerical oracle.
+The first authorized Release CPU/CUDA build and focused execution pass completed
+on an RTX 4070 (SM 8.9). Both full builds succeeded. The six focused parser,
+placement, tail, static, and scheduled-graph CTests passed on CPU and CUDA, and
+the required seeded Q8_0 segmented-current backend cases passed at both 256 and
+257 rows on CPU and CUDA.
+
+The real Qwen3.8-27B-UD-IQ2_M smoke initially exposed a scheduler gap hidden by
+the synthetic graph: model K/V reach attention through bufferless view/permute
+chains, so checking only `src->buffer` copied the complete mapped body to CUDA.
+Mapped-owner recognition now follows the view chain, and the scheduled graph
+regression reproduces that shape and asserts that no full body copy is inserted.
+The backend fixture was also corrected to compare the segmented-current
+attention result directly between CPU and CUDA; its former in-graph oracle used
+unsupported quantized `CONCAT` helpers and could fail before reaching the op
+under test.
+
+A bounded `llama-bench` smoke with that exact local model then completed prompt
+plus decode for the default-off control and windows 256, 257, and 1024. The
+single-process, single-repetition throughput printed by that smoke is not
+performance evidence and is intentionally not entered in the experiment
+ledger. A broader practical CTest set passed 87/87 on both CPU and CUDA. It
+excluded the unfiltered backend matrix (the required cases ran separately),
+network/download fixtures and their dependants, the unavailable full vocab
+fixture, and `test-model-resolution`: that independent loopback HTTP fixture
+reproducibly faults in `httplib::ClientImpl::set_follow_location()` at normal
+speed but passes under GDB, with no KV or scheduler frame in the captured core.
+Full exactness/state coverage, clean matched processes at the required depths,
+resource accounting, and an experiment disposition are still required before
+publication.
+
+## 2026-08-21: GPU-window prototype protocol boundary
+
+The first chunk-residency prototype deliberately keeps the complete standard
+Q8_0 KV body authoritative in pinned host RAM and adds only a compact Q8_0 suffix on
+CUDA. Attention masks those suffix rows out of the body, packs only the older
+host rows, evaluates both partials, and uses the existing normalized tail merge.
+This tests transfer deduplication without changing prompt-cache, state, rollback,
+or recovery ownership. Physical host-RAM deduplication is deferred until those
+ownership paths can represent a split canonical cache.
+
+The new `--kv-gpu-window N` control is default-off and fail-closed to the narrow
+single-sequence, standard non-SWA CUDA Q8_0/Q8_0 configuration with `N >= 256`
+documented in the current protocol. No build, execution, measurement, or
+experiment disposition exists for the initial source edit; it must not be cited
+as evidence.
+
 ## Evidence-curation transition: 2026-08-20
 
 Earlier editions asked agents to preserve invalid attempts and every historical

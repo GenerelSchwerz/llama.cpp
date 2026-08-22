@@ -2947,6 +2947,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * v_tail_current,
               uint32_t tail_history_slots,
                    bool tail_bodyless,
+                   bool tail_gpu_window,
         ggml_tensor ** final_attn_op) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
@@ -3016,6 +3017,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             }
             if (k_tail_current) {
                 ggml_flash_attn_ext_set_kv_tail_history_slots(cur, int32_t(tail_history_slots));
+            }
+            if (tail_gpu_window) {
+                ggml_flash_attn_ext_set_gpu_kv_window(cur);
             }
         }
         res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -3657,7 +3661,7 @@ ggml_tensor * llm_graph_context::build_attn(
             tail_route,
             kvarn_domain,
             k_tail_current, v_tail_current,
-            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op);
+            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), mctx_cur->is_gpu_window(), &final_tail_op);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }
@@ -4096,7 +4100,7 @@ ggml_tensor * llm_graph_context::build_attn(
             tail_route,
             kvarn_domain,
             k_tail_current, v_tail_current,
-            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), &final_tail_op);
+            mctx_cur->get_tail_slots(), !mctx_cur->has_kv_body(il), mctx_cur->is_gpu_window(), &final_tail_op);
     if (use_kvarn) {
         llm_flash_attn_ext_set_kvarn_domain(cur, kvarn_domain);
     }

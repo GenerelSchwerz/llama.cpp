@@ -2,6 +2,7 @@
 
 #include "fattn-common.cuh"
 #include "fattn-kvarn-dispatch.cuh"
+#include "mapped-host.cuh"
 
 template<typename T>
 static __global__ void k_flash_attn_ext_tail_pack_arenas(
@@ -460,6 +461,35 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const ggml_tensor * kt_current = dst->src[10];
     const ggml_tensor * vt_current = dst->src[11];
     GGML_ASSERT(q && kb && vb && mb && kt && vt && mt && qo && rd);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    ggml_tensor kb_mapped {};
+    ggml_tensor vb_mapped {};
+    if (ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_GPU_KV_WINDOW) != 0 &&
+            rd->ne[0] > 6 + mt->ne[0]) {
+        const auto map_host_tensor = [](const ggml_tensor * src, ggml_tensor & mapped) {
+            void * host_base = ggml_backend_buffer_get_base(src->buffer);
+            void * device_base = ggml_cuda_mapped_host_buffer_device_base(src->buffer);
+            if (host_base == nullptr || device_base == nullptr ||
+                    uintptr_t(src->data) < uintptr_t(host_base)) {
+                GGML_ABORT("GPU KV window body lost its validated CUDA mapping "
+                        "(tensor=%s buffer=%s size=%zu data=%p host=%p device=%p)",
+                        src->name, ggml_backend_buffer_name(src->buffer),
+                        ggml_backend_buffer_get_size(src->buffer), src->data, host_base, device_base);
+            }
+            const size_t offset = uintptr_t(src->data) - uintptr_t(host_base);
+            const size_t buffer_size = ggml_backend_buffer_get_size(src->buffer);
+            if (offset > buffer_size || ggml_nbytes(src) > buffer_size - offset) {
+                GGML_ABORT("GPU KV window body lies outside its validated CUDA mapping");
+            }
+            mapped = *src;
+            mapped.data = reinterpret_cast<void *>(uintptr_t(device_base) + offset);
+        };
+        map_host_tensor(kb, kb_mapped);
+        map_host_tensor(vb, vb_mapped);
+        kb = &kb_mapped;
+        vb = &vb_mapped;
+    }
+#endif
     GGML_ASSERT((kt_current == nullptr) == (vt_current == nullptr));
     if (kt_current) {
         GGML_ASSERT(kt_current->type == kt->type && vt_current->type == vt->type);
@@ -508,7 +538,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1] && vt->ne[1] == kt->ne[1]);
     const bool tail_bodyless = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
-    const bool indexed_small = tail_stride <= 256;
+    // The direct indexed kernel consumes scalar F16/BF16 rows.  Quantized
+    // tails must use the packed path even at the 256-token boundary.
+    const bool indexed_small = tail_stride <= 256 &&
+        !ggml_is_quantized(kt->type) && !ggml_is_quantized(vt->type);
     const int compute_stride = tail_bodyless ?
             int(GGML_PAD(tail_stride, FATTN_KQ_STRIDE)) :
             int(ggml_cuda_tail_compute_stride(tail_stride));
@@ -526,6 +559,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
 
     const size_t kt_elements = size_t(d_k)*compute_stride*n_head_k*n_active;
     const size_t vt_elements = size_t(d_v)*compute_stride*n_head_v*n_active;
+    const size_t kt_row_bytes = ggml_row_size(kt->type, d_k);
+    const size_t vt_row_bytes = ggml_row_size(vt->type, d_v);
+    const size_t kt_packed_bytes = kt_row_bytes*compute_stride*n_head_k*n_active;
+    const size_t vt_packed_bytes = vt_row_bytes*compute_stride*n_head_v*n_active;
     const size_t q_elements = size_t(d_k)*q_max*n_head*n_active;
     const size_t mask_elements = size_t(compute_stride)*q_max*n_active;
     const size_t body_mask_elements = body_packed && !tail_bodyless ?
@@ -537,9 +574,9 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const size_t vb_packed_bytes = body_packed && !tail_bodyless ?
             vb_row_bytes*body_stride*vb->ne[2]*n_active : 1;
     ggml_cuda_pool_alloc<uint8_t> kt_alloc(pool,
-            indexed_small ? 1 : kt_elements*ggml_type_size(kt->type));
+            indexed_small ? 1 : kt_packed_bytes);
     ggml_cuda_pool_alloc<uint8_t> vt_alloc(pool,
-            indexed_small ? 1 : vt_elements*ggml_type_size(vt->type));
+            indexed_small ? 1 : vt_packed_bytes);
     ggml_cuda_pool_alloc<float> q_alloc(pool,
             indexed_small && !body_packed ? 1 : q_elements);
     ggml_cuda_pool_alloc<half> mask_alloc(pool,
@@ -556,27 +593,36 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     const int threads = 256;
     auto blocks_for = [threads](size_t n) { return int(std::min<size_t>((n + threads - 1)/threads, 65535)); };
     const bool kt_vec = !indexed_small && kt->nb[0] == ggml_type_size(kt->type) &&
-            size_t(d_k)*kt->nb[0] % sizeof(uint4) == 0 &&
+            kt_row_bytes % sizeof(uint4) == 0 &&
             kt->nb[1] % alignof(uint4) == 0 && kt->nb[2] % alignof(uint4) == 0 &&
             uintptr_t(kt->data) % alignof(uint4) == 0 && uintptr_t(kt_alloc.get()) % alignof(uint4) == 0 &&
             (!kt_current || (kt_current->nb[0] == kt->nb[0] &&
                 kt_current->nb[1] % alignof(uint4) == 0 && kt_current->nb[2] % alignof(uint4) == 0 &&
                 uintptr_t(kt_current->data) % alignof(uint4) == 0));
     const bool vt_vec = !indexed_small && vt->nb[0] == ggml_type_size(vt->type) &&
-            size_t(d_v)*vt->nb[0] % sizeof(uint4) == 0 &&
+            vt_row_bytes % sizeof(uint4) == 0 &&
             vt->nb[1] % alignof(uint4) == 0 && vt->nb[2] % alignof(uint4) == 0 &&
             uintptr_t(vt->data) % alignof(uint4) == 0 && uintptr_t(vt_alloc.get()) % alignof(uint4) == 0 &&
             (!vt_current || (vt_current->nb[0] == vt->nb[0] &&
                 vt_current->nb[1] % alignof(uint4) == 0 && vt_current->nb[2] % alignof(uint4) == 0 &&
                 uintptr_t(vt_current->data) % alignof(uint4) == 0));
     if (kt_vec) {
-        const size_t n = kt_elements*ggml_type_size(kt->type)/sizeof(uint4);
+        const size_t n = kt_packed_bytes/sizeof(uint4);
         k_flash_attn_ext_tail_pack_arenas_vec<uint4><<<blocks_for(n), threads, 0, ctx.stream()>>>(
             (const char *) kt->data, kt_current ? (const char *) kt_current->data : nullptr,
             (uint4 *) kt_alloc.get(), (const int32_t *) rd->data,
-            int(size_t(d_k)*kt->nb[0]/sizeof(uint4)), compute_stride, n_head_k, n_active,
+            int(kt_row_bytes/sizeof(uint4)), compute_stride, n_head_k, n_active,
             desc_stride, history_slots, kt->nb[1], kt->nb[2],
             kt_current ? kt_current->nb[1] : 0, kt_current ? kt_current->nb[2] : 0);
+    } else if (!indexed_small && ggml_is_quantized(kt->type)) {
+        k_flash_attn_ext_tail_pack_arenas<uint8_t><<<blocks_for(kt_packed_bytes), threads, 0, ctx.stream()>>>(
+            (const char *) kt->data, kt_current ? (const char *) kt_current->data : nullptr,
+            kt_alloc.get(), (const int32_t *) rd->data,
+            int(kt_row_bytes), compute_stride, n_head_k, n_active, desc_stride, history_slots,
+            1, kt->nb[1], kt->nb[2],
+            kt_current ? 1 : 0,
+            kt_current ? kt_current->nb[1] : 0,
+            kt_current ? kt_current->nb[2] : 0);
     } else if (!indexed_small && ggml_type_size(kt->type) == sizeof(uint16_t)) {
         k_flash_attn_ext_tail_pack_arenas<uint16_t><<<blocks_for(kt_elements), threads, 0, ctx.stream()>>>(
             (const char *) kt->data, kt_current ? (const char *) kt_current->data : nullptr,
@@ -597,13 +643,22 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
             kt_current ? kt_current->nb[2] : 0);
     }
     if (vt_vec) {
-        const size_t n = vt_elements*ggml_type_size(vt->type)/sizeof(uint4);
+        const size_t n = vt_packed_bytes/sizeof(uint4);
         k_flash_attn_ext_tail_pack_arenas_vec<uint4><<<blocks_for(n), threads, 0, ctx.stream()>>>(
             (const char *) vt->data, vt_current ? (const char *) vt_current->data : nullptr,
             (uint4 *) vt_alloc.get(), (const int32_t *) rd->data,
-            int(size_t(d_v)*vt->nb[0]/sizeof(uint4)), compute_stride, n_head_v, n_active,
+            int(vt_row_bytes/sizeof(uint4)), compute_stride, n_head_v, n_active,
             desc_stride, history_slots, vt->nb[1], vt->nb[2],
             vt_current ? vt_current->nb[1] : 0, vt_current ? vt_current->nb[2] : 0);
+    } else if (!indexed_small && ggml_is_quantized(vt->type)) {
+        k_flash_attn_ext_tail_pack_arenas<uint8_t><<<blocks_for(vt_packed_bytes), threads, 0, ctx.stream()>>>(
+            (const char *) vt->data, vt_current ? (const char *) vt_current->data : nullptr,
+            vt_alloc.get(), (const int32_t *) rd->data,
+            int(vt_row_bytes), compute_stride, n_head_v, n_active, desc_stride, history_slots,
+            1, vt->nb[1], vt->nb[2],
+            vt_current ? 1 : 0,
+            vt_current ? vt_current->nb[1] : 0,
+            vt_current ? vt_current->nb[2] : 0);
     } else if (!indexed_small && ggml_type_size(vt->type) == sizeof(uint16_t)) {
         k_flash_attn_ext_tail_pack_arenas<uint16_t><<<blocks_for(vt_elements), threads, 0, ctx.stream()>>>(
             (const char *) vt->data, vt_current ? (const char *) vt_current->data : nullptr,
@@ -651,10 +706,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     ggml_cuda_tail_make_contiguous(q_packed, d_k, q_max, n_head, n_active, sizeof(float));
     ggml_tensor k_packed = *kt;
     k_packed.data = kt_alloc.get();
-    ggml_cuda_tail_make_contiguous(k_packed, d_k, compute_stride, n_head_k, n_active, ggml_type_size(kt->type));
+    ggml_cuda_tail_make_contiguous_type(k_packed, d_k, compute_stride, n_head_k, n_active);
     ggml_tensor v_packed = *vt;
     v_packed.data = vt_alloc.get();
-    ggml_cuda_tail_make_contiguous(v_packed, d_v, compute_stride, n_head_v, n_active, ggml_type_size(vt->type));
+    ggml_cuda_tail_make_contiguous_type(v_packed, d_v, compute_stride, n_head_v, n_active);
     ggml_tensor mask_packed = *mt;
     mask_packed.data = mask_alloc.get();
     ggml_cuda_tail_make_contiguous(mask_packed, compute_stride, q_max, 1, n_active, sizeof(half));

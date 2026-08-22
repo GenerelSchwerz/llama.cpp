@@ -2634,6 +2634,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--kv-gpu-window"}, "N",
+        string_format("experimental single-CUDA-device CPU-KV transfer window: keep the newest N Q8_0 rows per "
+                      "layer on the GPU and omit them from mapped pinned-host reads. The complete host body "
+                      "remains authoritative; requires operation offload, --no-kv-offload, --kv-cpu-pinned, Flash "
+                      "Attention, Q8_0/Q8_0 KV, 256 <= N < n_ctx, one sequence, no SWA, no precision tail, and --kv-gpu-layers 0 "
+                      "(default: %d)", params.kv_gpu_window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-gpu-window must not be negative");
+            }
+            params.kv_gpu_window = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GPU_WINDOW"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
