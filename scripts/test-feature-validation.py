@@ -10,12 +10,15 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -24,8 +27,13 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
-from feature_validation import core, profiler, telemetry  # noqa: E402
-from feature_validation.runner import StudyRunner, _verify_spec_identity  # noqa: E402
+from feature_validation import core, profiler, runner as validation_runner, telemetry  # noqa: E402
+from feature_validation.runner import (  # noqa: E402
+    StudyRunner,
+    _verify_spec_identity,
+    execute_run_spec,
+    launch_locked_spec,
+)
 
 
 CLI_SPEC = importlib.util.spec_from_file_location(
@@ -306,6 +314,96 @@ class FixtureMixin:
         return manifest, built_executable, cache, sidecar
 
 
+class ArtifactLifecycleTest(FixtureMixin, unittest.TestCase):
+    def _in_source_manifest(self) -> tuple[dict, pathlib.Path]:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        (self.repo / ".git" / "info" / "exclude").write_text(
+            "/build-validation-artifacts/\n", encoding="utf-8"
+        )
+        manifest_path = self.root / "in-source.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        return manifest, manifest_path
+
+    def test_run_and_resume_recheck_actual_ignored_directories(self) -> None:
+        _manifest, manifest_path = self._in_source_manifest()
+        runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        runner.prepare(resume=False)
+        stage = core.stage_by_id(runner.manifest, "exactness")
+        scheduled = core.build_schedule(runner.manifest, stage)[0]
+
+        result = runner._execute(stage, scheduled, retry_failed=False)
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        core.validate_artifact_directory_isolation(
+            runner.manifest, pathlib.Path(result["stdout"]["path"]).parent
+        )
+
+        (self.repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            runner.prepare(resume=True)
+
+    def test_profile_rechecks_created_directory_immediately_before_target(self) -> None:
+        manifest, manifest_path = self._in_source_manifest()
+        stage = core.stage_by_id(manifest, "production")
+        stage["resource"] = "gpu"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        config = {
+            "stage": "production",
+            "selector": {
+                "kernel_regex": "kernel",
+                "graph_only": False,
+                "occurrence_policy": {"kind": "last"},
+            },
+            "cuda_graph_trace": {
+                "applicability": "not_applicable",
+                "reason": "CPU-only isolation test",
+            },
+            "metrics": ["gpu__time_duration.sum"],
+        }
+        manifest_sha = file_sha256(manifest_path)
+        provenance = core.capture_provenance(manifest, manifest_sha)
+        profile_base = pathlib.Path(manifest["artifact_root"]) / "profiles"
+
+        def tool_identity(_name: str) -> dict[str, object]:
+            (self.repo / ".git" / "info" / "exclude").write_text("", encoding="utf-8")
+            return {"path": "/bin/true", "sha256": file_sha256(pathlib.Path("/bin/true"))}
+
+        with mock.patch.object(
+            CLI.profiler, "validate_native_affinity"
+        ), mock.patch.object(
+            CLI, "_tool_identity", side_effect=tool_identity
+        ), mock.patch.object(
+            CLI.core,
+            "command_capture",
+            return_value={"returncode": 0, "stdout": "", "stderr": ""},
+        ), mock.patch.object(
+            CLI.profiler,
+            "verify_nsys_graph_trace_capability",
+            return_value={"status": "not_applicable"},
+        ), mock.patch.object(
+            CLI.profiler, "nsys_discovery_argv", return_value=["/bin/true"]
+        ), mock.patch.object(
+            CLI, "launch_locked_spec"
+        ) as launch, self.assertRaisesRegex(
+            core.ManifestError, "exact artifact directory"
+        ):
+            CLI._profile_one(
+                manifest,
+                manifest_sha,
+                provenance,
+                config,
+                variant_name="baseline",
+                screen_id="default",
+                profile_base=profile_base,
+                resume=False,
+                execute_ncu=False,
+            )
+        launch.assert_not_called()
+
+
 class QuotingAndArityTest(unittest.TestCase):
     def test_safe_quoting_round_trips_spaces_quotes_and_metacharacters(self) -> None:
         argv = ["/tmp/a b", "single'quote", 'double"quote', "$(do-not-run)", "semi;colon"]
@@ -364,6 +462,25 @@ class QuotingAndArityTest(unittest.TestCase):
 
 
 class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
+    @staticmethod
+    def _set_exclude(repo: pathlib.Path, contents: str) -> None:
+        (repo / ".git" / "info" / "exclude").write_text(contents, encoding="utf-8")
+
+    def _new_repo(self, name: str) -> pathlib.Path:
+        repo = self.root / name
+        repo.mkdir()
+        (repo / "tracked").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.invalid"], cwd=repo, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Feature Tests"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=repo, check=True)
+        return repo
+
     def test_checked_in_example_is_structurally_valid_and_schema_is_json(self) -> None:
         schema_path = SCRIPTS / "feature_validation" / "manifest.schema.json"
         example_path = SCRIPTS.parent / "examples" / "feature-performance-validation" / "manifest.example.json"
@@ -386,6 +503,133 @@ class ManifestAndScheduleTest(FixtureMixin, unittest.TestCase):
             orientations.append(pair_runs[0]["orientation"])
             self.assertEqual(len({item["variant"] for item in pair_runs}), 2)
         self.assertEqual(orientations, ["AB", "BA", "AB", "BA", "AB"])
+
+    def test_in_source_artifacts_require_explicit_git_ignored_policy(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+
+        with self.assertRaisesRegex(core.ManifestError, "outside every variant source"):
+            core.validate_manifest(manifest)
+
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        with self.assertRaisesRegex(core.ManifestError, "Git-ignored"):
+            core.validate_manifest(manifest)
+
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text(
+            exclude.read_text(encoding="utf-8") + "\n/build-validation-artifacts/\n",
+            encoding="utf-8",
+        )
+        core.validate_manifest(manifest)
+
+    def test_ignored_synthetic_probe_does_not_authorize_unignored_root(self) -> None:
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(self.repo / "build-validation-artifacts")
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(
+            self.repo,
+            "/build-validation-artifacts/.feature-validation-artifact-root-probe\n",
+        )
+
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            core.validate_manifest(manifest)
+
+    def test_ignore_negation_fails_closed_for_exact_artifact_root(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        artifact_root.mkdir()
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(
+            self.repo,
+            "/build-validation-artifacts/\n!/build-validation-artifacts/\n",
+        )
+
+        with self.assertRaisesRegex(core.ManifestError, "exact artifact directory"):
+            core.validate_manifest(manifest)
+
+    def test_distinct_variant_roots_check_only_the_containing_root(self) -> None:
+        other = self._new_repo("other source")
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(self.repo, "/build-validation-artifacts/\n")
+        candidate = manifest["variants"]["candidate"]
+        candidate["source_root"] = str(other)
+        candidate["expected_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=other,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        core.validate_manifest(manifest)
+
+    def test_nested_variant_roots_must_both_ignore_the_exact_root(self) -> None:
+        nested = self.repo / "nested-source"
+        nested.mkdir()
+        (nested / "tracked").write_text("fixture\n", encoding="utf-8")
+        subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+        subprocess.run(
+            ["git", "config", "user.email", "tests@example.invalid"], cwd=nested, check=True
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Feature Tests"], cwd=nested, check=True
+        )
+        subprocess.run(["git", "add", "."], cwd=nested, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=nested, check=True)
+        artifact_root = nested / "build-validation-artifacts"
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        candidate = manifest["variants"]["candidate"]
+        candidate["source_root"] = str(nested)
+        candidate["expected_commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=nested,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self._set_exclude(
+            self.repo, "/nested-source/\n!/nested-source/\n/nested-source/build-validation-artifacts/\n"
+        )
+        self._set_exclude(nested, "")
+
+        with self.assertRaisesRegex(core.ManifestError, str(nested)):
+            core.validate_manifest(manifest)
+
+        self._set_exclude(nested, "/build-validation-artifacts/\n")
+        core.validate_manifest(manifest)
+
+    def test_ignored_in_source_artifacts_do_not_change_provenance_identity(self) -> None:
+        manifest = self.manifest()
+        artifact_root = self.repo / "build-validation-artifacts"
+        manifest["artifact_root"] = str(artifact_root)
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+        self._set_exclude(self.repo, "/build-validation-artifacts/\n")
+        manifest_path = self.root / "provenance.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        manifest_sha = file_sha256(manifest_path)
+        before = core.capture_provenance(manifest, manifest_sha)
+        artifact_root.mkdir()
+        (artifact_root / "raw-profile.sqlite").write_text("ignored\n", encoding="utf-8")
+        core.validate_artifact_directory_isolation(manifest, artifact_root)
+        after = core.capture_provenance(manifest, manifest_sha)
+
+        self.assertEqual(before["identity_fingerprint"], after["identity_fingerprint"])
+        self.assertEqual(before["variants"], after["variants"])
+
+    def test_in_source_artifacts_never_allow_git_metadata(self) -> None:
+        manifest = self.manifest()
+        manifest["artifact_root"] = str(self.repo / ".git" / "validation-artifacts")
+        manifest["artifact_root_policy"] = "git_ignored_inside_sources"
+
+        with self.assertRaisesRegex(core.ManifestError, "cannot be the source root or .git"):
+            core.validate_manifest(manifest)
 
     def test_single_pair_screening_is_explicit_and_limited_to_early_stages(self) -> None:
         manifest = self.manifest()
@@ -856,6 +1100,27 @@ class StatisticsTest(unittest.TestCase):
 
 
 class ProfilerTest(unittest.TestCase):
+    def test_memory_manifest_categories_are_explicit_and_schema_bounded(self) -> None:
+        stage = {
+            "resource": "gpu",
+            "selection": {"execution_mode": "direct_process"},
+        }
+        config = {
+            "selector": {"kernel_regex": "kernel"},
+            "cuda_graph_trace": {
+                "applicability": "not_applicable",
+                "reason": "direct launch",
+            },
+            "memory_evidence": {
+                "mode": "required",
+                "categories": ["gpu_memory_events", "vmm"],
+            },
+        }
+        core._validate_profiler_details(config, stage, label="profiler")
+        config["memory_evidence"]["categories"] = ["architecture_specific_bytes"]
+        with self.assertRaisesRegex(core.ManifestError, "non-empty unique subset"):
+            core._validate_profiler_details(config, stage, label="profiler")
+
     def test_regression_diagnostic_selects_preregistered_largest_screen(self) -> None:
         stage = {
             "id": "spans",
@@ -933,6 +1198,274 @@ class ProfilerTest(unittest.TestCase):
             profiler.verify_graph_node_discovery(
                 {"graph_node_trace": {"launches_with_graph_node": 0}}, config
             )
+
+    def test_nsys_memory_trace_is_explicit_and_required_support_fails_closed(self) -> None:
+        config = {
+            "mode": "required",
+            "categories": ["gpu_memory_events", "captured_device_high_water"],
+        }
+        evidence = profiler.verify_nsys_memory_trace_capability(
+            config,
+            help_text="--cuda-memory-usage= true|false",
+            version_text="Nsight Systems 2026.1",
+        )
+        self.assertEqual(evidence["status"], "supported")
+        argv = profiler.nsys_discovery_argv(
+            ["/tmp/llama-bench", "-C", "0x7", "--cpu-strict", "1"],
+            pathlib.Path("/tmp/discovery"),
+            request_cuda_memory_usage=True,
+        )
+        self.assertIn("--cuda-memory-usage=true", argv)
+        with self.assertRaisesRegex(core.ValidationError, "does not advertise required"):
+            profiler.verify_nsys_memory_trace_capability(
+                config,
+                help_text="older CUDA tracing help",
+                version_text="Nsight Systems old",
+            )
+        optional = profiler.verify_nsys_memory_trace_capability(
+            {**config, "mode": "optional"},
+            help_text="older CUDA tracing help",
+            version_text="Nsight Systems old",
+        )
+        self.assertEqual(optional["status"], "unsupported")
+
+    def test_memory_inventory_parses_allocations_copies_api_vmm_and_nvtx(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "memory.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE ENUM_CUDA_DEV_MEM_EVENT_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (0, 'Allocation');
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (1, 'Deallocation');
+                    CREATE TABLE ENUM_CUDA_MEM_KIND (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (1, 'Pinned');
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (2, 'Device');
+                    CREATE TABLE ENUM_CUDA_MEMCPY_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEMCPY_OPER VALUES (1, 'Host to Device');
+                    CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                        start INTEGER, globalPid INTEGER, deviceId INTEGER,
+                        contextId INTEGER, address INTEGER, bytes INTEGER,
+                        memKind INTEGER, memoryOperationType INTEGER,
+                        name TEXT, correlationId INTEGER
+                    );
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (10, 7, 0, 3, 100, 1024, 2, 0, 'device-a', 11);
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (15, 7, 0, 3, 200, 512, 1, 0, 'pinned-a', 12);
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (30, 7, 0, 3, 100, 1024, 2, 1, 'device-a', 13);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+                        start INTEGER, end INTEGER, bytes INTEGER,
+                        copyKind INTEGER, srcKind INTEGER, dstKind INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (16, 20, 512, 1, 1, 2);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (
+                        start INTEGER, end INTEGER, bytes INTEGER, memKind INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_MEMSET VALUES (21, 23, 256, 2);
+                    CREATE TABLE StringIds (id INTEGER, value TEXT);
+                    INSERT INTO StringIds VALUES (1, 'cuMemMap');
+                    INSERT INTO StringIds VALUES (2, 'cudaMallocHost_v3020');
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+                        start INTEGER, end INTEGER, nameId INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (5, 6, 1);
+                    INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (7, 9, 2);
+                    CREATE TABLE NVTX_EVENTS (start INTEGER, end INTEGER, text TEXT);
+                    INSERT INTO NVTX_EVENTS VALUES (4, 40, 'prefill');
+                    """
+                )
+                connection.commit()
+
+            inventory = profiler.parse_memory_inventory(path)
+
+        categories = inventory["categories"]
+        self.assertEqual(categories["gpu_memory_events"]["status"], "available")
+        self.assertEqual(categories["gpu_memory_events"]["event_count"], 3)
+        self.assertTrue(
+            any(
+                item["memory_kind"] == "Pinned"
+                for item in categories["gpu_memory_events"]["groups"]
+            )
+        )
+        pinned_balance = next(
+            item
+            for item in categories["gpu_memory_events"][
+                "captured_outstanding_by_process_device_kind"
+            ]
+            if item["memory_kind"] == "Pinned"
+        )
+        self.assertEqual(pinned_balance["captured_outstanding_high_water_bytes"], 512)
+        self.assertEqual(categories["allocation_lifetimes"]["paired_lifetime_count"], 1)
+        self.assertEqual(categories["allocation_lifetimes"]["unmatched_allocation_count"], 1)
+        self.assertEqual(
+            categories["captured_device_high_water"]["by_process_device"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            1024,
+        )
+        self.assertEqual(categories["copy_activity"]["event_count"], 2)
+        self.assertEqual(categories["vmm"]["event_count"], 1)
+        self.assertEqual(categories["nvtx_ranges"]["ranges"][0]["text"], "prefill")
+        assessment = profiler.assess_memory_evidence(
+            inventory,
+            {
+                "mode": "required",
+                "categories": [
+                    "gpu_memory_events",
+                    "allocation_lifetimes",
+                    "captured_device_high_water",
+                    "copy_activity",
+                    "cuda_api",
+                    "vmm",
+                    "nvtx_ranges",
+                ],
+            },
+            {"status": "supported"},
+        )
+        self.assertEqual(assessment["status"], "satisfied")
+        profiler.enforce_memory_evidence(assessment)
+        self.assertIn("never inferred from VmLck", inventory["memory_boundaries"]["pinned_host_memory"])
+
+    def test_memory_inventory_distinguishes_zero_from_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            zero_path = root / "zero.sqlite"
+            missing_path = root / "missing.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(zero_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE ENUM_CUDA_DEV_MEM_EVENT_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (0, 'Allocation');
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (1, 'Deallocation');
+                    CREATE TABLE ENUM_CUDA_MEM_KIND (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (2, 'Device');
+                    CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                        start INTEGER, globalPid INTEGER, deviceId INTEGER,
+                        address INTEGER, bytes INTEGER, memKind INTEGER,
+                        memoryOperationType INTEGER
+                    );
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+                        start INTEGER, end INTEGER, bytes INTEGER
+                    );
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (
+                        start INTEGER, end INTEGER, bytes INTEGER
+                    );
+                    CREATE TABLE StringIds (id INTEGER, value TEXT);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+                        start INTEGER, end INTEGER, nameId INTEGER
+                    );
+                    """
+                )
+                connection.commit()
+            with contextlib.closing(sqlite3.connect(missing_path)) as connection:
+                connection.execute("CREATE TABLE unrelated (value INTEGER)")
+                connection.commit()
+
+            zero = profiler.parse_memory_inventory(zero_path)
+            missing = profiler.parse_memory_inventory(missing_path)
+
+        for category in (
+            "gpu_memory_events",
+            "allocation_lifetimes",
+            "captured_device_high_water",
+            "copy_activity",
+            "cuda_api",
+            "vmm",
+        ):
+            self.assertEqual(zero["categories"][category]["status"], "available")
+            self.assertEqual(zero["categories"][category]["event_count"], 0)
+            self.assertEqual(missing["categories"][category]["status"], "unavailable")
+            self.assertIsNone(missing["categories"][category]["event_count"])
+        required = {
+            "mode": "required",
+            "categories": ["gpu_memory_events", "copy_activity", "vmm"],
+        }
+        failed = profiler.assess_memory_evidence(
+            missing, required, {"status": "supported"}
+        )
+        self.assertEqual(failed["status"], "failed")
+        with self.assertRaisesRegex(core.ValidationError, "required NSYS memory evidence"):
+            profiler.enforce_memory_evidence(failed)
+        optional = profiler.assess_memory_evidence(
+            missing, {**required, "mode": "optional"}, {"status": "unsupported"}
+        )
+        self.assertEqual(optional["status"], "optional_incomplete")
+        profiler.enforce_memory_evidence(optional)
+
+    def test_memory_inventory_accepts_named_variant_columns_and_rejects_missing_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            variant = root / "variant.sqlite"
+            invalid = root / "invalid.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(variant)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, processId INTEGER, device INTEGER, ptr INTEGER, "
+                    "size INTEGER, memoryKind TEXT, operation TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO CUDA_MEMORY_USAGE_EVENTS VALUES "
+                    "(1, 2, 0, 4096, 64, 'Device', 'Allocation')"
+                )
+                connection.commit()
+            with contextlib.closing(sqlite3.connect(invalid)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, address INTEGER, size INTEGER, memoryKind TEXT)"
+                )
+                connection.commit()
+
+            parsed = profiler.parse_memory_inventory(variant)
+            rejected = profiler.parse_memory_inventory(invalid)
+
+        self.assertEqual(parsed["categories"]["gpu_memory_events"]["status"], "available")
+        self.assertEqual(
+            parsed["categories"]["captured_device_high_water"]["by_process_device"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            64,
+        )
+        self.assertEqual(rejected["categories"]["gpu_memory_events"]["status"], "unavailable")
+
+    def test_capture_start_deallocation_marks_high_water_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "partial.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, processId INTEGER, device INTEGER, ptr INTEGER, "
+                    "size INTEGER, memoryKind TEXT, operation TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO CUDA_MEMORY_USAGE_EVENTS VALUES "
+                    "(1, 2, 0, 4096, 64, 'Device', 'Deallocation')"
+                )
+                connection.commit()
+
+            inventory = profiler.parse_memory_inventory(path)
+
+        categories = inventory["categories"]
+        self.assertEqual(categories["gpu_memory_events"]["status"], "available")
+        self.assertEqual(
+            categories["allocation_lifetimes"]["unmatched_deallocation_count"], 1
+        )
+        self.assertEqual(categories["captured_device_high_water"]["status"], "partial")
+        assessment = profiler.assess_memory_evidence(
+            inventory,
+            {"mode": "required", "categories": ["captured_device_high_water"]},
+            {"status": "supported"},
+        )
+        self.assertEqual(assessment["status"], "failed")
 
     def test_jsonl_discovery_and_one_filtered_ncu_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1085,6 +1618,48 @@ class ProfilerTest(unittest.TestCase):
                 },
             )
             core.write_json_atomic(
+                root / "memory-inventory.json",
+                {
+                    "assessment": {"status": "satisfied", "issues": []},
+                    "categories": {
+                        "gpu_memory_events": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "groups": [
+                                {
+                                    "memory_kind": "Device",
+                                    "operation": "allocation",
+                                    "event_count": 1,
+                                    "total_bytes": 4096,
+                                }
+                            ],
+                        },
+                        "allocation_lifetimes": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "paired_lifetime_count": 1,
+                            "unmatched_allocation_count": 0,
+                            "unmatched_deallocation_count": 0,
+                        },
+                        "captured_device_high_water": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "by_process_device": [
+                                {
+                                    "process_id": 1,
+                                    "device_id": 0,
+                                    "captured_outstanding_high_water_bytes": 4096,
+                                }
+                            ],
+                        },
+                    },
+                    "memory_boundaries": {"process_vram": "separate telemetry"},
+                },
+            )
+            core.write_json_atomic(
                 root / "nsys-result.json",
                 {"timing": {"target_process_seconds": 2.5}},
             )
@@ -1102,6 +1677,13 @@ class ProfilerTest(unittest.TestCase):
             summary["ncu"]["captures"][0]["metrics"][0]["value"], "1234"
         )
         self.assertEqual(summary["timing_seconds"]["nsys"]["target_process_seconds"], 2.5)
+        self.assertEqual(summary["memory"]["assessment_status"], "satisfied")
+        self.assertEqual(
+            summary["memory"]["captured_device_high_water"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            4096,
+        )
         self.assertIn("diagnostic-only", summary["evidence_boundary"].lower())
 
     def test_agent_comparison_keeps_raw_metrics_without_acceptance_claim(self) -> None:
@@ -1124,6 +1706,12 @@ class ProfilerTest(unittest.TestCase):
                         }
                     ]
                 },
+                "memory": {
+                    "assessment_status": "satisfied",
+                    "captured_device_high_water": [
+                        {"captured_outstanding_high_water_bytes": int(value)}
+                    ],
+                },
                 "timing_seconds": {},
             }
 
@@ -1135,6 +1723,12 @@ class ProfilerTest(unittest.TestCase):
         self.assertEqual(
             comparison["raw_ncu_metrics"]["candidate"][0]["metrics"][0]["value"],
             "12",
+        )
+        self.assertEqual(
+            comparison["memory_inventory"]["candidate"][
+                "captured_device_high_water"
+            ][0]["captured_outstanding_high_water_bytes"],
+            12,
         )
         self.assertIn("no paired interval", comparison["comparison_boundary"].lower())
 
@@ -1518,6 +2112,501 @@ class TelemetryTest(unittest.TestCase):
 
 
 class RunnerTest(FixtureMixin, unittest.TestCase):
+    def _spec(self, attempt: pathlib.Path, argv: list[str], run_id: str) -> dict:
+        return {
+            "schema_version": 1,
+            "run_id": run_id,
+            "attempt": 1,
+            "resource": "cpu",
+            "argv": argv,
+            "environment": {},
+            "cwd": str(attempt),
+            "timeout_seconds": 60.0,
+            "progress": "CPU-only real-signal lifecycle test",
+            "result_path": str(attempt / "result.json"),
+            "stdout_path": str(attempt / "stdout.log"),
+            "stderr_path": str(attempt / "stderr.log"),
+            "identity_files": [],
+            "source_identities": [],
+            "host_load_before": {},
+            "cleanup_term_timeout_seconds": 0.2,
+            "cleanup_kill_timeout_seconds": 1.0,
+        }
+
+    def _fake_flock(self, target_pids_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+        fake_bin = self.root / "fake-flock-bin"
+        fake_bin.mkdir()
+        held_path = self.root / "fake-lock-held"
+        released_path = self.root / "fake-lock-released.json"
+        fake = fake_bin / "flock"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            "if len(sys.argv) != 4 or sys.argv[2] != '-c':\n"
+            "    raise SystemExit(64)\n"
+            f"held = pathlib.Path({str(held_path)!r})\n"
+            f"released = pathlib.Path({str(released_path)!r})\n"
+            f"target_pids = pathlib.Path({str(target_pids_path)!r})\n"
+            "held.write_text(str(time.monotonic()))\n"
+            "result = subprocess.run(['/bin/sh', '-c', sys.argv[3]], check=False)\n"
+            "pids = json.loads(target_pids.read_text()) if target_pids.is_file() else []\n"
+            "deadline = time.monotonic() + 2.0\n"
+            "alive = []\n"
+            "while True:\n"
+            "    alive = []\n"
+            "    for pid in pids:\n"
+            "        try:\n"
+            "            os.kill(pid, 0)\n"
+            "        except ProcessLookupError:\n"
+            "            continue\n"
+            "        alive.append(pid)\n"
+            "    if not alive or time.monotonic() >= deadline:\n"
+            "        break\n"
+            "    time.sleep(.02)\n"
+            "released.write_text(json.dumps({'alive_at_release': alive, "
+            "'released_monotonic': time.monotonic(), 'inner_returncode': result.returncode}))\n"
+            "raise SystemExit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake_bin, released_path
+
+    def _prepared_first_run(
+        self, manifest_name: str
+    ) -> tuple[StudyRunner, dict, dict, str, pathlib.Path]:
+        manifest_path = self.root / manifest_name
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        study = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        study.prepare(resume=False)
+        stage = core.stage_by_id(study.manifest, "exactness")
+        scheduled = core.build_schedule(study.manifest, stage)[0]
+        run_id = f"{stage['id']}--{scheduled['run_id']}"
+        run_base = study.study_root / "runs" / stage["id"] / scheduled["run_id"]
+        return study, stage, scheduled, run_id, run_base
+
+    def test_parent_interrupt_holds_wrapper_until_descendant_is_reaped(self) -> None:
+        attempt = self.root / "parent-interrupted"
+        attempt.mkdir()
+        target_pids_path = attempt / "target-pids.json"
+        ready_path = attempt / "target-ready"
+        target = attempt / "parent-interrupt-target.py"
+        descendant_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"pathlib.Path({str(target_pids_path)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+            f"pathlib.Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+        fake_bin, released_path = self._fake_flock(target_pids_path)
+        spec = self._spec(attempt, [str(target)], "parent-interrupt-cleanup")
+        spec["lifecycle_path"] = str(attempt / "lifecycle-owner.json")
+        spec_path = attempt / "run-spec.json"
+
+        def interrupt_twice() -> None:
+            deadline = time.monotonic() + 5.0
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if ready_path.is_file():
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = threading.Thread(target=interrupt_twice)
+        interrupter.start()
+        result: dict | None = None
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+            ):
+                result = launch_locked_spec(
+                    spec, spec_path, SCRIPTS / "feature-performance-validation.py"
+                )
+        finally:
+            interrupter.join(timeout=5.0)
+            if target_pids_path.is_file():
+                target_pids = json.loads(target_pids_path.read_text(encoding="utf-8"))
+                for pid in target_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["launcher"]["interrupted"])
+        self.assertEqual(result["launcher"]["interrupt_signals"], ["SIGTERM", "SIGINT"])
+        self.assertIsNone(result["launcher"]["owned_target_fallback_cleanup"])
+        self.assertTrue(result["process_group_cleanup"]["kill_sent"])
+        self.assertTrue(result["process_group_cleanup"]["group_gone"])
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        self.assertIsNotNone(result["telemetry"])
+        release = json.loads(released_path.read_text(encoding="utf-8"))
+        self.assertEqual(release["alive_at_release"], [])
+        lifecycle = json.loads(
+            pathlib.Path(spec["lifecycle_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(lifecycle["state"], "cleanup_complete")
+        self.assertTrue(lifecycle["telemetry_stopped"])
+
+    def test_incomplete_attempt_is_sealed_and_retry_uses_next_number(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "incomplete-attempt.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        sentinel = first / "partial.log"
+        sentinel.write_text("interrupted output\n", encoding="utf-8")
+        resumed = StudyRunner(
+            study.manifest_path, SCRIPTS / "feature-performance-validation.py"
+        )
+        resumed.prepare(resume=True)
+
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            resumed._execute(stage, scheduled, retry_failed=False)
+        recovered = resumed.state["runs"][run_id][0]
+        self.assertEqual(recovered["status"], "failed")
+        self.assertNotIn("metric_value", recovered)
+        self.assertEqual(recovered["metric_disposition"], "not_counted_interrupted_attempt")
+        evidence_path = pathlib.Path(recovered["attempt_evidence"]["path"])
+        self.assertEqual(
+            recovered["attempt_evidence"]["sha256"], file_sha256(evidence_path)
+        )
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["study_identity"], resumed._study_identity())
+        self.assertIn("partial.log", [item["path"] for item in evidence["files"]])
+
+        result = resumed._execute(stage, scheduled, retry_failed=True)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["attempt"], 2)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "interrupted output\n")
+        self.assertTrue((run_base / "attempt-02" / "result.json").is_file())
+        self.assertEqual(
+            [item["status"] for item in resumed.state["runs"][run_id]],
+            ["failed", "success"],
+        )
+
+    def test_incomplete_attempt_with_live_owner_is_not_recycled(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "live-owner-incomplete.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "lifecycle-owner.json",
+            {
+                "run_id": run_id,
+                "attempt": 1,
+                "study_identity": study._study_identity(),
+                "executor": validation_runner._process_identity(os.getpid()),
+                "target": None,
+                "state": "executor_started",
+            },
+        )
+
+        with self.assertRaisesRegex(core.ValidationError, "live owned executor"):
+            study._execute(stage, scheduled, retry_failed=True)
+        self.assertNotIn(run_id, study.state["runs"])
+        self.assertFalse((first / "attempt-evidence.json").exists())
+
+    def test_noncanonical_incomplete_attempt_name_fails_closed(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "noncanonical-incomplete.json"
+        )
+        (run_base / "attempt-1").mkdir(parents=True)
+
+        with self.assertRaisesRegex(core.ProvenanceError, "noncanonical"):
+            study._execute(stage, scheduled, retry_failed=True)
+        self.assertNotIn(run_id, study.state["runs"])
+
+    def test_repeated_incomplete_attempts_are_preserved_before_attempt_three(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "repeated-incomplete.json"
+        )
+        for attempt in (1, 2):
+            directory = run_base / f"attempt-{attempt:02d}"
+            directory.mkdir(parents=True)
+            (directory / "partial.log").write_text(
+                f"interruption {attempt}\n", encoding="utf-8"
+            )
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        self.assertEqual(result["attempt"], 3)
+        records = study.state["runs"][run_id]
+        self.assertEqual([item["status"] for item in records], ["failed", "failed", "success"])
+        self.assertEqual([item["attempt"] for item in records], [1, 2, 3])
+        for attempt in (1, 2):
+            self.assertTrue((run_base / f"attempt-{attempt:02d}" / "attempt-evidence.json").is_file())
+
+    def test_preserved_incomplete_attempt_tamper_fails_closed(self) -> None:
+        study, stage, scheduled, _run_id, run_base = self._prepared_first_run(
+            "tampered-incomplete.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        sentinel = first / "partial.log"
+        sentinel.write_text("original\n", encoding="utf-8")
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            study._execute(stage, scheduled, retry_failed=False)
+        sentinel.write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(core.ProvenanceError, "evidence changed"):
+            study._execute(stage, scheduled, retry_failed=True)
+
+    def test_unindexed_success_result_is_preserved_but_never_counted(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "unindexed-success.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "result.json",
+            {
+                "run_id": run_id,
+                "attempt": 1,
+                "status": "success",
+                "metric_value": 999999,
+            },
+        )
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        recovered = study.state["runs"][run_id][0]
+        self.assertEqual(recovered["status"], "failed")
+        self.assertNotIn("metric_value", recovered)
+        self.assertEqual(
+            recovered["preserved_child_result"]["metric_disposition"],
+            "preserved_not_counted",
+        )
+        self.assertEqual(result["attempt"], 2)
+
+    def test_unindexed_presealed_failure_recovers_without_mutating_seal(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "unindexed-presealed.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "result.json",
+            {"run_id": run_id, "attempt": 1, "status": "failed", "error": "stopped"},
+        )
+        reference = study._seal_failed_attempt(first, run_id, 1)
+        evidence_path = pathlib.Path(reference["path"])
+        evidence_before = evidence_path.read_bytes()
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        recovered = study.state["runs"][run_id][0]
+        self.assertEqual(
+            recovered["recovery_record"],
+            "state_only_to_preserve_preexisting_immutable_attempt_seal",
+        )
+        self.assertEqual(recovered["attempt_evidence"], reference)
+        self.assertEqual(evidence_path.read_bytes(), evidence_before)
+        self.assertFalse((first / "interrupted-result.json").exists())
+        self.assertEqual(result["attempt"], 2)
+
+    def test_exited_leader_does_not_hide_sigterm_ignoring_descendant(self) -> None:
+        attempt = self.root / "leader-exited"
+        attempt.mkdir()
+        descendant_pid_path = attempt / "descendant.pid"
+        target = attempt / "spawn-descendant.py"
+        descendant_code = (
+            "import os, pathlib, signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            "#!/usr/bin/python3\n"
+            "import pathlib, subprocess, sys, time\n"
+            f"ready = pathlib.Path({str(descendant_pid_path)!r})\n"
+            f"subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            "for _ in range(200):\n"
+            "    if ready.is_file():\n"
+            "        break\n"
+            "    time.sleep(.01)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+
+        result = execute_run_spec(self._spec(attempt, [str(target)], "leader-exited"))
+
+        descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "success")
+        cleanup = result["process_group_cleanup"]
+        self.assertTrue(cleanup["term_sent"])
+        self.assertTrue(cleanup["kill_sent"])
+        self.assertTrue(cleanup["group_gone"])
+        self.assertTrue(cleanup["leader_reaped"])
+        with self.assertRaises(ProcessLookupError):
+            os.kill(descendant_pid, 0)
+
+    def test_real_sigint_reaps_target_group_and_preserves_failure(self) -> None:
+        attempt = self.root / "interrupted-attempt"
+        attempt.mkdir()
+        descendant_pid_path = attempt / "descendant.pid"
+        ready_path = attempt / "target-ready.json"
+        target = attempt / "interrupt-target.py"
+        descendant_code = (
+            "import os, pathlib, signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(os.getpid())); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            "#!/usr/bin/python3\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"descendant = pathlib.Path({str(descendant_pid_path)!r})\n"
+            "for _ in range(200):\n"
+            "    if descendant.is_file():\n"
+            "        break\n"
+            "    time.sleep(.01)\n"
+            f"pathlib.Path({str(ready_path)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+        spec = self._spec(attempt, [str(target)], "interrupt-cleanup")
+        spec_path = attempt / "spec.json"
+        spec_path.write_text(json.dumps(spec), encoding="utf-8")
+
+        with subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPTS / "feature-performance-validation.py"),
+                "_execute-run",
+                str(spec_path),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ) as executor:
+            deadline = time.monotonic() + 5.0
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(ready_path.is_file())
+            os.kill(executor.pid, signal.SIGINT)
+            self.assertEqual(executor.wait(timeout=5.0), 1)
+
+        target_pid, descendant_pid = json.loads(ready_path.read_text(encoding="utf-8"))
+        result = json.loads(pathlib.Path(spec["result_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("KeyboardInterrupt", result["error"])
+        self.assertEqual(result["process_group_id"], target_pid)
+        self.assertTrue(result["process_group_cleanup"]["kill_sent"])
+        self.assertTrue(result["process_group_cleanup"]["group_gone"])
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        for pid in (target_pid, descendant_pid):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_cleanup_errors_preserve_result_and_telemetry(self) -> None:
+        attempt = self.root / "cleanup-error"
+        attempt.mkdir()
+        spec = self._spec(attempt, ["/bin/true"], "cleanup-error")
+        original_cleanup = validation_runner._cleanup_process_group
+
+        def cleanup_with_error(*args: object, **kwargs: object) -> dict[str, object]:
+            report = original_cleanup(*args, **kwargs)
+            report["errors"].append("injected cleanup failure")
+            return report
+
+        with mock.patch.object(
+            validation_runner, "_cleanup_process_group", side_effect=cleanup_with_error
+        ):
+            result = execute_run_spec(spec)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("injected cleanup failure", result["error"])
+        self.assertIsNotNone(result["telemetry"])
+        self.assertTrue(pathlib.Path(spec["result_path"]).is_file())
+
+    def test_outer_launcher_real_sigint_persists_state_and_retry_semantics(self) -> None:
+        ready = self.root / "outer-ready"
+        allow = self.root / "outer-allow"
+        self.executable.write_text(
+            f"#!{sys.executable}\n"
+            "import pathlib, time\n"
+            f"ready = pathlib.Path({str(ready)!r})\n"
+            f"allow = pathlib.Path({str(allow)!r})\n"
+            "if allow.is_file():\n"
+            "    print('metric=100.0')\n"
+            "else:\n"
+            "    ready.write_text('ready')\n"
+            "    time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        self.executable.chmod(0o755)
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "interrupt fixture"], cwd=self.repo, check=True
+        )
+        manifest_path = self.root / "outer-interrupt.json"
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        runner = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        runner.prepare(resume=False)
+        stage = core.stage_by_id(runner.manifest, "exactness")
+        stage["resource"] = "gpu"
+        scheduled = core.build_schedule(runner.manifest, stage)[0]
+        fake_bin, _released_path = self._fake_flock(self.root / "no-target-pids")
+        fake_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
+
+        def cpu_locked(spec: dict, spec_path: pathlib.Path, tool_script: pathlib.Path) -> dict:
+            spec["resource"] = "cpu"
+            spec["cleanup_term_timeout_seconds"] = 0.2
+            spec["cleanup_kill_timeout_seconds"] = 1.0
+            return launch_locked_spec(spec, spec_path, tool_script)
+
+        def interrupt_when_ready() -> None:
+            deadline = time.monotonic() + 5.0
+            while not ready.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if ready.is_file():
+                os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = threading.Thread(target=interrupt_when_ready)
+        interrupter.start()
+        with mock.patch.dict(os.environ, {"PATH": fake_path}), mock.patch.object(
+            validation_runner, "launch_locked_spec", side_effect=cpu_locked
+        ), self.assertRaisesRegex(core.ValidationError, "preserved"):
+            runner._execute(stage, scheduled, retry_failed=False)
+        interrupter.join(timeout=5.0)
+        self.assertFalse(interrupter.is_alive())
+
+        run_id = f"{stage['id']}--{scheduled['run_id']}"
+        attempts = runner.state["runs"][run_id]
+        self.assertEqual([item["status"] for item in attempts], ["failed"])
+        self.assertTrue(attempts[0]["launcher"]["interrupted"])
+        self.assertEqual(
+            attempts[0]["attempt_evidence"]["sha256"],
+            file_sha256(pathlib.Path(attempts[0]["attempt_evidence"]["path"])),
+        )
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            runner._execute(stage, scheduled, retry_failed=False)
+
+        allow.write_text("go", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"PATH": fake_path}), mock.patch.object(
+            validation_runner, "launch_locked_spec", side_effect=cpu_locked
+        ):
+            retried = runner._execute(stage, scheduled, retry_failed=True)
+        self.assertEqual(retried["status"], "success")
+        self.assertEqual(
+            [item["status"] for item in runner.state["runs"][run_id]],
+            ["failed", "success"],
+        )
+
     def test_single_pair_screen_runs_once_and_fails_on_preregistered_signal(self) -> None:
         manifest = self.manifest()
         manifest_path = self.root / "single-pair-screen.json"
