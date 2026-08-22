@@ -5059,3 +5059,29 @@ Revised/pending. The transport path is retained for matched A/B/A measurement,
 but no throughput, VRAM, pinned-memory, PPL, deterministic-output, state, or
 prompt-cache claim is accepted yet. Publication requires those gates on a
 committed candidate binary.
+
+## Experiment 023: bypass split GPU-window attention during prompt batches
+
+Status: retained source policy; matched performance disposition pending. The
+exact source base is `83826504b`; the candidate is the implementation commit
+containing this entry.
+
+Committed-binary selection screens for Experiment 022 showed that a large
+window could cross the decode break-even point, but multi-token prompt graphs
+paid for a redundant second attention partial and merge. The complete
+CUDA-mapped host body remains canonical and already contains the rows mirrored
+by the device suffix. This change therefore uses ordinary one-pass attention
+when `ubatch.n_tokens > 1`, while preserving the ordered compact suffix update
+after attention. Single-token decode continues to use split body/window
+attention.
+
+CPU static/graph tests and a real-model CUDA development smoke exercised the
+new graph selection. The smoke is not performance evidence because it preceded
+this commit. Full committed-binary focused tests and matched A/B/A evidence are
+owned by the final composed candidate.
+
+### Disposition
+
+Retained as a correctness-preserving route selection needed to avoid a material
+prefill penalty. The packed body is still temporarily sized from full
+`kv_size`; Experiment 024 owns the independent cold-region bound.

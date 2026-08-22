@@ -94,6 +94,10 @@ the cold region (`kv_size - N`, with required alignment and reserve) remains a
 separate next implementation and measurement milestone; the first authorized
 focused debug/correctness smoke has completed, but it does not supply the
 matched evidence required for that optimization.
+Multi-token GPU-window graphs use the complete canonical mapped-host body once
+and update the compact suffix after attention. Only single-token graphs select
+split body/window attention. This keeps prompt processing off the additional
+partial-and-merge path while ensuring the suffix is populated before decode.
 
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or

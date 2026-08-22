@@ -501,6 +501,20 @@ def main() -> None:
         raise AssertionError("ggml compact segmented contract requires 12 source operands")
     if "ggml_kv_tail_attention_merge_segmented" not in graph:
         raise AssertionError("model graph does not attach graph-local current K/V")
+    gpu_window_prompt_route = graph.split(
+        "static bool use_gpu_window_split_attention(", 1
+    )[1].split("\n}\n", 1)[0]
+    for required in (
+        "!mctx->is_gpu_window()",
+        "ubatch.n_tokens == 1",
+    ):
+        if required not in gpu_window_prompt_route:
+            raise AssertionError(
+                f"GPU-window prompt bypass lacks the single-token split gate: {required}"
+            )
+    if "split_gpu_window_attention ?" not in graph or \
+            "LLAMA_KV_TAIL_ROUTE_NONE" not in graph:
+        raise AssertionError("GPU-window multi-token graphs do not bypass split attention")
 
     vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
     vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(

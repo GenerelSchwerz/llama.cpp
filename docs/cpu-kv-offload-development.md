@@ -115,6 +115,21 @@ Full exactness/state coverage, clean matched processes at the required depths,
 resource accounting, and an experiment disposition are still required before
 publication.
 
+The first committed-binary window screen then established a useful policy
+boundary. Small device suffixes did not amortize the second attention partial
+at long context: at depth 30K, windows 4096 and 8192 were slower than the
+default-off control. Window 16384 crossed the decode break-even point but made
+prefill materially slower because multi-token graphs also selected the split
+route. These ordered single-repetition screens are parameter-selection data,
+not performance evidence.
+
+The canonical host body already contains every visible row, so a multi-token
+prompt does not need split attention. The next milestone keeps suffix writes
+ordered after ordinary one-pass attention for those graphs and enables the
+body/window split only for single-token graphs. An uncommitted development
+smoke removed nearly all of the observed prefill loss while retaining the
+decode direction; it is not cited as a result for a commit.
+
 ## 2026-08-21: GPU-window prototype protocol boundary
 
 The first chunk-residency prototype deliberately keeps the complete standard

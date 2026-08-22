@@ -3362,6 +3362,15 @@ static ggml_tensor * prepare_compact_tail_current(
     return current;
 }
 
+static bool use_gpu_window_split_attention(
+        const llama_kv_cache_context * mctx, const llama_ubatch & ubatch) {
+    // The canonical mapped-host body already contains every visible row.  A
+    // multi-token prompt therefore needs only the ordinary attention route;
+    // the compact device suffix is still updated after attention and is ready
+    // when the next single-token decode graph selects the split route.
+    return !mctx->is_gpu_window() || ubatch.n_tokens == 1;
+}
+
 static void build_empty_kv_body(
         ggml_context * ctx0,
         ggml_tensor * k_cur,
@@ -3568,12 +3577,16 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // The SET_ROWS results alias the complete persistent shadow tensors and
     // carry the write dependency needed by same-graph attention reads.
-    ggml_tensor * k_tail = k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il);
-    ggml_tensor * v_tail = v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il);
+    const bool split_gpu_window_attention = use_gpu_window_split_attention(mctx_cur, ubatch);
+    ggml_tensor * k_tail = split_gpu_window_attention ?
+            (k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il)) : nullptr;
+    ggml_tensor * v_tail = split_gpu_window_attention ?
+            (v_tail_written ? v_tail_written : mctx_cur->get_v_tail(ctx0, il)) : nullptr;
     const bool gather_k_tail = k_tail != nullptr;
     const bool gather_v_tail = v_tail != nullptr;
-    ggml_tensor * tail_read_idxs = inp->get_tail_read_idxs();
-    llama_kv_tail_route tail_route = mctx_cur->get_tail_route(il);
+    ggml_tensor * tail_read_idxs = split_gpu_window_attention ? inp->get_tail_read_idxs() : nullptr;
+    llama_kv_tail_route tail_route = split_gpu_window_attention ?
+            mctx_cur->get_tail_route(il) : LLAMA_KV_TAIL_ROUTE_NONE;
     // Vulkan and other portable KVarN backends advertise a bounded rotated
     // query width. Outside that matrix the body is materialized, and the exact
     // tail must use the same explicit generic oracle instead of attaching
@@ -3589,7 +3602,7 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     ggml_tensor * k_tail_current = nullptr;
     ggml_tensor * v_tail_current = nullptr;
-    if (compact_tail) {
+    if (compact_tail && tail_route != LLAMA_KV_TAIL_ROUTE_NONE) {
         k_tail_current = prepare_compact_tail_current(ctx0, k_tail, k_cur);
         v_tail_current = prepare_compact_tail_current(ctx0, v_tail, v_cur);
         if (tail_route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
@@ -3601,7 +3614,8 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     const bool use_indexed_tail = gather_k_tail && gather_v_tail && tail_read_idxs &&
             tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE;
-    if (!use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {
+    if (tail_route != LLAMA_KV_TAIL_ROUTE_NONE &&
+            !use_indexed_tail && !use_kvarn && mctx_cur->get_tail_tokens() > 0) {
         if (!k_tail) {
             k_tail = mctx_cur->get_k_tail_fallback(ctx0, il, inp->self_tail_body_read_idxs);
         }
@@ -3641,8 +3655,8 @@ ggml_tensor * llm_graph_context::build_attn(
             }
         }
     }
-    ggml_tensor * kq_b_tail = build_attn_bias_tail(
-            kq_b, inp->get_tail_bias_read_idxs(), inp->get_kq_mask_tail());
+    ggml_tensor * kq_b_tail = tail_route != LLAMA_KV_TAIL_ROUTE_NONE ?
+            build_attn_bias_tail(kq_b, inp->get_tail_bias_read_idxs(), inp->get_kq_mask_tail()) : nullptr;
     ggml_tensor * body_mask = kq_mask;
     ggml_tensor * body_bias = kq_b;
     if (!mctx_cur->has_kv_body(il)) {
@@ -3654,7 +3668,8 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     ggml_tensor * final_tail_op = nullptr;
     ggml_tensor * cur = build_attn_mha(q, k, v, body_bias, body_mask, sinks, v_mla, kq_scale, il,
-            k_tail, v_tail, inp->get_kq_mask_tail(), kq_b_tail,
+            k_tail, v_tail,
+            tail_route != LLAMA_KV_TAIL_ROUTE_NONE ? inp->get_kq_mask_tail() : nullptr, kq_b_tail,
             use_indexed_tail ? tail_read_idxs : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_query_order() : nullptr,
             (use_indexed_tail || use_kvarn) ? inp->get_tail_run_desc() : nullptr,
