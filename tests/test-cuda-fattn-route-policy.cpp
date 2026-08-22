@@ -327,6 +327,28 @@ int main(int argc, char ** argv) {
                  count_occurrences(fattn_mma_f16, "GGML_CUDA_COMPACT_CAUSAL_MASK") == 1 &&
                  kvarn_mma_case.find("GGML_CUDA_COMPACT_CAUSAL_MASK") == std::string::npos,
         "compact causal-prefix kernels must keep one shared interface and guard only backend entry selection");
+    const std::string compact_vec_dispatch = slice_between(fattn_vec,
+            "static void ggml_cuda_flash_attn_ext_vec_case_dispatch(",
+            "template <int D, ggml_type type_K, ggml_type type_V>");
+    const std::string compact_vec_enabled = slice_between(compact_vec_dispatch,
+            "#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK", "#else");
+    const std::string compact_vec_disabled = slice_between(compact_vec_dispatch, "#else", "#endif");
+    const std::string compact_vec_entry = slice_between(fattn_vec,
+            "void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst)",
+            "#define DECL_FATTN_VEC_CASE");
+    ok &= expect(compact_vec_enabled.find("dst->src[3]") != std::string::npos &&
+                 compact_vec_enabled.find("GGML_TYPE_I64") != std::string::npos &&
+                 compact_vec_enabled.find("compact_causal_prefix") != std::string::npos,
+        "compact vector descriptor detection must stay inside the compiled feature guard");
+    ok &= expect(compact_vec_disabled.find("dst->src[3]") == std::string::npos &&
+                 compact_vec_disabled.find("GGML_TYPE_I64") == std::string::npos &&
+                 compact_vec_disabled.find("compact_causal_prefix") == std::string::npos &&
+                 compact_vec_disabled.find("GGML_ASSERT") == std::string::npos &&
+                 compact_vec_disabled.find("type_K, type_V, false>(ctx, dst, logit_softcap)") != std::string::npos &&
+                 compact_vec_entry.find("dst->src[3]") == std::string::npos &&
+                 compact_vec_entry.find("GGML_TYPE_I64") == std::string::npos &&
+                 compact_vec_entry.find("compact_causal_prefix") == std::string::npos,
+        "feature-disabled vector dispatch must instantiate dense attention without descriptor runtime work");
     ok &= expect(kvarn.find("GGML_KVARN_TEST_FORCE_PORTABLE_CAPABILITY") != std::string::npos,
         "CUDA tests must be able to simulate a portable-only pre-Turing capability on current hardware");
     ok &= expect(fattn.find("ggml_cuda_flash_attn_ext_kvarn_direct_tail_supported") != std::string::npos &&

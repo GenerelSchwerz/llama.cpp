@@ -671,9 +671,9 @@ template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_vec_case_dispatch(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
-        float logit_softcap,
-        bool compact_causal_prefix) {
+        float logit_softcap) {
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+    const bool compact_causal_prefix = dst->src[3] && dst->src[3]->type == GGML_TYPE_I64;
     if (compact_causal_prefix) {
         ggml_cuda_flash_attn_ext_vec_case_softcap<
             D, cols_per_block, type_K, type_V, true>(ctx, dst, logit_softcap);
@@ -682,7 +682,6 @@ static void ggml_cuda_flash_attn_ext_vec_case_dispatch(
             D, cols_per_block, type_K, type_V, false>(ctx, dst, logit_softcap);
     }
 #else
-    GGML_ASSERT(!compact_causal_prefix);
     ggml_cuda_flash_attn_ext_vec_case_softcap<
         D, cols_per_block, type_K, type_V, false>(ctx, dst, logit_softcap);
 #endif
@@ -690,23 +689,21 @@ static void ggml_cuda_flash_attn_ext_vec_case_dispatch(
 
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * KQV = dst;
     const ggml_tensor * Q   = dst->src[0];
-    const bool compact_causal_prefix = KQV->src[3] && KQV->src[3]->type == GGML_TYPE_I64;
 
     float logit_softcap;
-    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     if (Q->ne[1] == 1) {
         constexpr int cols_per_block = 1;
         ggml_cuda_flash_attn_ext_vec_case_dispatch<
-            D, cols_per_block, type_K, type_V>(ctx, dst, logit_softcap, compact_causal_prefix);
+            D, cols_per_block, type_K, type_V>(ctx, dst, logit_softcap);
         return;
     }
 
     constexpr int cols_per_block = 2;
     ggml_cuda_flash_attn_ext_vec_case_dispatch<
-        D, cols_per_block, type_K, type_V>(ctx, dst, logit_softcap, compact_causal_prefix);
+        D, cols_per_block, type_K, type_V>(ctx, dst, logit_softcap);
 }
 
 #define DECL_FATTN_VEC_CASE(D, type_K, type_V)                              \
