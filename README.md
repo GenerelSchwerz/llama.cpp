@@ -212,6 +212,7 @@ llama-server --models-preset presets.ini
 ## Documentation
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
+- [CPU KV-offload feature delta from base BeeLlama](docs/cpu-kv-offload-feature-delta.md)
 - [BeeLlama args reference](docs/beellama-args.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)
