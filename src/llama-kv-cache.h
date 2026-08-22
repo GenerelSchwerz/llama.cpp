@@ -330,6 +330,11 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    bool can_use_compact_causal_mask(
+            const llama_ubatch & ubatch, bool causal_attn,
+            uint32_t n_kv, bool is_reserve,
+            const slot_info * sinfo = nullptr) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_tail_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -694,6 +699,8 @@ public:
     virtual void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     virtual void set_input_k_shift   (ggml_tensor * dst) const;
+    virtual bool can_use_compact_causal_mask(
+            const llama_ubatch & ubatch, bool causal_attn, bool is_reserve) const;
     virtual void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     virtual void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,

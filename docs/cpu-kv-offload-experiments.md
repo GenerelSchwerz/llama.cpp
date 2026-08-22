@@ -3512,17 +3512,18 @@ passed 1/1 after the source comparison.
 This document preserves the complete valid integrated KV-line evidence record:
 Experiments 001-020 and W06. Its exact source-bearing baseline is
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; PR 5 and PR 6 source and evidence
-are present there. The 2026-08-21 readiness audit cleared PR 9 to carry this
-shared index into the KV line without changing that production-source identity,
-while the remaining feature lanes stay independently published:
+are present there. PR 9 merged this shared documentation and index as
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` without changing that production-
+source identity, while the remaining feature lanes stay independently
+published:
 
 | Lane | Exact published or merged identity | Evidence ownership and status |
 |---|---|---|
 | [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
-| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; refreshed source checkpoint `107b926e5`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; exact base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. The prior enabled evidence remains authoritative, and the fresh exact-base A/B/A gate separately proves omission and explicit off neutral. |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | published head `565233f79faebb5bace9e41f0e2d0ba9c70930cf`; preserved evidence head `d4183adb8b4902a125b9339cd39032a095fca013`; this investigation composes locally onto `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the historical performance/resource record; current-base results are composition evidence only. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; merged through `35e179272` and present in current KV base `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. It is an unrelated opt-in and is omitted from compact-mask causal commands. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
@@ -3587,6 +3588,176 @@ claim here.
 PR 8 source, generated arguments, presets, and feature-specific reproductions
 remain with that PR until source lands; shared protocol, research, roadmap,
 isolation, and identity indexing belong in the KV line.
+
+## 2026-08-20: pre-PR4 compact causal-mask isolation
+
+### Scope and source identity
+
+This experiment migrates only the compact causal-prefix descriptor from the
+isolated source diff `591337d4d..b2f0c93b` onto baseline
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`. The source was reconciled manually;
+`591337d4d` is not an ancestor of the candidate. The candidate is the committed
+tree containing this record on `exp/compact-causal-mask-pre-pr4`.
+
+The implementation has no CLI argument or user-configurable CMake option. It
+automatically replaces the dense F16 causal mask with an I64 exclusive-prefix
+descriptor only when FlashAttention is active, attention compute is offloaded,
+every scheduled accelerator advertises descriptor support, and the standard KV
+cache proves a single-stream contiguous physical prefix with consecutive writes.
+ALiBi, explicit attention bias, SWA, exact tails, multiple streams or sequences,
+holes, reordered positions, and unsupported backends keep the dense path. KVarN
+does not advertise the capability and therefore remains on its established
+path. The migration contains generic CPU handling plus CUDA F16 vector, tile,
+and MMA handling; it contains no PR-4 native-Q8 implementation or tests.
+
+Both builds used Release, native CPU tuning, CUDA FlashAttention, CUDA
+architecture 120, tests enabled, and at most six build jobs. The baseline source
+was an in-worktree read-only archive of c9 rather than another Git worktree:
+
+```bash
+git archive c9f727c1e | tar -x -C tmp/compact-baseline-src
+cmake -S tmp/compact-baseline-src -B build-compact-baseline-cuda \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_TESTS=ON
+cmake -S . -B build-compact-cuda \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_TESTS=ON
+cmake --build build-compact-cuda \
+  --target llama-perplexity llama-bench llama-cli test-backend-ops -j 6
+```
+
+The baseline reports build `11243-c9f727c1e`; the post-commit candidate reports
+build `11244-b05ddfdd8`. The executable and loaded-library hashes further pin the
+binary identity:
+
+| Artifact | baseline SHA-256 | candidate SHA-256 |
+|---|---|---|
+| `llama-bench` | `1f6229604db5092e79b42b38579194423f0fe249f57366749f619465ec450071` | `48fe4e4e56169a26546d8f6cd8a4137744ff7dba3482cfa8d66acdd44803cb2e` |
+| `llama-perplexity` | `453966fcb89e105e0a3e9e8fb39935801b4b1df616ea5611482cde897dda7aff` | `0a73bb071322119838c3bd77aa8b98e1fa4ddbedea3375f47139ff0657b882bc` |
+| `llama-cli` | `ce4676a1c976fd7bf52b0bfcb7b0ec63e80ad2540e1ac58a2e53742ece5a506a` | `13b1cc469d8d710a876980cf7f47a36319e3c2b632b5108390573ed0f3b67dd7` |
+| `libllama.so` | `92ef6eb76261ef76c56598bb0dfcb71a0b29b2f9d7542f245cb78b8991963520` | `c947fab8a134d67691bcf4bac34df96e5502a639c11b83f32c5f20011884d816` |
+| `libggml-cuda.so` | `0ea097eafed04cee5f7b8221a44d5d341c3906cacf7db1c8806243d3211d4e94` | `26a012172bf181cbd44467700a22cd836a9ec19f970a5af480901d09e7ccf2d0` |
+
+### Correctness and quality
+
+The focused test constructs compact and dense attention in the same graph and
+requires byte-identical F32 outputs. It covers CUDA vector (`D=64, nb=1`), tile
+(`D=40, nb=16`), and F16 MMA (`D=128, nb=64`) routes. The CPU and CUDA commands
+both passed 3/3:
+
+```bash
+build-compact-cpu/bin/test-backend-ops test -b CPU \
+  -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+  --seed 0x6a09e667f3bcc909
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-cuda/bin/test-backend-ops test -b CUDA0 \
+   -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+   --seed 0x6a09e667f3bcc909'
+```
+
+Seven adjacent static regressions also passed: backend-op seed stability, CUDA
+Graph source properties, standard KV tails, KVarN eager workspace, rollback,
+HIP tail capability, and HIP runtime validation.
+
+Quality used the 606,662-byte corpus
+`/home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt`
+(SHA-256 `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`)
+and matching `-b 512 -ub 256`. A fresh baseline/candidate/baseline bracket
+printed the identical four-chunk sequence `1.9315, 2.1279, 2.2498, 2.1674`
+in all three processes and the identical final estimate
+`PPL = 2.1674 +/- 0.03849`:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{build}/bin/llama-perplexity \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   --file /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+   --ctx-size 4096 --batch-size 512 --ubatch-size 256 --chunks 4 \
+   --cache-type-k q8_0 --cache-type-v q8_0 --threads 3 --threads-batch 24 \
+   --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+   --n-gpu-layers 999 --split-mode none --main-gpu 0 \
+   --no-kv-offload --kv-cpu-pinned --flash-attn on'
+```
+
+Here `{build}` was replaced in order with `build-compact-baseline-cuda`,
+`build-compact-cuda`, and `build-compact-baseline-cuda`; every invocation was a
+fresh locked process. The native `[1]` through `[4]` chunk counter exposed
+progress. An earlier one-chunk baseline/candidate screen also matched at
+`1.9312 +/- 0.06681`, but it is not the acceptance evidence.
+
+A deterministic 16-token CLI comparison used the same model and runtime
+placement, prompt `Write one concise sentence about causal attention.`, seed
+1234, temperature zero, context 4096, `--single-turn --simple-io`, and fresh
+locked baseline/candidate processes. After removing the build-identity and
+timing-only `[ Prompt: ... | Generation: ... ]` lines, both complete streams
+had SHA-256
+`cd35be773ca9520e5f79474c94ee1d07784433199b1c3c4f531dffbbcc353c6c`
+and `diff` was empty. The only raw-output differences were the expected build
+identity and timing lines.
+
+### Performance and resources
+
+Hardware was an Intel Core Ultra 9 285K and NVIDIA GeForce RTX 5070 Ti
+(15,880 MiB, compute capability 12.0). The model was the Qwen3.8 27B mixed
+GGUF above (`model_size=14,426,476,544`, `n_params=27,320,697,856`). Each row
+is one clean fresh process; no compiler or other model process was active.
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{build}/bin/llama-bench -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   -pg 512,64 -d {4096|30000} -r 1 --no-warmup --progress --kv-memory \
+   -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 -nkvo 1 --kv-cpu-pinned -fa on \
+   -b 1024 -ub 512 -o jsonl'
+```
+
+The acceptance performance screen also used fresh baseline/candidate/baseline
+processes in that order at both depths. The delta uses the midpoint of the two
+reference samples; each candidate value remains a single sample and therefore
+supports only a no-large-regression screen, not a small throughput claim.
+
+| depth | build/order | prompt 512 | decode 128 | combined 512/64 | peak process VRAM | pinned KV resident |
+|---:|---|---:|---:|---:|---:|---:|
+| 4,096 | c9 baseline A1 | 1,433.21 t/s | 19.877 t/s | 157.255 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | compact B | 1,439.86 t/s | 19.906 t/s | 159.015 t/s | 14,410,711,040 B | 187,170,816 B |
+| 4,096 | c9 baseline A2 | 1,434.06 t/s | 19.580 t/s | 158.740 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | B vs A midpoint | +0.43% | +0.90% | +0.64% | +20 MiB | 0 B |
+| 30,000 | c9 baseline A1 | 1,035.82 t/s | 13.975 t/s | 111.872 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | compact B | 1,054.77 t/s | 13.890 t/s | 112.029 t/s | 14,427,488,256 B | 1,087,373,312 B |
+| 30,000 | c9 baseline A2 | 1,061.78 t/s | 13.962 t/s | 112.077 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | B vs A midpoint | +0.57% | -0.56% | +0.05% | +44 MiB | 0 B |
+
+The bracket does not reproduce a material 30K performance loss. The one-sample
+`-0.56%` 30K decode movement is neutral at this resolution, while combined
+throughput is effectively unchanged. Peak process VRAM increased by 20 MiB at
+4K and 44 MiB at 30K. Pinned KV residency was identical and
+`kv_staging_bytes` was zero in all runs. A separate matched 30K resource-only
+pair reported maximum RSS of
+14,592,992 KiB baseline and 14,597,024 KiB candidate (+4,032 KiB, effectively
+identical at this process scale). Pageable host memory was not separately
+attributable from process RSS; the patch does not alter model mapping, KV
+allocation, pinned-memory, or host-staging code.
+
+The fresh bracket artifacts are retained at
+`/tmp/beellama-prepr4-compact-aba-20260820`. They include all three raw PPL
+logs, all six raw performance/progress logs, extracted JSONL, the GPU preflight,
+fresh CPU/CUDA 3/3 descriptor-oracle logs, the seven-test static regression log,
+and binary/library/model/corpus identities. `SHA256SUMS` covers every retained
+file other than itself and has SHA-256
+`17a19eb95b3d8f9af176017a8c4ac934392c2672b1e273abe8349208e152bb94`.
+
+### Disposition
+
+Retain the compact descriptor. It is bit-exact in direct CPU/CUDA coverage and
+end-to-end generation, has exactly matching four-chunk A/B/A PPL, shows no
+material performance regression in the fresh 4K/30K A/B/A screen, and fails
+closed to the dense mask for unproved layouts or capabilities. The measured
+cost is up to 44 MiB additional peak process VRAM in this CUDA configuration.
+Other models, multi-sequence layouts, KVarN native attention, and non-CUDA
+accelerators remain dense and require separate evidence before enabling compact
+selection.
 
 ## Post-PR9 test-only regression: F32 GDN recurrent snapshot fusion
 

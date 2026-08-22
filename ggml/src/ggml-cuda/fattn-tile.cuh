@@ -570,6 +570,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int stride_K2,
         const int stride_V2,
         const int stride_mask,
+        const bool compact_causal_prefix,
         float * const KQ_max,
         float * const KQ_sum,
         T_acc * const VKQ,
@@ -616,10 +617,22 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
 
+    int32_t causal_prefix_first_bound = 0;
+    if (compact_causal_prefix && threadIdx.x == 0) {
+        const int j = fastmodulo(col_Q_0, ne01);
+        causal_prefix_first_bound = flash_attn_causal_prefix_bound(
+            (const int64_t *) mask, j*stride_mask);
+    }
+    causal_prefix_first_bound = __shfl_sync(0xFFFFFFFF, causal_prefix_first_bound, 0, warp_size);
+
     // Apply logit softcap + mask, update KQ_max:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
-        const int j = fastmodulo(col_Q_0 + (jc0 + (threadIdx.y / np)*cpw)/ncols2, ne01);
+        const int query_offset = (jc0 + (threadIdx.y / np)*cpw)/ncols2;
+        const int j = fastmodulo(col_Q_0 + query_offset, ne01);
+        const int32_t causal_prefix_bound = causal_prefix_first_bound + query_offset;
+        const bool compact_boundary_tile = compact_causal_prefix &&
+            k_VKQ_0 + k_VKQ_sup > causal_prefix_bound;
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
@@ -636,8 +649,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += (ncols2 > 1 || mask) ?
-                    slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]) : 0.0f;
+                float mask_value = 0.0f;
+                if (compact_boundary_tile) {
+                    mask_value = k_VKQ_0 + i_KQ < causal_prefix_bound ? 0.0f : -INFINITY;
+                } else if (!compact_causal_prefix && (ncols2 > 1 || mask)) {
+                    mask_value = slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]);
+                }
+                KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += mask_value;
 
                 KQ_max_new[jc0] = fmaxf(KQ_max_new[jc0], KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] + FATTN_KQ_MAX_OFFSET);
             }
@@ -859,11 +877,13 @@ static __global__ void flash_attn_tile(
     const half2 * K_h2 = (const half2 *) (K + nb13*sequence + nb12*(head0 / gqa_ratio));
     const half2 * V_h2 = (const half2 *) (V + nb23*sequence + nb22*(head0 / gqa_ratio)); // K and V have same shape
 
+    const bool compact_causal_prefix = ne31 < 0;
     const half * maskh = mask ? (const half *) (mask + nb33*(sequence % ne33)) : nullptr;
 
     const int stride_K2   = nb11 / sizeof(half2);
     const int stride_V2   = nb21 / sizeof(half2);
-    const int stride_mask = nb31 / sizeof(half);
+    const int stride_mask = compact_causal_prefix ?
+        nb31 / sizeof(int64_t) : nb31 / sizeof(half);
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
 
@@ -961,14 +981,16 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, compact_causal_prefix,
+                KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, compact_causal_prefix,
+                KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -976,7 +998,8 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, compact_causal_prefix,
+                KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     }
 

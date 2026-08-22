@@ -1071,6 +1071,14 @@ void llama_kv_cache_kvarn_context::set_input_k_shift(ggml_tensor * dst) const {
     base()->set_input_k_shift(dst);
 }
 
+bool llama_kv_cache_kvarn_context::can_use_compact_causal_mask(
+        const llama_ubatch & ubatch, bool causal_attn, bool is_reserve) const {
+    GGML_UNUSED(ubatch);
+    GGML_UNUSED(causal_attn);
+    GGML_UNUSED(is_reserve);
+    return false;
+}
+
 void llama_kv_cache_kvarn_context::set_input_kq_mask(
         ggml_tensor * dst,
         const llama_ubatch * ubatch,
