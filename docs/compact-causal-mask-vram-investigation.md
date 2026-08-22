@@ -1,7 +1,11 @@
 # Compact causal-mask VRAM investigation
 
-Status: Candidate 1 accepted by the local evidence below. This record
-accompanies the implementation and its reproducible two-turn resource runner.
+Status: Candidate 1 was accepted by the historical evidence below. A later
+merge-readiness audit rejected its decode disposition, and the historical stop
+rule records that state. A user-authorized narrow direct-operator phase then
+superseded that stop rule. Its tile-relative uniform candidate is now frozen
+pending the final quality, compatibility, profiler, and composition gates. PR
+7 remains draft.
 
 ## Scope and identities
 
@@ -975,3 +979,880 @@ coverage and would risk mislabeling a documentation-only refresh as new
 performance evidence. No GPU command was run. The isolated c9 A/B/A and the
 `ae60c7321` composed checks remain the accepted evidence boundaries; this
 section is a path/tree/diff proof only.
+
+## Merge-readiness decode audit and kernel stop rule
+
+### Identity and corrected evidence boundary
+
+This audit started from exact published PR 7 head
+`565233f79faebb5bace9e41f0e2d0ba9c70930cf` on exact base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3`. No commit, push, PR-body edit,
+or draft-state change was made. The clean dense build used source
+`8e858fcec`; the compact build used source `565233f79f`. Native-Q8 attention,
+phase/live workspace, speculative decoding, and other unrelated policies were
+not enabled.
+
+The evidence classification is stricter than earlier sections of this ledger.
+Every model command containing `--no-kv-offload`, `--kv-cpu-pinned`, or
+`--recurrent-state-offload` is CPU-KV **composition evidence only**. It is not
+causal-only proof of compact-mask performance, even where NCU or NSYS directly
+targeted the llama executable. Those profiler captures do measure the selected
+kernel and its counters, but the enclosing model configuration remains a
+CPU-KV composition.
+
+Exact-head correctness and quality gates remained valid: Release CPU passed
+574/574 tests, Release CUDA passed 804/804 tests, the fixed-seed compact oracle
+passed 9/9 on CPU and 9/9 on CUDA, the seven adjacent focused checks passed,
+deterministic normalized output retained SHA-256
+`cd35be773ca9520e5f79474c94ee1d07784433199b1c3c4f531dffbbcc353c6c`,
+and dense/compact/dense matching-batch PPL was exactly
+`2.1674 +/- 0.03849` in all three processes. The generic broad backend abort
+was reproduced on the exact base and remains inherited, not a compact-mask
+regression.
+
+### Published-head CPU-KV composition result
+
+Fresh clean-process dense/compact/dense serving at 4K, 30K, and 64K retained
+the memory win and exact two-turn output, but exposed a small monotonic decode
+loss. The compact decode rate relative to the midpoint of the two dense
+processes was approximately -0.31%/-0.29% on turns 1/2 at 4K,
+-0.40%/-0.37% at 30K, and -0.64%/-0.60% at 64K. The independent five-repeat
+`llama-bench -p 0 -n 128` screen was -0.17%, -0.47%, and -0.60% at the same
+depths. These are CPU-KV composition measurements, not a direct-operator
+benchmark, but their A/B/A direction and growth reject the prior claim that
+the implicit replacement has no reproducible decode cost.
+
+The corresponding serving memory result remains real composition evidence:
+the compact process saved 20 MiB at 4K, 30 MiB at 30K, and 64 MiB at 64K,
+with lower CUDA/CUDA-host compute reservation and unchanged pinned KV. This
+audit did not invalidate those resource measurements; it invalidated the
+performance disposition.
+
+### Direct-input allocation repair and profiler allocation
+
+A graph/layout experiment passed the existing I64 write-index input directly
+to `FLASH_ATTN_EXT`, removing the per-consumer views while preserving the
+same capability and layout checks. NSYS reported 6,090 H2D copies for both
+dense and compact forms, so transfer-count differences no longer explained
+the remaining decode gap. The clean five-repeat 64K composition bracket was:
+
+| form | process 1 | dense anchor | process 2 | result |
+|---|---:|---:|---:|---:|
+| direct compact | 14.660429 tok/s | 14.743589 tok/s | 14.663808 tok/s | -0.56% / -0.54% |
+
+Targeted NCU captures then isolated the selected Q8_0/Q8_0, `ncols=1`,
+head-dimension-256 vector dispatch. The directly targeted llama processes used
+the same CPU-KV composition, so the table is a kernel-counter observation
+rather than a standalone operator benchmark:
+
+| metric | dense | direct compact |
+|---|---:|---:|
+| kernel duration | 460.61 us | 482.78 us |
+| registers/thread | 254 | 255 |
+| executed instructions | 127,572,480 | 128,307,744 |
+| branch efficiency | 100% | 97.08% |
+| average divergent branches | 0 | 5.83 |
+
+Measured fact: the compact specialization executes more instructions, uses one
+more register, and introduces divergent predicate handling in this dispatch.
+The simplest causal hypothesis is that the descriptor-bound load and
+per-key visibility predicate extend live state through the vector reduction;
+that is an inference from the counters, not proof that any one generated
+instruction accounts for the full end-to-end loss.
+
+The direct-input source diff had SHA-256
+`a64d29f658036369db484ca84a712aedb42c691af230e5ae19c6eecc27fe5564`.
+Artifacts are under
+`/tmp/beellama-pr7-merge-ready-20260821/{direct-reverse-decode,nsys-direct-*,ncu-direct-*}`.
+The NCU report hashes are
+`56ae8d17939871683afebaafe7fd63ccae63a9f289e807091197db4f786b281b`
+(dense) and
+`a0f2b9755a3301db8289278368e98a602202aef7a3f363575d46fdd0345892da`
+(compact).
+
+### Isolated kernel candidates
+
+Each candidate first used the fixed-seed CUDA compact-versus-dense oracle.
+All GPU commands were fresh whole commands inside
+`flock /tmp/beellama-single-gpu.lock -c`; no `taskset` was used. The model
+screen used the exact inner command captured in each manifest:
+
+```bash
+llama-bench -m "$model" -p 0 -n 128 -d 65536 -r 5 \
+  --no-warmup --progress --kv-memory -ctk q8_0 -ctv q8_0 \
+  -t 3 -C 0x7 --cpu-strict 1 --poll 100 -ngl 999 -sm none -mg 0 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload -fa on \
+  -b 1024 -ub 512 -o jsonl
+```
+
+Because this command uses CPU-KV placement flags, all throughput rows below
+are composition screens.
+
+| candidate | source-diff SHA-256 | compact process(es) | dense | disposition |
+|---|---|---:|---:|---|
+| direct input only | `a64d29f...` | 14.660429 / 14.663808 | 14.743589 | rejected, -0.56% / -0.54% |
+| loop bound | `b95ec15f...` | 14.817501 / 14.815612 | 14.743541 | rejected despite +0.50% / +0.49%: 64K turn-2 output diverged |
+| branchless select | `3cbf6dba...` | 14.707185 / 14.711500 | 14.744411 | rejected, -0.25% / -0.22% |
+| explicit bit mask | `80c33467...` | 14.670834 / 14.669919 | 14.747374 | rejected, -0.52% / -0.53% |
+| tile-uniform | `9a668a9f...` | 11.978935 | 14.746913 | rejected, **-18.7699%** |
+
+The loop-bound variant reduced the profiled vector launch to 437.02 us, 249
+registers/thread, and 121,808,064 instructions, but it did not preserve the
+two-turn exact-output oracle. That is an unconditional rejection regardless of
+throughput. Its NCU report is
+`/tmp/beellama-pr7-merge-ready-20260821/ncu-kernel-bound-compact.ncu-rep`,
+SHA-256
+`1bbdeea26af240927849e179973b1d5f1f121f946521cd9befcb1c919885ffd8`.
+
+The tile-uniform fixed-seed oracle passed before the model screen. Its compact
+process contained five tightly grouped samples, 11.9658--11.9841 tok/s; the
+dense process contained five samples, 14.7279--14.7537 tok/s. This zero-overlap
+18.77% loss is reproducible within the completed processes and far outside
+allocator or timing noise. A redundant second compact process had started but
+was interrupted before producing a JSON row; its empty stdout and partial
+stderr are preserved and explicitly excluded. Key artifact hashes are:
+
+- compact stdout: `891b323a8c7907f914eb4d5b7e694cd1e5cd1fb935f73e6b8114a87157416aac`
+- dense stdout: `41e5184e860b5b977b94a4d862abeb96ea40b2801a80e6aa0d2197edf966b3d4`
+- empty second-compact stdout: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+- partial second-compact stderr: `5d21805a9a590add9677309897a0fb7f9d58a11065d6fc99248db18dbcd70e56`
+
+A subsequent shared-bound experiment failed the fixed-seed CUDA oracle with a
+`misaligned address` and was rejected before performance testing. A low-word
+load experiment was then staged but never completed its build and was never
+run; the user stop rule superseded it. Its complete uncommitted source snapshot
+is preserved at
+`/tmp/beellama-pr7-merge-ready-20260821/rejected-low-word-source.patch`,
+SHA-256
+`3f235d21607d3778611c16f033ddd3705392f7d16141c0d5edbd76951a63ef66`.
+The temporary reverse-decode runner is preserved at
+`/tmp/beellama-pr7-merge-ready-20260821/runtime/rejected-variant-reverse-decode.sh`,
+SHA-256
+`5d3cf83153b91e8024143fa6220eeaf8046c8a6d1aedda1644964a3addf92e12`.
+
+### Stop-rule disposition
+
+The tile-uniform candidate passed fixed-seed equivalence but failed the 64K
+decode gate decisively. Per the explicit stop rule, no further kernel variant
+was proposed or benchmarked. The planned test-only 30K/64K standalone
+`FLASH_ATTN_EXT` performance harness and plain GPU-resident model gate would
+normally precede freeze, but they were not retroactively constructed after the
+already-running tile candidate met the stop condition. No candidate was
+frozen, so the final matched PPL rerun, full default-KVarN compatibility build,
+final NCU capture, one-time 128K CPU-KV composition study, and integration of
+the later `f6341a` KV-offload base were not performed. None of these gates can
+be silently waived or used to make this candidate ready.
+
+All rejected source changes were removed with patch edits after being
+archived. Production source is again byte-identical to published head
+`565233f79f`. PR 7 remains draft and unmodified remotely. The maintainable
+per-consumer-view allocation fix still proves a growing memory benefit in
+CPU-KV composition, but the implicit compact replacement does not satisfy the
+required strict decode-performance gate. It is therefore not merge-ready.
+
+## Narrow direct-operator investigation
+
+This phase started from published head
+`565233f79faebb5bace9e41f0e2d0ba9c70930cf` and exact dense base
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3`. It supersedes only the historical
+kernel stop rule above. The rejected source and runtime artifacts were first
+preserved, then every production/build/test/script path was restored to the
+published head. The rejected-phase ledger patch is
+`/tmp/beellama-pr7-merge-ready-20260821/rejected-phase-ledger.patch`
+(`628ad370e580aa47f5cd6de6e9e45677d258f89767a73b5648f353866be713df`),
+and the rejected low-word snapshot and runner retain the hashes recorded
+above. The interrupted second tile-uniform process remains explicitly excluded.
+
+### Test-only direct harness
+
+The ignored local harness is under `tmp/compact-fattn-screen`. It instantiates
+only the production `FLASH_ATTN_EXT` Q8_0/Q8_0 vector pair for `D=256`,
+`ncols=1`, grid `[1,17,24]`, block `[32,4,1]`, and SM120a. Its copied
+`fattn-vec-screen.cuh` began byte-identical to production and is updated with
+each candidate before compilation. It uses deterministic Q8 blocks and query
+data, a dense F16 mask and compact I64 bound, raw output/metadata bit comparison,
+PDL launch attributes, and CUDA-event ABBA timing. There is no shipped flag,
+compile option, dependency, or architecture-name routing in the production
+feature.
+
+The first non-aligned 30K oracle failed because the harness allocated only the
+logical K and mask extents even though the vector kernel reads a complete final
+128-key tile. That result is a harness failure, not feature evidence. Adding
+allocation-only tail guards while retaining logical tensor strides fixed the
+oracle: 30K and 64K, with hidden tails 0 and 113, became bit-exact. The final
+harness source SHA-256 is
+`42df44887537cccf68b37e8f344d1e3d1835346a30d7af70a7dec343e5c7bb44`;
+the build-script SHA-256 is
+`a943414e14262e417bec90408da5bceb919f5111614106d1f200b1993138a4bb`.
+
+The narrow build command is:
+
+```bash
+tmp/compact-fattn-screen/build.sh
+```
+
+It expands to direct `nvcc -O3 -DNDEBUG -std=c++17 --use_fast_math
+--extended-lambda --generate-code=arch=compute_120a,code=sm_120a -lineinfo`
+with only the harness translation unit and ordinary ggml/CUDA include paths.
+`GGML_CUDA_KVARN` is absent. Candidate compile times were 2.61--2.71 seconds.
+The selected compact kernel consistently used 255 registers, 4,352 B shared
+memory, and no spills; dense used 254 registers and the same shared memory.
+
+Every invocation below was a fresh process wholly inside the GPU lock:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'tmp/compact-fattn-screen/compact-fattn-screen \
+   --mode equivalence --depth {30000|65536} --hidden-tail {0|1|113|208|2177} \
+   --seed 305419896'
+
+flock /tmp/beellama-single-gpu.lock -c \
+  'tmp/compact-fattn-screen/compact-fattn-screen \
+   --mode timing --depth {30000|65536} --hidden-tail N \
+   --warmup-cycles 50 --measure-cycles 200 --seed 305419896'
+```
+
+Each timing process collected 400 samples per form in dense/compact/compact/
+dense order. Three fresh processes were used at each reported depth.
+
+### Bounded candidate table
+
+| hypothesis | minimal diff | fixed-seed result | 30K / 64K compact median delta vs dense | disposition |
+|---|---|---|---|---|
+| published descriptor predicate | none | exact after harness tail repair | +2.54--2.89% / +4.53--4.59% | causal baseline; regressive |
+| low-word descriptor load | load only the proven int32 low word | exact at tails 0/113 | +2.63--3.07% / +4.51--4.61% | rejected before model load |
+| direct selected assignment | select `sum` or `-inf`, avoiding add of selected zero | exact at tails 0/113 | +0.18--0.38% / +1.92--2.03% | rejected before model load |
+| tile-relative selected assignment | subtract `k_VKQ_0` once per tile, retain per-key select | exact at tails 0/1/113/2177 | **-2.09--2.14% / -0.88--0.92%** | direct pass; whole-model estimate remained slightly negative |
+| tile-relative uniform fast path | previous row plus bypass select for a proven fully visible tile | exact at tails 0/1/113/2177 | **-2.68--3.11% / -1.79--1.84%** | frozen after production gate |
+
+Negative deltas are speedups. The frozen candidate also remained faster with
+hidden tails 113, 208, and 2,177: 30K medians improved 2.68--3.05%, and 64K
+medians improved 1.72--1.88%. This rejects the theory that only an all-visible
+synthetic span produced the direct win. Its test-only overlay SHA-256 is
+`6b494d6aa256b45b9fae4153601ccf59d67604658a976d409a70b95774615193`;
+the complete diff against the published header is
+`99714fa04e6bc6191e4a18623f6ff0f06bed7ac23b327da5b24d2d22a8501dcf`.
+
+The maintainability boundary is small: all routing remains the existing
+compact-mask capability/type specialization. The candidate converts the I64
+exclusive bound to a tile-relative int32 value once per outer iteration and
+skips only the select when that value proves every key in the tile visible.
+Boundary and fully masked tiles retain the exact predicate. It adds no phase,
+depth, model, or architecture check and does not change loop count, reduction
+order, descriptor layout, or fallback policy.
+
+### Initial tile-uniform plain-GPU production gate
+
+This preliminary screening build combined the tile-uniform vector kernel with
+the then-current per-consumer graph views. It used Release, SM120,
+FlashAttention on, native CPU tuning, tests enabled, and the existing
+`GGML_CUDA_KVARN=OFF` option. It built only `llama-bench` and `llama-server`, at
+six jobs. The captured `libggml-cuda.so` SHA-256 is
+`b7ba12d140e2e10f490362029f9676219a0b06426ab0a68c0b0735520e6e3253`.
+The source/header SHA-256 is
+`6b494d6aa256b45b9fae4153601ccf59d67604658a976d409a70b95774615193`.
+
+The deepest practical plain GPU-resident point was 30K. Dense used
+15,553,658,880 B at peak against 16,652,042,240 B total; the 64K Q8_0/Q8_0 KV
+does not fit beside the 14,426,476,544 B model. Every unrelated placement or
+workspace opt-in was omitted. The exact benchmark command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{dense-or-compact}/bin/llama-bench \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   -p 0 -n 128 -d 30000 -r 5 --no-warmup --progress --kv-memory \
+   -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 -fa on -b 1024 -ub 512 -o jsonl'
+```
+
+The preliminary A/B/A was 43.9266, 43.9304, and 43.9227 tok/s: compact is
++0.013% relative to the dense midpoint. All rows report
+`no_kv_offload=false`, `kv_cpu_pinned=false`, and
+`recurrent_state_offload=false`. The CUDA peak was byte-identical. Compact
+reduced CUDA-host compute from 52,203,552 to 21,270,560 B; its device compute
+was 362,624 B larger, but the sampled serving result below retained the
+expected process saving.
+
+The temporary plain-GPU two-turn runner differed from the published runner only
+by omitting `--no-kv-offload` and `--kv-cpu-pinned`. Its SHA-256 is
+`e163b03be278b7aa8304bd31cbbd18d817a198940bf60f68dad1fec8be13c882`.
+It used the 29,398-token fixed request
+`b175b00ce6ae3c8ee01aec94bcd42bced7231dd49f0bc910e3dc327c146b89f9`
+and ran dense/compact/dense followed by compact/dense/compact. These compact
+processes used the tile-uniform kernel with the old per-consumer graph views;
+they are not repetitions of the later combined canonical-input candidate. All
+twelve timing-stripped responses were byte-identical with SHA-256
+`6af7967a4929e5d58b09a969e10f2ceef7a782b2168ba1571dad8bfee0eeb958`.
+Dense sampled 14,532 MiB process VRAM; every compact process sampled 14,504
+MiB, a 28 MiB saving. Compact current RSS was also lower; `VmHWM` remained the
+transient mapped-model high-water and `VmLck` remained zero.
+
+The three-process server means were:
+
+| turn | dense mean | compact mean | compact delta | approximate 95% delta interval |
+|---:|---:|---:|---:|---:|
+| 1 | 43.5295 tok/s | 43.4497 tok/s | -0.183% | about -0.48% to +0.11% |
+| 2 | 43.7419 tok/s | 43.7064 tok/s | -0.081% | about -0.36% to +0.20% |
+
+These server point estimates are negative. Their intervals overlap zero, but
+that does not make either point estimate non-negative. They are retained under
+their exact earlier source identity rather than relabeled or pooled with the
+combined candidate below. A later 4K model repetition also found a reproducible
+negative point estimate for this source, so its freeze was revoked before the
+canonical direct-input repair. No kernel variant followed the combined
+candidate described below.
+
+All narrow-phase artifacts are under
+`/tmp/beellama-pr7-direct-screen-20260821`. The SHA-256 of its sorted file
+manifest at this checkpoint is
+`a8c3014daf16b626fe3c0acffca28a447085a08eb7ed61e943c10bd36f653535`.
+
+## Frozen combined candidate: final validation and strict acceptance
+
+### Source and evidence boundary
+
+The final frozen candidate combines two upstream-style changes:
+
+1. the compact causal descriptor is passed once in its canonical one-dimensional
+   I64 layout and consumed directly, rather than materializing a graph view for
+   every attention consumer; and
+2. the existing compact-capable CUDA vector specialization converts the
+   exclusive bound to a tile-relative value once per tile and bypasses the
+   per-key select only when the complete tile is provably visible.
+
+There is still no phase, depth, model, or architecture-name switch; no public
+runtime flag; no new CMake option or dependency; and no dense/compact routing
+threshold. Capability, tensor type, and layout checks remain the only compact
+route boundary. The final `fattn-vec.cuh` SHA-256 is
+`6b494d6aa256b45b9fae4153601ccf59d67604658a976d409a70b95774615193`.
+The KVarN-off screening `libggml-cuda.so.0.19.0` SHA-256 is
+`689704e98594d365936d9fc9022d057a63443f3c962efcbcf36dda145effbfb6`;
+the exact f634 dense library is
+`b6a035b252ee1b1765261e2e079967994075065dd08117d6a1e8e02a9553b196`.
+The complete production/test/reproduction-runner diff against exact f634 is
+archived at
+`/tmp/beellama-pr7-direct-screen-20260821/frozen-combined-complete-vs-f634.patch`
+with SHA-256
+`77617de5810167b3abba13443a967be3f008e148fecac32298fc48a83052e09d`.
+A static added-line audit found no context constants, model-family routing, or
+architecture-name routing. `GGML_CUDA_COMPACT_CAUSAL_MASK` remains an
+unconditional internal CUDA translation-unit definition, not a user CMake
+option.
+
+The earlier tile-uniform/per-consumer 64-token server bracket remains valid
+negative evidence for that earlier source: -0.183% on turn 1 and -0.081% on
+turn 2. The f634 composed 4K screen likewise measured -0.33%, and its focused
+repeat measured about -0.216%. None of those rows is pooled with the combined
+candidate. The current combined-source plain-GPU evidence is:
+
+| case | dense process result(s) | combined compact | point estimate | evidence limit |
+|---|---:|---:|---:|---|
+| 4K, 10 repeats, no warmup | 49.7502 / 49.7164 tok/s | 49.7636 tok/s | +0.061% vs dense midpoint | one compact process |
+| 4K, warmed, 30 repeats | 49.7765 tok/s | 49.8291 / 49.8001 tok/s | +0.0765% | sample-level approximate 95% interval +0.031% to +0.122%; processes are the proper unit |
+| 30K, 10 repeats, no warmup | 43.9404 / 43.9109 tok/s | 44.1059 tok/s | +0.4105% | one compact process |
+
+All of these rows omit CPU-KV placement and every unrelated opt-in:
+`no_kv_offload=false`, `kv_cpu_pinned=false`, and
+`recurrent_state_offload=false`. At 4K the combined candidate reduced sampled
+process peak by 4 MiB. At 30K both forms landed in the same process allocation
+bin, although CUDA-host compute fell from 52,203,552 B to 21,270,560 B. The
+device compute reservation at 30K rose by 297,088 B, so no process-VRAM saving
+is claimed for that `llama-bench` graph. Both forms had identical VMM
+high-water: 14,632,960 B live and 14,680,064 B mapped.
+
+### Direct operator, exactness, PPL, profiler, and compatibility gates
+
+The final narrow Q8_0/Q8_0, D=256, `ncols=1` direct screen was bit-exact and
+measured compact median kernel speedups of 2.649% at 30K and 1.782% at 64K.
+The fixed-seed production CPU and CUDA compact-versus-dense oracles passed 3/3;
+their log hashes are respectively
+`fd2ea5c339d7f81c6d65ba17d53264116a689305c2f80709a3d6f4e144914aca`
+and
+`84151f6f19516d9ad19863150ebd4fc6c738fcd11dce8861e2d7787a86ddd664`.
+
+The clean direct-target 64K NCU report is
+`/tmp/beellama-pr7-direct-screen-20260821/ncu-frozen-combined-direct-64k.ncu-rep`
+(SHA-256
+`7d28208da7e6f501f6be46f6be1b8670c963145a320da36b824b2a7920245ca3`).
+The selected compact launch used 255 registers, executed 125,063,040
+instructions, reported 97.07% branch efficiency, and took 454.72 us under the
+41-pass profiler capture. This is profiler evidence, not an end-to-end timing
+substitute.
+
+The matching-batch PPL command remained the documented Q8_0/Q8_0,
+`-c 4096 -b 512 -ub 256` command. Dense A1, combined compact, and dense A2 all
+printed `[1]1.9315,[2]2.1279,[3]2.2498,[4]2.1674` and final
+`PPL = 2.1674 +/- 0.03849`. The combined log SHA-256 is
+`a668a99fdccc92919d4a5115d48642360c81a22db98672bbd861be1a2794f496`;
+there is no measured PPL increase.
+
+The final default-KVarN Release build completed at six jobs. Its
+`libggml-cuda.so.0.19.0` SHA-256 is
+`27c6d2dbbc5789e937c7e910764c5467b389232b9dd693198c84ab486f6486b8`.
+Nine focused static/CPU/CUDA tests passed, followed by the CUDA 3/3 oracle;
+the logs hash to
+`613995b860e0bf5a48952f2424246116d98e7736a16f44fe05ee44e6c745800a`
+and
+`84151f6f19516d9ad19863150ebd4fc6c738fcd11dce8861e2d7787a86ddd664`.
+
+### One-time 128K CPU-KV composition bracket
+
+The requested 128K dense/compact/dense bracket used clean processes and this
+exact whole-command lock template:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{dense-or-combined}/bin/llama-bench \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   -p 512 -n 128 -pg 512,64 -d 131072 -r 3 --no-warmup \
+   --progress --kv-memory -ctk q8_0 -ctv q8_0 \
+   -t 3 -C 0x7 --cpu-strict 1 --poll 100 -ngl 999 -sm none -mg 0 \
+   -nkvo 1 --kv-cpu-pinned --recurrent-state-offload \
+   -fa on -b 1024 -ub 512 -o jsonl'
+```
+
+Those three CPU-KV placement options make every row composition evidence, not
+causal-only proof. No live workspace, native-Q8 permission, speculation,
+phase policy, or other optional feature was enabled.
+
+| graph | dense A1 / combined / dense A2 | compact delta vs dense midpoint | dense / compact sampled peak | dense / compact device compute | dense / compact CUDA-host compute |
+|---|---:|---:|---:|---:|---:|
+| 128K `p512,n0` | 509.337 / 523.771 / 506.267 tok/s | +3.145% | 14,347.125 / 14,229.125 MiB | 995.837 / 877.337 MiB | 148.785 / 20.285 MiB |
+| 128K `p0,n128` | 8.35184 / 8.21260 / 8.18615 tok/s | **-0.682%** | 14,335.125 / 14,215.125 MiB | 994.056 / 875.806 MiB | 148.535 / 20.285 MiB |
+| 128K `p512,n64` | 65.2279 / 65.5275 / 65.1023 tok/s | +0.556% | 14,349.125 / 14,231.125 MiB | 997.618 / 878.868 MiB | 149.035 / 20.285 MiB |
+
+The sampled process saving was 118 MiB for prefill/mixed and 120 MiB for the
+decode graph. Dense A1 decode was visibly noisy (8.155--8.477 tok/s), while
+dense A2 and compact were tightly grouped; nevertheless the midpoint point
+estimate is negative and is recorded as negative. One compact process cannot
+establish a process-level interval. VMM high-water was identical for dense and
+compact (13.955 MiB live / 14 MiB mapped for prefill and mixed; 0.402 MiB live /
+2 MiB mapped for decode). Pinned CUDA-host context and resident KV were also
+identical; ordinary host context and compute buffers were zero. This benchmark
+did not sample total OS RSS, so it makes no total ordinary-RAM claim.
+
+Artifacts are under
+`/tmp/beellama-pr7-direct-screen-20260821/frozen-128k-composition-bench`.
+The JSONL SHA-256 values are dense A1
+`00b4dab2c48934ba3ce2c31dc382b306c462d0a7803cc99dff5d71f8fb9aa5d0`,
+combined
+`425305b189f57b15448137b5c2a641e4f99a085a3ec68dc7bab06bf9e0fb0e76`,
+and dense A2
+`bb7fad80b04b6ce3ccc0a95609da259c038bd840852623071b220cb75335e172`.
+
+### Strict 30K clean-process end-to-end decision
+
+Because an overlapping-zero interval does not rehabilitate the earlier
+negative server point estimates, the final decision used a new exact-source,
+balanced `A B B A A B` server bracket. Each of the six clean processes served
+two fully reprocessed copies of the same 29,398-token prompt and generated 512
+deterministic tokens. The longer decode reduced timing noise without another
+model suite. Adjacent pairs were `A1/B1`, `B2/A2`, and `A3/B3`, balancing
+ordering. The runner SHA-256 is
+`3353094b95a675277e0217a48761b8675b989d6b5e31e44d8890d6b51b801b8e`;
+the request SHA-256 is
+`1d33b0089ec7122fcbc3ad575726cf4d4c229d1ff64920d411107ac0740a395e`.
+Every whole runner invocation was independently locked.
+
+The command recorded in each manifest expands to:
+
+```bash
+llama-server --model "$model" --ctx-size 30000 --parallel 1 \
+  --cont-batching --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --cache-type-k q8_0 --cache-type-v q8_0 --threads 3 --threads-batch 24 \
+  --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --n-gpu-layers 999 --fit off --split-mode none --main-gpu 0 \
+  --flash-attn on --cache-ram 0 --seed 1234 --slots --metrics \
+  --host 127.0.0.1 --port "$port" --verbosity 4
+```
+
+No CPU-KV, live-workspace, speculative, native-Q8, or other optional control
+was present. The process means, treating each clean server as the unit, were:
+
+| source | process 1 | process 2 | process 3 | mean +/- sample SD |
+|---|---:|---:|---:|---:|
+| f634 dense | 43.2533 | 43.2328 | 43.2161 | 43.2341 +/- 0.0186 tok/s |
+| combined compact | 43.3807 | 43.3423 | 43.3774 | 43.3668 +/- 0.0213 tok/s |
+
+The compact point estimate is **+0.3070%**. A two-sided 95% Welch interval on
+the process means is **+0.2015% to +0.4126%**. The order-balanced adjacent-pair
+sensitivity interval is **+0.1559% to +0.4581%**. Both intervals are strictly
+positive. This is the clean targeted end-to-end repetition required by the
+acceptance clarification; it does not rewrite the earlier negative source
+results or the negative 128K composition point estimate.
+
+All twelve timing-stripped responses were byte-identical with SHA-256
+`f304d92512a513379101486c04c1cf12c63a805037224214b55841d8128e9021`.
+Every dense process sampled 14,532 MiB peak process VRAM and every compact
+process sampled 14,504 MiB, a strict 28 MiB saving through startup, both turns,
+and post-turn residence. Startup was 14,514 versus 14,486 MiB. Mean final RSS
+was 1,702,109 versus 1,678,041 KiB, a 23.50 MiB compact reduction; `VmLck` was
+zero throughout. Server reservations were 227.78 versus 198.28 MiB CUDA
+compute and 49.78 versus 20.28 MiB CUDA-host compute. Prompt throughput's point
+estimate was -0.261%; it is reported rather than hidden, and is not a decode
+regression.
+
+The sorted artifact-manifest SHA-256 is
+`b116f9b477d5aac2d61e79c3276cb2f8c92f0db9f82d6d96156104e83cd727bc`;
+artifacts are under
+`/tmp/beellama-pr7-direct-screen-20260821/strict-30k-server-512g`.
+
+## Frozen-candidate unresolved-gate validation and production profiling
+
+### Evidence boundary and exact identities
+
+This phase made no production, test, build, or public-interface change. The
+working production delta against exact f634 remained byte-for-byte identical to
+`frozen-combined-complete-vs-f634.patch` (SHA-256
+`77617de5810167b3abba13443a967be3f008e148fecac32298fc48a83052e09d`),
+and the final `fattn-vec.cuh` remained
+`6b494d6aa256b45b9fae4153601ccf59d67604658a976d409a70b95774615193`.
+The comparison binaries were the existing configuration-matched Release,
+SM120, CUDA-FA-on, native-on, **KVarN-off** builds:
+
+| source | build | `llama-bench` SHA-256 | CUDA library SHA-256 | CMake cache SHA-256 |
+|---|---|---|---|---|
+| exact `f6341a15779eb58fe6ad9e1b890e331c32b676c7` dense archive | `/tmp/beellama-pr7-f634-base-build.VCr0BF` | `497de09c880d0c0c9539f6e8347ce789023b3de76a25bcf45c211672f43ad1d2` | `b6a035b252ee1b1765261e2e079967994075065dd08117d6a1e8e02a9553b196` | `4daf76513c5fc367db1439b5f013de19ce9675747a0aa874dcb9ebb6dcae04fb` |
+| frozen combined compact working source | `build-compact-fast-screen-cuda` | `990139351acda670b8867e919401245d1086ade3d553e6a04e4f95c4e611e4d7` | `689704e98594d365936d9fc9022d057a63443f3c962efcbcf36dda145effbfb6` | `12eee7b2959ae8db22d8ecce7be3156a520e672464ce4875fbd95c1bfadd665b` |
+
+The ignored local resource sampler and process-level Welch/paired analyzer hash
+to `9ba921f80da87ae10f1030b5b1dfed74a256d1f26f72d625cc1556e5e95374b3`
+and `26b7072885c3436291f21bad660dce726b49deb664b87004781b21b0c80b2f65`.
+Every benchmark and profiler target was a fresh whole command inside
+`flock /tmp/beellama-single-gpu.lock -c`; all affinity was native llama
+affinity and no command used `taskset`. Ordinary timing runs did not run under
+a profiler.
+
+The source did not change after the already accepted quality gates. The
+fixed-seed CPU and CUDA equivalence logs remain exact at
+`fd2ea5c339d7f81c6d65ba17d53264116a689305c2f80709a3d6f4e144914aca`
+and `84151f6f19516d9ad19863150ebd4fc6c738fcd11dce8861e2d7787a86ddd664`.
+The matching-batch PPL remains byte-identical at final
+`2.1674 +/- 0.03849`; its compact log is
+`a668a99fdccc92919d4a5115d48642360c81a22db98672bbd861be1a2794f496`.
+These llama-bench gates generated no text, so they add no new output oracle and
+reuse the unchanged-source two-turn and fixed-seed exactness evidence above.
+
+### Gate A: plain-GPU 29,398-token full prefill
+
+Five independent processes per source ran in order `A B B A A B A B B A`.
+Each process included five full-prefill samples. CPU-KV placement, live
+workspace, speculation, native-Q8 permission, and every other optional policy
+were omitted. The exact workload after the sampler arguments was:
+
+```bash
+llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 29398 -n 0 -r 5 --progress --kv-memory \
+  -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+  -ngl 999 -sm none -mg 0 -fa on -b 1024 -ub 512 -o jsonl
+```
+
+| source | independent process means (tok/s) | mean +/- process SD | point estimate | process-level 95% interval |
+|---|---|---:|---:|---:|
+| f634 dense | 1608.796, 1601.764, 1602.105, 1603.809, 1601.128 | 1603.520 +/- 3.112 | reference | -- |
+| compact | 1600.558, 1600.163, 1599.463, 1599.732, 1599.360 | 1599.855 +/- 0.501 | **-0.229%** | Welch **-0.468% to +0.011%** |
+
+All five adjacent order-balanced compact effects were negative: -0.512%,
+-0.100%, -0.165%, -0.254%, and -0.110%. Their paired mean was -0.228%
+with a paired 95% interval of **-0.439% to -0.017%**. The result therefore
+reproduces, rather than reverses, the prior -0.261% server-prompt point. The
+unpaired interval narrowly overlaps zero because dense A1 was unusually fast;
+overlap is not treated as a win.
+
+Both forms reported 13,125.125 MiB model/startup CUDA use,
+14,761.125 MiB context use, 14,803.125 MiB synchronized prefill/peak use,
+13,155.125 MiB after-context residence, and a 14,780 MiB sampled process
+maximum. VMM high-water was byte-identical at 13.955 MiB live / 14 MiB mapped.
+Compact changed device compute from 505.000 to 505.283 MiB and CUDA-host
+compute from 49.035 to 20.285 MiB; the allocator bin did not change. Mean
+maximum `VmRSS`/`VmHWM` was 14,585,343/14,585,343 KiB dense and
+14,584,984/14,584,984 KiB compact; `VmLck` was zero in every process. Those
+RSS high-waters include transient model mappings and are not pinned-memory
+measurements. Mean clean-process wall time was 112.470 s dense and 112.650 s
+compact.
+
+Separate direct-target NSYS captures selected the same production
+`flash_attn_ext_f16<256,256,8,8,...F16,F16>` consumer 928 times. Aggregate
+attention CUDA time was 2.708 s dense and 2.751 s compact. Grouping the 32
+layer launches by prefill ubatch showed compact slower through the early and
+middle spans, crossing near 21K, then faster at the deepest full spans.
+
+Targeted NCU used only that kernel with `--launch-count 1`; skips 272 and 880
+selected representative ~8K and ~28K full-prefill launches. The full section
+set showed:
+
+| span/source | profiled duration | registers | achieved occupancy | executed instructions | branch uniformity / divergent targets | DRAM throughput |
+|---|---:|---:|---:|---:|---:|---:|
+| ~8K dense | 1.5196 ms | 243 | 14.323% | 227.679 M | 99.888% / 480 | 56.21 GB/s |
+| ~8K compact | 1.6562 ms | 246 | 14.288% | 250.317 M | 100% / 0 | 41.64 GB/s |
+| ~28K dense | 6.5536 ms | 243 | 16.707% | 701.159 M | 99.954% / 480 | 800.17 GB/s |
+| ~28K compact | 6.4813 ms | 246 | 15.965% | 771.571 M | 100% / 0 | 764.68 GB/s |
+
+Compact removes the sampled divergent targets but costs three registers and
+about 10% more instructions. At ~8K, its math-pipe stall ratio improves
+3.475 to 3.234 but its wait and short-scoreboard ratios worsen (1.716 to 1.866
+and 0.309 to 0.502), and the extra work dominates. At ~28K, long-scoreboard
+stall falls 4.897 to 3.392 and barrier stall 1.363 to 1.050, so tile-uniform
+bypass wins despite the instruction/register cost. Full prefill pays every
+early-span cost before reaching that crossover, explaining the negative
+end-to-end point.
+
+Gate-A timing artifacts have sorted-manifest SHA-256
+`57e818a2cc736eda92c5ae16918ef4a3aa8c54fb65313a4407eaf34b84eeca2e`;
+profile artifacts hash to
+`fcf5bc1e6c52e11422f99b8bfa5c9f1ed79c773776f40063d7669c535d7de1b6`.
+
+### Gate B: 128K CPU-KV-composed decode
+
+Five independent processes per source used the same order. Each process filled
+exactly 131,072 tokens once, restored that state between repetitions, and then
+measured five pure `p0,n128` decode samples. The three placement necessities
+were the only extra policies:
+
+```bash
+llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -p 0 -n 128 -d 131072 -r 5 --no-warmup --progress --kv-memory \
+  -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+  -ngl 999 -sm none -mg 0 \
+  --no-kv-offload 1 --kv-cpu-pinned --recurrent-state-offload \
+  -fa on -b 1024 -ub 512 -o jsonl
+```
+
+Two preliminary launches omitted the required explicit `1` after llama-bench's
+`--no-kv-offload` option. The parser consumed `--kv-cpu-pinned` as that value,
+lost pinned placement, and failed context creation before workload execution.
+Both artifacts are retained under the two `dense-a1-failed-*` directories and
+excluded from all evidence.
+
+| source | independent process means (tok/s) | mean +/- process SD | point estimate | process-level 95% interval |
+|---|---|---:|---:|---:|
+| f634 dense | 8.31158, 8.62214, 8.62336, 8.59896, 8.62477 | 8.55616 +/- 0.13714 | reference | -- |
+| compact | 8.29089, 8.21403, 8.61508, 8.60652, 8.64028 | 8.47336 +/- 0.20385 | **-0.968%** | Welch **-4.004% to +2.068%** |
+
+Adjacent pair effects were -0.249%, -4.733%, -0.096%, +0.088%, and
++0.180%; their paired mean was -0.962% with interval -3.588% to +1.664%.
+The final three processes per source occupied a visibly more stable state and,
+as a sensitivity view only, measured +0.057% with interval -0.372% to +0.487%.
+No process was dropped from the primary estimate. The prior -0.682%
+one-compact result is directionally reproduced by the all-process point, but
+its magnitude is not confirmed: process-state drift dominates the interval.
+The new evidence cannot demonstrate strict non-regression.
+
+Dense and compact respectively reported 14,299.125 / 14,179.125 MiB context,
+14,341.125 / 14,221.125 MiB post-fill, and 14,345.125 / 14,225.125 MiB
+synchronized peak CUDA use. Sampled process maxima were 14,314 / 14,194 MiB,
+a repeatable **120 MiB compact saving** in all ten processes. Device compute
+was 994.056 / 875.806 MiB and CUDA-host compute 148.535 / 20.285 MiB. Both
+forms retained identical 4,377.5 MiB resident KV and 4,360.5 MiB pinned
+CUDA-host context; ordinary host context/compute buffers were zero. VMM
+high-water was identical at 13.955 MiB live / 14 MiB mapped. Mean maximum
+`VmRSS`/`VmHWM` was 14,584,549/14,584,549 KiB dense and
+14,584,626/14,584,626 KiB compact, with `VmLck=0` throughout. `VmLck` must not
+be used as a proxy for CUDA page-locked allocations. Mean wall time including
+the one-time fill was 237.433 s dense and 236.286 s compact.
+
+The first NSYS pair used the default graph granularity and exposed only 16
+graph-capture vector launches; it is retained as a scope diagnostic, not a
+full-decode launch-count claim. The corrected direct-target pair used
+`--cuda-graph-trace=node` and saw exactly 2,048 production
+`flash_attn_ext_vec<256,1,Q8_0,Q8_0>` launches (128 tokens x 16 attention
+layers). Aggregate vector time was 1.7855 s dense and 1.7524 s compact
+(-1.856%); matching combine kernels were 596.0 and 581.9 ms. Thus the selected
+production compact consumer is faster at 128K even though the noisy
+whole-process primary point is negative.
+
+Targeted NCU then used that proven vector name, graph-node mode,
+`--launch-skip 1024`, and `--launch-count 1`. Dense versus compact was
+901.824 / 884.672 us, 254 / 255 registers, 16.167% / 16.195% achieved
+occupancy, and 254.041 / 249.953 M executed instructions. Compact raised DRAM
+throughput 488.70 to 497.38 GB/s and reduced wait, barrier, math-pipe, and
+short-scoreboard stall ratios, while slightly increasing long-scoreboard and
+not-selected ratios. Unlike prefill, dense had no divergent branch targets;
+compact reported 1,632 and branch uniformity 98.446%. The net sampled launch
+was still 1.902% faster, consistent with the full node-level NSYS aggregate.
+
+Gate-B timing artifacts, including the two excluded failures, have
+sorted-manifest SHA-256
+`edf7ea2eca93b23f267b444dcba9dd7d3c65a68f4ab794c0e663b675b9be2924`;
+profile artifacts hash to
+`c91e0f5164bac67719aeb816544eef841644859a734da3bfbd30da8563ab9a96`.
+
+### Disposition
+
+The combined candidate remains frozen; no further kernel variant is authorized
+or warranted in this phase. Correctness, deterministic output, and PPL remain
+exact, and the memory benefits remain real: 120 MiB at the 128K CPU-KV decode
+shape. The production 128K vector kernel is itself faster. However, the
+implicit replacement still has a reproducible negative 30K full-prefill point,
+and the complete 128K end-to-end process aggregate also remains negative with a
+wide interval. Neither overlapping-zero interval is described as a win.
+
+Under the strict acceptance standard, these results do **not** establish a
+strictly better production replacement. PR 7 must remain draft and not
+merge-ready. This phase made no commit, push, PR mutation, or source change.
+
+## 240,000-token load-to-idle allocation check
+
+This was a deliberately narrow allocation check requested after the timed
+gates. It made no inference request and performed no prefill. Each fresh
+`llama-server` process loaded the model, reached the stable model-loaded and
+all-slots-idle state, was sampled 16 times over several seconds, and then was
+terminated cleanly. Both builds were Release, SM120, CUDA-FA-on, native-on,
+and **KVarN-off**; the earlier concern that only the compact build disabled
+KVarN was disproved by the preserved CMake caches. The result is therefore a
+configuration-matched comparison, but it remains startup/resident evidence
+only.
+
+The common runtime shape was one slot, `--ctx-size 240000` (internally rounded
+to 240128), Q8_0/Q8_0, all model layers on one GPU, and the three CPU-KV
+placement necessities `--no-kv-offload --kv-cpu-pinned
+--recurrent-state-offload`. Live/phase workspace, native-Q8 permission,
+speculation, and unrelated policies were omitted. The exact command and binary
+identities are preserved in the manifests. The important identities are:
+
+| source | server SHA-256 | CUDA library SHA-256 | CMake cache SHA-256 |
+|---|---|---|---|
+| exact `f6341a15779eb58fe6ad9e1b890e331c32b676c7` dense archive | `2152baa65085baf9f5df419a42c772a82e1f6f4f7295af59628124bc3d2c25c6` | `b6a035b252ee1b1765261e2e079967994075065dd08117d6a1e8e02a9553b196` | `4daf76513c5fc367db1439b5f013de19ce9675747a0aa874dcb9ebb6dcae04fb` |
+| frozen combined compact working source | `6c1aec477e7f8aecded4a1582daa0228a2cc417e0b013370babfeb36c74daf5a` | `689704e98594d365936d9fc9022d057a63443f3c962efcbcf36dda145effbfb6` | `12eee7b2959ae8db22d8ecce7be3156a520e672464ce4875fbd95c1bfadd665b` |
+
+| stable idle measurement | dense | compact | compact delta |
+|---|---:|---:|---:|
+| sampled process VRAM | 15,052 MiB | 14,828 MiB | **-224 MiB** |
+| `VmRSS` | 9,662,604 KiB | 9,423,676 KiB | **-238,928 KiB (-233.33 MiB)** |
+| `VmHWM` | 14,580,092 KiB | 14,582,796 KiB | +2,704 KiB (+2.64 MiB) |
+| `VmLck` | 0 KiB | 0 KiB | 0 KiB |
+| CUDA compute reservation | 1,751.09 MiB | 1,526.59 MiB | **-224.50 MiB** |
+| CUDA-host compute reservation | 254.78 MiB | 20.28 MiB | **-234.50 MiB** |
+
+Model, KV, and recurrent-state reservations were identical: 12,879.47 MiB
+CUDA model, 17.00 MiB CUDA KV, 7,973.00 MiB CUDA-host KV, and 149.62 MiB CUDA
+recurrent state. `VmLck=0` does not disprove CUDA page locking and must not be
+used as a pinned-memory counter. The nearly exact agreement between the
+224 MiB process-VRAM reduction and the 224.50 MiB CUDA compute-reservation
+reduction supports attributing the idle device-memory result to removal of the
+dense causal-mask allocation, not to a different model, KV placement, KVarN
+matrix, or inference lifecycle.
+
+Artifacts are under
+`/tmp/beellama-pr7-direct-screen-20260821/load-idle-240k-20260821`.
+`sha256sum -c artifact-hashes.sha256` validates every listed artifact; the
+artifact-manifest file itself hashes to
+`f67307edb0dbb6a540e86a0ad42d099d8f5267452b0e1dbe13222142ad857f21`.
+
+## Measured conclusion and redesign charter
+
+### Why the frozen compact consumer is not yet a default
+
+The measurements establish two different facts that must not be conflated:
+
+1. The compact logical representation produces real, depth-scaling allocation
+   savings. The current exact-source checks include 28 MiB at the 30K server
+   shape, 120 MiB at the 128K CPU-KV decode shape, and 224 MiB at 240K stable
+   idle. The 240K reservation logs directly identify the removed CUDA and
+   CUDA-host compute allocations.
+2. The current CUDA consumer pays for representability inside the attention
+   hot path. At 29,398-token full prefill it executes about 10% more
+   instructions and uses three more registers in the sampled kernel. The
+   process point is -0.229%, with all five balanced pairs negative. At 128K
+   the selected vector kernel is about 1.9% faster, but process-state variance
+   leaves the complete decode point at -0.968% with a wide interval. Therefore
+   this implementation is not proven strictly non-regressive in all required
+   serving phases.
+
+The causal explanation beyond those observations is an inference. The dense
+mask is expensive to allocate but cheap for the existing FlashAttention
+consumer to read because the consumer's mature tiling and control flow already
+encode its access pattern. The frozen compact implementation removes the
+allocation but reconstructs visibility with additional integer arithmetic and
+selection in frequently executed code. At short and middle spans, that extra
+instruction/register cost dominates. At deeper spans, reduced memory and stall
+pressure can dominate instead. That crossover explains the direction of the
+profiles; it does not prove identical behavior on every GPU generation.
+
+NVIDIA's published architecture and CUDA guidance supports treating this as a
+scheduling problem rather than assuming integer arithmetic is universally
+free. Native arithmetic throughput varies by instruction and compute
+capability, while Turing and newer designs can overlap independent integer and
+floating-point instruction issue. Those facts make a small, amortized tile
+classification plausible, but they do not justify an architecture-name check
+or a cross-generation performance claim without measurement. References:
+
+- <https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#throughput-of-native-arithmetic-instructions>
+- <https://developer.nvidia.com/blog/nvidia-turing-architecture-in-depth/>
+- <https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/compute-capabilities.html>
+
+### Replacement objective
+
+The next implementation phase remains part of the same compact causal-mask
+feature and stays on this branch. It is not a new user feature. The objective
+is to preserve the compact/symbolic causal description and its allocation
+savings while moving visibility work out of the per-score inner loop:
+
+- graph construction expresses a causal exclusive-prefix boundary as semantic
+  operator metadata, using existing tensor/operator abstractions where
+  possible;
+- backend lowering classifies attention work at tile or launch granularity;
+- fully visible tiles execute the existing unmasked inner loop unchanged;
+- fully masked tiles are omitted or retired before score work;
+- only the boundary tile performs a predicate, with the minimum representable
+  arithmetic;
+- unsupported operators, layouts, or backends retain the existing dense-mask
+  path based on capability and layout checks.
+
+There will be no public runtime control, user-visible CMake option, context
+threshold, prefill/decode switch, GPU architecture-name allowlist, new
+dependency, or import from native-Q8/live-workspace/telemetry/perplexity-
+capacity branches. A layout that cannot prove the symbolic boundary remains on
+the dense fallback; it is never silently reinterpreted.
+
+### Bounded implementation and decision plan
+
+The work proceeds through explicit stop gates so an appealing design cannot
+hide a slower implementation:
+
+1. **Coherent source baseline.** Preserve the published evidence checkpoint,
+   retain the current frozen candidate and rejected experiments as artifacts,
+   reconcile onto exact `f6341a15779eb58fe6ad9e1b890e331c32b676c7`, and
+   prove that the only production delta is causal-mask representation and
+   consumption.
+2. **Minimal merit prototype.** Hoist the exclusive boundary to the outermost
+   existing tile/launch scope that can prove it. Do not first redesign the
+   operator ABI. Static review must show that the fully visible path contains
+   no new per-score predicate and that unsupported layouts still take dense
+   fallback.
+3. **Fast correctness/performance screen.** Run the fixed-seed CPU/CUDA
+   equivalence oracle, then warmed interleaved direct production-shape screens
+   near 8K, 30K, 64K, and 128K. The unit is the actual Q8_0/Q8_0, D=256,
+   `ncols=1` vector consumer where applicable. Reject immediately if 30K or
+   64K is reproducibly slower or any tail differs bit-for-bit.
+4. **Merit decision.** Only if the minimal prototype is exact and clearly
+   non-regressive at both 30K and 64K does it justify the full internal
+   redesign. Otherwise archive its diff, command, timing, and disposition and
+   leave the published source unchanged.
+5. **Full internal lowering, if earned.** Carry the symbolic boundary through
+   graph/operator metadata and backend capability negotiation, and apply the
+   same tile classification to generic CPU plus CUDA F16/vector/tile/MMA and
+   KVarN-capable paths without architecture-name dispatch. Preserve dense
+   fallback coverage for unsupported layouts.
+6. **Production freeze gate.** Use clean order-balanced plain-GPU A/B/A for
+   30K full prefill and the deepest fitting decode, followed by deterministic
+   two-turn output. Freeze the first maintainable implementation whose
+   process-level point estimates and confidence intervals meet the strict
+   non-regression standard; do not continue tuning after a pass.
+7. **Final acceptance.** Re-run matching-batch PPL, focused CPU/CUDA
+   correctness, 4K/30K/deep performance and allocation/lifecycle measurements,
+   final KVarN-enabled compatibility build/tests, targeted direct-target NSYS
+   and NCU, and one deep CPU-KV composition study. Any PPL increase or
+   reproducible decode loss is automatic rejection.
+
+Profiler captures remain separate from timed evidence. Every CUDA-linked
+process, including smoke/version probes, remains a fresh whole command under
+`flock /tmp/beellama-single-gpu.lock -c`; Nsight targets llama binaries
+directly, no command uses `taskset`, builds use at most six jobs, and long runs
+expose native progress. PR 7 remains draft until the full acceptance gate is
+met. Findings, rejected attempts, exact identities, commands, artifact hashes,
+and tradeoffs will continue to be recorded in this ledger rather than
+overwriting earlier evidence.
