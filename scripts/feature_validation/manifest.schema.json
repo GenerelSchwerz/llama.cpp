@@ -98,6 +98,7 @@
         "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
         "selector": { "$ref": "#/$defs/profilerSelector" },
         "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
+        "memory_evidence": { "$ref": "#/$defs/memoryEvidence" },
         "metrics": {
           "type": "array",
           "items": { "type": "string", "minLength": 1 }
@@ -155,6 +156,7 @@
           "timeout_seconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 86400 },
           "selector": { "$ref": "#/$defs/profilerSelector" },
           "cuda_graph_trace": { "$ref": "#/$defs/cudaGraphTrace" },
+          "memory_evidence": { "$ref": "#/$defs/memoryEvidence" },
           "metrics": {
             "type": "array",
             "items": { "type": "string", "minLength": 1 }
@@ -463,6 +465,30 @@
           }
         }
       ]
+    },
+    "memoryEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "categories"],
+      "properties": {
+        "mode": { "enum": ["required", "optional"] },
+        "categories": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "gpu_memory_events",
+              "allocation_lifetimes",
+              "captured_device_high_water",
+              "copy_activity",
+              "cuda_api",
+              "vmm",
+              "nvtx_ranges"
+            ]
+          }
+        }
+      }
     },
     "stage": {
       "type": "object",

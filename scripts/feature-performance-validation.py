@@ -74,9 +74,6 @@ def _profile_one(
                 raise core.ValidationError(
                     "the preserved NCU capture is failed or unverifiable; start a new profile identity"
                 )
-            return json.loads(plan_path.read_text(encoding="utf-8"))
-        if not execute_ncu and state.get("ncu_plan_completed"):
-            return json.loads(plan_path.read_text(encoding="utf-8"))
     else:
         if resume:
             raise core.ValidationError(f"no resumable profile exists at {profile_root}")
@@ -91,6 +88,7 @@ def _profile_one(
             "screen": screen_id,
             "evidence_claim": config.get("evidence_claim", "kernel_investigation_only"),
             "nsys_discovery_completed": False,
+            "memory_evidence_status": "not_evaluated",
             "ncu_plan_completed": False,
             "ncu_executed": False,
             "ncu_verification_status": "not_executed",
@@ -124,6 +122,9 @@ def _profile_one(
     nvidia_smi = nvidia_smi_identity["path"] if nvidia_smi_identity else "nvidia-smi"
 
     sqlite_path = profile_root / "discovery.sqlite"
+    memory_capability_path = profile_root / "nsys-memory-trace-capability.json"
+    memory_config = config.get("memory_evidence")
+    memory_capability: dict[str, Any]
     if not state["nsys_discovery_completed"]:
         nsys_identity = _tool_identity("nsys")
         nsys_help = core.command_capture(
@@ -132,7 +133,10 @@ def _profile_one(
         nsys_version = core.command_capture([nsys_identity["path"], "--version"])
         if (
             nsys_help.get("returncode") != 0
-            and config["cuda_graph_trace"]["applicability"] == "required"
+            and (
+                config["cuda_graph_trace"]["applicability"] == "required"
+                or (memory_config is not None and memory_config["mode"] == "required")
+            )
         ):
             raise core.ValidationError(
                 f"cannot inspect NSYS CUDA tracing support: {nsys_help.get('stderr', nsys_help.get('error'))}"
@@ -150,6 +154,21 @@ def _profile_one(
                 "version_command": nsys_version,
             },
         )
+        memory_capability = profiler.verify_nsys_memory_trace_capability(
+            memory_config,
+            help_text=str(nsys_help.get("stdout", ""))
+            + str(nsys_help.get("stderr", "")),
+            version_text=str(nsys_version.get("stdout", ""))
+            + str(nsys_version.get("stderr", "")),
+        )
+        core.write_json_atomic(
+            memory_capability_path,
+            {
+                **memory_capability,
+                "help_command": nsys_help,
+                "version_command": nsys_version,
+            },
+        )
         identity_files_with_nsys = [*identity_files, nsys_identity]
         prefix = profile_root / "discovery"
         nsys_argv = profiler.nsys_discovery_argv(
@@ -157,6 +176,7 @@ def _profile_one(
             prefix,
             direct_harness,
             cuda_graph_trace=config["cuda_graph_trace"],
+            request_cuda_memory_usage=memory_capability["status"] == "supported",
             nsys_executable=nsys_identity["path"],
         )
         spec_path = profile_root / "nsys-run-spec.json"
@@ -213,12 +233,38 @@ def _profile_one(
             raise core.ValidationError(f"NSYS SQLite export failed: {exported.stderr.strip()}")
         state["nsys_discovery_completed"] = True
         core.write_json_atomic(state_path, state)
+    elif memory_capability_path.is_file():
+        memory_capability = json.loads(
+            memory_capability_path.read_text(encoding="utf-8")
+        )
+    elif memory_config is not None:
+        raise core.ValidationError(
+            "resumed NSYS discovery predates configured memory capability evidence; "
+            "start a new profile identity"
+        )
+    else:
+        memory_capability = {
+            "requested": False,
+            "mode": None,
+            "categories": [],
+            "status": "not_configured",
+        }
 
     discovery = profiler.parse_discovery(sqlite_path)
     discovery["graph_node_verification"] = profiler.verify_graph_node_discovery(
         discovery, config["cuda_graph_trace"]
     )
     core.write_json_atomic(profile_root / "discovery-inventory.json", discovery)
+    memory_inventory = profiler.parse_memory_inventory(sqlite_path)
+    memory_assessment = profiler.assess_memory_evidence(
+        memory_inventory, memory_config, memory_capability
+    )
+    memory_inventory["request"] = memory_capability
+    memory_inventory["assessment"] = memory_assessment
+    core.write_json_atomic(profile_root / "memory-inventory.json", memory_inventory)
+    state["memory_evidence_status"] = memory_assessment["status"]
+    core.write_json_atomic(state_path, state)
+    profiler.enforce_memory_evidence(memory_assessment)
     plan = profiler.build_ncu_plan(
         discovery,
         config["selector"],

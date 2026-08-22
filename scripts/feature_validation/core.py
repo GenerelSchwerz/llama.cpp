@@ -34,6 +34,15 @@ PURPOSE_ORDER = {
     "long_context_acceptance": 4,
 }
 PROFILE_TOOLS = {"nsys", "ncu"}
+MEMORY_EVIDENCE_CATEGORIES = {
+    "gpu_memory_events",
+    "allocation_lifetimes",
+    "captured_device_high_water",
+    "copy_activity",
+    "cuda_api",
+    "vmm",
+    "nvtx_ranges",
+}
 FORBIDDEN_TOKENS = {"taskset"}
 OPAQUE_WRAPPERS = {
     "bash",
@@ -588,6 +597,31 @@ def _validate_profiler_details(
     else:
         if set(graph_trace) != {"applicability", "reason"} or not graph_trace.get("reason"):
             raise ManifestError("not-applicable CUDA graph tracing requires exactly a reason")
+    memory_evidence = config.get("memory_evidence")
+    if memory_evidence is not None:
+        if not isinstance(memory_evidence, dict) or set(memory_evidence) != {
+            "mode",
+            "categories",
+        }:
+            raise ManifestError(
+                f"{label}.memory_evidence requires exactly mode and categories"
+            )
+        if memory_evidence.get("mode") not in {"required", "optional"}:
+            raise ManifestError(
+                f"{label}.memory_evidence.mode must be required or optional"
+            )
+        categories = memory_evidence.get("categories")
+        if (
+            not isinstance(categories, list)
+            or not categories
+            or any(not isinstance(item, str) for item in categories)
+            or len(set(categories)) != len(categories)
+            or not set(categories).issubset(MEMORY_EVIDENCE_CATEGORIES)
+        ):
+            raise ManifestError(
+                f"{label}.memory_evidence.categories must be a non-empty unique subset of "
+                f"{sorted(MEMORY_EVIDENCE_CATEGORIES)}"
+            )
     metrics = config.get("metrics", [])
     if not isinstance(metrics, list) or any(
         not isinstance(value, str) or not value for value in metrics
@@ -1001,6 +1035,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             "timeout_seconds",
             "selector",
             "cuda_graph_trace",
+            "memory_evidence",
             "metrics",
         }
         profiler_required = {
@@ -1051,7 +1086,11 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
             "selector",
             "cuda_graph_trace",
         }
-        diagnostic_keys = diagnostic_required | {"timeout_seconds", "metrics"}
+        diagnostic_keys = diagnostic_required | {
+            "timeout_seconds",
+            "memory_evidence",
+            "metrics",
+        }
         if diagnostic_required - set(config) or set(config) - diagnostic_keys:
             raise ManifestError("early diagnostic has unknown or missing fields")
         diagnostic_id = safe_slug(str(config.get("id", "")))

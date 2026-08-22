@@ -1100,6 +1100,27 @@ class StatisticsTest(unittest.TestCase):
 
 
 class ProfilerTest(unittest.TestCase):
+    def test_memory_manifest_categories_are_explicit_and_schema_bounded(self) -> None:
+        stage = {
+            "resource": "gpu",
+            "selection": {"execution_mode": "direct_process"},
+        }
+        config = {
+            "selector": {"kernel_regex": "kernel"},
+            "cuda_graph_trace": {
+                "applicability": "not_applicable",
+                "reason": "direct launch",
+            },
+            "memory_evidence": {
+                "mode": "required",
+                "categories": ["gpu_memory_events", "vmm"],
+            },
+        }
+        core._validate_profiler_details(config, stage, label="profiler")
+        config["memory_evidence"]["categories"] = ["architecture_specific_bytes"]
+        with self.assertRaisesRegex(core.ManifestError, "non-empty unique subset"):
+            core._validate_profiler_details(config, stage, label="profiler")
+
     def test_regression_diagnostic_selects_preregistered_largest_screen(self) -> None:
         stage = {
             "id": "spans",
@@ -1177,6 +1198,274 @@ class ProfilerTest(unittest.TestCase):
             profiler.verify_graph_node_discovery(
                 {"graph_node_trace": {"launches_with_graph_node": 0}}, config
             )
+
+    def test_nsys_memory_trace_is_explicit_and_required_support_fails_closed(self) -> None:
+        config = {
+            "mode": "required",
+            "categories": ["gpu_memory_events", "captured_device_high_water"],
+        }
+        evidence = profiler.verify_nsys_memory_trace_capability(
+            config,
+            help_text="--cuda-memory-usage= true|false",
+            version_text="Nsight Systems 2026.1",
+        )
+        self.assertEqual(evidence["status"], "supported")
+        argv = profiler.nsys_discovery_argv(
+            ["/tmp/llama-bench", "-C", "0x7", "--cpu-strict", "1"],
+            pathlib.Path("/tmp/discovery"),
+            request_cuda_memory_usage=True,
+        )
+        self.assertIn("--cuda-memory-usage=true", argv)
+        with self.assertRaisesRegex(core.ValidationError, "does not advertise required"):
+            profiler.verify_nsys_memory_trace_capability(
+                config,
+                help_text="older CUDA tracing help",
+                version_text="Nsight Systems old",
+            )
+        optional = profiler.verify_nsys_memory_trace_capability(
+            {**config, "mode": "optional"},
+            help_text="older CUDA tracing help",
+            version_text="Nsight Systems old",
+        )
+        self.assertEqual(optional["status"], "unsupported")
+
+    def test_memory_inventory_parses_allocations_copies_api_vmm_and_nvtx(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "memory.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE ENUM_CUDA_DEV_MEM_EVENT_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (0, 'Allocation');
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (1, 'Deallocation');
+                    CREATE TABLE ENUM_CUDA_MEM_KIND (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (1, 'Pinned');
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (2, 'Device');
+                    CREATE TABLE ENUM_CUDA_MEMCPY_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEMCPY_OPER VALUES (1, 'Host to Device');
+                    CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                        start INTEGER, globalPid INTEGER, deviceId INTEGER,
+                        contextId INTEGER, address INTEGER, bytes INTEGER,
+                        memKind INTEGER, memoryOperationType INTEGER,
+                        name TEXT, correlationId INTEGER
+                    );
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (10, 7, 0, 3, 100, 1024, 2, 0, 'device-a', 11);
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (15, 7, 0, 3, 200, 512, 1, 0, 'pinned-a', 12);
+                    INSERT INTO CUDA_GPU_MEMORY_USAGE_EVENTS
+                        VALUES (30, 7, 0, 3, 100, 1024, 2, 1, 'device-a', 13);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+                        start INTEGER, end INTEGER, bytes INTEGER,
+                        copyKind INTEGER, srcKind INTEGER, dstKind INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_MEMCPY VALUES (16, 20, 512, 1, 1, 2);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (
+                        start INTEGER, end INTEGER, bytes INTEGER, memKind INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_MEMSET VALUES (21, 23, 256, 2);
+                    CREATE TABLE StringIds (id INTEGER, value TEXT);
+                    INSERT INTO StringIds VALUES (1, 'cuMemMap');
+                    INSERT INTO StringIds VALUES (2, 'cudaMallocHost_v3020');
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+                        start INTEGER, end INTEGER, nameId INTEGER
+                    );
+                    INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (5, 6, 1);
+                    INSERT INTO CUPTI_ACTIVITY_KIND_RUNTIME VALUES (7, 9, 2);
+                    CREATE TABLE NVTX_EVENTS (start INTEGER, end INTEGER, text TEXT);
+                    INSERT INTO NVTX_EVENTS VALUES (4, 40, 'prefill');
+                    """
+                )
+                connection.commit()
+
+            inventory = profiler.parse_memory_inventory(path)
+
+        categories = inventory["categories"]
+        self.assertEqual(categories["gpu_memory_events"]["status"], "available")
+        self.assertEqual(categories["gpu_memory_events"]["event_count"], 3)
+        self.assertTrue(
+            any(
+                item["memory_kind"] == "Pinned"
+                for item in categories["gpu_memory_events"]["groups"]
+            )
+        )
+        pinned_balance = next(
+            item
+            for item in categories["gpu_memory_events"][
+                "captured_outstanding_by_process_device_kind"
+            ]
+            if item["memory_kind"] == "Pinned"
+        )
+        self.assertEqual(pinned_balance["captured_outstanding_high_water_bytes"], 512)
+        self.assertEqual(categories["allocation_lifetimes"]["paired_lifetime_count"], 1)
+        self.assertEqual(categories["allocation_lifetimes"]["unmatched_allocation_count"], 1)
+        self.assertEqual(
+            categories["captured_device_high_water"]["by_process_device"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            1024,
+        )
+        self.assertEqual(categories["copy_activity"]["event_count"], 2)
+        self.assertEqual(categories["vmm"]["event_count"], 1)
+        self.assertEqual(categories["nvtx_ranges"]["ranges"][0]["text"], "prefill")
+        assessment = profiler.assess_memory_evidence(
+            inventory,
+            {
+                "mode": "required",
+                "categories": [
+                    "gpu_memory_events",
+                    "allocation_lifetimes",
+                    "captured_device_high_water",
+                    "copy_activity",
+                    "cuda_api",
+                    "vmm",
+                    "nvtx_ranges",
+                ],
+            },
+            {"status": "supported"},
+        )
+        self.assertEqual(assessment["status"], "satisfied")
+        profiler.enforce_memory_evidence(assessment)
+        self.assertIn("never inferred from VmLck", inventory["memory_boundaries"]["pinned_host_memory"])
+
+    def test_memory_inventory_distinguishes_zero_from_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            zero_path = root / "zero.sqlite"
+            missing_path = root / "missing.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(zero_path)) as connection:
+                connection.executescript(
+                    """
+                    CREATE TABLE ENUM_CUDA_DEV_MEM_EVENT_OPER (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (0, 'Allocation');
+                    INSERT INTO ENUM_CUDA_DEV_MEM_EVENT_OPER VALUES (1, 'Deallocation');
+                    CREATE TABLE ENUM_CUDA_MEM_KIND (id INTEGER, label TEXT);
+                    INSERT INTO ENUM_CUDA_MEM_KIND VALUES (2, 'Device');
+                    CREATE TABLE CUDA_GPU_MEMORY_USAGE_EVENTS (
+                        start INTEGER, globalPid INTEGER, deviceId INTEGER,
+                        address INTEGER, bytes INTEGER, memKind INTEGER,
+                        memoryOperationType INTEGER
+                    );
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMCPY (
+                        start INTEGER, end INTEGER, bytes INTEGER
+                    );
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_MEMSET (
+                        start INTEGER, end INTEGER, bytes INTEGER
+                    );
+                    CREATE TABLE StringIds (id INTEGER, value TEXT);
+                    CREATE TABLE CUPTI_ACTIVITY_KIND_RUNTIME (
+                        start INTEGER, end INTEGER, nameId INTEGER
+                    );
+                    """
+                )
+                connection.commit()
+            with contextlib.closing(sqlite3.connect(missing_path)) as connection:
+                connection.execute("CREATE TABLE unrelated (value INTEGER)")
+                connection.commit()
+
+            zero = profiler.parse_memory_inventory(zero_path)
+            missing = profiler.parse_memory_inventory(missing_path)
+
+        for category in (
+            "gpu_memory_events",
+            "allocation_lifetimes",
+            "captured_device_high_water",
+            "copy_activity",
+            "cuda_api",
+            "vmm",
+        ):
+            self.assertEqual(zero["categories"][category]["status"], "available")
+            self.assertEqual(zero["categories"][category]["event_count"], 0)
+            self.assertEqual(missing["categories"][category]["status"], "unavailable")
+            self.assertIsNone(missing["categories"][category]["event_count"])
+        required = {
+            "mode": "required",
+            "categories": ["gpu_memory_events", "copy_activity", "vmm"],
+        }
+        failed = profiler.assess_memory_evidence(
+            missing, required, {"status": "supported"}
+        )
+        self.assertEqual(failed["status"], "failed")
+        with self.assertRaisesRegex(core.ValidationError, "required NSYS memory evidence"):
+            profiler.enforce_memory_evidence(failed)
+        optional = profiler.assess_memory_evidence(
+            missing, {**required, "mode": "optional"}, {"status": "unsupported"}
+        )
+        self.assertEqual(optional["status"], "optional_incomplete")
+        profiler.enforce_memory_evidence(optional)
+
+    def test_memory_inventory_accepts_named_variant_columns_and_rejects_missing_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            variant = root / "variant.sqlite"
+            invalid = root / "invalid.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(variant)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, processId INTEGER, device INTEGER, ptr INTEGER, "
+                    "size INTEGER, memoryKind TEXT, operation TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO CUDA_MEMORY_USAGE_EVENTS VALUES "
+                    "(1, 2, 0, 4096, 64, 'Device', 'Allocation')"
+                )
+                connection.commit()
+            with contextlib.closing(sqlite3.connect(invalid)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, address INTEGER, size INTEGER, memoryKind TEXT)"
+                )
+                connection.commit()
+
+            parsed = profiler.parse_memory_inventory(variant)
+            rejected = profiler.parse_memory_inventory(invalid)
+
+        self.assertEqual(parsed["categories"]["gpu_memory_events"]["status"], "available")
+        self.assertEqual(
+            parsed["categories"]["captured_device_high_water"]["by_process_device"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            64,
+        )
+        self.assertEqual(rejected["categories"]["gpu_memory_events"]["status"], "unavailable")
+
+    def test_capture_start_deallocation_marks_high_water_partial(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "partial.sqlite"
+            import sqlite3
+
+            with contextlib.closing(sqlite3.connect(path)) as connection:
+                connection.execute(
+                    "CREATE TABLE CUDA_MEMORY_USAGE_EVENTS ("
+                    "timestamp INTEGER, processId INTEGER, device INTEGER, ptr INTEGER, "
+                    "size INTEGER, memoryKind TEXT, operation TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO CUDA_MEMORY_USAGE_EVENTS VALUES "
+                    "(1, 2, 0, 4096, 64, 'Device', 'Deallocation')"
+                )
+                connection.commit()
+
+            inventory = profiler.parse_memory_inventory(path)
+
+        categories = inventory["categories"]
+        self.assertEqual(categories["gpu_memory_events"]["status"], "available")
+        self.assertEqual(
+            categories["allocation_lifetimes"]["unmatched_deallocation_count"], 1
+        )
+        self.assertEqual(categories["captured_device_high_water"]["status"], "partial")
+        assessment = profiler.assess_memory_evidence(
+            inventory,
+            {"mode": "required", "categories": ["captured_device_high_water"]},
+            {"status": "supported"},
+        )
+        self.assertEqual(assessment["status"], "failed")
 
     def test_jsonl_discovery_and_one_filtered_ncu_plan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1329,6 +1618,48 @@ class ProfilerTest(unittest.TestCase):
                 },
             )
             core.write_json_atomic(
+                root / "memory-inventory.json",
+                {
+                    "assessment": {"status": "satisfied", "issues": []},
+                    "categories": {
+                        "gpu_memory_events": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "groups": [
+                                {
+                                    "memory_kind": "Device",
+                                    "operation": "allocation",
+                                    "event_count": 1,
+                                    "total_bytes": 4096,
+                                }
+                            ],
+                        },
+                        "allocation_lifetimes": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "paired_lifetime_count": 1,
+                            "unmatched_allocation_count": 0,
+                            "unmatched_deallocation_count": 0,
+                        },
+                        "captured_device_high_water": {
+                            "status": "available",
+                            "reason": None,
+                            "event_count": 2,
+                            "by_process_device": [
+                                {
+                                    "process_id": 1,
+                                    "device_id": 0,
+                                    "captured_outstanding_high_water_bytes": 4096,
+                                }
+                            ],
+                        },
+                    },
+                    "memory_boundaries": {"process_vram": "separate telemetry"},
+                },
+            )
+            core.write_json_atomic(
                 root / "nsys-result.json",
                 {"timing": {"target_process_seconds": 2.5}},
             )
@@ -1346,6 +1677,13 @@ class ProfilerTest(unittest.TestCase):
             summary["ncu"]["captures"][0]["metrics"][0]["value"], "1234"
         )
         self.assertEqual(summary["timing_seconds"]["nsys"]["target_process_seconds"], 2.5)
+        self.assertEqual(summary["memory"]["assessment_status"], "satisfied")
+        self.assertEqual(
+            summary["memory"]["captured_device_high_water"][0][
+                "captured_outstanding_high_water_bytes"
+            ],
+            4096,
+        )
         self.assertIn("diagnostic-only", summary["evidence_boundary"].lower())
 
     def test_agent_comparison_keeps_raw_metrics_without_acceptance_claim(self) -> None:
@@ -1368,6 +1706,12 @@ class ProfilerTest(unittest.TestCase):
                         }
                     ]
                 },
+                "memory": {
+                    "assessment_status": "satisfied",
+                    "captured_device_high_water": [
+                        {"captured_outstanding_high_water_bytes": int(value)}
+                    ],
+                },
                 "timing_seconds": {},
             }
 
@@ -1379,6 +1723,12 @@ class ProfilerTest(unittest.TestCase):
         self.assertEqual(
             comparison["raw_ncu_metrics"]["candidate"][0]["metrics"][0]["value"],
             "12",
+        )
+        self.assertEqual(
+            comparison["memory_inventory"]["candidate"][
+                "captured_device_high_water"
+            ][0]["captured_outstanding_high_water_bytes"],
+            12,
         )
         self.assertIn("no paired interval", comparison["comparison_boundary"].lower())
 

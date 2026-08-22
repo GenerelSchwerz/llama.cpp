@@ -338,6 +338,44 @@ selector. Thus `--launch-skip` and `--launch-count` are derived for the current
 binary, hardware, and capture rather than copied between builds. Re-run NSYS
 after any relevant identity changes.
 
+An optional `memory_evidence` block preregisters `mode` (`required` or
+`optional`) and the evidence categories needed from this same discovery. When
+configured, the runner inspects the exact NSYS help and, when supported,
+explicitly passes `--cuda-memory-usage=true`. Required mode fails before launch
+if the option is unsupported, and fails after export if any requested category
+is unavailable or only partial. Optional mode retains the same diagnostics but
+does not turn unavailable evidence into a successful memory claim.
+
+`memory-inventory.json` is schema-tolerant across known NSYS SQLite naming
+variants and separately reports:
+
+- CUDA allocation/deallocation events by memory kind, including device,
+  pinned, pageable, managed, and static kinds when NSYS supplies them, plus
+  captured outstanding-allocation high-water separately for each kind;
+- address-paired lifetimes plus every unmatched allocation/deallocation;
+- captured outstanding device-allocation high-water by process/device, which
+  is not total process VRAM or VMM reservation;
+- memcpy/memset counts, bytes, duration, and memory-kind groupings;
+- aggregated CUDA runtime/driver memory calls and named VMM reserve, create,
+  map, access, unmap, release, and address-free calls; and
+- standalone NVTX ranges when an NVTX table is present.
+
+Each category is `available`, `partial`, or `unavailable`. An available table
+with zero rows is measured zero; a missing table, required column, enum
+meaning, or unresolved identity is never reported as zero. Raw allocation rows
+and lifetimes remain in JSON; raw copy/API rows remain in the SQLite export and
+the JSON aggregates retain their complete counts and byte totals.
+
+The allocation-event balance is deliberately named *captured outstanding
+high-water*. It does not replace the persistent roughly-1-Hz `nvidia-smi`
+process-VRAM series, `/proc/PID/status` VmRSS/VmHWM ordinary-host-memory
+series, or a dedicated pinned-memory audit. CUDA events labelled `Pinned` are
+allocator events only; the toolkit never infers pinned bytes from VmLck or
+process VRAM. Robust nested-NVTX phase attribution, per-phase device high-water,
+and allocation backtraces remain bounded follow-ups because their cross-version
+joins and symbolization would create a substantially larger profiling
+framework.
+
 After the separate NCU process, the runner requires the expected nonempty
 `.ncu-rep`, hashes it, imports its raw CSV with the same NCU binary, and checks
 the observed demangled kernel, unique capture count, and available grid/block
@@ -398,6 +436,8 @@ The deterministic
   same-name occurrences, shapes, and graph-node IDs;
 - verified NCU capture count, raw per-capture requested metric values, and any
   verification issues;
+- memory-category availability, captured allocation high-water, allocation
+  lifecycle counts, copy/memset groups, and CUDA/VMM API groups when requested;
 - NSYS/NCU target and locked-lifecycle timing plus paths to the raw reports,
   inventory, plan, stdout/stderr, and verification record.
 

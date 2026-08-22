@@ -432,6 +432,17 @@
       "granularity": "node",
       "launch_origin": "host-only"
     },
+    "memory_evidence": {
+      "mode": "required",
+      "categories": [
+        "gpu_memory_events",
+        "allocation_lifetimes",
+        "captured_device_high_water",
+        "copy_activity",
+        "cuda_api",
+        "vmm"
+      ]
+    },
     "selector": {
       "kernel_regex": "replace-with-discovered-production-kernel-regex",
       "graph_only": true
