@@ -6227,6 +6227,68 @@ this feature is held to; a direct native-versus-native comparison against the
 per-pair binary was not run, because that library had already been overwritten
 by the time the regression was found.
 
+#### Rejected: a quantized-specific MMA configuration
+
+Quantized K/V inherits the F16 configuration table — `nthreads`, `occupancy`,
+`nbatch_fa`, `nbatch_K2`, `nbatch_V2`, `Q_in_reg` — which was tuned for a kernel
+that performs no dequantization, and then forces `nstages = 0`. With 255-register
+kernels and visible spills, retuning it looked like the obvious next lever.
+**It is not: every deviation tried lost, and the inherited table is retained
+unchanged.**
+
+The experiment applied a quant-only override on top of the arch table, threaded
+through the existing accessors behind an `is_quant` flag defaulting to false so
+F16, BF16 and KVarN read exactly the table they read before, selected by a
+build-time value with `0` verified as a no-op against the shipped build. All
+arms ran on `q6_0` — the type whose native advantage is merely neutral, so a
+configuration win would show most clearly — at 512-token prefill and depth
+32,768, reverse-order arm pairs, in a default-tier `GGML_CUDA_KVARN=OFF` build
+shared by every arm.
+
+| Configuration | Native vs materializing | Welch t | `D=256` spill |
+|---|---:|---:|---|
+| Inherited (control) | `+0.41%` | `+1.53` | 16 B |
+| `Q_in_reg = false`, prefill shapes | **`-9.35%`** | `-41.45` | 16 B, `REG:255` -> `219/222` |
+| `nbatch_fa` 32 -> 64, prefill shapes | **`-2.32%`** | `-9.89` | 40 / 112 B |
+| `nbatch_K2`/`nbatch_V2` 128 -> 64 | **`-2.66%`** | `-10.81` | 64 / 40 B |
+
+Two findings are worth more than the disposition.
+
+**The 255-register ceiling is not what limits this kernel.** `Q_in_reg = false`
+did exactly what it was meant to at the register level, dropping the production
+kernel from `REG:255` to `REG:219/222` with spill unchanged, and lost 9.35%.
+Keeping Q out of registers forces a shared-memory read per MMA that costs far
+more than the returned budget. Spill does not predict throughput in either
+direction here: the variant that *reduced* register pressure lost the most, and
+the variant that raised spill sevenfold lost the least. Anything proposing to
+tune this kernel by chasing registers or spill — including the residual 24 bytes
+introduced by the runtime-V parameter — should account for this result first.
+
+**`nthreads` and `occupancy` cannot be swept one field at a time.** The
+originally planned "128-thread/occupancy-2 versus 256-thread/occupancy-1" and
+"64-thread/occupancy-4 versus 128-thread/occupancy-2" arms do not compile:
+`zero-sized variable "KQ_C" is not allowed in device code`, and repeated
+`static assertion failed with "bad loop size"`. Each `fattn_mma_config` row is an
+internally consistent tuple coupled to the warp-tile geometry, so an occupancy
+experiment must move a whole valid row. The two arms above replaced them with
+changes the loader's own constraints admit.
+
+The override was reverted after measurement; no build-time knob is left in the
+tree.
+
+##### Methodology: a failed build in a sweep reports the previous arm
+
+Two arms of the first attempt produced believable numbers for configurations
+that were never compiled. The driver did not check the build status, a failed
+build left the previous variant's library in place, and the benchmark measured
+that. The tell was a 37-second "build" beside a 15-minute one, not any error
+message; the two arms landed within 0.07% of the preceding arm, which read as
+consistency rather than as the duplicate it was. Deleting the stale binaries was
+not enough either — leftover result files reproduced the same wrong numbers on
+the retry. The driver now aborts on a non-zero build status and reads only files
+written by the current run. Recorded because the failure mode is silent and the
+output is plausible.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes
