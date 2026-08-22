@@ -2133,6 +2133,288 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
             "cleanup_kill_timeout_seconds": 1.0,
         }
 
+    def _fake_flock(self, target_pids_path: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+        fake_bin = self.root / "fake-flock-bin"
+        fake_bin.mkdir()
+        held_path = self.root / "fake-lock-held"
+        released_path = self.root / "fake-lock-released.json"
+        fake = fake_bin / "flock"
+        fake.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            "if len(sys.argv) != 4 or sys.argv[2] != '-c':\n"
+            "    raise SystemExit(64)\n"
+            f"held = pathlib.Path({str(held_path)!r})\n"
+            f"released = pathlib.Path({str(released_path)!r})\n"
+            f"target_pids = pathlib.Path({str(target_pids_path)!r})\n"
+            "held.write_text(str(time.monotonic()))\n"
+            "result = subprocess.run(['/bin/sh', '-c', sys.argv[3]], check=False)\n"
+            "pids = json.loads(target_pids.read_text()) if target_pids.is_file() else []\n"
+            "deadline = time.monotonic() + 2.0\n"
+            "alive = []\n"
+            "while True:\n"
+            "    alive = []\n"
+            "    for pid in pids:\n"
+            "        try:\n"
+            "            os.kill(pid, 0)\n"
+            "        except ProcessLookupError:\n"
+            "            continue\n"
+            "        alive.append(pid)\n"
+            "    if not alive or time.monotonic() >= deadline:\n"
+            "        break\n"
+            "    time.sleep(.02)\n"
+            "released.write_text(json.dumps({'alive_at_release': alive, "
+            "'released_monotonic': time.monotonic(), 'inner_returncode': result.returncode}))\n"
+            "raise SystemExit(result.returncode)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return fake_bin, released_path
+
+    def _prepared_first_run(
+        self, manifest_name: str
+    ) -> tuple[StudyRunner, dict, dict, str, pathlib.Path]:
+        manifest_path = self.root / manifest_name
+        manifest_path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        study = StudyRunner(manifest_path, SCRIPTS / "feature-performance-validation.py")
+        study.prepare(resume=False)
+        stage = core.stage_by_id(study.manifest, "exactness")
+        scheduled = core.build_schedule(study.manifest, stage)[0]
+        run_id = f"{stage['id']}--{scheduled['run_id']}"
+        run_base = study.study_root / "runs" / stage["id"] / scheduled["run_id"]
+        return study, stage, scheduled, run_id, run_base
+
+    def test_parent_interrupt_holds_wrapper_until_descendant_is_reaped(self) -> None:
+        attempt = self.root / "parent-interrupted"
+        attempt.mkdir()
+        target_pids_path = attempt / "target-pids.json"
+        ready_path = attempt / "target-ready"
+        target = attempt / "parent-interrupt-target.py"
+        descendant_code = (
+            "import signal, time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(30)"
+        )
+        target.write_text(
+            f"#!{sys.executable}\n"
+            "import json, os, pathlib, subprocess, sys, time\n"
+            f"child = subprocess.Popen([sys.executable, '-c', {descendant_code!r}], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            f"pathlib.Path({str(target_pids_path)!r}).write_text(json.dumps([os.getpid(), child.pid]))\n"
+            f"pathlib.Path({str(ready_path)!r}).write_text('ready')\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        target.chmod(0o755)
+        fake_bin, released_path = self._fake_flock(target_pids_path)
+        spec = self._spec(attempt, [str(target)], "parent-interrupt-cleanup")
+        spec["lifecycle_path"] = str(attempt / "lifecycle-owner.json")
+        spec_path = attempt / "run-spec.json"
+
+        def interrupt_twice() -> None:
+            deadline = time.monotonic() + 5.0
+            while not ready_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if ready_path.is_file():
+                os.kill(os.getpid(), signal.SIGTERM)
+                time.sleep(0.05)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = threading.Thread(target=interrupt_twice)
+        interrupter.start()
+        result: dict | None = None
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"},
+            ):
+                result = launch_locked_spec(
+                    spec, spec_path, SCRIPTS / "feature-performance-validation.py"
+                )
+        finally:
+            interrupter.join(timeout=5.0)
+            if target_pids_path.is_file():
+                target_pids = json.loads(target_pids_path.read_text(encoding="utf-8"))
+                for pid in target_pids:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["launcher"]["interrupted"])
+        self.assertEqual(result["launcher"]["interrupt_signals"], ["SIGTERM", "SIGINT"])
+        self.assertIsNone(result["launcher"]["owned_target_fallback_cleanup"])
+        self.assertTrue(result["process_group_cleanup"]["kill_sent"])
+        self.assertTrue(result["process_group_cleanup"]["group_gone"])
+        self.assertTrue(result["process_group_cleanup"]["leader_reaped"])
+        self.assertIsNotNone(result["telemetry"])
+        release = json.loads(released_path.read_text(encoding="utf-8"))
+        self.assertEqual(release["alive_at_release"], [])
+        lifecycle = json.loads(
+            pathlib.Path(spec["lifecycle_path"]).read_text(encoding="utf-8")
+        )
+        self.assertEqual(lifecycle["state"], "cleanup_complete")
+        self.assertTrue(lifecycle["telemetry_stopped"])
+
+    def test_incomplete_attempt_is_sealed_and_retry_uses_next_number(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "incomplete-attempt.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        sentinel = first / "partial.log"
+        sentinel.write_text("interrupted output\n", encoding="utf-8")
+        resumed = StudyRunner(
+            study.manifest_path, SCRIPTS / "feature-performance-validation.py"
+        )
+        resumed.prepare(resume=True)
+
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            resumed._execute(stage, scheduled, retry_failed=False)
+        recovered = resumed.state["runs"][run_id][0]
+        self.assertEqual(recovered["status"], "failed")
+        self.assertNotIn("metric_value", recovered)
+        self.assertEqual(recovered["metric_disposition"], "not_counted_interrupted_attempt")
+        evidence_path = pathlib.Path(recovered["attempt_evidence"]["path"])
+        self.assertEqual(
+            recovered["attempt_evidence"]["sha256"], file_sha256(evidence_path)
+        )
+        evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+        self.assertEqual(evidence["study_identity"], resumed._study_identity())
+        self.assertIn("partial.log", [item["path"] for item in evidence["files"]])
+
+        result = resumed._execute(stage, scheduled, retry_failed=True)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["attempt"], 2)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "interrupted output\n")
+        self.assertTrue((run_base / "attempt-02" / "result.json").is_file())
+        self.assertEqual(
+            [item["status"] for item in resumed.state["runs"][run_id]],
+            ["failed", "success"],
+        )
+
+    def test_incomplete_attempt_with_live_owner_is_not_recycled(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "live-owner-incomplete.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "lifecycle-owner.json",
+            {
+                "run_id": run_id,
+                "attempt": 1,
+                "study_identity": study._study_identity(),
+                "executor": validation_runner._process_identity(os.getpid()),
+                "target": None,
+                "state": "executor_started",
+            },
+        )
+
+        with self.assertRaisesRegex(core.ValidationError, "live owned executor"):
+            study._execute(stage, scheduled, retry_failed=True)
+        self.assertNotIn(run_id, study.state["runs"])
+        self.assertFalse((first / "attempt-evidence.json").exists())
+
+    def test_noncanonical_incomplete_attempt_name_fails_closed(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "noncanonical-incomplete.json"
+        )
+        (run_base / "attempt-1").mkdir(parents=True)
+
+        with self.assertRaisesRegex(core.ProvenanceError, "noncanonical"):
+            study._execute(stage, scheduled, retry_failed=True)
+        self.assertNotIn(run_id, study.state["runs"])
+
+    def test_repeated_incomplete_attempts_are_preserved_before_attempt_three(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "repeated-incomplete.json"
+        )
+        for attempt in (1, 2):
+            directory = run_base / f"attempt-{attempt:02d}"
+            directory.mkdir(parents=True)
+            (directory / "partial.log").write_text(
+                f"interruption {attempt}\n", encoding="utf-8"
+            )
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        self.assertEqual(result["attempt"], 3)
+        records = study.state["runs"][run_id]
+        self.assertEqual([item["status"] for item in records], ["failed", "failed", "success"])
+        self.assertEqual([item["attempt"] for item in records], [1, 2, 3])
+        for attempt in (1, 2):
+            self.assertTrue((run_base / f"attempt-{attempt:02d}" / "attempt-evidence.json").is_file())
+
+    def test_preserved_incomplete_attempt_tamper_fails_closed(self) -> None:
+        study, stage, scheduled, _run_id, run_base = self._prepared_first_run(
+            "tampered-incomplete.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        sentinel = first / "partial.log"
+        sentinel.write_text("original\n", encoding="utf-8")
+        with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
+            study._execute(stage, scheduled, retry_failed=False)
+        sentinel.write_text("changed\n", encoding="utf-8")
+        with self.assertRaisesRegex(core.ProvenanceError, "evidence changed"):
+            study._execute(stage, scheduled, retry_failed=True)
+
+    def test_unindexed_success_result_is_preserved_but_never_counted(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "unindexed-success.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "result.json",
+            {
+                "run_id": run_id,
+                "attempt": 1,
+                "status": "success",
+                "metric_value": 999999,
+            },
+        )
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        recovered = study.state["runs"][run_id][0]
+        self.assertEqual(recovered["status"], "failed")
+        self.assertNotIn("metric_value", recovered)
+        self.assertEqual(
+            recovered["preserved_child_result"]["metric_disposition"],
+            "preserved_not_counted",
+        )
+        self.assertEqual(result["attempt"], 2)
+
+    def test_unindexed_presealed_failure_recovers_without_mutating_seal(self) -> None:
+        study, stage, scheduled, run_id, run_base = self._prepared_first_run(
+            "unindexed-presealed.json"
+        )
+        first = run_base / "attempt-01"
+        first.mkdir(parents=True)
+        core.write_json_atomic(
+            first / "result.json",
+            {"run_id": run_id, "attempt": 1, "status": "failed", "error": "stopped"},
+        )
+        reference = study._seal_failed_attempt(first, run_id, 1)
+        evidence_path = pathlib.Path(reference["path"])
+        evidence_before = evidence_path.read_bytes()
+
+        result = study._execute(stage, scheduled, retry_failed=True)
+
+        recovered = study.state["runs"][run_id][0]
+        self.assertEqual(
+            recovered["recovery_record"],
+            "state_only_to_preserve_preexisting_immutable_attempt_seal",
+        )
+        self.assertEqual(recovered["attempt_evidence"], reference)
+        self.assertEqual(evidence_path.read_bytes(), evidence_before)
+        self.assertFalse((first / "interrupted-result.json").exists())
+        self.assertEqual(result["attempt"], 2)
+
     def test_exited_leader_does_not_hide_sigterm_ignoring_descendant(self) -> None:
         attempt = self.root / "leader-exited"
         attempt.mkdir()
@@ -2278,6 +2560,8 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
         stage = core.stage_by_id(runner.manifest, "exactness")
         stage["resource"] = "gpu"
         scheduled = core.build_schedule(runner.manifest, stage)[0]
+        fake_bin, _released_path = self._fake_flock(self.root / "no-target-pids")
+        fake_path = f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}"
 
         def cpu_locked(spec: dict, spec_path: pathlib.Path, tool_script: pathlib.Path) -> dict:
             spec["resource"] = "cpu"
@@ -2294,7 +2578,7 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
 
         interrupter = threading.Thread(target=interrupt_when_ready)
         interrupter.start()
-        with mock.patch.object(
+        with mock.patch.dict(os.environ, {"PATH": fake_path}), mock.patch.object(
             validation_runner, "launch_locked_spec", side_effect=cpu_locked
         ), self.assertRaisesRegex(core.ValidationError, "preserved"):
             runner._execute(stage, scheduled, retry_failed=False)
@@ -2305,11 +2589,15 @@ class RunnerTest(FixtureMixin, unittest.TestCase):
         attempts = runner.state["runs"][run_id]
         self.assertEqual([item["status"] for item in attempts], ["failed"])
         self.assertTrue(attempts[0]["launcher"]["interrupted"])
+        self.assertEqual(
+            attempts[0]["attempt_evidence"]["sha256"],
+            file_sha256(pathlib.Path(attempts[0]["attempt_evidence"]["path"])),
+        )
         with self.assertRaisesRegex(core.ValidationError, "--retry-failed"):
             runner._execute(stage, scheduled, retry_failed=False)
 
         allow.write_text("go", encoding="utf-8")
-        with mock.patch.object(
+        with mock.patch.dict(os.environ, {"PATH": fake_path}), mock.patch.object(
             validation_runner, "launch_locked_spec", side_effect=cpu_locked
         ):
             retried = runner._execute(stage, scheduled, retry_failed=True)

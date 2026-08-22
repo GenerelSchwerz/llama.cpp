@@ -184,6 +184,10 @@ def _profile_one(
             "schema_version": 1,
             "run_id": f"profile--{stage['id']}--nsys-discovery",
             "attempt": 1,
+            "study_identity": {
+                "manifest_sha256": manifest_sha,
+                "provenance_identity_fingerprint": provenance["identity_fingerprint"],
+            },
             "resource": "gpu",
             "argv": nsys_argv,
             "environment": environment,
@@ -290,6 +294,10 @@ def _profile_one(
             "schema_version": 1,
             "run_id": f"profile--{stage['id']}--filtered-ncu",
             "attempt": 1,
+            "study_identity": {
+                "manifest_sha256": manifest_sha,
+                "provenance_identity_fingerprint": provenance["identity_fingerprint"],
+            },
             "resource": "gpu",
             "argv": command,
             "environment": environment,

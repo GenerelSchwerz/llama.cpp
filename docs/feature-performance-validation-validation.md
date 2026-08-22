@@ -392,3 +392,93 @@ attribution, per-phase device high-water, and allocation backtraces remain
 bounded follow-ups. Persistent `nvidia-smi` process VRAM and `/proc` ordinary
 host memory remain separate telemetry; CUDA events labelled Pinned are not
 relabeled as total process pinned memory and are never inferred from VmLck.
+
+## Parent-interrupt and incomplete-attempt correction
+
+The store-stage-pool validation reproduced two defects in the c2-era toolkit.
+First, the outer runner forwarded SIGINT to the complete `flock` wrapper group.
+Because the direct target intentionally has its own session, the lock holder
+could exit before the internal executor finished terminating that target group;
+a `llama-bench` descendant could therefore survive under PID 1 after the GPU
+lock was released. Second, an interruption after `attempt-01` was created but
+before its result reached `state.json` made retry recompute attempt 1 from the
+state-list length and fail on the existing directory.
+
+The correction keeps the lock wrapper alive during catchable parent SIGINT or
+SIGTERM. The internal executor writes an atomic ownership record before target
+creation, including its PID/start time and then the direct target PGID. The
+outer runner forwards one SIGINT only to that identified executor and absorbs
+further parent signals while cleanup runs. The existing process-group cleanup
+remains authoritative: it waits after SIGTERM, escalates to SIGKILL for a
+remaining descendant, reaps the direct child, stops telemetry, and persists the
+failed result before returning through `flock`. A bounded outer fallback uses
+the same target PGID before it terminates an unresponsive wrapper. The common
+launcher supplies the ownership path, so manifest, NSYS, and NCU locked
+lifecycles share this behavior.
+
+Resume now reconciles disk attempt numbers with state. Every unindexed attempt
+is preserved as failed and non-metric; even an existing child result labelled
+success is retained only as non-counted evidence. A normal recovery writes
+`interrupted-result.json`. An attempt already sealed immediately before state
+persistence instead keeps that seal immutable and binds the recovery through
+`state.json`. The `attempt-evidence.json` seal hashes every preserved artifact
+and binds the inventory to the run/attempt, manifest SHA-256, and provenance
+identity fingerprint. Existing failed attempts receive and verify the same
+seal. A live recorded owner prevents recovery, seal tampering fails closed, and
+retry uses one more than the highest state or disk attempt, preserving repeated
+interruptions without overwrite or reuse.
+
+Focused real-signal and resume validation used:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error \
+  python3 scripts/test-feature-validation.py -v \
+  RunnerTest.test_parent_interrupt_holds_wrapper_until_descendant_is_reaped \
+  RunnerTest.test_outer_launcher_real_sigint_persists_state_and_retry_semantics \
+  RunnerTest.test_real_sigint_reaps_target_group_and_preserves_failure \
+  RunnerTest.test_incomplete_attempt_is_sealed_and_retry_uses_next_number \
+  RunnerTest.test_incomplete_attempt_with_live_owner_is_not_recycled \
+  RunnerTest.test_noncanonical_incomplete_attempt_name_fails_closed \
+  RunnerTest.test_repeated_incomplete_attempts_are_preserved_before_attempt_three \
+  RunnerTest.test_preserved_incomplete_attempt_tamper_fails_closed \
+  RunnerTest.test_unindexed_success_result_is_preserved_but_never_counted \
+  RunnerTest.test_unindexed_presealed_failure_recovers_without_mutating_seal
+```
+
+Result: 10 tests passed in 1.845 seconds. The parent-interrupt test sends real
+SIGTERM and SIGINT, launches a real descendant that ignores SIGTERM, observes
+SIGKILL escalation, checks that no target PID remains when the fake lock holder
+records release, and verifies cleanup-state persistence. The fake `flock`
+accepts the exact `LOCK -c COMMAND` form and executes the safely quoted command,
+but does not acquire `/tmp/beellama-single-gpu.lock` or access a GPU.
+
+The complete warning-strict CPU suite used:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error \
+  python3 scripts/test-feature-validation.py -v
+```
+
+Result: 103 tests passed in 12.002 seconds. No warning was emitted, and a final
+process inspection found no surviving fake target, descendant, launcher, or
+sampler. Static checks also passed:
+
+```bash
+git diff --check
+PYTHONDONTWRITEBYTECODE=1 PYTHONWARNINGS=error python3 -m py_compile \
+  scripts/feature_validation/*.py \
+  scripts/feature-performance-validation.py \
+  scripts/test-feature-validation.py
+python3 -m json.tool scripts/feature_validation/manifest.schema.json >/dev/null
+for manifest in examples/feature-performance-validation/*.json; do
+  python3 -m json.tool "$manifest" >/dev/null
+done
+```
+
+This was CPU-only toolkit validation: no CUDA build, real GPU command, NSYS/NCU
+capture, or production source change occurred. Userspace cannot guarantee
+cleanup after SIGKILL to the complete wrapper/executor group, kernel failure,
+host reset, or power loss. Resume therefore refuses to recycle a still-live
+owned group; after a parent-only SIGKILL, the separately sessioned lock owner
+continues its finite target lifecycle and the unindexed attempt is later
+recovered conservatively as failed.

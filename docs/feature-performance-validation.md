@@ -224,14 +224,37 @@ or incomplete attempt is retained and stops the study. It is never dropped or
 overwritten. After correcting an external prerequisite, an explicit
 `--retry-failed` creates the next numbered attempt:
 
-If the user interrupts an active run, the outer launcher forwards the interrupt
-to its isolated wrapper group and waits for the internal executor to persist the
-attempt. The executor tracks the direct target's process-group ID independently
-of its leader, waits for the whole group to disappear, escalates from SIGTERM to
-SIGKILL when descendants remain, always reaps the direct child, and then stops
-telemetry. Cleanup errors are recorded without discarding telemetry or the
-result. The attempt is failed in `state.json` and is never resumable as
-successful evidence; a later attempt still requires `--resume --retry-failed`.
+For every new process, the internal executor atomically records its PID plus
+Linux process start time before telemetry or target creation, then records the
+direct target's process-group ID. The outer launcher installs SIGINT and SIGTERM
+handlers before starting `flock`. On parent interruption it signals only that
+identified executor—not the whole wrapper group—so `flock` continues to hold
+the GPU lock while the executor cleans up. Repeated parent signals are recorded
+but do not interrupt cleanup again. The executor tracks the target group after
+leader exit, escalates from SIGTERM to SIGKILL while descendants remain, reaps
+the direct child, stops telemetry, records the failed result, and only then
+exits the locked lifecycle. A bounded outer fallback uses the same recorded
+target group before terminating an unresponsive wrapper.
+
+On resume, the runner reconciles `state.json` with every numbered attempt
+directory for the scheduled run. A directory with no state entry is never
+reused, even when it contains a child `result.json` reporting success. Once no
+recorded executor or target group remains, the runner records a failed recovery
+with no metric and seals every preserved file in `attempt-evidence.json`.
+Normally the recovery is also written as `interrupted-result.json`. If the
+attempt was already sealed immediately before the parent died, its immutable
+seal is verified and retained while the recovery record lives in `state.json`,
+rather than adding a file that would invalidate that seal. The seal binds the
+file inventory and its SHA-256s to the run/attempt, manifest SHA-256, and
+provenance identity fingerprint. Tampering fails closed. The next retry is
+numbered above the highest attempt in state or on disk, so repeated
+interruptions preserve attempts 1, 2, and so on. If an ownership record still
+identifies a live process, resume refuses to recycle or seal that directory and
+asks the user to retry later.
+
+Cleanup errors are recorded without discarding telemetry or the result. The
+attempt is failed in `state.json` and is never resumable as successful evidence;
+a later attempt still requires `--resume --retry-failed`.
 
 ```bash
 python3 scripts/feature-performance-validation.py run \
@@ -241,6 +264,15 @@ python3 scripts/feature-performance-validation.py run \
 Do not delete a failed attempt to make a report look complete. If the manifest
 or any provenance identity changes, start a new deterministic study rather
 than combining unlike runs.
+
+Catchable parent SIGINT/SIGTERM and normal timeout/error paths have the complete
+ownership contract above. No userspace runner can guarantee cleanup after
+SIGKILL to the entire wrapper/executor group, kernel failure, host reset, or
+power loss. After such an event, resume remains fail-closed while a recorded
+process group is live; inspect it and the GPU lock before retrying. A parent-only
+SIGKILL does not release the separately sessioned wrapper: the lock-owning
+executor continues its finite target lifecycle, and the resulting unindexed
+directory is conservatively recovered as failed afterward.
 
 ## Statistics
 
@@ -507,8 +539,11 @@ and statistics core, clean-process runner, telemetry owner, and profiler
 parser/planner. The merge-readiness pass removed duplicate provenance-spec and
 GPU-lock launch implementations and removed the legacy single-executable
 manifest shape; the JSON schema and runtime now use the same executable-role
-contract. The remaining roughly 3.5k standard-library Python lines are mostly
-fail-closed validation, artifact inventory, lifecycle cleanup, and parsers with
-separate tests. There is no copied CUDA framework or project build dependency.
+contract. The remaining standard-library Python is mostly fail-closed
+validation, artifact inventory, lifecycle cleanup, and parsers with separate
+tests. Interrupt ownership and attempt reconciliation remain in the runner
+because they extend its existing process/state contract and share its cleanup
+and provenance primitives; they do not add a parallel supervisor or artifact
+framework. There is no copied CUDA framework or project build dependency.
 Further code should enter a new module only when it has an independent
 lifecycle or artifact contract, rather than growing another parallel runner.

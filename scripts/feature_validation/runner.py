@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import sys
@@ -39,18 +40,89 @@ def _process_group_exists(pgid: int) -> bool:
 
 
 def _wait_for_group_disappearance(
-    process: subprocess.Popen[Any], pgid: int, timeout: float
+    pgid: int,
+    timeout: float,
+    process: subprocess.Popen[Any] | None = None,
 ) -> bool:
     deadline = time.monotonic() + timeout
     while True:
         # poll() also reaps an exited direct child so its zombie cannot keep the
         # process group observable while descendants are being checked.
-        process.poll()
+        if process is not None:
+            process.poll()
         if not _process_group_exists(pgid):
             return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
+
+
+def _terminate_process_group(
+    pgid: int,
+    *,
+    process: subprocess.Popen[Any] | None = None,
+    term_timeout: float = 3.0,
+    kill_timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Terminate an entire tracked group, including descendants after leader exit."""
+    report: dict[str, Any] = {
+        "pgid": pgid,
+        "term_sent": False,
+        "kill_sent": False,
+        "group_gone": False,
+        "errors": [],
+    }
+    if pgid == os.getpgrp():
+        report["errors"].append("refusing to signal the executor's own process group")
+        return report
+    try:
+        group_exists = _process_group_exists(pgid)
+    except (Exception, KeyboardInterrupt) as caught:
+        group_exists = True
+        report["errors"].append(
+            f"process-group existence check: {type(caught).__name__}: {caught}"
+        )
+    if group_exists:
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            report["term_sent"] = True
+        except ProcessLookupError:
+            pass
+        except (Exception, KeyboardInterrupt) as caught:
+            report["errors"].append(
+                f"process-group SIGTERM: {type(caught).__name__}: {caught}"
+            )
+        try:
+            report["group_gone"] = _wait_for_group_disappearance(
+                pgid, term_timeout, process
+            )
+        except (Exception, KeyboardInterrupt) as caught:
+            report["errors"].append(
+                f"process-group TERM wait: {type(caught).__name__}: {caught}"
+            )
+    else:
+        report["group_gone"] = True
+    if not report["group_gone"]:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+            report["kill_sent"] = True
+        except ProcessLookupError:
+            pass
+        except (Exception, KeyboardInterrupt) as caught:
+            report["errors"].append(
+                f"process-group SIGKILL: {type(caught).__name__}: {caught}"
+            )
+        try:
+            report["group_gone"] = _wait_for_group_disappearance(
+                pgid, kill_timeout, process
+            )
+        except (Exception, KeyboardInterrupt) as caught:
+            report["errors"].append(
+                f"process-group KILL wait: {type(caught).__name__}: {caught}"
+            )
+    if not report["group_gone"]:
+        report["errors"].append(f"process group {pgid} remained after SIGKILL")
+    return report
 
 
 def _cleanup_process_group(
@@ -67,64 +139,13 @@ def _cleanup_process_group(
     escalation.  Cleanup failures are returned as evidence instead of raised so
     callers can still stop telemetry and serialize the attempt result.
     """
-    report: dict[str, Any] = {
-        "pgid": pgid,
-        "term_sent": False,
-        "kill_sent": False,
-        "group_gone": False,
-        "leader_reaped": False,
-        "errors": [],
-    }
-    if pgid == os.getpgrp():
-        report["errors"].append("refusing to signal the executor's own process group")
-    else:
-        try:
-            group_exists = _process_group_exists(pgid)
-        except (Exception, KeyboardInterrupt) as caught:
-            group_exists = True
-            report["errors"].append(
-                f"process-group existence check: {type(caught).__name__}: {caught}"
-            )
-        if group_exists:
-            try:
-                os.killpg(pgid, signal.SIGTERM)
-                report["term_sent"] = True
-            except ProcessLookupError:
-                pass
-            except (Exception, KeyboardInterrupt) as caught:
-                report["errors"].append(
-                    f"process-group SIGTERM: {type(caught).__name__}: {caught}"
-                )
-            try:
-                report["group_gone"] = _wait_for_group_disappearance(
-                    process, pgid, term_timeout
-                )
-            except (Exception, KeyboardInterrupt) as caught:
-                report["errors"].append(
-                    f"process-group TERM wait: {type(caught).__name__}: {caught}"
-                )
-        else:
-            report["group_gone"] = True
-        if not report["group_gone"]:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-                report["kill_sent"] = True
-            except ProcessLookupError:
-                pass
-            except (Exception, KeyboardInterrupt) as caught:
-                report["errors"].append(
-                    f"process-group SIGKILL: {type(caught).__name__}: {caught}"
-                )
-            try:
-                report["group_gone"] = _wait_for_group_disappearance(
-                    process, pgid, kill_timeout
-                )
-            except (Exception, KeyboardInterrupt) as caught:
-                report["errors"].append(
-                    f"process-group KILL wait: {type(caught).__name__}: {caught}"
-                )
-        if not report["group_gone"]:
-            report["errors"].append(f"process group {pgid} remained after SIGKILL")
+    report = _terminate_process_group(
+        pgid,
+        process=process,
+        term_timeout=term_timeout,
+        kill_timeout=kill_timeout,
+    )
+    report["leader_reaped"] = False
 
     try:
         if process.poll() is None:
@@ -135,6 +156,65 @@ def _cleanup_process_group(
     except (Exception, KeyboardInterrupt) as caught:
         report["errors"].append(f"leader reap: {type(caught).__name__}: {caught}")
     return report
+
+
+def _process_identity(pid: int) -> dict[str, int | None]:
+    """Return a PID plus Linux start ticks so stale ownership cannot hit PID reuse."""
+    start_ticks: int | None = None
+    stat_path = pathlib.Path(f"/proc/{pid}/stat")
+    try:
+        raw = stat_path.read_text(encoding="utf-8")
+        closing = raw.rfind(")")
+        fields = raw[closing + 2 :].split()
+        start_ticks = int(fields[19])
+    except (OSError, ValueError, IndexError):
+        pass
+    return {"pid": pid, "start_time_ticks": start_ticks}
+
+
+def _process_identity_is_live(identity: dict[str, Any] | None) -> bool:
+    if not identity:
+        return False
+    pid = int(identity["pid"])
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    expected = identity.get("start_time_ticks")
+    return expected is None or _process_identity(pid).get("start_time_ticks") == expected
+
+
+def _lifecycle_path(spec: dict[str, Any]) -> pathlib.Path | None:
+    value = spec.get("lifecycle_path")
+    if value is None:
+        return None
+    path = pathlib.Path(str(value)).resolve()
+    result_parent = pathlib.Path(spec["result_path"]).resolve().parent
+    if path.parent != result_parent:
+        raise core.ValidationError("lifecycle ownership record must stay in the attempt directory")
+    return path
+
+
+def _write_lifecycle(path: pathlib.Path | None, lifecycle: dict[str, Any]) -> None:
+    if path is None:
+        return
+    lifecycle["updated_utc"] = core.utc_now()
+    core.write_json_atomic(path, lifecycle)
+
+
+def _read_lifecycle(spec: dict[str, Any]) -> dict[str, Any] | None:
+    path = _lifecycle_path(spec)
+    if path is None or not path.is_file():
+        return None
+    lifecycle = json.loads(path.read_text(encoding="utf-8"))
+    if lifecycle.get("run_id") != spec["run_id"] or lifecycle.get("attempt") != spec["attempt"]:
+        raise core.ValidationError("lifecycle ownership record does not match this attempt")
+    expected_identity = spec.get("study_identity")
+    if expected_identity is not None and lifecycle.get("study_identity") != expected_identity:
+        raise core.ProvenanceError("lifecycle ownership provenance does not match this study")
+    return lifecycle
 
 
 def _append_error(error: str | None, label: str, caught: BaseException | str) -> str:
@@ -211,7 +291,20 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
     cleanup_seconds: float | None = None
     process_group_id: int | None = None
     process_group_cleanup: dict[str, Any] | None = None
+    lifecycle_path: pathlib.Path | None = None
+    lifecycle: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": spec["run_id"],
+        "attempt": spec["attempt"],
+        "study_identity": spec.get("study_identity"),
+        "executor": _process_identity(os.getpid()),
+        "target": None,
+        "state": "executor_started",
+        "created_utc": core.utc_now(),
+    }
     try:
+        lifecycle_path = _lifecycle_path(spec)
+        _write_lifecycle(lifecycle_path, lifecycle)
         phase_start = time.monotonic()
         _verify_spec_identity(spec)
         identity_seconds = time.monotonic() - phase_start
@@ -232,6 +325,12 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         # start_new_session makes the direct target the leader of a new process
         # group.  Keep this identity even if that leader exits before cleanup.
         process_group_id = process.pid
+        lifecycle["target"] = {
+            **_process_identity(process.pid),
+            "process_group_id": process_group_id,
+        }
+        lifecycle["state"] = "target_running"
+        _write_lifecycle(lifecycle_path, lifecycle)
         telemetry.attach(process.pid)
         print(
             f"[feature-validation] started run={spec['run_id']} pid={process.pid} "
@@ -318,6 +417,13 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
             telemetry_report = telemetry.stop()
         except (Exception, KeyboardInterrupt) as caught:
             error = _append_error(error, "telemetry cleanup", caught)
+        lifecycle["state"] = "cleanup_complete"
+        lifecycle["process_group_cleanup"] = process_group_cleanup
+        lifecycle["telemetry_stopped"] = telemetry_report is not None
+        try:
+            _write_lifecycle(lifecycle_path, lifecycle)
+        except (Exception, KeyboardInterrupt) as caught:
+            error = _append_error(error, "lifecycle cleanup record", caught)
         cleanup_seconds = time.monotonic() - cleanup_started
     stdout = b"".join(stdout_chunks)
     stderr = b"".join(stderr_chunks)
@@ -342,6 +448,7 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
         "run_id": spec["run_id"],
         "status": status,
         "attempt": spec["attempt"],
+        "study_identity": spec.get("study_identity"),
         "schedule": spec.get("schedule"),
         "started_utc": started,
         "finished_utc": core.utc_now(),
@@ -417,62 +524,142 @@ def execute_run_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
 def _run_launcher_with_interrupt_forwarding(
     wrapper: list[str], spec: dict[str, Any]
-) -> tuple[int | None, bool, dict[str, Any] | None, list[str]]:
-    """Run an isolated wrapper and forward outer SIGINT to its whole group."""
-    process = subprocess.Popen(wrapper, start_new_session=True)
-    pgid = process.pid
+) -> tuple[
+    int | None,
+    bool,
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    list[str],
+    list[str],
+]:
+    """Keep flock alive while an identified executor cleans its target group."""
     interrupted = False
+    forwarded = False
     errors: list[str] = []
-    while process.poll() is None:
-        try:
-            process.wait(timeout=0.1)
-        except subprocess.TimeoutExpired:
-            continue
-        except KeyboardInterrupt:
-            interrupted = True
-            try:
-                os.killpg(pgid, signal.SIGINT)
-            except ProcessLookupError:
-                pass
-            except Exception as caught:
-                errors.append(f"SIGINT forward: {type(caught).__name__}: {caught}")
+    interrupt_signals: list[str] = []
+    pending_signals: list[int] = []
+    old_handlers: dict[int, Any] = {}
+    can_install_handlers = threading.current_thread() is threading.main_thread()
+
+    def capture_interrupt(signum: int, _frame: Any) -> None:
+        pending_signals.append(signum)
+
+    if can_install_handlers:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            old_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, capture_interrupt)
+
+    try:
+        process = subprocess.Popen(wrapper, start_new_session=True)
+    except BaseException:
+        if can_install_handlers:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
+        raise
+    pgid = process.pid
 
     cleanup: dict[str, Any] | None = None
-    if interrupted:
-        # flock may exit before the internal executor finishes recording its
-        # interrupted target.  Give that executor its own TERM/KILL cleanup
-        # window, then force down any remaining launcher descendants.
-        grace = (
-            float(spec.get("cleanup_term_timeout_seconds", 3.0))
-            + float(spec.get("cleanup_kill_timeout_seconds", 3.0))
-            + 2.0
-        )
-        try:
-            group_gone = _wait_for_group_disappearance(process, pgid, grace)
-        except KeyboardInterrupt:
+    owned_target_cleanup: dict[str, Any] | None = None
+    interruption_deadline: float | None = None
+    try:
+        while process.poll() is None:
             try:
-                os.killpg(pgid, signal.SIGINT)
-            except ProcessLookupError:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
                 pass
-            except Exception as caught:
-                errors.append(f"repeated SIGINT forward: {type(caught).__name__}: {caught}")
-            group_gone = False
-        except Exception as caught:
-            errors.append(f"launcher group wait: {type(caught).__name__}: {caught}")
-            group_gone = False
-        if not group_gone:
-            cleanup = _cleanup_process_group(
-                process,
-                pgid,
-                term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
-                kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
-            )
-            errors.extend(str(item) for item in cleanup["errors"])
+            except KeyboardInterrupt:
+                pending_signals.append(signal.SIGINT)
+
+            if pending_signals:
+                interrupted = True
+                interrupt_signals.extend(signal.Signals(item).name for item in pending_signals)
+                pending_signals.clear()
+            if interrupted and not forwarded:
+                # The lifecycle record is written before telemetry or target
+                # creation.  Wait briefly for an executor that has just crossed
+                # the flock boundary; if no record appears, the wrapper is only
+                # waiting for the lock and is safe to cancel as a group.
+                owner_deadline = time.monotonic() + 0.5
+                lifecycle = _read_lifecycle(spec)
+                while lifecycle is None and process.poll() is None and time.monotonic() < owner_deadline:
+                    time.sleep(0.02)
+                    lifecycle = _read_lifecycle(spec)
+                if lifecycle is None:
+                    cleanup = _cleanup_process_group(
+                        process,
+                        pgid,
+                        term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
+                        kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
+                    )
+                    errors.extend(str(item) for item in cleanup["errors"])
+                else:
+                    executor = lifecycle.get("executor")
+                    if not _process_identity_is_live(executor):
+                        errors.append("owned executor disappeared before interrupt forwarding")
+                    else:
+                        try:
+                            os.kill(int(executor["pid"]), signal.SIGINT)
+                        except ProcessLookupError:
+                            errors.append("owned executor disappeared during interrupt forwarding")
+                        except Exception as caught:
+                            errors.append(
+                                f"executor SIGINT forward: {type(caught).__name__}: {caught}"
+                            )
+                forwarded = True
+                interruption_deadline = time.monotonic() + (
+                    float(spec.get("cleanup_term_timeout_seconds", 3.0))
+                    + float(spec.get("cleanup_kill_timeout_seconds", 3.0))
+                    + 5.0
+                )
+            if (
+                interrupted
+                and process.poll() is None
+                and interruption_deadline is not None
+                and time.monotonic() >= interruption_deadline
+            ):
+                # The normal path leaves the lock-owning wrapper untouched until
+                # the executor has reaped its target.  If that executor stalls,
+                # use its provenance-bound target PGID as the final fallback,
+                # then tear down the wrapper only after the target group is gone.
+                lifecycle = _read_lifecycle(spec)
+                target = lifecycle.get("target") if lifecycle else None
+                if target and target.get("process_group_id") is not None:
+                    owned_target_cleanup = _terminate_process_group(
+                        int(target["process_group_id"]),
+                        term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
+                        kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
+                    )
+                    errors.extend(
+                        f"owned target cleanup: {item}"
+                        for item in owned_target_cleanup["errors"]
+                    )
+                cleanup = _cleanup_process_group(
+                    process,
+                    pgid,
+                    term_timeout=float(spec.get("cleanup_term_timeout_seconds", 3.0)),
+                    kill_timeout=float(spec.get("cleanup_kill_timeout_seconds", 3.0)),
+                )
+                errors.extend(str(item) for item in cleanup["errors"])
+    finally:
+        if pending_signals:
+            interrupted = True
+            interrupt_signals.extend(signal.Signals(item).name for item in pending_signals)
+            pending_signals.clear()
+        if can_install_handlers:
+            for signum, handler in old_handlers.items():
+                signal.signal(signum, handler)
     try:
         process.wait(timeout=0)
     except Exception as caught:
         errors.append(f"launcher reap: {type(caught).__name__}: {caught}")
-    return process.returncode, interrupted, cleanup, errors
+    return (
+        process.returncode,
+        interrupted,
+        cleanup,
+        owned_target_cleanup,
+        errors,
+        interrupt_signals,
+    )
 
 
 def launch_locked_spec(
@@ -480,6 +667,10 @@ def launch_locked_spec(
 ) -> dict[str, Any]:
     """Launch one internal lifecycle under the required whole-command GPU lock."""
     result_path = pathlib.Path(spec["result_path"])
+    spec.setdefault(
+        "lifecycle_path",
+        str(result_path.with_name(f"{result_path.stem}-lifecycle-owner.json")),
+    )
     if spec_path.exists() or result_path.exists():
         raise core.ValidationError(
             f"refusing to overwrite an existing attempt: {spec_path} / {result_path}"
@@ -495,7 +686,14 @@ def launch_locked_spec(
     spec["launcher_requested_monotonic"] = time.monotonic()
     core.write_json_atomic(spec_path, spec)
     print(f"[feature-validation] launch {core.quote_argv(wrapper)}", flush=True)
-    returncode, interrupted, launcher_cleanup, launcher_errors = (
+    (
+        returncode,
+        interrupted,
+        launcher_cleanup,
+        owned_target_cleanup,
+        launcher_errors,
+        interrupt_signals,
+    ) = (
         _run_launcher_with_interrupt_forwarding(wrapper, spec)
     )
     if result_path.is_file():
@@ -509,13 +707,17 @@ def launch_locked_spec(
         result["launcher"] = {
             "returncode": returncode,
             "interrupted": interrupted,
+            "interrupt_signals": interrupt_signals,
             "process_group_cleanup": launcher_cleanup,
+            "owned_target_fallback_cleanup": owned_target_cleanup,
             "errors": launcher_errors,
         }
         if interrupted:
             result["status"] = "failed"
             result["error"] = _append_error(
-                result.get("error"), "outer launcher", "KeyboardInterrupt"
+                result.get("error"),
+                "outer launcher",
+                "parent interruption (" + ", ".join(interrupt_signals or ["SIGINT"]) + ")",
             )
         for launcher_error in launcher_errors:
             result["status"] = "failed"
@@ -529,7 +731,7 @@ def launch_locked_spec(
         "attempt": spec["attempt"],
         "status": "failed",
         "error": (
-            "outer launcher KeyboardInterrupt produced no internal result"
+            "outer launcher parent interruption produced no internal result"
             if interrupted
             else f"flock/internal executor returned {returncode} without result"
         ),
@@ -537,12 +739,66 @@ def launch_locked_spec(
         "launcher": {
             "returncode": returncode,
             "interrupted": interrupted,
+            "interrupt_signals": interrupt_signals,
             "process_group_cleanup": launcher_cleanup,
+            "owned_target_fallback_cleanup": owned_target_cleanup,
             "errors": launcher_errors,
         },
     }
     core.write_json_atomic(result_path, result)
     return result
+
+
+_ATTEMPT_DIRECTORY = re.compile(r"attempt-([0-9]+)")
+_ATTEMPT_EVIDENCE_NAME = "attempt-evidence.json"
+_RECOVERED_RESULT_NAME = "interrupted-result.json"
+
+
+def _attempt_file_inventory(attempt_root: pathlib.Path) -> list[dict[str, Any]]:
+    """Hash every preserved attempt artifact except the self-referential seal."""
+    inventory: list[dict[str, Any]] = []
+    for path in sorted(
+        attempt_root.rglob("*"), key=lambda item: str(item.relative_to(attempt_root))
+    ):
+        relative = str(path.relative_to(attempt_root))
+        if relative == _ATTEMPT_EVIDENCE_NAME or path.is_dir():
+            continue
+        if path.is_symlink():
+            target = os.fsencode(os.readlink(path))
+            inventory.append(
+                {
+                    "path": relative,
+                    "kind": "symlink",
+                    "sha256": hashlib.sha256(target).hexdigest(),
+                }
+            )
+            continue
+        if not path.is_file():
+            raise core.ValidationError(
+                f"attempt evidence contains unsupported non-file artifact: {path}"
+            )
+        before = core.stat_identity(path)
+        digest = core.sha256_file(path)
+        after = core.stat_identity(path)
+        if before != after:
+            raise core.ValidationError(f"attempt artifact changed while being sealed: {path}")
+        inventory.append(
+            {
+                "path": relative,
+                "kind": "file",
+                "sha256": digest,
+                **after,
+            }
+        )
+    return inventory
+
+
+def _attempt_evidence_reference(path: pathlib.Path) -> dict[str, Any]:
+    return {
+        "path": str(path),
+        "sha256": core.sha256_file(path),
+        "kind": "failed_or_interrupted_attempt_seal",
+    }
 
 
 class StudyRunner:
@@ -600,6 +856,246 @@ class StudyRunner:
         self.state["updated_utc"] = core.utc_now()
         core.write_json_atomic(self.state_path, self.state)
 
+    def _study_identity(self) -> dict[str, str]:
+        assert self.provenance is not None
+        return {
+            "manifest_sha256": self.manifest_sha256,
+            "provenance_identity_fingerprint": self.provenance["identity_fingerprint"],
+        }
+
+    def _seal_failed_attempt(
+        self,
+        run_root: pathlib.Path,
+        run_id: str,
+        attempt: int,
+    ) -> dict[str, Any]:
+        evidence_path = run_root / _ATTEMPT_EVIDENCE_NAME
+        if evidence_path.exists():
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            if (
+                evidence.get("run_id") != run_id
+                or evidence.get("attempt") != attempt
+                or evidence.get("study_identity") != self._study_identity()
+                or pathlib.Path(str(evidence.get("artifact_directory", ""))).resolve()
+                != run_root.resolve()
+            ):
+                raise core.ProvenanceError(
+                    f"failed-attempt evidence identity mismatch: {evidence_path}"
+                )
+            observed_inventory = _attempt_file_inventory(run_root)
+            if (
+                evidence.get("inventory_sha256")
+                != core.canonical_sha256(observed_inventory)
+                or evidence.get("files") != observed_inventory
+            ):
+                raise core.ProvenanceError(
+                    f"preserved failed-attempt evidence changed: {run_root}"
+                )
+            return _attempt_evidence_reference(evidence_path)
+
+        inventory = _attempt_file_inventory(run_root)
+        evidence = {
+            "schema_version": 1,
+            "kind": "failed_or_interrupted_attempt_evidence",
+            "run_id": run_id,
+            "attempt": attempt,
+            "artifact_directory": str(run_root.resolve()),
+            "study_identity": self._study_identity(),
+            "sealed_utc": core.utc_now(),
+            "files": inventory,
+            "inventory_sha256": core.canonical_sha256(inventory),
+        }
+        core.write_json_atomic(evidence_path, evidence)
+        return _attempt_evidence_reference(evidence_path)
+
+    def _assert_incomplete_attempt_inactive(self, run_root: pathlib.Path) -> None:
+        lifecycle_path = run_root / "lifecycle-owner.json"
+        if not lifecycle_path.is_file():
+            return
+        try:
+            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise core.ProvenanceError(
+                f"cannot establish ownership of incomplete attempt {run_root}: {error}"
+            ) from error
+        identity = lifecycle.get("study_identity")
+        if identity is not None and identity != self._study_identity():
+            raise core.ProvenanceError(
+                f"incomplete attempt lifecycle provenance mismatch: {lifecycle_path}"
+            )
+        if _process_identity_is_live(lifecycle.get("executor")):
+            raise core.ValidationError(
+                f"incomplete attempt still has a live owned executor; retry later: {run_root}"
+            )
+        target = lifecycle.get("target")
+        if target and _process_group_exists(int(target["process_group_id"])):
+            raise core.ValidationError(
+                f"incomplete attempt still has a live owned target group; retry later: {run_root}"
+            )
+
+    def _recover_incomplete_attempt(
+        self,
+        run_root: pathlib.Path,
+        run_id: str,
+        attempt: int,
+        scheduled: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._assert_incomplete_attempt_inactive(run_root)
+        preexisting_evidence: dict[str, Any] | None = None
+        if (run_root / _ATTEMPT_EVIDENCE_NAME).is_file():
+            preexisting_evidence = self._seal_failed_attempt(
+                run_root, run_id, attempt
+            )
+        spec_path = run_root / "run-spec.json"
+        preserved_spec: dict[str, Any] | None = None
+        if spec_path.is_file():
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            if spec.get("run_id") != run_id or spec.get("attempt") != attempt:
+                raise core.ProvenanceError(
+                    f"incomplete run spec does not match its deterministic directory: {spec_path}"
+                )
+            spec_identity = spec.get("study_identity")
+            if spec_identity is not None and spec_identity != self._study_identity():
+                raise core.ProvenanceError(
+                    f"incomplete run spec provenance mismatch: {spec_path}"
+                )
+            preserved_spec = {
+                "path": str(spec_path),
+                "sha256": core.sha256_file(spec_path),
+                "study_identity_present": spec_identity is not None,
+            }
+
+        child_result_path = run_root / "result.json"
+        preserved_child_result: dict[str, Any] | None = None
+        if child_result_path.is_file():
+            child_result = json.loads(child_result_path.read_text(encoding="utf-8"))
+            if (
+                child_result.get("run_id") != run_id
+                or child_result.get("attempt") != attempt
+            ):
+                raise core.ProvenanceError(
+                    "unindexed child result does not match its deterministic directory: "
+                    f"{child_result_path}"
+                )
+            preserved_child_result = {
+                "path": str(child_result_path),
+                "sha256": core.sha256_file(child_result_path),
+                "reported_status": child_result.get("status"),
+                "metric_disposition": "preserved_not_counted",
+            }
+
+        recovered_path = run_root / _RECOVERED_RESULT_NAME
+        if recovered_path.exists():
+            recovered = json.loads(recovered_path.read_text(encoding="utf-8"))
+            if (
+                recovered.get("run_id") != run_id
+                or recovered.get("attempt") != attempt
+                or recovered.get("study_identity") != self._study_identity()
+                or recovered.get("status") != "failed"
+            ):
+                raise core.ProvenanceError(
+                    f"recovered interruption record identity mismatch: {recovered_path}"
+                )
+        else:
+            recovered = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "attempt": attempt,
+                "schedule": scheduled,
+                "status": "failed",
+                "error": (
+                    "recovered an unindexed attempt directory after parent interruption; "
+                    "all artifacts are preserved and no metric is counted"
+                ),
+                "recovered_utc": core.utc_now(),
+                "study_identity": self._study_identity(),
+                "artifact_directory": str(run_root.resolve()),
+                "preserved_run_spec": preserved_spec,
+                "preserved_child_result": preserved_child_result,
+                "metric_disposition": "not_counted_interrupted_attempt",
+            }
+            if preexisting_evidence is None:
+                core.write_json_atomic(recovered_path, recovered)
+            else:
+                recovered["recovery_record"] = (
+                    "state_only_to_preserve_preexisting_immutable_attempt_seal"
+                )
+        recovered["attempt_evidence"] = (
+            preexisting_evidence
+            or self._seal_failed_attempt(run_root, run_id, attempt)
+        )
+        return recovered
+
+    def _reconcile_attempts(
+        self,
+        stage: dict[str, Any],
+        scheduled: dict[str, Any],
+        run_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        assert self.state is not None
+        run_base = self.study_root / "runs" / stage["id"] / scheduled["run_id"]
+        prior = self.state["runs"].get(run_id, [])
+        state_changed = False
+        by_attempt: dict[int, dict[str, Any]] = {}
+        for record in prior:
+            attempt = int(record.get("attempt", 0))
+            if attempt <= 0 or attempt in by_attempt:
+                raise core.ProvenanceError(f"invalid or duplicate attempt number for {run_id}")
+            by_attempt[attempt] = record
+
+        disk_attempts: dict[int, pathlib.Path] = {}
+        if run_base.is_dir():
+            for child in run_base.iterdir():
+                if not child.is_dir() or not child.name.startswith("attempt-"):
+                    continue
+                match = _ATTEMPT_DIRECTORY.fullmatch(child.name)
+                if match is None:
+                    raise core.ProvenanceError(
+                        f"unrecognized attempt directory cannot be reused: {child}"
+                    )
+                number = int(match.group(1))
+                if child.name != f"attempt-{number:02d}":
+                    raise core.ProvenanceError(
+                        f"noncanonical attempt directory cannot be reused: {child}"
+                    )
+                if number <= 0 or number in disk_attempts:
+                    raise core.ProvenanceError(f"invalid duplicate attempt directory: {child}")
+                disk_attempts[number] = child
+
+        for attempt, record in sorted(by_attempt.items()):
+            run_root = run_base / f"attempt-{attempt:02d}"
+            if disk_attempts.get(attempt) != run_root:
+                raise core.ProvenanceError(
+                    f"state references a missing deterministic attempt directory: {run_root}"
+                )
+            if record.get("status") != "success":
+                reference = self._seal_failed_attempt(run_root, run_id, attempt)
+                existing = record.get("attempt_evidence")
+                if existing is not None and existing != reference:
+                    raise core.ProvenanceError(
+                        f"state failed-attempt evidence reference mismatch: {run_root}"
+                    )
+                if existing is None:
+                    state_changed = True
+                record["attempt_evidence"] = reference
+
+        recovered_any = False
+        for attempt, run_root in sorted(disk_attempts.items()):
+            if attempt in by_attempt:
+                continue
+            recovered = self._recover_incomplete_attempt(
+                run_root, run_id, attempt, scheduled
+            )
+            by_attempt[attempt] = recovered
+            recovered_any = True
+
+        ordered = [by_attempt[number] for number in sorted(by_attempt)]
+        if recovered_any or state_changed or ordered != prior:
+            self.state["runs"][run_id] = ordered
+            self._save_state()
+        highest = max({0, *by_attempt, *disk_attempts})
+        return ordered, highest + 1
+
     def _execute(
         self,
         stage: dict[str, Any],
@@ -609,7 +1105,7 @@ class StudyRunner:
     ) -> dict[str, Any]:
         assert self.state is not None
         run_id = f"{stage['id']}--{scheduled['run_id']}"
-        prior = self.state["runs"].get(run_id, [])
+        prior, attempt = self._reconcile_attempts(stage, scheduled, run_id)
         if prior and prior[-1]["status"] == "success":
             print(f"[feature-validation] resume skip successful run={run_id}", flush=True)
             return prior[-1]
@@ -617,7 +1113,6 @@ class StudyRunner:
             raise core.ValidationError(
                 f"run {run_id} has a preserved failed attempt; use --retry-failed explicitly"
             )
-        attempt = len(prior) + 1
         run_root = self.study_root / "runs" / stage["id"] / scheduled["run_id"] / f"attempt-{attempt:02d}"
         run_root.mkdir(parents=True, exist_ok=False)
         core.validate_artifact_directory_isolation(self.manifest, run_root)
@@ -648,6 +1143,7 @@ class StudyRunner:
             "schema_version": 1,
             "run_id": run_id,
             "attempt": attempt,
+            "study_identity": self._study_identity(),
             "schedule": scheduled,
             "resource": stage["resource"],
             "argv": argv,
@@ -656,6 +1152,7 @@ class StudyRunner:
             "timeout_seconds": float(stage["timeout_seconds"]),
             "progress": stage["progress"],
             "result_path": str(result_path),
+            "lifecycle_path": str(run_root / "lifecycle-owner.json"),
             "stdout_path": str(run_root / "stdout.log"),
             "stderr_path": str(run_root / "stderr.log"),
             "metric": stage.get("metric"),
@@ -682,6 +1179,10 @@ class StudyRunner:
         self.state["runs"][run_id] = prior
         self._save_state()
         if result["status"] != "success":
+            result["attempt_evidence"] = self._seal_failed_attempt(
+                run_root, run_id, attempt
+            )
+            self._save_state()
             raise core.ValidationError(
                 f"run {run_id} attempt {attempt} failed; preserved at {result_path}: {result.get('error')}"
             )
