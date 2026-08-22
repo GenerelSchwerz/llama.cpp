@@ -98,8 +98,9 @@ The published KV base does **not** contain native quantized FlashAttention,
 compact causal masking, or bounded host-KV attention staging. Do not expect
 those later fields or use an associated later option in a current KV-base
 command. Live-context source and its preset/generated argument documentation
-remain owned by this PR 8 branch until it lands. See the evidence index for
-the exact PR identities.
+landed together through PR 8 merge
+`35e179272d510a0d5aefbf8dccb9dcf30fb31556`; see the evidence index for its
+exact pre-merge identities.
 
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or

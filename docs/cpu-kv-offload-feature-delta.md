@@ -8,7 +8,10 @@ compares BeeLlama v0.4.3 at
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`. The retained journal and
 Experiments 001-019 derive from local tip
 `6a20757854395309b32248dd4109d73e99c3e675`; the published base also includes
-the merged W06 perplexity-capacity fix and W02 allocation telemetry.
+the merged W06 perplexity-capacity fix and W02 allocation telemetry. The
+canonical integration line additionally contains the PR 8 live-context
+workspace source and documentation since merge
+`35e179272d510a0d5aefbf8dccb9dcf30fb31556`.
 
 The evidence and limitations for each feature are indexed in
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md). This document
@@ -30,6 +33,7 @@ endpoint are outside this delta.
 | `--spec-draft-ubatch-size N` | Gives a separate model-backed draft context its own physical ubatch. For MTP it must be omitted/inherited or equal to target ubatch. | Inherit |
 | `--spec-mtp-rs-planes N` | Caps total target recurrent planes, including the current plane; zero resolves to full `draft_max + 1`. | Full |
 | `--phase-aware-workspace` / `--no-phase-aware-workspace` | Enables explicit prompt/generation reservation transitions and shared backing for supported sequential target/MTP schedulers. | Off |
+| `--live-context-workspace` / `--no-live-context-workspace` | Bounds supported standard-attention graph reservations by padded live physical KV extent; merged after the core source checkpoint through PR 8. | Off |
 
 These policies flow through the normal common-argument configuration and the
 applicable CLI, environment, INI, context, server, and benchmark surfaces.
@@ -171,7 +175,7 @@ features of `4a7f9b496`:
 |---|---|
 | Native standard-quantized FlashAttention and `--flash-attn-native-quants` | PR 4. |
 | Automatic compact causal-prefix masking | Final draft PR 7 at `d4183adb8b4902a125b9339cd39032a095fca013`; no user control, not yet in the base. |
-| `--live-context-workspace`, preset spelling, generated/user docs, and idle trim | Final draft PR 8 at `0c8df007a504f16aa35fc5982303e3e1b9883331`; exact base `4a7f9b496`, six commits ahead, not yet in the base. |
+| `--live-context-workspace`, preset spelling, generated/user docs, and idle trim | Absent from core checkpoint `4a7f9b496`; final PR 8 source at `0c8df007a504f16aa35fc5982303e3e1b9883331` landed on the canonical integration line through merge `35e179272d510a0d5aefbf8dccb9dcf30fb31556`. |
 | Positive bounded host-attention staging and `--kv-attn-staging-chunk` | Rejected for exact serving; unfinished research is not accepted source. |
 | F16 persistent recurrent S state | Rejected by the quality gate. |
 | A Bee-specific CUDA graph-disable option | Not implemented; the audited upstream environment control is not a KV feature. |
