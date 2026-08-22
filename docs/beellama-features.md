@@ -242,7 +242,8 @@ when a conventional quantized KV layout is easier to compare across backends.
 
 Compare cache formats with identical model, context, corpus, `-b`, and `-ub`
 values. A build with the default CUDA policy contains 50 standard vector pairs;
-the ALL option contains 169.
+the ALL option contains 169. Fresh build caches omit KVarN; use
+`GGML_CUDA_KVARN=ON` for KVarN validation.
 
 ### Known limitations
 

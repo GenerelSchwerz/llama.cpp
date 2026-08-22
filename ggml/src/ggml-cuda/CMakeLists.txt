@@ -99,6 +99,16 @@ if (CUDAToolkit_FOUND)
     endif()
     message(STATUS "Using CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES} CMAKE_CUDA_ARCHITECTURES_NATIVE=${CMAKE_CUDA_ARCHITECTURES_NATIVE}")
 
+    if (GGML_CUDA_KVARN)
+        if (GGML_CUDA_FA_ALL_QUANTS)
+            message(STATUS "CUDA KVarN compilation: ON (36 fast-decode pairs)")
+        else()
+            message(STATUS "CUDA KVarN compilation: ON (15 fast-decode pairs)")
+        endif()
+    else()
+        message(STATUS "CUDA KVarN compilation: OFF (minimal fresh-cache default)")
+    endif()
+
     file(GLOB   GGML_HEADERS_CUDA "*.cuh")
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
