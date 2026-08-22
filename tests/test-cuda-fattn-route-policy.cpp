@@ -327,9 +327,16 @@ int main(int argc, char ** argv) {
     ok &= expect(kvarn.find("#if defined(GGML_CUDA_FA_ALL_QUANTS)") != std::string::npos &&
                  kvarn.find("GGML_CUDA_FA_HALF_QUANTS") == std::string::npos,
         "KVarN fast decode must have only default and ALL build tiers");
-    ok &= expect(cmake.find("option(GGML_CUDA_KVARN ") != std::string::npos &&
-                 cmake.find("option(GGML_CUDA_KVARN ") < cmake.find(" ON)", cmake.find("option(GGML_CUDA_KVARN ")),
-        "GGML_CUDA_KVARN must be the default-on KVarN CUDA compilation gate");
+    const size_t kvarn_option_pos = cmake.find("option(GGML_CUDA_KVARN ");
+    const std::string kvarn_option_line = kvarn_option_pos == std::string::npos ? "" :
+            cmake.substr(kvarn_option_pos, cmake.find('\n', kvarn_option_pos) - kvarn_option_pos);
+    ok &= expect(kvarn_option_line.find(" OFF)") != std::string::npos &&
+                 kvarn_option_line.find(" ON)") == std::string::npos,
+        "GGML_CUDA_KVARN must be the explicit opt-in KVarN CUDA compilation gate");
+    ok &= expect(cuda_cmake.find("CUDA KVarN compilation: OFF (minimal fresh-cache default)") != std::string::npos &&
+                 cuda_cmake.find("CUDA KVarN compilation: ON (15 fast-decode pairs)") != std::string::npos &&
+                 cuda_cmake.find("CUDA KVarN compilation: ON (36 fast-decode pairs)") != std::string::npos,
+        "CUDA configure output must make the selected KVarN compilation policy visible");
     ok &= expect(cmake.find("option(GGML_CUDA_KVARN_FA") == std::string::npos &&
                  cmake.find("option(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS") == std::string::npos &&
                  cmake.find("unset(GGML_CUDA_KVARN_FA CACHE)") != std::string::npos &&

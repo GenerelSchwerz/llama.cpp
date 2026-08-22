@@ -41,16 +41,16 @@ hardware rather than reusing the `sm_86` artifact names.
 
 CUDA FlashAttention vector cache coverage has two build modes:
 
-- Default: 103 pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`, `q5_1`,
-  `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's internal
-  q2 fallback type. It uses `rank(K) <= rank(V) || K == f16 || V == f16`.
-- `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered vector pairs.
+- Default: 50 standard pairs over `f16`, `bf16`, `q8_0`, `q6_1`, `q6_0`,
+  `q5_1`, `q5_0`, `q4_1`, `q4_0`, `q3_1`, `q3_0`, `q2_1`, and the fork's
+  internal q2 fallback type.
+- `-DGGML_CUDA_FA_ALL_QUANTS=ON`: all 169 ordered standard vector pairs.
 
-There is no `GGML_CUDA_FA_HALF_QUANTS` tier. KVarN has 15 balanced fast-decode
-pairs by default and all 36 with `GGML_CUDA_FA_ALL_QUANTS=ON`; every valid KVarN
-bit pair remains available through descriptor-native MMA when it is outside the
-fast matrix. `GGML_CUDA_KVARN=OFF` omits all dedicated CUDA KVarN kernels and
-templates.
+There is no `GGML_CUDA_FA_HALF_QUANTS` tier. Fresh CMake caches omit KVarN.
+`-DGGML_CUDA_KVARN=ON` explicitly adds its kernels and 15 balanced fast-decode
+pairs; combining it with `GGML_CUDA_FA_ALL_QUANTS=ON` selects all 36. Every valid
+KVarN bit pair remains available through descriptor-native MMA when it is
+outside the fast matrix. Existing CMake caches retain earlier selections.
 
 ## Layout
 

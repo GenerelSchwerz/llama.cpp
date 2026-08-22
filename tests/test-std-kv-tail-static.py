@@ -343,10 +343,10 @@ def main() -> None:
     removed_options = ("GGML_CUDA_KVARN_FA", "GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS")
     kvarn_option_line = next((line for line in ggml_cmake.splitlines()
                               if line.startswith(f"option({kvarn_option} ")), "")
-    if (not kvarn_option_line.endswith(" ON)") or
+    if (not kvarn_option_line.endswith(" OFF)") or
             f"if ({kvarn_option})" not in cuda_cmake or
             f"defined({kvarn_option})" not in kvarn_dispatch):
-        raise AssertionError("CUDA builds must expose one default-on KVarN compilation gate")
+        raise AssertionError("CUDA builds must expose one explicitly enabled KVarN compilation gate")
     if any(f"option({option}" in ggml_cmake or option in cuda_cmake + kvarn_dispatch
             for option in removed_options):
         raise AssertionError("obsolete KVarN CUDA compilation options must be removed")
@@ -380,7 +380,7 @@ def main() -> None:
     default_pairs_block = ggml_cmake.split("set(GGML_CUDA_KVARN_DEFAULT_PAIRS", 1)[1].split(")", 1)[0]
     default_pairs = default_pairs_block.split()
     if len(default_pairs) != 15:
-        raise AssertionError("default CUDA build must compile all and only the 15 default KVarN pairs")
+        raise AssertionError("an explicitly enabled default-tier KVarN build must compile exactly 15 pairs")
 
     ggml_header = (ROOT / "ggml/include/ggml.h").read_text(encoding="utf-8")
     cuda_fattn = (ROOT / "ggml/src/ggml-cuda/fattn.cu").read_text(encoding="utf-8")
