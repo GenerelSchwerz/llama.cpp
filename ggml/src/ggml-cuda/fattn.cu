@@ -282,31 +282,6 @@ static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cud
     }
 }
 
-// K and V are dispatched independently over the full cross product of compiled
-// types. The inner switch is still guarded by the same pair predicate the route
-// gate asks, so the two can never disagree about what has a kernel, and a build
-// that narrows the compiled set would narrow the dispatcher with it rather than
-// emit a call to a missing instantiation.
-template <ggml_type type_K>
-static void ggml_cuda_flash_attn_ext_mma_quant_switch_type_V(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#define FATTN_MMA_QUANT_DISPATCH_CASE_V(tv)                                            \
-        case tv:                                                                       \
-            if constexpr (ggml_cuda_fattn_mma_quant_pair(type_K, tv)) {                \
-                ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<type_K, tv>        \
-                    (ctx, dst);                                                        \
-            } else {                                                                   \
-                GGML_ABORT("fatal error"); /* gated by the pair policy */              \
-            }                                                                          \
-            break;
-
-    switch (dst->src[2]->type) {
-        FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_DISPATCH_CASE_V)
-        default:
-            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
-    }
-#undef FATTN_MMA_QUANT_DISPATCH_CASE_V
-}
-
 static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
@@ -318,9 +293,19 @@ static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, 
 
     // Expanded from the same list that drives the route predicate and the
     // extern declarations, so a type can never be routable without a kernel.
-#define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                       \
-        case t:                                                                \
-            ggml_cuda_flash_attn_ext_mma_quant_switch_type_V<t>(ctx, dst);     \
+    // The symmetric pair gets its V as a template argument; every mixed pair
+    // shares one runtime-V kernel per K type. So the common configuration keeps
+    // the code generation it had when V was always compile-time, and coverage of
+    // all ordered pairs costs 2n kernels rather than n^2.
+#define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                            \
+        case t:                                                                     \
+            if (V->type == (t)) {                                                   \
+                ggml_cuda_flash_attn_ext_mma_quant_switch_head_size<t, t>           \
+                    (ctx, dst);                                                     \
+            } else {                                                                \
+                ggml_cuda_flash_attn_ext_mma_quant_switch_head_size                 \
+                    <t, GGML_CUDA_FATTN_QUANT_V_RUNTIME>(ctx, dst);                 \
+            }                                                                       \
             break;
 
     switch (K->type) {

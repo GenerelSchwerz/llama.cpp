@@ -18,16 +18,15 @@ materializing path.
 
 K and V are independent template parameters of the kernel and reach the tile
 loader through separate calls, so any ordered pair of native types is
-expressible. **The route compiles all of them.** Whatever the F16-casting path
+expressible. **The route covers all of them.** Whatever the F16-casting path
 accepts for K and V, the native path accepts too, so no cache configuration has
 to reason about which pairings are eligible: 121 ordered pairs over the eleven
 types with `GGML_CUDA_FA_ALL_QUANTS`, 16 over the four of the default tier.
 
-That is a deliberate cost decision rather than a free one. Each pair costs three
-head sizes times sixteen column shapes, so the full matrix is 5,808 explicit
-template cases against the 528 the symmetric route needed, and it falls entirely
-on `GGML_CUDA_FA_ALL_QUANTS` builds, which are already the opt-in tier. The
-numbers are in the limitations section below.
+Coverage does not cost one kernel per pair. The symmetric pair is instantiated
+with V as a template argument; every mixed pair shares a single kernel per K
+type that selects its V loader at runtime, from a switch that runs once per K/V
+tile rather than per element. So n types cost 2n kernels rather than n^2.
 
 Nothing about a pair's direction is special-cased. `q8_0 / q2_0` and
 `q2_0 / q8_0` are both native, as are all the `_0`/`_1` crossings. Whether a
@@ -150,11 +149,20 @@ structure:
 - CMake includes those generated sources only when
   `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
 
-There are 16 tile shapes and three supported head dimensions. The default
-four-type registration (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`) is 16 ordered pairs and
-768 explicit template cases; `GGML_CUDA_FA_ALL_QUANTS` adds the remaining seven
-types, for 121 pairs and 5,808 cases. Adding an nth type costs `2n-1` new pairs,
-so the list is not a place to add speculatively. A future native pair is not inferred from the standard quant
+There are 16 tile shapes and three supported head dimensions, and two kernels
+per type: one specializing V for the symmetric pair, one selecting V at runtime
+for every mixed pair. The default four-type registration (`Q8_0`, `Q4_0`,
+`Q5_0`, `Q6_0`) is 384 explicit template cases and covers its 16 ordered pairs;
+`GGML_CUDA_FA_ALL_QUANTS` adds the remaining seven types for 1,056 cases
+covering all 121 pairs. Adding an nth type costs two more kernels, not `2n-1`
+more pairs, so the inventory is linear in the type list.
+
+The split exists for a measured reason. Making V runtime for the symmetric pair
+as well cuts the inventory further, to 528 cases, but pushes the `D = 256`
+kernel from 16 to 48 bytes of register spill and costs `-0.73%` (Welch
+`t = -2.88`) on `q8_0/q8_0` prefill — enough to put the native path behind the
+materializing path it replaces. With the symmetric pair specialized, the same
+measurement is `+1.09%` (`t = +3.87`). A future native pair is not inferred from the standard quant
 matrix. It requires an intentional loader/registration, a bounded generated
 inventory, route and fallback tests, output validation, and performance and
 memory evidence.
@@ -263,13 +271,13 @@ and run-time defaults remain off.
   performs synchronous dequantization into shared memory. That is a
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
-- Compile time and CUDA-library size increase substantially when the family is
-  built, because the pair matrix is quadratic in the number of compiled types:
-  768 explicit cases by default, 5,808 with `GGML_CUDA_FA_ALL_QUANTS`. Each is
+- Compile time and CUDA-library size increase when the family is built: 384
+  explicit cases by default, 1,056 with `GGML_CUDA_FA_ALL_QUANTS`. Coverage of
+  every ordered pair costs two kernels per type rather than one per pair,
+  because only the symmetric pair specializes V at compile time. Each case is
   one device kernel rather than two, because the route requires a zero logit
-  softcap and so never names the softcap specialization. This is the dominant
-  cost of the feature and the reason the build defaults stay off. Default
-  llama.cpp builds pay neither cost.
+  softcap and so never names the softcap specialization. Default llama.cpp
+  builds pay neither cost.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 

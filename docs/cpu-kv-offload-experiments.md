@@ -6140,6 +6140,93 @@ would have to execute that node, and doing so aborts the process on either
 route. The binary-level kernel audit above is the substitute, and it is the
 stronger check: it shows the kernel is not merely unselected but absent.
 
+#### Deduplicating the attention body across the pair matrix
+
+Covering every ordered pair by instantiating the kernel per pair costs 5,808
+explicit cases, because each pair duplicates the whole attention body for the
+sake of two tile-loader calls. The fix is to stop making V a template argument:
+one kernel per K type, choosing its V loader from a runtime switch at the
+tile-load site. The switch runs once per K/V tile -- at `D = 256` with
+`nbatch_V2 = 128` the V loop body executes once per tile -- so it is nowhere
+near the per-element path the packed loaders optimize.
+
+Mechanically this is constrained by a shared signature. The kernel needs a
+runtime V-type argument, but `flash_attn_ext_f16`'s pointer is stored as
+`fattn_kernel_t`, a typedef shared with the vector and tile kernels and with
+`fattn-mma-kvarn-case.cuh`, which takes pointers to the same kernel with KVarN
+template types. Widening that typedef would reach every FlashAttention kernel in
+the backend. Instead the MMA path gets its own `fattn_kernel_mma_t` with the
+trailing argument, `launch_fattn` becomes templated on the kernel pointer type
+with a forwarded argument pack, and the vector and tile kernels are untouched.
+
+Two traps worth recording. `GGML_CUDA_FATTN_KVARN_TYPE` is already
+`GGML_TYPE_COUNT` and `..._ORIGINAL_TYPE` is `GGML_TYPE_COUNT + 1`, so the
+obvious sentinel value aliases KVarN's: it makes
+`ggml_cuda_fattn_kvarn_template_type()` true for quantized kernels and drags the
+KVarN tile loader into translation units that never define it, which surfaces as
+"Broken module found" rather than as a type error. The runtime-V sentinel
+therefore sits at `+2`. Separately, `flash_attn_ext_f16_process_tile` has call
+sites inside the KVarN case file as well as in `fattn-mma-f16.cuh`; both need
+the new argument.
+
+##### The first version was measurably worse and was not kept
+
+Making V runtime for every pair reduces the inventory to 528 cases and the
+library to 493,431,264 bytes, and it passes correctness exactly: 1695/1695 with
+all 121 ordered pairs audited in the launch log. It also **loses**:
+
+| `q8_0/q8_0`, 512-token prefill at depth 32,768 | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 819.182 t/s | 4.705 |
+| native, V runtime everywhere | 10 | 813.220 t/s | 4.538 |
+
+`-0.73%`, Welch `t = -2.88`. That puts the native path *behind* the
+materializing path it exists to replace, on the most common cache
+configuration. The mechanism is visible in `cuobjdump -res-usage`: the `D = 256`
+production kernel goes from `REG:255 STACK:16` to `REG:255 STACK:48`. Spills
+were already present before this change -- every quantized kernel spilled 16
+bytes and 11 of 33 in a representative object were already at the register
+ceiling -- but tripling the spill on the production shape was enough to erase
+the feature's advantage.
+
+##### Hybrid: compile-time V for the symmetric pair, runtime V for the rest
+
+The regression is on `K == V`, which is also the common case, so the symmetric
+pair keeps V as a template argument and every mixed pair shares one runtime-V
+kernel per K type. Coverage of all n^2 ordered pairs then costs 2n kernels.
+
+| `q8_0/q8_0`, same shape | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 819.491 t/s | 4.389 |
+| native, hybrid | 10 | 828.439 t/s | 5.839 |
+
+`+1.09%`, Welch `t = +3.87`. The native path is ahead again.
+
+| | Per-pair (Phase 2) | V runtime everywhere | Hybrid |
+|---|---:|---:|---:|
+| All-quants explicit cases | 5,808 | 528 | **1,056** |
+| Default-tier explicit cases | 768 | 192 | **384** |
+| Quant instance object code | 489,731,256 B | 230,358,920 B | **286,159,048 B** |
+| `libggml-cuda.so` | 736,400,096 B | 493,431,264 B | **659,399,296 B** |
+| Symmetric `D=256` spill | 16 B | n/a | **24 B** |
+| `q8_0/q8_0` vs materializing | faster | **-0.73%** | **+1.09%** |
+
+Correctness is unchanged in both variants: **1695/1695** with all 121 distinct
+ordered pairs audited in the launch log. Model-level byte identity against the
+materializing arm holds for the hybrid on `q8_0/q8_0` (`759a5cea…`),
+`q8_0/q2_0` (`55ffa404…`), `q2_0/q8_0` (`52c51225…`) and `q4_0/q4_1`
+(`1fdbf861…`), each with 112 audited native launches, covering both the
+compile-time-V and runtime-V kernels.
+
+The hybrid does not fully recover the register budget. The symmetric `D = 256`
+kernel sits at 24 bytes of spill against 16 before, because
+`flash_attn_ext_f16` now carries the trailing runtime V-type parameter even in
+instantiations that ignore it. That residual is the honest cost of the
+mechanism. It is measured as a net win against materializing, which is the gate
+this feature is held to; a direct native-versus-native comparison against the
+per-pair binary was not run, because that library had already been overwritten
+by the time the regression was found.
+
 #### Revised disposition
 
 Retain the cleaned family as an explicit build and run-time opt-in. It removes

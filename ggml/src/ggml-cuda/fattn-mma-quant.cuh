@@ -339,6 +339,26 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_quant_pair_policy(ggml
          ggml_cuda_fattn_quant_pair_variant(type_K) <= ggml_cuda_fattn_quant_pair_variant(type_V));
 }
 
+// Sentinel V type meaning "the V cache type is not a template argument; it
+// arrives as the runtime kernel parameter type_V_rt".
+//
+// This is what keeps the pair matrix linear instead of quadratic. With V
+// compile-time, n native types cost n^2 instantiations of the entire attention
+// body. With V runtime, they cost n: one body per K type, carrying a switch over
+// the n V loaders at the tile-load site. The switch runs once per K/V tile, not
+// per element, so it is not on the per-element path the packed loaders optimize.
+// GGML_TYPE_COUNT and GGML_TYPE_COUNT + 1 are already taken by
+// GGML_CUDA_FATTN_KVARN_TYPE and GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE in
+// fattn-mma-kvarn.cuh, so this sits past them. Aliasing one of those makes
+// ggml_cuda_fattn_kvarn_template_type() true for quantized kernels and drags
+// the KVarN tile loader into translation units that never define it.
+static constexpr ggml_type GGML_CUDA_FATTN_QUANT_V_RUNTIME = (ggml_type) (GGML_TYPE_COUNT + 2);
+
+// True when the V loader must be chosen at runtime rather than instantiated.
+static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_v_runtime(ggml_type type_V) {
+    return type_V == GGML_CUDA_FATTN_QUANT_V_RUNTIME;
+}
+
 // The pairs this build has native kernels for: every ordered pair of compiled
 // types. Both the host-side route decision and the device-side kernel selection
 // ask this same question, so a pair can never be routable without a kernel.
