@@ -208,6 +208,7 @@ class TelemetrySession:
         gpu_period_seconds: float = 1.0,
         proc_period_seconds: float = 0.25,
         first_sample_timeout: float = 12.0,
+        sampler_identity: dict[str, Any] | None = None,
     ) -> None:
         if resource not in {"cpu", "gpu"}:
             raise ValidationError(f"unknown telemetry resource {resource!r}")
@@ -216,6 +217,7 @@ class TelemetrySession:
         self.gpu_period_seconds = gpu_period_seconds
         self.proc_period_seconds = proc_period_seconds
         self.first_sample_timeout = first_sample_timeout
+        self.expected_sampler_identity = sampler_identity
         self.gpu_samples: list[dict[str, Any]] = []
         self.proc_samples: list[dict[str, Any]] = []
         self.parse_errors: list[str] = []
@@ -436,13 +438,22 @@ class TelemetrySession:
             vm_lck_values.append(sum(int(item.get("VmLck_kib", 0)) for item in statuses))
             vm_pin_values.append(sum(int(item.get("VmPin_kib", 0)) for item in statuses))
         sampler_reaped = self._sampler is None or self._sampler.poll() is not None
-        sampler_path_text = shutil.which(self.nvidia_smi) or self.nvidia_smi
-        sampler_path = pathlib.Path(sampler_path_text).expanduser().resolve()
-        sampler_identity = {
-            "path": str(sampler_path),
-            "sha256": sha256_file(sampler_path) if sampler_path.is_file() else None,
-            "argv": [self.nvidia_smi, "-q", "-x", "-l", str(max(1, int(round(self.gpu_period_seconds))))],
-        }
+        if self.expected_sampler_identity is not None:
+            sampler_identity = dict(self.expected_sampler_identity)
+        else:
+            sampler_path_text = shutil.which(self.nvidia_smi) or self.nvidia_smi
+            sampler_path = pathlib.Path(sampler_path_text).expanduser().resolve()
+            sampler_identity = {
+                "path": str(sampler_path),
+                "sha256": sha256_file(sampler_path) if sampler_path.is_file() else None,
+            }
+        sampler_identity["argv"] = [
+            self.nvidia_smi,
+            "-q",
+            "-x",
+            "-l",
+            str(max(1, int(round(self.gpu_period_seconds)))),
+        ]
         return {
             "started_utc": self._started_utc,
             "stopped_utc": self._stopped_utc,

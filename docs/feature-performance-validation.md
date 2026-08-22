@@ -29,7 +29,8 @@ The validation ladder deliberately has three boundaries:
 An early result or an Nsight capture is never reported as proof of end-to-end
 performance, resource use, output exactness, or long-context behavior. A
 production-confirmation result is likewise not final acceptance. `summary.json`
-states which boundary was actually completed.
+states which boundary was executed and which gate actually passed. Merely
+completing every process is not acceptance.
 
 The selector schema accepts workload properties, tensor-layout properties,
 backend capabilities, and execution mode. It rejects architecture and model
@@ -53,25 +54,36 @@ For each baseline and candidate, record:
 - every shared model, prompt file, library-like input, or other material input
   as a hashed `inputs` entry.
 
-The runner hashes the executable and all ELF libraries reported by `ldd`, saves
-the entire discoverable CMake cache, verifies the source commit/tree before the
-study and before each process, and fingerprints the inputs. A resume fails if
-any stable identity changed. Host provenance records tool versions, CPU and OS
-identity, and starting load. Profiler executions additionally hash the `nsys`
-or `ncu` binary actually launched.
+The runner hashes the executable, all ELF libraries reported by `ldd`, inputs,
+harness sources, the CMake cache, and `nvidia-smi` once at fresh-study or resume
+provenance capture. Each child then compares size, mtime, ctime, device, and inode to
+that cryptographic capture, while source commit/tree identity is rechecked for
+every process. This avoids repeatedly hashing a large model and shared-library
+set without allowing a changed file to pass silently; every new invocation or
+resume performs the full hashes again. Host provenance records tool versions,
+CPU and OS identity, and starting load. Profiler executions additionally hash
+the `nsys` or `ncu` binary actually launched.
 
 Place all matched workload settings in `command.common_args`. If the feature
 requires different arguments or environment between variants, copy the exact
 differences into `controlled_delta`, explain why, and list the allowed option
 and environment names. The validator rejects variant deltas that change model,
 prompt, repetitions, depth, batch/ubatch, threads, affinity, GPU placement,
-flash-attention mode, cache layout, or seed. It also parses option arity; for
-example, both of these are invalid because `--no-kv-offload` is zero-arity:
+flash-attention mode, cache layout, or seed. It also parses target-specific
+option arity. Common-argument binaries such as `llama-cli`, `llama-server`, and
+`llama-perplexity` use bare `-nkvo`/`--no-kv-offload`; both of these are invalid
+for those targets:
 
 ```text
 --no-kv-offload 1
 --no-kv-offload=1
 ```
+
+`llama-bench` has a separate parser: both `-nkvo` and
+`--no-kv-offload` require a `0` or `1` value. The built-in llama schema derives
+that distinction from the direct executable name, so the valid bench long
+alias is not mistaken for the common zero-arity flag. A local harness must use
+`builtin=none` and explicitly declare its option arities.
 
 Unknown options fail unless their zero/one arity is declared in `cli_schema`.
 `taskset` is rejected anywhere. Shells, `env`, `flock`, `timeout`, Python, and
@@ -131,6 +143,12 @@ internal executor owns telemetry preflight, the direct target, and telemetry
 cleanup. Both the exact argv/environment command and the exact flock command
 are saved in each attempt.
 
+Each attempt records identity-check, telemetry-startup, target, cleanup, and
+locked-wrapper timing. A fresh `summary.json` aggregates those fields and
+reports wall-minus-target overhead against the 30-90 second early target. Use
+the fresh-study numbers for overhead decisions; a resume summary reuses prior
+attempt artifacts and therefore labels its timing mode as `resume`.
+
 A successful run is skipped on `--resume`. A failed, timed-out, contaminated,
 or incomplete attempt is retained and stops the study. It is never dropped or
 overwritten. After correcting an external prerequisite, an explicit
@@ -159,6 +177,13 @@ the confidence interval and effect thresholds classify it as inconclusive. A
 conclusive three-pair result records pairs four and five as
 `not_run_by_preregistered_conclusive_rule`. No subset selection, silent run
 dropping, threshold changes, or post-hoc extension is supported.
+
+Every performance stage also preregisters `decision_policy`. Only
+`improvement` and/or `equivalent` may be acceptable; a regression always fails,
+and an inconclusive result after five pairs is explicitly unresolved and fails
+closed. Stage records keep `execution_status=completed` separate from
+`status=passed|failed|unresolved`. `acceptance_complete` is emitted only when
+the final mandatory long-context gate passed its policy.
 
 ## Telemetry and clean-process evidence
 
@@ -208,6 +233,14 @@ python3 scripts/feature-performance-validation.py profile \
   /absolute/path/to/manifest.json --resume --execute-ncu
 ```
 
+For a graph-capable or graph-only stage, `cuda_graph_trace` must preregister
+node tracing and its launch origin. Before launch, the runner inspects the exact
+NSYS binary's version/help for `--cuda-graph-trace` node support. It then passes
+the explicit option (normally `--cuda-graph-trace=node:host-only`) and rejects
+an export with no nonzero graph-node IDs. Unsupported tool versions therefore
+fail before or immediately after discovery instead of silently producing a
+non-graph inventory.
+
 The NSYS SQLite parser inventories kernel names, graph-node IDs, grid/block
 shapes, counts, chronological launch indices, and same-name occurrence indices.
 The selector is applied to that inventory. The runner emits one exact-name NCU
@@ -216,6 +249,14 @@ kernel filter; otherwise it fails closed and asks for a narrower discovery or
 selector. Thus `--launch-skip` and `--launch-count` are derived for the current
 binary, hardware, and capture rather than copied between builds. Re-run NSYS
 after any relevant identity changes.
+
+After the separate NCU process, the runner requires the expected nonempty
+`.ncu-rep`, hashes it, imports its raw CSV with the same NCU binary, and checks
+the observed demangled kernel, unique capture count, and available grid/block
+shapes against the NSYS-derived plan. Missing report fields are
+`unverifiable`; mismatches fail. This post-capture check accounts for
+cross-process launch-order drift rather than assuming the discovery skip/count
+still selected the intended work.
 
 Profiler output is a kernel investigation, not a benchmark repetition. The
 intended pattern is one production NSYS discovery followed by one filtered
@@ -248,8 +289,10 @@ Automated:
 - exactness ordering, short smokes, weighted screens, selected-depth and final
   stage separation;
 - paired statistics and the preregistered 3-to-5 extension rule;
+- executed-versus-passed gate state and fail-closed final acceptance;
 - persistent GPU/proc telemetry and sampler cleanup;
-- NSYS SQLite discovery inventory and the derived one-command NCU plan.
+- explicit NSYS graph-node capability/capture verification, the derived
+  one-command NCU plan, and post-NCU report verification.
 
 Manual and study-specific:
 
@@ -267,3 +310,16 @@ Keep `.nsys-rep`, SQLite, NCU reports, stdout/stderr, and telemetry JSON outside
 Git. Check in only a schema/inventory or a concise truthful summary of valid
 evidence. Never promote a launcher failure, wrong identity, contaminated run,
 historical capture, or incomplete long-context run as current evidence.
+
+## Maintenance boundary
+
+The implementation is intentionally split into a thin CLI, manifest/provenance
+and statistics core, clean-process runner, telemetry owner, and profiler
+parser/planner. The merge-readiness pass removed duplicate provenance-spec and
+GPU-lock launch implementations and removed the legacy single-executable
+manifest shape; the JSON schema and runtime now use the same executable-role
+contract. The remaining roughly 3.5k standard-library Python lines are mostly
+fail-closed validation, artifact inventory, lifecycle cleanup, and parsers with
+separate tests. There is no copied CUDA framework or project build dependency.
+Further code should enter a new module only when it has an independent
+lifecycle or artifact contract, rather than growing another parallel runner.
