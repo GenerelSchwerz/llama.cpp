@@ -261,6 +261,12 @@ bool llama_kv_tail_sparse_body_capacity_safe(
         uint32_t physical_stream_rows,
         uint32_t arena_stride);
 
+// A same-format GPU window removes its retained suffix from the canonical
+// body's attention read without changing canonical storage ownership.
+uint32_t llama_kv_gpu_window_cold_body_rows(
+        uint32_t physical_stream_rows,
+        uint32_t retained_rows);
+
 // The packed body is graph-local and may be padded to a backend execution
 // alignment without changing the persistent compact-history capacity.
 uint32_t llama_kv_tail_packed_body_stride(

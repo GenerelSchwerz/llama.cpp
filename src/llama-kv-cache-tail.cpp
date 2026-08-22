@@ -156,6 +156,12 @@ bool llama_kv_tail_sparse_body_capacity_safe(
     return arena_stride > 0 && physical_stream_rows <= arena_stride;
 }
 
+uint32_t llama_kv_gpu_window_cold_body_rows(
+        uint32_t physical_stream_rows,
+        uint32_t retained_rows) {
+    return physical_stream_rows > retained_rows ? physical_stream_rows - retained_rows : 0;
+}
+
 uint32_t llama_kv_tail_packed_body_stride(uint64_t logical_rows, uint32_t alignment) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
         throw std::invalid_argument("packed KV body alignment must be a non-zero power of two");

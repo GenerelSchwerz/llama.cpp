@@ -149,6 +149,11 @@ int main() {
     assert(llama_kv_tail_sparse_body_capacity_safe(256, 256));
     assert(!llama_kv_tail_sparse_body_capacity_safe(257, 256));
 
+    CHECK(llama_kv_gpu_window_cold_body_rows(4608, 4096) == 512);
+    CHECK(llama_kv_gpu_window_cold_body_rows(4608, 4097) == 511);
+    CHECK(llama_kv_gpu_window_cold_body_rows(4608, 4608) == 0);
+    CHECK(llama_kv_gpu_window_cold_body_rows(4608, 8192) == 0);
+
     CHECK(llama_kv_tail_packed_body_stride(0, 256) == 0);
     CHECK(llama_kv_tail_packed_body_stride(33, 256) == 256);
     CHECK(llama_kv_tail_packed_body_stride(256, 256) == 256);

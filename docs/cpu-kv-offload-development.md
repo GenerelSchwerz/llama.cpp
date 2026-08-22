@@ -130,6 +130,15 @@ body/window split only for single-token graphs. An uncommitted development
 smoke removed nearly all of the observed prefill loss while retaining the
 decode direction; it is not cited as a result for a commit.
 
+The remaining full-`kv_size` packed-body reservation was then replaced by the
+maximum disjoint cold region, `kv_size - N`, padded to the backend execution
+alignment. The compact device suffix and rollback reserve are not subtracted
+twice. Capacity eligibility now proves the same cold bound for every future
+occupancy of a cached graph. Unit boundaries cover underflow and aligned
+transitions, and the graph explicitly permits the cold body to be smaller than
+the retained suffix. A development smoke showed the expected transient-memory
+and decode direction, but committed A/B/A evidence remains authoritative.
+
 ## 2026-08-21: GPU-window prototype protocol boundary
 
 The first chunk-residency prototype deliberately keeps the complete standard

@@ -5085,3 +5085,27 @@ owned by the final composed candidate.
 Retained as a correctness-preserving route selection needed to avoid a material
 prefill penalty. The packed body is still temporarily sized from full
 `kv_size`; Experiment 024 owns the independent cold-region bound.
+
+## Experiment 024: bound packed GPU-window body by the cold region
+
+Status: retained implementation; matched evidence pending. The exact source
+base is `7212e8aa4116953ed2c374330dc0e2aa54001c47`; the candidate is the
+implementation commit containing this entry.
+
+The GPU-window body pack previously reserved the complete physical `kv_size`
+even though the newest retained `N` rows are read only from the disjoint device
+suffix. The candidate reserves
+`align_up(max(kv_size - N, 0), 256)` body rows and applies the same cold-region
+bound when deciding whether a cached graph may use sparse packing. Persistent
+host KV, the device suffix, and its rollback reserve are unchanged.
+
+Focused CPU/CUDA tests cover the capacity arithmetic, graph policy, scheduler,
+and 256/257 attached-tail boundaries. Uncommitted development screens indicated
+lower transient bytes and a stronger decode direction at 4K and 30K; those
+values are parameter-selection data only and are not results for this commit.
+
+### Disposition
+
+Retained for final committed-binary A/B/A, PPL, deterministic output,
+state/prompt-cache, and resource validation. No PR performance claim is
+accepted until those gates complete.

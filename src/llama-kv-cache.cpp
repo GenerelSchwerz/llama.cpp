@@ -724,7 +724,10 @@ llama_kv_cache::llama_kv_cache(
             const uint32_t body_execution_rows = !has_body ? 0 :
                     tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY ?
                         llama_kv_tail_packed_body_stride(
-                                gpu_window ? kv_size : tail_plan.compact_layout.history_stride, 256) :
+                                gpu_window ? llama_kv_gpu_window_cold_body_rows(
+                                        kv_size, tail_plan.effective_tokens) :
+                                    tail_plan.compact_layout.history_stride,
+                                256) :
                         tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ?
                             tail_plan.layout.arena_stride : 0;
             auto * dev = spec.execution_backend;
@@ -7250,7 +7253,10 @@ bool llama_kv_cache::can_pack_tail_body(const llama_ubatch & ubatch) const {
         // must remain valid at its full physical capacity.  When the complete
         // stream fits, every possible visible-body subset fits as well.
         const uint32_t body_capacity = gpu_window ? get_tail_body_execution_stride() : tail_arena_stride;
-        if (!llama_kv_tail_sparse_body_capacity_safe(cells.size(), body_capacity)) {
+        const uint32_t required_rows = gpu_window ?
+                llama_kv_gpu_window_cold_body_rows(uint32_t(cells.size()), tail->retention()) :
+                uint32_t(cells.size());
+        if (!llama_kv_tail_sparse_body_capacity_safe(required_rows, body_capacity)) {
             return false;
         }
     }

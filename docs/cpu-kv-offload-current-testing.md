@@ -88,12 +88,11 @@ adds a same-format Q8_0 device suffix; therefore it
 deduplicates repeated host-to-device traffic, not system-RAM allocation. Do not
 add it to the canonical commands below until its build, exactness, state, and
 matched A/B/A gates have passed and an experiment entry owns the evidence.
-The current transport-correctness milestone intentionally retains a temporary
-packed-body capacity based on the complete `kv_size`. Bounding that capacity by
-the cold region (`kv_size - N`, with required alignment and reserve) remains a
-separate next implementation and measurement milestone; the first authorized
-focused debug/correctness smoke has completed, but it does not supply the
-matched evidence required for that optimization.
+The packed body capacity is bounded by the maximum cold canonical region
+`kv_size - N` and padded to the CUDA execution alignment. The retained suffix
+and its rollback reserve remain separate. This capacity change has focused and
+development-smoke coverage, but it does not become performance evidence until
+the final committed candidate passes matched A/B/A and resource gates.
 Multi-token GPU-window graphs use the complete canonical mapped-host body once
 and update the compact suffix after attention. Only single-token graphs select
 split body/window attention. This keeps prompt processing off the additional

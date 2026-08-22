@@ -515,6 +515,9 @@ def main() -> None:
     if "split_gpu_window_attention ?" not in graph or \
             "LLAMA_KV_TAIL_ROUTE_NONE" not in graph:
         raise AssertionError("GPU-window multi-token graphs do not bypass split attention")
+    kv_cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
+    if "llama_kv_gpu_window_cold_body_rows" not in kv_cache_source:
+        raise AssertionError("GPU-window packed body is not bounded by the cold canonical region")
 
     vulkan = (ROOT / "ggml/src/ggml-vulkan/ggml-vulkan.cpp").read_text(encoding="utf-8")
     vulkan_fattn_support = vulkan.split("case GGML_OP_FLASH_ATTN_EXT:", 1)[1].split(

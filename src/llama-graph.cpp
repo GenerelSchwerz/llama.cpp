@@ -3337,7 +3337,11 @@ static void build_attn_inp_tail(
     }
     if (!tail_run_desc) {
         const bool sparse_body = pack_sparse_body && mctx->can_pack_tail_body(ubatch);
-        GGML_ASSERT(!sparse_body || body_execution_stride >= arena_stride);
+        // Ordinary compact tails use the history arena as their body bound.
+        // A GPU window instead reserves only the disjoint cold canonical
+        // region, which can legitimately be smaller than the retained suffix.
+        GGML_ASSERT(!sparse_body || mctx->is_gpu_window() ||
+                body_execution_stride >= arena_stride);
         const int64_t desc_stride = sparse_body ?
                 int64_t(6 + attention_stride + body_execution_stride) : int64_t(6 + attention_stride);
         tail_run_desc = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, desc_stride, n_active);
