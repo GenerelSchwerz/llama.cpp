@@ -1273,11 +1273,9 @@ static __global__ void flash_attn_causal_prefix_to_KV_max(
     const int sequence = blockIdx.y;
     const int jt = blockIdx.x;
     const int64_t * write_indices = write_indices_ptr + sequence*s33 + jt*ncols1*s31;
-    int32_t bound = 0;
-#pragma unroll
-    for (int j = 0; j < ncols1; ++j) {
-        bound = max(bound, flash_attn_causal_prefix_bound(write_indices, j*s31));
-    }
+    // Compact-mask eligibility proves that write indices are consecutive.
+    // The last query bound is therefore the first bound plus its tile offset.
+    const int32_t bound = flash_attn_causal_prefix_bound(write_indices, 0) + ncols1 - 1;
     const int rounded = ((bound + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE;
     KV_max_ptr[sequence*gridDim.x + jt] = min(ne11, rounded);
 }
@@ -1579,8 +1577,8 @@ void launch_fattn(
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I64);
     const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
     GGML_ASSERT(!compact_causal_prefix ||
-        (mask->ne[0] == 1 && mask->ne[1] == Q->ne[1] && mask->ne[2] == 1 &&
-         mask->nb[1] == ggml_type_size(mask->type)));
+        (mask->ne[0] == Q->ne[1] && mask->ne[1] == 1 && mask->ne[2] == 1 &&
+         mask->ne[3] == 1 && mask->nb[0] == ggml_type_size(mask->type)));
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1688,7 +1686,7 @@ void launch_fattn(
             blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_causal_prefix_to_KV_max<ncols1>, launch_params,
             (const int64_t *) mask->data, KV_max.ptr, int(K->ne[1]),
-            mask->nb[1] / sizeof(int64_t), mask->nb[3] / sizeof(int64_t));
+            mask->nb[0] / sizeof(int64_t), 0);
         CUDA_CHECK(cudaGetLastError());
     } else if (!compact_causal_prefix && mask && use_KV_max) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
@@ -1823,7 +1821,7 @@ void launch_fattn(
         compact_causal_prefix ? -int32_t(Q->ne[1]) : (mask ? int32_t(mask->ne[1]) : 0),
         (mask ? int32_t(mask->ne[2]) : 0),
         mask ? mask->ne[3] : 0,
-        mask ? mask->nb[1] : 0,
+        mask ? (compact_causal_prefix ? mask->nb[0] : mask->nb[1]) : 0,
         (mask ? int32_t(mask->nb[2]) : 0),
         mask ? mask->nb[3] : 0
     );

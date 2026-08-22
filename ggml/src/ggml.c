@@ -5518,9 +5518,13 @@ struct ggml_tensor * ggml_flash_attn_ext(
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         if (mask->type == GGML_TYPE_I64) {
-            GGML_ASSERT(mask->ne[0] == 1);
-            GGML_ASSERT(mask->ne[1] == q->ne[1]);
+            // A compact causal descriptor contains consecutive write indices.
+            // Backends may derive later query bounds from the tile's first
+            // entry; callers that cannot prove this layout use an explicit mask.
+            GGML_ASSERT(mask->ne[0] == q->ne[1]);
+            GGML_ASSERT(mask->ne[1] == 1);
             GGML_ASSERT(mask->ne[2] == 1);
+            GGML_ASSERT(mask->ne[3] == 1);
             GGML_ASSERT(max_bias == 0.0f);
         }
 

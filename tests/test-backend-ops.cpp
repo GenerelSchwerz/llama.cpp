@@ -7187,7 +7187,7 @@ struct test_flash_attn_ext : public test_case {
             GGML_ASSERT(!compact_causal_prefix ||
                 (nr23[1] == 1 && max_bias == 0.0f && n_tail == 0));
             m = compact_causal_prefix ?
-                ggml_new_tensor_4d(ctx, GGML_TYPE_I64, 1, nb, 1, 1) :
+                ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb) :
                 ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
             if (compact_equivalence) {
@@ -10144,10 +10144,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 64, 64, 4, {4, 1}, 512, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(
-                40, 40, 4, {1, 1}, 512, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                64, 64, 4, {4, 1}, 512, 3, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(
-                128, 128, 4, {4, 1}, 512, 64, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                40, 40, 4, {1, 1}, 512, 17, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                128, 128, 4, {4, 1}, 512, 65, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, true, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {

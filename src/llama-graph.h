@@ -383,7 +383,7 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
-    bool self_kq_mask_causal_prefix = false; // I64 write-index view; exclusive bound is index + 1
+    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
     uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
 
     // note: assumes v_rot^2 == I
@@ -431,7 +431,7 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    bool self_kq_mask_causal_prefix = false; // I64 write-index view; exclusive bound is index + 1
+    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
     uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
 
     const llama_hparams hparams;

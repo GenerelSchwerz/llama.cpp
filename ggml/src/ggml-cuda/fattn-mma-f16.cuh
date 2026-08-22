@@ -474,16 +474,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
     if (compact_causal_prefix) {
+        const int32_t first_bound = *((const int32_t *) (tile_mask + nbatch_fa));
 #pragma unroll
         for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
             const int j_sram = j1 + threadIdx.y;
-            const int j_vram = fastmodulo(j0 + j_sram, ne01);
             if (j1 + nwarps > ncols1 && j_sram >= ncols1) {
                 break;
             }
 
-            const int32_t bound = flash_attn_causal_prefix_bound(
-                (const int64_t *) mask_h, int64_t(j_vram)*stride_mask);
+            const int32_t bound = first_bound + j_sram;
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
@@ -572,6 +571,30 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
     }
 }
 
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+template<int nbatch_fa>
+static __device__ __forceinline__ void flash_attn_causal_prefix_store_first_bound(
+        const half * const __restrict__ mask_h,
+        half * const __restrict__ tile_mask,
+        const int stride_mask,
+        const int j0,
+        const uint3 ne01) {
+    if (threadIdx.x != 0 || threadIdx.y != 0) {
+        return;
+    }
+
+    const int j_vram = fastmodulo(j0, ne01);
+    const int32_t first_bound = flash_attn_causal_prefix_bound(
+        (const int64_t *) mask_h, int64_t(j_vram)*stride_mask);
+
+    // The per-row mask stride includes eight padding halves. Cache the query
+    // tile's first bound in the first row's unused padding. Compact-mask
+    // eligibility proves that later query bounds are first_bound + row offset,
+    // so every warp can derive them without more descriptor loads.
+    *((int32_t *) (tile_mask + nbatch_fa)) = first_bound;
+}
+#endif
+
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
     bool use_logit_softcap, bool V_is_K_view, bool needs_fixup, bool is_fixup, bool last_iter, bool oob_check,
     typename T_A_KQ, typename T_B_KQ, typename T_C_KQ, typename T_A_VKQ, typename T_B_VKQ, typename T_C_VKQ,
@@ -624,6 +647,15 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     constexpr int stride_tile_V = V_is_K_view ? stride_tile_K : nbatch_V2 + 4;
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+    const int32_t causal_prefix_first_bound = compact_causal_prefix ?
+        *((const int32_t *) (tile_mask + nbatch_fa)) : 0;
+    const bool use_mask = compact_causal_prefix ?
+        k_VKQ_0 + k_VKQ_sup > causal_prefix_first_bound :
+        (ncols2 > 1 || mask_h);
+#else
+    const bool use_mask = ncols2 > 1 || mask_h;
+#endif
 #if defined(TURING_MMA_AVAILABLE)
     T_C_KQ KQ_C[nbatch_fa/(np*(cols_per_warp == 8 ? T_C_KQ::I : T_C_KQ::J))];
 #elif defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
@@ -644,14 +676,14 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     } else {
         constexpr bool use_cp_async = nstages == 1;
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-        if (compact_causal_prefix || ncols2 > 1 || mask_h) {
+        if (use_mask) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (compact_causal_prefix ? mask_h : mask_h + k_VKQ_0,
                  tile_mask, stride_mask, compact_causal_prefix,
                  k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01);
         }
 #else
-        if (ncols2 > 1 || mask_h) {
+        if (use_mask) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (mask_h + k_VKQ_0, tile_mask, stride_mask, k_VKQ_sup, jt*ncols1, ne01);
         }
@@ -761,7 +793,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
 
     if constexpr (cols_per_warp == 8) {
-        if (ncols2 > 1 || mask_h) {
+        if (use_mask) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -823,7 +855,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             }
         }
     } else { // not Turing mma or T_B_KQ::I > 8
-        if (ncols2 > 1 || mask_h) {
+        if (use_mask) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::J) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::J;
@@ -1009,7 +1041,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         __syncthreads();
         if (!last_iter) {
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-            if (compact_causal_prefix || ncols2 > 1 || mask_h) {
+            const bool use_next_mask = compact_causal_prefix ?
+                k_VKQ_0 + nbatch_fa + k_VKQ_sup > causal_prefix_first_bound :
+                (ncols2 > 1 || mask_h);
+            if (use_next_mask) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (compact_causal_prefix ? mask_h : mask_h + k_VKQ_0 + nbatch_fa,
                      tile_mask, stride_mask, compact_causal_prefix,
@@ -1277,6 +1312,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
     half * kvarn_smem = tile_mask + ncols1 * (nbatch_fa + 8);
 
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+    if (compact_causal_prefix) {
+        flash_attn_causal_prefix_store_first_bound<nbatch_fa>(
+            mask_h, tile_mask, stride_mask, jt*ncols1, ne01);
+    }
+#endif
+
     constexpr bool cache_kvarn_record_axes =
         type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE;
     if constexpr (cache_kvarn_record_axes) {
@@ -1375,7 +1417,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-        if (compact_causal_prefix || ncols2 > 1 || mask_h) {
+        const bool use_first_mask = compact_causal_prefix ?
+            kb0*nbatch_fa + k_VKQ_sup > *((const int32_t *) (tile_mask + nbatch_fa)) :
+            (ncols2 > 1 || mask_h);
+        if (use_first_mask) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (compact_causal_prefix ? mask_h : mask_h + kb0*nbatch_fa,
                  tile_mask, stride_mask, compact_causal_prefix,

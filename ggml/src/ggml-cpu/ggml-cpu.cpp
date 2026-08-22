@@ -530,8 +530,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
             const auto * mask = op->src[3];
             const bool mask_ok = mask == nullptr || mask->type == GGML_TYPE_F16 ||
-                (mask->type == GGML_TYPE_I64 && mask->ne[0] == 1 &&
-                 mask->ne[1] == src0->ne[1] && mask->ne[2] == 1 && max_bias == 0.0f);
+                (mask->type == GGML_TYPE_I64 && mask->ne[0] == src0->ne[1] &&
+                 mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && max_bias == 0.0f);
 
             return mask_ok && q_to_vec_dot && kq_vec_dot &&
                 (src2->type == GGML_TYPE_F32 || v_to_float);

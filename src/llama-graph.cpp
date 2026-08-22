@@ -139,15 +139,17 @@ static ggml_tensor * build_attn_inp_kq_mask(
     }
 
     // Proven consecutive current-token writes can reuse the existing I64 write
-    // indices as exclusive causal bounds (write index + 1). Keeping the bound
-    // in graph-visible input memory makes CUDA Graph replay observe each update
-    // without another allocation or a replay-unsafe dynamic op parameter.
+    // indices as exclusive causal bounds (write index + 1). Consumers may load
+    // the first bound of a query tile and derive every later bound by adding its
+    // query offset. Passing the existing 1-D input through directly lets
+    // attention reuse the scheduler copy already required by the K/V stores.
+    // It also keeps CUDA Graph replay aware of each update without another
+    // allocation or a replay-unsafe dynamic op parameter.
     if (compact) {
         GGML_ASSERT(causal_prefix != nullptr && k_idxs != nullptr);
         *causal_prefix = true;
-        ggml_tensor * res = ggml_reshape_4d(ctx, k_idxs, 1, n_tokens, 1, 1);
-        ggml_set_name(res, "attn_inp_kq_mask_compact");
-        return res;
+        ggml_set_name(k_idxs, "attn_inp_kq_mask_compact");
+        return k_idxs;
     }
 
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
@@ -172,7 +174,7 @@ static bool can_reuse_kq_mask(
 
     if (causal_prefix) {
         return kq_mask != nullptr && kq_mask->type == GGML_TYPE_I64 &&
-            kq_mask->ne[0] == 1 && kq_mask->ne[1] == n_tokens &&
+            kq_mask->ne[0] == n_tokens && kq_mask->ne[1] == 1 &&
             kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 &&
             causal_prefix_n_kv == n_kv &&
             mctx->can_use_compact_causal_mask(ubatch, cparams.causal_attn, false);
@@ -3075,17 +3077,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
-        ggml_tensor * kq_mask_consumer = kq_mask;
-        if (kq_mask_consumer && kq_mask_consumer->type == GGML_TYPE_I64) {
-            // A compact mask is small enough to transfer per consumer. Giving
-            // each attention layer its own view keeps the scheduler's backend
-            // copy local to that split instead of extending one tiny copy
-            // across every full-attention layer and pinning an allocator hole.
-            kq_mask_consumer = ggml_view_tensor(ctx0, kq_mask_consumer);
-            ggml_format_name(kq_mask_consumer, "attn_inp_kq_mask_compact_l%d", il);
-        }
-
-        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask_consumer, kq_scale, hparams.f_max_alibi_bias,
+        cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                   hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;

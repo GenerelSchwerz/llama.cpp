@@ -124,14 +124,16 @@ static __global__ void flash_attn_ext_vec(
     if constexpr (compact_causal_prefix) {
         mask_sequence = mask + nb33*(sequence % ne33);
         maskh = (const half *) mask_sequence;
+        int32_t first_bound = 0;
+        if ((ncols == 1 || ic0 < int(ne01.z)) && threadIdx.x == 0) {
+            const char * prefix = mask_sequence + nb31*ic0;
+            first_bound = flash_attn_causal_prefix_bound((const int64_t *) prefix, 0);
+        }
+        first_bound = __shfl_sync(0xFFFFFFFF, first_bound, 0, WARP_SIZE);
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
-            int32_t bound = 0;
-            if ((ncols == 1 || ic0 + j < int(ne01.z)) && threadIdx.x == 0) {
-                const char * prefix = mask_sequence + nb31*(ic0 + j);
-                bound = flash_attn_causal_prefix_bound((const int64_t *) prefix, 0);
-            }
-            causal_prefix_bounds[j] = __shfl_sync(0xFFFFFFFF, bound, 0, WARP_SIZE);
+            causal_prefix_bounds[j] =
+                ncols == 1 || ic0 + j < int(ne01.z) ? first_bound + j : 0;
         }
     } else {
         maskh = (const half *) (mask + nb33*(sequence % ne33) + nb31*ic0);
@@ -291,6 +293,16 @@ static __global__ void flash_attn_ext_vec(
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 #endif
 
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+        int32_t causal_prefix_tile_bounds[ncols];
+        if constexpr (compact_causal_prefix) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+                causal_prefix_tile_bounds[j] = causal_prefix_bounds[j] - k_VKQ_0;
+            }
+        }
+#endif
+
         // Calculate KQ tile and keep track of new maximum KQ values:
         float KQ_reg[ncols]; // KQ in registers.
 
@@ -300,43 +312,96 @@ static __global__ void flash_attn_ext_vec(
             KQ_max_new[j] = KQ_max[j];
         }
 
-#pragma unroll
-        for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
-            const int i_KQ = threadIdx.y*WARP_SIZE + (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
-
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+        if constexpr (compact_causal_prefix) {
+            bool fully_visible = true;
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
-                sum = warp_reduce_sum<nthreads_KQ>(sum);
-
-                if (use_logit_softcap) {
-                    sum = logit_softcap*tanhf(sum);
+                if ((ncols == 1 || ic0 + j < int(ne01.z)) &&
+                        causal_prefix_tile_bounds[j] < nthreads) {
+                    fully_visible = false;
                 }
+            }
 
-#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-                if constexpr (compact_causal_prefix) {
-                    if (ncols == 1 || ic0 + j < int(ne01.z)) {
-                        const int k_local = k_VKQ_0 + i_KQ;
-                        sum += k_local < causal_prefix_bounds[j] ? 0.0f : -INFINITY;
+            if (fully_visible) {
+#pragma unroll
+                for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+                    const int i_KQ = threadIdx.y*WARP_SIZE +
+                        (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        sum = warp_reduce_sum<nthreads_KQ>(sum);
+
+                        if (use_logit_softcap) {
+                            sum = logit_softcap*tanhf(sum);
+                        }
+
+                        KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+
+                        if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
+                            KQ_reg[j] = sum;
+                        }
                     }
-                } else {
+                }
+            } else {
+#pragma unroll
+                for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+                    const int i_KQ = threadIdx.y*WARP_SIZE +
+                        (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+
+#pragma unroll
+                    for (int j = 0; j < ncols; ++j) {
+                        float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                        sum = warp_reduce_sum<nthreads_KQ>(sum);
+
+                        if (use_logit_softcap) {
+                            sum = logit_softcap*tanhf(sum);
+                        }
+
+                        if (ncols == 1 || ic0 + j < int(ne01.z)) {
+                            sum = i_KQ < causal_prefix_tile_bounds[j] ? sum : -INFINITY;
+                        }
+
+                        KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+
+                        if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
+                            KQ_reg[j] = sum;
+                        }
+                    }
+                }
+            }
+        } else {
+#endif
+#pragma unroll
+            for (int i_KQ_0 = 0; i_KQ_0 < nthreads_KQ; ++i_KQ_0) {
+                const int i_KQ = threadIdx.y*WARP_SIZE +
+                    (nthreads_KQ == WARP_SIZE ? 0 : (threadIdx.x & ~(nthreads_KQ-1))) + i_KQ_0;
+
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    float sum = vec_dot_KQ(K + i_KQ*nb11, Q_reg[j], Q_i32[j], Q_ds[j]);
+                    sum = warp_reduce_sum<nthreads_KQ>(sum);
+
+                    if (use_logit_softcap) {
+                        sum = logit_softcap*tanhf(sum);
+                    }
+
                     if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                         sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
                     }
-                }
-#else
-                if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
-                    sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
-                }
-#endif
 
-                KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
+                    KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
 
-                if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
-                    KQ_reg[j] = sum;
+                    if ((nthreads_KQ == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads_KQ) == uint32_t(i_KQ_0)) {
+                        KQ_reg[j] = sum;
+                    }
                 }
             }
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
         }
+#endif
 
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {

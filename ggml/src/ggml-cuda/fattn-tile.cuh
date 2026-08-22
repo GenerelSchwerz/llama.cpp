@@ -617,10 +617,22 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
             Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
     }
 
+    int32_t causal_prefix_first_bound = 0;
+    if (compact_causal_prefix && threadIdx.x == 0) {
+        const int j = fastmodulo(col_Q_0, ne01);
+        causal_prefix_first_bound = flash_attn_causal_prefix_bound(
+            (const int64_t *) mask, j*stride_mask);
+    }
+    causal_prefix_first_bound = __shfl_sync(0xFFFFFFFF, causal_prefix_first_bound, 0, warp_size);
+
     // Apply logit softcap + mask, update KQ_max:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
-        const int j = fastmodulo(col_Q_0 + (jc0 + (threadIdx.y / np)*cpw)/ncols2, ne01);
+        const int query_offset = (jc0 + (threadIdx.y / np)*cpw)/ncols2;
+        const int j = fastmodulo(col_Q_0 + query_offset, ne01);
+        const int32_t causal_prefix_bound = causal_prefix_first_bound + query_offset;
+        const bool compact_boundary_tile = compact_causal_prefix &&
+            k_VKQ_0 + k_VKQ_sup > causal_prefix_bound;
 
 #pragma unroll
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
@@ -638,11 +650,9 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
                 float mask_value = 0.0f;
-                if (compact_causal_prefix) {
-                    const int32_t bound = flash_attn_causal_prefix_bound(
-                        (const int64_t *) mask, j*stride_mask);
-                    mask_value = k_VKQ_0 + i_KQ < bound ? 0.0f : -INFINITY;
-                } else if (ncols2 > 1 || mask) {
+                if (compact_boundary_tile) {
+                    mask_value = k_VKQ_0 + i_KQ < causal_prefix_bound ? 0.0f : -INFINITY;
+                } else if (!compact_causal_prefix && (ncols2 > 1 || mask)) {
                     mask_value = slope*__half2float(mask[j*stride_mask + k_VKQ_0 + i_KQ]);
                 }
                 KQ_acc[(i_KQ_0/(np*warp_size))*cpw + jc0] += mask_value;

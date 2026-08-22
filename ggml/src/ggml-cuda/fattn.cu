@@ -488,9 +488,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask) {
         if (mask->type == GGML_TYPE_I64) {
-            if (mask->ne[0] != 1 || mask->ne[1] != Q->ne[1] ||
-                    mask->ne[2] != 1 || mask->ne[3] != Q->ne[3] ||
-                    mask->nb[1] != ggml_type_size(mask->type) || max_bias != 0.0f) {
+            if (mask->ne[0] != Q->ne[1] || mask->ne[1] != 1 ||
+                    mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                    mask->nb[0] != ggml_type_size(mask->type) || max_bias != 0.0f) {
                 return BEST_FATTN_KERNEL_NONE;
             }
         } else if (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1) {
