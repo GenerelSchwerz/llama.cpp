@@ -4,6 +4,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-feature-performance-validation
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test-feature-validation.py)
+    set_property(TEST test-feature-performance-validation PROPERTY LABELS main)
+
+    add_test(
         NAME test-release-workflow-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
