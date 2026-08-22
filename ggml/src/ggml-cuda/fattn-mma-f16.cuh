@@ -2137,13 +2137,25 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 // replaces. Mixed pairs take the runtime-V kernel, so coverage of all n^2
 // ordered pairs costs 2n kernels rather than n^2, and the pair that regressed
 // keeps exactly its former code generation.
-#define DECL_FATTN_MMA_QUANT_CASE(type_K, DKQ, DV, ncols1, ncols2)                             \
+// One statement per macro. A macro that expanded to two would be a trap for the
+// declaration header: `extern DECL_...` binds the `extern` to the first
+// statement only, silently turning the second into an explicit instantiation
+// *definition* in every translation unit that includes it. That put 528 full
+// attention kernels into fattn.cu and took its ptxas pass past an hour.
+#define DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(type_K, DKQ, DV, ncols1, ncols2)                   \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                        \
     <DKQ, DV, ncols1, ncols2, type_K, type_K>                                                  \
-    (ggml_backend_cuda_context & ctx, ggml_tensor * dst);                                      \
+    (ggml_backend_cuda_context & ctx, ggml_tensor * dst)                                       \
+
+#define DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(type_K, DKQ, DV, ncols1, ncols2)                   \
     template void ggml_cuda_flash_attn_ext_mma_f16_case                                        \
     <DKQ, DV, ncols1, ncols2, type_K, GGML_CUDA_FATTN_QUANT_V_RUNTIME>                         \
     (ggml_backend_cuda_context & ctx, ggml_tensor * dst)                                       \
+
+// Definitions only. Never prefix this with `extern`; use the two macros above.
+#define DECL_FATTN_MMA_QUANT_CASE(type_K, DKQ, DV, ncols1, ncols2)                             \
+    DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(type_K, DKQ, DV, ncols1, ncols2);                      \
+    DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(type_K, DKQ, DV, ncols1, ncols2)                       \
 
 #define DECL_FATTN_MMA_F16_CASE_ALL_NCOLS2(DKQ, DV, ncols)   \
     extern DECL_FATTN_MMA_F16_CASE(DKQ, DV, (ncols)/ 1,  1); \

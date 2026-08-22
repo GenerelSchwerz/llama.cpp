@@ -6207,9 +6207,14 @@ kernel per K type. Coverage of all n^2 ordered pairs then costs 2n kernels.
 | All-quants explicit cases | 5,808 | 528 | **1,056** |
 | Default-tier explicit cases | 768 | 192 | **384** |
 | Quant instance object code | 489,731,256 B | 230,358,920 B | **286,159,048 B** |
-| `libggml-cuda.so` | 736,400,096 B | 493,431,264 B | **659,399,296 B** |
+| `libggml-cuda.so` | 736,400,096 B | 493,431,264 B | **539,733,488 B** |
 | Symmetric `D=256` spill | 16 B | n/a | **24 B** |
-| `q8_0/q8_0` vs materializing | faster | **-0.73%** | **+1.09%** |
+| `q8_0/q8_0` vs materializing | faster | **-0.73%** | **+1.33%** |
+
+The hybrid's library size and throughput in that table are the corrected
+figures. The first hybrid build measured 659,399,296 B and `+1.09%` at
+`t = +3.87`; both moved when the declaration defect described below was fixed,
+which changed no generated hot-path code.
 
 Correctness is unchanged in both variants: **1695/1695** with all 121 distinct
 ordered pairs audited in the launch log. Model-level byte identity against the
@@ -6226,6 +6231,61 @@ mechanism. It is measured as a net win against materializing, which is the gate
 this feature is held to; a direct native-versus-native comparison against the
 per-pair binary was not run, because that library had already been overwritten
 by the time the regression was found.
+
+##### The declaration header was compiling what it only meant to declare
+
+The hybrid emits two kernels per K type, and the macro that names them expanded
+to two `template void ...` statements. `fattn-mma-quant-decl.cuh` writes
+`extern DECL_FATTN_MMA_QUANT_CASE(...)`, and in C++ the `extern` binds to the
+*first* statement only. The second was therefore not an explicit instantiation
+declaration but an explicit instantiation **definition**, in every translation
+unit that included the header.
+
+Only `fattn.cu` includes it, so only `fattn.cu` paid, but it paid the full
+price: 528 complete attention kernels compiled into a translation unit whose
+job was to declare them. Nothing was wrong with the resulting binary --
+duplicate explicit instantiations resolve as weak symbols and the generated
+instance files supply the same definitions -- so no test, no launch audit and no
+model hash could see it. Only the build time and the library size could, and
+they were attributed to full pair coverage.
+
+The fix splits the macro into `DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC` and
+`DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V`, one statement each, and the declaration
+header applies `extern` to both. The definition-side macro composes the two, so
+the generated instance files are unchanged.
+
+| | Before | After | Δ |
+|---|---:|---:|---:|
+| `fattn.cu` compile | 1 h 28 min+ | **17.9 s** | −99.7% |
+| `fattn.cu.o` | n/a, dominated by 528 kernels | **1,345,032 B** | |
+| `libggml-cuda.so` | 659,399,296 B | **539,733,488 B** | −114 MiB |
+| Clean CUDA rebuild, `-j16` | 1 h 16 min | **40 min 13 s** | −47.1% |
+| Quant instance object code | 286,159,048 B | **286,159,048 B** | unchanged |
+
+The unchanged instance-object total is the check that the fix touched only the
+declaration side.
+
+Re-measuring throughput on the corrected binary, same 512-token prefill at
+depth 32,768, reverse-order arm pairs:
+
+| `q8_0/q8_0` | Arm a | Arm b |
+|---|---:|---:|
+| materializing | 818.959 +/- 5.762 t/s | 817.791 +/- 4.907 t/s |
+| native, hybrid | 829.290 +/- 4.839 t/s | 829.156 +/- 5.166 t/s |
+
+818.375 against 829.223 t/s pooled: `+1.33%`, Welch `t = +4.95`, up from
+`+1.09%` at `t = +3.87` on the defective build. The two builds contain the same
+device code, so this is run-to-run and binary-layout movement rather than a
+speedup from the fix; the fix is a build-cost change only.
+
+Correctness on the corrected binary is unchanged: **1695/1695** with 121
+distinct ordered pairs audited, and model-level byte identity holds with the
+same hashes as before -- `q8_0/q8_0` `759a5cea1cb597ca`, `q8_0/q2_0`
+`55ffa404f1bf4348`, `q4_0/q4_1` `1fdbf861874c6da4`, 112 native launches each.
+
+The general lesson is worth keeping: a multi-statement macro is unsafe to
+prefix with `extern`, and the failure mode is silent. Both macros above are
+commented to say so.
 
 #### Rejected: a quantized-specific MMA configuration
 

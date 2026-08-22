@@ -18,22 +18,33 @@
 // which emits the definitions. All three must name the same types.
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 #define DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)                        \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_1,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q5_1,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q6_1,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q3_0,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q3_1,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q2_0S, DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q2_1,  DKQ, DV, ncols1, ncols2);
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q4_1,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q4_1,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q5_1,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q5_1,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q6_1,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q6_1,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q3_0,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q3_0,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q3_1,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q3_1,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q2_0S, DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q2_0S, DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q2_1,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q2_1,  DKQ, DV, ncols1, ncols2);
 #else
 #define DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
 #define DECL_FATTN_MMA_QUANT_CASE_TYPES(DKQ, DV, ncols1, ncols2)                              \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q5_0,  DKQ, DV, ncols1, ncols2);               \
-    extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q6_0,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q8_0,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q8_0,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q4_0,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q4_0,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q5_0,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q5_0,  DKQ, DV, ncols1, ncols2);               \
+    extern DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC(GGML_TYPE_Q6_0,  DKQ, DV, ncols1, ncols2); \
+    extern DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V(GGML_TYPE_Q6_0,  DKQ, DV, ncols1, ncols2);               \
     DECL_FATTN_MMA_QUANT_CASE_TYPES_EXTRA(DKQ, DV, ncols1, ncols2)
 
 #define DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(D, ncols)          \
