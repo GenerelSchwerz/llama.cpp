@@ -277,7 +277,18 @@ static __global__ void flash_attn_ext_vec(
 #endif // V_DOT2_F32_F16_AVAILABLE
     }
 
-    const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+    int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+    if constexpr (compact_causal_prefix) {
+        // The last valid query has the widest causal prefix.  Use its bound to
+        // retire fully masked K tiles without the dense path's mask scan or an
+        // additional launch.  Round to the vector kernel's K tile size so the
+        // existing boundary predicate still handles the final partial tile.
+        const int last_col = min(ncols - 1, int(ne01.z) - ic0 - 1);
+        const int bound = causal_prefix_bounds[last_col];
+        k_VKQ_max = min(ne11, ((bound + nthreads - 1) / nthreads) * nthreads);
+    }
+#endif
     K     += blockIdx.y*nthreads * nb11;
     V     += blockIdx.y*nthreads * nb21;
 #ifdef GGML_CUDA_COMPACT_CAUSAL_MASK

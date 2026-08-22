@@ -2217,3 +2217,240 @@ production CUDA header and is an investigation tool, not product surface. Raw
 artifacts remain outside Git. The isolated PR commit contains only the compact
 causal representation/consumer changes, partial-tile exactness coverage, and
 this ledger update; staged work from unrelated migrations is excluded.
+
+## Post-redesign vector tile retirement
+
+### Scope and decision rule
+
+After the consecutive-bound redesign passed its final gates, the user
+authorized one further evidence-guided improvement. The previously discussed
+affine/operator representation was a suggestion, not prescribed guidance. It
+was therefore screened against smaller changes that attack the measured cost
+directly. The source comparison remained exact dense
+`f6341a15779eb58fe6ad9e1b890e331c32b676c7` versus compact parent
+`f92c2de62bcc11abed0cff8b10a848fc8d97f29d`. No native-Q8, live-workspace,
+phase/depth routing, telemetry policy, speculative path, public runtime flag,
+user CMake option, optional dependency, model-family condition, or
+architecture-name condition was added.
+
+The candidate loop remained bounded: fixed-seed equivalence, then the local
+production-header Q8_0/Q8_0 D=256 `ncols=1` screen at 30K/64K/128K, then a
+single production build only for a clearly non-regressive candidate. The
+first production candidate that passed strict process-level 4K/30K/128K
+decode, exact output, and PPL was frozen. Profiling was performed afterward in
+separate processes and is not timing evidence.
+
+| hypothesis | minimal change | exactness and direct timing | disposition |
+|---|---|---|---|
+| batch compact `KV_max` conversion | replace the existing one-thread-per-query-tile compact prepass with a wider/batched launch | static review only | rejected: the production `--ubatch-size 512` prefill has Q below the `Q >= 1024` prepass threshold, so it cannot address the measured prefill path |
+| share the first compact bound across the vector block | load the I64 bound once per block through existing shared synchronization | bit-exact; candidate time versus frozen was -0.045% at 30K, **+0.016%** at 64K, and -0.031% at 128K | rejected as neutral; the bound load was not the remaining dominant cost |
+| new affine/operator descriptor | add another internal representation/operator around the already consecutive write indices | not implemented after the prior two findings | rejected as unnecessary surface: removing/centralizing descriptor loads did not produce a direct win, while the existing compact contract already proves the needed affine relation |
+| local compact vector upper bound | round the widest valid query's compact prefix to the vector K-tile size and use it as `k_VKQ_max` | bit-exact; clearly faster at all screened depths and tails | **accepted and frozen** |
+
+The first shared-bound build command mistakenly invoked missing
+`/usr/bin/time`; its pipeline retained the prior binary. That attempt is
+explicitly excluded. The corrected build took 2.601 s and retained 249
+registers/thread, one barrier, and 4,352 B shared memory. Its four-process
+ABBA direct result above is preserved under
+`/tmp/beellama-pr7-further-20260822/shared-bound-screen` as rejected evidence.
+
+### Accepted implementation and direct screen
+
+The vector kernel already held the final compact prefix bound for every query
+in its tile. For decode (`ncols=1`), however, the optional host-side `KV_max`
+prepass is intentionally not launched, so the vector loop still visited the
+full allocated K capacity and predicated the causally masked tail. The
+accepted change derives the widest valid compact bound locally, rounds it to
+the existing vector `nthreads` K-tile, clamps it to `ne11`, and uses that as
+the loop limit. The existing per-key predicate still handles the final partial
+tile. It adds no kernel launch or allocation and changes no dense
+specialization.
+
+The optional compact `KV_max` path remains compatible. When Q is at least
+1,024 or there are multiple sequences, its prepass derives the same final
+compact prefix rounded to `FATTN_KQ_STRIDE`; the local vector limit is equal or
+tighter because it rounds the same proven bound to the vector tile. Compact
+eligibility continues to prove consecutive write indices and supported KV
+layout before either path is selected.
+
+The final `fattn-vec.cuh` SHA-256 is
+`dc89e8254eafd9dca421ffc51f54fdf7c056dc4629d4e746c7599114955a7416`.
+The exact-production-header local harness compiled in 2.583 s; its binary is
+`ab62affe75e5ac028b37324a97fe17d0e04f399b93acc5903fb22ac99e50034e`.
+It retained 249 compact registers/thread, 254 dense registers/thread, one
+barrier, and 4,352 B shared memory. Four independent processes per source ran
+800 warmed interleaved samples per form; every output and metadata comparison
+was bit-exact:
+
+| K span / hidden tail | frozen median | accepted median | accepted time delta |
+|---|---:|---:|---:|
+| 30,000 / 0 | 194.704 us | 193.728 us | **-0.501%** |
+| 30,000 / 113 | 195.072 us | 194.232 us | **-0.431%** |
+| 65,536 / 0 | 442.688 us | 440.336 us | **-0.531%** |
+| 65,536 / 113 | 443.096 us | 440.832 us | **-0.511%** |
+| 131,072 / 0 | 880.640 us | 876.272 us | **-0.496%** |
+| 131,072 / 2,177 | 881.872 us | 862.424 us | **-2.205%** |
+
+The larger partial-tail result is expected: the accepted limit retires every
+fully masked vector tile after the causal boundary rather than paying the
+predicate for allocator padding. These direct results are screening evidence,
+not model-level throughput claims. Their 48-log aggregate SHA-256 is
+`1d3ad20b591a9401a755686d64aa2b7277b6b7ac08765f8b1df7c5b97cfbc1a1`;
+artifacts are under
+`/tmp/beellama-pr7-further-20260822/local-kvmax-screen`.
+
+### Production correctness, quality, and exact output
+
+The configuration-matched performance build remained Release, SM120,
+CUDA-FA-on, native-on, and KVarN-off. The accepted CUDA library SHA-256 is
+`91bb0b23abb604178f13c2da2ffdac9aa0c033d32ebeea9fe7b1e2848127d5ee`;
+`llama-bench` remained
+`990139351acda670b8867e919401245d1086ade3d553e6a04e4f95c4e611e4d7`.
+The exact dense f634 library and benchmark remained
+`b6a035b252ee1b1765261e2e079967994075065dd08117d6a1e8e02a9553b196`
+and
+`497de09c880d0c0c9539f6e8347ce789023b3de76a25bcf45c211672f43ad1d2`.
+
+The fixed-seed CPU and CUDA compact-versus-dense oracles both passed 4/4 for
+`nb=1,3,17,65`. A fresh two-turn candidate server run reprocessed the exact
+29,398-token request twice and generated 512 deterministic tokens each time.
+Both responses match the existing dense and prior compact standardized output
+SHA-256
+`3c4940d2a701f831ffb639644a42db76ae92b25a1a3bffa705e629f6d679e73a`.
+Peak process VRAM remained 14,504 MiB, `VmRSS` 1,689,624 KiB,
+`VmHWM` 14,589,192 KiB, and `VmLck=0`; this preserves the 28 MiB serving
+saving and is not a new memory-representation claim.
+
+Because production source changed, matching-batch PPL was rerun in a fresh
+locked process with Q8_0/Q8_0, `-c 4096 -b 512 -ub 256`, and four chunks:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-fast-screen-cuda/bin/llama-perplexity \
+   -m QWEN38_MODEL --file CC_CORPUS --ctx-size 4096 \
+   --batch-size 512 --ubatch-size 256 --chunks 4 \
+   --cache-type-k q8_0 --cache-type-v q8_0 \
+   --threads 3 --threads-batch 24 --cpu-range 0-2 \
+   --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+   --n-gpu-layers 999 --split-mode none --main-gpu 0 \
+   --no-kv-offload --kv-cpu-pinned --flash-attn on'
+```
+
+It printed the exact established chunk sequence `1.9315, 2.1279, 2.2498,
+2.1674` and final `PPL = 2.1674 +/- 0.03849`. The log SHA-256 is
+`07ddd3d135f466ad26484f209b9c88786bbbaf54473dd3c90ab8cfadf8c26bb5`;
+there is no PPL increase.
+
+### Ordinary production decode
+
+The 4K and 30K shapes used plain GPU-resident Q8_0/Q8_0 cache with every
+unrelated opt-in omitted. The 128K shape used only the placement necessities
+`--no-kv-offload 1 --kv-cpu-pinned --recurrent-state-offload`; it remains
+CPU-KV composition evidence. All three used clean processes, native llama
+affinity, and ordinary timing outside profilers.
+
+| depth | order / repetitions | dense process means | compact process means | compact effect and 95% CI |
+|---:|---|---|---|---|
+| 4,096 | A B B A A B; 10 samples/process | 49.764924, 49.759558, 49.742826 | 49.828992, 49.819227, 49.803566 | **+0.12359%**, Welch `[+0.06778%, +0.17939%]`; paired `[+0.11217%, +0.13500%]` |
+| 30,000 | A B B A A B; 5 samples/process | 43.960827, 43.869221, 43.864071 | 44.130984, 44.111277, 44.093114 | **+0.48693%**, Welch `[+0.21416%, +0.75970%]`; paired `[+0.26889%, +0.70511%]` |
+| 131,072 | A B B A A B; 5 samples/process after fill | 8.667775, 8.667047, 8.668555 | 8.710877, 8.709349, 8.711315 | **+0.49287%**, Welch `[+0.46835%, +0.51740%]`; paired `[+0.48143%, +0.50432%]` |
+
+The benchmark command shape was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{dense-or-compact}/bin/llama-bench -m QWEN38_MODEL \
+   -p 0 -n 128 -d DEPTH -r REPEATS --no-warmup --progress --kv-memory \
+   -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 PLACEMENT -fa on -b 1024 -ub 512 -o jsonl'
+```
+
+The compact representation's resource deltas are unchanged by this kernel
+loop-limit refinement. The accepted rows retain approximately -4 MiB at 4K,
+-28 MiB at 30K serving, and -120 MiB at 128K. At 128K, dense/compact device
+compute remained 1,042,342,784 / 918,348,672 B and CUDA-host compute
+155,750,432 / 21,270,560 B; pinned CUDA-host context (4,572,315,648 B),
+resident KV (4,590,141,440 B), ordinary host context/compute (zero), and VMM
+live/mapped high-water (14,632,960 / 14,680,064 B) were identical. `VmLck`
+was zero and is not used as a pinned-memory proxy. The 4K and 128K analysis
+JSON hashes are
+`2710a724faf3f11197b7680711f7f3154cbbdc2f8e8926f51ea21db771b346bc`
+and
+`a5dbcde60f72c8f3a1d278f04280f8cca53ad93143c503458a7831b6e6cecc00`.
+
+The production 29,398-token prefill route is F16 MMA, not the modified vector
+consumer. Its representation, selected kernel source, and previously neutral
+four-process prefill evidence are unchanged; no prefill result is relabeled as
+new evidence. The accepted source change cannot phase- or depth-switch into
+that route.
+
+### Source-matched NCU and final compatibility
+
+After the ordinary timing was frozen, one paired full NCU capture directly
+targeted each production `llama-bench` binary. NSYS had already established
+the Q8_0/Q8_0 vector kernel and 2,048 launches for this workload; graph-node
+mode, `--launch-skip 1024`, and `--launch-count 1` selected one matching 128K
+launch. The exact direct-target form was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '/usr/bin/ncu --target-processes application-only --replay-mode kernel \
+   --graph-profiling node --kernel-name-base function \
+   --kernel-name regex:flash_attn_ext_vec --launch-skip 1024 \
+   --launch-count 1 --set full --force-overwrite --export REPORT \
+   --page raw --csv /absolute/path/to/llama-bench \
+   -m QWEN38_MODEL -p 0 -n 128 -d 131072 -r 1 --no-warmup \
+   --progress --kv-memory -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 \
+   --cpu-strict 1 --poll 100 -ngl 999 -sm none -mg 0 \
+   --no-kv-offload 1 --kv-cpu-pinned --recurrent-state-offload \
+   -fa on -b 1024 -ub 512 -o jsonl'
+```
+
+| selected vector launch | dense | accepted compact | compact delta |
+|---|---:|---:|---:|
+| duration | 899.232 us | 859.456 us | **-4.423%** |
+| registers/thread | 254 | 249 | -5 |
+| achieved occupancy | 16.20% | 16.21% | neutral |
+| executed instructions | 254,040,576 | 243,331,296 | **-4.216%** |
+| branch uniformity / divergent targets | 100% / 0 | 99.46% / 1,632 | divergence cost added |
+| DRAM throughput | 490.47 GB/s | 511.73 GB/s | +4.34% |
+
+Compact long-scoreboard and MIO stall ratios rose slightly (1.32 to 1.33 and
+0.60 to 0.72), while short-scoreboard and wait fell (0.34 to 0.17 and 0.62 to
+0.59). The measured causal finding is that retiring masked tail tiles removes
+4.22% of executed instructions and wins despite modest added boundary
+divergence. This explains the SM120 result; it does not prove speed on an
+untested GPU generation. Dense/compact report SHA-256 values are
+`86901d8364722899c42727ace4afa380bbc4d96b709d774c6f42584124cf0e7a`
+and
+`0625d2ee67c8a3bbec0c551f1c37cc6943af6ab7332aa0acae766535aa06ef72`.
+
+Finally, the default KVarN-enabled Release/SM120/CUDA-FA build completed at
+`--parallel 6`. Its CUDA library SHA-256 is
+`f45adc5cc62d2c77e9953c2208a3e777047d8819ab3691cf15ae473cd1161178`;
+the CMake cache remained
+`a771ab7a14336beac002fe07b6df4c21400bb68fc438668b4958f283ec78e532`.
+The same seven adjacent static/CPU guards passed 7/7, and the final CUDA
+compact-versus-dense oracle passed 4/4. Their log hashes are
+`7d4ea82b3678574f4c53cebb27d501aaac0a47db7a087eb00ae5618c35cc935d`
+and
+`81da5c1121b6851b7a1a28f996b01e7a40b2b1b20a66dcc3150cf65c37939b8e`.
+
+All GPU-capable commands were fresh whole processes under
+`flock /tmp/beellama-single-gpu.lock -c`; no command used `taskset`, and NCU
+targeted llama binaries directly. The complete 233-file external artifact
+manifest is `/tmp/beellama-pr7-further-20260822/SHA256SUMS`, SHA-256
+`01d03357defd6f2603fcb1638f4ed5a2a65180b119b7bd90f5d2e80d1e833f4e`.
+
+### Disposition
+
+The local compact vector upper bound is accepted. It is a 12-line refinement
+of the existing compact vector specialization, not a new representation or
+operator. It makes 4K, 30K, and 128K decode strictly positive on the tested
+RTX 5070 Ti while retaining exact PPL/output and the existing depth-scaled
+memory savings. The 30K point is statistically the same performance class as
+the prior accepted compact consumer rather than a claim of an additional
+end-to-end gain; the direct and 128K results show the added tail retirement's
+specific merit. The strongest remaining limitation is cross-generation GPU
+performance, which is still unmeasured and must not be inferred from SM120
+alone.
