@@ -150,6 +150,17 @@ and V body views with control dependencies on their corresponding writes; the
 device-suffix writes remain ordered after attention as before. The current
 protocol explicitly excludes launch-blocking runs from acceptance evidence.
 
+The final committed candidate `e67f3d3b0` passed the normal asynchronous
+prompt-cache lifecycle against the default-off control, exact PPL A/B/A, and
+matched performance/resource A/B/A. Decode improved 8.77% at depth 4K with a
+4096-row window and 15.33% at depth 30K with a 16384-row window; prefill moved
+-0.20% and -2.60% respectively. Peak process VRAM increased 146 MiB and
+622 MiB during decode while allocator-owned host context bytes and RSS remained
+effectively unchanged. Experiment 025 owns the exact setup, caveats, and
+disposition. The remaining publication checks are deliberately narrow: repeat
+the seeded CUDA 256/257 cases on that exact identity and make the explicit PR
+tradeoff decision on the 30K prefill regression.
+
 ## 2026-08-21: GPU-window prototype protocol boundary
 
 The first chunk-residency prototype deliberately keeps the complete standard

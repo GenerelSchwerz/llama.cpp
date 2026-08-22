@@ -76,18 +76,20 @@ command. Live-context source and its preset/generated argument documentation
 remain owned by this PR 8 branch until it lands. See the evidence index for
 the exact PR identities.
 
-The `--kv-gpu-window` source in this experimental worktree is not yet a
-published or measured result. It is intentionally narrower than general
+The `--kv-gpu-window` source in this experimental worktree is a measured,
+default-off PR candidate, not yet part of the published KV base. It is
+intentionally narrower than general
 bounded host-KV staging: it requires standard non-SWA attention, CUDA Flash
 Attention, operation offload, `--no-kv-offload`, `--kv-cpu-pinned`, one
 sequence, a default target context, and no separate precision tail,
 layer-residency policy, or tensor split. Every attention layer must resolve to
 the same CUDA registry device 0. Its first edition requires Q8_0/Q8_0 and
 `256 <= N < n_ctx`, keeps the complete canonical body in pinned host RAM, and
-adds a same-format Q8_0 device suffix; therefore it
-deduplicates repeated host-to-device traffic, not system-RAM allocation. Do not
-add it to the canonical commands below until its build, exactness, state, and
-matched A/B/A gates have passed and an experiment entry owns the evidence.
+adds a same-format Q8_0 device suffix; therefore it deduplicates repeated
+host-to-device traffic, not system-RAM allocation. Experiment 025 owns the
+committed-candidate build, exactness, state, matched A/B/A, and resource
+evidence. Keep it out of the canonical published-base commands until the
+candidate is merged.
 The packed body capacity is bounded by the maximum cold canonical region
 `kv_size - N` and padded to the CUDA execution alignment. The retained suffix
 and its rollback reserve remain separate. This capacity change has focused and

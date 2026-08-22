@@ -5023,8 +5023,8 @@ used the unaffected, always-current DSpark configuration.
 
 ## Experiment 022: mapped-host Q8 GPU-window transport milestone
 
-Status: revised implementation milestone; performance and full correctness
-disposition pending. The exact source base is
+Status: retained implementation milestone; final composed evidence is recorded
+by Experiment 025. The exact source base is
 `f6341a15779eb58fe6ad9e1b890e331c32b676c7`; the candidate is the implementation
 commit containing this entry. This entry is intentionally extended rather than
 duplicated when matched evidence is accepted.
@@ -5055,14 +5055,13 @@ separate follow-up milestone.
 
 ### Disposition
 
-Revised/pending. The transport path is retained for matched A/B/A measurement,
-but no throughput, VRAM, pinned-memory, PPL, deterministic-output, state, or
-prompt-cache claim is accepted yet. Publication requires those gates on a
-committed candidate binary.
+Retained. This milestone's initially pending gates were completed on the final
+composed committed candidate and are reported in Experiment 025.
 
 ## Experiment 023: bypass split GPU-window attention during prompt batches
 
-Status: retained source policy; matched performance disposition pending. The
+Status: retained source policy; final composed evidence is recorded by
+Experiment 025. The
 exact source base is `83826504b`; the candidate is the implementation commit
 containing this entry.
 
@@ -5088,7 +5087,8 @@ prefill penalty. The packed body is still temporarily sized from full
 
 ## Experiment 024: bound packed GPU-window body by the cold region
 
-Status: retained implementation; matched evidence pending. The exact source
+Status: retained implementation; final composed evidence is recorded by
+Experiment 025. The exact source
 base is `7212e8aa4116953ed2c374330dc0e2aa54001c47`; the candidate is the
 implementation commit containing this entry.
 
@@ -5106,15 +5106,14 @@ values are parameter-selection data only and are not results for this commit.
 
 ### Disposition
 
-Retained for final committed-binary A/B/A, PPL, deterministic output,
-state/prompt-cache, and resource validation. No PR performance claim is
-accepted until those gates complete.
+Retained. The final composed committed-binary A/B/A, PPL,
+state/prompt-cache, and resource validation is reported in Experiment 025.
 
 ## Experiment 025: order mapped-body prompt reads after CPU KV writes
 
-Status: retained correctness fix; final committed-binary evidence pending. The
-exact source base is `f3f17db55`; the candidate is the implementation commit
-containing this entry.
+Status: retained correctness fix and measured composed candidate. The exact
+source base is `f3f17db55`; the measured candidate is
+`e67f3d3b0bbab9640f4893c46fd6926e745358f5`.
 
 The multi-token policy from Experiment 023 reads the complete canonical
 mapped-host body with ordinary CUDA attention. Its CPU K/V `SET_ROWS` nodes
@@ -5136,8 +5135,53 @@ sequence against the default-off control. Because that validation preceded
 the candidate commit, it is a gate-closing screen rather than evidence for the
 final identity.
 
+The committed Release CPU/CUDA binary was then validated on an RTX 4070
+(12,282 MiB total, SM 8.9) with an i5-13400F and 31 GiB system RAM. The model
+was `Qwen3.8-27B-UD-IQ2_M.gguf` (10,319,907,904 bytes, SHA-256
+`04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`). Six
+focused CTests passed in both build trees, and the practical offline matrix
+passed 85/85 in both. The exact seeded 256/257 segmented-current cases passed
+2/2 on CPU. A final CUDA invocation could not see a CUDA device and skipped
+the backend, so repeating those two exact cases on the candidate identity is a
+publication follow-up rather than accepted evidence.
+
+The committed asynchronous prompt-cache lifecycle compared window 0 with
+window 4096 over six serialized requests. Both completed five checkpoint hits,
+3,694 planned and committed cache tokens, reuse efficiency 1.0, zero restore
+failures, zero degraded sequences, and zero unexpected prompt work. Every
+candidate cached and recompute sequence matched the corresponding control
+sequence. Both configurations shared one cached-versus-recompute greedy
+boundary mismatch on turn 3; because the candidate matched the control in
+both phases, this is not a candidate regression and is not claimed as an
+absolute cached/oracle exactness pass.
+
+PPL A/B/A used `vendor/miniaudio/miniaudio.h`, `-c 8192 -b 512 -ub 256`, and
+window 0/4096/0. All three runs produced exactly
+`2.4923 +/- 0.06741`, including identical stdout SHA-256
+`8c18ee56cca97e6e28e4a3d79b51e8fc03448cd236a5809c77dc82c2a98269a5`.
+
+Matched `llama-bench` A/B/A used Q8_0/Q8_0, one sequence, pinned CPU KV,
+FlashAttention, `-p 512 -n 64 -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1`, no
+warmup, and identical runtime settings. Means use the two surrounding control
+runs:
+
+| Depth / window | Repetitions | Prefill tok/s (control / candidate) | Decode tok/s (control / candidate) | Candidate delta | Peak process VRAM delta |
+|---|---:|---:|---:|---:|---:|
+| 4,096 / 4,096 | 10 | 939.006 / 937.172 | 15.266 / 16.604 | prefill -0.20%; decode +8.77% | +138 MiB prefill; +146 MiB decode |
+| 30,000 / 16,384 | 5 | 652.799 / 635.802 | 9.387 / 10.826 | prefill -2.60%; decode +15.33% | +564 MiB prefill; +622 MiB decode |
+
+Allocator-owned accelerator-host context bytes were identical between each
+control and candidate, and process RSS was effectively unchanged. The device
+cost is expected: the retained suffix consumes 136 MiB at window 4096 and
+544 MiB at window 16384, with bounded decode packing/transient peaks of about
+10 MiB and 64 MiB respectively. This candidate trades that bounded VRAM and a
+small-to-moderate prefill regression for the measured decode improvement; it
+does not reduce the authoritative pinned-host allocation.
+
 ### Disposition
 
-Retained. Rebuild the committed candidate and repeat the normal asynchronous
-prompt-cache/checkpoint lifecycle before accepting state correctness or any
-performance/resource result for the PR.
+Retained as a default-off draft-PR candidate. The committed asynchronous
+lifecycle, PPL, A/B/A throughput, and resource gates are accepted with the
+shared control/candidate greedy-boundary caveat above. Before publication,
+repeat the exact seeded CUDA 256/257 backend cases on the measured identity and
+decide whether the 30K prefill cost is acceptable for the opt-in tradeoff.
