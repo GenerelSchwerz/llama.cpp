@@ -10449,6 +10449,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true, false, false,
             4, false, 0.0f, -1, 0, true));
     }
+    // A quantized tail below the cutoff that is not FATTN_KQ_STRIDE-aligned.
+    // Such a tail cannot use the scalar indexed-small kernel, so it only works
+    // if the compute stride is padded and the pass is checked against the real
+    // FA route. kv matches the arena stride, which bounds the body map the
+    // canonical-body descriptor writes.
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 256, 4,
+        true, false, 0.0f, 0.0f, GGML_PREC_F32,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, 192, false,
+        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, false, false, true, false, false,
+        4, false, 0.0f, -1, 0, true));
     // Serving-size exact-tail reductions. With a 512-token ubatch, configured
     // tails of 1024 and 2048 use union strides of 1536 and 2560 respectively.
     // A fully covering overlay must still equal one ordinary exact FA pass at

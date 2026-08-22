@@ -435,12 +435,21 @@ static __global__ void k_flash_attn_ext_tail_scatter(
     }
 }
 
-static int64_t ggml_cuda_tail_compute_stride(int64_t logical_stride) {
-    // The direct indexed kernel accepts compact tails as-is. Larger tails use
-    // the upstream FA kernels, whose D=512 path requires a 256-row-aligned KV
-    // extent. Keep that padding graph-local: it must never leak into the
+// The direct indexed kernel consumes scalar F16/BF16 rows, so quantized tails
+// must take the packed upstream route even at the 256-token boundary. Every
+// decision keyed off that boundary has to agree, otherwise a pass can be
+// reported supported and then dispatched with a geometry no kernel accepts.
+static bool ggml_cuda_tail_uses_indexed_small(int64_t tail_stride, ggml_type kt_type, ggml_type vt_type) {
+    return tail_stride <= 256 && !ggml_is_quantized(kt_type) && !ggml_is_quantized(vt_type);
+}
+
+static int64_t ggml_cuda_tail_compute_stride(int64_t logical_stride, ggml_type kt_type, ggml_type vt_type) {
+    // The direct indexed kernel accepts compact tails as-is. Everything else
+    // uses the upstream FA kernels, whose D=512 path requires a 256-row-aligned
+    // KV extent. Keep that padding graph-local: it must never leak into the
     // persistent N+R history allocation or the serialized state.
-    return logical_stride <= 256 ? logical_stride : GGML_PAD(logical_stride, FATTN_KQ_STRIDE);
+    return ggml_cuda_tail_uses_indexed_small(logical_stride, kt_type, vt_type) ?
+        logical_stride : GGML_PAD(logical_stride, FATTN_KQ_STRIDE);
 }
 
 static size_t ggml_cuda_tail_pass_alloc_size(ggml_backend_cuda_context & ctx, ggml_tensor & pass) {
@@ -538,13 +547,10 @@ static void ggml_cuda_flash_attn_ext_tail(ggml_backend_cuda_context & ctx, ggml_
     GGML_ASSERT(history_slots > 0 && history_slots <= kt->ne[1] && vt->ne[1] == kt->ne[1]);
     const bool tail_bodyless = ggml_get_op_params_i32(
             dst, GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS) != 0;
-    // The direct indexed kernel consumes scalar F16/BF16 rows.  Quantized
-    // tails must use the packed path even at the 256-token boundary.
-    const bool indexed_small = tail_stride <= 256 &&
-        !ggml_is_quantized(kt->type) && !ggml_is_quantized(vt->type);
+    const bool indexed_small = ggml_cuda_tail_uses_indexed_small(tail_stride, kt->type, vt->type);
     const int compute_stride = tail_bodyless ?
             int(GGML_PAD(tail_stride, FATTN_KQ_STRIDE)) :
-            int(ggml_cuda_tail_compute_stride(tail_stride));
+            int(ggml_cuda_tail_compute_stride(tail_stride, kt->type, vt->type));
     const size_t n_tail_rows = size_t(q_max)*n_head*n_active;
     const size_t n_body_rows = body_packed ? n_tail_rows : size_t(n_query)*n_head*n_stream;
 

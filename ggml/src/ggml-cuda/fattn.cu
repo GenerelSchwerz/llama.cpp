@@ -651,7 +651,7 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     const ggml_tensor * kt_current = dst->src[10];
     const ggml_tensor * vt_current = dst->src[11];
     const int64_t tail_stride = dst->src[7]->ne[0];
-    const int64_t compute_stride = ggml_cuda_tail_compute_stride(tail_stride);
+    const int64_t compute_stride = ggml_cuda_tail_compute_stride(tail_stride, kt->type, vt->type);
     const int64_t body_map_offset = 6 + tail_stride;
     if (!qo || !rd || qo->ne[0] <= 0 || qo->ne[1] <= 0 ||
             rd->ne[0] < body_map_offset || rd->ne[1] != qo->ne[1]) {
@@ -688,11 +688,12 @@ static bool ggml_cuda_flash_attn_ext_tail_pass_supported(int device, const ggml_
     }
     ggml_cuda_tail_make_contiguous(pass, pass.ne[0], pass.ne[1], qo->ne[0], qo->ne[1], sizeof(float));
     // Compact decode tails up to two native KVarN groups use the direct
-    // indexed-small kernel
-    // below, so they do not need to satisfy the padded upstream FA geometry.
-    // This matters for D512, whose generic FA route requires a 256-token KV
-    // stride even though the direct exact-tail kernel supports 128 tokens.
-    if (tail_stride > 256 &&
+    // indexed-small kernel below, so they do not need to satisfy the padded
+    // upstream FA geometry. This matters for D512, whose generic FA route
+    // requires a 256-token KV stride even though the direct exact-tail kernel
+    // supports 128 tokens. Quantized tails never reach that kernel, so they
+    // must be checked against the real FA route at any stride.
+    if (!ggml_cuda_tail_uses_indexed_small(tail_stride, kt->type, vt->type) &&
             ggml_cuda_get_best_fattn_kernel(device, &pass) == BEST_FATTN_KERNEL_NONE) {
         return false;
     }
