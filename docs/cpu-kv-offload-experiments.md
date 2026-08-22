@@ -5020,3 +5020,459 @@ ubatch-matched MTP protocol (Characterization 025's caveat) to get a
 current-provenance number is future work, not expected to change the
 qualitative finding since this entry's own DSpark half of the pair already
 used the unaffected, always-current DSpark configuration.
+
+## Experiment 022: pool compatible canonical accelerator KV-store staging
+
+Status: retained for draft-PR review by owner decision on 2026-08-22, with
+additional testing required before confidence in merging. The original
+`748c1df5` measurements below remain historical support, not current
+certification. Revalidation at `c2ea686d` reproduced the memory and correctness
+benefits. Its preregistered five-pair 30K decode interval did not close the
+required +/-1% equivalence bound, so strict statistical equivalence remains
+inconclusive; this is not evidence of a regression. The owner explicitly
+accepted that residual uncertainty for review because the point estimate was
+neutral, shorter decode and prefill gates passed, the kernel/copy surface was
+identical, and the VRAM reduction was clear. This acceptance permits an
+unmerged draft PR; it does not relabel the frozen result or certify merging.
+
+### Historical `748c1df5` source identity and change
+
+The exact clean base and candidate parent were
+`748c1df5bad4dae0d1f59f65997cc7e1f3f3125b`, the then-current
+`generel/beellama-kv-cpu-offload` tip after PR 11. The measured candidate's
+source-only dirty fingerprint was
+`5e4da3ca1be8e6791e2ceefa3a9e49ea077b7aa000ef22baed8a9f4d30f759b1`;
+its sole source modification was `src/llama-kv-cache.cpp`, SHA-256
+`615558b809456ba34facd1af6cd2dfa7654ba594edbae02a1edda4052ae4c4a1`.
+This evidence entry was added after measurement and is intentionally outside
+that measured fingerprint.
+
+Previously every compatible host-resident attention layer owned a distinct K
+and V device store-stage tensor. The candidate reuses a stage only when buffer
+type, quantized tensor type, and embedding width all match. K and V have
+separate pools so sibling stores cannot overwrite each other. Heterogeneous
+layouts create additional exact-match pool entries rather than assuming a
+model architecture. Existing backend route probes still decide whether
+staging is legal; GPU-resident, unquantized, transposed-V, and unsupported
+paths remain unchanged.
+
+On the measured Qwen3.8 layout, 16 host-resident attention layers collapse
+from 32 per-layer K/V stages to two compatible pools. At ubatch 512 the logged
+device staging allocation changes from 17.00 MiB to 1.06 MiB, saving 15.94
+MiB. At ubatch 256 the long-context allocator counter changes from 8,912,896
+to 557,056 bytes, saving 8,355,840 bytes (7.96875 MiB).
+
+### Historical `748c1df5` build, model, and protocol
+
+Both trees used clean Release Ninja builds with CUDA 13.3, native CPU,
+FlashAttention, `GGML_CUDA_ARCHITECTURES=120`, the default quant matrix,
+KVarN enabled, and native Q8 FlashAttention explicitly disabled. The GPU was
+an RTX 5070 Ti (15,880 MiB reported, compute capability 12.0); the CPU was an
+Intel Core Ultra 9 285K. The model SHA-256 was
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+
+| Binary | Base SHA-256 | Candidate SHA-256 |
+|---|---|---|
+| `llama-cli` | `1d37e9c685b98a1b899ecfe34c0e22347d93661515314b125ca54e0a2a1fe990` | `3dc4938d47656c2babea8cb89628f7b0a13f6e7078133bdb191c9e1a0a3f7b9a` |
+| `llama-bench` | `75e371b144a2dd6de40d31a258aadefddc275c847fb2f1719b69a3c9022f1a32` | `79a0d7b1c1590cc9795bdba79a92efcab6e82d6348b29c50db03716397738266` |
+| `llama-perplexity` | `17384f96efea194773474ce67ceab8262d9730ca3c03f712eb4d8df6ec3ee7d9` | `d7a494bcbdcd0d44d388ebbea447dfefc30cd6da243faebea126547403633fc4` |
+| `llama-server` | `24db1f8e3a9eea225d63edfa4eafb6e32f70de08f6ebd0c81993dbebce62ea9d` | `fe8820c510eef6d0bdfe7125f01ddc70d880559ed30198172c2bed0aba435964` |
+| `libllama.so` | `adae11db3987cd14f2f9a7dbf97964f01321e25f04d1b95f971fcf79835cbdc3` | `65da76de7bec9feab3df6099f1868809fef064c7aaa962d1869ed21a00f16560` |
+
+The preregistered validation runner internally held the required GPU lock for
+each fresh direct-target process. Its snapshot preserves each exact command:
+
+```bash
+python3 scripts/feature-performance-validation.py run \
+  tmp/store-stage-pool-early.manifest.json --through acceptance --resume
+```
+
+Production stages used native `-C 0x7 --cpu-strict 1`, `--progress`,
+`--kv-memory`, Q8_0 K/V, pinned host KV, and `-b 512 -ub 256`. Unrelated
+live-context, phase-aware, recurrent-state-offload, partial-residency, KV-tail,
+speculation, and native-Q8 paths were disabled or absent. Prefill was 30,000
+tokens with three repetitions per process. Decode was 128 generated tokens at
+depth 30,000 with five in-process repetitions and five balanced clean-process
+A/B pairs after the preregistered adaptive extension.
+
+The quality A/B/A lane used the existing 606 KiB corpus, SHA-256
+`8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`;
+no dataset was downloaded. Its common command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  BUILD/bin/llama-perplexity \
+    -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+    -f /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+    -c 4096 -b 512 -ub 256 --chunks 4 -t 3 -tb 24 \
+    --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 \
+    -ngl 999 -sm none -mg 0 --flash-attn on --no-kv-offload \
+    --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+    --no-phase-aware-workspace --no-live-context-workspace \
+    --cache-type-k q8_0 --cache-type-v q8_0
+'
+```
+
+The maintained exactness runner owned the whole locked GPU lifecycle for the
+greedy 1K, stochastic 5K MTP-6, and 30K-prefill/next-turn matrices:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  python3 scripts/mtp-exactness.py tmp/store-stage-mtp-exactness.json
+'
+flock /tmp/beellama-single-gpu.lock -c '
+  python3 scripts/mtp-exactness.py tmp/store-stage-lifecycle-32k.json
+'
+```
+
+NSYS directly targeted each `llama-bench` binary, with no `taskset`, shell
+target, or all-process wrapper. The exact base command was:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  /usr/bin/nsys profile \
+    --output /tmp/beellama-kv-store-stage-pool-validation/nsys-r1/base \
+    --force-overwrite=true --trace=cuda,nvtx,osrt --sample=none \
+    --cpuctxsw=none --stats=false \
+    /home/gencoolpc/beellama-kv-store-stage-base/build-cuda-store-stage/bin/llama-bench \
+    -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+    -p 128 -n 16 -d 4096 -r 1 -b 512 -ub 256 -t 3 \
+    -C 0x7 --cpu-strict 1 --poll 100 -ngl 999 -sm none -mg 0 \
+    -nkvo 1 --kv-cpu-pinned --kv-gpu-layers 0 -fa on \
+    -ctk q8_0 -ctv q8_0 --no-warmup --progress -o jsonl
+'
+```
+
+The candidate command changed only executable and report path. NCU replay was
+not warranted: this is allocation ownership, NSYS showed identical kernel and
+transfer surfaces, and unprofiled repeated lanes own the timing claims.
+
+### Historical `748c1df5` correctness and quality
+
+- The deterministic CLI outputs had identical SHA-256
+  `6027f45fff7e81501a1314770c2aed67ac1cf18e9a9d8112671aa72538f39a78`.
+- All three PPL processes produced chunks
+  `1.9315, 2.1279, 2.2498, 2.1674` and final
+  `2.1674 +/- 0.03849`. There is no observed perplexity increase.
+- Greedy target-plus-MTP matched all 1,000 token IDs and response bytes, hash
+  `842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`.
+- Stochastic temperature-0.8 target-plus-MTP matched all 5,000 token IDs and
+  bytes, hash
+  `1a19d5ac5189b1a9d7822833794aaa9e0a4585b4e143f88917dc066ce8924b1c`.
+  Draft attempts/accepts were identical at 2,435/2,077.
+- A 30,102-token prefill and two same-server independent turns matched every
+  token, prompt ID, request semantic, and response byte. Aggregate token hash:
+  `e1456f0e9d9b51c1dfaa5e96f84860b17b35b9fd8b51be2a89d85d659be94551`.
+- Focused allocator/argument tests passed and `git diff --check` was clean.
+
+### Historical `748c1df5` VRAM, host memory, and CUDA VMM
+
+| Clean-process point | Base | Candidate | Delta |
+|---|---:|---:|---:|
+| ub512 server startup | 13,644 MiB | 13,628 MiB | **-16 MiB** |
+| ub512 30K prefill peak | 13,658 MiB | 13,642 MiB | **-16 MiB** |
+| ub512 first short next turn | 13,662 MiB | 13,646 MiB | **-16 MiB** |
+| ub512 repeated next turn | 13,662 MiB | 13,646 MiB | **-16 MiB** |
+| ub512 MTP-6 1K startup / peak | 14,696 / 14,722 MiB | 14,680 / 14,706 MiB | **-16 / -16 MiB** |
+| ub512 MTP-6 5K startup / peak | 14,724 / 14,750 MiB | 14,708 / 14,734 MiB | **-16 / -16 MiB** |
+| ub256 long-depth stage buffer | 8,912,896 B | 557,056 B | **-8,355,840 B** |
+
+Pinned `CUDA_Host` KV was exactly 1,088.00 MiB in both lifecycle servers and
+CUDA-host compute was exactly 52.28 MiB. Peak ordinary `RssAnon` was 718,772
+versus 718,728 KiB (-44 KiB, noise), `RssShmem` was exactly 1,179,940 KiB,
+and `VmLck` was zero. At the 30K bench shape, allocator-classified
+accelerator-host context/compute bytes were exactly 1,051,721,728/31,605,792
+in both, and ordinary-host context/compute were 156,893,184/zero. The saving
+does not move storage into pinned or ordinary host RAM.
+
+CUDA VMM was identical: 10,485,760 mapped-high-water and 9,619,456
+live-high-water bytes in the representative ub256 lane, with one active pool
+after workload and none after context teardown. Pooling removes persistent
+context-buffer bytes; it does not alter transient-pool growth.
+
+A fully GPU-resident Q8 control proved the branch is inactive outside host
+staging. Both binaries reported byte-identical context, compute, KV-resident,
+device-used, and VMM counters, no staging log, and 48.138608 versus 48.138616
+t/s in the single-pair smoke.
+
+### Historical `748c1df5` performance and profiler result
+
+| Production lane | Candidate geometric change | 95% paired interval | Decision |
+|---|---:|---:|---|
+| 30K prefill, 3 balanced pairs | -0.0850% | [-0.7849%, +0.6197%] | equivalent within +/-1% |
+| 30K decode, 5 balanced pairs | +0.2953% | [-0.3247%, +0.9192%] | equivalent within +/-1% |
+
+The first three decode pairs were inconclusive, so the preregistered rule
+extended only that lane. The final point estimate is positive; there is no
+measured decode regression. MTP-6 5K was 58.0832 versus 58.0458 t/s (-0.0645%,
+single A/B) with identical acceptance; 1K differed by -0.0075%.
+
+Direct-target NSYS contained the same 48 kernel names and exactly 12,610
+launches. H2D was identical at 5,264 operations / 22,585.729 MB and D2H at
+4,249 operations / 13,685.292 MB. Only the expected initialization signature
+changed: two memsets totaled 17.826 MB for base and 1.114 MB for candidate.
+This supports the causal interpretation that the result removes redundant
+storage without changing compute or transfer work.
+
+### Historical `748c1df5` disposition and evidence
+
+The stale-base investigation recommended retaining the candidate. It was an
+upstream-style capability/layout refinement,
+not a public option or compile-time dependency. In the qualified pinned-host
+standard-Q8 layout it lowers startup, prefill, decode-resident, and next-turn
+VRAM with no extra host memory, VMM high-water, output/PPL change, or measured
+performance regression at that source identity. GPU KV was unchanged. Runtime coverage was limited to
+the available homogeneous Qwen3.8 Q8 CUDA model; other models/backends remain
+separate qualification lanes even though the pool fails closed by exact
+buffer/type/shape compatibility. This historical recommendation is superseded
+by the canonical revalidation and final disposition below.
+
+| Evidence | Path | SHA-256 |
+|---|---|---|
+| runner manifest / provenance / summary | `/tmp/beellama-kv-store-stage-pool-validation/artifacts/canonical-kv-store-stage-pool-748c-dirty-r1-ce9aef4ae52a` | `8a0746bc3ebee5947ae4a013a19f437dc20f177cf5984753fe191855379162cc` / `f06d89d4d8aa9e52d99c946883508e48ecf45f8cb35322f72fa53d23e09eea4c` / `d2fe2eaef5c41d6292d91e7cf460667a431736565975a5e6db0470466fca8bcc` |
+| PPL A/B/A logs | `/tmp/beellama-kv-store-stage-pool-validation/perplexity-r1` | `3df7b0c2d30a42b3c9cdc1ba402f941184c5790b61d1dedf7ab00d6281ac177e` / `d2b0baba4508bdab7c4378537f13fcd9d76a4def95af7520aa45eba5263345e6` / `a2612040777924691b759605fdb6239c9fc082bb4c91ef18d9ce722d37df5016` |
+| 1K MTP manifest / provenance / comparisons / summary | `/tmp/beellama-kv-store-stage-pool-validation/mtp-exactness-1k-r1` | `534dd3f06e03cee6acd647d30ba70050a86661acf35e7ad1732a09d090383c5e` / `adeb7ae6b04b39557e6040c0298715bad655692dfafc967efcce90337b76a67c` / `0ac34ba373ab3add80f864019ddcdf5cf2decaa4d7f704b18609db9403110bc2` / `42e5ca62e2fcaa8b0e3c6e6bf9226b710223e6b26b7a642af31be9b02cda7e18` |
+| 5K MTP manifest / provenance / comparisons / summary | `/tmp/beellama-kv-store-stage-pool-validation/mtp-exactness-5k-r1` | `7f0a793ab1fbea89ae8d43cdc73fec26c1ba3d45845ac5c0743e63adc0cde02c` / `c064b41240f7aba941570233a39a33038bf042e5f9d115fcc6b6080172df32a7` / `59ce69ea615234373fa10e62ce61c00942ae5e2ddf304491ae2dd539416af710` / `86cb6c58d247258b1403f05984afb364808b9c31a1db95199d87d6efcf0a95c9` |
+| 32K lifecycle manifest / provenance / comparisons / summary | `/tmp/beellama-kv-store-stage-pool-validation/lifecycle-32k-r1` | `23f5105973900677a39b6c756bf6838bc4bf86dcb8a3a2833b4df36d67cbd6ee` / `e09fefb7e761a609c4d34b5119ba1d7c388acbd7727119f7779a4a0abdf01872` / `062db0d2c9a704506f0f982992c9912e5cee0fec5a87154df02999e34884a2f2` / `a48a7860a9b6f68b5b85cbf18600f407bd82ba7e1108823301b12c00867e1acd` |
+| NSYS base / candidate | `/tmp/beellama-kv-store-stage-pool-validation/nsys-r1` | `1d418be99bf5f5f0a36d5098a71f2fbd39e3b023782f70e1359d68c62a5caae1` / `63861acbf1cd67d1fdbcea739d206239765ae7d2de08bc6352a2d214a26273d6` |
+
+### Canonical `c2ea686d` revalidation and PR disposition
+
+The candidate was rebased additively from `748c1df5bad4dae0d1f59f65997cc7e1f3f3125b`
+to the exact current KV-offload commit
+`c2ea686d662ef36e0f6dcbef9195309b505cb422`. The clean reference source was
+`/home/gencoolpc/beellama-minimal-cuda-default` at that commit. Its registered
+source fingerprint was
+`ce80e8d7485204b2c29e7e0ac86abd70b24f10f73f40c4b8ce62987b3c5f6fa8`
+(3,874 files). The measured candidate used the same parent and registered dirty
+fingerprint
+`13fac8f7faaaf65980be0d19373847bba8d94f9ad16be70315f4fa8b5dc37e8a`
+(3,877 files). Documentation added after measurement was outside that
+fingerprint.
+
+The draft PR is based on
+`31cef2845a7efdfbf322b94435f69256aeb2ef33`, which is `c2ea686d` plus the
+tooling-only feature-performance-validation PR 13 merge. That intervening
+delta changes only validation scripts and their documentation/tests; it does
+not touch KV-cache production source, this experiment ledger, or the focused
+pooling-test registration. The c2 GPU evidence therefore remains evidence for
+the identical production change, while the published PR source is identified
+separately and receives a fresh non-GPU build/test check.
+
+On the `31cef284` publication base, a Release CPU build with `GGML_CUDA=OFF`,
+`GGML_NATIVE=ON`, `GGML_CUDA_KVARN=OFF`, tests enabled, server disabled, and
+`LLAMA_CURL=OFF` compiled both the production `llama` library and
+`test-kv-store-stage-pool`. The focused command shown below then passed 4/4 in
+12.57 seconds (`test-feature-performance-validation`, `test-std-kv-tail-static`,
+the pool static test, and the pool graph test). No additional GPU validation
+was run for publication; the exact c2 GPU artifacts remain the applicable
+evidence and the gaps below remain open.
+
+The canonicalized implementation pooled only an exact
+`{K-or-V side, backend buffer type, quantized element type, embedding width}`
+match within one cache context. The existing route probe still required a
+persistent host tensor, accelerator layer, non-transposed quantized layout,
+and backend support for both direct quantized store and staged F32 conversion.
+There was no architecture name, public flag, environment variable, optional
+dependency, KVarN/native-Q8 coupling, precision change, or cache-format change.
+GPU KV, CPU layers, unquantized layouts, transposed V, compact/native exact
+tails, and unsupported probes retained the existing path.
+
+The lifetime audit found no unsafe sharing boundary: the scheduler expands a
+stage copy and its consuming `SET_ROWS` consecutively and submits graph splits
+in order; reuse begins only at a later layer. The pool belonged to one cache
+context, so slots, parallel contexts, target/draft contexts, and devices could
+not share it. The exact buffer-type key separated devices and heterogeneous
+backends; type and width separated quantized layouts; K and V remained distinct;
+the stage row count covered the configured maximum ubatch and fused probe
+geometry; exact tails consumed the staged body before their separate update.
+These conclusions were covered by a small CPU graph test plus static selector
+and fallback assertions before GPU work. The final focused candidate command
+passed all four selected tests:
+
+```bash
+ctest --test-dir build-store-stage-pool-c2-kvarn-off --output-on-failure \
+  -R 'test-(feature-performance-validation|std-kv-tail-static|kv-store-stage-pool-static|kv-store-stage-pool)$'
+```
+
+The result was 4/4 passed in 9.78 seconds. The broader focused CUDA test set
+also passed except `test-upstream-merge-keepers-static`; the exact clean
+`c2ea686d` reference failed the same assertion because that test expects a
+literal phrase absent from canonical `AGENTS.md`, so it was not attributed to
+this candidate and no unrelated keeper text was changed.
+
+Both Release builds were configured under `/tmp/beellama-cuda-build.lock` and
+built with at most 12 jobs. The only source/build-directory substitutions in
+the two invocations were `SOURCE` and `BUILD`:
+
+```bash
+flock /tmp/beellama-cuda-build.lock -c '
+  cmake -S SOURCE -B BUILD -G Ninja -DGGML_CUDA=ON -DGGML_NATIVE=ON \
+    -DGGML_CUDA_FA=ON -DGGML_CUDA_KVARN=OFF \
+    -DGGML_CUDA_FA_ALL_QUANTS=OFF -DCMAKE_CUDA_ARCHITECTURES=120 \
+    -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF \
+    -DCMAKE_BUILD_TYPE=Release &&
+  cmake --build BUILD --parallel 12
+'
+```
+
+The reference/candidate CMake-cache SHA-256 values were respectively
+`ea9917bfd43cdfcf1177bd9e645f480c0c7194aeb1bd1c8b5028c9e7242c0878`
+and `86b97786d3259ac6f8768ce32dc4a0f3991cd5bc41b97e71ad25d578baaf44d9`.
+KVarN was explicitly off in both; this was the minimal standard-Q8 lane.
+
+| Binary | Canonical `c2ea686d` | Measured candidate |
+|---|---|---|
+| `llama-cli` | `9f94beb840d952cb75641534701bda815f2b1f09aab62b25c2450ad0580e095c` | `b6b462dcb04aaca958110c8b2c5d260a260c63a4f40a1e0a27af07a99004c607` |
+| `llama-bench` | `d76d7a3f8bcbf6511c93dd03c691fcde7d649f9f25022ab4fef68c202926429e` | `06d5cd9519b6163d171dbece88992687326819a0065553a2744b8f5d95656569` |
+| `llama-perplexity` | `2ef14a420d3c91b176ab8580671537489164d9c276f6aca28d1a988335194d2d` | `3b743de44b689a8cb6a9650c6ee3fe078441bfdf508b76d6a26d384e28ba58ce` |
+| `llama-server` | `26cf3d242e73eafb0df70b2e81c5fdbd5ae46e79d0b80e290b871da4e34cd381` | `0bd4c5bb1463f83d323deb0ef18940e8ae114012bd9bf63f40f904604a0b8dd5` |
+
+All GPU children were fresh direct processes and the runner preserved each
+fully quoted whole-lifecycle command as
+`flock /tmp/beellama-single-gpu.lock -c COMMAND`. They used native llama
+affinity (`-C 0x7 --cpu-strict 1` for `llama-bench`, corresponding
+`--cpu-range` controls for common tools), progress, the same model and model
+SHA-256 as above, Q8_0 K/V, pinned host KV, `-b 512 -ub 256`, and disabled
+KVarN, phase-aware, and live-context feature lanes. The main registered run was:
+
+```bash
+python3 scripts/feature-performance-validation.py run \
+  tmp/store-stage-pool-c2.manifest.json --through acceptance
+```
+
+Its immutable R2 snapshot had manifest identity
+`c3df1c007dd2` and provenance identity
+`979d4d43ac50312c54a27cd30c63da53bfe415d9c06f8dff10780d0e40daba32`.
+R4 independently froze manifest SHA-256
+`83842cd336f539728c91ed6a12e8aa00d9e1699923455e726e695f7e46567b98`
+and provenance identity
+`698b1b3adf120b9a18999fdf1263dd44defe855d000bcd6013e754b8f8989f05`
+before its lower-variance 4K repetitions. Thresholds remained fixed at a 1%
+regression/equivalence bound, with three balanced pairs extended to five only
+when inconclusive.
+
+Current valid results were:
+
+- Deterministic 32-token output was byte-identical, SHA-256
+  `6027f45fff7e81501a1314770c2aed67ac1cf18e9a9d8112671aa72538f39a78`.
+- Matching-batch PPL A/candidate/A printed the same four chunks
+  `1.9315, 2.1279, 2.2498, 2.1674` and final
+  `2.1674 +/- 0.03849`; no increase was printed.
+- A target-plus-MTP-6 1K interaction matched all token IDs and bytes, hash
+  `842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`,
+  and attempts/accepts were identical at 470/428. Peak process VRAM was
+  14,596 versus 14,586 MiB.
+- A 30,102-token prefill, 32-token next turn, and repeated next turn matched
+  exactly, aggregate token SHA-256
+  `74611f23d6c40cf912d6cadf246d52d9450ef48ade47026e41e894172fac17da`.
+  Startup/prefill/next-turn VRAM was 13,644/13,658/13,662 MiB for canonical
+  and 13,628/13,642/13,646 MiB for the candidate, a consistent 16 MiB saving.
+- Pinned `CUDA_Host` KV and compute were exactly 1,088.00 and 52.28 MiB in
+  both lifecycle servers. Peak ordinary `RssAnon` was 718,420 versus 720,372
+  KiB (a +1,952 KiB single-process difference), `RssShmem` was exactly
+  1,179,940 KiB, and `VmLck` was zero. W02 allocator telemetry likewise kept
+  accelerator-host context and ordinary-host context identical at 151,519,232
+  and 156,893,184 bytes. No device saving was displaced into classified host
+  storage.
+- W02 VMM on/off/on reproduction was identical: the on runs reached 9,619,456
+  live and 10,485,760 mapped bytes at prefill, then 421,120/2,097,152 at
+  decode; all VMM fields were zero when disabled. The device context buffer
+  fell from 8,912,896 to 557,056 bytes. A fully GPU-resident standard-Q8
+  control remained unchanged.
+- R2 five-pair 30K prefill was equivalent at -0.0725%, 95% interval
+  [-0.4343%, +0.2906%]. R4 five-pair 4K decode, with five fixed 128-token
+  repetitions per clean process, was equivalent at +0.0382%, 95% interval
+  [-0.8249%, +0.9089%]. An earlier valid one-repetition R3 4K screen was
+  superseded by R4, not discarded.
+- R2 five-pair 30K decode had a near-zero +0.0505% point estimate, but its
+  95% interval was [-1.0606%, +1.1740%]. The registered report therefore
+  states `acceptance_unresolved`, with final long-context acceptance false.
+
+One direct-target Nsight Systems 2026.1.3 profile per binary used:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  /usr/bin/nsys profile --trace=cuda,nvtx,osrt --sample=none \
+    --cpuctxsw=none --cuda-memory-usage=true \
+    --cuda-graph-trace=node:host-only --output REPORT --force-overwrite=true \
+    BUILD/bin/llama-bench -m MODEL -p 128 -n 16 -d 4096 -r 1 \
+    -b 512 -ub 256 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+    -ngl 999 -sm none -mg 0 -nkvo 1 --kv-cpu-pinned \
+    --kv-gpu-layers 0 -fa on -ctk q8_0 -ctv q8_0 \
+    --no-warmup --progress -o jsonl
+'
+```
+
+The profiles had identical complete kernel signature
+`b8ef141e56008598baea34b92e5dc61606c6ce080461104380b9f036b9ca45e6`,
+copy signature
+`439d1348a565aaf9ec07c4ffdcfab45b8f2c01e27272dde4793e75c5d5b0e18a`,
+and graph-kernel signature
+`a713e09531fa4d939443b4033230ee99a2f12fc488743ced2023294db0abdebe`.
+Both contained 69,644 kernel launches, 57,034 graph kernel launches, 11,951
+CUDA graph-node events, 5,264 H2D operations / 22,585.729 MB, and 4,249 D2H
+operations / 13,685.292 MB. Allocation/deallocation event counts were also
+identical at 360/16. The expected lifetime changed from two 8,912,896-byte
+allocations/memsets to two 557,056-byte allocations/memsets, removing
+8,355,840 bytes per allocation. NSYS found no kernel or copy-surface change
+and the repeated lanes found no stable regression, so the preregistered NCU
+condition was not met and NCU was not run.
+
+The attempted R4 30K repeat was externally interrupted during its first
+baseline and is invalid; no throughput or memory metric from it is retained.
+Partial run specifications and the final `returncode: -15`, `metric_value:
+null` result remain only as forensic artifacts. A parent SIGINT briefly left
+`llama-bench` orphaned after the GPU lock was released; the coordinator
+terminated it. This exposed a validation-toolkit cleanup edge case, but that
+tooling is not owned or modified by this feature branch.
+
+The current artifact inventory is:
+
+| Evidence | Path | SHA-256 |
+|---|---|---|
+| R2 manifest / provenance / summary | `/tmp/beellama-kv-store-stage-pool-c2-validation/toolkit-r2/canonical-kv-store-stage-pool-c2-dirty-r2-c3df1c007dd2` | `6df1ffd9f5d04140c185dbc6d3d8b87d9a7d515759a43cfb67328706c003b159` / `2669a5aa3c638274c2c1a3ebde4bdf0c2a326a56273b09f049f57c782351a552` / `3be5c8a71120326800d2cedd141208a24e8031dc7cc49a1498342c728d4fa633` |
+| R4 manifest / provenance / state | `/tmp/beellama-kv-store-stage-pool-c2-validation/toolkit-r4-r5-decode/canonical-kv-store-stage-pool-c2-dirty-r4-r5-decode-83842cd336f5` | `9aa4a093cf2ae6896de944e025ed9c6d09a11d4eccf0685f405c7cf26ea8f269` / `a44125a882ec36fef4ea6705d98464cb120a349113fadee72e2bf6842fa312a5` / `de26277484808792ef63e6fec279289f9ac982279880a6ea747bb2d303a96719` |
+| PPL A / candidate / A | `/tmp/beellama-kv-store-stage-pool-c2-validation/perplexity-r1` | `98648d63ce66dc8a1a486a1c1d39d70c87052f98336d25e0f7afd5794e8e2c31` / `fe392f27b425ce6b3163784fff20ae1df50bf164d1e4c60b589c3ef756e2b932` / `05f1de60cf10d54759e6416d9eafd588723924b253e47b50036a3c6883f2e94d` |
+| MTP manifest / provenance / comparisons / summary | `/tmp/beellama-kv-store-stage-pool-c2-validation/mtp-exactness-1k-r1` | `948f0f46674fa91df2d0f08108e7648252ae1c81a16114a65086f24c00f6ddcf` / `589ca5f97240270e331ce2b18db42f153faed12b4961905cde5030ea60fc3e3f` / `01a82a1522eeb3fe64c4bdee5d72940df76feff10214b54e26664d475722a1d3` / `74bf8c604b0caf6056f80848aab0cc8675a98d695700e1f56fe039e11864094a` |
+| Lifecycle manifest / provenance / comparisons / summary | `/tmp/beellama-kv-store-stage-pool-c2-validation/lifecycle-30k-r1` | `f70d0be4a6882bd70dcb91f013750c20681aa6314e5b688c45a059bdfc0352e7` / `86b847649595ac86248272005149c3e0e1308245bab875e8f6ab3942984ea78a` / `7e6530df6b92f2df5abc722e384bf0fbb673dbdd59f3cf56b30d6267b3897219` / `f3da67b5a2bfd590aded10d5cc86a471b299ffc84f205ab35257b80835711197` |
+| W02 on/off/on logs | `/tmp/beellama-kv-store-stage-pool-c2-validation/w02-r1` | six per-file hashes are preserved with the logs; no aggregate file was synthesized |
+| NSYS canonical / candidate reports | `/tmp/beellama-kv-store-stage-pool-c2-validation/nsys-r1` | `a5e11c752411448843e7103d0d7ee78cf136d730cac4448399d354dfdf8730d3` / `7c9ae93053c6dc11dd7b88459d59084f6c878eae08f9fe4c26f3dcc0943538e7` |
+
+Final disposition: **retained for an unmerged draft PR, not merge-certified**.
+The candidate is exact, isolated, capability/layout based, materially reduces
+device context memory, and passed the focused, PPL, MTP, lifecycle, VMM,
+prefill, 4K decode, and profiler gates. The only completed preregistered 30K
+decode acceptance set was unresolved after its maximum five pairs, and its
+frozen policy correctly records a failed acceptance gate. Its near-zero point
+estimate does not support a negative performance finding, while the interval
+is too wide to certify equivalence. The owner accepts that distinction for PR
+review; the original result remains `acceptance_unresolved`.
+
+Before confidence in merging, complete at least these remaining gates:
+
+1. Preregister and complete a fresh lower-variance 30K decode comparison using
+   the now-merged interrupt-safe toolkit, preferably five fixed 128-token
+   repetitions per clean process and the unchanged +/-1% equivalence bound.
+   Do not reuse the externally interrupted R4 attempt or change thresholds
+   after seeing samples.
+2. Run exactness with more than one parallel slot and more than one KV stream,
+   including interleaved slot activity and CUDA graph replay, to exercise the
+   shared-backing lifetime under the highest-risk scheduler shape.
+3. Exercise a multi-device/tensor-split configuration when suitable hardware
+   is available. Confirm that distinct backend buffer types receive distinct
+   pools and that allocation/copy ordering remains correct across scheduler
+   splits.
+4. Add or run heterogeneous-layout coverage with differing per-layer K/V
+   types or embedding widths, plus partial final ubatches. Confirm exact-match
+   pooling and separate fallback allocations rather than cross-layout reuse.
+5. Recheck transposed V, standard exact-tail/compact-tail interaction, and an
+   unsupported conversion probe. These should retain the existing path or fail
+   closed without partially pooled state.
+6. Qualify HIP and Vulkan independently before claiming cross-backend runtime
+   confidence. Until then, describe the runtime evidence as CUDA-specific even
+   though selection is backend-capability based.
+
+The minimum merge-confidence closure is items 1 and 2 plus focused review of
+the scheduler-ordering argument. Items 3 through 6 may be explicit platform
+limitations if hardware is unavailable, but must not be presented as tested.

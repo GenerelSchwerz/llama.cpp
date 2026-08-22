@@ -46,6 +46,12 @@ if (Python3_Interpreter_FOUND)
     set_property(TEST test-vmm-allocation-telemetry-static PROPERTY LABELS cuda)
 
     add_test(
+        NAME test-kv-store-stage-pool-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-kv-store-stage-pool-static.py)
+    set_property(TEST test-kv-store-stage-pool-static PROPERTY LABELS main)
+
+    add_test(
         NAME test-removed-cache-types-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-removed-cache-types-static.py)
@@ -405,6 +411,12 @@ llama_build_and_test(test-kv-cache-placement.cpp ../src/llama-kv-cache-placement
 target_include_directories(test-kv-cache-placement PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-std-kv-tail-graph.cpp ../src/llama-kv-cache-tail.cpp)
 target_include_directories(test-std-kv-tail-graph PRIVATE ${PROJECT_SOURCE_DIR}/src)
+
+add_executable(test-kv-store-stage-pool test-kv-store-stage-pool.cpp)
+target_include_directories(test-kv-store-stage-pool PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-kv-store-stage-pool PRIVATE ggml)
+add_test(NAME test-kv-store-stage-pool WORKING_DIRECTORY . COMMAND $<TARGET_FILE:test-kv-store-stage-pool>)
+set_property(TEST test-kv-store-stage-pool PROPERTY LABELS main)
 
 add_executable(test-kvarn test-kvarn.cpp ../src/llama-kvarn.cpp)
 target_include_directories(test-kvarn PRIVATE ${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/include)

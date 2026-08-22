@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-store-stage.h"
 #include "llama-kv-cache-update.h"
 
 #include "llama-impl.h"
@@ -878,6 +879,18 @@ llama_kv_cache::llama_kv_cache(
     uint64_t store_stage_bytes = 0;
     uint32_t store_stage_layers = 0;
 
+    struct store_stage_entry {
+        llama_kv_store_stage_key key;
+        ggml_tensor * tensor;
+    };
+
+    // A cache context owns this pool for its full lifetime. build_attn() expands
+    // each stage CPY and its consuming host SET_ROWS consecutively, and the
+    // backend scheduler submits those splits in graph order. A later layer may
+    // therefore reuse compatible backing after the consumer has transferred it;
+    // K and V remain distinct key domains because both stores are independent.
+    std::vector<store_stage_entry> store_stages;
+
     const auto store_stage_buft = [&](uint32_t il, ggml_type type, int64_t n_embd) {
         if (n_ubatch == 0 || !ggml_is_quantized(type)) {
             return (ggml_backend_buffer_type_t) nullptr;
@@ -910,6 +923,31 @@ llama_kv_cache::llama_kv_cache(
         const bool staged_store = ggml_backend_dev_supports_op(
                 dev, ggml_cpy(probe.get(), src, dst));
         return direct_store && staged_store ? buft : nullptr;
+    };
+
+    const auto pooled_store_stage = [&](llama_kv_store_stage_side side,
+                                        ggml_backend_buffer_type_t buft,
+                                        ggml_type type,
+                                        int64_t n_embd) {
+        const llama_kv_store_stage_key key { side, buft, type, n_embd };
+        for (const auto & entry : store_stages) {
+            if (entry.key == key) {
+                return entry.tensor;
+            }
+        }
+
+        const char * side_name = side == llama_kv_store_stage_side::K ? "k" : "v";
+        auto * store_ctx = ctx_for_buft(buft);
+        if (!store_ctx) {
+            throw std::runtime_error(format(
+                    "failed to create %s-cache store staging context", side_name));
+        }
+
+        auto * stage = ggml_new_tensor_2d(store_ctx, type, n_embd, store_stage_rows);
+        ggml_format_name(stage, "cache_%s_store_stage_pool_%zu", side_name, store_stages.size());
+        store_stage_bytes += ggml_nbytes(stage);
+        store_stages.push_back({ key, stage });
+        return stage;
     };
 
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -1018,24 +1056,14 @@ llama_kv_cache::llama_kv_cache(
                         il, ggml_backend_dev_name(layer_dev), ggml_type_name(layer_type_v)));
             }
             if (k_store_buft) {
-                auto * store_ctx = ctx_for_buft(k_store_buft);
-                if (!store_ctx) {
-                    throw std::runtime_error("failed to create K-cache store staging context");
-                }
-                k_store_stage = ggml_new_tensor_2d(
-                        store_ctx, layer_type_k, n_embd_k_gqa, store_stage_rows);
-                ggml_format_name(k_store_stage, "cache_k_store_stage_l%d", il);
-                store_stage_bytes += ggml_nbytes(k_store_stage);
+                k_store_stage = pooled_store_stage(
+                        llama_kv_store_stage_side::K,
+                        k_store_buft, layer_type_k, n_embd_k_gqa);
             }
             if (v_store_buft) {
-                auto * store_ctx = ctx_for_buft(v_store_buft);
-                if (!store_ctx) {
-                    throw std::runtime_error("failed to create V-cache store staging context");
-                }
-                v_store_stage = ggml_new_tensor_2d(
-                        store_ctx, layer_type_v, n_embd_v_gqa, store_stage_rows);
-                ggml_format_name(v_store_stage, "cache_v_store_stage_l%d", il);
-                store_stage_bytes += ggml_nbytes(v_store_stage);
+                v_store_stage = pooled_store_stage(
+                        llama_kv_store_stage_side::V,
+                        v_store_buft, layer_type_v, n_embd_v_gqa);
             }
             if (k_store_stage || v_store_stage) {
                 ++store_stage_layers;
@@ -1117,7 +1145,8 @@ llama_kv_cache::llama_kv_cache(
 
     if (store_stage_layers > 0) {
         LLAMA_LOG_INFO("%s: canonical accelerator KV store staging: %u host-resident layer(s), "
-                "%u rows, %.2f MiB device memory\n", __func__, store_stage_layers, store_stage_rows,
+                "%zu compatible K/V pool(s), %u rows, %.2f MiB device memory\n", __func__,
+                store_stage_layers, store_stages.size(), store_stage_rows,
                 store_stage_bytes/1024.0/1024.0);
     }
 
