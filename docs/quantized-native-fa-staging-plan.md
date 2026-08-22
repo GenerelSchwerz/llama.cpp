@@ -10,6 +10,94 @@ loadable cache type now beats the materializing path at 32K prefill, from
 `+0.52%` (`q6_0`) to `+7.32%` (`q2_1`). The loader itself is synchronous, and
 `nstages` is pinned to `0` for quantized K/V.
 
+## Revisions after the pair-matrix and configuration work
+
+This plan was written against a kernel that specialized V at compile time and an
+untested assumption that the configuration table was worth retuning. Both
+changed, and both change this plan.
+
+### The configuration is fixed, and the tables below still hold
+
+The quantized-specific configuration sweep was run and **rejected**: every
+deviation from the inherited F16 table lost, so `nthreads = 128`,
+`occupancy = 2`, `nbatch_fa = 32`, `nbatch_K2 = nbatch_V2 = 128` and
+`Q_in_reg = true` are retained unchanged for the production `D = 256` 8x8 shape.
+The resource tables in this document were computed against exactly those values,
+so they need no recalculation. The prerequisite "do not start pipeline
+implementation while the winning configuration is unresolved" is satisfied: the
+winner is the incumbent.
+
+### Occupancy 2 -> 1 now has a measured price, and it is disqualifying
+
+Two separate sweep arms dropped the production shape to one block per SM, one
+explicitly via `occupancy = 1` and one implicitly by setting `Q_in_reg = false`
+so that shared memory became `Q + KV + mask` instead of `max(Q, KV + mask)`.
+Both landed within 0.07% of each other at roughly **-9.3%** against
+materialization.
+
+So the note below that `q8_0` double-buffered "must be measured rather than
+assumed" is superseded: it drops to one block per SM, and one block per SM is
+worth about -9% on this shape. A staged `q8_0` would have to find more than 9%
+of overlap to break even. Treat it as expected-dead and measure only to confirm,
+not as an open question.
+
+### `Q_in_reg = false` is not available as a shared-memory escape hatch
+
+If a staged variant runs short of shared memory, the tempting move is to spill Q
+out of registers and reclaim its 33,792 B floor. That was measured directly:
+**-9.35%, Welch t = -41.45**, because keeping Q out of registers forces a
+shared-memory read per MMA. It is not a lever this plan may use.
+
+For the same reason, the register budget is not the thing to optimise for. That
+arm *succeeded* at relieving pressure -- `REG:255` down to `REG:219/222` with
+spill unchanged -- and still lost 9.35%. Spill did not predict throughput in
+either direction across the sweep.
+
+### Runtime-V kernels change what a raw V region must be sized for
+
+Mixed K/V pairs no longer instantiate per pair. There are now two kernel shapes:
+
+- the **symmetric** kernel, with V as a template argument, used when `K == V`;
+- the **runtime-V** kernel, one per K type, which selects its V loader from a
+  switch at the tile-load site and therefore does not know V's row stride at
+  compile time.
+
+A raw staging region for V in the runtime-V kernel must be sized for the
+**largest** V row, not the actual one: 272 B per row (`q8_0`) at `D = 256`,
+against 80 B for `q2_0s`. The staging budget before crossing the `Q` floor is
+`33,792 - (16,896 + 640) = 16,256 B`.
+
+| K type | Row B | Symmetric, single | Fits | Runtime-V, single | Fits | Runtime-V, double | Occupancy |
+|---|---:|---:|---|---:|---|---:|---|
+| `q8_0` | 272 | 17,408 | no | 17,408 | no | 34,816 | **1/SM** |
+| `q6_1` | 224 | 14,336 | yes | 15,872 | yes | 31,744 | 2/SM |
+| `q6_0` | 208 | 13,312 | yes | 15,360 | yes | 30,720 | 2/SM |
+| `q5_0` | 176 | 11,264 | yes | 14,336 | yes | 28,672 | 2/SM |
+| `q4_0` | 144 | 9,216 | yes | 13,312 | yes | 26,624 | 2/SM |
+| `q3_0` | 112 | 7,168 | yes | 12,288 | yes | 24,576 | 2/SM |
+| `q2_1` | 96 | 6,144 | yes | 11,776 | yes | 23,552 | 2/SM |
+| `q2_0s` | 80 | 5,120 | yes | 11,264 | yes | 22,528 | 2/SM |
+
+The result is better than feared. Because `nbytes_shared_Q` sets a 33,792 B
+floor that the K/V tile does not approach, single-buffered raw staging stays
+free even in the runtime-V kernel for every type except `q8_0`, and double
+buffering still holds two blocks per SM for every type except `q8_0`. Only
+`q8_0` is squeezed, and it is squeezed identically in both kernel shapes.
+
+### Consequences for the prototype
+
+- Start on the **symmetric** kernel, not the runtime-V one. It is the common
+  configuration, it avoids the worst-case V sizing question entirely, and it is
+  the shape whose throughput the retained hybrid depends on.
+- `q3_0/q3_0` and `q2_1/q2_1` remain the right first types, now for a stronger
+  reason: staging is free in shared memory for them under either kernel shape.
+- Do not touch `nbatch_fa`, `nbatch_K2` or `nbatch_V2` to make room. Those were
+  swept: `nbatch_fa` 32 -> 64 cost -2.32% and `nbatch_K2`/`V2` 128 -> 64 cost
+  -2.66%, both on the production shape.
+- Extending staging to the runtime-V kernel is a second step with its own
+  measurement, because its raw region is worst-case sized and its loader
+  selection is a runtime branch.
+
 ## What `nstages` means today
 
 `fattn-mma-f16.cuh` carries three loading modes, selected per `(DKQ, DV, ncols)`
@@ -171,7 +259,9 @@ zero point won, and paired-lane loading lost decisively.
    occupancy unchanged, then two reverse-order `llama-bench` runs of `r=5`
    against the current library with native attention on in both arms.
 3. Only if step 1 wins, extend to double buffering, and only then to `q8_0`,
-   where the occupancy cliff has to be measured rather than assumed.
+   whose occupancy cliff is now measured rather than open: one block per SM
+   costs about 9% on this shape, so staged `q8_0` must find more overlap than
+   that to break even.
 4. If step 1 loses, record it in `docs/cpu-kv-offload-experiments.md` the way
    paired-lane loading was recorded and stop. Do not proceed to `D = 64` and
    `D = 128`, which additionally require new `cp.async` widths.
