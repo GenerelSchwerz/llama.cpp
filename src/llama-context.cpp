@@ -4627,15 +4627,50 @@ llama_context * llama_init_from_model(
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
     }
 
+    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
+            return nullptr;
+        }
+    }
+
+    // Must run after every flash_attn auto-enable above: the window mandates a
+    // Q8_0/Q8_0 cache, whose own auto-enable is what turns the default
+    // --flash-attn auto into ENABLED.
     if (params.kv_gpu_window > 0) {
         const bool standard_attention = model->hparams.n_layer_kv() > 0 &&
                 !model->hparams.is_mla() && !model->hparams.is_swa_any() &&
                 model->arch != LLM_ARCH_DEEPSEEK32 && model->arch != LLM_ARCH_DFLASH;
-        const uint32_t resolved_n_ctx = params.n_ctx > 0 ? params.n_ctx : model->hparams.n_ctx_train;
+        // Mirror the normalization llama_context applies to cparams, so the
+        // window is validated against the context the cache is actually sized
+        // from. n_seq_max is pinned to 1 below, so n_ctx_seq == n_ctx here.
+        const uint32_t resolved_n_seq_max = std::max(1u, params.n_seq_max);
+        const uint32_t resolved_n_ctx = GGML_PAD(
+                params.n_ctx > 0 ? params.n_ctx : model->hparams.n_ctx_train, 256);
         const llama_kv_gpu_window_requirements requirements = {
             /*.requested_tokens        =*/ params.kv_gpu_window,
             /*.n_ctx                   =*/ resolved_n_ctx,
-            /*.n_seq_max               =*/ params.n_seq_max,
+            /*.n_seq_max               =*/ resolved_n_seq_max,
             /*.kv_gpu_layers           =*/ params.kv_gpu_layers,
             /*.default_context         =*/ params.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
             /*.standard_attention      =*/ standard_attention,
@@ -4687,32 +4722,6 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-            LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-    }
-
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
-        LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
-        return nullptr;
-    }
-
-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-            LLAMA_LOG_ERROR("%s: quantized V cache requires flash_attn to be enabled\n", __func__);
-            return nullptr;
-        }
-    }
 
     if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED && ggml_is_quantized(params.type_k)) {
         const uint32_t blck_size = ggml_blck_size(params.type_k);
