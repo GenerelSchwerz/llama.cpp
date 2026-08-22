@@ -41,6 +41,52 @@ clean-process proof, allocation accounting, or any feature-specific acceptance
 gate. A single matched fail-fast pair has no confidence claim; a clear signal
 authorizes deeper validation and nothing more.
 
+## 2026-08-22: GPU-window review fixes and the sub-256 quantized tail case
+
+Static review of the composed candidate `c101a19c3` found three defects that
+the existing evidence could not have caught, and they are fixed on head
+`89795a8f3`.
+
+The first is a routing agreement failure. Narrowing the CUDA `indexed_small`
+predicate to exclude quantized K/V left two other decisions keyed off the same
+256-token boundary untouched: `ggml_cuda_tail_compute_stride()` returned the
+stride unpadded, and `ggml_cuda_flash_attn_ext_tail_pass_supported()` skipped
+the best-kernel check whenever `tail_stride <= 256`. A quantized attached tail
+whose stride is below the cutoff and not `FATTN_KQ_STRIDE`-aligned was therefore
+advertised by `supports_op` and then dispatched onto a pass whose KV extent no
+kernel accepts, aborting in the `BEST_FATTN_KERNEL_NONE` case. All three
+decisions now share one `ggml_cuda_tail_uses_indexed_small()` predicate.
+
+The required backend surface consequently grows: the seeded Q8_0
+segmented-current cases are now 192, 256, and 257 rows on CPU and CUDA. The
+192-row case is the one that actually discriminates. It needs D512 to
+reproduce; at D128 an unpadded 192-row stride still finds a kernel and the case
+passes with or without the fix, so a D128 case would have been silent
+coverage.
+
+The second is that the realized-buffer-type loop in the standard KV cache
+refreshed `spec.buft` from the allocated tensor but not the newly added
+`spec.tail_buft`, so the tail `SET_ROWS` probe tested a pre-realization buffer
+type. This is concrete for `COMPACT_NATIVE_EXACT`, where `spec.buft` becomes
+the tail tensor's owner while `spec.tail_buft` still held the body's, and tail
+write capability was evaluated against the wrong owner.
+
+The third is an ordering defect in context creation: the `--kv-gpu-window` gate
+ran before the block that auto-enables Flash Attention for a quantized V cache.
+Because the window mandates a Q8_0/Q8_0 cache, the default `--flash-attn auto`
+would certainly have resolved to enabled, yet the gate rejected it first and
+`llama_init_from_model` returned null with "--flash-attn on is required". The
+gate now runs after every flash-attn auto-enable, and normalizes `n_ctx`
+(padded to 256) and `n_seq_max == 0` the way `llama_context` normalizes
+`cparams`. This defect made the feature unreachable from a default command
+line, which is why no earlier measurement encountered it: every recorded
+invocation passed Flash Attention explicitly.
+
+Experiment 026 owns the evidence. The Experiment 025 performance, PPL, and
+prompt-cache results were measured at `e67f3d3b0` and are not re-run here; the
+publication follow-up now also covers repeating the identity-sensitive gates on
+the fixed head.
+
 ## 2026-08-22: GPU-window source consolidation, milestone 1
 
 The same-format Q8_0 mapped-host design remains the sole candidate. The

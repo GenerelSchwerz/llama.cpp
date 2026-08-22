@@ -5185,3 +5185,65 @@ lifecycle, PPL, A/B/A throughput, and resource gates are accepted with the
 shared control/candidate greedy-boundary caveat above. Before publication,
 repeat the exact seeded CUDA 256/257 backend cases on the measured identity and
 decide whether the 30K prefill cost is acceptable for the opt-in tradeoff.
+
+## Experiment 026: agree on the quantized attached-tail stride cutoff
+
+Status: retained. The exact source base is
+`c101a19c389636a2667fbbfbb52e3e6ebc48c496`; the candidate is `89795a8f3`,
+composed of `0e9a056e8`, `0722988ef`, and `89795a8f3`.
+
+Static review of the Experiment 025 candidate found three defects that no
+recorded measurement could have reached. The candidate fixes all three and adds
+the backend case that discriminates the first one.
+
+The CUDA attached-tail route keyed three separate decisions off a 256-token
+boundary, but only the dispatch predicate learned that quantized tails cannot
+use the scalar indexed-small kernel. `ggml_cuda_tail_compute_stride()` still
+returned the stride unpadded below the boundary, and
+`ggml_cuda_flash_attn_ext_tail_pass_supported()` still skipped the
+`ggml_cuda_get_best_fattn_kernel()` check there. A quantized tail with a
+sub-256, non-`FATTN_KQ_STRIDE`-aligned stride was reported supported and then
+aborted at execution. The candidate routes all three through one
+`ggml_cuda_tail_uses_indexed_small()` predicate.
+
+The standard KV cache refreshed `spec.buft` in the realized-buffer-type loop
+but left `spec.tail_buft` at the pre-realization `route_buft`, so the tail
+`SET_ROWS` probe evaluated the wrong owner under
+`LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT`. The GPU-window configuration gate
+ran before the quantized-V flash-attn auto-enable and read an unnormalized
+`n_ctx` and `n_seq_max`, so `--kv-gpu-window` with the default `--flash-attn
+auto` failed at load.
+
+Validation ran on the RTX 4070 (SM 8.9) CUDA build tree described by the
+current protocol. The new seeded backend case is a D512 Q8_0/Q8_0 attached tail
+at stride 192; it aborts on the source base and passes on the candidate. The
+seeded Q8_0 segmented-current cases pass at 192, 256, and 257 rows. Focused
+CTests over `kv-cache-placement|kv-tail|kvarn|std-kv-tail|adaptive-dm|server-loop-guard`
+passed 14/14.
+
+A D128 variant of the same 192-row case passes on both the source base and the
+candidate, because D128 still finds a kernel at an unpadded 192-row stride. It
+is recorded here as a negative result: only D512 discriminates, and a D128 case
+would have been silent coverage.
+
+The model-level check used `Qwen3.8-27B-UD-IQ2_M.gguf` with `-ngl 99 -ctk q8_0
+-ctv q8_0 -nkvo 1 --kv-cpu-pinned -p 512 -n 64 -d 2048 -r 1` and Flash
+Attention left at the default `auto`. Windows 0, 256, 257, and 1024 all loaded
+and ran. The identical invocation fails at load on the source base with
+`cannot enable --kv-gpu-window=1024: --flash-attn on is required`, which
+reproduces the third defect end to end. A single-turn `llama-cli` run at window
+1024 generated coherently and exited cleanly. These are single-repetition,
+single-process smokes and are not performance evidence.
+
+Two failures were confirmed identical on the source base and are not attributed
+to this candidate: `test-backend-ops -o FLASH_ATTN_EXT` aborts in
+`ggml_cuda_flash_attn_ext_vec` after the `hsk=320` cases, because this build
+config compiles no vector kernel for the following pair; and the `q2_0s` body
+with `f16` tail case at `n_tail=16` fails with `ERR = 1.5576`.
+
+### Disposition
+
+Retained. The Experiment 025 performance, PPL, and prompt-cache results were
+measured at `e67f3d3b0` and are not re-run here, so repeating the
+identity-sensitive gates on `89795a8f3` joins the existing publication
+follow-ups.
