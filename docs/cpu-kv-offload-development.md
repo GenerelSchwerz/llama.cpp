@@ -139,6 +139,17 @@ transitions, and the graph explicitly permits the cold body to be smaller than
 the retained suffix. A development smoke showed the expected transient-memory
 and decode direction, but committed A/B/A evidence remains authoritative.
 
+The first full prompt-cache/checkpoint lifecycle then exposed a missing
+cross-backend dependency in the prompt bypass. The CPU `SET_ROWS` nodes publish
+new K/V rows into mapped host storage, while ordinary CUDA attention consumes
+views of that same storage. Graph insertion order alone does not order those
+operations across backends. Serializing CUDA launches made the lifecycle match
+the default-off baseline, which identified the missing edge rather than a
+state-format or checkpoint-payload defect. The prompt route now wraps both K
+and V body views with control dependencies on their corresponding writes; the
+device-suffix writes remain ordered after attention as before. The current
+protocol explicitly excludes launch-blocking runs from acceptance evidence.
+
 ## 2026-08-21: GPU-window prototype protocol boundary
 
 The first chunk-residency prototype deliberately keeps the complete standard

@@ -515,6 +515,20 @@ def main() -> None:
     if "split_gpu_window_attention ?" not in graph or \
             "LLAMA_KV_TAIL_ROUTE_NONE" not in graph:
         raise AssertionError("GPU-window multi-token graphs do not bypass split attention")
+    gpu_window_prompt_dependency = graph.split(
+        "static ggml_tensor * depend_on_kv_body_write(", 1
+    )[1].split("\n}\n", 1)[0]
+    for required in (
+        "ggml_view_tensor(ctx0, body)",
+        "ordered->src[5] = written",
+    ):
+        if required not in gpu_window_prompt_dependency:
+            raise AssertionError(
+                f"GPU-window prompt body read lacks its CPU-write dependency: {required}"
+            )
+    if graph.count("depend_on_kv_body_write(ctx0") < 2 or \
+            "GGML_ASSERT(k_body_written && v_body_written)" not in graph:
+        raise AssertionError("GPU-window prompt K/V body reads are not both ordered after their writes")
     kv_cache_source = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     if "llama_kv_gpu_window_cold_body_rows" not in kv_cache_source:
         raise AssertionError("GPU-window packed body is not bounded by the cold canonical region")

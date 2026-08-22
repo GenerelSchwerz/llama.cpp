@@ -5109,3 +5109,35 @@ values are parameter-selection data only and are not results for this commit.
 Retained for final committed-binary A/B/A, PPL, deterministic output,
 state/prompt-cache, and resource validation. No PR performance claim is
 accepted until those gates complete.
+
+## Experiment 025: order mapped-body prompt reads after CPU KV writes
+
+Status: retained correctness fix; final committed-binary evidence pending. The
+exact source base is `f3f17db55`; the candidate is the implementation commit
+containing this entry.
+
+The multi-token policy from Experiment 023 reads the complete canonical
+mapped-host body with ordinary CUDA attention. Its CPU K/V `SET_ROWS` nodes
+were added to the graph before attention, but the mapped body views did not
+carry data dependencies on those writes. Cross-backend scheduling therefore
+had no contract requiring the CPU publications to complete before CUDA read
+the same storage. This is independent of checkpoint serialization: full and
+partial state already preserve the exact compact suffix payload and logical
+generation metadata.
+
+The candidate preserves the ordinary K/V view shapes and attaches a
+control-only dependency from each view to its corresponding body write. The
+existing post-attention compact-suffix dependencies are unchanged. Focused
+CPU/CUDA parser, placement, tail, static, and scheduled-graph tests pass, and
+the static regression requires both K and V ordering edges. Development
+lifecycle validation without launch blocking completed six serialized
+requests with five checkpoint hits and matched every cached and oracle output
+sequence against the default-off control. Because that validation preceded
+the candidate commit, it is a gate-closing screen rather than evidence for the
+final identity.
+
+### Disposition
+
+Retained. Rebuild the committed candidate and repeat the normal asynchronous
+prompt-cache/checkpoint lifecycle before accepting state correctness or any
+performance/resource result for the PR.

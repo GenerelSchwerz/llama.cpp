@@ -97,6 +97,11 @@ Multi-token GPU-window graphs use the complete canonical mapped-host body once
 and update the compact suffix after attention. Only single-token graphs select
 split body/window attention. This keeps prompt processing off the additional
 partial-and-merge path while ensuring the suffix is populated before decode.
+The mapped-body K and V views must each retain an explicit graph dependency on
+their current CPU `SET_ROWS` result. Host/device execution order is otherwise
+not implied by node insertion order; a run serialized with
+`CUDA_LAUNCH_BLOCKING=1` is a diagnostic only and cannot validate this normal
+asynchronous contract.
 
 `llama-perplexity` declares its full logical batch as the maximum output-row
 requirement before context creation. Therefore matched PPL runs may enable or

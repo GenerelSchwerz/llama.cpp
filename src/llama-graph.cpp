@@ -3375,6 +3375,21 @@ static bool use_gpu_window_split_attention(
     return !mctx->is_gpu_window() || ubatch.n_tokens == 1;
 }
 
+static ggml_tensor * depend_on_kv_body_write(
+        ggml_context * ctx0, ggml_tensor * body, ggml_tensor * written) {
+    if (!body || !written) {
+        return body;
+    }
+
+    // The GPU-window prompt route reads the complete mapped-host body instead
+    // of splitting attention.  Preserve the view shape while making that CUDA
+    // read wait for the CPU SET_ROWS which publishes the current prompt rows.
+    // src[5] is a control-only edge, matching ggml_set_rows_ordered().
+    ggml_tensor * ordered = ggml_view_tensor(ctx0, body);
+    ordered->src[5] = written;
+    return ordered;
+}
+
 static void build_empty_kv_body(
         ggml_context * ctx0,
         ggml_tensor * k_cur,
@@ -3521,7 +3536,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * k_tail_written = nullptr;
     ggml_tensor * v_tail_written = nullptr;
+    ggml_tensor * k_body_written = nullptr;
+    ggml_tensor * v_body_written = nullptr;
     const bool compact_tail = mctx_cur->has_compact_tail();
+    const bool split_gpu_window_attention = use_gpu_window_split_attention(mctx_cur, ubatch);
 
     // store to KV cache
     {
@@ -3529,8 +3547,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & v_idxs = inp->get_v_idxs();
 
         if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
+            if ((k_body_written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il))) {
+                ggml_build_forward_expand(gf, k_body_written);
             }
         } else {
             k_tail_written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, inp->self_tail_idxs, il);
@@ -3544,8 +3562,8 @@ ggml_tensor * llm_graph_context::build_attn(
             }
         }
         if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
+            if ((v_body_written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il))) {
+                ggml_build_forward_expand(gf, v_body_written);
             }
         } else {
             v_tail_written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, inp->self_tail_idxs, il);
@@ -3569,6 +3587,11 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = use_kvarn ?
         kvarn_ctx->get_v_for_attention(ctx0, il, kvarn_plan.native_attention) :
         mctx_cur->get_v(ctx0, il);
+    if (mctx_cur->is_gpu_window() && !split_gpu_window_attention) {
+        GGML_ASSERT(k_body_written && v_body_written);
+        k = depend_on_kv_body_write(ctx0, k, k_body_written);
+        v = depend_on_kv_body_write(ctx0, v, v_body_written);
+    }
     ggml_tensor * kvarn_rot = use_kvarn ? llm_kvarn_rot_for_dim(
             inp->self_kvarn_rot_128, inp->self_kvarn_rot_256,
             inp->self_kvarn_rot_512, q->ne[0]) : nullptr;
@@ -3581,7 +3604,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // The SET_ROWS results alias the complete persistent shadow tensors and
     // carry the write dependency needed by same-graph attention reads.
-    const bool split_gpu_window_attention = use_gpu_window_split_attention(mctx_cur, ubatch);
     ggml_tensor * k_tail = split_gpu_window_attention ?
             (k_tail_written ? k_tail_written : mctx_cur->get_k_tail(ctx0, il)) : nullptr;
     ggml_tensor * v_tail = split_gpu_window_attention ?
