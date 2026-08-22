@@ -7146,6 +7146,7 @@ struct test_flash_attn_ext : public test_case {
     const float scale;
     const int64_t n_tail_active;
     const int64_t n_tail_history_slots;
+    const bool native_quants;
 
     std::string vars() override {
         return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute) +
@@ -7160,7 +7161,8 @@ struct test_flash_attn_ext : public test_case {
             " segmented_equivalence=" + std::to_string(int(segmented_equivalence)) +
             " scale=" + std::to_string(scale) +
             " n_tail_active=" + std::to_string(n_tail_active) +
-            " n_tail_history_slots=" + std::to_string(n_tail_history_slots);
+            " n_tail_history_slots=" + std::to_string(n_tail_history_slots) +
+            " native_quants=" + std::to_string(int(native_quants));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7221,14 +7223,21 @@ struct test_flash_attn_ext : public test_case {
                         bool full_coverage_equivalence = false, bool split_equivalence = false,
                         int64_t n_tail_current = 0, bool segmented_equivalence = false,
                         float scale = 0.0f, int64_t n_tail_active = -1,
-                        int64_t n_tail_history_slots = 0)
+                        int64_t n_tail_history_slots = 0, bool native_quants = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), n_tail(n_tail), tail_only(tail_only), type_tail_k(type_tail_k),
           type_tail_v(type_tail_v == GGML_TYPE_COUNT ? type_tail_k : type_tail_v), tail_interleaved(tail_interleaved),
           tail_all_masked(tail_all_masked), canonical_body(canonical_body),
           full_coverage_equivalence(full_coverage_equivalence), split_equivalence(split_equivalence),
           n_tail_current(n_tail_current), segmented_equivalence(segmented_equivalence), scale(scale),
-          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots) {}
+          n_tail_active(n_tail_active), n_tail_history_slots(n_tail_history_slots), native_quants(native_quants) {}
+
+    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
+                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
+                        ggml_type type_K, ggml_type type_V, bool native_quants)
+        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
+              {0, 1, 2, 3}, 0, false, GGML_TYPE_F16, GGML_TYPE_COUNT, false, false, false, false, false, 0, false,
+              0.0f, -1, 0, native_quants) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7411,9 +7420,11 @@ struct test_flash_attn_ext : public test_case {
         }
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_flash_attn_ext_set_native_quants(out, native_quants);
         if (exact != nullptr) {
             ggml_flash_attn_ext_add_sinks(exact, s);
             ggml_flash_attn_ext_set_prec (exact, prec);
+            ggml_flash_attn_ext_set_native_quants(exact, native_quants);
             out = ggml_concat(ctx, out, exact, 3);
         }
         ggml_set_name(out, "out");
@@ -10197,6 +10208,116 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Quantized-native K/V coverage, one pass per type with a native loader.
+    // These sweep the supported head sizes, GQA ratios that select ncols2,
+    // query batches that select ncols1, and an unpadded KV length that
+    // exercises the loader's bounds-checked path.
+    // Every type with a native tile loader. The ones past the default tier are
+    // only compiled with GGML_CUDA_FA_ALL_QUANTS; without it they fall back to
+    // the F16-casting path and these cases still check that fallback.
+    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
+                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
+                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+        for (int hs : { 64, 128, 256 }) {
+            for (int nr2 : { 1, 2, 4, 16 }) {
+                for (int kv : { 512, 113 }) {
+                    for (int nb : { 3, 16, 32, 64 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                    hs, hs, 4, {nr2, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                    tkv, tkv, true));
+                    }
+                }
+            }
+        }
+    }
+
+    // The sweep above pins mask=true, sinks=false, max_bias=0 and prec=F32, so
+    // it never reached the kernel variants those select. Cover them at one
+    // geometry per type rather than crossing them with the full sweep.
+    //
+    // A non-zero logit_softcap is deliberately NOT covered here. It selects the
+    // use_logit_softcap kernel, and that combination aborts the CUDA backend
+    // with "unspecified launch failure" for every quantized K/V type. The fault
+    // is not in the quantized-native route: it reproduces identically with the
+    // native permission withheld, and F16 K/V with the same softcap passes
+    // 120/120. Adding cases for it here would abort the whole FLASH_ATTN_EXT
+    // suite rather than report a failure, so it is documented in
+    // docs/quantized-native-flash-attention.md instead.
+    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
+                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
+                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+        for (int hs : { 64, 256 }) {
+            // attention sinks
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // ALiBi slopes
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, false, 8.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // no mask
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, false, false, 0.0f, 0.0f, GGML_PREC_F32,
+                        tkv, tkv, true));
+            // sinks at the default precision
+            test_cases.emplace_back(new test_flash_attn_ext(
+                        hs, hs, 4, {4, 1}, 512, 16, true, true, 0.0f, 0.0f, GGML_PREC_DEFAULT,
+                        tkv, tkv, true));
+        }
+    }
+
+    // Mixed K/V pairs. K and V are independent template parameters of the
+    // kernel and reach the tile loader through separate calls, so a pair of
+    // different native types loads two different quant layouts into the two
+    // halves of the same shared tile. That is the part these cases exist to
+    // check; the symmetric sweep above cannot, because it never puts two
+    // layouts in one kernel.
+    //
+    // Every ordered pair is covered, in both directions, because every ordered
+    // pair has a kernel. The list is built from the type array rather than
+    // written out so that adding a native type cannot silently leave its
+    // pairings untested.
+    {
+        static const ggml_type native_types[] = {
+            GGML_TYPE_Q8_0,
+            GGML_TYPE_Q6_1, GGML_TYPE_Q6_0,
+            GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
+            GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
+            GGML_TYPE_Q3_1, GGML_TYPE_Q3_0,
+            GGML_TYPE_Q2_1, GGML_TYPE_Q2_0S,
+        };
+
+        for (ggml_type tk : native_types) {
+            for (ggml_type tv : native_types) {
+                if (tk == tv) {
+                    continue; // covered by the symmetric sweep above
+                }
+                for (int hs : { 64, 256 }) {
+                    // kv=113 is unpadded, so both loaders take their
+                    // bounds-checked tail path with K and V disagreeing about
+                    // the row stride.
+                    for (int kv : { 512, 113 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(
+                                    hs, hs, 4, {4, 1}, kv, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                    tk, tv, true));
+                    }
+                }
+                // One geometry per pair through the variant-selecting parameters.
+                test_cases.emplace_back(new test_flash_attn_ext(
+                            128, 128, 4, {2, 1}, 512, 8, true, true, 0.0f, 0.0f, GGML_PREC_F32,
+                            tk, tv, true));
+            }
+        }
+    }
+
+    // A head size the route does not cover must retain the established
+    // materializing path rather than silently selecting a mismatched kernel.
+    // There is no rejected pair to check any more: every ordered pair of native
+    // types has a kernel, which is what the sweep above verifies.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                72, 72, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {

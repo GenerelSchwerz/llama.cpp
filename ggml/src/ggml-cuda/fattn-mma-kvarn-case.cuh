@@ -9,7 +9,7 @@
 #if defined(GGML_USE_HIP)
 using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 #else
-using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
+using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_mma_t;
 #endif
 
 // STOPGAP: keep windowed prefill single-chunk by default until the chunked
@@ -33,7 +33,7 @@ static inline int ggml_cuda_fattn_kvarn_window_chunk(const int n_kv) {
 }
 
 template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
-static inline fattn_kernel_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
+static inline fattn_kernel_mma_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
         bool k_original_domain,
         bool v_original_domain) {
     constexpr bool V_is_K_view = false;
@@ -179,7 +179,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
-         jt, zt_gqa, 0, iter_k);
+         jt, zt_gqa, 0, iter_k, (int) GGML_TYPE_COUNT); // V is a template argument here
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, partial_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -246,7 +246,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
-         jt, zt_gqa, 0, iter_k);
+         jt, zt_gqa, 0, iter_k, (int) GGML_TYPE_COUNT); // V is a template argument here
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, dst_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -535,7 +535,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             v_win.nb[2] = chunk_len * DV * (int64_t) sizeof(half);
             v_win.nb[3] = (int64_t) plan.n_kv_heads * chunk_len * DV * (int64_t) sizeof(half);
 
-            fattn_kernel_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
+            fattn_kernel_mma_t f16_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, false>;
 #if !defined(GGML_USE_MUSA)
             CUDA_CHECK(cudaFuncSetAttribute(
                 reinterpret_cast<ggml_cuda_fattn_kernel_attr_ptr_t>(f16_kernel),
@@ -547,7 +547,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             dst->src[1] = &k_win;
             dst->src[2] = &v_win;
             launch_fattn<DV, ncols1, ncols2>(
-                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
+                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host,
+                (int) GGML_TYPE_COUNT); // unused: V is a template argument here
             dst->src[1] = orig_k;
             dst->src[2] = orig_v;
             return true;
@@ -709,7 +710,7 @@ bool ggml_cuda_fattn_kvarn_wide_mma_supported(
         return false;
     }
 
-    fattn_kernel_t fattn_kernel = logit_softcap == 0.0f ?
+    fattn_kernel_mma_t fattn_kernel = logit_softcap == 0.0f ?
         ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, false>(
             k_original_domain, v_original_domain) :
         ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, true>(
@@ -801,12 +802,12 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
 #if defined(GGML_USE_HIP)
     using fattn_kernel_ptr_t = const void*;
 #else
-    using fattn_kernel_ptr_t = fattn_kernel_t;
+    using fattn_kernel_ptr_t = fattn_kernel_mma_t;
 #endif
-    fattn_kernel_t fattn_kernel;
-    fattn_kernel_t fattn_kernel_no_softcap = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, false>(
+    fattn_kernel_mma_t fattn_kernel;
+    fattn_kernel_mma_t fattn_kernel_no_softcap = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, false>(
         k_original_domain, v_original_domain);
-    fattn_kernel_t fattn_kernel_softcap = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, true>(
+    fattn_kernel_mma_t fattn_kernel_softcap = ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel<DKQ, DV, ncols1, ncols2, true>(
         k_original_domain, v_original_domain);
     if (logit_softcap == 0.0f) {
         fattn_kernel = fattn_kernel_no_softcap;
@@ -832,7 +833,8 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     // need_f16_K=false, need_f16_V=false: KVarN K/V stay descriptor-backed.
     // Mixed prefill reconstructs original-domain V in the native loader.
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host,
+         (int) GGML_TYPE_COUNT); // unused: V is a template argument here
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 }

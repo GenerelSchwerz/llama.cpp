@@ -3003,6 +3003,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         if (kvarn_domain != GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO) {
             cur->op_params[GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN] = (int32_t) kvarn_domain;
         }
+        ggml_flash_attn_ext_set_native_quants(cur, cparams.flash_attn_native_quants);
         if (use_native_tail) {
             GGML_ASSERT(tail_query_order && tail_run_desc);
             cur = k_tail_current ?
