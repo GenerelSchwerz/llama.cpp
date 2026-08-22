@@ -242,7 +242,8 @@ when a conventional quantized KV layout is easier to compare across backends.
 
 Compare cache formats with identical model, context, corpus, `-b`, and `-ub`
 values. A build with the default CUDA policy contains 50 standard vector pairs;
-the ALL option contains 169.
+the ALL option contains 169. Fresh build caches omit KVarN; use
+`GGML_CUDA_KVARN=ON` for KVarN validation.
 
 ### Known limitations
 
@@ -534,6 +535,134 @@ ubatch, prompt, and sampling settings. Record the selected representation,
 persistent VRAM, and both prompt and generation speed as functions of tail
 length. Treat the uniform capped-1024 `auto` setting as a starting policy and
 measure the exact workload before deploying it.
+
+## Independent target and draft KV residency
+
+### What it is
+
+BeeLlama can keep a bounded number of attention-KV layers on the accelerator
+while the rest remain in host memory. The target uses `--kv-gpu-layers`; a
+separate speculative or integrated-MTP context can override that policy with
+`--spec-draft-kv-gpu-layers` (`--kv-gpu-layers-draft`).
+
+The count follows cache ownership rather than model architecture names. A
+draft layer that owns no cache because it shares another context's KV does not
+consume the draft budget. This keeps shared-cache speculative implementations
+on their existing owner-defined placement path.
+
+### When to use it
+
+Use the draft override when target KV must remain mostly or entirely in host
+RAM but the independently owned draft cache has a different memory/performance
+tradeoff. Draft cache residency is independent of draft weight placement and
+of the phase-aware compute allocator.
+
+### Key arguments
+
+- [`--kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
+- [`--spec-draft-kv-gpu-layers`](beellama-args.md#cpu-kv-placement)
+- [`--kv-cpu-pinned`](beellama-args.md#cpu-kv-placement)
+
+Omitting the draft override inherits the complete target KV policy. An explicit
+nonnegative value selects a draft-only partial-residency policy; zero means no
+independently owned draft KV layers on the device. CPU-resident draft layers
+still use `--kv-cpu-pinned` when enabled.
+
+### Known limitations
+
+Residency is selected per owned layer, not per token window, and there is no
+automatic VRAM sizing. The option does not create independent placement for a
+cache that the draft context shares with another owner.
+
+The retained Q8/CUDA MTP validation covers pinned-CPU target KV with the
+independently owned draft cache on CUDA, including a 5,000-token stochastic
+same-geometry exactness gate. Other cache formats, models, backends, and
+arbitrary partial target or multi-layer draft mixes still require their own
+measurements.
+
+## Phase-aware prompt and generation workspace
+
+### What it is
+
+`--phase-aware-workspace` is an opt-in transient-memory policy. It starts a
+text context with the compact generation graph reservation, grows to the full
+physical ubatch for prompt processing, and returns to the compact reservation
+for generation. A later prompt on the same server context repeats the safe
+grow/shrink transition.
+
+For integrated MTP, target and draft schedulers keep separate graph plans but
+share physical compute backing by exact backend buffer type. They execute
+sequentially and synchronize at ownership handoffs. The shared allocator grows
+immediately and coalesces a real phase shrink across every active member, so
+checkpoint replay graph variants do not cause per-replay reallocations.
+
+### When to use it
+
+Use it when model weights and persistent state fit, but retaining both target
+and MTP prompt workspaces makes steady generation exceed the desired VRAM
+budget. It reduces startup and decode residency as well as the coexistence
+portion of prompt peak. It does not cap persistent KV or recurrent state and
+does not make the actual target prompt workspace smaller.
+
+### Key argument
+
+- [`--phase-aware-workspace`](beellama-args.md#phase-aware-compute-workspace)
+
+The default is disabled. CLI, `LLAMA_ARG_PHASE_AWARE_WORKSPACE`, and the INI
+key `phase-aware-workspace` select the same option.
+
+### Measurement and validation
+
+At 140K context on the Qwen3.8 27B CPU-Q8-KV MTP-6 configuration, the retained
+candidate reduced initialized and steady process VRAM by 1,108 MiB and reduced
+the measured prompt peak by 902-926 MiB. A matched 138K prompt changed prefill
+from 742.52 to 741.66 t/s (-0.12%). The plain 5,000-token coding run changed
+decode from 52.10 to 51.15 t/s (-1.83%); the profiled pair changed 50.50 to
+50.27 t/s (-0.44%). All fixed-seed response hashes, draft counts, acceptance,
+and replay work matched.
+
+Nsight reported exactly the same complete H2D and D2H byte totals and call
+counts for baseline and candidate, proving that workspace sharing introduced
+no hidden transfer traffic. Exact commands and the full resource ledger are in
+[`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).
+
+### Known limitations
+
+Shrinking and regrowing requires buffer replacement, graph invalidation, and
+recapture. The measured MTP-6 transition cost was about 42-46 ms per request
+across target and draft contexts. Prompt peak still includes the active target
+prompt workspace, and the policy does not address the context-linear staging
+and explicit-mask allocations within that workspace.
+
+## Live-context workspace growth
+
+`--live-context-workspace` is a separate default-off transient-memory policy
+for supported standard attention layouts. Instead of constructing every graph
+against configured KV capacity, it reserves from the exact padded physical
+high row published by the prepared batch, grows geometrically, and contracts
+after demand falls below its hysteresis boundary. Hybrid memory forwards this
+capability only for its standard attention member while retaining the full
+recurrent reservation.
+
+Capability and layout checks control the path. KVarN, ISWA, recurrent-only,
+and other memory implementations that do not expose bounded attention sizing
+keep full reservation and original upfront decode ordering even if the flag is
+requested. Phase-aware prompt/generation geometry remains independent.
+
+When all server slots are idle, an effective live-sized context asks registered
+CUDA backends to release the unused tail of synchronized transient VMM pools.
+Legacy pools and other backends return zero; no device or model architecture is
+hard-coded. This idle trim does not discard the current graph plan and never
+runs on the default-off or unsupported path.
+
+Use the option when a large configured context normally serves short requests,
+or when a long turn is followed by short turns and lower idle residency
+matters. Expect one-time synchronization, graph re-reservation, and buffer
+replacement cost at growth and shrink boundaries. Persistent KV bytes and
+full-depth peak are unchanged.
+
+The exact argument contract is in
+[`beellama-args.md`](beellama-args.md#live-context-compute-workspace).
 
 ## Upstream DFlash with profit adaptation
 

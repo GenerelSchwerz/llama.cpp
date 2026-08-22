@@ -82,6 +82,10 @@ struct llama_memory_context_i {
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
 
+    // Maximum physical attention-KV extent needed by every ubatch prepared in
+    // this context. Zero means the memory type does not expose a bounded view.
+    virtual uint32_t get_attn_reserve_n_kv() const { return 0; }
+
     // Compact cache metadata is prepared by apply(), but is not authoritative
     // until the graph finishes. Wrappers must forward both hooks to their
     // participating child contexts.
@@ -117,6 +121,16 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // Simulate an attention cache whose graph-visible physical extent is
+    // bounded by n_kv. Unsupported memory types retain full reservation.
+    virtual llama_memory_context_ptr init_reserve(uint32_t n_kv) {
+        GGML_UNUSED(n_kv);
+        return init_full();
+    }
+
+    // Nonzero only when init_reserve() implements a bounded attention layout.
+    virtual uint32_t get_attn_reserve_capacity() const { return 0; }
+
     // prepare for any pending memory updates, such as shifts, copies, etc.
     // status == LLAMA_MEMORY_STATUS_NO_UPDATE if there is nothing to update
     virtual llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) = 0;
@@ -145,6 +159,9 @@ struct llama_memory_i {
     };
 
     virtual seq_rm_capability get_seq_rm_capability() const { return {}; }
+
+    virtual bool recurrent_sparse_snapshots_supported() const { return false; }
+    virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
 
     virtual bool seq_rm_plan(
             llama_seq_id seq_id, llama_pos p0, llama_pos p1,

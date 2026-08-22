@@ -278,6 +278,35 @@ json result_timings::to_json() const {
     if (draft_n > 0) {
         base["draft_n"] = draft_n;
         base["draft_n_accepted"] = draft_n_accepted;
+        base["spec_checkpoint_captures"] = spec_checkpoint_captures;
+        base["spec_checkpoint_restores"] = spec_checkpoint_restores;
+        base["spec_checkpoint_capture_ms"] = spec_checkpoint_capture_ms;
+        base["spec_checkpoint_restore_ms"] = spec_checkpoint_restore_ms;
+        base["spec_checkpoint_target_bytes"] = spec_checkpoint_target_bytes;
+        base["spec_checkpoint_draft_bytes"] = spec_checkpoint_draft_bytes;
+        base["spec_checkpoint_spec_bytes"] = spec_checkpoint_spec_bytes;
+        base["spec_checkpoint_peak_bytes"] = spec_checkpoint_peak_bytes;
+        base["spec_replay_cycles"] = spec_replay_cycles;
+        base["spec_replay_batch_tokens"] = spec_replay_batch_tokens;
+    }
+
+    if (workspace_target_reserves > 0 || workspace_draft_reserves > 0) {
+        base["workspace_target_reserves"] = workspace_target_reserves;
+        base["workspace_target_grows"] = workspace_target_grows;
+        base["workspace_target_shrinks"] = workspace_target_shrinks;
+        base["workspace_target_kv_grows"] = workspace_target_kv_grows;
+        base["workspace_target_kv_shrinks"] = workspace_target_kv_shrinks;
+        base["workspace_target_reserved_kv"] = workspace_target_reserved_kv;
+        base["workspace_target_kv_capacity"] = workspace_target_kv_capacity;
+        base["workspace_target_reserve_ms"] = workspace_target_reserve_ms;
+        base["workspace_draft_reserves"] = workspace_draft_reserves;
+        base["workspace_draft_grows"] = workspace_draft_grows;
+        base["workspace_draft_shrinks"] = workspace_draft_shrinks;
+        base["workspace_draft_kv_grows"] = workspace_draft_kv_grows;
+        base["workspace_draft_kv_shrinks"] = workspace_draft_kv_shrinks;
+        base["workspace_draft_reserved_kv"] = workspace_draft_reserved_kv;
+        base["workspace_draft_kv_capacity"] = workspace_draft_kv_capacity;
+        base["workspace_draft_reserve_ms"] = workspace_draft_reserve_ms;
     }
 
     return base;

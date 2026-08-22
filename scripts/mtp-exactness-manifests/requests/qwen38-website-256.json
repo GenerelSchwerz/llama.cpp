@@ -1,0 +1,9 @@
+{
+  "prompt": "<|im_start|>system\nReasoning effort is set to high. Analyze the requirements before producing the implementation and check accessibility, responsiveness, and failure states.<|im_end|>\n<|im_start|>user\nDesign a single-file HTML dashboard for a neighborhood tool library. It needs searchable inventory cards, category and availability filters, an accessible reservation dialog, a compact mobile layout, persistent demo reservations using localStorage, and a small activity chart drawn without libraries or external assets. Explain the state model and then provide the complete HTML, CSS, and JavaScript.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+  "n_predict": 256,
+  "seed": 2026,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true,
+  "temperature": 0.65
+}

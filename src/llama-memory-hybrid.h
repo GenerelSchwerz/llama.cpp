@@ -28,14 +28,17 @@ public:
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   attn_offload,
+                     bool   attn_cpu_pinned,
+                     bool   attn_offload_compute,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                     bool   recurrent_offload,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
@@ -44,7 +47,8 @@ public:
                  uint32_t   tail_tokens = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
-                 uint32_t   tail_rollback_tokens = 0);
+                 uint32_t   tail_rollback_tokens = 0,
+                 uint32_t   attn_n_gpu_layers = 0);
 
     llama_memory_hybrid(
         const llama_model & model,
@@ -64,10 +68,17 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
     seq_rm_capability get_seq_rm_capability() const override;
+
+    bool recurrent_sparse_snapshots_supported() const override;
+    bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
     void clear(bool data) override;
 
@@ -132,6 +143,11 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    // init with a bounded attention reservation and full recurrent state
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        llama_memory_context_ptr   ctx_attn_in);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
@@ -153,6 +169,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_memory_hybrid_context

@@ -7,6 +7,7 @@
 #include "speculative.h"
 
 #include <filesystem>
+#include <fstream>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -37,7 +38,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     const int stderr_fd = fileno(stderr);
     const int saved_fd  = dup(stderr_fd);
     assert(saved_fd >= 0);
-    assert(dup2(fileno(capture), stderr_fd) == 0);
+    assert(dup2(fileno(capture), stderr_fd) == stderr_fd);
 #endif
 
     fn();
@@ -54,7 +55,7 @@ static std::string capture_stderr(const std::function<void()> & fn) {
     assert(_dup2(saved_fd, stderr_fd) == 0);
     _close(saved_fd);
 #else
-    assert(dup2(saved_fd, stderr_fd) == 0);
+    assert(dup2(saved_fd, stderr_fd) == stderr_fd);
     close(saved_fd);
 #endif
     fclose(capture);
@@ -531,6 +532,7 @@ static void test(void) {
     assert(params.n_batch == 9090);
 
     unset_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX");
+    unset_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES");
     params = common_params();
     argv = {"binary_name", "--spec-type", "draft-dflash"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
@@ -542,6 +544,223 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
     assert(params.speculative.draft_n_max_explicit);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "64"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 64);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH", "32");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 32);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
+    // Clean Bee MTP always inherits the target physical ubatch. Preserve that
+    // prompt-synchronization geometry unless an explicit value is identical.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "128"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // Other model-backed speculative modes retain an independent draft
+    // ubatch; this restriction is specific to recurrent MTP synchronization.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash", "--ubatch-size", "512",
+            "--spec-draft-ubatch-size", "128"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH", "128");
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
+    params = common_params();
+    assert(params.speculative.draft.kv_gpu_layers == -1);
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-layers-draft", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kv_gpu_layers == 0);
+
+    set_test_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS", "3");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.kv_gpu_layers == 3);
+    unset_test_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS");
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.phase_aware_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--phase-aware-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.phase_aware_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--phase-aware-workspace", "--no-phase-aware-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.phase_aware_workspace);
+
+    set_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE", "1");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.phase_aware_workspace);
+    unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+
+    unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.live_context_workspace);
+    assert(!common_context_params_to_llama(params).live_context_workspace);
+    assert(!llama_context_default_params().live_context_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--live-context-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.live_context_workspace);
+    assert(!params.phase_aware_workspace);
+    assert(common_context_params_to_llama(params).live_context_workspace);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--live-context-workspace", "--no-live-context-workspace"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.live_context_workspace);
+
+    set_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE", "1");
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.live_context_workspace);
+    assert(!params.phase_aware_workspace);
+    unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
+
+    // MTP recurrent-plane cap: zero preserves the full draft-depth reserve.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 0);
+    assert(!params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 0);
+    assert(params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    // The minimum cap allocates two planes; the full value is behavior- and
+    // allocation-equivalent to the default for MTP-8.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 2);
+    assert(params.speculative.need_n_rs_seq() == 1);
+    assert(params.speculative.is_mtp_rs_capped());
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "9"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.need_n_rs_seq() == 8);
+    assert(!params.speculative.is_mtp_rs_capped());
+
+    for (const char * invalid : {"-1", "1", "10"}) {
+        params = common_params();
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8",
+                "--spec-mtp-rs-planes", invalid};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-mtp-rs-planes", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    // An explicit full allocation does not activate the cap, so the plane
+    // option itself adds no mixed-mode restriction.
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8",
+            "--spec-mtp-rs-planes", "9"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(!params.speculative.is_mtp_rs_capped());
+
+    set_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES", "4");
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 4);
+    assert(params.speculative.need_n_rs_seq() == 3);
+    unset_test_env("LLAMA_ARG_SPEC_MTP_RS_PLANES");
+
+    // INI keys are rendered through the same common argument definitions.
+    const std::filesystem::path mtp_preset_fixture =
+            std::filesystem::temp_directory_path() / "beellama-mtp-rs-planes.ini";
+    {
+        std::ofstream fixture(mtp_preset_fixture);
+        fixture << "[mtp-cap]\n"
+                << "spec-type = draft-mtp\n"
+                << "spec-draft-n-max = 8\n"
+                << "ubatch-size = 512\n"
+                << "spec-draft-ubatch-size = 512\n"
+                << "spec-mtp-rs-planes = 4\n"
+                << "spec-draft-kv-gpu-layers = 2\n"
+                << "phase-aware-workspace = true\n"
+                << "\n[mtp-ubatch-mismatch]\n"
+                << "spec-type = draft-mtp\n"
+                << "ubatch-size = 512\n"
+                << "spec-draft-ubatch-size = 128\n";
+        assert(fixture.good());
+    }
+    common_preset global;
+    common_preset_context preset_ctx(LLAMA_EXAMPLE_SERVER);
+    const common_presets presets = preset_ctx.load_from_ini(mtp_preset_fixture.string(), global);
+    assert(presets.count("mtp-cap") == 1);
+    argv = presets.at("mtp-cap").to_args("binary_name");
+    params = common_params();
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 4);
+    assert(params.speculative.need_n_rs_seq() == 3);
+    assert(params.speculative.draft.n_ubatch == 512);
+    assert(params.speculative.draft.kv_gpu_layers == 2);
+    assert(params.phase_aware_workspace);
+
+    assert(presets.count("mtp-ubatch-mismatch") == 1);
+    argv = presets.at("mtp-ubatch-mismatch").to_args("binary_name");
+    params = common_params();
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(std::filesystem::remove(mtp_preset_fixture));
 
     set_test_env("LLAMA_ARG_SPEC_DRAFT_N_MAX", "7");
     params = common_params();
@@ -562,6 +781,11 @@ static void test(void) {
 
     params = common_params();
     params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
+    assert(params.speculative.draft.n_max == 15);
+
+    params = common_params();
+    params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     assert(common_speculative_resolve_dflash_draft_n_max(params.speculative, dflash_fixture.string()));
     assert(params.speculative.draft.n_max == 15);
 
@@ -832,10 +1056,62 @@ static void test_single_device_draft_does_not_inherit_target_tensor_split() {
     }
 }
 
+static void test_draft_kv_gpu_layers_override() {
+    common_params params;
+    params.no_kv_offload = true;
+    params.kv_gpu_layers = 7;
+
+    const common_params inherited = common_base_params_to_speculative(params);
+    assert(inherited.no_kv_offload);
+    assert(inherited.kv_gpu_layers == 7);
+
+    params.speculative.draft.kv_gpu_layers = 3;
+    const common_params overridden = common_base_params_to_speculative(params);
+    assert(overridden.no_kv_offload);
+    assert(overridden.kv_gpu_layers == 3);
+
+    params.no_kv_offload = false;
+    params.speculative.draft.kv_gpu_layers = 0;
+    const common_params host_draft = common_base_params_to_speculative(params);
+    assert(host_draft.no_kv_offload);
+    assert(host_draft.kv_gpu_layers == 0);
+
+    // Converting the draft parameters must not mutate the target policy.
+    assert(!params.no_kv_offload);
+    assert(params.kv_gpu_layers == 7);
+}
+
+static void test_mtp_draft_ubatch_validation() {
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+
+    // Inheritance and an explicit equal value preserve target prefill geometry.
+    common_validate_speculative_params(params, 512);
+    params.draft.n_ubatch = 512;
+    common_validate_speculative_params(params, 512);
+
+    // A smaller MTP physical ubatch splits recurrent prompt synchronization
+    // differently and is not bitwise output-stable.
+    params.draft.n_ubatch = 128;
+    bool rejected = false;
+    try {
+        common_validate_speculative_params(params, 512);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected);
+
+    // Independent ubatches remain available to the other speculative modes.
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    common_validate_speculative_params(params, 512);
+}
+
 int main(void) {
     try {
         test();
         test_single_device_draft_does_not_inherit_target_tensor_split();
+        test_draft_kv_gpu_layers_override();
+        test_mtp_draft_ubatch_validation();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

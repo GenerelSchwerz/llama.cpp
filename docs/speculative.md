@@ -282,6 +282,9 @@ If a draft model is combined with a draftless decoding the draftless decoding ha
                                         KV cache data type for V for the draft model
                                         allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1, q6_0, q6_1, q3_0, q3_1, q2_0, q2_1
                                         (env: LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V)
+--spec-draft-kv-gpu-layers, --kv-gpu-layers-draft  N
+                                        override target KV placement for the separate draft context and keep the first N independently owned draft attention-KV layers device-resident; shared KV layers follow their owner (default: inherit target KV placement)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS)
 --spec-draft-override-tensor, -otd, --override-tensor-draft  <tensor name pattern>=<buffer type>,...
                                         override tensor buffer type for draft model
 --spec-draft-cpu-moe, -cmoed, --cpu-moe-draft

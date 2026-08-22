@@ -385,6 +385,12 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_rs::llm_graph_input_rs(const llama_memory_recurrent_context * mctx) :
+        mctx(mctx),
+        sparse_snapshots(mctx->has_sparse_snapshots()),
+        selected_snapshot_token(mctx->get_selected_snapshot_token()) {
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -415,6 +421,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= sparse_snapshots == mctx->has_sparse_snapshots();
+    res &= selected_snapshot_token == mctx->get_selected_snapshot_token();
 
     return res;
 }
@@ -1493,6 +1501,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->sparse_snapshots == mctx->get_recr()->has_sparse_snapshots();
+    res &= inp_rs->selected_snapshot_token == mctx->get_recr()->get_selected_snapshot_token();
 
     return res;
 }
@@ -1536,6 +1546,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->sparse_snapshots == mctx->get_recr()->has_sparse_snapshots();
+    res &= inp_rs->selected_snapshot_token == mctx->get_recr()->get_selected_snapshot_token();
 
     return res;
 }
@@ -1626,6 +1638,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->sparse_snapshots == mctx->get_recr()->has_sparse_snapshots();
+    res &= inp_rs->selected_snapshot_token == mctx->get_recr()->get_selected_snapshot_token();
 
     return res;
 }
@@ -3130,8 +3144,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         // recombine streams
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
 
-        if (!cparams.offload_kqv) {
-            // all nodes between the KV store and the attention output are run on the CPU
+        if (!cparams.offload_attn_compute) {
+            // Plain CPU KV keeps the complete attention region on CPU. Pinned
+            // host KV and partial device KV retain accelerator attention while
+            // offload_kqv continues to control persistent cache placement.
             ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
         }
     }
@@ -3165,7 +3181,7 @@ static void validate_native_tail_operation(
         throw std::logic_error(format(
                 "KV tail layer %d execution descriptor does not match final tensor types or extents", il));
     }
-    auto * dev = route->owner;
+    auto * dev = route->execution_backend;
     if (!dev || !ggml_backend_dev_supports_op(dev, op)) {
         throw std::runtime_error(format(
                 "KV tail layer %d native operation is unsupported by its planned backend %s; "
@@ -3179,6 +3195,23 @@ static void validate_native_tail_operation(
             ggml_type_name(op->src[1]->type), ggml_type_name(op->src[2]->type),
             ggml_type_name(op->src[5]->type), ggml_type_name(op->src[6]->type),
             mctx->get_tail_body_execution_rows(il));
+}
+
+static ggml_backend_t get_native_tail_execution_backend(
+        ggml_backend_sched_t sched,
+        const llama_kv_cache_context * mctx,
+        int32_t il) {
+    auto * dev = mctx->get_tail_backend(il);
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    for (int i = 0; i < n_backends; ++i) {
+        auto * backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_get_device(backend) == dev) {
+            return backend;
+        }
+    }
+    throw std::runtime_error(format(
+            "KV tail layer %d planned execution device %s has no scheduler backend",
+            il, dev ? ggml_backend_dev_name(dev) : "unknown"));
 }
 
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
@@ -3630,6 +3663,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        ggml_backend_sched_set_tensor_backend(
+                sched, final_tail_op,
+                get_native_tail_execution_backend(sched, mctx_cur, il));
     }
     if (compact_tail) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(
@@ -4066,6 +4102,9 @@ ggml_tensor * llm_graph_context::build_attn(
     }
     if (tail_route == LLAMA_KV_TAIL_ROUTE_NATIVE) {
         validate_native_tail_operation(mctx_cur, il, final_tail_op);
+        ggml_backend_sched_set_tensor_backend(
+                sched, final_tail_op,
+                get_native_tail_execution_backend(sched, mctx_cur, il));
     }
     if (compact_tail) {
         if (ggml_tensor * written = mctx_cur->cpy_k_tail(

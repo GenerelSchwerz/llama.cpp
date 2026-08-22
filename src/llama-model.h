@@ -665,6 +665,11 @@ struct llama_model {
     // MLA/DSA graphs do not currently compose the standard exact-tail overlay.
     virtual bool graph_consumes_exact_kv_tail() const;
 
+    // Static model-graph declaration for recurrent caches. Implementations
+    // that can retain sparse verification boundaries and write a selected
+    // replay boundary opt in here; backend support is checked separately.
+    virtual bool graph_supports_recurrent_sparse_snapshots() const;
+
     // Per-layer contract used by KV route construction. This is derived from
     // the same loaded tensors that the model graph uses to build self-attention
     // bias, including layer-zero fallback tensors such as T5 relative bias.

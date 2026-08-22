@@ -28,6 +28,31 @@ static inline bool server_speculative_rollback_requires_checkpoint(
           (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && proposed_rollback > max_rollback);
 }
 
+struct server_speculative_checkpoint_policy {
+    bool capture = false;
+    bool restore = false;
+    bool replay  = false;
+};
+
+// Capture against the worst-case rejection after the actual draft is known.
+// Restore and replay only when the rejected suffix exceeds native rollback.
+static inline server_speculative_checkpoint_policy server_speculative_checkpoint_policy_for(
+        common_context_seq_rm_type type,
+        uint32_t                   max_rollback,
+        size_t                     actual_draft,
+        size_t                     rejected_suffix) {
+    GGML_ASSERT(rejected_suffix <= actual_draft);
+    const bool capture = actual_draft > 0 &&
+            server_speculative_rollback_requires_checkpoint(type, max_rollback, actual_draft);
+    const bool restore = rejected_suffix > 0 &&
+            server_speculative_rollback_requires_checkpoint(type, max_rollback, rejected_suffix);
+    return {
+        /*.capture =*/ capture,
+        /*.restore =*/ restore,
+        /*.replay  =*/ restore,
+    };
+}
+
 // Some memory layouts need a durable checkpoint even when ordinary attention
 // retains the complete prefix (pos_min == 0). In that case the live suffix
 // threshold alone would not enter checkpoint selection.
@@ -321,6 +346,33 @@ struct result_timings {
     // Optional speculative metrics - only included when > 0
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
+    uint64_t spec_checkpoint_captures = 0;
+    uint64_t spec_checkpoint_restores = 0;
+    double spec_checkpoint_capture_ms = 0.0;
+    double spec_checkpoint_restore_ms = 0.0;
+    uint64_t spec_checkpoint_target_bytes = 0;
+    uint64_t spec_checkpoint_draft_bytes = 0;
+    uint64_t spec_checkpoint_spec_bytes = 0;
+    uint64_t spec_checkpoint_peak_bytes = 0;
+    uint64_t spec_replay_cycles = 0;
+    uint64_t spec_replay_batch_tokens = 0;
+
+    uint64_t workspace_target_reserves = 0;
+    uint64_t workspace_target_grows = 0;
+    uint64_t workspace_target_shrinks = 0;
+    uint64_t workspace_target_kv_grows = 0;
+    uint64_t workspace_target_kv_shrinks = 0;
+    uint32_t workspace_target_reserved_kv = 0;
+    uint32_t workspace_target_kv_capacity = 0;
+    double workspace_target_reserve_ms = 0.0;
+    uint64_t workspace_draft_reserves = 0;
+    uint64_t workspace_draft_grows = 0;
+    uint64_t workspace_draft_shrinks = 0;
+    uint64_t workspace_draft_kv_grows = 0;
+    uint64_t workspace_draft_kv_shrinks = 0;
+    uint32_t workspace_draft_reserved_kv = 0;
+    uint32_t workspace_draft_kv_capacity = 0;
+    double workspace_draft_reserve_ms = 0.0;
 
     json to_json() const;
 };

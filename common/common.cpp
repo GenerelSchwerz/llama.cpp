@@ -86,6 +86,56 @@ const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_m
     return "unknown";
 }
 
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch) {
+    const bool has_mtp = std::find(
+            params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
+
+    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch > 0 &&
+            params.draft.n_ubatch != target_ubatch) {
+        throw std::invalid_argument(string_format(
+                "draft-mtp requires spec-draft-ubatch-size (%d) to match the target ubatch (%d) "
+                "for output-stable recurrent prompt synchronization; omit the draft override or use "
+                "--phase-aware-workspace to reduce decode workspace",
+                params.draft.n_ubatch, target_ubatch));
+    }
+
+    if (!params.mtp_rs_planes_explicit) {
+        return;
+    }
+
+    if (!has_mtp) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires --spec-type draft-mtp");
+    }
+
+    if (params.mtp_rs_planes == 0) {
+        return;
+    }
+
+    if (params.draft.n_max < 1) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires spec-draft-n-max >= 1");
+    }
+
+    const int64_t max_planes = int64_t(params.draft.n_max) + 1;
+    if (params.mtp_rs_planes < 2 || int64_t(params.mtp_rs_planes) > max_planes) {
+        throw std::invalid_argument(string_format(
+                "spec-mtp-rs-planes must be 0 or in [2, %" PRId64 "] for spec-draft-n-max=%d",
+                max_planes, params.draft.n_max));
+    }
+
+    const bool has_other_recurrent_mode = std::any_of(
+            params.types.begin(), params.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    if (params.is_mtp_rs_capped() && has_other_recurrent_mode) {
+        throw std::invalid_argument(
+                "spec-mtp-rs-planes cannot be combined with another speculative mode that requires recurrent rollback");
+    }
+}
+
 void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
     if (params.min_reasoning_tokens < 0) {
         throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");
@@ -491,10 +541,11 @@ std::string common_params_get_system_info(const common_params & params) {
 bool common_speculative_resolve_dflash_draft_n_max(
         common_params_speculative & params,
         const std::string & draft_model_path) {
-    const bool has_dflash = std::find(
-            params.types.begin(), params.types.end(),
-            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.types.end();
-    if (!has_dflash || params.draft_n_max_explicit) {
+    const bool has_dflash_family = std::any_of(
+            params.types.begin(), params.types.end(), [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    if (!has_dflash_family || params.draft_n_max_explicit) {
         return true;
     }
 
@@ -1838,6 +1889,11 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
+    cparams.kv_cpu_pinned     = params.kv_cpu_pinned;
+    cparams.recurrent_state_offload = params.recurrent_state_offload;
+    cparams.phase_aware_workspace = params.phase_aware_workspace;
+    cparams.live_context_workspace = params.live_context_workspace;
+    cparams.kv_gpu_layers     = (uint32_t) params.kv_gpu_layers;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;

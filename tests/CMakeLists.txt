@@ -4,6 +4,12 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 
 if (Python3_Interpreter_FOUND)
     add_test(
+        NAME test-feature-performance-validation
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/scripts/test-feature-validation.py)
+    set_property(TEST test-feature-performance-validation PROPERTY LABELS main)
+
+    add_test(
         NAME test-release-workflow-static
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-release-workflow-static.py)
@@ -32,6 +38,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-std-kv-tail-static.py)
     set_property(TEST test-std-kv-tail-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-vmm-allocation-telemetry-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-vmm-allocation-telemetry-static.py)
+    set_property(TEST test-vmm-allocation-telemetry-static PROPERTY LABELS cuda)
 
     add_test(
         NAME test-removed-cache-types-static
@@ -80,6 +92,12 @@ if (Python3_Interpreter_FOUND)
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-server-loop-guard-checkpoint-static.py)
     set_property(TEST test-server-loop-guard-checkpoint-static PROPERTY LABELS main)
+
+    add_test(
+        NAME test-live-context-workspace-static
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tests/test-live-context-workspace-static.py)
+    set_property(TEST test-live-context-workspace-static PROPERTY LABELS main)
 
     add_test(
         NAME test-spec-cession-static

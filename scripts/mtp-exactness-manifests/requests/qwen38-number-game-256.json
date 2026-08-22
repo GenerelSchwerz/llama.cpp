@@ -1,0 +1,9 @@
+{
+  "prompt": "<|im_start|>system\nReasoning effort is set to high. Work carefully, show enough intermediate state to make every transition auditable, and finish with a compact verification table.<|im_end|>\n<|im_start|>user\nPlay this deterministic number game for 40 turns. Start with x = 7. On odd-numbered turns replace x with 3*x + turn. On even-numbered turns replace x with floor(x/2) - turn. After every turn, report the turn number, the operation, and the new x. Then independently recompute turns 37 through 40 from the turn-36 value and state whether the two results agree.<|im_end|>\n<|im_start|>assistant\n<think>\n",
+  "n_predict": 256,
+  "seed": 7,
+  "cache_prompt": false,
+  "stream": false,
+  "return_tokens": true,
+  "temperature": 0.8
+}

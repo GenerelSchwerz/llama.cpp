@@ -1,0 +1,1701 @@
+========= COMPUTE-SANITIZER
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGraphExecUpdate.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3671d4] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 
+========= Program hit cudaErrorGraphExecUpdateFailure (error 910) due to "the graph update was not performed because it included changes which violated constraints specific to instantiated graph update" on CUDA API call to cudaGetLastError.
+=========     Saved host backtrace up to driver entry point at error
+=========         Host Frame: ggml_backend_cuda_graph_compute(ggml_backend*, ggml_cgraph*) [0x3683dc] in libggml-cuda.so.0
+=========         Host Frame: ggml_backend_sched_graph_compute_async [0x3c2aa] in libggml-base.so.0
+=========         Host Frame: llama_context::graph_compute(ggml_cgraph*, bool) [0x1137ff] in libllama.so.0
+=========         Host Frame: llama_context::process_ubatch(llama_ubatch const&, llm_graph_type, llama_memory_context_i*, ggml_status&) [0x119471] in libllama.so.0
+=========         Host Frame: llama_context::decode(llama_batch const&) [0x11c5ba] in libllama.so.0
+=========         Host Frame: llama_decode [0x11e0cd] in libllama.so.0
+=========         Host Frame: server_context_impl::decode(int&, int, llama_batch&) [0x1e39ca] in libllama-server-impl.so
+=========         Host Frame: server_context_impl::update_slots() [0x1e641c] in libllama-server-impl.so
+=========         Host Frame: server_queue::start_loop(long) [0x16b2f0] in libllama-server-impl.so
+=========         Host Frame: llama_server(common_params&, int, char**) [0x1008ad] in libllama-server-impl.so
+=========         Host Frame: llama_server(int, char**) [0x103191] in libllama-server-impl.so
+=========         Host Frame:  [0x27d0d] in libc.so.6
+=========         Host Frame: __libc_start_main [0x27e4a] in libc.so.6
+=========         Host Frame: _start [0x1074] in llama-server
+========= 

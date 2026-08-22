@@ -49,10 +49,11 @@ capacity. KVarN values are also rounded upward to 128-token groups. Startup logs
 show raw, requested, effective, and window lengths, the structural group ID,
 participating layers, selected compact-overlay or compact-native-exact
 representation, actual body and exact types, logical history rows, rollback
-rows, graph-local body execution rows, owner backend, current-segment
-presence, transient estimate, and memory increments. Native routes are checked
-again against the final constructed operation. A mismatch fails context/graph
-construction instead of allowing the scheduler to move that layer silently.
+rows, graph-local body execution rows, storage buffer type, execution backend,
+current-segment presence, transient estimate, and memory increments. Native
+routes are checked again against the final constructed operation. A mismatch
+fails context/graph construction instead of allowing the scheduler to move that
+layer silently.
 
 The CLI is parsed once into an immutable, model-independent request. Fit probes
 and the final context bind that same request to the model's canonical cache
@@ -174,6 +175,175 @@ Completion timing JSON includes `cache_lcp_n`, `cache_planned_n`,
 tail metric is actionable rather than silently counted as a hit. Accounted
 bytes are serialized payload accounting, not exact process-resident memory.
 
+## CPU-resident KV versus CPU execution
+
+Persistent KV placement and attention execution are independent policies. In
+particular, `--no-kv-offload --kv-cpu-pinned` stores the attention history in
+CUDA-pinned host RAM, but with normal operation offload the attention graph
+still executes on CUDA. The growing host cache must therefore participate in
+the accelerator path. This saves persistent VRAM at the cost of substantial,
+context-dependent H2D traffic; it is not equivalent to CPU attention.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--kv-offload`, `--no-kv-offload` | `LLAMA_ARG_KV_OFFLOAD` | Enabled | Controls whether the ordinary persistent KV cache is device-resident. Disabling it moves eligible KV storage to the host; it does not by itself describe every operation's execution backend. |
+| `--kv-cpu-pinned`, `--no-kv-cpu-pinned` | `LLAMA_ARG_KV_CPU_PINNED` | Disabled | Uses accelerator-visible pinned host buffers for CPU-resident KV. With normal operation offload, attention placement is resolved independently and can remain on CUDA. |
+| `--recurrent-state-offload`, `--no-recurrent-state-offload` | `LLAMA_ARG_RECURRENT_STATE_OFFLOAD` | Disabled | For hybrid models under `--no-kv-offload`, keeps the fixed recurrent R/S state on the GPU while long attention KV remains in host memory. With ordinary KV offload enabled, recurrent state is already device-resident. |
+| `--kv-gpu-layers N` | `LLAMA_ARG_KV_GPU_LAYERS` | `0` | Under `--no-kv-offload`, retains the first `N` attention-KV layers on the device. This trades VRAM for lower repeated host-to-device traffic; a value at or above the attention-layer count matches full KV offload for those layers. |
+| `--spec-draft-kv-gpu-layers N`, `--kv-gpu-layers-draft N` | `LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS` | Inherit target | Overrides the target KV policy for a separate draft context and keeps the first `N` independently owned draft attention-KV layers device-resident. Shared KV layers follow their owner. The INI key is `spec-draft-kv-gpu-layers`. |
+| `--op-offload`, `--no-op-offload` | — | Enabled | Controls whether operations over host tensors may execute on the accelerator. The negated form selects the separately tested CPU execution route; it is not the serving-performance path measured below. |
+
+Target and draft attention-KV placement is independent of model-weight
+placement: `--n-gpu-layers-draft` controls draft weights, while the draft KV
+option controls persistent cache storage. Omitting the draft option preserves
+the existing behavior exactly by inheriting `--kv-offload`/`--no-kv-offload`
+and `--kv-gpu-layers`. An explicit zero places every independently owned draft
+KV layer on the CPU; a value at or above the owned attention-layer count places
+all of them on the selected device. Layers whose KV storage is shared with
+another context do not consume the draft count. CPU-resident draft layers still
+inherit `--kv-cpu-pinned`; the explicit count does not modify target placement
+or phase-aware workspace lifetime.
+
+For standard quantized KV whose persistent storage is on the CPU but whose
+attention executes on an accelerator, new rows are quantized by a small
+accelerator stage and copied byte-for-byte into the host cache. This preserves
+the accelerator's canonical quantized representation across GPU- and
+CPU-resident storage. Storage capability governs the cache write, while
+execution capability governs attention and exact-tail math; unsupported
+combinations fail during route construction.
+
+The final matched MTP-6/Q8_0 5K Nsight comparison measured 61.001 decode t/s
+and 14,778 MiB peak VRAM for GPU-resident KV versus 55.622 t/s and 14,532 MiB
+for pinned CPU-resident KV. The pinned case saved 246 MiB, decoded 8.82% more
+slowly, and added 310,224.226 MB H2D. These are single-run profiler results,
+not confidence intervals. Exact commands, model and binary hashes, token hashes,
+transfer counts, D2H totals, and the CPU-execution smoke test are in
+[`mtp-output-exactness-reproduction.md`](mtp-output-exactness-reproduction.md)
+and Experiment 018 of
+[`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
+
+## MTP recurrent-plane cap
+
+MTP draft depth and target recurrent-state rollback capacity are separate
+controls. `--spec-draft-n-max 8` still permits an eight-token draft when the
+target retains only four recurrent planes; the cap changes how a rejected
+suffix is recovered, not how many tokens MTP may propose.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--spec-mtp-rs-planes N` | `LLAMA_ARG_SPEC_MTP_RS_PLANES` | `0` | Sets total target recurrent planes for `draft-mtp`, including the current state. `0` preserves the full allocation of `spec-draft-n-max + 1`; otherwise `N` must be in `2..spec-draft-n-max + 1`. The same name, `spec-mtp-rs-planes`, is accepted in INI presets. |
+
+The default and an explicit full value (`N = spec-draft-n-max + 1`) use the
+ordinary consecutive snapshots and expose `N - 1` direct rollback positions.
+A smaller value is a true cap: it reserves one of the `N` planes for the exact
+pre-verification input state and uses the other `N - 1` planes for recent
+verified outputs. That gives a direct rejected-suffix horizon of `N - 2`.
+Deeper rejection runs the original verification batch shape again on the GPU
+and writes only the selected accepted boundary, avoiding a target host
+checkpoint while retaining deterministic output.
+
+The capped GPU path requires the loaded model graph to declare selected sparse
+recurrent-snapshot support and every recurrent-state buffer backend to advertise
+the matching operation capability. The current provider is NVIDIA CUDA; other
+backends fail closed. This is a capability contract rather than an architecture
+name check, so another compatible graph can opt in without changing recurrent
+memory code. A cap cannot be combined with another speculative implementation
+that requires recurrent rollback. The server logs the resolved depth, total
+planes, direct horizon, allocation, and GPU replay policy. Completion timing
+JSON reports speculative checkpoint counts/times/payloads plus replay cycles and
+actual replay-batch tokens. Nsight transfer totals remain authoritative;
+serialized payload counters are not transfer measurements. Omitting the option
+preserves full-plane behavior.
+
+The complete source lineage, build/ccache setup, implementation chronology,
+failed designs, exact commands, profiler queries, artifact hashes, and merge
+procedure are recorded separately in
+[`mtp-recurrent-plane-cap-reproduction.md`](mtp-recurrent-plane-cap-reproduction.md).
+
+The earlier host-checkpoint replay implementation changed CUDA batch shape and
+failed long output-equivalence validation; Experiment 012 records that rejected
+path. The selected-boundary full-shape GPU replay in Experiment 013 passed the
+long fixed-seed output gate.
+
+Startup logs report resolved draft depth, total planes, direct rollback
+horizon, total per-slot recurrent allocation, and whether selected full-shape
+GPU replay is enabled. Completion timing JSON and the speculative timing log
+report checkpoint capture/restore counts and wall time, cumulative serialized
+target/draft/speculative-state bytes, peak live checkpoint payload bytes,
+replay cycles, and actual replay-batch tokens. These byte counters describe
+serialized payload size; use a backend profiler such as Nsight Systems for
+authoritative host-to-device and device-to-host transfer totals.
+
+## Phase-aware compute workspace
+
+Prompt processing and token generation need different graph-allocation
+geometries. The opt-in phase-aware policy retains only the active geometry and,
+for an integrated MTP context, lets the target and draft schedulers use the same
+physical backing because they execute sequentially.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--phase-aware-workspace`, `--no-phase-aware-workspace` | `LLAMA_ARG_PHASE_AWARE_WORKSPACE` | Disabled | Starts with a compact generation reservation, grows to the configured physical ubatch when a prompt batch requires it, and shrinks after returning to generation. The INI key is `phase-aware-workspace`. The negated form is useful when overriding a preset or environment value. |
+
+The generation bound is not assumed to be one token. The server reserves for
+`parallel * (1 + resolved speculative draft maximum)`, capped by `batch-size`;
+the derived MTP context uses the same bound. A batch larger than that bound is
+classified as prompt processing and receives the full target or draft
+`ubatch-size`. Later requests on the same live context regrow prompt backing and
+shrink it again after prefill.
+
+Target and MTP schedulers retain independent allocation plans. A generic GGML
+shared-backing group tracks the maximum current requirement for each exact
+backend buffer type, so heterogeneous and multi-backend layouts are not merged
+by name. Growth is immediate. Shrink is a group epoch completed only after
+every active member has published its new plan; this prevents speculative
+replay variants from causing target/draft reallocation ping-pong. Physical
+generation changes invalidate peer scheduler graph addresses, and the MTP
+handoffs synchronize before the next sequential owner uses the backing.
+
+This option changes transient compute allocation only. It does not unload model
+weights or the MTP head, move active recurrent state, reduce recurrent rollback
+planes, change KV representation, alter sampling, or reduce the prompt-phase
+workspace required at the configured context. Fit/no-allocation measurement
+continues to evaluate the full prompt geometry. The default-off path retains
+the existing full reservations.
+
+Per-request completion timings expose:
+
+- `workspace_target_reserves`, `workspace_target_grows`,
+  `workspace_target_shrinks`, and `workspace_target_reserve_ms`;
+- `workspace_draft_reserves`, `workspace_draft_grows`,
+  `workspace_draft_shrinks`, and `workspace_draft_reserve_ms`.
+
+The complete implementation history, exact 140K commands, clean-process memory
+measurements, fixed-seed hashes, Nsight transfer totals, and later-turn test are
+in
+[`phase-aware-workspace-reproduction.md`](phase-aware-workspace-reproduction.md).
+
+## Live-context compute workspace
+
+This independent, opt-in policy sizes supported standard attention graph plans
+from the padded live physical KV high row rather than configured context
+capacity. It starts at 256 rows, grows in power-of-two bins, and uses shrink
+hysteresis so short speculative rollbacks do not repeatedly replace backing.
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--live-context-workspace`, `--no-live-context-workspace` | `LLAMA_ARG_LIVE_CONTEXT_WORKSPACE` | Disabled | Bounds supported standard/hybrid attention graph reservations by live physical KV placement. The INI key is `live-context-workspace`. Unsupported memory layouts and fit/no-allocation contexts retain full reservation and established upfront decode ordering. |
+
+The prepared batch publishes its exact padded physical high row before graph
+execution. A real pending shift or copy still receives the established
+worst-case reservation before it resets or computes through the scheduler.
+After every server slot becomes idle, capable CUDA backends may unmap the
+unused tail of transient VMM pools so a contracted workspace becomes visible
+in process residency. The live graph plan itself remains reserved.
+
+This option does not alter persistent KV storage, attention arithmetic,
+sampling, phase-aware token geometry, causal-mask representation, host staging,
+or native quantized attention. Completion timing JSON adds target/draft KV grow
+and shrink counts plus current reserved rows and capacity. Default-off behavior
+retains the original full-context reservation and ordering.
+
 ## DFlash and adaptive draft depth
 
 The first five rows are upstream speculative controls with Bee-specific DFlash
@@ -185,6 +355,7 @@ behavior. The `--spec-dm-*` rows are Bee server additions.
 | `--spec-draft-model FNAME`, `-md FNAME` | `LLAMA_ARG_SPEC_DRAFT_MODEL` | Unused | Loads an upstream-format `dflash` draft GGUF. |
 | `--spec-draft-n-max N` | `LLAMA_ARG_SPEC_DRAFT_N_MAX` | Upstream: `3`; omitted DFlash: `dflash.block_size - 1` | Sets the maximum draft depth. An explicit CLI or env value always wins; upstream clamps values above the drafter's trained limit. A block-16 drafter therefore defaults to 15 only when this setting is omitted. |
 | `--spec-draft-n-min N` | `LLAMA_ARG_SPEC_DRAFT_N_MIN` | `0` | Sets the minimum number of draft tokens used by upstream speculation. |
+| `--spec-draft-ubatch-size N`, `--ubatch-size-draft N`, `-ubd N` | `LLAMA_ARG_SPEC_DRAFT_UBATCH` | `0` (inherit target) | Sets the physical batch size of a separate draft context. For `draft-mtp`, omit it or set it equal to the target `--ubatch-size`; another value is rejected because clean Bee MTP inherits the target geometry and different recurrent prompt-synchronization chunks can change later output. Other model-backed speculative modes retain independent draft ubatches. Use `--phase-aware-workspace` to reduce MTP decode workspace without changing its physical ubatch. |
 | `--spec-draft-p-min P`, `--draft-p-min P` | `LLAMA_ARG_SPEC_DRAFT_P_MIN` | `0.0` | Stops an individual greedy draft when its probability falls below `P`; this is independent of the profit controller. |
 | `--spec-dm-controller MODE` | `LLAMA_ARG_SPEC_DM_CONTROLLER` | `profit` | `profit` adapts DFlash depth from measured cycle profit; `off` keeps the resolved or explicit maximum static. Other speculative modes are unchanged. |
 | `--spec-dm-profit-min F` | `LLAMA_ARG_SPEC_DM_PROFIT_MIN` | `0.05` | Sets the minimum margin over the no-spec baseline before clearing disable dwell. Range: `0.0` to `0.50`. |
@@ -250,7 +421,7 @@ Use the same corpus, context, logical batch, and physical ubatch for both KLD le
 | Argument | Env var | Default | Behavior |
 |---|---|---|---|
 | `-DGGML_CUDA_FA_ALL_QUANTS=ON` | — | Off | Expands the CUDA vector matrix from 50 to all 169 standard cache pairs and, when `GGML_CUDA_KVARN=ON`, KVarN fast-decode instances from 15 balanced pairs to all 36 ordered bit pairs. Valid KVarN pairs outside the fast matrix use descriptor-native MMA. |
-| `-DGGML_CUDA_KVARN=ON/OFF` | — | On | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
+| `-DGGML_CUDA_KVARN=ON/OFF` | — | Off | Compiles or omits the shared CUDA/HIP KVarN kernels and CUDA native-attention template instances. Enable it explicitly for KVarN builds. When enabled, `GGML_CUDA_FA_ALL_QUANTS` selects 15 default or all 36 CUDA fast-decode pairs. CUDA devices without the specialized Turing MMA contract use the portable direct-record route when their warp, thread-block, shared-memory, head-dimension, and tail-type capabilities pass. |
 
 Release packages are built with CUDA 12.4 and 13.1. CUDA 12.4 can emit the
 Maxwell, Pascal, and Volta PTX targets used by the portable KVarN route; CUDA
@@ -275,4 +446,4 @@ tests.
 | `--spec-dflash-default`, `--dflash-max-slots`, `--tree-budget`, `--draft-topk`, `--draft-model`, `--spec-replace`, `--spec-draft-replace` | Removed with the fork DFlash verifier and tree paths. | Use upstream `--spec-*` controls where an equivalent exists. |
 | `--spec-dflash-cross-ctx`, `--spec-branch-budget`, `--spec-draft-temp`, `GGML_DFLASH_*` | Removed with the fork ring, capture, and verifier implementation. | No direct replacement. |
 | `GGML_CUDA_FA_HALF_QUANTS` | Removed. | Use the default matrix or `GGML_CUDA_FA_ALL_QUANTS=ON`. |
-| `GGML_CUDA_KVARN_FA`, `GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS` | Removed. | Use the default-on `GGML_CUDA_KVARN`; `GGML_CUDA_FA_ALL_QUANTS` selects 15 or 36 fast-decode pairs. |
+| `GGML_CUDA_KVARN_FA`, `GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS` | Removed. | Use explicit `GGML_CUDA_KVARN=ON`; `GGML_CUDA_FA_ALL_QUANTS` selects 15 or 36 fast-decode pairs. |

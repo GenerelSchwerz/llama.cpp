@@ -66,6 +66,8 @@ public:
 
     bool get_can_shift() const override;
     seq_rm_capability get_seq_rm_capability() const override;
+    bool recurrent_sparse_snapshots_supported() const override;
+    bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
     // state write/load
 
@@ -78,6 +80,13 @@ public:
 
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
+
+    bool sparse_snapshots = false;
+    int32_t selected_snapshot_token = -1;
+
+    // Absolute positions represented by each physical recurrent plane.
+    std::vector<llama_pos> rs_plane_pos;
+    std::vector<bool> rs_plane_pos_sparse;
 
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
@@ -121,6 +130,7 @@ public:
 private:
     //const llama_model & model;
     const llama_hparams & hparams;
+    const bool graph_supports_sparse_snapshots;
 
     const uint32_t n_seq_max = 1;
 
@@ -182,10 +192,16 @@ public:
 
     int32_t s_copy(int i) const;
 
+    bool has_sparse_snapshots() const;
+    int32_t get_selected_snapshot_token() const;
+
 private:
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;
+
+    bool sparse_snapshots = false;
+    int32_t selected_snapshot_token = -1;
 
     size_t i_next = 0;
 

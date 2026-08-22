@@ -232,7 +232,7 @@ static const llm_fused_op_probe llm_fused_op_gdn_ar_probe = {
 static const llm_fused_op_probe llm_fused_op_gdn_ch_probe = {
     /*.op               =*/ LLM_FUSED_OP_GDN_CH,
     /*.name             =*/ "fused Gated Delta Net (chunked)",
-    /*.n_tokens_per_seq =*/ 16,
+    /*.n_tokens_per_seq =*/ LLAMA_MAX_FUSED_OP_PROBE_TOKENS_PER_SEQ,
 };
 
 static const llm_fused_op_probe llm_fused_op_lid_probe = {
@@ -298,6 +298,13 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
+    cparams.recurrent_state_offload = params.recurrent_state_offload;
+    cparams.phase_aware_workspace   = params.phase_aware_workspace;
+    cparams.live_context_workspace  = params.live_context_workspace;
+    cparams.kv_gpu_layers           = params.kv_gpu_layers;
+    cparams.offload_attn_compute    = params.offload_kqv ||
+        (params.op_offload && (params.kv_cpu_pinned || params.kv_gpu_layers > 0));
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -572,7 +579,9 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
-    cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+    cparams.n_outputs_max = llama_model_has_encoder(&model) ? cparams.n_batch :
+            params.n_outputs_max != 0 ? params.n_outputs_max :
+            cparams.phase_aware_workspace ? cparams.n_seq_max : cparams.n_batch;
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
@@ -812,6 +821,21 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        const bool live_context_workspace = cparams.live_context_workspace && memory &&
+                memory->get_attn_reserve_capacity() > 0;
+        if ((cparams.phase_aware_workspace || live_context_workspace) && !model.hparams.no_alloc) {
+            if (cparams.phase_aware_workspace && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+                    params.ctx_other != nullptr && params.ctx_other->sched_shared_buffers) {
+                sched_shared_buffers = params.ctx_other->sched_shared_buffers;
+                LLAMA_LOG_INFO("%s: sharing phase-aware compute backing with the target context\n", __func__);
+            } else {
+                sched_shared_buffers = std::shared_ptr<ggml_gallocr_shared_buffers>(
+                        ggml_gallocr_shared_buffers_new(), ggml_gallocr_shared_buffers_free);
+                LLAMA_LOG_INFO("%s: created %s compute backing\n", __func__,
+                        cparams.phase_aware_workspace ? "phase-aware" : "live-context");
+            }
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -843,7 +867,16 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            if (size_exp == size_act) {
+            if (sched_shared_buffers) {
+                // The physical size is the current maximum across members,
+                // while size_exp records what this context observed after its
+                // most recent plan publication. A peer transition can change
+                // the former without invalidating either plan.
+                LLAMA_LOG_DEBUG("%s: %10s shared compute backing size is %8.4f MiB "
+                        "(last observed %8.4f MiB)\n",
+                        __func__, ggml_backend_buft_name(buft),
+                        size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
+            } else if (size_exp == size_act) {
                 LLAMA_LOG_DEBUG("%s: %10s compute buffer size is %8.4f MiB, matches expectation of %8.4f MiB\n",
                     __func__, ggml_backend_buft_name(buft), size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
             } else {
@@ -932,39 +965,157 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     }
 }
 
-void llama_context::sched_reserve() {
-    if (!sched_need_reserve) {
+static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capacity) {
+    GGML_ASSERT(capacity > 0);
+    required = std::max(1u, std::min(required, capacity));
+
+    uint32_t result = std::min(256u, capacity);
+    while (result < required) {
+        result = uint32_t(std::min<uint64_t>(capacity, uint64_t(result)*2));
+    }
+    return result;
+}
+
+void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
+    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_tokens_tg  = std::min(n_tokens_max,
+            std::max(cparams.n_seq_max, cparams.n_outputs_max));
+
+    const uint32_t n_kv_capacity = memory ? memory->get_attn_reserve_capacity() : 0;
+    const bool live_kv = cparams.live_context_workspace && !model.hparams.no_alloc &&
+            n_kv_capacity > 0;
+
+    uint32_t n_kv = 0;
+    if (live_kv) {
+        const uint32_t required = n_kv_req > 0 ? n_kv_req :
+                sched_reserved_kv > 0 ? sched_reserved_kv : std::min(256u, n_kv_capacity);
+        n_kv = llama_workspace_kv_growth_bound(required, n_kv_capacity);
+
+        // Avoid churn when speculative rollback briefly crosses a bin edge.
+        if (sched_reserved_kv > n_kv && n_kv >= sched_reserved_kv/2) {
+            n_kv = sched_reserved_kv;
+        }
+    }
+
+    uint32_t n_tokens = n_tokens_max;
+    if (cparams.phase_aware_workspace && !model.hparams.no_alloc) {
+        // A logical decode can contain several rows (parallel sequences,
+        // speculative verification, or chained MTP heads).  n_outputs_max is
+        // the caller-provided bound for that geometry.  Anything larger is a
+        // prompt batch and gets the full physical-ubatch reservation so prompt
+        // chunks do not repeatedly grow the scheduler.
+        n_tokens = n_tokens_req > n_tokens_tg ? n_tokens_max : n_tokens_tg;
+
+        // Do not shrink a prompt reservation merely because a later prompt
+        // chunk is shorter. It shrinks automatically when the submitted batch
+        // has returned to generation geometry.
+        if (sched_reserved_tokens > n_tokens_tg &&
+                n_tokens_req > n_tokens_tg && n_tokens_req <= sched_reserved_tokens) {
+            n_tokens = sched_reserved_tokens;
+        }
+    }
+
+    if (sched && sched_shared_buffers) {
+        if (sched_reserved_tokens > n_tokens || (live_kv && sched_reserved_kv > n_kv)) {
+            // A backing reduction is a group operation: every sequential member
+            // publishes once before the common physical backing is replaced.
+            ggml_backend_sched_request_shared_buffer_shrink(sched.get());
+        }
+        const uint64_t generation =
+                ggml_backend_sched_shared_buffers_generation(sched.get());
+        if (generation != sched_shared_generation) {
+            // A sequential peer changed the shared physical allocation. Its
+            // graph plan remains private, but any tensor addresses cached by
+            // this scheduler must be discarded before the next graph build.
+            synchronize();
+            ggml_backend_sched_reset(sched.get());
+            if (gf_res_prev) {
+                gf_res_prev->reset();
+            }
+            sched_shared_generation = generation;
+        }
+        const uint64_t plan_generation =
+                ggml_backend_sched_shared_buffers_plan_generation(sched.get());
+        if (plan_generation != sched_shared_plan_generation) {
+            // A peer began a coalesced shrink. Republish this scheduler's
+            // current plan even if its token geometry did not change, so an
+            // unchanged member cannot leave the shared backing oversized.
+            sched_need_reserve = true;
+            sched_shared_plan_generation = plan_generation;
+        }
+    }
+
+    if (!sched_need_reserve && sched_reserved_tokens == n_tokens &&
+            (!live_kv || sched_reserved_kv == n_kv)) {
         return;
     }
 
     sched_need_reserve = false;
 
-    LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
+    const uint32_t n_tokens_prev = sched_reserved_tokens;
+    const uint32_t n_kv_prev = sched_reserved_kv;
+    if (live_kv) {
+        LLAMA_LOG_INFO("%s: reserving %s workspace (tokens = %u, previous = %u, kv = %u, previous = %u) ...\n",
+                __func__, n_tokens == n_tokens_tg ? "decode" : "prefill",
+                n_tokens, n_tokens_prev, n_kv, n_kv_prev);
+    } else {
+        LLAMA_LOG_INFO("%s: reserving %s workspace (tokens = %u, previous = %u) ...\n",
+                __func__, n_tokens == n_tokens_tg ? "decode" : "prefill",
+                n_tokens, n_tokens_prev);
+    }
 
     synchronize();
 
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(n_tokens_max);
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
-    gf_res_prev.reset(new llm_graph_result(max_nodes));
-    gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    if (!gf_res_prev) {
+        gf_res_prev.reset(new llm_graph_result(max_nodes));
+    } else {
+        gf_res_prev->reset();
+    }
+    if (!gf_res_reserve) {
+        gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    } else {
+        gf_res_reserve->reset();
+    }
     std::fill(backend_kvarn_workspace_y_size.begin(),
             backend_kvarn_workspace_y_size.end(), 0);
     std::fill(backend_kvarn_workspace_split_k_size.begin(),
             backend_kvarn_workspace_split_k_size.end(), 0);
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    auto create_sched = [&](bool pipeline_parallel) {
+        sched.reset(ggml_backend_sched_new(
+                backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                max_nodes, pipeline_parallel, cparams.op_offload));
+        if (sched_shared_buffers) {
+            ggml_backend_sched_set_shared_buffers(sched.get(), sched_shared_buffers.get());
+            sched_shared_generation =
+                    ggml_backend_sched_shared_buffers_generation(sched.get());
+            sched_shared_plan_generation =
+                    ggml_backend_sched_shared_buffers_plan_generation(sched.get());
+        }
+    };
+
+    if (!sched) {
+        create_sched(cparams.pipeline_parallel);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
-        LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
-        mctx = memory->init_full();
+        if (live_kv) {
+            LLAMA_LOG_DEBUG("%s: reserving bounded memory module (n_kv = %u, capacity = %u)\n",
+                    __func__, n_kv, n_kv_capacity);
+            mctx = memory->init_reserve(n_kv);
+        } else {
+            LLAMA_LOG_DEBUG("%s: reserving full memory module\n", __func__);
+            mctx = memory->init_full();
+        }
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory module");
         }
@@ -994,7 +1145,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                create_sched(false);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -1009,7 +1160,8 @@ void llama_context::sched_reserve() {
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
-        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(),
+                model.hparams.no_alloc || sched_shared_buffers != nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -1025,7 +1177,8 @@ void llama_context::sched_reserve() {
         //
         // auto * gf = graph_reserve(n_tokens, 1, n_tokens, mctx.get());
         //
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), model.hparams.no_alloc);
+        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
+                model.hparams.no_alloc || sched_shared_buffers != nullptr);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
         }
@@ -1068,8 +1221,99 @@ void llama_context::sched_reserve() {
 
     const int64_t t_end_us = ggml_time_us();
 
-    LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
-            __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    if (sched_shared_buffers) {
+        sched_shared_generation =
+                ggml_backend_sched_shared_buffers_generation(sched.get());
+        sched_shared_plan_generation =
+                ggml_backend_sched_shared_buffers_plan_generation(sched.get());
+    }
+
+    sched_reserved_tokens = n_tokens;
+    sched_reserved_kv = live_kv ? n_kv : 0;
+    workspace_reserve_count++;
+    workspace_reserve_us += t_end_us - t_start_us;
+    if (n_tokens_prev > 0 && n_tokens > n_tokens_prev) {
+        workspace_grow_count++;
+    } else if (n_tokens_prev > 0 && n_tokens < n_tokens_prev) {
+        workspace_shrink_count++;
+    }
+
+    if (n_kv_prev > 0 && sched_reserved_kv > n_kv_prev) {
+        workspace_kv_grow_count++;
+    } else if (n_kv_prev > 0 && sched_reserved_kv < n_kv_prev) {
+        workspace_kv_shrink_count++;
+    }
+
+    if (live_kv) {
+        LLAMA_LOG_INFO("%s: %s workspace reserve took %.2f ms (kv = %u), sched copies = %d\n",
+                __func__, n_tokens == n_tokens_tg ? "decode" : "prefill",
+                (t_end_us - t_start_us)/1000.0, n_kv,
+                ggml_backend_sched_get_n_copies(sched.get()));
+    } else {
+        LLAMA_LOG_INFO("%s: %s workspace reserve took %.2f ms, sched copies = %d\n",
+                __func__, n_tokens == n_tokens_tg ? "decode" : "prefill",
+                (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+}
+
+llama_workspace_stats llama_context::get_workspace_stats() const {
+    llama_workspace_stats result;
+    result.kv_capacity = memory ? memory->get_attn_reserve_capacity() : 0;
+    const bool live_context_workspace = cparams.live_context_workspace && result.kv_capacity > 0;
+    result.enabled = (cparams.phase_aware_workspace || live_context_workspace) &&
+            !model.hparams.no_alloc;
+    result.reserved_tokens = sched_reserved_tokens;
+    result.prefill_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    result.decode_tokens = std::min(result.prefill_tokens,
+            std::max(cparams.n_seq_max, cparams.n_outputs_max));
+    result.reserved_kv = sched_reserved_kv;
+    result.reserve_count = workspace_reserve_count;
+    result.grow_count = workspace_grow_count;
+    result.shrink_count = workspace_shrink_count;
+    result.kv_grow_count = workspace_kv_grow_count;
+    result.kv_shrink_count = workspace_kv_shrink_count;
+    result.reserve_us = workspace_reserve_us > 0 ? uint64_t(workspace_reserve_us) : 0;
+
+    for (size_t i = 0; sched && i < backend_ptrs.size(); ++i) {
+        const auto buft = backend_buft[i];
+        if (std::find(backend_buft.begin(), backend_buft.begin() + i, buft) != backend_buft.begin() + i) {
+            continue;
+        }
+        const uint64_t bytes = ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i]);
+        if (ggml_backend_buft_is_host(buft)) {
+            result.host_bytes += bytes;
+        } else {
+            result.device_bytes += bytes;
+        }
+    }
+    return result;
+}
+
+uint64_t llama_context::trim_transient_memory() {
+    const bool live_context_workspace = cparams.live_context_workspace && memory &&
+            memory->get_attn_reserve_capacity() > 0 && !model.hparams.no_alloc;
+    if (!live_context_workspace) {
+        return 0;
+    }
+
+    synchronize();
+
+    using trim_fn = uint64_t (*)(ggml_backend_t);
+    uint64_t released = 0;
+    for (ggml_backend_t backend : backend_ptrs) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto * fn = reg != nullptr ? (trim_fn) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_cuda_trim_transient_pools") : nullptr;
+        if (fn != nullptr) {
+            released += fn(backend);
+        }
+    }
+    return released;
+}
+
+bool llama_context::shares_workspace_with(const llama_context & other) const {
+    return sched_shared_buffers && sched_shared_buffers == other.sched_shared_buffers;
 }
 
 void llama_context::record_backend_private_workspace(ggml_cgraph * gf) {
@@ -1196,6 +1440,10 @@ llama_memory_t llama_context::get_memory() const {
 }
 
 llama_memory_status llama_context::memory_update(bool optimize) {
+    return memory_update(optimize, 0);
+}
+
+llama_memory_status llama_context::memory_update(bool optimize, uint32_t n_tokens_req) {
     if (!memory) {
         return LLAMA_MEMORY_STATUS_NO_UPDATE;
     }
@@ -1224,6 +1472,13 @@ llama_memory_status llama_context::memory_update(bool optimize) {
                 }
         }
 
+        // Real deferred shifts/copies keep the established worst-case reserve
+        // before resetting or computing through the scheduler. No-update can
+        // wait for init_batch() to publish the exact plan.
+        if (n_tokens_req > 0) {
+            sched_reserve(n_tokens_req);
+        }
+
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
@@ -1241,14 +1496,18 @@ llama_memory_status llama_context::memory_update(bool optimize) {
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
-        const auto mctx = memory->init_full();
+        const uint32_t n_kv_capacity = memory->get_attn_reserve_capacity();
+        const bool live_kv = cparams.live_context_workspace && !model.hparams.no_alloc &&
+                n_kv_capacity > 0 && sched_reserved_kv > 0;
+        const auto mctx = live_kv ? memory->init_reserve(sched_reserved_kv) : memory->init_full();
         if (!mctx) {
             LLAMA_LOG_ERROR("%s: failed to initialize full memory context\n", __func__);
             return LLAMA_MEMORY_STATUS_FAILED_PREPARE;
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = sched_reserved_tokens > 0 ? sched_reserved_tokens :
+                std::min(cparams.n_ctx, cparams.n_ubatch);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1874,7 +2133,7 @@ int llama_context::encode(const llama_batch & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    sched_reserve();
+    sched_reserve(n_tokens);
 
     n_queued_tokens += n_tokens;
 
@@ -2227,12 +2486,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
-    sched_reserve();
+    const bool live_exact_batch_plan = cparams.live_context_workspace && memory &&
+            memory->get_attn_reserve_capacity() > 0 && !model.hparams.no_alloc;
+
+    // Preserve the established upfront reservation order unless live sizing is
+    // explicitly effective. Only that policy waits for exact physical rows.
+    if (!live_exact_batch_plan) {
+        sched_reserve(n_tokens_all);
+    }
 
     bool did_optimize = false;
 
     // handle any pending shifts/copies
-    if (llama_memory_status_is_fail(memory_update(false))) {
+    const llama_memory_status update_status = live_exact_batch_plan ?
+            memory_update(false, n_tokens_all) : memory_update(false);
+    if (llama_memory_status_is_fail(update_status)) {
         LLAMA_LOG_ERROR("%s: failed to apply pending memory update\n", __func__);
         return -2;
     }
@@ -2260,7 +2528,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     if (!did_optimize) {
                         did_optimize = true;
 
-                        if (memory_update(true) == LLAMA_MEMORY_STATUS_SUCCESS) {
+                        const llama_memory_status optimize_status = live_exact_batch_plan ?
+                                memory_update(true, n_tokens_all) : memory_update(true);
+                        if (optimize_status == LLAMA_MEMORY_STATUS_SUCCESS) {
                             LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
 
                             continue;
@@ -2280,6 +2550,12 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         break;
+    }
+
+    if (live_exact_batch_plan) {
+        // init_batch() has exact physical placement for every ubatch. Grow the
+        // bounded graph before any compute can observe those rows.
+        sched_reserve(n_tokens_all, mctx->get_attn_reserve_n_kv());
     }
 
     // reserve output buffer
@@ -4253,6 +4529,11 @@ llama_context_params llama_context_default_params() {
         /*.kv_tail_type                =*/ GGML_TYPE_COUNT,
         /*.kv_tail_config              =*/ nullptr,
         /*.kv_tail_request             =*/ nullptr,
+        /*.kv_cpu_pinned               =*/ false,
+        /*.recurrent_state_offload     =*/ false,
+        /*.kv_gpu_layers               =*/ 0,
+        /*.phase_aware_workspace       =*/ false,
+        /*.live_context_workspace      =*/ false,
     };
 
     return result;
@@ -4447,6 +4728,16 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+bool llama_recurrent_sparse_snapshots_supported(const llama_context * ctx) {
+    return ctx != nullptr && ctx->get_memory() != nullptr &&
+            ctx->get_memory()->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_recurrent_set_sparse_snapshot_mode(llama_context * ctx, bool enabled, int32_t selected_token) {
+    return ctx != nullptr && ctx->get_memory() != nullptr &&
+            ctx->get_memory()->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {
@@ -5082,4 +5373,18 @@ llama_kv_memory_stats llama_get_kv_memory_stats(const struct llama_context * ctx
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {
     return ctx->get_cparams().ctx_other;
+}
+
+llama_workspace_stats llama_get_workspace_stats(const struct llama_context * ctx) {
+    return ctx != nullptr ? ctx->get_workspace_stats() : llama_workspace_stats{};
+}
+
+bool llama_contexts_share_workspace(
+        const struct llama_context * ctx_a,
+        const struct llama_context * ctx_b) {
+    return ctx_a != nullptr && ctx_b != nullptr && ctx_a->shares_workspace_with(*ctx_b);
+}
+
+uint64_t llama_trim_transient_memory(struct llama_context * ctx) {
+    return ctx != nullptr ? ctx->trim_transient_memory() : 0;
 }

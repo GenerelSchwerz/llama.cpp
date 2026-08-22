@@ -56,6 +56,23 @@ overrides:
 ctx-size    = 32768
 batch-size  = 1024
 ubatch-size = 512
+# Optional for non-MTP model-backed speculation: keep the target ubatch above
+# while reducing only the separate draft context's physical ubatch.
+spec-draft-ubatch-size = 128
+# MTP must omit that setting or explicitly use 512 so recurrent prompt
+# synchronization retains clean Bee's physical batch geometry. Use the
+# phase-aware workspace setting below for MTP decode-workspace reduction.
+# Optional: override target KV placement for independently owned draft cache
+# layers. Omit this key to inherit the target policy.
+# spec-draft-kv-gpu-layers = N
+# Optional: retain only the active prompt or generation workspace. This regrows
+# automatically when a later request needs prompt processing and is the MTP
+# workspace-reduction control.
+phase-aware-workspace = true
+# Optional and independent of phase-aware sizing: grow supported standard
+# attention workspace reservations with the padded live physical KV extent.
+# This is default-off; unsupported memory layouts keep full reservation.
+live-context-workspace = true
 
 [qwen-local]
 model        = D:/models/qwen.gguf
@@ -72,6 +89,16 @@ top-k       = 0
 `load-on-startup = 1` autoloads a section. The total number of startup sections
 must not exceed `--models-max` unless that upstream limit is configured as
 unlimited.
+
+`live-context-workspace` is the preset spelling of
+`--live-context-workspace`. It is opt-in and independent of
+`phase-aware-workspace`: the former bounds supported standard or hybrid
+attention reservations by live physical KV placement, while the latter changes
+prompt/generation token geometry. Omit it or set it to `false` to retain the
+full-context upfront reservation. Unsupported memory layouts and
+fit/no-allocation contexts also retain full reservation and the established
+upfront decode order even when it is enabled. At full live demand, the bounded
+reservation reaches the configured capacity.
 
 ## Remote presets
 

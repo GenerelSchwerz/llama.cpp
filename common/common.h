@@ -326,6 +326,8 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch = 0; // physical draft batch size (0 = inherit target)
+    int32_t kv_gpu_layers = -1; // independently owned draft KV layers on GPU (-1 = inherit target policy)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -393,6 +395,8 @@ struct common_params_speculative {
     // controller; the old fringe controller was coupled to the retired fork
     // verifier and is intentionally not part of the v0.4.0 API.
     bool draft_n_max_explicit = false;
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    bool mtp_rs_planes_explicit = false;
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
     float   dm_profit_min               = 0.05f;
     float   dm_profit_raise_margin      = 0.05f;
@@ -406,14 +410,32 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool is_mtp_rs_capped() const {
+        return mtp_rs_planes > 0 &&
+               int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
+    }
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(
+                types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        if (has_mtp && mtp_rs_planes > 0) {
+            return uint32_t(mtp_rs_planes - 1);
+        }
+
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
     }
 };
+
+// Validate options whose legality depends on the complete speculative-mode
+// selection. This is intentionally separate from individual argument handlers
+// so CLI, environment, and rendered INI options are order-independent.
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch);
 
 // Resolve Bee's omitted DFlash draft maximum before target-context allocation.
 // Returns false when the draft GGUF metadata cannot be read or is invalid.
@@ -510,6 +532,7 @@ struct common_params {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     int32_t n_gpu_layers       = -1;    // number of layers to store in VRAM, -1 is auto, <= -2 is all
+    int32_t kv_gpu_layers      = 0;     // with no_kv_offload, keep this many attention-KV layers device-resident
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
@@ -613,6 +636,10 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool kv_cpu_pinned     = false; // route CPU-resident KV cache layers through pinned/host memory
+    bool recurrent_state_offload = false; // for hybrid models, keep recurrent state GPU-resident even with no_kv_offload
+    bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
+    bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

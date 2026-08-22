@@ -497,6 +497,21 @@ extern "C" {
         enum ggml_type kv_tail_type;
         const struct llama_kv_tail_config * kv_tail_config; // borrowed only during context creation
         const struct llama_kv_tail_request * kv_tail_request; // model-independent; borrowed during context creation
+
+        // Appended at the end of the struct (rather than grouped with the other
+        // booleans above) to preserve the offset of every preexisting field for
+        // callers built against earlier BeeLlama.cpp releases.
+        bool kv_cpu_pinned;           // route CPU-resident KV cache layers through pinned/host memory instead of plain CPU memory
+                                       // (only affects layers not offloaded to GPU; speeds up CPU<->GPU KV transfers)
+                                       // and allows attention placement to be resolved independently of persistent KV placement
+        bool recurrent_state_offload; // for hybrid attention/recurrent models, allow the fixed recurrent (R/S) state to stay
+                                       // GPU-resident even when offload_kqv=false keeps attention KV on CPU
+        uint32_t kv_gpu_layers;       // with offload_kqv=false, keep this many attention-KV layers device-resident anyway.
+                                       // Trades device memory for host-to-device KV traffic; 0 keeps every layer on host.
+        bool phase_aware_workspace;   // resize compute schedulers between prompt processing and token generation.
+                                      // Fit/no-alloc contexts still measure the full prompt reservation.
+        bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent.
+                                      // false preserves the full-context reservation and initialization order.
     };
 
     struct llama_model_tensor_override {
@@ -683,6 +698,9 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);
+    LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
+            struct llama_context * ctx, bool enabled, int32_t selected_token);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");

@@ -51,12 +51,15 @@ cmake -B build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-The default CUDA FlashAttention build contains 50 standard vector pairs and 15
-balanced KVarN fast-decode pairs. The standard quant matrix follows the same
-bit-pair rules as KVarN and adds homogeneous F16/F16 and BF16/BF16 tail pairs.
-`GGML_CUDA_FA_ALL_QUANTS=ON` expands those to
-169 standard pairs and all 36 ordered KVarN bit pairs.
-`GGML_CUDA_KVARN=OFF` omits all dedicated CUDA KVarN kernels and templates.
+The minimal fresh-cache CUDA FlashAttention build contains 50 standard vector
+pairs and omits KVarN. The standard quant matrix follows the same bit-pair rules
+as KVarN and adds homogeneous F16/F16 and BF16/BF16 tail pairs.
+`GGML_CUDA_KVARN=ON` explicitly adds the dedicated CUDA/HIP KVarN kernels and 15
+balanced KVarN fast-decode pairs. `GGML_CUDA_FA_ALL_QUANTS=ON` expands the
+standard matrix to 169 pairs and, when KVarN is enabled, expands its matrix to
+all 36 ordered bit pairs. CMake caches retain earlier selections, so pass
+`-DGGML_CUDA_KVARN=OFF` when converting an existing build tree to the minimal
+policy. Enable KVarN only in worktrees that build or validate that feature.
 `GGML_CUDA_FA_HALF_QUANTS` no longer exists. Valid KVarN pairs outside the fast
 matrix use descriptor-native MMA fallback.
 
@@ -113,6 +116,25 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 - `docs/quickstart-qwen36-dflash.md` - Qwen3.6 DFlash guide.
 - `docs/quickstart-gemma-4-31b-dflash.md` - Gemma 4 DFlash guide.
 - `docs/preset.md` - INI preset format.
+- `docs/cpu-kv-offload-current-testing.md` - authoritative current CPU KV
+  build, runtime, exactness, benchmark, progress, and artifact protocol. Start
+  here before running or recording any CPU KV experiment.
+- `docs/cpu-kv-offload-development.md` - progress and decision journal. It
+  records protocol transitions, durable rationale, and concise summaries of
+  valid rejected paths. It is not a transcript of every attempted run.
+- `docs/cpu-kv-offload-experiments.md` - complete curated CPU KV Experiments
+  001-020 and W06 record plus the post-KV evidence/identity index. It contains
+  only valid, decision-relevant evidence; use Git history for superseded
+  editions.
+- `docs/cpu-kv-offload-vram-roadmap.md` - ranked shared VRAM work, including
+  integrated controls, independent PR lanes, rejected paths, and later research.
+- `docs/vram-feature-isolation-plan.md` - source, measurement, comparison, and
+  post-composition gates for every KV-derived VRAM feature branch.
+- `docs/cpu-kv-offload-feature-delta.md` - source-backed capability delta from
+  BeeLlama v0.4.3, including explicit features absent from the published KV base.
+- `docs/feature-performance-validation.md` - manifest-driven early A/B
+  screening, telemetry, statistics, resume, and optional Nsight diagnostics for
+  KV-derived feature work.
 
 ### Invariants
 
@@ -136,25 +158,130 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
 
 ```bash
 # Unit and regression tests
-ctest --test-dir build --output-on-failure
+flock /tmp/beellama-single-gpu.lock -c '
+  ctest --test-dir build --output-on-failure
+'
 
 # KVarN quality at the intended serving cadence
-build/bin/llama-perplexity -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-perplexity \
+    -m model.gguf -f test.txt -c 4096 -b 512 -ub 256
+'
 
 # Decode speed
-build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-bench -m model.gguf -p 0 -n 64 -t 1 --progress
+'
 
 # Upstream DFlash with recommended standard q cache
-build/bin/llama-server -m target.gguf \
-  --spec-type draft-dflash \
-  --spec-draft-model drafter.gguf \
-  --spec-draft-n-max 8 \
-  --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
-  --port 8080
+flock /tmp/beellama-single-gpu.lock -c '
+  build/bin/llama-server -m target.gguf \
+    --spec-type draft-dflash \
+    --spec-draft-model drafter.gguf \
+    --spec-draft-n-max 8 \
+    --flash-attn on --cache-type-k q5_0 --cache-type-v q4_1 \
+    --port 8080
+'
 ```
 
 KLD comparisons use matching `-b` and `-ub` values for the baseline and
 candidate. Record both values with every result.
+
+## CPU KV-offload Experiment Workflow
+
+These instructions apply when working on `exp/kv-cpu-offload` or continuing its
+CPU-resident KV-cache investigation.
+
+- Read `docs/cpu-kv-offload-current-testing.md` before changing code, launching
+  a test, or interpreting a current result. It is the only documentation source
+  for the runnable current protocol; the local source remains authoritative if
+  documentation and behavior disagree.
+- For a new CPU-KV-derived performance or memory feature, preregister and run
+  the manifest workflow in `docs/feature-performance-validation.md` for early
+  exactness, short prefill/decode, representative weighted screens, and
+  resource telemetry. A clear early signal only permits deeper validation;
+  it never replaces the current long-context, perplexity, clean-process,
+  allocation-lifecycle, or feature-specific acceptance gates.
+- Read the relevant sections of `docs/cpu-kv-offload-development.md` and
+  `docs/cpu-kv-offload-experiments.md` when historical rationale, prior
+  protocol editions, rejected approaches, or old measurements are needed.
+  Never promote a command from those records into a current run unless the
+  current-testing document explicitly permits it. Treat Git commits as the
+  source of truth for exact historical diffs.
+- Do not include retired arguments or environment-variable names in a current
+  command, including defensive `env -u` entries. In particular,
+  `GGML_KV_CPU_PINNED` and `GGML_RECURRENT_STATE_OFFLOAD` are historical and
+  must not appear in current setup or benchmark commands. Use the supported
+  CLI controls documented in the current-testing document.
+- Do not use `taskset` in a current CPU-KV benchmark or profiler command. In
+  particular, never put it before or after `ncu` or `nsys`: the former pins
+  profiler collectors and helpers, while the latter makes an affinity wrapper
+  the direct profiling target. Launch the llama binary directly under the
+  profiler and express target worker placement with llama.cpp's own
+  `--cpu-mask`/`--cpu-range`, batch-affinity, and `--cpu-strict` controls. Any
+  `taskset` command in the development journal, evidence index, or a
+  reproduction document is historical evidence, not a current template.
+- Keep the known BeeLlama baseline worktree unchanged. Make experimental source,
+  build, profile, and documentation changes in the dedicated experimental
+  worktree and branch.
+- Give each independently testable optimization its own commit. Include the
+  implementation and its corresponding update to
+  `docs/cpu-kv-offload-experiments.md` in that commit so the code and evidence
+  cannot drift apart.
+- Update `docs/cpu-kv-offload-current-testing.md` first whenever supported
+  controls, the active setup, exactness oracle, benchmark shape, progress
+  mechanism, or required artifact set changes. Record why the prior edition
+  was superseded in `docs/cpu-kv-offload-development.md`. Preserve durable
+  rationale, not obsolete command copies or an attempt-by-attempt transcript.
+  Pure result additions that do not change the protocol or working theory
+  belong only in the experiment/evidence index.
+- Record a rejected or neutral experiment only when its run was valid and its
+  result tests a distinct hypothesis or prevents likely repeated work. Prefer a
+  clean revert or a separate revert commit when preserving the exact attempted
+  source diff is useful; never leave an undocumented partial implementation in
+  the branch.
+- Invalid runs are not evidence. A run with a wrong binary, unmatched prompt or
+  configuration, contaminated hardware, setup/launcher failure, incomplete
+  output, or a violated acceptance gate must not contribute measurements,
+  artifact inventories, or a ledger entry. If the mistake exposes a reusable
+  protocol hazard, record only a short correction in the development journal;
+  Git history and temporary artifacts are sufficient for forensic detail.
+- Do not create a new record for an otherwise identical rerun that adds no new
+  confidence or decision. Aggregate required repetitions into the existing
+  experiment with sample count and summary statistics. Record a reproduction
+  separately only when it changes confidence, covers a materially different
+  model/hardware/commit, closes a named correctness gate, or contradicts prior
+  evidence.
+- For every performance change, measure clean baseline and candidate processes
+  with identical model, depth, cache formats, affinity, thread counts, build
+  options, and runtime settings. At minimum record prefill, decode at depth 4096,
+  decode at a long-context depth, and peak process VRAM.
+- Record system-RAM and pinned-memory costs when allocation behavior changes.
+  Do not equate `nvidia-smi` process VRAM with CUDA host mappings or page-locked
+  system memory.
+- Run correctness/regression coverage proportional to the change. Cache-format
+  quality comparisons require matching `llama-perplexity` `-b` and `-ub`
+  values for baseline and candidate.
+- Every command that may have a long or uncertain runtime must expose progress.
+  Use the tool's native progress option when available (`llama-bench
+  --progress`, for example); otherwise launch it with a documented external
+  progress mechanism that can be inspected without restarting or attaching a
+  debugger. State the progress mechanism in the launch update and preserve it
+  in the recorded command. Do not start an unbounded or duration-uncertain run
+  whose only observable states are running and finished.
+- Wrap every runnable GPU test, benchmark, profiler, or server lifecycle in
+  the exact whole-command form
+  `flock /tmp/beellama-single-gpu.lock -c 'COMMAND'`. Do not use flock's
+  direct-command form; the quoted command must own the complete lifecycle and
+  use safe inner quoting.
+- Every experiment entry must state its base and candidate commit IDs, the
+  current protocol plus any explicit command/configuration delta, hardware,
+  model path, measurements, resource tradeoffs, and disposition: retained,
+  revised, neutral, or reverted. Include a full command only when the canonical
+  current template plus recorded deltas cannot reproduce the valid evidence.
+- Do not present measurements from an uncommitted or differently configured
+  binary as results for the current commit. Rebuild or verify the binary's build
+  commit before benchmarking.
 
 ## Git Conventions
 

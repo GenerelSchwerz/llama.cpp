@@ -1,0 +1,4 @@
+# Preserve raw historical formatting without making unrelated diffs ignore whitespace.
+SUMMARY.txt -whitespace
+logs/*.cmd -whitespace
+logs/*.log -whitespace

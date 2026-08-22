@@ -1,0 +1,227 @@
+{
+  "request_file": "scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json",
+  "output_dir": "/tmp/qwen38-mtp6-partial-draft-residency-q8-1k-20260819",
+  "input_files": [
+    {
+      "role": "target-and-mtp-model",
+      "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf"
+    }
+  ],
+  "environment": {
+    "CUDA_PATH": "/opt/cuda"
+  },
+  "startup_timeout_seconds": 600,
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 2,
+  "comparison_contract": {
+    "require_explicit_references": true,
+    "required_identity_keys": [
+      "model.sha256",
+      "mtp.depth",
+      "mtp.p_min",
+      "target_kv.k",
+      "target_kv.v",
+      "draft_kv.k",
+      "draft_kv.v",
+      "context",
+      "batch",
+      "ubatch",
+      "effective_draft_ubatch",
+      "sampler.seed",
+      "sampler.temperature"
+    ],
+    "common_identity": {
+      "model": {
+        "sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"
+      },
+      "mtp": {
+        "depth": 6,
+        "p_min": 0.85
+      },
+      "target_kv": {
+        "k": "q8_0",
+        "v": "q8_0",
+        "residency": "gpu"
+      },
+      "draft_kv": {
+        "k": "q8_0",
+        "v": "q8_0",
+        "residency": "gpu"
+      },
+      "recurrent_planes": "full",
+      "workspace": {
+        "phase_aware": false
+      },
+      "context": 4096,
+      "batch": 1024,
+      "ubatch": 512,
+      "effective_draft_ubatch": 512,
+      "sampler": {
+        "seed": 1234,
+        "temperature": 0
+      }
+    }
+  },
+  "common_args": [
+    "--model",
+    "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+    "--n-gpu-layers",
+    "999",
+    "--n-gpu-layers-draft",
+    "999",
+    "--fit",
+    "off",
+    "--split-mode",
+    "none",
+    "--main-gpu",
+    "0",
+    "--flash-attn",
+    "on",
+    "--ctx-size",
+    "4096",
+    "--parallel",
+    "1",
+    "--cont-batching",
+    "--kv-unified",
+    "--batch-size",
+    "1024",
+    "--ubatch-size",
+    "512",
+    "--cache-type-k",
+    "q8_0",
+    "--cache-type-v",
+    "q8_0",
+    "--threads",
+    "3",
+    "--threads-batch",
+    "24",
+    "--cpu-range",
+    "0-2",
+    "--cpu-range-batch",
+    "0-23",
+    "--cpu-strict",
+    "1",
+    "--poll",
+    "100",
+    "--seed",
+    "1234",
+    "--cache-ram",
+    "0",
+    "--reasoning-loop-guard",
+    "force-close",
+    "--verbosity",
+    "4",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "6",
+    "--spec-draft-p-min",
+    "0.85",
+    "--spec-draft-type-k",
+    "q8_0",
+    "--spec-draft-type-v",
+    "q8_0"
+  ],
+  "cases": [
+    {
+      "name": "clean-gpu-mtp6-full",
+      "role": "golden",
+      "artifact_dir": "/tmp/qwen38-mtp-cross-residency-q8-1k-final-v2-20260819/clean-gpu-mtp6",
+      "args": [
+        "--alias",
+        "clean-gpu-mtp6-full"
+      ]
+    },
+    {
+      "name": "candidate-cpu-inherited-mtp6-planes3",
+      "compare_to": "clean-gpu-mtp6-full",
+      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "identity": {
+        "target_kv": {
+          "residency": "cpu"
+        },
+        "draft_kv": {
+          "residency": "cpu"
+        },
+        "workspace": {
+          "phase_aware": true
+        },
+        "recurrent_planes": 3
+      },
+      "args": [
+        "--alias",
+        "candidate-cpu-inherited-mtp6-planes3",
+        "--no-kv-offload",
+        "--kv-cpu-pinned",
+        "--recurrent-state-offload",
+        "--kv-gpu-layers",
+        "0",
+        "--phase-aware-workspace",
+        "--spec-mtp-rs-planes",
+        "3"
+      ]
+    },
+    {
+      "name": "candidate-cpu-explicit-mtp6-planes3",
+      "compare_to": "clean-gpu-mtp6-full",
+      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "identity": {
+        "target_kv": {
+          "residency": "cpu"
+        },
+        "draft_kv": {
+          "residency": "cpu"
+        },
+        "workspace": {
+          "phase_aware": true
+        },
+        "recurrent_planes": 3
+      },
+      "args": [
+        "--alias",
+        "candidate-cpu-explicit-mtp6-planes3",
+        "--no-kv-offload",
+        "--kv-cpu-pinned",
+        "--recurrent-state-offload",
+        "--kv-gpu-layers",
+        "0",
+        "--kv-gpu-layers-draft",
+        "0",
+        "--phase-aware-workspace",
+        "--spec-mtp-rs-planes",
+        "3"
+      ]
+    },
+    {
+      "name": "candidate-draft-gpu-mtp6-planes3",
+      "compare_to": "clean-gpu-mtp6-full",
+      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "identity": {
+        "target_kv": {
+          "residency": "cpu"
+        },
+        "draft_kv": {
+          "residency": "gpu"
+        },
+        "workspace": {
+          "phase_aware": true
+        },
+        "recurrent_planes": 3
+      },
+      "args": [
+        "--alias",
+        "candidate-draft-gpu-mtp6-planes3",
+        "--no-kv-offload",
+        "--kv-cpu-pinned",
+        "--recurrent-state-offload",
+        "--kv-gpu-layers",
+        "0",
+        "--kv-gpu-layers-draft",
+        "1",
+        "--phase-aware-workspace",
+        "--spec-mtp-rs-planes",
+        "3"
+      ]
+    }
+  ]
+}

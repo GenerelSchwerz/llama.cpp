@@ -18,14 +18,17 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   attn_offload,
+                     bool   attn_cpu_pinned,
+                     bool   attn_offload_compute,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                     bool   recurrent_offload,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -34,7 +37,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
-                 uint32_t   tail_rollback_tokens) :
+                 uint32_t   tail_rollback_tokens,
+                 uint32_t   attn_n_gpu_layers) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -42,7 +46,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_k,
         type_v,
         v_trans,
-        offload,
+        attn_offload,
         unified,
         kv_size,
         n_seq_max,
@@ -60,13 +64,17 @@ llama_memory_hybrid::llama_memory_hybrid(
         tail_type,
         tail_tokens_requested,
         false,
-        tail_rollback_tokens
+        tail_rollback_tokens,
+        /* tail_visibility_window */ 0,
+        attn_cpu_pinned,
+        attn_n_gpu_layers,
+        attn_offload_compute
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        recurrent_offload,
         rs_size,
         n_seq_max,
         n_rs_seq,
@@ -146,6 +154,14 @@ llama_memory_context_ptr llama_memory_hybrid::init_full() {
     return std::make_unique<llama_memory_hybrid_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_context>(this, mem_attn->init_reserve(n_kv));
+}
+
+uint32_t llama_memory_hybrid::get_attn_reserve_capacity() const {
+    return mem_attn->get_attn_reserve_capacity();
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_context>(this, lctx, optimize);
 }
@@ -157,6 +173,14 @@ bool llama_memory_hybrid::get_can_shift() const {
 
 llama_memory_i::seq_rm_capability llama_memory_hybrid::get_seq_rm_capability() const {
     return llama_memory_seq_rm_capability_all({ mem_attn.get(), mem_recr.get() });
+}
+
+bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
+    return mem_recr->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
+    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
 }
 
 void llama_memory_hybrid::clear(bool data) {
@@ -322,6 +346,14 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(llama_memory_hybrid * m
 }
 
 llama_memory_hybrid_context::llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        llama_memory_context_ptr   ctx_attn_in) :
+    ctx_attn(std::move(ctx_attn_in)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
               llama_context * lctx,
                        bool   optimize) :
@@ -381,6 +413,10 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_context::get_attn_reserve_n_kv() const {
+    return ctx_attn->get_attn_reserve_n_kv();
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {

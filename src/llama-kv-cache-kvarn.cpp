@@ -1150,7 +1150,8 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         uint32_t tail_tokens,
         ggml_type tail_type_requested,
         uint32_t tail_tokens_requested,
-        uint32_t tail_rollback_tokens) :
+        uint32_t tail_rollback_tokens,
+        bool cpu_pinned) :
     model(model),
     hparams(hparams),
     params(params),
@@ -1279,7 +1280,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 "KVarN cache layer %u is assigned to backend %s, which cannot store and materialize KVarN records",
                 il, dev ? ggml_backend_dev_name(dev) : "unknown"));
         }
-        auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
+        auto * buft = offload ?
+                ggml_backend_dev_buffer_type(dev) :
+                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create KVarN cache tensor context");
@@ -1989,7 +1992,8 @@ llama_kv_memory_stats llama_kv_cache_kvarn::kv_memory_stats() const {
     llama_kv_memory_stats result;
     llama_kv_memory_component_stats & component = swa ? result.swa : result.global;
     for (const auto & route : metadata->get_tail_layer_routes()) {
-        const bool cpu = !route.owner || ggml_backend_dev_type(route.owner) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool cpu = !route.execution_backend ||
+                ggml_backend_dev_type(route.execution_backend) == GGML_BACKEND_DEVICE_TYPE_CPU;
         if (cpu) {
             component.tail_cpu_layers++;
         } else if (route.capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE) {

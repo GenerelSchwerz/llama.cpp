@@ -15,6 +15,11 @@ struct llama_hparams;
 struct llama_model;
 struct llama_context;
 
+ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model,
+        uint32_t il,
+        bool cpu_pinned);
+
 //
 // llama_kv_cache
 //
@@ -125,7 +130,10 @@ public:
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0);
+                 uint32_t   tail_visibility_window = 0,
+                     bool   cpu_pinned = false,
+                 uint32_t   gpu_resident_layers = 0,
+                     bool   offload_attn_compute = false);
 
     ~llama_kv_cache() = default;
 
@@ -139,6 +147,10 @@ public:
             bool embd_all) override;
 
     llama_memory_context_ptr init_full() override;
+
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
@@ -211,6 +223,7 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+    uint32_t get_reserve_n_kv(const slot_info_vec_t & sinfos) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -358,6 +371,10 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
+    ggml_tensor * stage_store_rows(
+            ggml_context * ctx,
+            ggml_tensor  * source,
+            ggml_tensor  * stage) const;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -371,6 +388,8 @@ private:
         ggml_tensor * v;
         ggml_tensor * k_tail;
         ggml_tensor * v_tail;
+        ggml_tensor * k_store_stage;
+        ggml_tensor * v_store_stage;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -565,6 +584,11 @@ public:
     llama_kv_cache_context(
             llama_kv_cache * kv);
 
+    // used to create a bounded reservation context
+    llama_kv_cache_context(
+            llama_kv_cache * kv,
+            uint32_t n_kv);
+
     // used to create an update context
     llama_kv_cache_context(
             llama_kv_cache * kv,
@@ -591,6 +615,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_kv_cache_context specific API
@@ -716,5 +741,6 @@ private:
 
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
-    int32_t n_kv;
+    int32_t n_kv = 0;
+    uint32_t reserve_n_kv = 0;
 };

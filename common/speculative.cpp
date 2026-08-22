@@ -1292,6 +1292,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    shared_workspace = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1368,6 +1369,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        shared_workspace = llama_contexts_share_workspace(ctx_tgt, ctx_dft);
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1457,6 +1459,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+        // The target output copy is asynchronous. A phase-aware MTP context
+        // borrows the same physical graph backing next, so complete both the
+        // output dependency and the ownership handoff before its first decode.
+        if (shared_workspace) {
+            llama_synchronize(ctx_tgt);
+        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1517,6 +1525,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (chain_heads) {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+            }
+            // A prompt can span multiple target ubatches. The next target
+            // decode may immediately borrow this same physical workspace, so
+            // finish the MTP catch-up before returning ownership to target.
+            if (shared_workspace) {
+                llama_synchronize(ctx_dft);
             }
             if (!ok) {
                 return false;
@@ -1681,6 +1695,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        // Draft sampling normally synchronizes every submitted graph already.
+        // Keep the ownership fence at the real draft->target handoff so empty
+        // or failed draft loops cannot leave shared backing in flight, without
+        // stalling between catch-up and the first draft step.
+        if (shared_workspace) {
+            llama_synchronize(ctx_dft);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2398,9 +2420,30 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.kv_gpu_layers >= 0) {
+        // An explicit draft count is an independent partial-residency policy.
+        // The standard cache already excludes shared layers from this budget,
+        // so only storage owned by the draft context is affected.
+        result.no_kv_offload = true;
+        result.kv_gpu_layers = params_spec.kv_gpu_layers;
+    }
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
     result.kv_tail_tokens = "0";
     result.kv_tail_type   = GGML_TYPE_F16;
-    result.n_outputs_max = params.n_parallel;
+    if (params.phase_aware_workspace) {
+        // Phase-aware schedulers use n_outputs_max as the largest
+        // generation-side graph geometry. MTP chained heads can submit the
+        // accepted prefix plus the next row in one draft decode, so keep the
+        // full speculative horizon in the compact reservation rather than
+        // treating it as prompt processing.
+        const int64_t n_outputs = (int64_t) params.n_parallel *
+                (1 + std::max(0, params.speculative.draft.n_max));
+        result.n_outputs_max = (int32_t) std::min<int64_t>(params.n_batch, n_outputs);
+    } else {
+        result.n_outputs_max = params.n_parallel;
+    }
 
     return result;
 }

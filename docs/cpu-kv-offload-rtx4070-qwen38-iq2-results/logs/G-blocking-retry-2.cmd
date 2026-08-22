@@ -1,0 +1,1 @@
+cmd: /home/piggidragon/Services/llama.cpp/build/bin/llama-server --model /home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf --port 8712 --ctx-size 16384 --no-kv-offload --kv-cpu-pinned --recurrent-state-offload --spec-type draft-mtp --spec-draft-n-max 6 --draft-p-min 0.85 --cache-type-k-draft q8_0 --cache-type-v-draft q8_0 --spec-mtp-rs-planes 0

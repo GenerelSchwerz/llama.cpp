@@ -1,0 +1,167 @@
+{
+  "request_file": "scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json",
+  "output_dir": "/tmp/mtp-golden-gpu-q8-full-depths-1k-20260819",
+  "input_files": [
+    {
+      "role": "target-and-mtp-model",
+      "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf"
+    }
+  ],
+  "environment": {
+    "CUDA_PATH": "/opt/cuda"
+  },
+  "startup_timeout_seconds": 600,
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 2,
+  "comparison_contract": {
+    "require_explicit_references": true,
+    "required_identity_keys": [
+      "model.sha256",
+      "mtp.depth",
+      "mtp.p_min",
+      "target_kv.k",
+      "target_kv.v",
+      "target_kv.residency",
+      "draft_kv.k",
+      "draft_kv.v",
+      "draft_kv.residency",
+      "recurrent_planes",
+      "workspace.phase_aware",
+      "context",
+      "batch",
+      "ubatch",
+      "effective_draft_ubatch",
+      "backend",
+      "sampler.seed",
+      "sampler.temperature"
+    ],
+    "common_identity": {
+      "model": {
+        "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+        "sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"
+      },
+      "mtp": {"p_min": 0.85},
+      "target_kv": {"k": "q8_0", "v": "q8_0", "residency": "gpu"},
+      "draft_kv": {"k": "q8_0", "v": "q8_0", "residency": "gpu"},
+      "recurrent_planes": "full",
+      "workspace": {"phase_aware": false},
+      "context": 4096,
+      "batch": 1024,
+      "ubatch": 512,
+      "effective_draft_ubatch": 512,
+      "backend": "cuda-sm120-flash-attention",
+      "sampler": {"seed": 1234, "temperature": 0}
+    }
+  },
+  "common_args": [
+    "--model", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+    "--n-gpu-layers", "999",
+    "--fit", "off",
+    "--split-mode", "none",
+    "--main-gpu", "0",
+    "--flash-attn", "on",
+    "--ctx-size", "4096",
+    "--parallel", "1",
+    "--cont-batching",
+    "--kv-unified",
+    "--batch-size", "1024",
+    "--ubatch-size", "512",
+    "--cache-type-k", "q8_0",
+    "--cache-type-v", "q8_0",
+    "--threads", "3",
+    "--threads-batch", "24",
+    "--cpu-range", "0-2",
+    "--cpu-range-batch", "0-23",
+    "--cpu-strict", "1",
+    "--poll", "100",
+    "--seed", "1234",
+    "--cache-ram", "0",
+    "--verbosity", "4"
+  ],
+  "cases": [
+    {
+      "name": "golden-mtp1",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 1}},
+      "args": ["--alias", "golden-mtp1", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp1",
+      "compare_to": "golden-mtp1",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 1}},
+      "args": ["--alias", "candidate-mtp1", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "golden-mtp2",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 2}},
+      "args": ["--alias", "golden-mtp2", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp2",
+      "compare_to": "golden-mtp2",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 2}},
+      "args": ["--alias", "candidate-mtp2", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "golden-mtp3",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 3}},
+      "args": ["--alias", "golden-mtp3", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp3",
+      "compare_to": "golden-mtp3",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 3}},
+      "args": ["--alias", "candidate-mtp3", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "3", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "golden-mtp5",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 5}},
+      "args": ["--alias", "golden-mtp5", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "5", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp5",
+      "compare_to": "golden-mtp5",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 5}},
+      "args": ["--alias", "candidate-mtp5", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "5", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "golden-mtp6",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 6}},
+      "args": ["--alias", "golden-mtp6", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "6", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp6",
+      "compare_to": "golden-mtp6",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 6}},
+      "args": ["--alias", "candidate-mtp6", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "6", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "golden-mtp8",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"mtp": {"depth": 8}},
+      "args": ["--alias", "golden-mtp8", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-mtp8",
+      "compare_to": "golden-mtp8",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"mtp": {"depth": 8}},
+      "args": ["--alias", "candidate-mtp8", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    }
+  ]
+}

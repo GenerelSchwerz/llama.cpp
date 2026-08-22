@@ -1,0 +1,71 @@
+{
+  "request_file": "scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json",
+  "output_dir": "/tmp/mtp-cpu-q8-mtp2-postfix-v2-1k-20260819",
+  "input_files": [
+    {"role": "target-and-mtp-model", "path": "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf"}
+  ],
+  "environment": {"CUDA_PATH": "/opt/cuda"},
+  "startup_timeout_seconds": 600,
+  "timeout_seconds": 1800,
+  "poll_interval_seconds": 2,
+  "comparison_contract": {
+    "require_explicit_references": true,
+    "required_identity_keys": [
+      "model.sha256", "mtp.depth", "mtp.p_min",
+      "target_kv.k", "target_kv.v", "target_kv.residency",
+      "draft_kv.k", "draft_kv.v", "draft_kv.residency",
+      "recurrent_planes", "context", "batch", "ubatch", "effective_draft_ubatch",
+      "sampler.seed", "sampler.temperature"
+    ],
+    "common_identity": {
+      "model": {"sha256": "ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c"},
+      "mtp": {"depth": 2, "p_min": 0.85},
+      "target_kv": {"k": "q8_0", "v": "q8_0", "residency": "cpu"},
+      "draft_kv": {"k": "q8_0", "v": "q8_0", "residency": "cpu"},
+      "recurrent_planes": "full",
+      "context": 4096,
+      "batch": 1024,
+      "ubatch": 512,
+      "effective_draft_ubatch": 512,
+      "sampler": {"seed": 1234, "temperature": 0}
+    }
+  },
+  "common_args": [
+    "--model", "/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf",
+    "--n-gpu-layers", "999", "--fit", "off", "--split-mode", "none", "--main-gpu", "0",
+    "--flash-attn", "on", "--no-kv-offload", "--ctx-size", "4096", "--parallel", "1", "--cont-batching", "--kv-unified",
+    "--batch-size", "1024", "--ubatch-size", "512", "--cache-type-k", "q8_0", "--cache-type-v", "q8_0",
+    "--threads", "3", "--threads-batch", "24", "--cpu-range", "0-2", "--cpu-range-batch", "0-23",
+    "--cpu-strict", "1", "--poll", "100", "--seed", "1234", "--cache-ram", "0", "--verbosity", "4"
+  ],
+  "cases": [
+    {
+      "name": "golden-cpu-mtp2",
+      "role": "golden",
+      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "identity": {"implementation": {"host_buffer": "pageable", "recurrent_residency": "cpu", "draft_ubatch_setting": "inherited"}},
+      "args": ["--alias", "golden-cpu-mtp2", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-inherited-phase-off",
+      "compare_to": "golden-cpu-mtp2",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"implementation": {"host_buffer": "cuda-pinned", "recurrent_residency": "gpu", "draft_ubatch_setting": "inherited", "phase_aware": false}},
+      "args": ["--alias", "candidate-inherited-phase-off", "--kv-cpu-pinned", "--recurrent-state-offload", "--no-phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-inherited-phase-on",
+      "compare_to": "golden-cpu-mtp2",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"implementation": {"host_buffer": "cuda-pinned", "recurrent_residency": "gpu", "draft_ubatch_setting": "inherited", "phase_aware": true}},
+      "args": ["--alias", "candidate-inherited-phase-on", "--kv-cpu-pinned", "--recurrent-state-offload", "--phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    },
+    {
+      "name": "candidate-explicit-equal-phase-on",
+      "compare_to": "golden-cpu-mtp2",
+      "server": "/home/gencoolpc/beellama-mtp-exact/build-mtp-exact/bin/llama-server",
+      "identity": {"implementation": {"host_buffer": "cuda-pinned", "recurrent_residency": "gpu", "draft_ubatch_setting": 512, "phase_aware": true}},
+      "args": ["--alias", "candidate-explicit-equal-phase-on", "--kv-cpu-pinned", "--recurrent-state-offload", "--phase-aware-workspace", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-ubatch-size", "512", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
+    }
+  ]
+}

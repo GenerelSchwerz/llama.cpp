@@ -44,10 +44,25 @@ GGML_API enum ggml_status    ggml_tallocr_alloc(struct ggml_tallocr * talloc, st
 //   ggml_set_output(): output tensors are never freed and never overwritten
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
+typedef struct ggml_gallocr_shared_buffers * ggml_gallocr_shared_buffers_t;
+
+// A shared backing store for graph allocators that execute sequentially.
+// Each member keeps an independent graph plan; the backing buffers are sized
+// to the maximum per-buffer requirement across all current member plans.
+GGML_API ggml_gallocr_shared_buffers_t ggml_gallocr_shared_buffers_new(void);
+GGML_API void ggml_gallocr_shared_buffers_free(ggml_gallocr_shared_buffers_t shared);
+GGML_API uint64_t ggml_gallocr_shared_buffers_generation(ggml_gallocr_shared_buffers_t shared);
+GGML_API uint64_t ggml_gallocr_shared_buffers_plan_generation(ggml_gallocr_shared_buffers_t shared);
+// Begin a coalesced shrink epoch. The physical buffers are not reduced until
+// every active member has published its current plan; growth remains immediate.
+GGML_API void ggml_gallocr_shared_buffers_request_shrink(ggml_gallocr_shared_buffers_t shared);
 
 GGML_API ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft);
 GGML_API ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs);
 GGML_API void           ggml_gallocr_free(ggml_gallocr_t galloc);
+GGML_API void           ggml_gallocr_set_shared_buffers(
+    ggml_gallocr_t galloc,
+    ggml_gallocr_shared_buffers_t shared);
 
 // pre-allocate buffers from a measure graph - does not allocate or modify the graph
 // call with a worst-case graph to avoid buffer reallocations

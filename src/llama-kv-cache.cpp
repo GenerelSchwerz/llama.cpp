@@ -27,12 +27,34 @@ static bool ggml_is_power_of_2(int n) {
 
 namespace {
 
+// A pinned/host buffer type's registered ggml_backend_buft_get_device() is the
+// GPU that allocated it (see e.g. ggml_backend_cuda_host_buffer_type()), but
+// that is only where the memory is *addressable from*, not where ops on it
+// actually execute. ggml_backend_sched picks the highest-priority backend that
+// both supports the buft and the op (ggml_backend_sched_backend_from_buffer);
+// on a discrete GPU, ggml_backend_*_device_supports_buft() rejects a host buft
+// (it is accepted only on an integrated GPU, where host memory is GPU-visible
+// unified memory), so the op actually falls back to the CPU backend. Mirror
+// that decision here so KV-tail capability probing checks the backend that
+// will really run the op, not just the buft's nominal owner device.
+static ggml_backend_dev_t llama_kv_cache_get_backend(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
+    if (dev != nullptr && !ggml_backend_dev_supports_buft(dev, buft)) {
+        dev = nullptr;
+    }
+    if (!dev) {
+        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    }
+    return dev;
+}
+
 using backend_kv_tail_attention_supported_t = bool (*)(
         ggml_type, ggml_type, ggml_type, ggml_type, int64_t, int64_t);
 
 struct kv_tail_backend_probe_spec {
     uint32_t layer_id;
     ggml_backend_buffer_type_t buft;
+    ggml_backend_dev_t execution_backend;
     ggml_type body_type_k;
     ggml_type body_type_v;
     int64_t head_dim_k;
@@ -42,15 +64,11 @@ struct kv_tail_backend_probe_spec {
 };
 
 static bool backend_supports_native_kv_tail(
-        ggml_backend_buffer_type_t buft,
+        ggml_backend_dev_t dev,
         ggml_type body_k, ggml_type body_v,
         ggml_type tail_k, ggml_type tail_v,
         int64_t d_k, int64_t d_v,
         bool segmented) {
-    auto dev = buft ? ggml_backend_buft_get_device(buft) : nullptr;
-    if (!dev) {
-        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
     const auto supports = [&](ggml_backend_dev_t candidate) {
         const auto reg = candidate ? ggml_backend_dev_backend_reg(candidate) : nullptr;
         const auto fn = reg ? reinterpret_cast<backend_kv_tail_attention_supported_t>(
@@ -82,11 +100,9 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
     auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    auto * dev = ggml_backend_buft_get_device(spec.buft);
-    if (!dev) {
-        dev = cpu;
-    }
-    if (!dev || !cpu) {
+    auto * storage_dev = llama_kv_cache_get_backend(spec.buft);
+    auto * execution_dev = spec.execution_backend;
+    if (!storage_dev || !execution_dev || !cpu) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
 
@@ -112,38 +128,41 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     auto * tail_v = ggml_new_tensor_2d(ctx.get(), exact_v, spec.head_dim_v, n_tail);
     auto * commit_dependency = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
 
-    const auto owner_supports = [&](ggml_tensor * op) {
-        return op && ggml_backend_dev_supports_op(dev, op);
+    const auto storage_supports = [&](ggml_tensor * op) {
+        return op && ggml_backend_dev_supports_op(storage_dev, op);
     };
-    const auto compact_supports = [&](ggml_tensor * op) {
-        return owner_supports(op) || (op && ggml_backend_dev_supports_op(cpu, op));
+    const auto execution_supports = [&](ggml_tensor * op) {
+        return op && ggml_backend_dev_supports_op(execution_dev, op);
+    };
+    const auto read_supports = [&](ggml_tensor * op) {
+        return execution_supports(op) || (op && ggml_backend_dev_supports_op(cpu, op));
     };
 
     llama_kv_tail_route_requirements requirements;
     const bool fused_k = ggml_is_quantized(spec.body_type_k) &&
             (exact_k == GGML_TYPE_F16 || exact_k == GGML_TYPE_BF16);
     if (segmented) {
-        requirements.write_k = owner_supports(ggml_set_rows(
+        requirements.write_k = storage_supports(ggml_set_rows(
                 ctx.get(), body_k, src_k, idx64)) &&
-            owner_supports(ggml_set_rows_ordered(
+            storage_supports(ggml_set_rows_ordered(
                 ctx.get(), tail_k, src_k, tail_idx64, commit_dependency));
     } else if (fused_k) {
-        requirements.write_k = owner_supports(ggml_set_rows_with_shadow(
+        requirements.write_k = storage_supports(ggml_set_rows_with_shadow(
                 ctx.get(), body_k, src_k, idx64, tail_k, tail_idx64));
     } else {
-        requirements.write_k = owner_supports(ggml_set_rows(ctx.get(), body_k, src_k, idx64)) &&
-                compact_supports(ggml_set_rows(ctx.get(), tail_k, src_k, tail_idx64));
+        requirements.write_k = storage_supports(ggml_set_rows(ctx.get(), body_k, src_k, idx64)) &&
+                storage_supports(ggml_set_rows(ctx.get(), tail_k, src_k, tail_idx64));
     }
 
     const bool fused_v = !v_transposed && ggml_is_quantized(spec.body_type_v) &&
             (exact_v == GGML_TYPE_F16 || exact_v == GGML_TYPE_BF16);
     if (segmented && !v_transposed) {
-        requirements.write_v = owner_supports(ggml_set_rows(
+        requirements.write_v = storage_supports(ggml_set_rows(
                 ctx.get(), body_v, src_v, idx64)) &&
-            owner_supports(ggml_set_rows_ordered(
+            storage_supports(ggml_set_rows_ordered(
                 ctx.get(), tail_v, src_v, tail_idx64, commit_dependency));
     } else if (fused_v) {
-        requirements.write_v = owner_supports(ggml_set_rows_with_shadow(
+        requirements.write_v = storage_supports(ggml_set_rows_with_shadow(
                 ctx.get(), body_v, src_v, idx64, tail_v, tail_idx64));
     } else if (v_transposed && ggml_is_quantized(spec.body_type_v)) {
         requirements.write_v = false;
@@ -157,18 +176,18 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
         } else {
             body_write = ggml_set_rows(ctx.get(), body_v, src_v, idx64);
         }
-        requirements.write_v = owner_supports(body_write) &&
-                compact_supports(ggml_set_rows(ctx.get(), tail_v, src_v, tail_idx64));
+        requirements.write_v = storage_supports(body_write) &&
+                storage_supports(ggml_set_rows(ctx.get(), tail_v, src_v, tail_idx64));
     }
 
-    requirements.gather_k = compact_supports(ggml_get_rows_as(ctx.get(), tail_k, idx32, exact_k));
-    requirements.gather_v = compact_supports(ggml_get_rows_as(ctx.get(), tail_v, idx32, exact_v));
+    requirements.gather_k = read_supports(ggml_get_rows_as(ctx.get(), tail_k, idx32, exact_k));
+    requirements.gather_v = read_supports(ggml_get_rows_as(ctx.get(), tail_v, idx32, exact_v));
 
     auto * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, spec.head_dim_k, 1);
     auto * body_scores = ggml_mul_mat(ctx.get(), body_k, q);
     auto * exact_scores = ggml_mul_mat(ctx.get(), tail_k, q);
-    requirements.body_score = owner_supports(body_scores);
-    requirements.exact_score = compact_supports(exact_scores);
+    requirements.body_score = execution_supports(body_scores);
+    requirements.exact_score = read_supports(exact_scores);
 
     auto * body_weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
     auto * exact_weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_tail, 1);
@@ -182,8 +201,8 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     }
     auto * exact_v_transposed = ggml_new_tensor_2d(ctx.get(), exact_v, n_tail, spec.head_dim_v);
     auto * exact_value = ggml_mul_mat(ctx.get(), exact_v_transposed, exact_weights);
-    requirements.body_value = owner_supports(body_value);
-    requirements.exact_value = compact_supports(exact_value);
+    requirements.body_value = execution_supports(body_value);
+    requirements.exact_value = read_supports(exact_value);
 
     auto * scores = ggml_concat(ctx.get(), body_scores, exact_scores, 0);
     auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body + n_tail, 1);
@@ -193,9 +212,10 @@ static llama_kv_tail_route_capability probe_standard_kv_tail_route(
     }
     auto * normalized = ggml_soft_max_ext(ctx.get(), scores, mask, 1.0f, 0.0f);
     auto * merged = ggml_add(ctx.get(), body_value, exact_value);
-    requirements.generic_merge = owner_supports(scores) && owner_supports(normalized) && owner_supports(merged);
+    requirements.generic_merge = execution_supports(scores) &&
+            execution_supports(normalized) && execution_supports(merged);
     requirements.native_attention = flash_attn && !spec.explicit_bias &&
-            backend_supports_native_kv_tail(spec.buft,
+            backend_supports_native_kv_tail(execution_dev,
                     spec.body_type_k, spec.body_type_v, exact_k, exact_v,
                     spec.head_dim_k, spec.head_dim_v, segmented);
     return llama_kv_tail_select_route(requirements);
@@ -210,11 +230,9 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     if (!spec.has_v) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
-    auto * dev = ggml_backend_buft_get_device(spec.buft);
-    if (!dev) {
-        dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    }
-    if (!dev) {
+    auto * storage_dev = llama_kv_cache_get_backend(spec.buft);
+    auto * execution_dev = spec.execution_backend;
+    if (!storage_dev || !execution_dev) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
 
@@ -235,11 +253,14 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     auto * body_v = v_transposed ?
             ggml_new_tensor_2d(ctx.get(), actual_v, n_body, spec.head_dim_v) :
             ggml_new_tensor_2d(ctx.get(), actual_v, spec.head_dim_v, n_body);
-    const auto supports = [&](ggml_tensor * op) {
-        return op && ggml_backend_dev_supports_op(dev, op);
+    const auto storage_supports = [&](ggml_tensor * op) {
+        return op && ggml_backend_dev_supports_op(storage_dev, op);
+    };
+    const auto execution_supports = [&](ggml_tensor * op) {
+        return op && ggml_backend_dev_supports_op(execution_dev, op);
     };
 
-    if (!supports(ggml_set_rows(ctx.get(), body_k, src_k, idx))) {
+    if (!storage_supports(ggml_set_rows(ctx.get(), body_k, src_k, idx))) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_K };
     }
     ggml_tensor * v_write = nullptr;
@@ -251,7 +272,7 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
     } else {
         v_write = ggml_set_rows(ctx.get(), body_v, src_v, idx);
     }
-    if (!supports(v_write)) {
+    if (!storage_supports(v_write)) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_WRITE_V };
     }
 
@@ -261,29 +282,29 @@ static llama_kv_tail_route_capability probe_standard_native_exact_route(
         auto * v = ggml_reshape_4d(ctx.get(), body_v, spec.head_dim_v, n_body, 1, 1);
         auto * mask = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F16, n_body, 1, 1, 1);
         auto * attn = ggml_flash_attn_ext(ctx.get(), q, k, v, mask, 1.0f, 0.0f, 0.0f);
-        return supports(attn) ?
+        return execution_supports(attn) ?
                 llama_kv_tail_route_capability { true, LLAMA_KV_TAIL_ROUTE_NATIVE, LLAMA_KV_TAIL_OP_NONE } :
                 llama_kv_tail_route_capability { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_NATIVE_ATTENTION };
     }
 
     auto * q = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, spec.head_dim_k, 1);
     auto * scores = ggml_mul_mat(ctx.get(), body_k, q);
-    if (!supports(scores)) {
+    if (!execution_supports(scores)) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_BODY_SCORE };
     }
     if (spec.explicit_bias) {
         auto * bias = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
         scores = ggml_add(ctx.get(), scores, bias);
-        if (!supports(scores)) {
+        if (!execution_supports(scores)) {
             return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_BODY_SCORE };
         }
     }
     auto * mask = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
-    if (!supports(ggml_soft_max_ext(ctx.get(), scores, mask, 1.0f, 0.0f))) {
+    if (!execution_supports(ggml_soft_max_ext(ctx.get(), scores, mask, 1.0f, 0.0f))) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_GENERIC_MERGE };
     }
     auto * weights = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_body, 1);
-    if (!supports(ggml_mul_mat(ctx.get(), body_v, weights))) {
+    if (!execution_supports(ggml_mul_mat(ctx.get(), body_v, weights))) {
         return { false, LLAMA_KV_TAIL_ROUTE_NONE, LLAMA_KV_TAIL_OP_BODY_VALUE };
     }
     return { true, LLAMA_KV_TAIL_ROUTE_GENERIC, LLAMA_KV_TAIL_OP_NONE };
@@ -307,6 +328,21 @@ private:
     clock::time_point start;
 };
 
+}
+
+ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model,
+        uint32_t il,
+        bool cpu_pinned) {
+    if (cpu_pinned) {
+        if (auto * dev = model.dev_layer(il)) {
+            if (auto * buft = ggml_backend_dev_host_buffer_type(dev)) {
+                return buft;
+            }
+        }
+    }
+
+    return ggml_backend_cpu_buffer_type();
 }
 
 // orthonormal Walsh-Hadamard rotation matrix
@@ -376,7 +412,10 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_tokens_requested,
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
-                 uint32_t   tail_visibility_window) :
+                 uint32_t   tail_visibility_window,
+                     bool   cpu_pinned,
+                 uint32_t   gpu_resident_layers,
+                     bool   offload_attn_compute) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -399,6 +438,38 @@ llama_kv_cache::llama_kv_cache(
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;
+
+    std::vector<int32_t> layer_share_ids(n_layer, -1);
+    std::vector<ggml_backend_buffer_type_t> layer_buft(n_layer, nullptr);
+    uint32_t n_gpu_resident = 0;
+
+    for (uint32_t il = 0; il < n_layer; ++il) {
+        if (!hparams.has_kv(il) || (filter && !filter(il))) {
+            continue;
+        }
+
+        if (share && other) {
+            layer_share_ids[il] = share(il);
+        }
+
+        if (layer_share_ids[il] >= 0) {
+            continue;
+        }
+
+        const bool layer_offload = offload || n_gpu_resident < gpu_resident_layers;
+        layer_buft[il] = layer_offload ?
+                ggml_backend_dev_buffer_type(model.dev_layer(il)) :
+                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
+
+        if (!offload && layer_offload) {
+            ++n_gpu_resident;
+        }
+    }
+
+    if (!offload && gpu_resident_layers > 0) {
+        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested KV layers device-resident\n",
+                __func__, n_gpu_resident, gpu_resident_layers);
+    }
     const uint32_t n_layer_kv = hparams.n_layer_kv();
     const bool is_mla = hparams.is_mla();
 
@@ -447,8 +518,8 @@ llama_kv_cache::llama_kv_cache(
             uint32_t actual_k_dim = owned_k_dim;
             uint32_t actual_v_dim = owned_v_dim;
 
-            if (share && other) {
-                const int32_t il_share = share(il);
+            if (layer_share_ids[il] >= 0) {
+                const int32_t il_share = layer_share_ids[il];
                 if (il_share >= 0) {
                     const auto & source = other->layers[other->map_layer_ids.at(il_share)];
                     shared_layer = true;
@@ -516,16 +587,19 @@ llama_kv_cache::llama_kv_cache(
 
             ggml_backend_buffer_type_t route_buft = nullptr;
             if (shared_layer) {
-                const int32_t il_share = share(il);
+                const int32_t il_share = layer_share_ids[il];
                 const auto & source = other->layers[other->map_layer_ids.at(il_share)];
                 route_buft = ggml_backend_buffer_get_type(source.k->buffer);
-            } else if (offload) {
-                route_buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
             } else {
-                route_buft = ggml_backend_cpu_buffer_type();
+                route_buft = layer_buft[il];
+            }
+            auto * storage_backend = llama_kv_cache_get_backend(route_buft);
+            auto * execution_backend = offload_attn_compute ? model.dev_layer(il) : storage_backend;
+            if (!execution_backend) {
+                execution_backend = storage_backend;
             }
             route_probe_specs.push_back({
-                    il, route_buft, actual_type_k, actual_type_v,
+                    il, route_buft, execution_backend, actual_type_k, actual_type_v,
                     int64_t(hparams.n_embd_head_k(il)),
                     int64_t(has_v ? hparams.n_embd_head_v(il) : 0), has_v,
                     model.self_attention_uses_explicit_bias(il),
@@ -603,10 +677,7 @@ llama_kv_cache::llama_kv_cache(
                                 tail_plan.compact_layout.history_stride, 256) :
                         tail_plan.kind == LLAMA_KV_TAIL_STORAGE_OVERLAY ?
                             tail_plan.layout.arena_stride : 0;
-            auto * dev = ggml_backend_buft_get_device(spec.buft);
-            if (!dev) {
-                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            }
+            auto * dev = spec.execution_backend;
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -636,10 +707,7 @@ llama_kv_cache::llama_kv_cache(
             const ggml_type actual_v = ggml_is_quantized(spec.body_type_v) ? candidate : spec.body_type_v;
             const auto capability = probe_standard_native_exact_route(
                     spec, actual_k, actual_v, v_trans, !v_trans);
-            auto * dev = ggml_backend_buft_get_device(spec.buft);
-            if (!dev) {
-                dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            }
+            auto * dev = spec.execution_backend;
             routes.push_back({
                     spec.layer_id,
                     dev ? ggml_backend_dev_name(dev) : ggml_backend_buft_name(spec.buft),
@@ -750,7 +818,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((2u*(1 + n_stream) +
+                /*.mem_size   =*/ size_t((4u + 2u*n_stream +
                         (tail_plan.kind == LLAMA_KV_TAIL_STORAGE_COMPACT_NATIVE_EXACT ? 2u : 0u))*
                         n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
@@ -799,6 +867,51 @@ llama_kv_cache::llama_kv_cache(
                 __func__, hparams.n_embd_v_gqa_max());
     }
 
+    const uint64_t store_stage_probe_rows =
+            uint64_t(LLAMA_MAX_FUSED_OP_PROBE_TOKENS_PER_SEQ)*n_seq_max;
+    if (store_stage_probe_rows > uint64_t(std::numeric_limits<uint32_t>::max())) {
+        throw std::overflow_error("accelerator KV store stage row count overflows uint32_t");
+    }
+    const uint32_t store_stage_rows = std::max(
+            n_ubatch, uint32_t(store_stage_probe_rows));
+
+    uint64_t store_stage_bytes = 0;
+    uint32_t store_stage_layers = 0;
+
+    const auto store_stage_buft = [&](uint32_t il, ggml_type type, int64_t n_embd) {
+        if (n_ubatch == 0 || !ggml_is_quantized(type)) {
+            return (ggml_backend_buffer_type_t) nullptr;
+        }
+
+        auto * dev = model.dev_layer(il);
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return (ggml_backend_buffer_type_t) nullptr;
+        }
+
+        auto * buft = ggml_backend_dev_buffer_type(dev);
+        if (!buft || ggml_backend_buft_is_host(buft)) {
+            return (ggml_backend_buffer_type_t) nullptr;
+        }
+
+        ggml_init_params params = {
+            /*.mem_size   =*/ 5*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr probe(ggml_init(params));
+        if (!probe) {
+            return (ggml_backend_buffer_type_t) nullptr;
+        }
+        auto * dst = ggml_new_tensor_2d(probe.get(), type, n_embd, 1);
+        auto * src = ggml_new_tensor_2d(probe.get(), GGML_TYPE_F32, n_embd, 1);
+        auto * idx = ggml_new_tensor_1d(probe.get(), GGML_TYPE_I64, 1);
+        const bool direct_store = ggml_backend_dev_supports_op(
+                dev, ggml_set_rows(probe.get(), dst, src, idx));
+        const bool staged_store = ggml_backend_dev_supports_op(
+                dev, ggml_cpy(probe.get(), src, dst));
+        return direct_store && staged_store ? buft : nullptr;
+    };
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -810,8 +923,8 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
-        if (share && other) {
-            const int32_t il_share = share(il);
+        if (layer_share_ids[il] >= 0) {
+            const int32_t il_share = layer_share_ids[il];
 
             if (il_share >= 0) {
                 const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
@@ -850,16 +963,11 @@ llama_kv_cache::llama_kv_cache(
         const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
         const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
 
-        const char * dev_name = "CPU";
+        ggml_backend_buffer_type_t buft = layer_buft[il];
+        GGML_ASSERT(buft != nullptr);
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
-
-        if (offload) {
-            auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
-
-            dev_name = ggml_backend_dev_name(dev);
-        }
+        auto * dev = llama_kv_cache_get_backend(buft);
+        const char * dev_name = dev ? ggml_backend_dev_name(dev) : "CPU";
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
@@ -888,6 +996,52 @@ llama_kv_cache::llama_kv_cache(
                 ggml_new_tensor_2d(ctx, tail_plan.actual_body_type_v, n_embd_v_gqa,
                         tail_plan.compact_layout.history_slots) : nullptr;
 
+        ggml_tensor * k_store_stage = nullptr;
+        ggml_tensor * v_store_stage = nullptr;
+        if (ggml_backend_buft_is_host(buft) && !compact_native_exact) {
+            const auto k_store_buft = store_stage_buft(il, layer_type_k, n_embd_k_gqa);
+            const auto v_store_buft = has_v && !v_trans ?
+                    store_stage_buft(il, layer_type_v, n_embd_v_gqa) : nullptr;
+            auto * layer_dev = model.dev_layer(il);
+            const bool accelerator_layer = layer_dev &&
+                    ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (accelerator_layer && ggml_is_quantized(layer_type_k) && !k_store_buft) {
+                throw std::runtime_error(format(
+                        "layer %u cannot preserve accelerator %s K-cache store semantics in host-resident storage: "
+                        "the layer backend must support both direct and staged F32-to-%s conversion",
+                        il, ggml_backend_dev_name(layer_dev), ggml_type_name(layer_type_k)));
+            }
+            if (accelerator_layer && has_v && !v_trans && ggml_is_quantized(layer_type_v) && !v_store_buft) {
+                throw std::runtime_error(format(
+                        "layer %u cannot preserve accelerator %s V-cache store semantics in host-resident storage: "
+                        "the layer backend must support both direct and staged F32-to-%s conversion",
+                        il, ggml_backend_dev_name(layer_dev), ggml_type_name(layer_type_v)));
+            }
+            if (k_store_buft) {
+                auto * store_ctx = ctx_for_buft(k_store_buft);
+                if (!store_ctx) {
+                    throw std::runtime_error("failed to create K-cache store staging context");
+                }
+                k_store_stage = ggml_new_tensor_2d(
+                        store_ctx, layer_type_k, n_embd_k_gqa, store_stage_rows);
+                ggml_format_name(k_store_stage, "cache_k_store_stage_l%d", il);
+                store_stage_bytes += ggml_nbytes(k_store_stage);
+            }
+            if (v_store_buft) {
+                auto * store_ctx = ctx_for_buft(v_store_buft);
+                if (!store_ctx) {
+                    throw std::runtime_error("failed to create V-cache store staging context");
+                }
+                v_store_stage = ggml_new_tensor_2d(
+                        store_ctx, layer_type_v, n_embd_v_gqa, store_stage_rows);
+                ggml_format_name(v_store_stage, "cache_v_store_stage_l%d", il);
+                store_stage_bytes += ggml_nbytes(v_store_stage);
+            }
+            if (k_store_stage || v_store_stage) {
+                ++store_stage_layers;
+            }
+        }
+
         if (k) {
             ggml_format_name(k, "cache_k_l%d", il);
         }
@@ -911,7 +1065,8 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_tail, v_tail, k_stream, v_stream });
+        layers.push_back({ il, k, v, k_tail, v_tail, k_store_stage, v_store_stage,
+                k_stream, v_stream });
     }
 
     if (reuse) {
@@ -958,6 +1113,12 @@ llama_kv_cache::llama_kv_cache(
         ggml_backend_buffer_clear(buf, 0);
 
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (store_stage_layers > 0) {
+        LLAMA_LOG_INFO("%s: canonical accelerator KV store staging: %u host-resident layer(s), "
+                "%u rows, %.2f MiB device memory\n", __func__, store_stage_layers, store_stage_rows,
+                store_stage_bytes/1024.0/1024.0);
     }
 
     const auto tensor_buft = [](const ggml_tensor * tensor) -> ggml_backend_buffer_type_t {
@@ -1944,6 +2105,14 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_kv_cache_context>(this, n_kv);
+}
+
+uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
+    return get_size();
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -2044,7 +2213,8 @@ llama_kv_memory_stats llama_kv_cache::kv_memory_stats() const {
     llama_kv_memory_stats result;
     llama_kv_memory_component_stats & component = n_swa > 0 ? result.swa : result.global;
     for (const auto & route : tail_plan.layer_routes) {
-        const bool cpu = !route.owner || ggml_backend_dev_type(route.owner) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        const bool cpu = !route.execution_backend ||
+                ggml_backend_dev_type(route.execution_backend) == GGML_BACKEND_DEVICE_TYPE_CPU;
         if (cpu) {
             component.tail_cpu_layers++;
         } else if (route.capability.route != LLAMA_KV_TAIL_ROUTE_NATIVE) {
@@ -2847,6 +3017,28 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
+uint32_t llama_kv_cache::get_reserve_n_kv(const slot_info_vec_t & sinfos) const {
+    uint32_t result = 0;
+
+    // prepare() has simulated every placement and retained the exact physical
+    // indices. Include the current live high row because a later ubatch can
+    // preserve it while writing elsewhere.
+    for (const auto & sinfo : sinfos) {
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const uint32_t strm = sinfo.strm[s];
+            GGML_ASSERT(strm < v_cells.size());
+            result = std::max(result, v_cells[strm].used_max_p1());
+            for (const uint32_t idx : sinfo.idxs[s]) {
+                GGML_ASSERT(idx < v_cells[strm].size());
+                result = std::max(result, idx + 1);
+            }
+        }
+    }
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+    return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(result, n_pad_cur)));
+}
+
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
     const int32_t ikv = map_layer_ids.at(il);
 
@@ -2912,6 +3104,32 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
+ggml_tensor * llama_kv_cache::stage_store_rows(
+        ggml_context * ctx,
+        ggml_tensor  * source,
+        ggml_tensor  * stage) const {
+    GGML_ASSERT(source && stage && source->type == GGML_TYPE_F32);
+
+    const int64_t n_embd   = source->ne[0]*source->ne[1];
+    const int64_t n_tokens = source->ne[2];
+    if (n_embd != stage->ne[0] || n_tokens > stage->ne[1]) {
+        const std::string message = format(
+                "accelerator KV store stage shape mismatch: source=[%lld,%lld,%lld,%lld] "
+                "stage=[%lld,%lld,%lld,%lld]",
+                (long long) source->ne[0], (long long) source->ne[1],
+                (long long) source->ne[2], (long long) source->ne[3],
+                (long long) stage->ne[0], (long long) stage->ne[1],
+                (long long) stage->ne[2], (long long) stage->ne[3]);
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, message.c_str());
+        throw std::runtime_error(message);
+    }
+    GGML_ASSERT(ggml_row_size(source->type, source->ne[0]) == source->nb[1]);
+
+    source = ggml_view_2d(ctx, source, n_embd, n_tokens, source->nb[2], 0);
+    stage = ggml_view_2d(ctx, stage, n_embd, n_tokens, stage->nb[1], 0);
+    return ggml_cpy(ctx, source, stage);
+}
+
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -2933,7 +3151,9 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_embd_gqa = n_embd_head * n_head;
     GGML_ASSERT(n_embd_gqa == k->ne[0]);
 
-    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+    k_cur = layers[ikv].k_store_stage ?
+            stage_store_rows(ctx, k_cur, layers[ikv].k_store_stage) :
+            ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
     const int64_t n_stream = k->ne[2];
 
@@ -2976,7 +3196,9 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     if (!v_trans) {
         GGML_ASSERT(n_embd_gqa == v->ne[0]);
 
-        v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+        v_cur = layers[ikv].v_store_stage ?
+                stage_store_rows(ctx, v_cur, layers[ikv].v_store_stage) :
+                ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
@@ -3032,9 +3254,17 @@ ggml_tensor * llama_kv_cache::cpy_k_with_tail(
     GGML_ASSERT(k_idxs->ne[0] == n_tokens && tail_idxs->ne[0] == n_tokens);
     GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
 
-    k_cur = ggml_view_2d(ctx, k_cur, n_embd, n_tokens, k_cur->nb[2], 0);
+    ggml_tensor * k_cur_exact = k_cur;
+    k_cur = layers[ikv].k_store_stage ?
+            stage_store_rows(ctx, k_cur, layers[ikv].k_store_stage) :
+            ggml_view_2d(ctx, k_cur, n_embd, n_tokens, k_cur->nb[2], 0);
     if (body->ne[2] > 1) {
         body = ggml_reshape_2d(ctx, body, n_embd, body->ne[1]*body->ne[2]);
+    }
+
+    if (layers[ikv].k_store_stage) {
+        ggml_tensor * body_written = ggml_set_rows(ctx, body, k_cur, k_idxs);
+        return cpy_k_tail(ctx, k_cur_exact, tail_idxs, il, body_written);
     }
 
     ggml_tensor * written = ggml_set_rows_with_shadow(
@@ -3064,9 +3294,17 @@ ggml_tensor * llama_kv_cache::cpy_v_with_tail(
     GGML_ASSERT(v_idxs->ne[0] == n_tokens && tail_idxs->ne[0] == n_tokens);
     GGML_ASSERT(ggml_row_size(v_cur->type, v_cur->ne[0]) == v_cur->nb[1]);
 
-    v_cur = ggml_view_2d(ctx, v_cur, n_embd, n_tokens, v_cur->nb[2], 0);
+    ggml_tensor * v_cur_exact = v_cur;
+    v_cur = layers[ikv].v_store_stage ?
+            stage_store_rows(ctx, v_cur, layers[ikv].v_store_stage) :
+            ggml_view_2d(ctx, v_cur, n_embd, n_tokens, v_cur->nb[2], 0);
     if (body->ne[2] > 1) {
         body = ggml_reshape_2d(ctx, body, n_embd, body->ne[1]*body->ne[2]);
+    }
+
+    if (layers[ikv].v_store_stage) {
+        ggml_tensor * body_written = ggml_set_rows(ctx, body, v_cur, v_idxs);
+        return cpy_v_tail(ctx, v_cur_exact, tail_idxs, il, body_written);
     }
 
     ggml_tensor * written = ggml_set_rows_with_shadow(
@@ -6230,8 +6468,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
 llama_kv_cache_context::llama_kv_cache_context(
-        llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
+        llama_kv_cache * kv) : llama_kv_cache_context(kv, kv->get_size()) {
+}
+
+llama_kv_cache_context::llama_kv_cache_context(
+        llama_kv_cache * kv,
+        uint32_t n_kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+    this->n_kv = std::max(1u, std::min(n_kv, kv->get_size()));
+    reserve_n_kv = this->n_kv;
 
     const uint32_t n_stream = kv->get_n_stream();
 
@@ -6260,6 +6504,7 @@ llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv,
         llama_kv_cache::slot_info_vec_t sinfos,
         std::vector<llama_ubatch> ubatches) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv), sinfos(std::move(sinfos)), ubatches(std::move(ubatches)) {
+    reserve_n_kv = kv->get_reserve_n_kv(this->sinfos);
 }
 
 llama_kv_cache_context::~llama_kv_cache_context() = default;
@@ -6309,6 +6554,10 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_cur];
+}
+
+uint32_t llama_kv_cache_context::get_attn_reserve_n_kv() const {
+    return reserve_n_kv;
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
@@ -6527,7 +6776,7 @@ ggml_backend_dev_t llama_kv_cache::get_tail_backend(int32_t il) const {
     if (it == tail_plan.layer_routes.end()) {
         throw std::logic_error(format("KV tail has no execution descriptor for layer %d", il));
     }
-    return it->owner;
+    return it->execution_backend;
 }
 
 bool llama_kv_cache::get_tail_explicit_bias(int32_t il) const {

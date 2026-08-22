@@ -29,14 +29,17 @@ public:
                  uint32_t   n_batch,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                     bool   attn_offload,
+                     bool   attn_cpu_pinned,
+                     bool   attn_offload_compute,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                     bool   recurrent_offload,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,

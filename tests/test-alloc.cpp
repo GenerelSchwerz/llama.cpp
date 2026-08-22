@@ -606,6 +606,205 @@ static void test_reallocation() {
     }
 }
 
+static void test_shared_buffers_track_maximum_plan() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto make_add_graph = [](int64_t n_elements) {
+        auto result = make_context();
+        ggml_tensor * a = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * b = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * out = ggml_add(result.ctx, a, b);
+        ggml_set_output(out);
+        ggml_build_forward_expand(result.graph, out);
+        return result;
+    };
+
+    auto small_a = make_add_graph(4);
+    auto small_b = make_add_graph(4);
+    auto small_c = make_add_graph(4);
+    auto medium_a = make_add_graph(16);
+    auto medium_b = make_add_graph(16);
+    auto large   = make_add_graph(24);
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr first(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_ptr second(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(first.get(), shared);
+        ggml_gallocr_set_shared_buffers(second.get(), shared);
+
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), medium_a.graph));
+        const size_t medium_size = ggml_gallocr_get_buffer_size(first.get(), 0);
+        const uint64_t medium_generation = ggml_gallocr_shared_buffers_generation(shared);
+        GGML_ASSERT(medium_size > 0);
+        GGML_ASSERT(backend.context->allocated_total() == medium_size);
+
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), large.graph));
+        const size_t large_size = ggml_gallocr_get_buffer_size(second.get(), 0);
+        const uint64_t large_generation = ggml_gallocr_shared_buffers_generation(shared);
+        GGML_ASSERT(large_size > medium_size);
+        GGML_ASSERT(large_generation > medium_generation);
+        // The physical allocation is the larger plan, not the sum of plans.
+        GGML_ASSERT(backend.context->allocated_total() == large_size);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(first.get(), 0) == large_size);
+
+        // A same-geometry graph variant may publish a smaller plan without
+        // starting a group shrink. The member retains its phase high-water
+        // requirement until the caller explicitly allows a phase reduction.
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), small_a.graph));
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(first.get(), 0) == large_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) == large_generation);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_plan_generation(shared) == 0);
+
+        ggml_gallocr_shared_buffers_request_shrink(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), small_a.graph));
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(first.get(), 0) == large_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) == large_generation);
+        const uint64_t first_shrink_plan_generation =
+                ggml_gallocr_shared_buffers_plan_generation(shared);
+        GGML_ASSERT(first_shrink_plan_generation > 0);
+
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), small_b.graph));
+        const size_t small_size = ggml_gallocr_get_buffer_size(second.get(), 0);
+        GGML_ASSERT(small_size < large_size);
+        GGML_ASSERT(backend.context->allocated_total() == small_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) > large_generation);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(first.get(), small_a.graph));
+        check_all_allocated(small_a.graph);
+
+        const uint64_t small_generation = ggml_gallocr_shared_buffers_generation(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), medium_a.graph));
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(first.get(), 0) == medium_size);
+        GGML_ASSERT(backend.context->allocated_total() == medium_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) > small_generation);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(first.get(), medium_a.graph));
+        check_all_allocated(medium_a.graph);
+
+        // A growth that remains below the peer's larger allocation must not
+        // seed a stale shrink epoch. The following reduction is coalesced
+        // until the unchanged peer republishes its current plan.
+        const uint64_t medium_again_generation =
+                ggml_gallocr_shared_buffers_generation(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), large.graph));
+        const uint64_t large_again_generation =
+                ggml_gallocr_shared_buffers_generation(shared);
+        GGML_ASSERT(large_again_generation > medium_again_generation);
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), medium_b.graph));
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) == large_again_generation);
+        ggml_gallocr_shared_buffers_request_shrink(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), small_a.graph));
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) == large_again_generation);
+        const uint64_t unchanged_peer_plan_generation =
+                ggml_gallocr_shared_buffers_plan_generation(shared);
+        GGML_ASSERT(unchanged_peer_plan_generation > first_shrink_plan_generation);
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), medium_b.graph));
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(second.get(), 0) == medium_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) > large_again_generation);
+
+        second.reset();
+        GGML_ASSERT(backend.context->allocated_total() == medium_size);
+        // Member removal requests a new epoch; the surviving plan publication
+        // reclaims the departed member's high-water requirement.
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), small_c.graph));
+        GGML_ASSERT(backend.context->allocated_total() == small_size);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(first.get(), small_c.graph));
+        check_all_allocated(small_c.graph);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
+static void test_shared_buffers_single_member_resize() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto make_add_graph = [](int64_t n_elements) {
+        auto result = make_context();
+        ggml_tensor * a = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * b = make_input_1d(result.ctx, n_elements);
+        ggml_build_forward_expand(result.graph, ggml_add(result.ctx, a, b));
+        return result;
+    };
+
+    auto small  = make_add_graph(4);
+    auto medium = make_add_graph(16);
+    auto large  = make_add_graph(24);
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(alloc.get(), shared);
+
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), large.graph));
+        const size_t large_size = backend.context->allocated_total();
+        const uint64_t large_generation = ggml_gallocr_shared_buffers_generation(shared);
+
+        ggml_gallocr_shared_buffers_request_shrink(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), small.graph));
+        const size_t small_size = backend.context->allocated_total();
+        GGML_ASSERT(small_size < large_size);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_generation(shared) > large_generation);
+
+        GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), medium.graph));
+        const size_t medium_size = backend.context->allocated_total();
+        GGML_ASSERT(medium_size > small_size);
+        GGML_ASSERT(medium_size < large_size);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), medium.graph));
+        check_all_allocated(medium.graph);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
+static void test_shared_buffers_ignore_nonmembers() {
+    dummy_backend first_backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    dummy_backend second_backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto make_add_graph = [](int64_t n_elements) {
+        auto result = make_context();
+        ggml_tensor * a = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * b = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * out = ggml_add(result.ctx, a, b);
+        ggml_set_output(out);
+        ggml_build_forward_expand(result.graph, out);
+        return result;
+    };
+
+    auto small = make_add_graph(4);
+    auto large = make_add_graph(24);
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr first(ggml_gallocr_new(&first_backend.buffer_type));
+        ggml_gallocr_ptr second(ggml_gallocr_new(&second_backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(first.get(), shared);
+        ggml_gallocr_set_shared_buffers(second.get(), shared);
+
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), large.graph));
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), large.graph));
+        const size_t first_large  = first_backend.context->allocated_total();
+        const size_t second_large = second_backend.context->allocated_total();
+        const uint64_t plan_generation =
+                ggml_gallocr_shared_buffers_plan_generation(shared);
+        GGML_ASSERT(first_large > 0);
+        GGML_ASSERT(second_large > 0);
+
+        // Every active allocator must publish once per epoch, even if its
+        // plan uses a disjoint buffer type. This keeps the group protocol
+        // independent of the backend topology.
+        ggml_gallocr_shared_buffers_request_shrink(shared);
+        GGML_ASSERT(ggml_gallocr_reserve(first.get(), small.graph));
+        GGML_ASSERT(first_backend.context->allocated_total() == first_large);
+        GGML_ASSERT(second_backend.context->allocated_total() == second_large);
+        GGML_ASSERT(ggml_gallocr_shared_buffers_plan_generation(shared) > plan_generation);
+        GGML_ASSERT(ggml_gallocr_reserve(second.get(), large.graph));
+        GGML_ASSERT(first_backend.context->allocated_total() < first_large);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(first_backend.context->allocated_total() == 0);
+    GGML_ASSERT(second_backend.context->allocated_total() == 0);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -628,5 +827,8 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_shared_buffers_track_maximum_plan", test_shared_buffers_track_maximum_plan);
+    run("test_shared_buffers_single_member_resize", test_shared_buffers_single_member_resize);
+    run("test_shared_buffers_ignore_nonmembers", test_shared_buffers_ignore_nonmembers);
     return 0;
 }

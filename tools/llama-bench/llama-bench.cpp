@@ -378,6 +378,7 @@ struct cmd_params {
     std::vector<llama_load_mode>     load_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
+    std::vector<int>                 kv_gpu_layers;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
@@ -395,6 +396,9 @@ struct cmd_params {
     bool                             progress;
     bool                             kv_memory;
     bool                             no_warmup;
+    bool                             kv_cpu_pinned;
+    bool                             recurrent_state_offload;
+    bool                             live_context_workspace;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -425,6 +429,7 @@ static const cmd_params cmd_params_defaults = {
     /* load_mode            */ { LLAMA_LOAD_MODE_MMAP },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
+    /* kv_gpu_layers        */ { 0 },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -442,6 +447,9 @@ static const cmd_params cmd_params_defaults = {
     /* progress             */ false,
     /* kv_memory            */ false,
     /* no_warmup            */ false,
+    /* kv_cpu_pinned        */ false,
+    /* recurrent_state_offload */ false,
+    /* live_context_workspace  */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -462,6 +470,11 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --progress                                  print test progress indicators\n");
     printf("  --kv-memory                                capture synchronized KV component and device allocation checkpoints\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --live-context-workspace                    grow supported attention workspaces with the live KV extent\n");
+    printf("  --kv-cpu-pinned                             route CPU-resident KV cache layers through pinned/host memory\n");
+    printf("  --kv-gpu-layers <n>                         with -nkvo, keep the first n attention-KV layers device-resident (default: %s)\n",
+            join(cmd_params_defaults.kv_gpu_layers, ",").c_str());
+    printf("  --recurrent-state-offload                   for hybrid models, keep recurrent state GPU-resident despite -nkvo\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -680,6 +693,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.kv_memory            = cmd_params_defaults.kv_memory;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.kv_cpu_pinned        = cmd_params_defaults.kv_cpu_pinned;
+    params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
+    params.live_context_workspace = cmd_params_defaults.live_context_workspace;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1228,6 +1244,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.kv_memory = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--kv-cpu-pinned") {
+                params.kv_cpu_pinned = true;
+            } else if (arg == "--recurrent-state-offload") {
+                params.recurrent_state_offload = true;
+            } else if (arg == "--live-context-workspace") {
+                params.live_context_workspace = true;
+            } else if (arg == "--no-live-context-workspace") {
+                params.live_context_workspace = false;
+            } else if (arg == "--kv-gpu-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.kv_gpu_layers.insert(params.kv_gpu_layers.end(), p.begin(), p.end());
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1337,6 +1368,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_kv_offload.empty()) {
         params.no_kv_offload = cmd_params_defaults.no_kv_offload;
     }
+    if (params.kv_gpu_layers.empty()) {
+        params.kv_gpu_layers = cmd_params_defaults.kv_gpu_layers;
+    }
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
     }
@@ -1401,6 +1435,10 @@ struct cmd_params_instance {
     llama_load_mode    load_mode;
     int                main_gpu;
     bool               no_kv_offload;
+    bool               kv_cpu_pinned;
+    bool               recurrent_state_offload;
+    bool               live_context_workspace;
+    int                kv_gpu_layers;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
@@ -1474,19 +1512,23 @@ struct cmd_params_instance {
     llama_context_params to_llama_cparams() const {
         llama_context_params cparams = llama_context_default_params();
 
-        cparams.n_ctx           = n_prompt + n_gen + n_depth;
-        cparams.n_batch         = n_batch;
-        cparams.n_ubatch        = n_ubatch;
-        cparams.type_k          = type_k.ggml;
-        cparams.type_v          = type_v.ggml;
-        cparams.kvarn           = kvarn_params_from_cache_pair(type_k, type_v);
-        cparams.kv_tail_tokens  = kv_tail_tokens;
-        cparams.kv_tail_type    = kv_tail_type;
-        cparams.offload_kqv     = !no_kv_offload;
-        cparams.flash_attn_type = flash_attn;
-        cparams.embeddings      = embeddings;
-        cparams.op_offload      = !no_op_offload;
-        cparams.swa_full        = false;
+        cparams.n_ctx                   = n_prompt + n_gen + n_depth;
+        cparams.n_batch                 = n_batch;
+        cparams.n_ubatch                = n_ubatch;
+        cparams.type_k                  = type_k.ggml;
+        cparams.type_v                  = type_v.ggml;
+        cparams.kvarn                   = kvarn_params_from_cache_pair(type_k, type_v);
+        cparams.kv_tail_tokens          = kv_tail_tokens;
+        cparams.kv_tail_type            = kv_tail_type;
+        cparams.offload_kqv             = !no_kv_offload;
+        cparams.kv_cpu_pinned           = kv_cpu_pinned;
+        cparams.recurrent_state_offload = recurrent_state_offload;
+        cparams.live_context_workspace  = live_context_workspace;
+        cparams.kv_gpu_layers           = (uint32_t) kv_gpu_layers;
+        cparams.flash_attn_type         = flash_attn;
+        cparams.embeddings              = embeddings;
+        cparams.op_offload              = !no_op_offload;
+        cparams.swa_full                = false;
 
         return cparams;
     }
@@ -1518,6 +1560,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tail_n : params.kv_tail_tokens)
     for (const auto & tail_type : params.kv_tail_type)
     for (const auto & nkvo : params.no_kv_offload)
+    for (const auto & kvgl : params.kv_gpu_layers)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
@@ -1553,6 +1596,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
+                /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1591,6 +1638,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
+                /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1629,6 +1680,10 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .load_mode             = */ lm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ params.kv_cpu_pinned,
+                /* .recurrent_state_offload = */ params.recurrent_state_offload,
+                /* .live_context_workspace = */ params.live_context_workspace,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1718,6 +1773,26 @@ struct test {
     uint64_t                 cuda_used_peak_bytes = 0;
     uint64_t                 cuda_used_after_context_bytes = 0;
     uint64_t                 cuda_total_bytes = 0;
+    uint64_t                 cuda_vmm_live_model_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_model_bytes = 0;
+    uint64_t                 cuda_vmm_live_context_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_context_bytes = 0;
+    uint64_t                 cuda_vmm_live_after_workload_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_after_workload_bytes = 0;
+    uint64_t                 cuda_vmm_live_peak_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_peak_bytes = 0;
+    uint64_t                 cuda_vmm_live_after_context_bytes = 0;
+    uint64_t                 cuda_vmm_mapped_after_context_bytes = 0;
+    uint64_t                 cuda_vmm_active_pools_model = 0;
+    uint64_t                 cuda_vmm_active_pools_context = 0;
+    uint64_t                 cuda_vmm_active_pools_after_workload = 0;
+    uint64_t                 cuda_vmm_active_pools_after_context = 0;
+    uint64_t                 cuda_device_context_buffer_bytes = 0;
+    uint64_t                 cuda_device_compute_buffer_bytes = 0;
+    uint64_t                 accelerator_host_context_buffer_bytes = 0;
+    uint64_t                 accelerator_host_compute_buffer_bytes = 0;
+    uint64_t                 host_context_buffer_bytes = 0;
+    uint64_t                 host_compute_buffer_bytes = 0;
     uint64_t                 cuda_context_buffer_bytes = 0;
     uint64_t                 cuda_non_kv_context_buffer_bytes = 0;
     uint64_t                 cuda_compute_buffer_bytes = 0;
@@ -1732,6 +1807,10 @@ struct test {
     llama_load_mode          load_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
+    bool                     kv_cpu_pinned;
+    bool                     recurrent_state_offload;
+    bool                     live_context_workspace;
+    int                      kv_gpu_layers;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
@@ -1781,6 +1860,10 @@ struct test {
         load_mode      = inst.load_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
+        kv_cpu_pinned  = inst.kv_cpu_pinned;
+        recurrent_state_offload = inst.recurrent_state_offload;
+        live_context_workspace = inst.live_context_workspace;
+        kv_gpu_layers  = inst.kv_gpu_layers;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
@@ -1861,11 +1944,23 @@ struct test {
             "kv_tail_pack_bytes", "kv_tail_body_output_bytes", "kv_tail_exact_output_bytes", "kv_tail_plan_input_bytes",
             "kv_transient_bytes", "kv_peak_bytes", "cuda_used_model_bytes", "cuda_used_context_bytes",
             "cuda_used_prefill_bytes", "cuda_used_peak_bytes", "cuda_used_after_context_bytes", "cuda_total_bytes",
+            "cuda_vmm_live_model_bytes", "cuda_vmm_mapped_model_bytes",
+            "cuda_vmm_live_context_bytes", "cuda_vmm_mapped_context_bytes",
+            "cuda_vmm_live_after_workload_bytes", "cuda_vmm_mapped_after_workload_bytes",
+            "cuda_vmm_live_peak_bytes", "cuda_vmm_mapped_peak_bytes",
+            "cuda_vmm_live_after_context_bytes", "cuda_vmm_mapped_after_context_bytes",
+            "cuda_vmm_active_pools_model", "cuda_vmm_active_pools_context",
+            "cuda_vmm_active_pools_after_workload", "cuda_vmm_active_pools_after_context",
+            "cuda_device_context_buffer_bytes", "cuda_device_compute_buffer_bytes",
+            "accelerator_host_context_buffer_bytes", "accelerator_host_compute_buffer_bytes",
+            "host_context_buffer_bytes", "host_compute_buffer_bytes",
             "cuda_context_buffer_bytes", "cuda_non_kv_context_buffer_bytes", "cuda_compute_buffer_bytes",
             "cuda_context_delta_bytes", "cuda_peak_delta_bytes", "cuda_reconciliation_delta_bytes",
             "cuda_runtime_overhead_bytes", "cuda_teardown_delta_bytes",
             "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
+            "live_context_workspace",
+            "kv_gpu_layers",  "flash_attn",     "devices",       "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1884,7 +1979,8 @@ struct test {
         }
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "kv_gpu_layers" || field == "n_prompt" || field == "n_gen" ||
+            field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" || field == "kv_tail_tokens" ||
             field == "kv_tail_tokens_effective" || field == "kvarn_route_split" || field == "kvarn_route_vector" ||
@@ -1898,8 +1994,10 @@ struct test {
             field == "kv_tail_device_fallback_layers" || field == "kv_tail_cpu_layers") {
             return INT;
         }
-        if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+        if (field == "f16_kv" || field == "no_kv_offload" || field == "kv_cpu_pinned" ||
+            field == "recurrent_state_offload" || field == "live_context_workspace" ||
+            field == "cpu_strict" || field == "embeddings" ||
+            field == "no_host") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -2019,6 +2117,26 @@ struct test {
                                              std::to_string(cuda_used_peak_bytes),
                                              std::to_string(cuda_used_after_context_bytes),
                                              std::to_string(cuda_total_bytes),
+                                             std::to_string(cuda_vmm_live_model_bytes),
+                                             std::to_string(cuda_vmm_mapped_model_bytes),
+                                             std::to_string(cuda_vmm_live_context_bytes),
+                                             std::to_string(cuda_vmm_mapped_context_bytes),
+                                             std::to_string(cuda_vmm_live_after_workload_bytes),
+                                             std::to_string(cuda_vmm_mapped_after_workload_bytes),
+                                             std::to_string(cuda_vmm_live_peak_bytes),
+                                             std::to_string(cuda_vmm_mapped_peak_bytes),
+                                             std::to_string(cuda_vmm_live_after_context_bytes),
+                                             std::to_string(cuda_vmm_mapped_after_context_bytes),
+                                             std::to_string(cuda_vmm_active_pools_model),
+                                             std::to_string(cuda_vmm_active_pools_context),
+                                             std::to_string(cuda_vmm_active_pools_after_workload),
+                                             std::to_string(cuda_vmm_active_pools_after_context),
+                                             std::to_string(cuda_device_context_buffer_bytes),
+                                             std::to_string(cuda_device_compute_buffer_bytes),
+                                             std::to_string(accelerator_host_context_buffer_bytes),
+                                             std::to_string(accelerator_host_compute_buffer_bytes),
+                                             std::to_string(host_context_buffer_bytes),
+                                             std::to_string(host_compute_buffer_bytes),
                                              std::to_string(cuda_context_buffer_bytes),
                                              std::to_string(cuda_non_kv_context_buffer_bytes),
                                              std::to_string(cuda_compute_buffer_bytes),
@@ -2032,6 +2150,10 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
+                                            std::to_string(kv_cpu_pinned),
+                                            std::to_string(recurrent_state_offload),
+                                            std::to_string(live_context_workspace),
+                                            std::to_string(kv_gpu_layers),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
@@ -2202,6 +2324,18 @@ struct markdown_printer : public printer {
         if (field == "n_gpu_layers") {
             return 3;
         }
+        if (field == "kv_gpu_layers") {
+            return 4;
+        }
+        if (field == "kv_cpu_pinned") {
+            return 5;
+        }
+        if (field == "recurrent_state_offload") {
+            return 3;
+        }
+        if (field == "live_context_workspace") {
+            return 3;
+        }
         if (field == "n_threads") {
             return 7;
         }
@@ -2256,6 +2390,18 @@ struct markdown_printer : public printer {
         }
         if (field == "no_kv_offload") {
             return "nkvo";
+        }
+        if (field == "kv_cpu_pinned") {
+            return "kvpin";
+        }
+        if (field == "recurrent_state_offload") {
+            return "rso";
+        }
+        if (field == "live_context_workspace") {
+            return "lcw";
+        }
+        if (field == "kv_gpu_layers") {
+            return "kvgl";
         }
         if (field == "flash_attn") {
             return "fa";
@@ -2344,6 +2490,18 @@ struct markdown_printer : public printer {
         }
         if (params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
             fields.emplace_back("no_kv_offload");
+        }
+        if (params.kv_cpu_pinned != cmd_params_defaults.kv_cpu_pinned) {
+            fields.emplace_back("kv_cpu_pinned");
+        }
+        if (params.recurrent_state_offload != cmd_params_defaults.recurrent_state_offload) {
+            fields.emplace_back("recurrent_state_offload");
+        }
+        if (params.live_context_workspace != cmd_params_defaults.live_context_workspace) {
+            fields.emplace_back("live_context_workspace");
+        }
+        if (params.kv_gpu_layers.size() > 1 || params.kv_gpu_layers != cmd_params_defaults.kv_gpu_layers) {
+            fields.emplace_back("kv_gpu_layers");
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
@@ -2623,6 +2781,17 @@ using bench_kv_memory_transient_stats_reset_fn = void (*)();
 using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
 using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
 
+struct bench_cuda_vmm_pool_stats {
+    uint64_t live_bytes;
+    uint64_t live_peak_bytes;
+    uint64_t mapped_bytes;
+    uint64_t mapped_peak_bytes;
+    uint64_t active_pools;
+};
+
+using bench_cuda_vmm_pool_stats_get_fn = bool (*)(int, bench_cuda_vmm_pool_stats *);
+using bench_cuda_vmm_pool_stats_reset_fn = bool (*)(int);
+
 static ggml_backend_dev_t bench_memory_device(const cmd_params_instance & inst) {
     if (inst.main_gpu >= 0 && size_t(inst.main_gpu) < inst.devices.size() &&
             inst.devices[inst.main_gpu] != nullptr) {
@@ -2795,6 +2964,7 @@ int llama_bench(int argc, char ** argv) {
         uint64_t cuda_used_model = 0;
         uint64_t cuda_free_model = 0;
         uint64_t cuda_total = 0;
+        bench_cuda_vmm_pool_stats cuda_vmm_model = {};
         ggml_backend_dev_t memory_dev = bench_memory_device(inst);
         const char * memory_device_name = memory_dev != nullptr ? ggml_backend_dev_name(memory_dev) : nullptr;
         const uint32_t route_stats_abi_version = memory_device_name != nullptr &&
@@ -2821,6 +2991,14 @@ int llama_bench(int argc, char ** argv) {
             reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
                 ggml_backend_reg_get_proc_address(
                     memory_reg, "ggml_backend_cuda_memory_checkpoint")) : nullptr;
+        auto cuda_vmm_pool_stats_get = memory_reg != nullptr ?
+            reinterpret_cast<bench_cuda_vmm_pool_stats_get_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_get")) : nullptr;
+        auto cuda_vmm_pool_stats_reset = memory_reg != nullptr ?
+            reinterpret_cast<bench_cuda_vmm_pool_stats_reset_fn>(
+                ggml_backend_reg_get_proc_address(
+                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_reset")) : nullptr;
         if (params.kv_memory) {
             if (kv_memory_transient_stats_reset == nullptr || kv_memory_transient_stats_get == nullptr ||
                     memory_dev == nullptr) {
@@ -2828,11 +3006,17 @@ int llama_bench(int argc, char ** argv) {
                 llama_model_free(lmodel);
                 return 1;
             }
+            if (cuda_vmm_pool_stats_reset != nullptr) {
+                cuda_vmm_pool_stats_reset(inst.main_gpu);
+            }
             if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, nullptr,
                     &cuda_used_model, &cuda_free_model, &cuda_total)) {
                 fprintf(stderr, "%s: error: failed to capture the synchronized model-only device checkpoint\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
+            }
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                cuda_vmm_pool_stats_get(inst.main_gpu, &cuda_vmm_model);
             }
         }
 
@@ -2868,23 +3052,44 @@ int llama_bench(int argc, char ** argv) {
             t.kv_tail_cpu_layers = kv_stats.tail_cpu_layers();
             t.cuda_used_model_bytes = cuda_used_model;
             t.cuda_total_bytes = cuda_total;
+            t.cuda_vmm_live_model_bytes = cuda_vmm_model.live_bytes;
+            t.cuda_vmm_mapped_model_bytes = cuda_vmm_model.mapped_bytes;
+            t.cuda_vmm_active_pools_model = cuda_vmm_model.active_pools;
 
             const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
             for (const auto & [buft, memory] : breakdown) {
                 ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
                 if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    // Preserve the historical accelerator-owner totals for result compatibility.
+                    // Accelerator host buffers consume host RAM, not physical device memory.
                     t.cuda_context_buffer_bytes += memory.context;
                     t.cuda_compute_buffer_bytes += memory.compute;
                 }
+                if (ggml_backend_buft_is_host(buft)) {
+                    if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        t.accelerator_host_context_buffer_bytes += memory.context;
+                        t.accelerator_host_compute_buffer_bytes += memory.compute;
+                    } else {
+                        t.host_context_buffer_bytes += memory.context;
+                        t.host_compute_buffer_bytes += memory.compute;
+                    }
+                } else if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                    t.cuda_device_context_buffer_bytes += memory.context;
+                    t.cuda_device_compute_buffer_bytes += memory.compute;
+                }
             }
-            if (t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
+            // The historical CUDA-owner total includes device KV and CUDA-pinned host KV,
+            // but deliberately excludes ordinary host buffers. Only subtract resident KV
+            // when its buffer type participates in that owner total.
+            const bool kv_in_cuda_owner_total = !inst.no_kv_offload || inst.kv_cpu_pinned;
+            if (kv_in_cuda_owner_total && t.cuda_context_buffer_bytes < t.kv_resident_bytes) {
                 fprintf(stderr, "%s: error: GPU context buffers are smaller than categorized resident KV storage\n", __func__);
                 llama_free(ctx);
                 llama_model_free(lmodel);
                 return 1;
             }
-            t.cuda_non_kv_context_buffer_bytes =
-                t.cuda_context_buffer_bytes - t.kv_resident_bytes;
+            t.cuda_non_kv_context_buffer_bytes = t.cuda_context_buffer_bytes -
+                (kv_in_cuda_owner_total ? t.kv_resident_bytes : 0);
 
             uint64_t cuda_free_context = 0;
             uint64_t cuda_total_context = 0;
@@ -2896,6 +3101,14 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             t.cuda_context_delta_bytes = int64_t(t.cuda_used_context_bytes) - int64_t(t.cuda_used_model_bytes);
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats stats = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats)) {
+                    t.cuda_vmm_live_context_bytes = stats.live_bytes;
+                    t.cuda_vmm_mapped_context_bytes = stats.mapped_bytes;
+                    t.cuda_vmm_active_pools_context = stats.active_pools;
+                }
+            }
         }
 
         if (kvarn_route_stats_reset != nullptr) {
@@ -2961,6 +3174,9 @@ int llama_bench(int argc, char ** argv) {
 
         if (params.kv_memory) {
             kv_memory_transient_stats_reset();
+            if (cuda_vmm_pool_stats_reset != nullptr) {
+                cuda_vmm_pool_stats_reset(inst.main_gpu);
+            }
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -3102,11 +3318,22 @@ int llama_bench(int argc, char ** argv) {
             t.kv_peak_bytes = t.kv_resident_bytes + t.kv_transient_bytes;
             t.cuda_peak_delta_bytes = int64_t(t.cuda_used_peak_bytes) - int64_t(t.cuda_used_model_bytes);
             t.cuda_reconciliation_delta_bytes = t.cuda_peak_delta_bytes -
-                    int64_t(t.cuda_context_buffer_bytes + t.cuda_compute_buffer_bytes);
+                    int64_t(t.cuda_device_context_buffer_bytes + t.cuda_device_compute_buffer_bytes);
             // cudaMemGetInfo includes driver/runtime allocations and VMM pool
             // granularity that are not owned by a llama context buffer. Keep
             // that residual explicit instead of attributing it to KVarN.
             t.cuda_runtime_overhead_bytes = t.cuda_reconciliation_delta_bytes;
+
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats vmm_stats = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &vmm_stats)) {
+                    t.cuda_vmm_live_after_workload_bytes = vmm_stats.live_bytes;
+                    t.cuda_vmm_mapped_after_workload_bytes = vmm_stats.mapped_bytes;
+                    t.cuda_vmm_live_peak_bytes = vmm_stats.live_peak_bytes;
+                    t.cuda_vmm_mapped_peak_bytes = vmm_stats.mapped_peak_bytes;
+                    t.cuda_vmm_active_pools_after_workload = vmm_stats.active_pools;
+                }
+            }
 
             llama_perf_context_print(ctx);
             llama_free(ctx);
@@ -3122,6 +3349,14 @@ int llama_bench(int argc, char ** argv) {
             }
             t.cuda_teardown_delta_bytes = int64_t(t.cuda_used_after_context_bytes) -
                     int64_t(t.cuda_used_model_bytes);
+            if (cuda_vmm_pool_stats_get != nullptr) {
+                bench_cuda_vmm_pool_stats stats_after = {};
+                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats_after)) {
+                    t.cuda_vmm_live_after_context_bytes = stats_after.live_bytes;
+                    t.cuda_vmm_mapped_after_context_bytes = stats_after.mapped_bytes;
+                    t.cuda_vmm_active_pools_after_context = stats_after.active_pools;
+                }
+            }
         }
 
         if (p) {
