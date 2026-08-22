@@ -362,6 +362,7 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    bool has_causal_prefix() const { return self_kq_mask_causal_prefix; }
     ggml_tensor * get_kq_mask_tail() const { return self_kq_mask_tail; }
     ggml_tensor * get_tail_read_idxs() const { return self_tail_read_idxs; }
     ggml_tensor * get_tail_bias_read_idxs() const { return self_tail_bias_read_idxs; }
@@ -382,6 +383,8 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
+    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
+    uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -422,11 +425,14 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
+    bool has_causal_prefix() const { return self_kq_mask_causal_prefix; }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
+    uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -826,6 +832,7 @@ struct llm_graph_params {
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
+    bool is_reserve = false;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -926,6 +933,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            is_reserve == other.is_reserve &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1066,6 +1074,7 @@ struct llm_graph_context {
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
 
+    const bool is_reserve;
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?

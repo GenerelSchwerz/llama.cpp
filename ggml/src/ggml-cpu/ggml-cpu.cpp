@@ -526,7 +526,15 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(src1->type)->vec_dot;
             ggml_to_float_t   const v_to_float     = ggml_get_type_traits(src2->type)->to_float;
 
-            return q_to_vec_dot && kq_vec_dot && (src2->type == GGML_TYPE_F32 || v_to_float);
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            const auto * mask = op->src[3];
+            const bool mask_ok = mask == nullptr || mask->type == GGML_TYPE_F16 ||
+                (mask->type == GGML_TYPE_I64 && mask->ne[0] == src0->ne[1] &&
+                 mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && max_bias == 0.0f);
+
+            return mask_ok && q_to_vec_dot && kq_vec_dot &&
+                (src2->type == GGML_TYPE_F32 || v_to_float);
         }
         case GGML_OP_OUT_PROD:
             return (

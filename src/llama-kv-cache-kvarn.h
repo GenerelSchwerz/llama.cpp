@@ -174,6 +174,8 @@ public:
     void set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const override;
     void set_input_k_shift(ggml_tensor * dst) const override;
+    bool can_use_compact_causal_mask(
+            const llama_ubatch & ubatch, bool causal_attn, bool is_reserve) const override;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const override;
     void set_input_kq_mask_tail(
             ggml_tensor * body, ggml_tensor * exact,
