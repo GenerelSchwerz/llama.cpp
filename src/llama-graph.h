@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <optional>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -370,7 +371,7 @@ public:
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-    bool has_causal_prefix() const { return self_kq_mask_causal_prefix; }
+    bool has_causal_prefix() const { return self_kq_mask_causal_prefix_n_kv.has_value(); }
     ggml_tensor * get_kq_mask_tail() const { return self_kq_mask_tail; }
     ggml_tensor * get_tail_read_idxs() const { return self_tail_read_idxs; }
     ggml_tensor * get_tail_bias_read_idxs() const { return self_tail_bias_read_idxs; }
@@ -391,8 +392,9 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [tail_tokens, n_batch/n_stream, 1, n_stream]
-    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
-    uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
+    // Present only for consecutive I64 write indices. The value is the logical
+    // K span retained by the compact descriptor.
+    std::optional<uint32_t> self_kq_mask_causal_prefix_n_kv;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -433,14 +435,15 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
-    bool has_causal_prefix() const { return self_kq_mask_causal_prefix; }
+    bool has_causal_prefix() const { return self_kq_mask_causal_prefix_n_kv.has_value(); }
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-    bool self_kq_mask_causal_prefix = false; // consecutive I64 write indices; exclusive bound is index + 1
-    uint32_t self_kq_mask_n_kv = 0; // logical K span retained by the compact descriptor
+    // Present only for consecutive I64 write indices. The value is the logical
+    // K span retained by the compact descriptor.
+    std::optional<uint32_t> self_kq_mask_causal_prefix_n_kv;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
