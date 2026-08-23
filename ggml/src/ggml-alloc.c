@@ -767,6 +767,35 @@ static int ggml_gallocr_shared_register_member(struct ggml_gallocr_shared_buffer
     return member;
 }
 
+static void ggml_gallocr_shared_unregister_member(
+        struct ggml_gallocr_shared_buffers * shared,
+        int member) {
+    GGML_ASSERT(member >= 0 && member < shared->members_capacity);
+    shared->members_active[member] = false;
+    shared->shrink_seen[member] = false;
+    for (int i = 0; i < shared->n_entries; ++i) {
+        struct ggml_gallocr_shared_buffer_entry * entry = &shared->entries[i];
+        size_t * requirements = ggml_gallocr_shared_member_requirements(shared, entry, member);
+        memset(requirements, 0, GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
+        if (entry->members_present[member]) {
+            entry->members_present[member] = false;
+        }
+    }
+    for (int other = 0; other < shared->members_capacity; ++other) {
+        if (shared->members_active[other]) {
+            // A live peer must republish before a former member's maximum
+            // can be reclaimed without invalidating a graph in flight.
+            ggml_gallocr_shared_buffers_request_shrink(shared);
+            break;
+        }
+    }
+    // Keep the existing physical allocation until a remaining member
+    // publishes another plan or the group is destroyed. Resizing during
+    // unregister could invalidate a still-live peer at shutdown/reload,
+    // and reclaiming a transient larger buffer here is not worth that
+    // lifetime coupling.
+}
+
 static int ggml_gallocr_shared_find_or_add_entry(
         struct ggml_gallocr_shared_buffers * shared,
         ggml_backend_buffer_type_t buft) {
@@ -850,32 +879,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     }
 
     if (galloc->shared != NULL) {
-        GGML_ASSERT(galloc->shared_member >= 0 &&
-                galloc->shared_member < galloc->shared->members_capacity);
-        galloc->shared->members_active[galloc->shared_member] = false;
-        galloc->shared->shrink_seen[galloc->shared_member] = false;
-        for (int i = 0; i < galloc->shared->n_entries; ++i) {
-            struct ggml_gallocr_shared_buffer_entry * entry = &galloc->shared->entries[i];
-            size_t * requirements = ggml_gallocr_shared_member_requirements(
-                    galloc->shared, entry, galloc->shared_member);
-            memset(requirements, 0, GGML_VBUFFER_MAX_CHUNKS * sizeof(size_t));
-            if (entry->members_present[galloc->shared_member]) {
-                entry->members_present[galloc->shared_member] = false;
-            }
-        }
-        for (int member = 0; member < galloc->shared->members_capacity; ++member) {
-            if (galloc->shared->members_active[member]) {
-                // A live peer must republish before a former member's maximum
-                // can be reclaimed without invalidating a graph in flight.
-                ggml_gallocr_shared_buffers_request_shrink(galloc->shared);
-                break;
-            }
-        }
-        // Keep the existing physical allocation until a remaining member
-        // publishes another plan or the group is destroyed. Resizing during
-        // unregister could invalidate a still-live peer at shutdown/reload,
-        // and reclaiming a transient larger buffer here is not worth that
-        // lifetime coupling.
+        ggml_gallocr_shared_unregister_member(galloc->shared, galloc->shared_member);
     }
 
     for (int i = 0; i < galloc->n_buffers; i++) {
