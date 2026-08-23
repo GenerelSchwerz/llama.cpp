@@ -6549,6 +6549,102 @@ The general lesson is worth keeping: a multi-statement macro is unsafe to
 prefix with `extern`, and the failure mode is silent. Both macros above are
 commented to say so.
 
+#### Rejected: raw-byte `cp.async` staging of quantized rows
+
+`nstages` is forced to `0` for quantized caches because `cp.async` is a
+byte-for-byte DMA and cannot dequantize. Design A of
+[`docs/quantized-native-fa-staging-plan.md`](quantized-native-fa-staging-plan.md)
+works around that by staging the *raw* quantized rows into shared memory and
+letting the existing packed loaders read shared instead of global, with their
+arithmetic untouched. **It was implemented, it is exact, and it loses on every
+arm measured. It is not retained.**
+
+The prototype was the narrowest one the plan allows: `D = 256`, `ncols2 >= 2`,
+symmetric `q3_0` and `q2_1` only -- the types whose raw region fits underneath
+the shared-memory floor `nbytes_shared_Q` already sets, so occupancy is held
+fixed and the experiment measures overlap alone. Single raw buffer, whole-row
+16-byte transfers, synchronous fallback for the `oob_check` tail.
+
+Two mechanisms had to be added that the plan did not anticipate. `cp-async.cuh`
+exposed only `cp_async_wait_all()`, which waits for *every* outstanding copy;
+waiting for staged K that way would also wait for staged V and destroy the
+overlap the design exists to create, so K and V are committed as separate groups
+via new `cp_async_commit_group()` / `cp_async_wait_group<n>()` helpers, and K
+waits with one group still in flight. Separately, `cp-async.cuh` has no include
+guard -- most `.cuh` files in this backend rely on being included once per
+translation unit -- so including it from `fattn-mma-quant.cuh` gave `fattn.cu`
+two definitions of everything in it. That one failed loudly in 32 seconds,
+unlike the `extern` defect above.
+
+Both arms were built from identical source, separated only by an internal
+build-time `GGML_CUDA_FATTN_QUANT_STAGE`, with `0` generating the shipped code
+path so the baseline is the real implementation and not a staging-shaped rewrite
+of it. `GGML_CUDA_FA_ALL_QUANTS=ON` (the prototype types are extra-tier),
+`GGML_CUDA_KVARN=OFF`.
+
+Every gate before the benchmark passed, including one that improved:
+
+| `D = 256`, 8x8 | Synchronous | Staged |
+|---|---|---|
+| `q3_0` symmetric | `REG:255 STACK:40` | `REG:255` **`STACK:16`** |
+| `q2_1` symmetric | `REG:255 STACK:16` | `REG:255 STACK:16` |
+| `q3_0`/`q2_1` runtime-V | `REG:255 STACK:48` | `REG:255 STACK:48` |
+
+Spill *fell* by 24 bytes on `q3_0`, because `cp.async` writes global to shared
+directly and skips the register round-trip the synchronous loader needs for raw
+bytes. `libggml-cuda.so` shrank by 602,112 bytes for the same reason.
+Correctness is exact: **1695/1695** with 36 `D = 256` native launches for each
+prototype pair, and model-level output is byte-identical to the synchronous
+build -- `q3_0/q3_0` `64b940e5df0aa624`, `q2_1/q2_1` `e176079d5562e702`, 112
+native launches each.
+
+Then it lost, at 512-token prefill and depth 32,768, two reverse-order arm pairs
+of `r = 5` per cell:
+
+| Pair / KV residency | Synchronous | Staged | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| `q3_0/q3_0`, GPU | 933.569 t/s | 918.096 t/s | **`-1.657%`** | `-4.77` |
+| `q3_0/q3_0`, host | 897.305 t/s | 882.548 t/s | **`-1.645%`** | `-5.75` |
+| `q2_1/q2_1`, GPU | 947.657 t/s | 941.258 t/s | `-0.675%` | `-1.94` |
+| `q2_1/q2_1`, host | 918.890 t/s | 912.253 t/s | `-0.722%` | `-2.60` |
+
+The SASS says exactly what was traded, for the `q3_0` `D = 256` 8x8 kernel:
+
+| | Synchronous | Staged |
+|---|---:|---:|
+| `LDG` (global loads) | 360 | **60** |
+| `LDGSTS` (`cp.async`) | 0 | **24** |
+| `LDS` | 493 | 529 |
+| `STS` | 337 | 355 |
+| `BAR.SYNC` | 36 | **48** |
+| `HMMA` | 768 | 768 |
+
+The DMA did its job: 300 global load instructions became 24 whole-row
+transfers, and the loads are genuine shared-memory `LDS` rather than generic
+`LD`, so the address space resolved correctly. `HMMA` is unchanged, confirming
+the math is untouched. What it cost is **12 additional barriers per tile**, and
+that is more than the overlap is worth.
+
+Structurally, only half the transfer can overlap anything. K is issued and then
+waited on almost immediately, because the KQ multiply needs it; only V's fetch
+spans the multiply. So the design pays two barriers' worth of synchronization to
+hide one of its two fetches, against a synchronous loader whose global loads the
+compiler was already overlapping with math inside the unrolled loop. `q3_0`
+loses roughly twice as much as `q2_1`, consistent with its wider row: more bytes
+staged, same barrier count.
+
+Per the plan's disposition rule this stops here. No double buffering, no `q8_0`
+(whose occupancy cliff was already priced at about `-9.3%`), no `D = 64` or
+`D = 128` (which would additionally need `cp.async` widths that `cp-async.cuh`
+does not have). The source changes are reverted; the attempted diff and both
+SASS dumps are preserved outside the tree.
+
+This is the third independent result on this branch showing that register and
+spill relief does not predict throughput for this kernel. `Q_in_reg = false`
+relieved registers and lost 9.35%. The hybrid raised spill and cost nothing.
+Staging lowered spill by 24 bytes and lost 1.7%. Whatever limits this kernel, it
+is not the register file.
+
 #### Rejected: a quantized-specific MMA configuration
 
 Quantized K/V inherits the F16 configuration table — `nthreads`, `occupancy`,
