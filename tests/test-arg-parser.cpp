@@ -128,6 +128,9 @@ static void test(void) {
     argv = {"binary_name", "--kv-gpu-layers", "-1"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--spec-draft-kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
     // wrong value (enum)
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -225,6 +228,12 @@ static void test(void) {
 
     params = common_params();
     params.model.path = "model_file.gguf";
+
+    common_params draft_arg_params;
+    assert(draft_arg_params.speculative.draft.kv_gpu_layers == -1);
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-layers-draft", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), draft_arg_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(draft_arg_params.speculative.draft.kv_gpu_layers == 0);
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -271,6 +280,34 @@ static void test(void) {
         assert(!placement_params.recurrent_state_offload);
     }
 
+    {
+        common_params draft_placement_params;
+        draft_placement_params.no_kv_offload = true;
+        draft_placement_params.kv_gpu_layers = 7;
+
+        const auto inherited = common_base_params_to_speculative(draft_placement_params);
+        assert(inherited.no_kv_offload);
+        assert(inherited.kv_gpu_layers == 7);
+
+        draft_placement_params.no_kv_offload = false;
+        draft_placement_params.speculative.draft.kv_gpu_layers = 3;
+        const auto overridden = common_base_params_to_speculative(draft_placement_params);
+        assert(overridden.no_kv_offload);
+        assert(overridden.kv_gpu_layers == 3);
+
+        const auto cparams = common_context_params_to_llama(overridden);
+        assert(!cparams.offload_kqv);
+        assert(cparams.kv_gpu_layers == 3);
+
+        draft_placement_params.speculative.draft.kv_gpu_layers = 0;
+        const auto host_only = common_base_params_to_speculative(draft_placement_params);
+        assert(host_only.no_kv_offload);
+        assert(host_only.kv_gpu_layers == 0);
+
+        assert(!draft_placement_params.no_kv_offload);
+        assert(draft_placement_params.kv_gpu_layers == 7);
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -292,6 +329,13 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_ubatch == 32);
     unsetenv("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
+    setenv("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS", "3", true);
+    common_params draft_env_params;
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), draft_env_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(draft_env_params.speculative.draft.kv_gpu_layers == 3);
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};

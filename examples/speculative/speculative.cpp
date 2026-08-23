@@ -94,6 +94,10 @@ int main(int argc, char ** argv) {
     }
     params.n_outputs_max = params.n_parallel;
     params.n_outputs_max_per_seq = 1;
+    if (params.speculative.draft.kv_gpu_layers >= 0) {
+        params.no_kv_offload = true;
+        params.kv_gpu_layers = params.speculative.draft.kv_gpu_layers;
+    }
     if (params.speculative.draft.cpuparams.n_threads > 0) {
         params.cpuparams.n_threads = params.speculative.draft.cpuparams.n_threads;
     }

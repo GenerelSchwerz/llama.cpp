@@ -2356,6 +2356,10 @@ common_params common_base_params_to_speculative(const common_params & params) {
     if (params_spec.n_ubatch > 0) {
         result.n_ubatch = params_spec.n_ubatch;
     }
+    if (params_spec.kv_gpu_layers >= 0) {
+        result.no_kv_offload = true;
+        result.kv_gpu_layers = params_spec.kv_gpu_layers;
+    }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 
