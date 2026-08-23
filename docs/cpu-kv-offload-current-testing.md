@@ -125,9 +125,11 @@ branch and are not current KV-base templates.
 
 ## Current host and inputs
 
-- Experimental worktree: `/home/gencoolpc/beellama-kv-offload`, branch
-  `exp/kv-cpu-offload`.
-- Known BeeLlama baseline: `/home/gencoolpc/beellama.cpp`; keep it unchanged.
+- Current integration worktree: `/home/gencoolpc/beellama-main`, branch
+  `beellama/main`.
+- Known BeeLlama v0.4.3 baseline:
+  `/home/gencoolpc/beellama-baseline-v0.4.3`, branch
+  `beellama/baseline-v0.4.3`; keep it unchanged.
 - CUDA build: `build-cuda-all`, Release, native CPU, CUDA FlashAttention,
   compute architecture 120, default quant-pair matrix.
 - GPU: NVIDIA GeForce RTX 5070 Ti, 15,880 MiB usable process memory, compute
@@ -215,7 +217,7 @@ reproduce their named build and are not current scheduling templates.
 Run before a measurement:
 
 ```bash
-cd /home/gencoolpc/beellama-kv-offload
+cd /home/gencoolpc/beellama-main
 git status --short --branch
 git rev-parse HEAD
 llama-benchy --version
@@ -417,7 +419,7 @@ context, batch, target/effective-draft ubatch, and request semantics. Change
 only the feature under test. The maintained gates are:
 
 ```bash
-cd /home/gencoolpc/beellama-kv-offload
+cd /home/gencoolpc/beellama-main
 flock /tmp/beellama-single-gpu.lock -c '
   python3 scripts/mtp-exactness.py \
     scripts/mtp-exactness-manifests/qwen38-mtp6-partial-draft-residency-q8-1k.json
