@@ -6423,6 +6423,55 @@ two implementations are indistinguishable. The 24-byte spill is real in
 body deduplication buys 197 MB of library and 5,808 -> 1,056 explicit cases for
 no runtime price.
 
+A single ordered pair at one shape is a screen, not a result, so the comparison
+was widened to a depth and prompt-length matrix, both arms native, ABBA-ordered
+per configuration, `r = 5`. Prefill and decode come from the same invocation
+wherever both are present, so they share a process and a cache state.
+
+| Configuration | Test | Per-pair | Hybrid | Δ | Welch `t` |
+|---|---|---:|---:|---:|---:|
+| depth 0, ubatch 512 | `pp512` | 1248.382 | 1249.024 | `-0.051%` | `-0.07` |
+| depth 0, ubatch 512 | `tg64` | 39.192 | 39.221 | `-0.075%` | `-0.77` |
+| depth 4,096 | `pp512` | 1187.883 | 1187.367 | `+0.043%` | `+0.13` |
+| depth 4,096 | `tg64` | 31.710 | 31.721 | `-0.033%` | `-0.30` |
+| depth 32,768 | `pp512` | 829.736 | 829.439 | `+0.036%` | `+0.14` |
+| depth 32,768 | `tg64` | 13.049 | 13.052 | `-0.027%` | `-0.89` |
+| depth 32,768, ubatch 2,048 | `pp2048` | 877.019 | 877.012 | `+0.001%` | `+0.01` |
+| depth 32,768, ubatch 2,048 | `pp8192` | 858.301 | 858.377 | `-0.009%` | `-0.58` |
+| depth 131,072 | `pp512` | 395.376 | 395.090 | `+0.072%` | `+0.21` |
+| depth 131,072 | `tg64` | 4.305 | 4.305 | `+0.004%` | `+0.14` |
+
+Ten comparisons, largest `|Δ|` `0.075%`, largest `|t|` `0.89`. Nothing is
+distinguishable. The two `ubatch = 2048` rows matter beyond prompt length:
+`ubatch` selects the MMA kernel's `ncols` geometry, so those arms run different
+compiled shapes from the `512` ones and would expose a shape-dependent cost of
+sharing one body if there were one.
+
+One caution about reading this matrix while it runs: at the point where only
+one hybrid arm of the `131,072` configuration had landed, `tg64` there read
+`-0.066%` at `t = -3.11`, which crosses the usual significance threshold. With
+the second arm complete it is `+0.004%` at `t = +0.14`. A half-finished ABBA
+pair is not a small sample of the result, it is a biased one, because the two
+arms of a pair sit at different points in any thermal or clock drift.
+
+Allocation was measured separately, because `llama-bench` hides compute-buffer
+differences behind its logits reservation. `llama-server --parallel 1 -v`,
+reserve-time buffers plus a one-second `nvidia-smi` sample across a real
+prefill and decode:
+
+| Context | Peak process VRAM | `CUDA0` compute | `CUDA_Host` compute | `CUDA0` KV | `CUDA_Host` KV |
+|---|---:|---:|---:|---:|---:|
+| 4,096 | 9,762 MiB | 150.27 MiB | 24.28 MiB | 17.00 MiB | 136.00 MiB |
+| 32,768 | 9,814 MiB | 202.27 MiB | 52.28 MiB | 17.00 MiB | 1,088.00 MiB |
+| 131,072 | 10,080 MiB | 468.27 MiB | 148.28 MiB | 17.00 MiB | 4,352.00 MiB |
+
+Every figure is identical between the two builds at every context, which is the
+expected result and worth stating as a check rather than an achievement: the
+hybrid changes which kernel is compiled, not the shared-memory request or the
+cache layout, so any allocation difference would have indicated a defect. The
+per-request server timings in those runs are single unrepeated requests and are
+not used as throughput evidence.
+
 This also settles the reading of the earlier `-0.73%` regression that killed the
 plain runtime-V variant. That loss cannot be attributed to spill as such: spill
 rose 16 -> 48 B there and 16 -> 24 B here, and only the former lost. What
