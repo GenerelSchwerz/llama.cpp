@@ -552,16 +552,74 @@ struct ggml_cuda_vmm_pool_stats_atomic {
     std::atomic<uint64_t> mapped_bytes      { 0 };
     std::atomic<uint64_t> mapped_peak_bytes { 0 };
     std::atomic<uint64_t> active_pools      { 0 };
+
+    static void update_peak(std::atomic<uint64_t> & peak, uint64_t value) {
+        uint64_t observed = peak.load(std::memory_order_relaxed);
+        while (observed < value &&
+                !peak.compare_exchange_weak(observed, value,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+        }
+    }
+
+    bool is_enabled() const {
+        return enabled.load(std::memory_order_relaxed);
+    }
+
+    void add_live(uint64_t size) {
+        const uint64_t live = live_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        update_peak(live_peak_bytes, live);
+    }
+
+    void remove_live(uint64_t size) {
+        live_bytes.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    void add_mapped(uint64_t size) {
+        const uint64_t mapped = mapped_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        update_peak(mapped_peak_bytes, mapped);
+    }
+
+    void remove_mapped(uint64_t size) {
+        mapped_bytes.fetch_sub(size, std::memory_order_relaxed);
+    }
+
+    void track_pool(uint64_t live, uint64_t mapped) {
+        active_pools.fetch_add(1, std::memory_order_relaxed);
+        add_live(live);
+        add_mapped(mapped);
+    }
+
+    void untrack_pool(uint64_t live, uint64_t mapped) {
+        remove_live(live);
+        remove_mapped(mapped);
+        active_pools.fetch_sub(1, std::memory_order_relaxed);
+    }
+
+    ggml_cuda_vmm_pool_stats checkpoint() const {
+        return {
+            live_bytes.load(std::memory_order_relaxed),
+            live_peak_bytes.load(std::memory_order_relaxed),
+            mapped_bytes.load(std::memory_order_relaxed),
+            mapped_peak_bytes.load(std::memory_order_relaxed),
+            active_pools.load(std::memory_order_relaxed),
+        };
+    }
+
+    void reset_peaks() {
+        enabled.store(true, std::memory_order_relaxed);
+        live_peak_bytes.store(live_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        mapped_peak_bytes.store(mapped_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
 };
 
 static ggml_cuda_vmm_pool_stats_atomic g_cuda_vmm_pool_stats[GGML_CUDA_MAX_DEVICES];
 
-static void ggml_cuda_vmm_pool_update_peak(std::atomic<uint64_t> & peak, uint64_t value) {
-    uint64_t observed = peak.load(std::memory_order_relaxed);
-    while (observed < value &&
-            !peak.compare_exchange_weak(observed, value,
-                std::memory_order_relaxed, std::memory_order_relaxed)) {
+static ggml_cuda_vmm_pool_stats_atomic * ggml_cuda_vmm_pool_stats_for_device(int device) {
+    if (device < 0 || device >= ggml_cuda_info().device_count ||
+            !ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
     }
+    return &g_cuda_vmm_pool_stats[device];
 }
 
 struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
@@ -573,7 +631,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     size_t pool_used = 0;
     size_t pool_size = 0;
     size_t granularity;
-    bool telemetry_tracked;
+    bool telemetry_tracked = false;
 #if defined(GGML_USE_HIP)
     std::vector<std::pair<CUdeviceptr, size_t>> mappings;
 #endif
@@ -581,23 +639,18 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
     explicit ggml_cuda_pool_vmm(int device) :
         device(device),
         physical_device(ggml_cuda_get_physical_device(device)),
-        granularity(ggml_cuda_info().devices[device].vmm_granularity),
-        telemetry_tracked(false) {
+        granularity(ggml_cuda_info().devices[device].vmm_granularity) {
         track_telemetry();
     }
 
     void track_telemetry() {
         auto & stats = g_cuda_vmm_pool_stats[device];
-        if (telemetry_tracked || !stats.enabled.load(std::memory_order_relaxed)) {
+        if (telemetry_tracked || !stats.is_enabled()) {
             return;
         }
 
         telemetry_tracked = true;
-        stats.active_pools.fetch_add(1, std::memory_order_relaxed);
-        const uint64_t live = stats.live_bytes.fetch_add(pool_used, std::memory_order_relaxed) + pool_used;
-        const uint64_t mapped = stats.mapped_bytes.fetch_add(pool_size, std::memory_order_relaxed) + pool_size;
-        ggml_cuda_vmm_pool_update_peak(stats.live_peak_bytes, live);
-        ggml_cuda_vmm_pool_update_peak(stats.mapped_peak_bytes, mapped);
+        stats.track_pool(pool_used, pool_size);
     }
 
     ~ggml_cuda_pool_vmm() {
@@ -616,9 +669,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
         if (telemetry_tracked) {
-            g_cuda_vmm_pool_stats[device].live_bytes.fetch_sub(pool_used, std::memory_order_relaxed);
-            g_cuda_vmm_pool_stats[device].mapped_bytes.fetch_sub(pool_size, std::memory_order_relaxed);
-            g_cuda_vmm_pool_stats[device].active_pools.fetch_sub(1, std::memory_order_relaxed);
+            g_cuda_vmm_pool_stats[device].untrack_pool(pool_used, pool_size);
         }
     }
 
@@ -708,11 +759,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
             if (telemetry_tracked) {
-                const uint64_t mapped =
-                    g_cuda_vmm_pool_stats[device].mapped_bytes.fetch_add(
-                        reserve_size, std::memory_order_relaxed) + reserve_size;
-                ggml_cuda_vmm_pool_update_peak(
-                    g_cuda_vmm_pool_stats[device].mapped_peak_bytes, mapped);
+                g_cuda_vmm_pool_stats[device].add_mapped(reserve_size);
             }
 
             //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
@@ -726,11 +773,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         *actual_size = size;
         pool_used += size;
         if (telemetry_tracked) {
-            const uint64_t live =
-                g_cuda_vmm_pool_stats[device].live_bytes.fetch_add(
-                    size, std::memory_order_relaxed) + size;
-            ggml_cuda_vmm_pool_update_peak(
-                g_cuda_vmm_pool_stats[device].live_peak_bytes, live);
+            g_cuda_vmm_pool_stats[device].add_live(size);
         }
 
 #ifdef DEBUG_CUDA_MALLOC
@@ -748,7 +791,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
         pool_used -= size;
         if (telemetry_tracked) {
-            g_cuda_vmm_pool_stats[device].live_bytes.fetch_sub(size, std::memory_order_relaxed);
+            g_cuda_vmm_pool_stats[device].remove_live(size);
         }
 
         // all deallocations must be in reverse order of the allocations
@@ -786,7 +829,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         pool_size = keep_size;
 #endif
         if (telemetry_tracked) {
-            g_cuda_vmm_pool_stats[device].mapped_bytes.fetch_sub(released, std::memory_order_relaxed);
+            g_cuda_vmm_pool_stats[device].remove_mapped(released);
         }
         return released;
     }
@@ -795,17 +838,15 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 
 static bool ggml_backend_cuda_vmm_pool_stats_get(int device, ggml_cuda_vmm_pool_stats * stats) {
 #if defined(GGML_USE_VMM)
-    if (stats == nullptr || device < 0 || device >= ggml_cuda_info().device_count ||
-            !ggml_cuda_info().devices[device].vmm) {
+    if (stats == nullptr) {
+        return false;
+    }
+    ggml_cuda_vmm_pool_stats_atomic * source = ggml_cuda_vmm_pool_stats_for_device(device);
+    if (source == nullptr) {
         return false;
     }
 
-    const auto & source = g_cuda_vmm_pool_stats[device];
-    stats->live_bytes        = source.live_bytes.load(std::memory_order_relaxed);
-    stats->live_peak_bytes   = source.live_peak_bytes.load(std::memory_order_relaxed);
-    stats->mapped_bytes      = source.mapped_bytes.load(std::memory_order_relaxed);
-    stats->mapped_peak_bytes = source.mapped_peak_bytes.load(std::memory_order_relaxed);
-    stats->active_pools      = source.active_pools.load(std::memory_order_relaxed);
+    *stats = source->checkpoint();
     return true;
 #else
     GGML_UNUSED(device);
@@ -816,17 +857,12 @@ static bool ggml_backend_cuda_vmm_pool_stats_get(int device, ggml_cuda_vmm_pool_
 
 static bool ggml_backend_cuda_vmm_pool_stats_reset(int device) {
 #if defined(GGML_USE_VMM)
-    if (device < 0 || device >= ggml_cuda_info().device_count ||
-            !ggml_cuda_info().devices[device].vmm) {
+    ggml_cuda_vmm_pool_stats_atomic * stats = ggml_cuda_vmm_pool_stats_for_device(device);
+    if (stats == nullptr) {
         return false;
     }
 
-    auto & stats = g_cuda_vmm_pool_stats[device];
-    stats.enabled.store(true, std::memory_order_relaxed);
-    stats.live_peak_bytes.store(
-        stats.live_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    stats.mapped_peak_bytes.store(
-        stats.mapped_bytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats->reset_peaks();
     return true;
 #else
     GGML_UNUSED(device);
