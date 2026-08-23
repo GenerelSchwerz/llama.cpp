@@ -978,79 +978,104 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
     return result;
 }
 
-void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
-    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
-    const uint32_t n_tokens_tg  = std::min(n_tokens_max,
+llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
+        uint32_t n_tokens_req,
+        uint32_t n_kv_req) const {
+    sched_reserve_plan plan;
+    plan.n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+    plan.n_tokens_decode = std::min(plan.n_tokens_max,
             std::max(cparams.n_seq_max, cparams.n_outputs_max));
+    plan.n_tokens = plan.n_tokens_max;
 
-    const uint32_t n_kv_capacity = memory ? memory->get_attn_reserve_capacity() : 0;
-    const bool live_kv = cparams.live_context_workspace && !model.hparams.no_alloc &&
-            n_kv_capacity > 0;
+    plan.n_kv_capacity = memory ? memory->get_attn_reserve_capacity() : 0;
+    plan.live_kv = cparams.live_context_workspace && !model.hparams.no_alloc &&
+            plan.n_kv_capacity > 0;
 
-    uint32_t n_kv = 0;
-    if (live_kv) {
+    if (plan.live_kv) {
         const uint32_t required = n_kv_req > 0 ? n_kv_req :
-                sched_reserved_kv > 0 ? sched_reserved_kv : std::min(256u, n_kv_capacity);
-        n_kv = llama_workspace_kv_growth_bound(required, n_kv_capacity);
+                sched_reserved_kv > 0 ? sched_reserved_kv : std::min(256u, plan.n_kv_capacity);
+        plan.n_kv = llama_workspace_kv_growth_bound(required, plan.n_kv_capacity);
 
         // Avoid churn when speculative rollback briefly crosses a bin edge.
-        if (sched_reserved_kv > n_kv && n_kv >= sched_reserved_kv/2) {
-            n_kv = sched_reserved_kv;
+        if (sched_reserved_kv > plan.n_kv && plan.n_kv >= sched_reserved_kv/2) {
+            plan.n_kv = sched_reserved_kv;
         }
     }
 
-    uint32_t n_tokens = n_tokens_max;
     if (cparams.phase_aware_workspace && !model.hparams.no_alloc) {
         // A logical decode can contain several rows (parallel sequences,
         // speculative verification, or chained MTP heads).  n_outputs_max is
         // the caller-provided bound for that geometry.  Anything larger is a
         // prompt batch and gets the full physical-ubatch reservation so prompt
         // chunks do not repeatedly grow the scheduler.
-        n_tokens = n_tokens_req > n_tokens_tg ? n_tokens_max : n_tokens_tg;
+        plan.n_tokens = n_tokens_req > plan.n_tokens_decode ?
+                plan.n_tokens_max : plan.n_tokens_decode;
 
         // Do not shrink a prompt reservation merely because a later prompt
         // chunk is shorter. It shrinks automatically when the submitted batch
         // has returned to generation geometry.
-        if (sched_reserved_tokens > n_tokens_tg &&
-                n_tokens_req > n_tokens_tg && n_tokens_req <= sched_reserved_tokens) {
-            n_tokens = sched_reserved_tokens;
+        if (sched_reserved_tokens > plan.n_tokens_decode &&
+                n_tokens_req > plan.n_tokens_decode && n_tokens_req <= sched_reserved_tokens) {
+            plan.n_tokens = sched_reserved_tokens;
         }
     }
 
-    if (sched && sched_shared_buffers) {
-        if (sched_reserved_tokens > n_tokens || (live_kv && sched_reserved_kv > n_kv)) {
-            // A backing reduction is a group operation: every sequential member
-            // publishes once before the common physical backing is replaced.
-            ggml_backend_sched_request_shared_buffer_shrink(sched.get());
-        }
-        const uint64_t generation =
-                ggml_backend_sched_shared_buffers_generation(sched.get());
-        if (generation != sched_shared_generation) {
-            // A sequential peer changed the shared physical allocation. Its
-            // graph plan remains private, but any tensor addresses cached by
-            // this scheduler must be discarded before the next graph build.
-            synchronize();
-            ggml_backend_sched_reset(sched.get());
-            if (gf_res_prev) {
-                gf_res_prev->reset();
-            }
-            sched_shared_generation = generation;
-        }
-        const uint64_t plan_generation =
-                ggml_backend_sched_shared_buffers_plan_generation(sched.get());
-        if (plan_generation != sched_shared_plan_generation) {
-            // A peer began a coalesced shrink. Republish this scheduler's
-            // current plan even if its token geometry did not change, so an
-            // unchanged member cannot leave the shared backing oversized.
-            sched_need_reserve = true;
-            sched_shared_plan_generation = plan_generation;
-        }
-    }
+    return plan;
+}
 
-    if (!sched_need_reserve && sched_reserved_tokens == n_tokens &&
-            (!live_kv || sched_reserved_kv == n_kv)) {
+void llama_context::prepare_shared_sched_reserve(const sched_reserve_plan & plan) {
+    if (!sched || !sched_shared_buffers) {
         return;
     }
+
+    if (sched_reserved_tokens > plan.n_tokens ||
+            (plan.live_kv && sched_reserved_kv > plan.n_kv)) {
+        // A backing reduction is a group operation: every sequential member
+        // publishes once before the common physical backing is replaced.
+        ggml_backend_sched_request_shared_buffer_shrink(sched.get());
+    }
+
+    const uint64_t generation =
+            ggml_backend_sched_shared_buffers_generation(sched.get());
+    if (generation != sched_shared_generation) {
+        // A sequential peer changed the shared physical allocation. Its
+        // graph plan remains private, but any tensor addresses cached by
+        // this scheduler must be discarded before the next graph build.
+        synchronize();
+        ggml_backend_sched_reset(sched.get());
+        if (gf_res_prev) {
+            gf_res_prev->reset();
+        }
+        sched_shared_generation = generation;
+    }
+
+    const uint64_t plan_generation =
+            ggml_backend_sched_shared_buffers_plan_generation(sched.get());
+    if (plan_generation != sched_shared_plan_generation) {
+        // A peer began a coalesced shrink. Republish this scheduler's
+        // current plan even if its token geometry did not change, so an
+        // unchanged member cannot leave the shared backing oversized.
+        sched_need_reserve = true;
+        sched_shared_plan_generation = plan_generation;
+    }
+}
+
+void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
+    const auto plan = make_sched_reserve_plan(n_tokens_req, n_kv_req);
+
+    prepare_shared_sched_reserve(plan);
+
+    if (!sched_need_reserve && sched_reserved_tokens == plan.n_tokens &&
+            (!plan.live_kv || sched_reserved_kv == plan.n_kv)) {
+        return;
+    }
+
+    const uint32_t n_tokens_max = plan.n_tokens_max;
+    const uint32_t n_tokens_tg  = plan.n_tokens_decode;
+    const uint32_t n_tokens     = plan.n_tokens;
+    const uint32_t n_kv_capacity = plan.n_kv_capacity;
+    const uint32_t n_kv          = plan.n_kv;
+    const bool live_kv            = plan.live_kv;
 
     sched_need_reserve = false;
 

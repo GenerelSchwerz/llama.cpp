@@ -1715,6 +1715,26 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     return instances;
 }
 
+// Private proc-address payload shared by llama-bench and the CUDA backend.
+// Keep this out of public headers: the extension is optional and backend-specific.
+struct bench_cuda_vmm_pool_stats {
+    uint64_t live_bytes;
+    uint64_t live_peak_bytes;
+    uint64_t mapped_bytes;
+    uint64_t mapped_peak_bytes;
+    uint64_t active_pools;
+};
+
+struct bench_cuda_vmm_checkpoint {
+    uint64_t live_bytes;
+    uint64_t mapped_bytes;
+    uint64_t active_pools;
+};
+
+static bench_cuda_vmm_checkpoint make_bench_cuda_vmm_checkpoint(const bench_cuda_vmm_pool_stats & stats) {
+    return { stats.live_bytes, stats.mapped_bytes, stats.active_pools };
+}
+
 struct test {
     static const std::string build_commit;
     static const int         build_number;
@@ -1786,20 +1806,12 @@ struct test {
     uint64_t                 cuda_used_peak_bytes = 0;
     uint64_t                 cuda_used_after_context_bytes = 0;
     uint64_t                 cuda_total_bytes = 0;
-    uint64_t                 cuda_vmm_live_model_bytes = 0;
-    uint64_t                 cuda_vmm_mapped_model_bytes = 0;
-    uint64_t                 cuda_vmm_live_context_bytes = 0;
-    uint64_t                 cuda_vmm_mapped_context_bytes = 0;
-    uint64_t                 cuda_vmm_live_after_workload_bytes = 0;
-    uint64_t                 cuda_vmm_mapped_after_workload_bytes = 0;
+    bench_cuda_vmm_checkpoint cuda_vmm_model = {};
+    bench_cuda_vmm_checkpoint cuda_vmm_context = {};
+    bench_cuda_vmm_checkpoint cuda_vmm_after_workload = {};
+    bench_cuda_vmm_checkpoint cuda_vmm_after_context = {};
     uint64_t                 cuda_vmm_live_peak_bytes = 0;
     uint64_t                 cuda_vmm_mapped_peak_bytes = 0;
-    uint64_t                 cuda_vmm_live_after_context_bytes = 0;
-    uint64_t                 cuda_vmm_mapped_after_context_bytes = 0;
-    uint64_t                 cuda_vmm_active_pools_model = 0;
-    uint64_t                 cuda_vmm_active_pools_context = 0;
-    uint64_t                 cuda_vmm_active_pools_after_workload = 0;
-    uint64_t                 cuda_vmm_active_pools_after_context = 0;
     uint64_t                 cuda_device_context_buffer_bytes = 0;
     uint64_t                 cuda_device_compute_buffer_bytes = 0;
     uint64_t                 accelerator_host_context_buffer_bytes = 0;
@@ -2133,20 +2145,20 @@ struct test {
                                              std::to_string(cuda_used_peak_bytes),
                                              std::to_string(cuda_used_after_context_bytes),
                                              std::to_string(cuda_total_bytes),
-                                             std::to_string(cuda_vmm_live_model_bytes),
-                                             std::to_string(cuda_vmm_mapped_model_bytes),
-                                             std::to_string(cuda_vmm_live_context_bytes),
-                                             std::to_string(cuda_vmm_mapped_context_bytes),
-                                             std::to_string(cuda_vmm_live_after_workload_bytes),
-                                             std::to_string(cuda_vmm_mapped_after_workload_bytes),
+                                             std::to_string(cuda_vmm_model.live_bytes),
+                                             std::to_string(cuda_vmm_model.mapped_bytes),
+                                             std::to_string(cuda_vmm_context.live_bytes),
+                                             std::to_string(cuda_vmm_context.mapped_bytes),
+                                             std::to_string(cuda_vmm_after_workload.live_bytes),
+                                             std::to_string(cuda_vmm_after_workload.mapped_bytes),
                                              std::to_string(cuda_vmm_live_peak_bytes),
                                              std::to_string(cuda_vmm_mapped_peak_bytes),
-                                             std::to_string(cuda_vmm_live_after_context_bytes),
-                                             std::to_string(cuda_vmm_mapped_after_context_bytes),
-                                             std::to_string(cuda_vmm_active_pools_model),
-                                             std::to_string(cuda_vmm_active_pools_context),
-                                             std::to_string(cuda_vmm_active_pools_after_workload),
-                                             std::to_string(cuda_vmm_active_pools_after_context),
+                                             std::to_string(cuda_vmm_after_context.live_bytes),
+                                             std::to_string(cuda_vmm_after_context.mapped_bytes),
+                                             std::to_string(cuda_vmm_model.active_pools),
+                                             std::to_string(cuda_vmm_context.active_pools),
+                                             std::to_string(cuda_vmm_after_workload.active_pools),
+                                             std::to_string(cuda_vmm_after_context.active_pools),
                                              std::to_string(cuda_device_context_buffer_bytes),
                                              std::to_string(cuda_device_compute_buffer_bytes),
                                              std::to_string(accelerator_host_context_buffer_bytes),
@@ -2806,15 +2818,6 @@ using bench_kvarn_route_stats_get_fn = void (*)(bench_kvarn_route_stats *);
 using bench_kv_memory_transient_stats_reset_fn = void (*)();
 using bench_kv_memory_transient_stats_get_fn = void (*)(bench_kv_memory_transient_stats *);
 using bench_cuda_memory_checkpoint_fn = bool (*)(int, uint64_t *, uint64_t *, uint64_t *);
-
-struct bench_cuda_vmm_pool_stats {
-    uint64_t live_bytes;
-    uint64_t live_peak_bytes;
-    uint64_t mapped_bytes;
-    uint64_t mapped_peak_bytes;
-    uint64_t active_pools;
-};
-
 using bench_cuda_vmm_pool_stats_get_fn = bool (*)(int, bench_cuda_vmm_pool_stats *);
 using bench_cuda_vmm_pool_stats_reset_fn = bool (*)(int);
 
@@ -2863,6 +2866,36 @@ static bool bench_device_memory_checkpoint(
     *used_bytes = total_value - free_value;
     return true;
 }
+
+class bench_cuda_vmm_telemetry {
+public:
+    bench_cuda_vmm_telemetry(ggml_backend_reg_t reg, int cuda_device) :
+        cuda_device_(cuda_device),
+        get_(reg != nullptr ? reinterpret_cast<bench_cuda_vmm_pool_stats_get_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_pool_stats_get")) : nullptr),
+        reset_(reg != nullptr ? reinterpret_cast<bench_cuda_vmm_pool_stats_reset_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_pool_stats_reset")) : nullptr) {
+    }
+
+    void reset() const {
+        if (reset_ != nullptr) {
+            (void) reset_(cuda_device_);
+        }
+    }
+
+    bench_cuda_vmm_pool_stats checkpoint() const {
+        bench_cuda_vmm_pool_stats stats = {};
+        if (get_ != nullptr) {
+            (void) get_(cuda_device_, &stats);
+        }
+        return stats;
+    }
+
+private:
+    int                                cuda_device_;
+    bench_cuda_vmm_pool_stats_get_fn   get_ = nullptr;
+    bench_cuda_vmm_pool_stats_reset_fn reset_ = nullptr;
+};
 
 int llama_bench(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
@@ -3017,14 +3050,7 @@ int llama_bench(int argc, char ** argv) {
             reinterpret_cast<bench_cuda_memory_checkpoint_fn>(
                 ggml_backend_reg_get_proc_address(
                     memory_reg, "ggml_backend_cuda_memory_checkpoint")) : nullptr;
-        auto cuda_vmm_pool_stats_get = memory_reg != nullptr ?
-            reinterpret_cast<bench_cuda_vmm_pool_stats_get_fn>(
-                ggml_backend_reg_get_proc_address(
-                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_get")) : nullptr;
-        auto cuda_vmm_pool_stats_reset = memory_reg != nullptr ?
-            reinterpret_cast<bench_cuda_vmm_pool_stats_reset_fn>(
-                ggml_backend_reg_get_proc_address(
-                    memory_reg, "ggml_backend_cuda_vmm_pool_stats_reset")) : nullptr;
+        bench_cuda_vmm_telemetry vmm_telemetry(memory_reg, inst.main_gpu);
         if (params.kv_memory) {
             if (kv_memory_transient_stats_reset == nullptr || kv_memory_transient_stats_get == nullptr ||
                     memory_dev == nullptr) {
@@ -3032,18 +3058,14 @@ int llama_bench(int argc, char ** argv) {
                 llama_model_free(lmodel);
                 return 1;
             }
-            if (cuda_vmm_pool_stats_reset != nullptr) {
-                cuda_vmm_pool_stats_reset(inst.main_gpu);
-            }
+            vmm_telemetry.reset();
             if (!bench_device_memory_checkpoint(memory_dev, cuda_memory_checkpoint, inst.main_gpu, nullptr,
                     &cuda_used_model, &cuda_free_model, &cuda_total)) {
                 fprintf(stderr, "%s: error: failed to capture the synchronized model-only device checkpoint\n", __func__);
                 llama_model_free(lmodel);
                 return 1;
             }
-            if (cuda_vmm_pool_stats_get != nullptr) {
-                cuda_vmm_pool_stats_get(inst.main_gpu, &cuda_vmm_model);
-            }
+            cuda_vmm_model = vmm_telemetry.checkpoint();
         }
 
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
@@ -3078,9 +3100,7 @@ int llama_bench(int argc, char ** argv) {
             t.kv_tail_cpu_layers = kv_stats.tail_cpu_layers();
             t.cuda_used_model_bytes = cuda_used_model;
             t.cuda_total_bytes = cuda_total;
-            t.cuda_vmm_live_model_bytes = cuda_vmm_model.live_bytes;
-            t.cuda_vmm_mapped_model_bytes = cuda_vmm_model.mapped_bytes;
-            t.cuda_vmm_active_pools_model = cuda_vmm_model.active_pools;
+            t.cuda_vmm_model = make_bench_cuda_vmm_checkpoint(cuda_vmm_model);
 
             const llama_memory_breakdown breakdown = llama_get_memory_breakdown(ctx);
             for (const auto & [buft, memory] : breakdown) {
@@ -3127,14 +3147,7 @@ int llama_bench(int argc, char ** argv) {
                 return 1;
             }
             t.cuda_context_delta_bytes = int64_t(t.cuda_used_context_bytes) - int64_t(t.cuda_used_model_bytes);
-            if (cuda_vmm_pool_stats_get != nullptr) {
-                bench_cuda_vmm_pool_stats stats = {};
-                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats)) {
-                    t.cuda_vmm_live_context_bytes = stats.live_bytes;
-                    t.cuda_vmm_mapped_context_bytes = stats.mapped_bytes;
-                    t.cuda_vmm_active_pools_context = stats.active_pools;
-                }
-            }
+            t.cuda_vmm_context = make_bench_cuda_vmm_checkpoint(vmm_telemetry.checkpoint());
         }
 
         if (kvarn_route_stats_reset != nullptr) {
@@ -3200,9 +3213,7 @@ int llama_bench(int argc, char ** argv) {
 
         if (params.kv_memory) {
             kv_memory_transient_stats_reset();
-            if (cuda_vmm_pool_stats_reset != nullptr) {
-                cuda_vmm_pool_stats_reset(inst.main_gpu);
-            }
+            vmm_telemetry.reset();
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -3350,16 +3361,10 @@ int llama_bench(int argc, char ** argv) {
             // that residual explicit instead of attributing it to KVarN.
             t.cuda_runtime_overhead_bytes = t.cuda_reconciliation_delta_bytes;
 
-            if (cuda_vmm_pool_stats_get != nullptr) {
-                bench_cuda_vmm_pool_stats vmm_stats = {};
-                if (cuda_vmm_pool_stats_get(inst.main_gpu, &vmm_stats)) {
-                    t.cuda_vmm_live_after_workload_bytes = vmm_stats.live_bytes;
-                    t.cuda_vmm_mapped_after_workload_bytes = vmm_stats.mapped_bytes;
-                    t.cuda_vmm_live_peak_bytes = vmm_stats.live_peak_bytes;
-                    t.cuda_vmm_mapped_peak_bytes = vmm_stats.mapped_peak_bytes;
-                    t.cuda_vmm_active_pools_after_workload = vmm_stats.active_pools;
-                }
-            }
+            const bench_cuda_vmm_pool_stats vmm_stats = vmm_telemetry.checkpoint();
+            t.cuda_vmm_after_workload = make_bench_cuda_vmm_checkpoint(vmm_stats);
+            t.cuda_vmm_live_peak_bytes = vmm_stats.live_peak_bytes;
+            t.cuda_vmm_mapped_peak_bytes = vmm_stats.mapped_peak_bytes;
 
             llama_perf_context_print(ctx);
             llama_free(ctx);
@@ -3375,14 +3380,7 @@ int llama_bench(int argc, char ** argv) {
             }
             t.cuda_teardown_delta_bytes = int64_t(t.cuda_used_after_context_bytes) -
                     int64_t(t.cuda_used_model_bytes);
-            if (cuda_vmm_pool_stats_get != nullptr) {
-                bench_cuda_vmm_pool_stats stats_after = {};
-                if (cuda_vmm_pool_stats_get(inst.main_gpu, &stats_after)) {
-                    t.cuda_vmm_live_after_context_bytes = stats_after.live_bytes;
-                    t.cuda_vmm_mapped_after_context_bytes = stats_after.mapped_bytes;
-                    t.cuda_vmm_active_pools_after_context = stats_after.active_pools;
-                }
-            }
+            t.cuda_vmm_after_context = make_bench_cuda_vmm_checkpoint(vmm_telemetry.checkpoint());
         }
 
         if (p) {

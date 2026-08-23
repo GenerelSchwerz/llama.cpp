@@ -1159,7 +1159,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         ggml_type tail_type_requested,
         uint32_t tail_tokens_requested,
         uint32_t tail_rollback_tokens,
-        bool cpu_pinned) :
+        llama_memory_placement_options placement) :
     model(model),
     hparams(hparams),
     params(params),
@@ -1290,7 +1290,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         }
         auto * buft = offload ?
                 ggml_backend_dev_buffer_type(dev) :
-                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
+                llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create KVarN cache tensor context");

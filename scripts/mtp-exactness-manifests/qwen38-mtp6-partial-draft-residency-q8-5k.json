@@ -135,7 +135,7 @@
     {
       "name": "candidate-cpu-inherited-mtp6-planes3",
       "compare_to": "clean-gpu-mtp6-full",
-      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {
         "target_kv": {
           "residency": "cpu"
@@ -164,7 +164,7 @@
     {
       "name": "candidate-draft-gpu-mtp6-planes3",
       "compare_to": "clean-gpu-mtp6-full",
-      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {
         "target_kv": {
           "residency": "cpu"

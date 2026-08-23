@@ -48,7 +48,7 @@ def main() -> None:
     trim = cuda[cuda.find("size_t trim() override"):
                 cuda.find("static bool ggml_backend_cuda_vmm_pool_stats_get")]
     require("track_telemetry();" in trim and
-            "mapped_bytes.fetch_sub(released" in trim,
+            "remove_mapped" in trim and "released" in trim,
             "idle trim must contract current mapped telemetry without discarding its peak")
 
 

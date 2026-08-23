@@ -19,13 +19,11 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                      bool   attn_offload,
-                     bool   attn_cpu_pinned,
-                     bool   attn_offload_compute,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
-                     bool   recurrent_offload,
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -37,8 +35,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
-                 uint32_t   tail_rollback_tokens,
-                 uint32_t   attn_n_gpu_layers) :
+                 uint32_t   tail_rollback_tokens) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -66,15 +63,13 @@ llama_memory_hybrid::llama_memory_hybrid(
         false,
         tail_rollback_tokens,
         /* tail_visibility_window */ 0,
-        attn_cpu_pinned,
-        attn_n_gpu_layers,
-        attn_offload_compute
+        placement
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        recurrent_offload,
+        placement.recurrent_offload,
         rs_size,
         n_seq_max,
         n_rs_seq,

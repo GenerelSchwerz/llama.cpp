@@ -577,10 +577,24 @@ def main() -> None:
         raise AssertionError("same-graph tail reads must depend on the exact-shadow SET_ROWS results")
 
     model = (ROOT / "src/llama-model.cpp").read_text(encoding="utf-8")
-    if model.count("if (params.kv_tail_native_exact)") < 2:
-        raise AssertionError("full-window KVarN selection must use the logical native-exact policy")
-    if model.count("params.kv_tail_native_exact ? cparams.n_ctx : 0") < 2:
+    kvarn_factory = model.split("const auto make_kvarn_attn_memory =", 1)[1].split("switch (arch)", 1)[0]
+    if model.count("make_kvarn_attn_memory(") != 2:
+        raise AssertionError("hybrid and target KVarN caches must share one construction policy")
+    if kvarn_factory.count("if (params.kv_tail_native_exact)") != 1:
+        raise AssertionError("KVarN construction must use the logical native-exact policy")
+    if not re.search(
+        r"params\.kv_tail_rollback_tokens,\s*cparams\.n_ctx,\s*non_partial_attn_placement",
+        kvarn_factory,
+    ):
         raise AssertionError("full-window KVarN storage must retain the logical visibility window")
+    if kvarn_factory.count("non_partial_attn_placement") != 2:
+        raise AssertionError("structured and exact-fallback KVarN caches must reject partial residency")
+    for callsite in (
+        "make_kvarn_attn_memory(filter_attn, nullptr)",
+        "make_kvarn_attn_memory(filter, reuse)",
+    ):
+        if model.count(callsite) != 1:
+            raise AssertionError(f"missing KVarN construction call site: {callsite}")
     cache = (ROOT / "src/llama-kv-cache.cpp").read_text(encoding="utf-8")
     if cache.count("route_spec.body_type_k = candidate") != 1 or cache.count(
             "route_spec.body_type_v = candidate") != 1:

@@ -145,7 +145,7 @@
     {
       "name": "live-cpu-draft-mtp6-planes3",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {
         "target_kv": {
           "residency": "cpu"
@@ -162,7 +162,7 @@
     {
       "name": "live-gpu-draft-mtp6-planes3",
       "compare_to": "live-cpu-draft-mtp6-planes3",
-      "server": "/home/gencoolpc/beellama-kv-offload/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {
         "target_kv": {
           "residency": "cpu"

@@ -126,7 +126,7 @@
     {
       "name": "clean-gpu-seed7",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "args": ["--alias", "clean-gpu-seed7"]
     },
     {
@@ -165,7 +165,7 @@
     {
       "name": "clean-gpu-seed42",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"sampler": {"seed": 42}},
       "request": {"seed": 42},
       "args": ["--alias", "clean-gpu-seed42", "--seed", "42"]

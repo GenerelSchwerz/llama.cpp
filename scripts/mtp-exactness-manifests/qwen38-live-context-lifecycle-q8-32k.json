@@ -45,19 +45,19 @@
   "cases": [
     {
       "name": "upfront-a", "role": "golden",
-      "server": "/home/gencoolpc/beellama-live-workspace-pre-pr4/build-live-cuda/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": { "workspace": { "live_context": false } },
       "args": ["--alias", "upfront-a"]
     },
     {
       "name": "live-context", "compare_to": "upfront-a",
-      "server": "/home/gencoolpc/beellama-live-workspace-pre-pr4/build-live-cuda/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": { "workspace": { "live_context": true } },
       "args": ["--alias", "live-context", "--live-context-workspace"]
     },
     {
       "name": "upfront-b", "compare_to": "upfront-a",
-      "server": "/home/gencoolpc/beellama-live-workspace-pre-pr4/build-live-cuda/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": { "workspace": { "live_context": false } },
       "args": ["--alias", "upfront-b", "--no-live-context-workspace"]
     }

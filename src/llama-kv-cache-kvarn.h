@@ -225,7 +225,7 @@ public:
             ggml_type tail_type = GGML_TYPE_F16,
             uint32_t tail_tokens_requested = UINT32_MAX,
             uint32_t tail_rollback_tokens = 0,
-            bool cpu_pinned = false);
+            llama_memory_placement_options placement = {});
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,

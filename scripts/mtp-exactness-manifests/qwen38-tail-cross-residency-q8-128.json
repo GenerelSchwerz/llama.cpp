@@ -38,7 +38,7 @@
     {
       "name": "clean-gpu-tail128",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "request": {"n_predict": 128},
       "args": ["--alias", "clean-gpu-tail128"]
     },
