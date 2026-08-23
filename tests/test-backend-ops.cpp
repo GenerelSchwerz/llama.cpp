@@ -10294,6 +10294,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(
                 128, 128, 4, {4, 1}, 512, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true, true));
+    // D=256 wide-Q tiles have a larger register-staging footprint than their
+    // synchronous K/V workspace. This catches compact/native composition bugs
+    // that narrower D=128 tiles cannot expose, both without and with GQA.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {1, 1}, 512, 64, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, 512, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true, true));
 
     // Quantized-native K/V coverage, one pass per type with a native loader.
     // These sweep the supported head sizes, GQA ratios that select ncols2,

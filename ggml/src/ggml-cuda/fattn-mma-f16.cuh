@@ -462,11 +462,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_tile(
 template<int ncols1, int nwarps, int nbatch_fa, bool use_cp_async, bool oob_check>
 static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
         const half * const __restrict__ mask_h, half * const __restrict__ tile_mask,
-        const int stride_mask, const bool compact_causal_prefix,
+        const int stride_mask, const bool compact_causal_prefix, const int32_t causal_prefix_first_bound,
         const int k_VKQ_0, const int i_sup, const int j0, const uint3 ne01) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     if (compact_causal_prefix) {
-        const int32_t first_bound = *((const int32_t *) (tile_mask + nbatch_fa));
+        const int32_t first_masked_i = causal_prefix_first_bound - k_VKQ_0;
 #pragma unroll
         for (int j1 = 0; j1 < ncols1; j1 += nwarps) {
             const int j_sram = j1 + threadIdx.y;
@@ -474,13 +474,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
                 break;
             }
 
-            const int32_t bound = first_bound + j_sram;
+            const int32_t first_masked_i_row = first_masked_i + j_sram;
 #pragma unroll
             for (int i0 = 0; i0 < nbatch_fa; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
                 if (i < nbatch_fa) {
                     tile_mask[j_sram*(nbatch_fa + 8) + i] =
-                        i < i_sup && k_VKQ_0 + i >= bound ? half(-INFINITY) : half(0.0f);
+                        i < i_sup && i >= first_masked_i_row ? half(-INFINITY) : half(0.0f);
                 }
             }
         }
@@ -565,7 +565,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_load_mask(
 template<int nbatch_fa>
 static __device__ __forceinline__ void flash_attn_causal_prefix_store_first_bound(
         const half * const __restrict__ mask_h,
-        half * const __restrict__ tile_mask,
+        int32_t * const __restrict__ first_bound_smem,
         const int stride_mask,
         const int j0,
         const uint3 ne01) {
@@ -577,11 +577,14 @@ static __device__ __forceinline__ void flash_attn_causal_prefix_store_first_boun
     const int32_t first_bound = flash_attn_causal_prefix_bound(
         (const int64_t *) mask_h, int64_t(j_vram)*stride_mask);
 
-    // The per-row mask stride includes eight padding halves. Cache the query
-    // tile's first bound in the first row's unused padding. Compact-mask
-    // eligibility proves that later query bounds are first_bound + row offset,
-    // so every warp can derive them without more descriptor loads.
-    *((int32_t *) (tile_mask + nbatch_fa)) = first_bound;
+    *first_bound_smem = first_bound;
+}
+
+static __device__ __forceinline__ int32_t flash_attn_causal_prefix_load_first_bound(
+        const int32_t * const __restrict__ first_bound_smem) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int32_t first_bound = threadIdx.x == 0 ? *first_bound_smem : 0;
+    return __shfl_sync(0xFFFFFFFF, first_bound, 0, warp_size);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, int nwarps,
@@ -594,6 +597,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         const half2  * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
         const bool compact_causal_prefix,
+        const int32_t * const __restrict__ causal_prefix_first_bound_smem,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
         const float scale,
@@ -638,7 +642,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 
     const int k_VKQ_0 = kb0 * nbatch_fa;
     const int32_t causal_prefix_first_bound = compact_causal_prefix ?
-        *((const int32_t *) (tile_mask + nbatch_fa)) : 0;
+        flash_attn_causal_prefix_load_first_bound(causal_prefix_first_bound_smem) : 0;
     const bool use_mask = compact_causal_prefix ?
         k_VKQ_0 + k_VKQ_sup > causal_prefix_first_bound :
         (ncols2 > 1 || mask_h);
@@ -664,7 +668,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         if (use_mask) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (compact_causal_prefix ? mask_h : mask_h + k_VKQ_0,
-                 tile_mask, stride_mask, compact_causal_prefix,
+                 tile_mask, stride_mask, compact_causal_prefix, causal_prefix_first_bound,
                  k_VKQ_0, k_VKQ_sup, jt*ncols1, ne01);
         }
     }
@@ -1031,7 +1035,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
             if (use_next_mask) {
                 flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                     (compact_causal_prefix ? mask_h : mask_h + k_VKQ_0 + nbatch_fa,
-                     tile_mask, stride_mask, compact_causal_prefix,
+                     tile_mask, stride_mask, compact_causal_prefix, causal_prefix_first_bound,
                      k_VKQ_0 + nbatch_fa, k_VKQ_sup, jt*ncols1, ne01);
             }
             flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1251,6 +1255,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const half2  * const __restrict__ V_h2,
         const half   * const __restrict__ mask_h,
         const bool compact_causal_prefix,
+        int32_t      * const __restrict__ causal_prefix_first_bound_smem,
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
@@ -1318,7 +1323,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
     if (compact_causal_prefix) {
         flash_attn_causal_prefix_store_first_bound<nbatch_fa>(
-            mask_h, tile_mask, stride_mask, jt*ncols1, ne01);
+            mask_h, causal_prefix_first_bound_smem, stride_mask, jt*ncols1, ne01);
     }
 
     constexpr bool cache_kvarn_record_axes =
@@ -1418,13 +1423,16 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         constexpr bool use_cp_async = true;
         constexpr bool oob_check    = false;
         constexpr int  k_VKQ_sup    = nbatch_fa;
+        const int32_t causal_prefix_first_bound = compact_causal_prefix ?
+            flash_attn_causal_prefix_load_first_bound(causal_prefix_first_bound_smem) : 0;
         const bool use_first_mask = compact_causal_prefix ?
-            kb0*nbatch_fa + k_VKQ_sup > *((const int32_t *) (tile_mask + nbatch_fa)) :
+            kb0*nbatch_fa + k_VKQ_sup > causal_prefix_first_bound :
             (ncols2 > 1 || mask_h);
         if (use_first_mask) {
             flash_attn_ext_f16_load_mask<ncols1, nwarps, nbatch_fa, use_cp_async, oob_check>
                 (compact_causal_prefix ? mask_h : mask_h + kb0*nbatch_fa,
                  tile_mask, stride_mask, compact_causal_prefix,
+                 causal_prefix_first_bound,
                  kb0*nbatch_fa, k_VKQ_sup, jt*ncols1, ne01);
         }
         flash_attn_ext_f16_load_tile<stride_tile_K, nwarps, nbatch_fa, use_cp_async, oob_check>
@@ -1440,7 +1448,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
-                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, causal_prefix_first_bound_smem,
+                 dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, type_V_rt);
         }
@@ -1449,7 +1458,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
               T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
-            (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, causal_prefix_first_bound_smem,
+             dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, type_V_rt);
     } else {
@@ -1460,7 +1470,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
             flash_attn_ext_f16_iter
                 <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
                  T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
-                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, dstk, dstk_fixup, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, causal_prefix_first_bound_smem,
+                 dstk, dstk_fixup, scale, slope, logit_softcap,
                  ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
                  KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, type_V_rt);
         }
@@ -1469,7 +1480,8 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         flash_attn_ext_f16_iter
             <DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, last_iter, oob_check,
              T_A_KQ, T_B_KQ, T_C_KQ, T_A_VKQ, T_B_VKQ, T_C_VKQ, type_K, type_V>
-            (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, dstk, dstk_fixup, scale, slope, logit_softcap,
+            (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, causal_prefix_first_bound_smem,
+             dstk, dstk_fixup, scale, slope, logit_softcap,
              ne01, ne02, stride_K, stride_V, stride_mask, tile_Q, tile_K, tile_V, tile_mask, kvarn_smem, Q_B, VKQ_C,
              KQ_max, KQ_rowsum, jt, kb0, k_VKQ_sup, type_V_rt);
     }
@@ -1988,6 +2000,9 @@ static __global__ void flash_attn_ext_f16(
 #else
     constexpr bool compact_causal_prefix = false;
 #endif
+    // The bound lives for the whole block, unlike the dynamically shared Q/K/V/mask phases.
+    // Give it block-owned storage rather than borrowing padding from an aliased phase.
+    __shared__ int32_t causal_prefix_first_bound_smem;
     const int stride_mask = compact_causal_prefix ? nb31 / sizeof(int64_t) : nb31 / sizeof(half);
 
     const int stride_V = V_is_K_view ? stride_K :
@@ -2038,12 +2053,14 @@ static __global__ void flash_attn_ext_f16(
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
-                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, &causal_prefix_first_bound_smem,
+                 sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, type_V_rt);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
-                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, &causal_prefix_first_bound_smem,
+                 sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, type_V_rt);
         }
 
@@ -2085,7 +2102,8 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, type_K, type_V>
-        (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, compact_causal_prefix, &causal_prefix_first_bound_smem,
+         sinks_f, dstk, dst_meta, dst_final_meta_tile, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop, type_V_rt);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, dst_final_meta_ptr, scale,
