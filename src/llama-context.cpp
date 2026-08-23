@@ -121,6 +121,7 @@ llama_context::llama_context(
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
+    cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -396,6 +397,14 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+
+        if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+            if (memory && memory->get_supports_partial_kv()) {
+                cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
+            } else {
+                LLAMA_LOG_WARN("%s: partial GPU KV residency is not supported for this memory layout; ignoring kv_gpu_layers\n", __func__);
+            }
+        }
     }
 
     // init backends
@@ -3518,6 +3527,7 @@ llama_context_params llama_context_default_params() {
         /*.n_rs_seq                    =*/ 0,
         /*.n_outputs_max               =*/ 0,
         /*.n_outputs_max_per_seq       =*/ 1,
+        /*.kv_gpu_layers               =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.ctx_type                    =*/ LLAMA_CONTEXT_TYPE_DEFAULT,

@@ -568,6 +568,7 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
+    int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

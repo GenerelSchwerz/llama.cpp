@@ -2426,6 +2426,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-gpu-layers"}, "N",
+        string_format("with --no-kv-offload, keep the first N independently owned attention KV layers device-resident "
+                      "for standard and direct hybrid caches. Unsupported specialized caches ignore this option "
+                      "(default: %d)", params.kv_gpu_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-gpu-layers must not be negative");
+            }
+            params.kv_gpu_layers = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GPU_LAYERS"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

@@ -16,6 +16,7 @@ class llama_io_read_i;
 
 struct llama_memory_placement_options {
     bool cpu_pinned = false;
+    uint32_t gpu_resident_layers = 0;
     bool recurrent_offload = false;
 };
 
@@ -104,6 +105,10 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    virtual bool get_supports_partial_kv() const {
+        return false;
+    }
 
     //
     // ops

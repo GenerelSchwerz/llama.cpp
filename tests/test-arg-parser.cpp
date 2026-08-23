@@ -125,6 +125,9 @@ static void test(void) {
     argv = {"binary_name", "-ngl", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
     // wrong value (enum)
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -221,17 +224,20 @@ static void test(void) {
         const auto defaults = llama_context_default_params();
         assert(!defaults.kv_cpu_pinned);
         assert(!defaults.recurrent_state_offload);
+        assert(defaults.kv_gpu_layers == 0);
 
         common_params placement_params;
-        argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--recurrent-state-offload"};
+        argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--kv-gpu-layers", "4", "--recurrent-state-offload"};
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
         assert(placement_params.no_kv_offload);
         assert(placement_params.kv_cpu_pinned);
+        assert(placement_params.kv_gpu_layers == 4);
         assert(placement_params.recurrent_state_offload);
 
         const auto cparams = common_context_params_to_llama(placement_params);
         assert(!cparams.offload_kqv);
         assert(cparams.kv_cpu_pinned);
+        assert(cparams.kv_gpu_layers == 4);
         assert(cparams.recurrent_state_offload);
 
         argv = {"binary_name", "--no-kv-cpu-pinned", "--no-recurrent-state-offload"};

@@ -356,6 +356,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t kv_gpu_layers;         // with offload_kqv=false, keep this many standard or direct hybrid attention KV layers on their assigned devices
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 

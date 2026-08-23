@@ -2189,8 +2189,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_i * res;
     const llama_memory_placement_options placement = {
         cparams.kv_cpu_pinned,
+        cparams.kv_gpu_layers,
         cparams.offload_kqv || cparams.recurrent_state_offload,
     };
+    llama_memory_placement_options specialized_placement = placement;
+    specialized_placement.gpu_resident_layers = 0;
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2233,7 +2236,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         filter_idx,
                         nullptr,
-                        placement);
+                        specialized_placement);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2287,7 +2290,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            placement);
+                            specialized_placement);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -2340,7 +2343,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            placement);
+                            specialized_placement);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2368,7 +2371,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mtp,
                             nullptr,
                             nullptr,
-                            placement);
+                            specialized_placement);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2385,7 +2388,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr,
                             nullptr,
-                            placement);
+                            specialized_placement);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2410,7 +2413,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            placement);
+                            specialized_placement);
                     break;
                 }
             }
@@ -2474,7 +2477,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* attn_offload      */ cparams.offload_kqv,
-                            /* placement         */ placement,
+                            /* placement         */ specialized_placement,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2567,7 +2570,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    placement);
+                                    specialized_placement);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2585,7 +2588,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    placement);
+                                    specialized_placement);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
