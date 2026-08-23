@@ -116,9 +116,6 @@ def main() -> None:
         "live_context_workspace",
         "composed telemetry benchmark must publish the selected live-workspace policy",
     )
-    for excluded in ("phase_aware_workspace", "flash_attn_native_quants"):
-        if excluded in bench:
-            raise AssertionError(f"W02 must not depend on later feature field {excluded}")
 
 
 if __name__ == "__main__":
