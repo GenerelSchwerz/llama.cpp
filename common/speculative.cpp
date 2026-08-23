@@ -2208,6 +2208,20 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
     }
 }
 
+void common_validate_speculative_params(
+        const common_params_speculative & params,
+        int32_t target_ubatch) {
+    const bool has_mtp = std::find(
+            params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
+
+    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch > 0 && params.draft.n_ubatch != target_ubatch) {
+        throw std::invalid_argument(string_format(
+                "draft-mtp requires spec-draft-ubatch-size (%d) to match the target ubatch (%d); "
+                "omit the draft override or use the target ubatch",
+                params.draft.n_ubatch, target_ubatch));
+    }
+}
+
 std::vector<common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names) {
     std::vector<common_speculative_type> types;
     types.reserve(names.size());
@@ -2339,6 +2353,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
 
     result.cache_type_k  = params_spec.cache_type_k;
     result.cache_type_v  = params_spec.cache_type_v;
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = params_spec.n_ubatch;
+    }
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

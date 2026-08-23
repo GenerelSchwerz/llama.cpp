@@ -89,6 +89,9 @@ int main(int argc, char ** argv) {
     params.devices = params.speculative.draft.devices;
     params.model = params.speculative.draft.mparams;
     params.n_gpu_layers = params.speculative.draft.n_gpu_layers;
+    if (params.speculative.draft.n_ubatch > 0) {
+        params.n_ubatch = params.speculative.draft.n_ubatch;
+    }
     params.n_outputs_max = params.n_parallel;
     params.n_outputs_max_per_seq = 1;
     if (params.speculative.draft.cpuparams.n_threads > 0) {
