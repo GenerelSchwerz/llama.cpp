@@ -30,6 +30,7 @@ from feature_validation import (  # noqa: E402
     contracts,
     core,
     profiler,
+    provenance,
     runner as validation_runner,
     telemetry,
 )
@@ -180,6 +181,31 @@ class CoreContractBoundaryTest(unittest.TestCase):
         for name in names:
             with self.subTest(name=name):
                 self.assertIs(getattr(core, name), getattr(contracts, name))
+
+
+class CoreProvenanceBoundaryTest(unittest.TestCase):
+    def test_core_reexports_established_provenance_objects(self) -> None:
+        names = (
+            "BUILD_PROVENANCE_SCHEMA_VERSION",
+            "BUILD_PROVENANCE_KIND",
+            "stat_identity",
+            "command_capture",
+            "_git_text",
+            "git_snapshot",
+            "git_source_file_manifest",
+            "_find_cmake_cache",
+            "cmake_snapshot",
+            "binary_snapshot",
+            "capture_cmake_build_provenance",
+            "verify_cmake_build_provenance",
+            "verify_variant",
+            "capture_provenance",
+            "provenance_identity_spec",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIs(getattr(core, name), getattr(provenance, name))
+        self.assertIs(provenance.ProvenanceError, core.ProvenanceError)
 
 
 class QuotingAndArityTest(unittest.TestCase):
