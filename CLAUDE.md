@@ -59,9 +59,9 @@ and head dimension; every other case keeps the F16-casting path. K and V may be
 different types, and every ordered pair of native types has a kernel — 16 pairs
 in the default tier, 121 with `GGML_CUDA_FA_ALL_QUANTS` — so no quantized K/V
 combination falls back merely for being mixed. The vector pair matrix above is
-tiered separately and is narrower. The kernels are
-compiled only when `GGML_CUDA_FATTN_Q8_NATIVE=ON`, so on a build without them
-the option keeps the standard path and reports a warning. The cache type still
+tiered separately and is narrower. The default-tier kernels are always
+compiled; `GGML_CUDA_FA_ALL_QUANTS` is the only build flag that widens the
+family. The cache type still
 comes exclusively from `--cache-type-k` and `--cache-type-v`; the native option
 does not select a second layout. See
 [`docs/quantized-native-flash-attention.md`](docs/quantized-native-flash-attention.md)

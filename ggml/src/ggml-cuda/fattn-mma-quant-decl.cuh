@@ -11,8 +11,6 @@
 // inside the kernel, so there is no pair dimension here at all. Coverage of
 // every ordered pair is therefore linear in the number of native types.
 
-#ifdef GGML_CUDA_FATTN_Q8_NATIVE
-
 // Kept in step with FATTN_MMA_QUANT_TYPES in fattn-mma-quant.cuh, which drives
 // the route predicate, and with FATTN_MMA_QUANT_TYPES in generate_cu_files.py,
 // which emits the definitions. All three must name the same types.
@@ -65,5 +63,3 @@ DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256,  8)
 DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 16)
 DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 32)
 DECL_FATTN_MMA_QUANT_CASE_ALL_NCOLS2(256, 64)
-
-#endif // GGML_CUDA_FATTN_Q8_NATIVE

@@ -6402,10 +6402,97 @@ The hybrid does not fully recover the register budget. The symmetric `D = 256`
 kernel sits at 24 bytes of spill against 16 before, because
 `flash_attn_ext_f16` now carries the trailing runtime V-type parameter even in
 instantiations that ignore it. That residual is the honest cost of the
-mechanism. It is measured as a net win against materializing, which is the gate
-this feature is held to; a direct native-versus-native comparison against the
-per-pair binary was not run, because that library had already been overwritten
-by the time the regression was found.
+mechanism, and it was left open whether it costs throughput: the original
+per-pair library had been overwritten by the time the regression was found.
+
+##### The residual spill costs nothing: per-pair against hybrid, natively
+
+The per-pair implementation was rebuilt from its own commit into a separate
+worktree so both libraries could exist at once, and the two were compared
+directly with `--flash-attn-native-quants` enabled on both arms. This is the
+comparison the hybrid entry above could not make.
+
+| `q8_0/q8_0`, 512-token prefill at depth 32,768 | n | Mean | SD |
+|---|---:|---:|---:|
+| per-pair, `35115bf4d`, 5,808 cases | 10 | 829.801 t/s | 4.664 |
+| hybrid, `8b9a5d111`, 1,056 cases | 10 | 829.562 t/s | 4.386 |
+
+`+0.029%`, Welch `t = +0.112` over two reverse-order arm pairs of `r = 5`. The
+two implementations are indistinguishable. The 24-byte spill is real in
+`cuobjdump -res-usage` and costs nothing measurable on the production shape, so
+body deduplication buys 197 MB of library and 5,808 -> 1,056 explicit cases for
+no runtime price.
+
+A single ordered pair at one shape is a screen, not a result, so the comparison
+was widened to a depth and prompt-length matrix, both arms native, ABBA-ordered
+per configuration, `r = 5`. Prefill and decode come from the same invocation
+wherever both are present, so they share a process and a cache state.
+
+| Configuration | Test | Per-pair | Hybrid | Δ | Welch `t` |
+|---|---|---:|---:|---:|---:|
+| depth 0, ubatch 512 | `pp512` | 1248.382 | 1249.024 | `-0.051%` | `-0.07` |
+| depth 0, ubatch 512 | `tg64` | 39.192 | 39.221 | `-0.075%` | `-0.77` |
+| depth 4,096 | `pp512` | 1187.883 | 1187.367 | `+0.043%` | `+0.13` |
+| depth 4,096 | `tg64` | 31.710 | 31.721 | `-0.033%` | `-0.30` |
+| depth 32,768 | `pp512` | 829.736 | 829.439 | `+0.036%` | `+0.14` |
+| depth 32,768 | `tg64` | 13.049 | 13.052 | `-0.027%` | `-0.89` |
+| depth 32,768, ubatch 2,048 | `pp2048` | 877.019 | 877.012 | `+0.001%` | `+0.01` |
+| depth 32,768, ubatch 2,048 | `pp8192` | 858.301 | 858.377 | `-0.009%` | `-0.58` |
+| depth 131,072 | `pp512` | 395.376 | 395.090 | `+0.072%` | `+0.21` |
+| depth 131,072 | `tg64` | 4.305 | 4.305 | `+0.004%` | `+0.14` |
+
+Ten comparisons, largest `|Δ|` `0.075%`, largest `|t|` `0.89`. Nothing is
+distinguishable. The two `ubatch = 2048` rows matter beyond prompt length:
+`ubatch` selects the MMA kernel's `ncols` geometry, so those arms run different
+compiled shapes from the `512` ones and would expose a shape-dependent cost of
+sharing one body if there were one.
+
+One caution about reading this matrix while it runs: at the point where only
+one hybrid arm of the `131,072` configuration had landed, `tg64` there read
+`-0.066%` at `t = -3.11`, which crosses the usual significance threshold. With
+the second arm complete it is `+0.004%` at `t = +0.14`. A half-finished ABBA
+pair is not a small sample of the result, it is a biased one, because the two
+arms of a pair sit at different points in any thermal or clock drift.
+
+Allocation was measured separately, because `llama-bench` hides compute-buffer
+differences behind its logits reservation. `llama-server --parallel 1 -v`,
+reserve-time buffers plus a one-second `nvidia-smi` sample across a real
+prefill and decode:
+
+| Context | Peak process VRAM | `CUDA0` compute | `CUDA_Host` compute | `CUDA0` KV | `CUDA_Host` KV |
+|---|---:|---:|---:|---:|---:|
+| 4,096 | 9,762 MiB | 150.27 MiB | 24.28 MiB | 17.00 MiB | 136.00 MiB |
+| 32,768 | 9,814 MiB | 202.27 MiB | 52.28 MiB | 17.00 MiB | 1,088.00 MiB |
+| 131,072 | 10,080 MiB | 468.27 MiB | 148.28 MiB | 17.00 MiB | 4,352.00 MiB |
+
+Every figure is identical between the two builds at every context, which is the
+expected result and worth stating as a check rather than an achievement: the
+hybrid changes which kernel is compiled, not the shared-memory request or the
+cache layout, so any allocation difference would have indicated a defect. The
+per-request server timings in those runs are single unrepeated requests and are
+not used as throughput evidence.
+
+This also settles the reading of the earlier `-0.73%` regression that killed the
+plain runtime-V variant. That loss cannot be attributed to spill as such: spill
+rose 16 -> 48 B there and 16 -> 24 B here, and only the former lost. What
+distinguishes them is that the plain variant put the runtime switch on the
+symmetric pair's own V load, while the hybrid keeps that pair fully
+compile-time. Consistent with the configuration sweep, which found the register
+ceiling is not this kernel's limit in either direction.
+
+Both binaries were built with identical flags, and after the harness fix below
+their `llama-bench` sources were byte-identical, so the arms differ only in
+`libggml-cuda.so`.
+
+The per-pair binary could not emit JSON on the first attempt: it aborted in the
+output writer with `vector::_M_range_check: __n (which is 127) >= this->size()
+(which is 127)` after all five runs had completed. The rebase resolution had
+kept both branches' additions to the `llama-bench` field-name list, leaving 131
+names against 127 values. `2df2bf4fe` fixes it at branch HEAD, but every commit
+between the rebase and that fix carries it, which matters for any future
+per-commit benchmarking or bisect in that range. Applying the one-line fix to
+the worktree rebuilt only `llama-bench`; `libggml-cuda.so` was verified
+unchanged by size and mtime.
 
 ##### The declaration header was compiling what it only meant to declare
 
@@ -6461,6 +6548,345 @@ same hashes as before -- `q8_0/q8_0` `759a5cea1cb597ca`, `q8_0/q2_0`
 The general lesson is worth keeping: a multi-statement macro is unsafe to
 prefix with `extern`, and the failure mode is silent. Both macros above are
 commented to say so.
+
+#### Rejected: raw-byte `cp.async` staging of quantized rows
+
+`nstages` is forced to `0` for quantized caches because `cp.async` is a
+byte-for-byte DMA and cannot dequantize. Design A of
+[`docs/quantized-native-fa-staging-plan.md`](quantized-native-fa-staging-plan.md)
+works around that by staging the *raw* quantized rows into shared memory and
+letting the existing packed loaders read shared instead of global, with their
+arithmetic untouched. **It was implemented, it is exact, and it loses on every
+arm measured. It is not retained.**
+
+The prototype was the narrowest one the plan allows: `D = 256`, `ncols2 >= 2`,
+symmetric `q3_0` and `q2_1` only -- the types whose raw region fits underneath
+the shared-memory floor `nbytes_shared_Q` already sets, so occupancy is held
+fixed and the experiment measures overlap alone. Single raw buffer, whole-row
+16-byte transfers, synchronous fallback for the `oob_check` tail.
+
+Two mechanisms had to be added that the plan did not anticipate. `cp-async.cuh`
+exposed only `cp_async_wait_all()`, which waits for *every* outstanding copy;
+waiting for staged K that way would also wait for staged V and destroy the
+overlap the design exists to create, so K and V are committed as separate groups
+via new `cp_async_commit_group()` / `cp_async_wait_group<n>()` helpers, and K
+waits with one group still in flight. Separately, `cp-async.cuh` has no include
+guard -- most `.cuh` files in this backend rely on being included once per
+translation unit -- so including it from `fattn-mma-quant.cuh` gave `fattn.cu`
+two definitions of everything in it. That one failed loudly in 32 seconds,
+unlike the `extern` defect above.
+
+Both arms were built from identical source, separated only by an internal
+build-time `GGML_CUDA_FATTN_QUANT_STAGE`, with `0` generating the shipped code
+path so the baseline is the real implementation and not a staging-shaped rewrite
+of it. `GGML_CUDA_FA_ALL_QUANTS=ON` (the prototype types are extra-tier),
+`GGML_CUDA_KVARN=OFF`.
+
+Every gate before the benchmark passed, including one that improved:
+
+| `D = 256`, 8x8 | Synchronous | Staged |
+|---|---|---|
+| `q3_0` symmetric | `REG:255 STACK:40` | `REG:255` **`STACK:16`** |
+| `q2_1` symmetric | `REG:255 STACK:16` | `REG:255 STACK:16` |
+| `q3_0`/`q2_1` runtime-V | `REG:255 STACK:48` | `REG:255 STACK:48` |
+
+Spill *fell* by 24 bytes on `q3_0`, because `cp.async` writes global to shared
+directly and skips the register round-trip the synchronous loader needs for raw
+bytes. `libggml-cuda.so` shrank by 602,112 bytes for the same reason.
+Correctness is exact: **1695/1695** with 36 `D = 256` native launches for each
+prototype pair, and model-level output is byte-identical to the synchronous
+build -- `q3_0/q3_0` `64b940e5df0aa624`, `q2_1/q2_1` `e176079d5562e702`, 112
+native launches each.
+
+Then it lost, at 512-token prefill and depth 32,768, two reverse-order arm pairs
+of `r = 5` per cell:
+
+| Pair / KV residency | Synchronous | Staged | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| `q3_0/q3_0`, GPU | 933.569 t/s | 918.096 t/s | **`-1.657%`** | `-4.77` |
+| `q3_0/q3_0`, host | 897.305 t/s | 882.548 t/s | **`-1.645%`** | `-5.75` |
+| `q2_1/q2_1`, GPU | 947.657 t/s | 941.258 t/s | `-0.675%` | `-1.94` |
+| `q2_1/q2_1`, host | 918.890 t/s | 912.253 t/s | `-0.722%` | `-2.60` |
+
+The SASS says exactly what was traded, for the `q3_0` `D = 256` 8x8 kernel:
+
+| | Synchronous | Staged |
+|---|---:|---:|
+| `LDG` (global loads) | 360 | **60** |
+| `LDGSTS` (`cp.async`) | 0 | **24** |
+| `LDS` | 493 | 529 |
+| `STS` | 337 | 355 |
+| `BAR.SYNC` | 36 | **48** |
+| `HMMA` | 768 | 768 |
+
+The DMA did its job: 300 global load instructions became 24 whole-row
+transfers, and the loads are genuine shared-memory `LDS` rather than generic
+`LD`, so the address space resolved correctly. `HMMA` is unchanged, confirming
+the math is untouched. What it cost is **12 additional barriers per tile**, and
+that is more than the overlap is worth.
+
+Structurally, only half the transfer can overlap anything. K is issued and then
+waited on almost immediately, because the KQ multiply needs it; only V's fetch
+spans the multiply. So the design pays two barriers' worth of synchronization to
+hide one of its two fetches, against a synchronous loader whose global loads the
+compiler was already overlapping with math inside the unrolled loop. `q3_0`
+loses roughly twice as much as `q2_1`, consistent with its wider row: more bytes
+staged, same barrier count.
+
+Per the plan's disposition rule this stops here. No double buffering, no `q8_0`
+(whose occupancy cliff was already priced at about `-9.3%`), no `D = 64` or
+`D = 128` (which would additionally need `cp.async` widths that `cp-async.cuh`
+does not have). The source changes are reverted; the attempted diff and both
+SASS dumps are preserved outside the tree.
+
+This is the third independent result on this branch showing that register and
+spill relief does not predict throughput for this kernel. `Q_in_reg = false`
+relieved registers and lost 9.35%. The hybrid raised spill and cost nothing.
+Staging lowered spill by 24 bytes and lost 1.7%. Whatever limits this kernel, it
+is not the register file.
+
+#### The vector/MMA crossover: MMA wins everywhere measured, and cannot be adopted
+
+The Ada dispatch rule sends quantized K/V to the vector kernel at `n_q <= 2` and
+to MMA above it (`ggml_cuda_get_best_fattn_kernel` in `fattn.cu`). That constant
+was never measured against this branch's native MMA path, so it was swept.
+
+The vector kernel is compiled only for `cols_per_block` 1 and 2, but it covers
+larger batches by launching more blocks rather than more columns per block, so
+every threshold value is runnable and the constant is a genuine tuning choice
+rather than the edge of what exists. The sweep used an internal
+`GGML_CUDA_FATTN_VEC_MAX_NQ` read once from the environment, defaulting to 2,
+which lets one build measure both sides; `0` forces MMA at every batch size and
+a large value forces vector. Verified before use: `0` and `2` give identical
+routing on the 1694-case audit, and `64` moves 946 of those cases off MMA.
+
+Prompt-side, `q8_0/q8_0`, depth 4,096, GPU-resident KV, ABBA per cell, `r = 5`:
+
+| `n_q` | Vector | MMA | Δ | Welch `t` |
+|---:|---:|---:|---:|---:|
+| 1 | 41.389 t/s | 41.799 t/s | `+0.99%` | `+33.79` |
+| 2 | 73.561 t/s | 74.995 t/s | `+1.95%` | `+27.79` |
+| 3 | 97.972 t/s | 102.213 t/s | `+4.33%` | `+35.90` |
+| 4 | 118.003 t/s | 123.369 t/s | `+4.55%` | `+66.63` |
+| 6 | 145.138 t/s | 152.868 t/s | `+5.33%` | `+33.68` |
+| 8 | 166.107 t/s | 176.877 t/s | `+6.48%` | `+74.86` |
+| 16 | 290.294 t/s | 324.110 t/s | `+11.65%` | `+324.83` |
+| 32 | 438.977 t/s | 521.550 t/s | `+18.81%` | `+389.92` |
+
+Prompt processing at `ubatch = 1` is a proxy for a verification batch, not real
+decode, so decode was measured separately with `-n 64` where `n_q = 1` arises
+naturally:
+
+| Decode, GPU-resident | Vector | MMA | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| depth 4,096 | 39.074 t/s | 39.402 t/s | `+0.84%` | `+6.55` |
+| depth 32,768 | 32.557 t/s | 36.330 t/s | **`+11.59%`** | `+67.75` |
+
+**There is no crossover in the measured range.** MMA wins at every batch size
+from 1 to 32 and at real decode, and its advantage grows monotonically with
+batch size. The shipped rule sends `n_q <= 2` the wrong way, costing 11.6% of
+decode throughput at depth 32,768 on this model.
+
+That is a statement about *this* model, and the rule is global. This model has a
+high GQA ratio, and the dispatcher already contains
+`!gqa_opt_applies && Q->ne[1] == 1 -> VEC`, which implies MMA is expected to win
+when GQA folding applies. The honest reading is that the rule needs a GQA-aware
+term rather than a smaller constant, and confirming that needs a low-GQA model.
+
+**The change the data recommends is currently unimplementable, and that is the
+more important result.** With host-resident KV
+(`-nkvo 1 --kv-cpu-pinned --kv-gpu-layers 0`), forcing MMA at `n_q = 1` aborts
+in `ggml_backend_cuda_synchronize` deterministically: 4 of 4 retries, twice, at
+both depths, while the vector arm at the same settings succeeded on the first
+attempt every time. Host-resident `n_q <= 8` could not be measured at all for
+the same reason; only `n_q` 16 and 32 completed, where MMA wins by `+10.20%` and
+`+17.09%`.
+
+The abort is not this feature's:
+
+- It occurs with `--no-flash-attn-native-quants` as well as with it.
+- It occurs with an `f16` cache, not only quantized.
+- It occurs with GPU-resident KV at small `ubatch` too, and without
+  `--kv-cpu-pinned`, so it is not a pinning or residency property alone.
+- Default routing did not **abort** in the runs tried here: `f16` and `q8_0`,
+  host-resident, decode at depths 4,096 and 16,384 all completed cleanly.
+
+That last point was originally written up as "not reachable through default
+routing". **It is wrong, and the root-cause section below supersedes it.**
+Completing cleanly is not evidence of not reaching the defect: the failure is
+undefined behaviour, and `compute-sanitizer --tool synccheck` later showed the
+diverging kernel *is* entered through default routing, reporting 1408 errors on
+an `f16` cache at depth 8,704 with no experiment control set at all. What the
+clean runs establish is only that the shipped rule does not usually make it
+abort, not that it avoids the kernel.
+
+Lowering the threshold globally would still turn a measured 11.6% decode gain
+into frequent aborts for anyone running host-resident KV.
+
+**Disposition: the threshold is not changed here.** The evidence is strong
+enough to say the constant is wrong for high-GQA models with a native quantized
+cache, and not strong enough to replace it: it would need a GQA-aware rule
+validated on a low-GQA model, and it would need the host-resident MMA path fixed
+first. Both belong in their own change, and the host-resident abort belongs with
+the CPU KV offload work rather than here. The experiment control is reverted.
+
+**Historical reproducer — does not run on the committed tree.** The command
+below forced the route with `GGML_CUDA_FATTN_VEC_MAX_NQ`, the experiment control
+that was reverted with the rest of this experiment, so the variable no longer
+exists in the source and the command silently measures default routing instead.
+It is kept only to record what was run at the time. For a reproducer that works
+on the committed tree, use the `synccheck` command in the root-cause section
+below, which needs no experiment control.
+
+```
+# requires the reverted GGML_CUDA_FATTN_VEC_MAX_NQ control; will not force the
+# route on the committed tree
+GGML_CUDA_FATTN_VEC_MAX_NQ=0 llama-bench -m MODEL -ngl 99 -sm none -mg 0 -t 3 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -p 0 -n 64 -d 4096 -r 5
+```
+
+Two measurement notes. `llama-bench` applies `-ubatch` to the depth prefill as
+well as to the measured tokens, so `-ub 1 -d 32768` means 32,768 single-token
+forward passes; the first attempt at this sweep was abandoned after one cell ran
+past eleven minutes, and depth 4,096 was used instead. And `test-backend-ops
+perf` would be the better instrument -- it times FlashAttention directly at
+`kv = 4096` and `7680` with no depth cost -- except every perf case carries
+`native_quants=0`, so it cannot reach the native path without new cases.
+
+#### Root cause of the crossover blocker: divergent barriers in the MMA kernel
+
+The abort that blocked the crossover work was diagnosed. It is **not** an
+out-of-bounds access and **not** this feature's defect. It is a divergent
+`__syncthreads()` in upstream's `flash_attn_ext_f16`, and it is reachable
+through default routing today.
+
+`compute-sanitizer --tool memcheck` reports **0 errors** on a run that aborts
+without it, which is the first clue: nothing reads out of bounds.
+`--tool synccheck` reports 512:
+
+```
+Barrier error detected. Divergent thread(s) in block.
+  at flash_attn_ext_f16<256, 256, ncols1=1, ncols2=8, ...>+0x47580
+```
+
+In the SASS, `@P0 BRA 0x47660` at `0x47460` jumps over the `BAR.SYNC` at
+`0x47580`, and the target lands in the combine write-back with no barrier of its
+own. The instructions in between -- `SHFL.BFLY`, `MUFU.EX2` (an `expf`), a
+second shuffle -- place it in the combine reduction, the
+`if (np > 1 && threadIdx.y % np == 0)` block whose source already carries an
+`else if (np > 1) { __syncthreads(); }` balancer written to prevent exactly
+this. Divergent barriers are undefined behaviour, which accounts for every
+symptom: flaky rather than deterministic, depth-dependent, and invisible to
+memcheck.
+
+Affected shapes, measured with synccheck rather than inferred:
+
+| Shape | `n_q` | synccheck |
+|---|---|---:|
+| `ncols1 = 1`, `ncols2 = 8` | 1 | 512 errors |
+| `ncols1 = 2`, `ncols2 = 8` | 2 | 1024 errors |
+| `ncols1 = 4`, `ncols2 = 8` | 3-4 | 1984 errors |
+| `ncols1 = 8`, `ncols2 = 8` | >= 5, including prefill | **0 errors** |
+
+An earlier prediction that only `np > 1` shapes were affected was wrong;
+`ncols1 = 4` diverges too. The boundary is empirical: small-batch shapes
+diverge, the 8x8 production prefill shape does not.
+
+**The production prefill shape is clean, so no measurement in this PR is
+affected.** Every throughput figure recorded here comes from `ncols1 = 8`
+prefill or from the vector kernel.
+
+It is independent of this feature and reachable by default:
+
+- It reproduces with `--no-flash-attn-native-quants` and with an `f16` cache:
+  `flash_attn_ext_f16<256, 256, 1, 8, ..., f16, f16>`, same 512 errors.
+- With **no experiment control at all** -- default routing, `f16` cache,
+  GPU-resident KV, depth 8,704 -- synccheck reports **1408 errors**. The Ada
+  rule sends `n_q = 1` to MMA for non-quantized caches when
+  `gqa_ratio > 4 && K->ne[1] >= 8192`, which this model satisfies.
+- For quantized caches the Ada rule sends `n_q <= 2` to the vector kernel, but
+  `n_q` 3 and 4 route to MMA by default and land on the diverging
+  `ncols1 = 4` shape. Speculative verification at small draft batch sizes sits
+  exactly there.
+
+Whether it aborts depends on timing. Host-resident KV aborted reliably from
+depth 4,096 up and was clean at 2,048; GPU-resident KV aborted occasionally at
+depth 32,768. The focused `native_quants=1` selection of `test-backend-ops`
+passes 1695/1695 regardless -- that is the selection, not the full suite, which
+has its own inherited exception documented in the feature guide -- because divergent
+barriers on Volta-and-later frequently produce correct results anyway -- which
+is why this survived undetected.
+
+**Consequence for the crossover: the gain and the bug are the same shapes.**
+The measured `+11.59%` decode win at depth 32,768 is `n_q = 1`, which is
+`ncols1 = 1`. Lowering the vector threshold to capture it means routing more
+work onto the diverging shapes, not fewer. There is no threshold setting that
+takes the gain while avoiding the defect, so an opt-in "experimental" flag would
+amount to shipping a switch that enables undefined behaviour, whose failure mode
+includes silently wrong attention output rather than only a crash. It is not
+offered.
+
+The order is therefore: fix the barrier divergence first, in upstream's kernel
+and as its own change; then re-measure the crossover, because undefined
+behaviour can affect timing as well as results and the `+11.59%` was measured on
+a diverging kernel; then decide the threshold, with a low-GQA model to check the
+GQA-aware term.
+
+Reproducer, requiring nothing from this branch:
+
+```
+compute-sanitizer --tool synccheck llama-bench -m MODEL -ngl 99 -sm none -mg 0 \
+  -t 3 -nkvo 0 -fa on -ctk f16 -ctv f16 -b 512 -ub 512 -p 0 -n 4 -d 8704 -r 1
+```
+
+#### Retired without further attempts: the remaining loader-internal work
+
+Four separate interventions inside this kernel's loader have now been measured,
+and every one of them lost:
+
+| Attempt | Premise | Result |
+|---|---|---:|
+| Paired-lane block fetch | fewer load instructions | `-4.0%` to `-7.7%` |
+| `Q_in_reg = false` | relieve register pressure | `-9.35%` |
+| `nbatch_fa`, `nbatch_K2`/`nbatch_V2` | better batching | `-2.32%`, `-2.66%` |
+| Raw-byte `cp.async` staging | hide global-memory latency | `-1.65%` |
+
+The two changes that ever won here -- packing the loaders, and subtracting the
+zero point in float -- both kept the loader's structure intact and did the same
+work with fewer or cheaper instructions. Every attempt to change its *structure*
+has lost, whether by removing loads, redistributing them across lanes, moving
+them into a DMA, or changing how much of the tile is in flight at once.
+
+The two remaining planned loader experiments are therefore not attempted:
+
+- **One complete 32-element quant block per lane.** Structurally the paired-lane
+  experiment again -- the same loads, redistributed across lanes -- minus the
+  shuffles. Paired-lane lost decisively on every type with `|t| > 15`.
+- **Per-format field alignment for wider loads.** The nearest thing to packing,
+  which won, so this is the least implausible of the group. It is still narrow:
+  it applies only to formats whose layout guarantees the alignment, and the plan
+  already required stopping if the compiler coalesces the accesses anyway.
+
+**Warp-specialized producer/consumer dequantization is blocked by its own
+prerequisites**, not by this decision. It required either register pressure
+below the ceiling -- the kernel sits at `REG:255` -- or a reason arising from the
+staging result: staging winning with conversion still exposed, or profiling
+showing conversion dominates once DMA latency is hidden. Staging lost, so
+neither holds.
+
+Attributing these losses would need a kernel profiler. Nsight Compute is not
+installed on the benchmark host and the CUDA toolkit there ships neither `ncu`
+nor `nsys`, so establishing the real limiter is itself a piece of setup work.
+Given four consecutive regressions from interventions premised on a bottleneck
+the measurements contradict, the judgement recorded here is that further
+loader-internal attempts are not worth the time without that profiler, and that
+effort is better spent on the vector/MMA crossover, which changes dispatch
+rather than kernel code, and on closing interaction coverage.
+
+Anyone reopening this should install a profiler first and re-derive the premise.
+The evidence above is enough to say what does *not* limit this kernel; it is not
+enough to say what does.
 
 #### Rejected: a quantized-specific MMA configuration
 

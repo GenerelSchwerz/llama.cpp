@@ -247,21 +247,20 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-#ifdef GGML_CUDA_FATTN_Q8_NATIVE
 // Routing is otherwise only observable indirectly, through allocation size or
 // throughput, and both can be dominated by unrelated effects. Setting
-// GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE logs every launch that actually takes this
+// GGML_CUDA_FATTN_NATIVE_VERBOSE logs every launch that actually takes this
 // path, so a measurement can state that it exercised the kernel rather than
 // inferring it.
 static void ggml_cuda_flash_attn_ext_mma_quant_log_route(const ggml_tensor * dst) {
-    static const bool verbose = getenv("GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE") != nullptr;
+    static const bool verbose = getenv("GGML_CUDA_FATTN_NATIVE_VERBOSE") != nullptr;
     if (!verbose) {
         return;
     }
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    GGML_LOG_INFO("fattn-q8-native: K=%s V=%s D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
+    GGML_LOG_INFO("fattn-native: K=%s V=%s D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
         ggml_type_name(K->type), ggml_type_name(V->type),
         (int) Q->ne[0], (int) Q->ne[1], (int) K->ne[1], (int) Q->ne[2], (int) K->ne[2]);
 }
@@ -316,7 +315,6 @@ static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, 
     }
 #undef FATTN_MMA_QUANT_DISPATCH_CASE
 }
-#endif // GGML_CUDA_FATTN_Q8_NATIVE
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -420,26 +418,16 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
-    BEST_FATTN_KERNEL_MMA_Q8  = 500, // MMA reading a Q8_0 cache in place, no F16 copy
+    BEST_FATTN_KERNEL_MMA_NATIVE  = 500, // MMA reading a quantized cache in place, no F16 copy
 };
 
-// The graph opts in per node. Builds without a registered native kernel keep
-// the ordinary materializing route and report that the request was ignored.
+// The graph opts in per node. The kernels for the default cache types are
+// compiled by every CUDA FlashAttention build, so a default-tier request is
+// declined only by the route predicate below. An extra-tier request is still
+// declined by the build when GGML_CUDA_FA_ALL_QUANTS was not set, because
+// ggml_cuda_fattn_mma_quant_type() then does not name those types.
 static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
-    const bool requested =
-        ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
-#ifdef GGML_CUDA_FATTN_Q8_NATIVE
-    return requested;
-#else
-    if (requested) {
-        static std::once_flag warn_flag;
-        std::call_once(warn_flag, [] {
-            GGML_LOG_WARN("quantized-native CUDA FlashAttention was requested, but this build has no native kernels; "
-                          "using the standard materializing path\n");
-        });
-    }
-    return false;
-#endif // GGML_CUDA_FATTN_Q8_NATIVE
+    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
 }
 
 // The native route covers the compiled K/V type pairs at the supported equal
@@ -627,7 +615,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
         if (ggml_cuda_fattn_native_applies(cc, dst)) {
-            return BEST_FATTN_KERNEL_MMA_Q8;
+            return BEST_FATTN_KERNEL_MMA_NATIVE;
         }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
@@ -718,7 +706,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
-        case BEST_FATTN_KERNEL_MMA_Q8:
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
             // The whole point: the kernel reads the Q8_0 cache in place.
             break;
         case BEST_FATTN_KERNEL_NONE:
@@ -744,12 +732,8 @@ static void ggml_cuda_flash_attn_ext_dispatch(ggml_backend_cuda_context & ctx, g
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_MMA_Q8:
-#ifdef GGML_CUDA_FATTN_Q8_NATIVE
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
             ggml_cuda_flash_attn_ext_mma_quant(ctx, dst);
-#else
-            GGML_ABORT("fatal error"); // unreachable: gated by ggml_cuda_fattn_native_applies
-#endif // GGML_CUDA_FATTN_Q8_NATIVE
             break;
     }
 }

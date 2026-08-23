@@ -5,8 +5,11 @@ supported quantized K/V cache directly. This removes the temporary F16 K/V
 materialization used by the standard MMA path. It does not change the
 persistent cache format, cache placement, or quantization policy.
 
-The feature is deliberately explicit at both build time and run time. Its
-current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
+The feature is deliberately explicit at run time: `--flash-attn-native-quants`
+is off by default and nothing takes the native route without it. The kernels
+for the default types are compiled by every CUDA FlashAttention build
+(`GGML_CUDA_FA=ON`, its default), so there is no family-specific build switch to
+enable them. Its current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
 equal head dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
 implementation. `GGML_CUDA_FA_ALL_QUANTS` adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`,
 `Q3_1`, `Q2_0`, and `Q2_1` to the same head-dimension set. K and V need not be
@@ -71,13 +74,13 @@ pair from the K and V tensors themselves.
 
 ## Build and use
 
-The native MMA family (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`; plus `Q4_1`, `Q5_1`,
-`Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, `Q2_1` under `GGML_CUDA_FA_ALL_QUANTS`) is not
-compiled by default:
+The native MMA family's default types (`Q8_0`, `Q6_0`, `Q5_0`, `Q4_0`) are
+compiled by every CUDA FlashAttention build. `GGML_CUDA_FA_ALL_QUANTS` is the
+single build flag that adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0` and `Q2_1`. This build
+therefore contains the default family:
 
 ```bash
-cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
-  -DGGML_CUDA_FATTN_Q8_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
@@ -90,16 +93,19 @@ build/bin/llama-server -m model.gguf --flash-attn on \
 ```
 
 The run-time option is exposed by the server, CLI, perplexity, batched,
-parallel, and benchmark tools. A build without native kernels accepts the
-option, retains the standard route, and reports a once-only warning. A build
-with the native family reports the same kind of warning when an opted-in
-quantized pair or head dimension has no registered kernel. F16/BF16 attention
-is not treated as an unsupported quantized request.
+parallel, and benchmark tools. Because the default kernels are always present, a
+default-tier request can no longer be declined by the build. It is still
+declined -- with a once-only warning -- when the opted-in pair, head dimension,
+or device has no registered kernel, and an **extra-tier** request is declined on
+a build without `GGML_CUDA_FA_ALL_QUANTS`, because that build omitted those
+types. Only default-tier requests are independent of a build switch, and only
+when FlashAttention itself is compiled. F16/BF16 attention is not treated as an
+unsupported quantized request.
 
 `GGML_CUDA_FA_ALL_QUANTS` extends this family's own registration list (see
 above) in addition to controlling the existing vector FlashAttention pair
-matrix; it does not implicitly instantiate every K/V pair for the native MMA
-route.
+matrix. For the native MMA route it does instantiate every ordered K/V pair of
+the compiled types: 16 pairs in the default tier, 121 with the flag.
 
 ## Implementation structure
 
@@ -146,8 +152,10 @@ structure:
   the full unfiltered cross product; declaring the pairs the policy rejects costs
   nothing because they are never odr-used, and it removes any chance of the
   declaration list and the generator disagreeing.
-- CMake includes those generated sources only when
-  `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
+- CMake always includes the generated sources for the default types. Without
+  `GGML_CUDA_FA_ALL_QUANTS` the extra-tier K-type files are filtered out, since
+  they would contribute no cases and each would still cost an `nvcc` invocation
+  over the full MMA header.
 
 There are 16 tile shapes and three supported head dimensions, and two kernels
 per type: one specializing V for the symmetric pair, one selecting V at runtime
@@ -192,7 +200,7 @@ is large enough for MMA routing.
 Performance is shape- and device-dependent. Removing conversion traffic can
 reduce memory use without guaranteeing a meaningful speedup, and an in-kernel
 dequantization schedule can lose to the materialized path on an untested GPU or
-geometry. This is why both the build and run-time defaults remain off.
+geometry. This is why the run-time default remains off.
 
 ## Validation protocol
 
@@ -200,10 +208,10 @@ For a source change, validate both build modes and both execution outcomes:
 
 1. Generate instances from `ggml/src/ggml-cuda/template-instances` and confirm
    a second generator run is byte-idempotent.
-2. Build with `GGML_CUDA_FATTN_Q8_NATIVE=OFF`; verify no native quantized MMA
-   instance is compiled or linked and an opted-in graph uses the fallback with
-   a warning.
-3. Build with it `ON`; run the focused `FLASH_ATTN_EXT` cases filtered by
+2. Build without `GGML_CUDA_FA_ALL_QUANTS`; verify only the four default K
+   types produce instances and that an extra-tier pair falls back.
+3. Build with `GGML_CUDA_FA_ALL_QUANTS=ON`; run the focused `FLASH_ATTN_EXT`
+   cases filtered by
    `native_quants=1`. They cover D=64/128/256, padded and unpadded KV lengths,
    GQA-selected column geometries, query-batch tile choices, and unsupported
    fallbacks against the CPU reference.
@@ -217,7 +225,7 @@ For a source change, validate both build modes and both execution outcomes:
    VRAM, and the reserved CUDA compute buffer.
 
 For route auditing only,
-`GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` logs each launch that actually selects
+`GGML_CUDA_FATTN_NATIVE_VERBOSE=1` logs each launch that actually selects
 the native quantized MMA family, for any of its registered types. It does not
 enable or disable the route and is not part of a serving configuration.
 
@@ -229,11 +237,13 @@ Qwen3.8 27B model and homogeneous Q8_0 target and MTP cache types. The detailed
 commands, hashes, and artifacts are recorded in Experiment 022 of
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
-- Both CMake modes built from the same commit. The disabled build contained no
-  Q8 MMA instances and passed all 98 opted-in cases through the once-warned
-  standard fallback. The enabled build passed the same 98 cases, selecting all
-  registered D=64/128/256 geometries and retaining the mixed-pair and D=72
-  fallbacks.
+- Both CMake modes built from the same commit. This predates the build-policy
+  change below: at the time the family was opt-in, so the disabled build
+  contained no native MMA instances and passed all 98 opted-in cases through the
+  once-warned standard fallback, while the enabled build passed the same 98
+  cases, selecting all registered D=64/128/256 geometries and retaining the
+  mixed-pair and D=72 fallbacks. That fallback-with-warning arm no longer exists
+  for the default types.
 - A maintained 1,000-token MTP exactness comparison changed only the native
   permission. Prompt tokens, request semantics, all output token IDs, and
   response bytes matched exactly.
@@ -249,9 +259,94 @@ commands, hashes, and artifacts are recorded in Experiment 022 of
   single ordered pair.
 
 Enabling the family increased `libggml-cuda.so` by 7,469,120 bytes (7.12 MiB,
-4.02%) in these otherwise matched builds. This build-size cost, the mixed
-short-depth performance, and the limited hardware coverage are why the build
-and run-time defaults remain off.
+4.02%) in these otherwise matched builds. **That figure is historical and must
+not be used to describe the current build policy**: it was measured on the
+earlier symmetric-only implementation, before all-pair coverage, the shared
+attention body, and the removal of the build switch. The mandatory cost of the
+current policy is recorded under "Build cost of the mandatory default family"
+below. The mixed short-depth performance and the limited hardware coverage are
+why the run-time default remains off.
+
+### Known baseline exception to the full-suite gate
+
+Step 4 of the validation protocol requires the full FlashAttention backend
+suite with the run-time option off. **That suite does not currently pass on this
+fork, for reasons that predate this feature**, and the gate should be claimed
+with that exception stated rather than silently.
+
+The focused selection passes: `test-backend-ops -o FLASH_ATTN_EXT -p
+"native_quants=1"` gives 1695/1695. The unfiltered suite aborts with exit 134
+in `ggml_cuda_flash_attn_ext_vec` at:
+
+```
+hsk=320,hsv=256,nr23=[32,1],kv=512,nb=1
+```
+
+No quantized cache is involved, and the mechanism is not an MMA fallthrough.
+`test_flash_attn_ext` builds Q with `nh * nr23[0]` heads against `nh` K/V heads,
+so this case has **GQA ratio 32**, which is the supported multiple: in
+`ggml_cuda_get_best_fattn_kernel`, `case 320` returns
+`BEST_FATTN_KERNEL_NONE` when `gqa_ratio % 32 != 0`, so a ratio *below* 32 never
+reaches vector attention at all. At ratio 32 the shape passes that gate, and
+`can_use_vector_kernel` then admits it because its predicate is only
+`ne[0] <= 512 && ne[0] % 64 == 0 && ne[0] != 192` — and `320 % 64 == 0`. Ada's
+single-query preference returns `BEST_FATTN_KERNEL_VEC` before MMA is
+considered, `fattn-vec-dispatch.cuh` has no `D = 320` case, and the dispatcher
+falls through to the fatal abort while `ggml_backend_supports_op` claims
+support.
+
+In short: D320/DV256 at a supported GQA multiple of 32, in the affected
+small-query shapes, can be selected for vector attention even though no D320
+vector instance exists. The confirmed reproducer is GQA 32.
+
+Provenance, established by @GenerelSchwerz on PR 4: the exact PR target base
+fails identically, tagged BeeLlama v0.4.3 (`ba27edad2`) fails identically, and
+the mismatch originated in `c9e746733`, an ancestor of v0.4.3 in the v0.4.0
+rebase lineage, whose `fattn.cu` is identical to current `beellama-main`.
+
+This is a BeeLlama vector-routing maintenance defect to be tracked and fixed
+separately. It is recorded here only so that "the full suite was run" is never
+claimed for this feature without the exception attached.
+
+## Build cost of the mandatory default family
+
+The default four types are compiled by every CUDA FlashAttention build, so this
+cost is paid
+whether or not `--flash-attn-native-quants` is ever used. It is recorded here
+because the decision to make it mandatory rests on it.
+
+Measured by @GenerelSchwerz on PR 4, matched fresh Release builds, CUDA on,
+KVarN off, all-quants off, `CMAKE_CUDA_ARCHITECTURES=120`:
+
+| Build | `libggml-cuda.so` |
+|---|---:|
+| base `53f4439f0`, family not compiled | 170,893,376 B |
+| head `3f9b1d0b3`, family always compiled | 228,075,704 B |
+| **delta** | **+57,182,328 B (+54.53 MiB, +33.46%)** |
+
+Two things this figure is not. It is not the `+7,469,120` bytes quoted in
+"Recorded validation" above: that predates all-pair coverage, the shared
+attention body, and the removal of the build switch, and it must not be used to
+describe current policy. And it is one architecture — `sm_120` — so a build for
+a different `CMAKE_CUDA_ARCHITECTURES` will differ in absolute size, though the
+mandatory nature of the cost does not.
+
+`GGML_CUDA_FA_ALL_QUANTS` adds the other seven types on top of this, taking the
+family from 384 to 1,056 explicit cases.
+
+**Decision: the cost is accepted deliberately.** The feature previously needed a
+build flag *and* a run-time flag before it did anything, which is poor
+ergonomics for a maintained extension: a user who passes
+`--flash-attn-native-quants` on a stock build got a warning and the slow path,
+with no indication that the fix was a rebuild. Making the default types
+unconditional means the run-time flag is the only thing anyone has to know
+about, and it is the flag that actually decides behaviour.
+
+The trade is `+54.53 MiB` of `libggml-cuda.so` on every CUDA FlashAttention
+build against
+removing a build-time footgun. `GGML_CUDA_FA_ALL_QUANTS` remains available for
+the seven extra types, so the mandatory portion is bounded at the four types
+that cover the common quantized cache configurations.
 
 ## Limitations
 
@@ -271,13 +366,13 @@ and run-time defaults remain off.
   performs synchronous dequantization into shared memory. That is a
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
-- Compile time and CUDA-library size increase when the family is built: 384
-  explicit cases by default, 1,056 with `GGML_CUDA_FA_ALL_QUANTS`. Coverage of
-  every ordered pair costs two kernels per type rather than one per pair,
-  because only the symmetric pair specializes V at compile time. Each case is
-  one device kernel rather than two, because the route requires a zero logit
-  softcap and so never names the softcap specialization. Default llama.cpp
-  builds pay neither cost.
+- Compile time and CUDA-library size increase because the family is always
+  built: 384 explicit cases by default, 1,056 with `GGML_CUDA_FA_ALL_QUANTS`.
+  Coverage of every ordered pair costs two kernels per type rather than one per
+  pair, because only the symmetric pair specializes V at compile time. Each case
+  is one device kernel rather than two, because the route requires a zero logit
+  softcap and so never names the softcap specialization. **Every CUDA
+  FlashAttention build pays the default-tier cost**, measured below.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 
