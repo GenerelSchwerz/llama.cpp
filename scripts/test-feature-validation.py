@@ -832,6 +832,52 @@ class StatisticsTest(unittest.TestCase):
 
 
 class ProfilerTest(unittest.TestCase):
+    def test_profile_workflow_wrapper_preserves_cli_patch_seams(self) -> None:
+        manifest: dict[str, object] = {}
+        provenance: dict[str, object] = {}
+        config: dict[str, object] = {}
+        profile_base = pathlib.Path("/tmp/profile-base")
+        tool_identity = mock.Mock()
+        launch_locked = mock.Mock()
+        expected = {"status": "delegated"}
+
+        with mock.patch.object(
+            CLI, "_tool_identity", tool_identity
+        ), mock.patch.object(
+            CLI, "launch_locked_spec", launch_locked
+        ), mock.patch.object(
+            CLI.profile_workflow, "profile_one", return_value=expected
+        ) as profile_one:
+            observed = CLI._profile_one(
+                manifest,
+                "manifest-sha",
+                provenance,
+                config,
+                variant_name="baseline",
+                screen_id="low",
+                profile_base=profile_base,
+                resume=True,
+                execute_ncu=True,
+            )
+
+        self.assertIs(observed, expected)
+        self.assertIs(CLI.profile_workflow.core, CLI.core)
+        self.assertIs(CLI.profile_workflow.profiler, CLI.profiler)
+        profile_one.assert_called_once_with(
+            manifest,
+            "manifest-sha",
+            provenance,
+            config,
+            variant_name="baseline",
+            screen_id="low",
+            profile_base=profile_base,
+            resume=True,
+            execute_ncu=True,
+            tool_script=CLI.TOOL_SCRIPT,
+            tool_identity=tool_identity,
+            launch_run=launch_locked,
+        )
+
     def test_memory_manifest_categories_are_explicit_and_schema_bounded(self) -> None:
         stage = {
             "resource": "gpu",
