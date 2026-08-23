@@ -207,7 +207,10 @@ option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"  
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile full K/V cache quant pair matrix for FlashAttention"     OFF)
 option(GGML_CUDA_KVARN                      "ggml: compile CUDA/HIP KVarN kernels and native-attention instances"     OFF)
-option(GGML_CUDA_FATTN_Q8_NATIVE            "ggml: compile quantized-native Q8_0 K/V FlashAttention MMA kernels"     OFF)
+# The quantized-native FlashAttention kernels are always compiled for the
+# default cache types (q8_0, q6_0, q5_0, q4_0). GGML_CUDA_FA_ALL_QUANTS adds the
+# remaining seven. Selecting the route at run time is --flash-attn-native-quants.
+unset(GGML_CUDA_FATTN_Q8_NATIVE CACHE)
 unset(GGML_CUDA_KVARN_FA CACHE)
 unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})

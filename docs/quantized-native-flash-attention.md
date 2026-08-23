@@ -76,8 +76,7 @@ The native MMA family (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`; plus `Q4_1`, `Q5_1`,
 compiled by default:
 
 ```bash
-cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON \
-  -DGGML_CUDA_FATTN_Q8_NATIVE=ON -DCMAKE_BUILD_TYPE=Release
+cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
@@ -146,8 +145,10 @@ structure:
   the full unfiltered cross product; declaring the pairs the policy rejects costs
   nothing because they are never odr-used, and it removes any chance of the
   declaration list and the generator disagreeing.
-- CMake includes those generated sources only when
-  `GGML_CUDA_FATTN_Q8_NATIVE=ON`.
+- CMake always includes the generated sources for the default types. Without
+  `GGML_CUDA_FA_ALL_QUANTS` the extra-tier K-type files are filtered out, since
+  they would contribute no cases and each would still cost an `nvcc` invocation
+  over the full MMA header.
 
 There are 16 tile shapes and three supported head dimensions, and two kernels
 per type: one specializing V for the symmetric pair, one selecting V at runtime
@@ -200,10 +201,10 @@ For a source change, validate both build modes and both execution outcomes:
 
 1. Generate instances from `ggml/src/ggml-cuda/template-instances` and confirm
    a second generator run is byte-idempotent.
-2. Build with `GGML_CUDA_FATTN_Q8_NATIVE=OFF`; verify no native quantized MMA
-   instance is compiled or linked and an opted-in graph uses the fallback with
-   a warning.
-3. Build with it `ON`; run the focused `FLASH_ATTN_EXT` cases filtered by
+2. Build without `GGML_CUDA_FA_ALL_QUANTS`; verify only the four default K
+   types produce instances and that an extra-tier pair falls back.
+3. Build with `GGML_CUDA_FA_ALL_QUANTS=ON`; run the focused `FLASH_ATTN_EXT`
+   cases filtered by
    `native_quants=1`. They cover D=64/128/256, padded and unpadded KV lengths,
    GQA-selected column geometries, query-batch tile choices, and unsupported
    fallbacks against the CPU reference.
@@ -217,7 +218,7 @@ For a source change, validate both build modes and both execution outcomes:
    VRAM, and the reserved CUDA compute buffer.
 
 For route auditing only,
-`GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` logs each launch that actually selects
+`GGML_CUDA_FATTN_NATIVE_VERBOSE=1` logs each launch that actually selects
 the native quantized MMA family, for any of its registered types. It does not
 enable or disable the route and is not part of a serving configuration.
 

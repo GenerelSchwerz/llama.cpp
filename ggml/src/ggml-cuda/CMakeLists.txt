@@ -123,18 +123,17 @@ if (CUDAToolkit_FOUND)
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")
     ggml_cuda_select_kvarn_fast_decode_sources(SRCS "template-instances" ${SRCS})
     add_compile_definitions(GGML_CUDA_COMPACT_CAUSAL_MASK)
-    if (GGML_CUDA_FATTN_Q8_NATIVE)
-        add_compile_definitions(GGML_CUDA_FATTN_Q8_NATIVE)
-        if (NOT GGML_CUDA_FA_ALL_QUANTS)
-            # The native instances are split one file per K type. Without
-            # GGML_CUDA_FA_ALL_QUANTS the extra-tier K types contribute no cases
-            # at all, so their files would each cost an nvcc invocation over the
-            # full MMA header for an empty translation unit.
-            list(FILTER SRCS EXCLUDE REGEX
-                "fattn-mma-quant-instance-(q4_1|q5_1|q6_1|q3_0|q3_1|q2_0s|q2_1)-.*[.]cu$")
-        endif()
-    else()
-        list(FILTER SRCS EXCLUDE REGEX "fattn-mma-quant-instance-.*[.]cu$")
+    # Quantized-native MMA FlashAttention is always compiled for the default
+    # cache types (q8_0, q6_0, q5_0, q4_0). There is no separate switch to
+    # enable the family; GGML_CUDA_FA_ALL_QUANTS is the single build flag that
+    # widens it, and --flash-attn-native-quants selects the route at run time.
+    if (NOT GGML_CUDA_FA_ALL_QUANTS)
+        # The native instances are split one file per K type. Without
+        # GGML_CUDA_FA_ALL_QUANTS the extra-tier K types contribute no cases
+        # at all, so their files would each cost an nvcc invocation over the
+        # full MMA header for an empty translation unit.
+        list(FILTER SRCS EXCLUDE REGEX
+            "fattn-mma-quant-instance-(q4_1|q5_1|q6_1|q3_0|q3_1|q2_0s|q2_1)-.*[.]cu$")
     endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
