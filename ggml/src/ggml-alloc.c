@@ -619,6 +619,54 @@ static bool ggml_gallocr_shared_resize_all(
     return true;
 }
 
+static bool ggml_gallocr_shared_reserve(ggml_gallocr_t galloc) {
+    GGML_ASSERT(galloc->shared != NULL);
+
+    // Publish this allocator's complete current plan. Duplicate buffer types
+    // share one tallocr and therefore one requirement entry.
+    bool * entry_updated = (bool *) calloc((size_t) galloc->shared->n_entries, sizeof(bool));
+    GGML_ASSERT(entry_updated != NULL);
+    for (int i = 0; i < galloc->n_buffers; ++i) {
+        const int entry_id = galloc->shared_entry_ids[i];
+        if (entry_updated[entry_id]) {
+            continue;
+        }
+        entry_updated[entry_id] = true;
+
+        size_t * requirements = ggml_gallocr_shared_member_requirements(
+                galloc->shared, &galloc->shared->entries[entry_id], galloc->shared_member);
+        size_t next[GGML_VBUFFER_MAX_CHUNKS] = {0};
+        for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
+            next[c] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
+        }
+        memcpy(requirements, next, sizeof(next));
+    }
+    free(entry_updated);
+
+    bool shrink_ready = false;
+    if (galloc->shared->shrink_pending) {
+        galloc->shared->shrink_seen[galloc->shared_member] = true;
+        shrink_ready = true;
+        for (int member = 0; member < galloc->shared->members_capacity; ++member) {
+            if (galloc->shared->members_active[member] &&
+                    !galloc->shared->shrink_seen[member]) {
+                shrink_ready = false;
+                break;
+            }
+        }
+    }
+
+    const bool ok = ggml_gallocr_shared_resize_all(galloc->shared, shrink_ready);
+    if (ok && shrink_ready) {
+        galloc->shared->shrink_pending = false;
+        if (galloc->shared->members_capacity > 0) {
+            memset(galloc->shared->shrink_seen, 0,
+                    (size_t) galloc->shared->members_capacity * sizeof(bool));
+        }
+    }
+    return ok;
+}
+
 ggml_gallocr_shared_buffers_t ggml_gallocr_shared_buffers_new(void) {
     struct ggml_gallocr_shared_buffers * shared =
             (struct ggml_gallocr_shared_buffers *) calloc(1, sizeof(*shared));
@@ -1267,49 +1315,7 @@ static bool ggml_gallocr_reserve_n_impl(
     }
 
     if (galloc->shared != NULL && !no_alloc) {
-        // Publish this allocator's complete current plan. Duplicate buffer
-        // types share one tallocr and therefore one requirement entry.
-        bool * entry_updated = (bool *) calloc((size_t) galloc->shared->n_entries, sizeof(bool));
-        GGML_ASSERT(entry_updated != NULL);
-        for (int i = 0; i < galloc->n_buffers; ++i) {
-            const int entry_id = galloc->shared_entry_ids[i];
-            if (entry_updated[entry_id]) {
-                continue;
-            }
-            entry_updated[entry_id] = true;
-
-            size_t * requirements = ggml_gallocr_shared_member_requirements(
-                    galloc->shared, &galloc->shared->entries[entry_id], galloc->shared_member);
-            size_t next[GGML_VBUFFER_MAX_CHUNKS] = {0};
-            for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; ++c) {
-                next[c] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
-            }
-            memcpy(requirements, next, sizeof(next));
-        }
-        free(entry_updated);
-
-        bool shrink_ready = false;
-        if (galloc->shared->shrink_pending) {
-            galloc->shared->shrink_seen[galloc->shared_member] = true;
-            shrink_ready = true;
-            for (int member = 0; member < galloc->shared->members_capacity; ++member) {
-                if (galloc->shared->members_active[member] &&
-                        !galloc->shared->shrink_seen[member]) {
-                    shrink_ready = false;
-                    break;
-                }
-            }
-        }
-
-        const bool ok = ggml_gallocr_shared_resize_all(galloc->shared, shrink_ready);
-        if (ok && shrink_ready) {
-            galloc->shared->shrink_pending = false;
-            if (galloc->shared->members_capacity > 0) {
-                memset(galloc->shared->shrink_seen, 0,
-                        (size_t) galloc->shared->members_capacity * sizeof(bool));
-            }
-        }
-        return ok;
+        return ggml_gallocr_shared_reserve(galloc);
     }
 
     // reallocate private buffers if needed

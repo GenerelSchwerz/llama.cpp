@@ -40,6 +40,15 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    struct sched_reserve_plan {
+        uint32_t n_tokens_max    = 0;
+        uint32_t n_tokens_decode = 0;
+        uint32_t n_tokens        = 0;
+        uint32_t n_kv_capacity   = 0;
+        uint32_t n_kv            = 0;
+        bool live_kv             = false;
+    };
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -54,6 +63,8 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve(uint32_t n_tokens = 0, uint32_t n_kv = 0);
+    sched_reserve_plan make_sched_reserve_plan(uint32_t n_tokens, uint32_t n_kv) const;
+    void prepare_shared_sched_reserve(const sched_reserve_plan & plan);
     llama_workspace_stats get_workspace_stats() const;
     bool shares_workspace_with(const llama_context & other) const;
     void record_backend_private_workspace(ggml_cgraph * gf);
