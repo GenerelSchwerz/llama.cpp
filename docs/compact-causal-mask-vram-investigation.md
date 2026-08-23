@@ -3233,3 +3233,128 @@ and
 `b07d65d0c3dad4c25f09ae1a05890633fb2d22a0deb1f70c0a864531b177cc8e`;
 the artifact manifest SHA-256 is
 `90e5d33caecce8cbe060c46e19b73ed09db1c659096f8388649a2708dbe660e0`.
+
+## 2026-08-23: post-main-merge composition validation
+
+The lifetime repair was committed as
+`0a85856eeb6509881677cb745fb11745887dc1f3`; its allocation attribution was
+committed separately as `77164bcd8f51090eabbd0fefe03e1ce2cf8e9710`.
+Merge `df9491bb2ff5442b70c2b1e91f4502792bd5e18b` then incorporated maintenance
+head `4b86269fdf001de44dd96e9c9ae26a9e25091cca` without conflicts. The incoming
+source included allocator, scheduler-reserve, KV ownership, VMM telemetry,
+validation-tooling, and speculative replay cleanup, so the merged head received
+fresh proportional compile, exactness, quality, performance, and allocation
+coverage. The committed compact source was clean for its accepted runs; the
+dense controls carried only the one-line capability delta documented below.
+
+The post-merge build retained Release, native CPU tuning, SM120, CUDA
+FlashAttention, native Q8 MMA on, KVarN off, and the default quant matrix. The
+complete build command was serialized by `/tmp/beellama-cuda-build.lock` and
+used `--parallel 12`. `llama-bench`, `llama-perplexity`,
+`test-backend-ops`, `libllama.so.0`, the restored compact CUDA library, and the
+CMake cache respectively hash to
+`d9cfbe682e113054441a8f37531c2a91f26b5289996f975a5cd57422c4157055`,
+`1f6ae1d70479735eb9783da2835df5651213fc952084cdfb77b5dd9dbf2a106b`,
+`0cb9a4f69613ebd5caa4bc8be5010f426eda63b8e0e047072f89053a9e8057f3`,
+`ddd9339c7860a863344bf8d006fcc34c38aae68cd76558558a0b73b033a18258`,
+`bbce271d9ced0b59ce0ae72e57ca418f9fe227a53b5d14bdb9c0b4c5b91d949f`,
+and
+`de994706eb1a9ea97ad6a947d5fffb0c2547f9d8a720c1943d17399449fd97d8`.
+The runtime reported build `11379 (df9491bb2)`. Hardware remained the NVIDIA
+GeForce RTX 5070 Ti with driver 610.57.04 and Intel Core Ultra 9 285K recorded
+for the preceding campaign.
+
+### Correctness and quality after composition
+
+The restored source passed all seven compact-versus-explicit-dense CUDA
+equivalence cases, including the two D=256 native-Q8 layouts; its captured log
+SHA-256 is
+`d3f602c92ced804cf65f3233e4088da3170902861f9a7759771d933a6f8a6714`.
+Fourteen focused static, generated-dispatch, allocator, graph, native-route,
+CPU attention-support, argument, and speculative-replay tests passed 14/14.
+Their log SHA-256 is
+`b23a187fbb3fe7627c599453faeb04ecf7acaddbbe3bc3ff5f4ea6746a155975`.
+The initial attempt to capture that CTest group was a launcher failure because
+the nested shell expanded an unquoted alternation regex; CTest never started,
+the invalid log was replaced, and it contributes no test result.
+
+The source-matched CPU-pinned quality gate used the exact preceding
+`llama-perplexity` command with `-c 4096 -b 512 -ub 256 --chunks 4`. It again
+printed exactly `1.9315, 2.1279, 2.2498, 2.1674` and final
+`PPL = 2.1674 +/- 0.03849`. The captured log SHA-256 is
+`aaca2f32c237f73c4f503d1c8b7a5b40c754ce8d36f62f86649c9f00750973f5`.
+The model and corpus retain their recorded SHA-256 values
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`
+and
+`8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
+There is still exactly zero measured perplexity increase.
+
+### Source-matched performance and allocation bracket
+
+Every benchmark was a fresh process wholly enclosed by
+`/tmp/beellama-single-gpu.lock`. The commands were the exact 4K GPU-KV and 30K
+CPU-pinned templates recorded above, plus a 30K GPU-KV form that changed only
+`-d 30000`. All used three repetitions, `-b 512 -ub 256`, native llama
+affinity, `--no-warmup --progress --kv-memory`, and unrelated live-context
+workspace off. The dense control changed only the CUDA backend's compact
+capability return to `false`; its one-line source diff SHA-256 is
+`d4e817ebff07164040ddd822f2cc273acdb029022bb944e248f9c86cae7e73a0`
+and its CUDA library SHA-256 is
+`48c1dca1c82befda1394fbd5a9285e1e7297e9158dd465302d3342a3c0290887`.
+The compact library was restored to the exact hash above after every dense
+arm.
+
+The stable GPU-resident results are:
+
+| depth / phase | compact bracket | dense | compact point effect | A2 versus A1 |
+|---|---:|---:|---:|---:|
+| 4K / 512-token prefill | 1,801.965355 tok/s | 1,800.314908 tok/s | +0.091675% | -0.186717% |
+| 4K / 128-token decode | 49.760205 tok/s | 49.743544 tok/s | +0.033495% | -0.157402% |
+| 30K / 512-token prefill | 1,355.102178 tok/s | 1,335.199178 tok/s | **+1.490639%** | +0.101756% |
+| 30K / 128-token decode | 44.164006 tok/s | 43.915398 tok/s | **+0.566106%** | -0.000509% |
+
+Thus the 4K point is neutral and the long-context GPU bracket is positive.
+The two 30K compact decode processes are effectively identical, closing the
+post-merge throughput gate without turning the small 4K point into a speedup
+claim.
+
+The 30K CPU-pinned order was extended from A/B/A to A/B/A/B/A after the
+closing A exposed host-sensitive drift. The three compact process means were
+`23.973638, 23.282981, 23.354568 tok/s`; the two dense means were
+`23.888814, 23.135163 tok/s`. Their aggregate point means are
+`23.537062` and `23.511989 tok/s` (+0.106643%), but the between-process range
+is much larger than that difference and the two local brackets disagree.
+One-second telemetry for the closing dense/compact pair showed matching
+sustained SM clocks near 2.827 GHz, so GPU throttling does not explain the
+host-path variation. This timing series is valid but neutral/inconclusive and
+supports no CPU-pinned decode speed claim. Its three compact prefill means all
+exceeded both dense means; the aggregate prefill point is +1.563414%, but it is
+reported only as a point effect because the process count is small.
+
+Allocation fields were deterministic across every repeated process:
+
+| placement / phase | peak process VRAM compact / dense | device compute delta | accelerator-host compute delta | total CUDA-owned compute delta |
+|---|---:|---:|---:|---:|
+| GPU KV 4K / prefill | 14,389,739,520 / 14,391,836,672 B | -2,359,296 B | -2,359,296 B | -4,718,592 B |
+| GPU KV 4K / decode | 14,377,156,608 / 14,379,253,760 B | -2,228,224 B | -2,228,224 B | -4,456,448 B |
+| GPU KV 30K / prefill | 15,297,806,336 / 15,297,806,336 B | +287,872 B | -15,728,640 B | -15,440,768 B |
+| GPU KV 30K / decode | 15,276,834,816 / 15,276,834,816 B | +287,872 B | -15,466,496 B | -15,178,624 B |
+| CPU-pinned KV 30K / prefill | 14,240,841,728 / 14,240,841,728 B | +282,752 B | -15,728,640 B | -15,445,888 B |
+| CPU-pinned KV 30K / decode | 14,236,647,424 / 14,236,647,424 B | +282,752 B | -15,466,496 B | -15,183,744 B |
+
+Device/accelerator-host context buffers, resident KV, ordinary-host buffers,
+and VMM live/mapped high-water matched within every placement. The 4K graph
+retains a 2 MiB process-VRAM saving. At 30K the allocator outcome keeps
+process VRAM equal while compact removes about 15 MiB of CUDA-owned compute
+storage, almost entirely accelerator-host memory. These post-merge values
+reproduce the earlier source-matched allocation deltas exactly despite the
+incoming ownership and VMM cleanup.
+
+Disposition: retain the lifetime repair and the merged maintenance cleanup.
+The merged source is exact at the operation and model levels, the stable 30K
+GPU throughput gate is positive, the 4K point is neutral, the CPU-pinned decode
+timing is explicitly inconclusive, and the compact allocation reduction is
+unchanged. Raw artifacts are under
+`/home/gencoolpc/vram-results/2026-08-23-dev-main-merge-validation`; the verified
+artifact manifest SHA-256 is
+`6911a3bd31fc288e6782f77db1507261b9e4a330b8caefce632f51dd62f6e442`.
