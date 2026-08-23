@@ -44,7 +44,7 @@
     {
       "name": "clean-gpu-mtp2",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"mtp": {"depth": 2}},
       "args": ["--alias", "clean-gpu-mtp2", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },
@@ -72,7 +72,7 @@
     {
       "name": "clean-gpu-mtp6",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"mtp": {"depth": 6}},
       "args": ["--alias", "clean-gpu-mtp6", "--spec-type", "draft-mtp", "--spec-draft-n-max", "6", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },

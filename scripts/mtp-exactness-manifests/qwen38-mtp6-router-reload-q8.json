@@ -77,7 +77,7 @@
     {
       "name": "clean-gpu-phase-off",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "request": {"model": "mtp6-reload"},
       "router_preset": {
         "initial_file": "/home/gencoolpc/beellama-mtp-exact/scripts/mtp-exactness-manifests/presets/qwen38-mtp6-reload-before.ini",

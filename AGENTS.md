@@ -189,7 +189,7 @@ candidate. Record both values with every result.
 
 ## CPU KV-offload Experiment Workflow
 
-These instructions apply when working on `exp/kv-cpu-offload` or continuing its
+These instructions apply when working on local `beellama/main` or continuing its
 CPU-resident KV-cache investigation.
 
 - Read `docs/cpu-kv-offload-current-testing.md` before changing code, launching

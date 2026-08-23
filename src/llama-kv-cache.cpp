@@ -413,9 +413,7 @@ llama_kv_cache::llama_kv_cache(
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
                  uint32_t   tail_visibility_window,
-                     bool   cpu_pinned,
-                 uint32_t   gpu_resident_layers,
-                     bool   offload_attn_compute) :
+ llama_memory_placement_options placement) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
     tail_tokens(tail_tokens), tail_rollback_tokens(tail_rollback_tokens),
@@ -456,19 +454,19 @@ llama_kv_cache::llama_kv_cache(
             continue;
         }
 
-        const bool layer_offload = offload || n_gpu_resident < gpu_resident_layers;
+        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
         layer_buft[il] = layer_offload ?
                 ggml_backend_dev_buffer_type(model.dev_layer(il)) :
-                llama_kv_cache_get_host_buft(model, il, cpu_pinned);
+                llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
         }
     }
 
-    if (!offload && gpu_resident_layers > 0) {
+    if (!offload && placement.gpu_resident_layers > 0) {
         LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested KV layers device-resident\n",
-                __func__, n_gpu_resident, gpu_resident_layers);
+                __func__, n_gpu_resident, placement.gpu_resident_layers);
     }
     const uint32_t n_layer_kv = hparams.n_layer_kv();
     const bool is_mla = hparams.is_mla();
@@ -594,7 +592,7 @@ llama_kv_cache::llama_kv_cache(
                 route_buft = layer_buft[il];
             }
             auto * storage_backend = llama_kv_cache_get_backend(route_buft);
-            auto * execution_backend = offload_attn_compute ? model.dev_layer(il) : storage_backend;
+            auto * execution_backend = placement.offload_attn_compute ? model.dev_layer(il) : storage_backend;
             if (!execution_backend) {
                 execution_backend = storage_backend;
             }
@@ -878,7 +876,12 @@ llama_kv_cache::llama_kv_cache(
     uint64_t store_stage_bytes = 0;
     uint32_t store_stage_layers = 0;
 
-    const auto store_stage_buft = [&](uint32_t il, ggml_type type, int64_t n_embd) {
+    enum class kv_store_side {
+        key,
+        value,
+    };
+
+    const auto probe_store_stage_buft = [&](uint32_t il, ggml_type type, int64_t n_embd) -> ggml_backend_buffer_type_t {
         if (n_ubatch == 0 || !ggml_is_quantized(type)) {
             return (ggml_backend_buffer_type_t) nullptr;
         }
@@ -910,6 +913,40 @@ llama_kv_cache::llama_kv_cache(
         const bool staged_store = ggml_backend_dev_supports_op(
                 dev, ggml_cpy(probe.get(), src, dst));
         return direct_store && staged_store ? buft : nullptr;
+    };
+
+    const auto resolve_store_stage_buft = [&](uint32_t il, ggml_type type, int64_t n_embd,
+                                              kv_store_side side) -> ggml_backend_buffer_type_t {
+        const auto store_buft = probe_store_stage_buft(il, type, n_embd);
+        auto * layer_dev = model.dev_layer(il);
+        const bool accelerator_layer = layer_dev &&
+                ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        if (accelerator_layer && ggml_is_quantized(type) && !store_buft) {
+            const char * side_label = side == kv_store_side::key ? "K" : "V";
+            throw std::runtime_error(format(
+                    "layer %u cannot preserve accelerator %s %s-cache store semantics in host-resident storage: "
+                    "the layer backend must support both direct and staged F32-to-%s conversion",
+                    il, ggml_backend_dev_name(layer_dev), side_label, ggml_type_name(type)));
+        }
+        return store_buft;
+    };
+
+    const auto create_store_stage = [&](ggml_backend_buffer_type_t store_buft,
+                                        uint32_t il, ggml_type type, int64_t n_embd,
+                                        kv_store_side side) -> ggml_tensor * {
+        GGML_ASSERT(store_buft);
+
+        const char * side_label = side == kv_store_side::key ? "K" : "V";
+        const char * side_name  = side == kv_store_side::key ? "k" : "v";
+        auto * store_ctx = ctx_for_buft(store_buft);
+        if (!store_ctx) {
+            throw std::runtime_error(format(
+                    "failed to create %s-cache store staging context", side_label));
+        }
+        auto * stage = ggml_new_tensor_2d(store_ctx, type, n_embd, store_stage_rows);
+        ggml_format_name(stage, "cache_%s_store_stage_l%d", side_name, il);
+        store_stage_bytes += ggml_nbytes(stage);
+        return stage;
     };
 
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -999,44 +1036,14 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k_store_stage = nullptr;
         ggml_tensor * v_store_stage = nullptr;
         if (ggml_backend_buft_is_host(buft) && !compact_native_exact) {
-            const auto k_store_buft = store_stage_buft(il, layer_type_k, n_embd_k_gqa);
+            const auto k_store_buft = resolve_store_stage_buft(
+                    il, layer_type_k, n_embd_k_gqa, kv_store_side::key);
             const auto v_store_buft = has_v && !v_trans ?
-                    store_stage_buft(il, layer_type_v, n_embd_v_gqa) : nullptr;
-            auto * layer_dev = model.dev_layer(il);
-            const bool accelerator_layer = layer_dev &&
-                    ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU;
-            if (accelerator_layer && ggml_is_quantized(layer_type_k) && !k_store_buft) {
-                throw std::runtime_error(format(
-                        "layer %u cannot preserve accelerator %s K-cache store semantics in host-resident storage: "
-                        "the layer backend must support both direct and staged F32-to-%s conversion",
-                        il, ggml_backend_dev_name(layer_dev), ggml_type_name(layer_type_k)));
-            }
-            if (accelerator_layer && has_v && !v_trans && ggml_is_quantized(layer_type_v) && !v_store_buft) {
-                throw std::runtime_error(format(
-                        "layer %u cannot preserve accelerator %s V-cache store semantics in host-resident storage: "
-                        "the layer backend must support both direct and staged F32-to-%s conversion",
-                        il, ggml_backend_dev_name(layer_dev), ggml_type_name(layer_type_v)));
-            }
-            if (k_store_buft) {
-                auto * store_ctx = ctx_for_buft(k_store_buft);
-                if (!store_ctx) {
-                    throw std::runtime_error("failed to create K-cache store staging context");
-                }
-                k_store_stage = ggml_new_tensor_2d(
-                        store_ctx, layer_type_k, n_embd_k_gqa, store_stage_rows);
-                ggml_format_name(k_store_stage, "cache_k_store_stage_l%d", il);
-                store_stage_bytes += ggml_nbytes(k_store_stage);
-            }
-            if (v_store_buft) {
-                auto * store_ctx = ctx_for_buft(v_store_buft);
-                if (!store_ctx) {
-                    throw std::runtime_error("failed to create V-cache store staging context");
-                }
-                v_store_stage = ggml_new_tensor_2d(
-                        store_ctx, layer_type_v, n_embd_v_gqa, store_stage_rows);
-                ggml_format_name(v_store_stage, "cache_v_store_stage_l%d", il);
-                store_stage_bytes += ggml_nbytes(v_store_stage);
-            }
+                    resolve_store_stage_buft(il, layer_type_v, n_embd_v_gqa, kv_store_side::value) : nullptr;
+            k_store_stage = k_store_buft ?
+                    create_store_stage(k_store_buft, il, layer_type_k, n_embd_k_gqa, kv_store_side::key) : nullptr;
+            v_store_stage = v_store_buft ?
+                    create_store_stage(v_store_buft, il, layer_type_v, n_embd_v_gqa, kv_store_side::value) : nullptr;
             if (k_store_stage || v_store_stage) {
                 ++store_stage_layers;
             }
@@ -3104,15 +3111,18 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0);
 }
 
-ggml_tensor * llama_kv_cache::stage_store_rows(
+ggml_tensor * llama_kv_cache::build_store_source(
         ggml_context * ctx,
         ggml_tensor  * source,
         ggml_tensor  * stage) const {
-    GGML_ASSERT(source && stage && source->type == GGML_TYPE_F32);
+    if (stage) {
+        GGML_ASSERT(source && source->type == GGML_TYPE_F32);
+    }
 
     const int64_t n_embd   = source->ne[0]*source->ne[1];
     const int64_t n_tokens = source->ne[2];
-    if (n_embd != stage->ne[0] || n_tokens > stage->ne[1]) {
+
+    if (stage && (n_embd != stage->ne[0] || n_tokens > stage->ne[1])) {
         const std::string message = format(
                 "accelerator KV store stage shape mismatch: source=[%lld,%lld,%lld,%lld] "
                 "stage=[%lld,%lld,%lld,%lld]",
@@ -3123,9 +3133,15 @@ ggml_tensor * llama_kv_cache::stage_store_rows(
         LLAMA_LOG_ERROR("%s: %s\n", __func__, message.c_str());
         throw std::runtime_error(message);
     }
-    GGML_ASSERT(ggml_row_size(source->type, source->ne[0]) == source->nb[1]);
+    if (stage) {
+        GGML_ASSERT(ggml_row_size(source->type, source->ne[0]) == source->nb[1]);
+    }
 
     source = ggml_view_2d(ctx, source, n_embd, n_tokens, source->nb[2], 0);
+    if (!stage) {
+        return source;
+    }
+
     stage = ggml_view_2d(ctx, stage, n_embd, n_tokens, stage->nb[1], 0);
     return ggml_cpy(ctx, source, stage);
 }
@@ -3142,7 +3158,6 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 
     const int64_t n_embd_head = k_cur->ne[0];
     const int64_t n_head      = k_cur->ne[1];
-    const int64_t n_tokens    = k_cur->ne[2];
 
     // we can merge dims 0 and 1
     // TODO: add ggml helper function for this?
@@ -3151,9 +3166,7 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
     const int64_t n_embd_gqa = n_embd_head * n_head;
     GGML_ASSERT(n_embd_gqa == k->ne[0]);
 
-    k_cur = layers[ikv].k_store_stage ?
-            stage_store_rows(ctx, k_cur, layers[ikv].k_store_stage) :
-            ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+    k_cur = build_store_source(ctx, k_cur, layers[ikv].k_store_stage);
 
     const int64_t n_stream = k->ne[2];
 
@@ -3196,9 +3209,7 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     if (!v_trans) {
         GGML_ASSERT(n_embd_gqa == v->ne[0]);
 
-        v_cur = layers[ikv].v_store_stage ?
-                stage_store_rows(ctx, v_cur, layers[ikv].v_store_stage) :
-                ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+        v_cur = build_store_source(ctx, v_cur, layers[ikv].v_store_stage);
 
         if (n_stream > 1) {
             const int64_t kv_size = get_size();
@@ -3255,14 +3266,13 @@ ggml_tensor * llama_kv_cache::cpy_k_with_tail(
     GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
 
     ggml_tensor * k_cur_exact = k_cur;
-    k_cur = layers[ikv].k_store_stage ?
-            stage_store_rows(ctx, k_cur, layers[ikv].k_store_stage) :
-            ggml_view_2d(ctx, k_cur, n_embd, n_tokens, k_cur->nb[2], 0);
+    ggml_tensor * store_stage = layers[ikv].k_store_stage;
+    k_cur = build_store_source(ctx, k_cur, store_stage);
     if (body->ne[2] > 1) {
         body = ggml_reshape_2d(ctx, body, n_embd, body->ne[1]*body->ne[2]);
     }
 
-    if (layers[ikv].k_store_stage) {
+    if (store_stage) {
         ggml_tensor * body_written = ggml_set_rows(ctx, body, k_cur, k_idxs);
         return cpy_k_tail(ctx, k_cur_exact, tail_idxs, il, body_written);
     }
@@ -3295,14 +3305,13 @@ ggml_tensor * llama_kv_cache::cpy_v_with_tail(
     GGML_ASSERT(ggml_row_size(v_cur->type, v_cur->ne[0]) == v_cur->nb[1]);
 
     ggml_tensor * v_cur_exact = v_cur;
-    v_cur = layers[ikv].v_store_stage ?
-            stage_store_rows(ctx, v_cur, layers[ikv].v_store_stage) :
-            ggml_view_2d(ctx, v_cur, n_embd, n_tokens, v_cur->nb[2], 0);
+    ggml_tensor * store_stage = layers[ikv].v_store_stage;
+    v_cur = build_store_source(ctx, v_cur, store_stage);
     if (body->ne[2] > 1) {
         body = ggml_reshape_2d(ctx, body, n_embd, body->ne[1]*body->ne[2]);
     }
 
-    if (layers[ikv].v_store_stage) {
+    if (store_stage) {
         ggml_tensor * body_written = ggml_set_rows(ctx, body, v_cur, v_idxs);
         return cpy_v_tail(ctx, v_cur_exact, tail_idxs, il, body_written);
     }

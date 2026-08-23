@@ -18,6 +18,112 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 
 For the full feature and public-repo comparison, read [docs/beellama-features.md](docs/beellama-features.md). For the complete argument reference, read [docs/beellama-args.md](docs/beellama-args.md).
 
+## New on Main
+
+> **Living section:** these are the newest user-facing features merged after
+> BeeLlama v0.4.3. They remain here with practical examples while the mainline
+> evolves, then graduate into the regular feature sections and release notes.
+
+The current mainline adds explicit controls for moving KV storage out of VRAM
+and reducing transient compute allocations. These controls are opt-in: without
+them, Bee retains GPU-resident KV and upfront workspace reservation. They do
+not change KV precision by themselves; `--cache-type-k` and `--cache-type-v`
+still control cache representation and quality.
+
+| Feature | Enable it with | Default | Main tradeoff |
+| --- | --- | --- | --- |
+| Pinned CPU KV | `--no-kv-offload --kv-cpu-pinned` | Off | Saves persistent VRAM, but consumes pinned system RAM and transfers growing history to the accelerator. |
+| Hybrid recurrent-state offload | `--recurrent-state-offload` | Off | Keeps fixed recurrent R/S state on the GPU while attention KV remains on the host. |
+| Partial target KV residency | `--kv-gpu-layers N` | `0` under CPU-KV policy | Trades VRAM for lower host-to-device traffic by retaining the first `N` owned attention-KV layers on the accelerator. |
+| Independent draft KV residency | `--spec-draft-kv-gpu-layers N` | Inherit target | Lets a separately owned speculative draft cache use a different host/device split. |
+| Phase-aware workspace | `--phase-aware-workspace` | Off | Reuses supported sequential target/MTP backing and changes reservation size between prompt and generation phases. |
+| Live-context workspace | `--live-context-workspace` | Off | Grows supported attention workspace with the padded live KV extent instead of reserving full-context compute space at startup. |
+| MTP recurrent-plane cap | `--spec-mtp-rs-planes N` | Full (`draft max + 1`) | Saves recurrent-state VRAM; deep rejections may require deterministic GPU replay. |
+| KV allocation telemetry | `llama-bench --kv-memory` | Off | Reports allocation classes and CUDA VMM live, mapped, and high-water state without changing allocation policy. |
+
+### Put Attention KV in Pinned Host Memory
+
+```sh
+llama-server -m model.gguf --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned \
+  --cache-type-k q8_0 --cache-type-v q8_0
+```
+
+This moves persistent attention KV to accelerator-visible host memory while
+normal operation offload can keep attention execution on the accelerator. It
+does not pin model weights or force attention computation onto the CPU. The
+VRAM saving comes with page-locked system-memory use and context-dependent
+transfer/decode cost.
+
+For hybrid attention/recurrent models, keep the fixed recurrent state on the
+accelerator independently:
+
+```sh
+llama-server -m model.gguf --flash-attn on \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload
+```
+
+### Tune Target and Draft KV Residency
+
+```sh
+# Host target KV, except for the first eight independently owned KV layers
+llama-server -m target.gguf --no-kv-offload --kv-cpu-pinned \
+  --kv-gpu-layers 8
+
+# Give a separately owned draft cache its own residency policy
+llama-server -m target.gguf --spec-type draft-simple \
+  --spec-draft-model draft.gguf \
+  --no-kv-offload --kv-cpu-pinned \
+  --kv-gpu-layers 8 --spec-draft-kv-gpu-layers 0
+```
+
+These are layer-residency controls, not token-recency windows. Omit the draft
+option to inherit the target policy. Shared KV follows its actual owner.
+
+### Reduce Transient Workspace VRAM
+
+The two workspace controls are independent and default off. Test either one
+against the ordinary upfront-reservation path for your model and workload:
+
+```sh
+# Reserve supported prompt/decode geometries according to the active phase
+llama-server -m model.gguf --phase-aware-workspace
+
+# Start small and grow supported attention reservations with live KV depth
+llama-server -m model.gguf --live-context-workspace
+```
+
+Live-context growth saves the most before the configured context is filled;
+once its padded live extent reaches the full reservation, that part of the
+saving is exhausted. Phase-aware allocation targets prompt-versus-generation
+geometry instead. Unsupported layouts retain the established full reservation
+or fail closed as documented.
+
+### Cap MTP Recurrent Rollback Memory
+
+```sh
+llama-server -m model.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 8 \
+  --spec-mtp-rs-planes 4
+```
+
+The plane count includes the current target state. `0`, omission, or an
+explicit `draft max + 1` keeps the full allocation. A smaller supported cap
+retains exact recovery through selected full-shape GPU replay, but replay work
+can reduce decode speed. Unsupported graph/backend combinations fail closed.
+
+### Inspect KV and VMM Memory
+
+```sh
+llama-bench -m model.gguf -p 0 -n 64 --progress --kv-memory
+```
+
+Use the reported device, pinned-host, ordinary-host, and CUDA VMM fields
+together; process VRAM alone does not measure page-locked system memory. See
+[the complete argument reference](docs/beellama-args.md) for every control and
+[the CPU KV feature delta](docs/cpu-kv-offload-feature-delta.md) for scope,
+limitations, and evidence links.
+
 ## KV Cache Quantization
 
 K and V cache types are set independently with `--cache-type-k` and `--cache-type-v`. The research is covered in articles: [KVarN KV Cache: Implementation and Benchmarks](https://anbeeld.com/articles/kvarn-kv-cache-implementation-and-benchmarks), [KV Cache Precision Tail: Implementation and Benchmarks](https://anbeeld.com/articles/kv-cache-precision-tail-implementation-and-benchmarks), and [KV Cache Quantization Benchmarks: KVarN, Precision Tail](https://anbeeld.com/articles/kv-cache-quantization-benchmarks-kvarn-precision-tail).
@@ -211,6 +317,7 @@ llama-server --models-preset presets.ini
 ## Documentation
 
 - [BeeLlama features and public repo diff](docs/beellama-features.md)
+- [CPU KV-offload feature delta from base BeeLlama](docs/cpu-kv-offload-feature-delta.md)
 - [BeeLlama args reference](docs/beellama-args.md)
 - [Build docs](docs/build.md)
 - [Server docs](tools/server/README.md)

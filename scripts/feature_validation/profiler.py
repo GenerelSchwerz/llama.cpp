@@ -15,9 +15,15 @@ from .core import (
     ManifestError,
     ValidationError,
     flock_argv,
+    load_json,
     quote_argv,
     reject_forbidden_tokens,
     validate_direct_target,
+)
+from .nsys_memory import (
+    assess_memory_evidence,
+    enforce_memory_evidence,
+    parse_memory_inventory,
 )
 
 
@@ -239,6 +245,7 @@ def nsys_discovery_argv(
     direct_harness: dict[str, Any] | None = None,
     *,
     cuda_graph_trace: dict[str, Any] | None = None,
+    request_cuda_memory_usage: bool = False,
     nsys_executable: str = "nsys",
 ) -> list[str]:
     validate_native_affinity(target_argv, direct_harness)
@@ -257,6 +264,8 @@ def nsys_discovery_argv(
             "--cuda-graph-trace="
             f"{cuda_graph_trace['granularity']}:{cuda_graph_trace['launch_origin']}"
         )
+    if request_cuda_memory_usage:
+        argv.append("--cuda-memory-usage=true")
     return [*argv, *target_argv]
 
 
@@ -285,6 +294,39 @@ def verify_nsys_graph_trace_capability(
             "this NSYS version does not advertise required --cuda-graph-trace node support"
         )
     evidence["status"] = "supported" if required else "not_applicable"
+    return evidence
+
+
+def verify_nsys_memory_trace_capability(
+    config: dict[str, Any] | None,
+    *,
+    help_text: str,
+    version_text: str,
+) -> dict[str, Any]:
+    """Verify the exact NSYS binary before requesting CUDA memory events."""
+    if config is None:
+        return {
+            "requested": False,
+            "mode": None,
+            "categories": [],
+            "nsys_version": version_text.strip(),
+            "help_mentions_cuda_memory_usage": "--cuda-memory-usage" in help_text,
+            "status": "not_configured",
+        }
+    supported = "--cuda-memory-usage" in help_text
+    evidence = {
+        "requested": True,
+        "mode": config["mode"],
+        "categories": list(config["categories"]),
+        "nsys_version": version_text.strip(),
+        "help_mentions_cuda_memory_usage": supported,
+        "requested_option": "--cuda-memory-usage=true" if supported else None,
+        "status": "supported" if supported else "unsupported",
+    }
+    if config["mode"] == "required" and not supported:
+        raise ValidationError(
+            "this NSYS version does not advertise required --cuda-memory-usage support"
+        )
     return evidence
 
 
@@ -625,7 +667,7 @@ def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
         path = root / name
         if not path.is_file():
             return None
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = load_json(path)
         if not isinstance(value, dict):
             raise ValidationError(f"profiler artifact is not an object: {path}")
         return value
@@ -633,6 +675,7 @@ def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
     plan = read_json("ncu-plan.json")
     discovery = read_json("discovery-inventory.json")
     verification = read_json("ncu-verification.json")
+    memory_inventory = read_json("memory-inventory.json")
     state = read_json("profile-state.json")
     if plan is None or discovery is None or state is None:
         raise ValidationError(f"profiler artifacts are incomplete: {root}")
@@ -653,6 +696,49 @@ def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
         if verification is not None
         else []
     )
+    memory_summary: dict[str, Any] = {
+        "assessment_status": "legacy_unavailable",
+        "categories": {},
+    }
+    if memory_inventory is not None:
+        memory_categories = memory_inventory.get("categories", {})
+        memory_summary = {
+            "assessment_status": memory_inventory.get("assessment", {}).get(
+                "status", "not_evaluated"
+            ),
+            "issues": memory_inventory.get("assessment", {}).get("issues", []),
+            "categories": {
+                name: {
+                    "status": details.get("status", "unavailable"),
+                    "reason": details.get("reason"),
+                    "event_count": details.get("event_count"),
+                }
+                for name, details in memory_categories.items()
+            },
+            "allocation_groups": memory_categories.get("gpu_memory_events", {}).get(
+                "groups", []
+            ),
+            "captured_outstanding_by_memory_kind": memory_categories.get(
+                "gpu_memory_events", {}
+            ).get("captured_outstanding_by_process_device_kind", []),
+            "allocation_lifetime_counts": {
+                key: memory_categories.get("allocation_lifetimes", {}).get(key)
+                for key in (
+                    "paired_lifetime_count",
+                    "unmatched_allocation_count",
+                    "unmatched_deallocation_count",
+                )
+            },
+            "captured_device_high_water": memory_categories.get(
+                "captured_device_high_water", {}
+            ).get("by_process_device", []),
+            "copy_groups": memory_categories.get("copy_activity", {}).get("groups", []),
+            "memory_api_groups": memory_categories.get("cuda_api", {}).get(
+                "memory_api_groups", []
+            ),
+            "vmm_groups": memory_categories.get("vmm", {}).get("groups", []),
+            "memory_boundaries": memory_inventory.get("memory_boundaries", {}),
+        }
     return {
         "status": (
             "verified"
@@ -689,10 +775,15 @@ def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
             ),
             "captures": captures,
         },
+        "memory": memory_summary,
         "timing_seconds": timings,
         "artifacts": {
             "root": str(root),
             "discovery_inventory": str(root / "discovery-inventory.json"),
+            "memory_inventory": str(root / "memory-inventory.json"),
+            "memory_trace_capability": str(
+                root / "nsys-memory-trace-capability.json"
+            ),
             "nsys_report": str(root / "discovery.nsys-rep"),
             "nsys_stdout": str(root / "nsys-stdout.log"),
             "nsys_stderr": str(root / "nsys-stderr.log"),
@@ -745,6 +836,10 @@ def compare_agent_profiles(
         "raw_ncu_metrics": {
             "baseline": metric_inventory(baseline),
             "candidate": metric_inventory(candidate),
+        },
+        "memory_inventory": {
+            "baseline": baseline.get("memory", {}),
+            "candidate": candidate.get("memory", {}),
         },
         "timing_seconds": {
             "baseline": baseline.get("timing_seconds", {}),

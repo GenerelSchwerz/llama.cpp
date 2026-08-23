@@ -33,6 +33,15 @@ class llama_memory_recurrent_context;
 class llama_memory_hybrid_context;
 class llama_memory_hybrid_iswa_context;
 
+struct llama_recurrent_snapshot_mode {
+    bool sparse = false;
+    int32_t selected_token = -1;
+
+    bool operator==(const llama_recurrent_snapshot_mode & other) const {
+        return sparse == other.sparse && selected_token == other.selected_token;
+    }
+};
+
 // certain models (typically multi-modal) can produce different types of graphs
 enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
@@ -279,8 +288,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
-    bool sparse_snapshots;
-    int32_t selected_snapshot_token;
+    llama_recurrent_snapshot_mode snapshot_mode;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

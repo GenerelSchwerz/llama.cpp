@@ -515,8 +515,9 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         //   the same ubatch, which `split_equal()` guarantees via its n_keep_tail argument
 
         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
-        const bool sparse = mctx_cur->has_sparse_snapshots();
-        const int32_t selected = mctx_cur->get_selected_snapshot_token();
+        const auto & snapshot_mode = mctx_cur->get_snapshot_mode();
+        const bool sparse = snapshot_mode.sparse;
+        const int32_t selected = snapshot_mode.selected_token;
         const int64_t n_copies = sparse
                 ? (selected >= 0 ? 1 : K)
                 : K;
@@ -594,8 +595,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
-    const bool sparse = mctx_cur->has_sparse_snapshots();
-    const int32_t selected = mctx_cur->get_selected_snapshot_token();
+    const auto & snapshot_mode = mctx_cur->get_snapshot_mode();
+    const bool sparse = snapshot_mode.sparse;
+    const int32_t selected = snapshot_mode.selected_token;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = sparse

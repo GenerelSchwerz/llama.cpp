@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "llama-kv-cache-tail.h"
 
 #include <cmath>
@@ -210,6 +211,98 @@ static void test_meta_shadow_roundtrip(ggml_backend_t backend) {
     ggml_free(compute_ctx);
     ggml_backend_buffer_free(static_buffer);
     ggml_free(static_ctx);
+}
+
+static void test_quantized_store_cross_residency(
+        ggml_backend_t accelerator,
+        ggml_backend_t cpu) {
+    constexpr int64_t width  = 256;
+    constexpr int64_t slots  = 7;
+    constexpr int64_t writes = 3;
+
+    ggml_init_params params = { 1024*1024, nullptr, true };
+    ggml_context_ptr device_ctx { ggml_init(params) };
+    ggml_tensor * source = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_F32, width, writes);
+    ggml_tensor * direct_body = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_Q8_0, width, slots);
+    ggml_tensor * direct_idxs = ggml_new_tensor_1d(device_ctx.get(), GGML_TYPE_I64, writes);
+    ggml_tensor * stage = ggml_new_tensor_2d(device_ctx.get(), GGML_TYPE_Q8_0, width, writes);
+    ggml_backend_buffer_ptr device_buffer {
+        ggml_backend_alloc_ctx_tensors(device_ctx.get(), accelerator)
+    };
+    if (!device_buffer) {
+        fail("cross-residency device allocation failed");
+    }
+
+    ggml_context_ptr host_ctx { ggml_init(params) };
+    ggml_tensor * host_body = ggml_new_tensor_2d(host_ctx.get(), GGML_TYPE_Q8_0, width, slots);
+    ggml_tensor * host_idxs = ggml_new_tensor_1d(host_ctx.get(), GGML_TYPE_I64, writes);
+    ggml_backend_buffer_ptr host_buffer {
+        ggml_backend_alloc_ctx_tensors(host_ctx.get(), cpu)
+    };
+    if (!host_buffer || !ggml_backend_buft_is_host(ggml_backend_buffer_get_type(host_buffer.get()))) {
+        fail("cross-residency host allocation failed");
+    }
+
+    ggml_context_ptr direct_ctx { ggml_init(params) };
+    ggml_tensor * direct_write = ggml_set_rows(
+            direct_ctx.get(), direct_body, source, direct_idxs);
+    ggml_cgraph * direct_graph = ggml_new_graph(direct_ctx.get());
+    ggml_build_forward_expand(direct_graph, direct_write);
+
+    ggml_context_ptr staged_ctx { ggml_init(params) };
+    ggml_tensor * converted = ggml_cpy(staged_ctx.get(), source, stage);
+    ggml_tensor * host_write = ggml_set_rows(
+            staged_ctx.get(), host_body, converted, host_idxs);
+    ggml_cgraph * staged_graph = ggml_new_graph(staged_ctx.get());
+    ggml_build_forward_expand(staged_graph, host_write);
+
+    if (!ggml_backend_supports_op(accelerator, direct_write) ||
+            !ggml_backend_supports_op(accelerator, converted)) {
+        std::printf("cross-residency Q8 store route unsupported by %s; skipping\n",
+                ggml_backend_name(accelerator));
+        return;
+    }
+
+    std::vector<float> source_data(width*writes);
+    for (int64_t row = 0; row < writes; ++row) {
+        for (int64_t i = 0; i < width; ++i) {
+            const int value = int((37*i + 53*row) % 511) - 255;
+            source_data[size_t(i + width*row)] = float(value)/113.0f;
+        }
+    }
+    const int64_t indices[] = { 2, 5, 1 };
+    ggml_backend_buffer_clear(device_buffer.get(), 0);
+    ggml_backend_buffer_clear(host_buffer.get(), 0);
+    ggml_backend_tensor_set(source, source_data.data(), 0,
+            source_data.size()*sizeof(source_data[0]));
+    ggml_backend_tensor_set(direct_idxs, indices, 0, sizeof(indices));
+    ggml_backend_tensor_set(host_idxs, indices, 0, sizeof(indices));
+
+    if (ggml_backend_graph_compute(accelerator, direct_graph) != GGML_STATUS_SUCCESS) {
+        fail("direct accelerator Q8 store failed");
+    }
+
+    ggml_backend_t backends[] = { accelerator, cpu };
+    ggml_backend_sched_ptr sched {
+        ggml_backend_sched_new(backends, nullptr, 2, 32, false, true)
+    };
+    if (!sched || !ggml_backend_sched_alloc_graph(sched.get(), staged_graph)) {
+        fail("cross-residency Q8 store graph allocation failed");
+    }
+    if (ggml_backend_sched_get_tensor_backend(sched.get(), converted) != accelerator) {
+        fail("cross-residency Q8 conversion was not pinned by its persistent device stage");
+    }
+    if (ggml_backend_sched_graph_compute(sched.get(), staged_graph) != GGML_STATUS_SUCCESS) {
+        fail("cross-residency Q8 store failed");
+    }
+
+    std::vector<uint8_t> direct_bytes(ggml_nbytes(direct_body));
+    std::vector<uint8_t> host_bytes(ggml_nbytes(host_body));
+    ggml_backend_tensor_get(direct_body, direct_bytes.data(), 0, direct_bytes.size());
+    ggml_backend_tensor_get(host_body, host_bytes.data(), 0, host_bytes.size());
+    if (direct_bytes != host_bytes) {
+        fail("cross-residency Q8 store differs from direct accelerator bytes");
+    }
 }
 
 static void test_fully_masked_quant_body(ggml_backend_t backend, ggml_type body_type) {
@@ -943,6 +1036,7 @@ int main() {
     backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     if (backend) {
         ggml_backend_t reference = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        test_quantized_store_cross_residency(backend, reference);
         test_bounded_attached_tail_attention(backend, reference);
         ggml_backend_free(reference);
         test_attention_graph(backend);

@@ -7,7 +7,6 @@ import pathlib
 import pty
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -15,6 +14,7 @@ import xml.etree.ElementTree as ET
 from typing import Any
 
 from .core import ValidationError, sha256_file, utc_now
+from .lifecycle import terminate_owned_process as _terminate_owned
 
 
 PROC_STATUS_FIELDS = {
@@ -164,25 +164,6 @@ def _process_tree(root_pid: int) -> set[int]:
                 descendants.add(pid)
                 changed = True
     return descendants
-
-
-def _terminate_owned(process: subprocess.Popen[Any], timeout: float = 3.0) -> None:
-    if process.poll() is not None:
-        return
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        process.terminate()
-    try:
-        process.wait(timeout=timeout)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        process.kill()
-    process.wait(timeout=timeout)
 
 
 def _is_compute_process(process: dict[str, Any]) -> bool:

@@ -42,8 +42,21 @@ work, CPU KV placement, and future features.
 ## Prepare a manifest
 
 Keep the manifest small and preregister it before collecting measurements.
-Large outputs must go to the absolute `artifact_root`, which the runner rejects
-if it is inside either source repository.
+Large outputs must go to the absolute `artifact_root`. By default the runner
+rejects a root inside either source repository. A worktree-confined study may
+set `artifact_root_policy` to `git_ignored_inside_sources`; this opt-in is
+accepted only when the root is below (and not equal to) every containing source
+root, is outside `.git`, and `git check-ignore --no-index` proves that the exact
+artifact directory itself—not a synthetic child—is ignored by every containing
+variant root. The runner repeats this check on each actual study, attempt,
+diagnostic, and profile directory immediately before a target starts, including
+on resume.
+
+This opt-in deliberately relaxes physical isolation: ignored artifacts can
+share a worktree filesystem with source and may be visible to build scripts or
+other tools that traverse ignored paths. It protects Git source identity and
+accidental commits, but is not equivalent to the default cross-worktree
+boundary. Prefer an outside-source root unless worktree confinement is required.
 
 Register every CMake-built executable after its final build, reconfiguration,
 or copy and before adding it to a manifest:
@@ -211,6 +224,38 @@ or incomplete attempt is retained and stops the study. It is never dropped or
 overwritten. After correcting an external prerequisite, an explicit
 `--retry-failed` creates the next numbered attempt:
 
+For every new process, the internal executor atomically records its PID plus
+Linux process start time before telemetry or target creation, then records the
+direct target's process-group ID. The outer launcher installs SIGINT and SIGTERM
+handlers before starting `flock`. On parent interruption it signals only that
+identified executor—not the whole wrapper group—so `flock` continues to hold
+the GPU lock while the executor cleans up. Repeated parent signals are recorded
+but do not interrupt cleanup again. The executor tracks the target group after
+leader exit, escalates from SIGTERM to SIGKILL while descendants remain, reaps
+the direct child, stops telemetry, records the failed result, and only then
+exits the locked lifecycle. A bounded outer fallback uses the same recorded
+target group before terminating an unresponsive wrapper.
+
+On resume, the runner reconciles `state.json` with every numbered attempt
+directory for the scheduled run. A directory with no state entry is never
+reused, even when it contains a child `result.json` reporting success. Once no
+recorded executor or target group remains, the runner records a failed recovery
+with no metric and seals every preserved file in `attempt-evidence.json`.
+Normally the recovery is also written as `interrupted-result.json`. If the
+attempt was already sealed immediately before the parent died, its immutable
+seal is verified and retained while the recovery record lives in `state.json`,
+rather than adding a file that would invalidate that seal. The seal binds the
+file inventory and its SHA-256s to the run/attempt, manifest SHA-256, and
+provenance identity fingerprint. Tampering fails closed. The next retry is
+numbered above the highest attempt in state or on disk, so repeated
+interruptions preserve attempts 1, 2, and so on. If an ownership record still
+identifies a live process, resume refuses to recycle or seal that directory and
+asks the user to retry later.
+
+Cleanup errors are recorded without discarding telemetry or the result. The
+attempt is failed in `state.json` and is never resumable as successful evidence;
+a later attempt still requires `--resume --retry-failed`.
+
 ```bash
 python3 scripts/feature-performance-validation.py run \
   /absolute/path/to/manifest.json --through early --resume --retry-failed
@@ -219,6 +264,15 @@ python3 scripts/feature-performance-validation.py run \
 Do not delete a failed attempt to make a report look complete. If the manifest
 or any provenance identity changes, start a new deterministic study rather
 than combining unlike runs.
+
+Catchable parent SIGINT/SIGTERM and normal timeout/error paths have the complete
+ownership contract above. No userspace runner can guarantee cleanup after
+SIGKILL to the entire wrapper/executor group, kernel failure, host reset, or
+power loss. After such an event, resume remains fail-closed while a recorded
+process group is live; inspect it and the GPU lock before retrying. A parent-only
+SIGKILL does not release the separately sessioned wrapper: the lock-owning
+executor continues its finite target lifecycle, and the resulting unindexed
+directory is conservatively recovered as failed afterward.
 
 ## Statistics
 
@@ -316,6 +370,44 @@ selector. Thus `--launch-skip` and `--launch-count` are derived for the current
 binary, hardware, and capture rather than copied between builds. Re-run NSYS
 after any relevant identity changes.
 
+An optional `memory_evidence` block preregisters `mode` (`required` or
+`optional`) and the evidence categories needed from this same discovery. When
+configured, the runner inspects the exact NSYS help and, when supported,
+explicitly passes `--cuda-memory-usage=true`. Required mode fails before launch
+if the option is unsupported, and fails after export if any requested category
+is unavailable or only partial. Optional mode retains the same diagnostics but
+does not turn unavailable evidence into a successful memory claim.
+
+`memory-inventory.json` is schema-tolerant across known NSYS SQLite naming
+variants and separately reports:
+
+- CUDA allocation/deallocation events by memory kind, including device,
+  pinned, pageable, managed, and static kinds when NSYS supplies them, plus
+  captured outstanding-allocation high-water separately for each kind;
+- address-paired lifetimes plus every unmatched allocation/deallocation;
+- captured outstanding device-allocation high-water by process/device, which
+  is not total process VRAM or VMM reservation;
+- memcpy/memset counts, bytes, duration, and memory-kind groupings;
+- aggregated CUDA runtime/driver memory calls and named VMM reserve, create,
+  map, access, unmap, release, and address-free calls; and
+- standalone NVTX ranges when an NVTX table is present.
+
+Each category is `available`, `partial`, or `unavailable`. An available table
+with zero rows is measured zero; a missing table, required column, enum
+meaning, or unresolved identity is never reported as zero. Raw allocation rows
+and lifetimes remain in JSON; raw copy/API rows remain in the SQLite export and
+the JSON aggregates retain their complete counts and byte totals.
+
+The allocation-event balance is deliberately named *captured outstanding
+high-water*. It does not replace the persistent roughly-1-Hz `nvidia-smi`
+process-VRAM series, `/proc/PID/status` VmRSS/VmHWM ordinary-host-memory
+series, or a dedicated pinned-memory audit. CUDA events labelled `Pinned` are
+allocator events only; the toolkit never infers pinned bytes from VmLck or
+process VRAM. Robust nested-NVTX phase attribution, per-phase device high-water,
+and allocation backtraces remain bounded follow-ups because their cross-version
+joins and symbolization would create a substantially larger profiling
+framework.
+
 After the separate NCU process, the runner requires the expected nonempty
 `.ncu-rep`, hashes it, imports its raw CSV with the same NCU binary, and checks
 the observed demangled kernel, unique capture count, and available grid/block
@@ -376,6 +468,8 @@ The deterministic
   same-name occurrences, shapes, and graph-node IDs;
 - verified NCU capture count, raw per-capture requested metric values, and any
   verification issues;
+- memory-category availability, captured allocation high-water, allocation
+  lifecycle counts, copy/memset groups, and CUDA/VMM API groups when requested;
 - NSYS/NCU target and locked-lifecycle timing plus paths to the raw reports,
   inventory, plan, stdout/stderr, and verification record.
 
@@ -445,8 +539,11 @@ and statistics core, clean-process runner, telemetry owner, and profiler
 parser/planner. The merge-readiness pass removed duplicate provenance-spec and
 GPU-lock launch implementations and removed the legacy single-executable
 manifest shape; the JSON schema and runtime now use the same executable-role
-contract. The remaining roughly 3.5k standard-library Python lines are mostly
-fail-closed validation, artifact inventory, lifecycle cleanup, and parsers with
-separate tests. There is no copied CUDA framework or project build dependency.
+contract. The remaining standard-library Python is mostly fail-closed
+validation, artifact inventory, lifecycle cleanup, and parsers with separate
+tests. Interrupt ownership and attempt reconciliation remain in the runner
+because they extend its existing process/state contract and share its cleanup
+and provenance primitives; they do not add a parallel supervisor or artifact
+framework. There is no copied CUDA framework or project build dependency.
 Further code should enter a new module only when it has an independent
 lifecycle or artifact contract, rather than growing another parallel runner.
