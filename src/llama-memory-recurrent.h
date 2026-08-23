@@ -81,9 +81,6 @@ public:
     // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
-    bool sparse_snapshots = false;
-    int32_t selected_snapshot_token = -1;
-
     // Absolute positions represented by each physical recurrent plane.
     std::vector<llama_pos> rs_plane_pos;
     std::vector<bool> rs_plane_pos_sparse;
@@ -128,11 +125,18 @@ public:
     std::vector<ggml_tensor *> s_l;
 
 private:
+    friend class llama_memory_recurrent_context;
+
     //const llama_model & model;
     const llama_hparams & hparams;
     const bool graph_supports_sparse_snapshots;
 
     const uint32_t n_seq_max = 1;
+
+    // This policy is context-wide because the recurrent graph and backend op
+    // use one selected-token value for the entire decode batch. init_batch()
+    // captures it so an in-flight memory context has immutable graph identity.
+    llama_recurrent_snapshot_mode next_snapshot_mode;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -143,6 +147,8 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+
+    int32_t find_sparse_snapshot_plane(llama_seq_id seq_id, llama_pos pos) const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
@@ -165,6 +171,11 @@ public:
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem,
             std::vector<llama_ubatch> ubatches);
+
+    llama_memory_recurrent_context(
+            llama_memory_recurrent * mem,
+            std::vector<llama_ubatch> ubatches,
+            llama_recurrent_snapshot_mode snapshot_mode);
 
     virtual ~llama_memory_recurrent_context();
 
@@ -194,14 +205,14 @@ public:
 
     bool has_sparse_snapshots() const;
     int32_t get_selected_snapshot_token() const;
+    const llama_recurrent_snapshot_mode & get_snapshot_mode() const;
 
 private:
     const llama_memory_status status;
 
     llama_memory_recurrent * mem;
 
-    bool sparse_snapshots = false;
-    int32_t selected_snapshot_token = -1;
+    const llama_recurrent_snapshot_mode snapshot_mode;
 
     size_t i_next = 0;
 

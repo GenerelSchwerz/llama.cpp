@@ -221,6 +221,45 @@ struct server_batch {
     }
 };
 
+struct server_mtp_gpu_replay_state {
+    bool snapshots_active = false;
+    llama_tokens accepted_tokens;
+    common_sampler_ptr accepted_sampler;
+    uint32_t n_accepted = 0;
+
+    bool pending() const {
+        return accepted_sampler != nullptr;
+    }
+
+    void arm(bool enabled) {
+        GGML_ASSERT(!pending());
+        snapshots_active = enabled;
+    }
+
+    void begin(llama_tokens tokens, common_sampler_ptr sampler, uint32_t accepted) {
+        GGML_ASSERT(snapshots_active && !pending() && sampler != nullptr);
+        accepted_tokens = std::move(tokens);
+        accepted_sampler = std::move(sampler);
+        n_accepted = accepted;
+    }
+
+    uint32_t finish(llama_tokens & tokens, common_sampler_ptr & sampler) {
+        GGML_ASSERT(pending());
+        tokens = std::move(accepted_tokens);
+        sampler = std::move(accepted_sampler);
+        const uint32_t accepted = n_accepted;
+        reset();
+        return accepted;
+    }
+
+    void reset() {
+        snapshots_active = false;
+        accepted_tokens.clear();
+        accepted_sampler.reset();
+        n_accepted = 0;
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -241,10 +280,7 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
-    bool spec_gpu_snapshot_active = false;
-    llama_tokens spec_replay_ids;
-    common_sampler_ptr spec_replay_smpl;
-    uint32_t spec_replay_accepted = 0;
+    server_mtp_gpu_replay_state spec_gpu_replay;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -440,10 +476,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
-        spec_gpu_snapshot_active = false;
-        spec_replay_ids.clear();
-        spec_replay_smpl.reset();
-        spec_replay_accepted = 0;
+        spec_gpu_replay.reset();
 
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
@@ -3649,7 +3682,7 @@ private:
 
             if (!draft.empty()) {
                 const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
-                slot.spec_gpu_snapshot_active = capped_mtp;
+                slot.spec_gpu_replay.arm(capped_mtp);
                 const auto target_policy = server_speculative_checkpoint_policy_for(
                         ctx_tgt_seq_rm_type, common_context_seq_rm_max_rollback(ctx_tgt),
                         draft.size(), 0);
@@ -4590,7 +4623,7 @@ private:
             const size_t n_draft = slot.spec_draft.size();
 
             GGML_ASSERT(n_draft > 0);
-            const bool gpu_snapshot_replay = slot.spec_is_replay && slot.spec_replay_smpl != nullptr;
+            const bool gpu_snapshot_replay = slot.spec_is_replay && slot.spec_gpu_replay.pending();
 
             // verify and try to accept the draft
             const int64_t t_verify_start = ggml_time_us();
@@ -4622,8 +4655,7 @@ private:
                 slot.spec_i_batch.clear();
 
                 if (gpu_snapshot_replay) {
-                    accepted = std::move(slot.spec_replay_ids);
-                    slot.smpl = std::move(slot.spec_replay_smpl);
+                    const uint32_t replay_accepted = slot.spec_gpu_replay.finish(accepted, slot.smpl);
 
                     if (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, -1)) {
                         SLT_ERR(slot, "%s", "failed to restore normal sparse snapshot mode\n");
@@ -4632,7 +4664,7 @@ private:
                     }
 
                     const auto & ckpt = slot.spec_ckpt;
-                    const llama_pos accepted_end = ckpt.pos_max + 2 + slot.spec_replay_accepted;
+                    const llama_pos accepted_end = ckpt.pos_max + 2 + replay_accepted;
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, accepted_end, -1)) {
                         SLT_ERR(slot, "%s", "failed to select the replayed recurrent boundary\n");
                         slot.release();
@@ -4645,17 +4677,15 @@ private:
                         return;
                     }
 
-                    common_speculative_accept(spec.get(), slot.id, slot.spec_replay_accepted);
+                    common_speculative_accept(spec.get(), slot.id, replay_accepted);
                     slot.spec_draft = accepted;
-                    slot.spec_replay_accepted = 0;
-                    slot.spec_gpu_snapshot_active = false;
                 } else {
                     GGML_ASSERT(accepted.size() >= 1);
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
                     const uint32_t direct_horizon = llama_n_rs_seq(ctx_tgt) > 0
                             ? llama_n_rs_seq(ctx_tgt) - 1 : 0;
-                    const bool use_gpu_replay = slot.spec_gpu_snapshot_active &&
+                    const bool use_gpu_replay = slot.spec_gpu_replay.snapshots_active &&
                             n_rollback > direct_horizon;
 
                     if (use_gpu_replay) {
@@ -4692,9 +4722,8 @@ private:
                         }
 
                         slot.spec_is_replay = true;
-                        slot.spec_replay_ids = std::move(accepted);
-                        slot.spec_replay_smpl = std::move(slot.smpl);
-                        slot.spec_replay_accepted = n_accepted;
+                        slot.spec_gpu_replay.begin(
+                                std::move(accepted), std::move(slot.smpl), n_accepted);
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
                         return;
@@ -4754,7 +4783,7 @@ private:
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
-                    slot.spec_gpu_snapshot_active = false;
+                    slot.spec_gpu_replay.reset();
                 }
             }
 
