@@ -359,6 +359,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             cuda_vmm_telemetry;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* cuda_vmm_telemetry   */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -422,6 +424,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --cuda-vmm-telemetry                        report CUDA VMM pool allocation checkpoints\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
     if (llama_supports_rpc()) {
@@ -520,6 +523,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.cuda_vmm_telemetry   = cmd_params_defaults.cuda_vmm_telemetry;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1040,6 +1044,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
+            } else if (arg == "--cuda-vmm-telemetry") {
+                params.cuda_vmm_telemetry = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1435,6 +1441,14 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
 
     return instances;
 }
+
+struct bench_cuda_vmm_pool_stats {
+    uint64_t live_bytes;
+    uint64_t live_peak_bytes;
+    uint64_t mapped_bytes;
+    uint64_t mapped_peak_bytes;
+    uint64_t active_pools;
+};
 
 struct test {
     static const std::string build_commit;
@@ -2185,6 +2199,80 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("fatal error");
 }
 
+using bench_cuda_vmm_pool_stats_get_fn = bool (*)(int, bench_cuda_vmm_pool_stats *);
+using bench_cuda_vmm_pool_stats_reset_fn = bool (*)(int);
+
+static ggml_backend_dev_t bench_cuda_vmm_device(const cmd_params_instance & inst) {
+    if (inst.main_gpu >= 0 && size_t(inst.main_gpu) < inst.devices.size() &&
+            inst.devices[inst.main_gpu] != nullptr) {
+        return inst.devices[inst.main_gpu];
+    }
+    for (ggml_backend_dev_t dev : inst.devices) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            return dev;
+        }
+    }
+    return ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+}
+
+class bench_cuda_vmm_telemetry {
+public:
+    void init(ggml_backend_dev_t dev) {
+        if (dev == nullptr) {
+            return;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+            if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                cuda_device_ = int(i);
+                break;
+            }
+        }
+        if (cuda_device_ < 0) {
+            return;
+        }
+        get_ = reinterpret_cast<bench_cuda_vmm_pool_stats_get_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_pool_stats_get"));
+        reset_ = reinterpret_cast<bench_cuda_vmm_pool_stats_reset_fn>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_vmm_pool_stats_reset"));
+    }
+
+    int device() const {
+        return cuda_device_;
+    }
+
+    bool reset() const {
+        return reset_ != nullptr && reset_(cuda_device_);
+    }
+
+    bench_cuda_vmm_pool_stats checkpoint() const {
+        bench_cuda_vmm_pool_stats stats = {};
+        if (get_ != nullptr) {
+            (void) get_(cuda_device_, &stats);
+        }
+        return stats;
+    }
+
+private:
+    int                                cuda_device_ = -1;
+    bench_cuda_vmm_pool_stats_get_fn   get_ = nullptr;
+    bench_cuda_vmm_pool_stats_reset_fn reset_ = nullptr;
+};
+
+static void bench_cuda_vmm_print(
+        int cuda_device,
+        const bench_cuda_vmm_pool_stats & model,
+        const bench_cuda_vmm_pool_stats & context,
+        const bench_cuda_vmm_pool_stats & workload,
+        const bench_cuda_vmm_pool_stats & teardown) {
+    fprintf(stderr, "llama-bench: CUDA VMM device %d: model live=%" PRIu64 " mapped=%" PRIu64 " pools=%" PRIu64 "; context live=%" PRIu64 " mapped=%" PRIu64 " pools=%" PRIu64 "; workload live=%" PRIu64 " mapped=%" PRIu64 " live_peak=%" PRIu64 " mapped_peak=%" PRIu64 " pools=%" PRIu64 "; teardown live=%" PRIu64 " mapped=%" PRIu64 " pools=%" PRIu64 "\n",
+            cuda_device,
+            model.live_bytes, model.mapped_bytes, model.active_pools,
+            context.live_bytes, context.mapped_bytes, context.active_pools,
+            workload.live_bytes, workload.mapped_bytes, workload.live_peak_bytes, workload.mapped_peak_bytes, workload.active_pools,
+            teardown.live_bytes, teardown.mapped_bytes, teardown.active_pools);
+}
+
 // satisfies -Wmissing-declarations
 int llama_bench(int argc, char ** argv);
 
@@ -2312,6 +2400,21 @@ int llama_bench(int argc, char ** argv) {
             prev_inst = &inst;
         }
 
+        bench_cuda_vmm_telemetry vmm_telemetry;
+        bench_cuda_vmm_pool_stats cuda_vmm_model = {};
+        bench_cuda_vmm_pool_stats cuda_vmm_context = {};
+        bool cuda_vmm_telemetry_active = false;
+        if (params.cuda_vmm_telemetry) {
+            ggml_backend_dev_t vmm_dev = bench_cuda_vmm_device(inst);
+            vmm_telemetry.init(vmm_dev);
+            cuda_vmm_telemetry_active = vmm_telemetry.reset();
+            if (cuda_vmm_telemetry_active) {
+                cuda_vmm_model = vmm_telemetry.checkpoint();
+            } else {
+                fprintf(stderr, "llama-bench: CUDA VMM telemetry is unavailable for the selected device\n");
+            }
+        }
+
         llama_context * ctx = llama_init_from_model(lmodel, cparams);
         if (ctx == NULL) {
             fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
@@ -2320,6 +2423,9 @@ int llama_bench(int argc, char ** argv) {
         }
 
         test t(inst, lmodel, ctx);
+        if (cuda_vmm_telemetry_active) {
+            cuda_vmm_context = vmm_telemetry.checkpoint();
+        }
 
         llama_memory_clear(llama_get_memory(ctx), false);
 
@@ -2376,6 +2482,10 @@ int llama_bench(int argc, char ** argv) {
                     exit(1);
                 }
             }
+        }
+
+        if (cuda_vmm_telemetry_active) {
+            (void) vmm_telemetry.reset();
         }
 
         for (int i = 0; i < params.reps; i++) {
@@ -2451,6 +2561,17 @@ int llama_bench(int argc, char ** argv) {
             t.samples_ns.push_back(t_ns);
         }
 
+        if (cuda_vmm_telemetry_active) {
+            const bench_cuda_vmm_pool_stats cuda_vmm_after_workload = vmm_telemetry.checkpoint();
+
+            llama_perf_context_print(ctx);
+            llama_free(ctx);
+            ctx = nullptr;
+
+            const bench_cuda_vmm_pool_stats cuda_vmm_after_context = vmm_telemetry.checkpoint();
+            bench_cuda_vmm_print(vmm_telemetry.device(), cuda_vmm_model, cuda_vmm_context, cuda_vmm_after_workload, cuda_vmm_after_context);
+        }
+
         if (p) {
             p->print_test(t);
             fflush(p->fout);
@@ -2461,9 +2582,10 @@ int llama_bench(int argc, char ** argv) {
             fflush(p_err->fout);
         }
 
-        llama_perf_context_print(ctx);
-
-        llama_free(ctx);
+        if (ctx != nullptr) {
+            llama_perf_context_print(ctx);
+            llama_free(ctx);
+        }
 
         ggml_threadpool_free_fn(threadpool);
     }
