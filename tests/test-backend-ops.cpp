@@ -519,6 +519,15 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+using backend_flash_attn_causal_prefix_supported_t = bool (*)(ggml_backend_dev_t);
+
+static bool backend_has_flash_attn_causal_prefix(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto fn = (backend_flash_attn_causal_prefix_supported_t) ggml_backend_reg_get_proc_address(
+        reg, "ggml_backend_flash_attn_causal_prefix_supported");
+    return fn && fn(dev);
+}
+
 enum test_mode {
     MODE_TEST,
     MODE_PERF,
@@ -11570,7 +11579,18 @@ int main(int argc, char ** argv) {
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
-        bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
+        bool capability_ok = true;
+        if (op_names_filter && strstr(op_names_filter, "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE") &&
+                strcmp(ggml_backend_reg_name(reg), "CUDA") == 0) {
+            capability_ok = backend_has_flash_attn_causal_prefix(dev);
+            if (!capability_ok) {
+                std::fprintf(stderr, "CUDA backend did not register compact causal-prefix capability\n");
+            }
+        }
+
+        bool ok = capability_ok && test_backend(
+            backend.get(), dev, mode, op_names_filter, params_filter,
+            output_printer.get(), test_file_path, parallel_workers);
 
         if (ok) {
             n_ok++;
