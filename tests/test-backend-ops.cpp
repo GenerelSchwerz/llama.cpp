@@ -10266,6 +10266,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(
                 128, 128, 4, {4, 1}, 512, 65, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_F16, GGML_TYPE_F16, true, true));
+    // D=256 wide-Q tiles exercise the MMA lifetime across aliased dynamic
+    // shared-memory phases, both without and with grouped-query attention.
+    test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {1, 1}, 512, 64, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                256, 256, 4, {6, 1}, 512, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_F16, GGML_TYPE_F16, true, true));
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
