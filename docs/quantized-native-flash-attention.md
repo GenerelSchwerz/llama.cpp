@@ -282,9 +282,22 @@ in `ggml_cuda_flash_attn_ext_vec` at:
 hsk=320,hsv=256,nr23=[32,1],kv=512,nb=1
 ```
 
-No quantized cache is involved: head dimension 320 with a GQA ratio below 32
-has MMA instances only at `ncols2 = 32`, so it falls through to the vector path,
-which has no `D = 320` case, while `ggml_backend_supports_op` claims support.
+No quantized cache is involved, and the mechanism is not an MMA fallthrough.
+`test_flash_attn_ext` builds Q with `nh * nr23[0]` heads against `nh` K/V heads,
+so this case has **GQA ratio 32**, which is the supported multiple: in
+`ggml_cuda_get_best_fattn_kernel`, `case 320` returns
+`BEST_FATTN_KERNEL_NONE` when `gqa_ratio % 32 != 0`, so a ratio *below* 32 never
+reaches vector attention at all. At ratio 32 the shape passes that gate, and
+`can_use_vector_kernel` then admits it because its predicate is only
+`ne[0] <= 512 && ne[0] % 64 == 0 && ne[0] != 192` — and `320 % 64 == 0`. Ada's
+single-query preference returns `BEST_FATTN_KERNEL_VEC` before MMA is
+considered, `fattn-vec-dispatch.cuh` has no `D = 320` case, and the dispatcher
+falls through to the fatal abort while `ggml_backend_supports_op` claims
+support.
+
+In short: D320/DV256 at a supported GQA multiple of 32, in the affected
+small-query shapes, can be selected for vector attention even though no D320
+vector instance exists. The confirmed reproducer is GQA 32.
 
 Provenance, established by @GenerelSchwerz on PR 4: the exact PR target base
 fails identically, tagged BeeLlama v0.4.3 (`ba27edad2`) fails identically, and

@@ -266,8 +266,9 @@ template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0>  : fattn_quant_2bit_t
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_2bit_traits<block_q3_1,  QK3_1,  true,  true>  {};
 
 // Compiled type tiers. The default set is compiled by every CUDA FlashAttention
-// build and costs it +54.53 MiB of libggml-cuda.so; GGML_CUDA_FA_ALL_QUANTS adds
-// the rest, mirroring how the vector FlashAttention pair matrix is tiered.
+// build, at a library-size cost that is architecture dependent and recorded in
+// docs/quantized-native-flash-attention.md; GGML_CUDA_FA_ALL_QUANTS adds the
+// rest, mirroring how the vector FlashAttention pair matrix is tiered.
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 #define FATTN_MMA_QUANT_TYPES_EXTRA(F) \
     F(GGML_TYPE_Q4_1) F(GGML_TYPE_Q5_1) F(GGML_TYPE_Q6_1) \
