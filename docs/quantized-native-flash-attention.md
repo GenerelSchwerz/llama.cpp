@@ -5,8 +5,10 @@ supported quantized K/V cache directly. This removes the temporary F16 K/V
 materialization used by the standard MMA path. It does not change the
 persistent cache format, cache placement, or quantization policy.
 
-The feature is deliberately explicit at both build time and run time. Its
-current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
+The feature is deliberately explicit at run time: `--flash-attn-native-quants`
+is off by default and nothing takes the native route without it. The kernels
+for the default types are always compiled, so there is no build-time switch to
+enable the family. Its current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
 equal head dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
 implementation. `GGML_CUDA_FA_ALL_QUANTS` adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`,
 `Q3_1`, `Q2_0`, and `Q2_1` to the same head-dimension set. K and V need not be
@@ -71,9 +73,10 @@ pair from the K and V tensors themselves.
 
 ## Build and use
 
-The native MMA family (`Q8_0`, `Q4_0`, `Q5_0`, `Q6_0`; plus `Q4_1`, `Q5_1`,
-`Q6_1`, `Q3_0`, `Q3_1`, `Q2_0`, `Q2_1` under `GGML_CUDA_FA_ALL_QUANTS`) is not
-compiled by default:
+The native MMA family's default types (`Q8_0`, `Q6_0`, `Q5_0`, `Q4_0`) are
+compiled by every CUDA build. `GGML_CUDA_FA_ALL_QUANTS` is the single build flag
+that adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0` and `Q2_1`. This build
+therefore contains the default family:
 
 ```bash
 cmake -B build -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DCMAKE_BUILD_TYPE=Release
@@ -89,16 +92,16 @@ build/bin/llama-server -m model.gguf --flash-attn on \
 ```
 
 The run-time option is exposed by the server, CLI, perplexity, batched,
-parallel, and benchmark tools. A build without native kernels accepts the
-option, retains the standard route, and reports a once-only warning. A build
-with the native family reports the same kind of warning when an opted-in
-quantized pair or head dimension has no registered kernel. F16/BF16 attention
-is not treated as an unsupported quantized request.
+parallel, and benchmark tools. Because the default kernels are always present, a
+request can no longer be declined by the build; it is declined only when the
+opted-in quantized pair, head dimension, or device has no registered kernel, and
+that reports a once-only warning. F16/BF16 attention is not treated as an
+unsupported quantized request.
 
 `GGML_CUDA_FA_ALL_QUANTS` extends this family's own registration list (see
 above) in addition to controlling the existing vector FlashAttention pair
-matrix; it does not implicitly instantiate every K/V pair for the native MMA
-route.
+matrix. For the native MMA route it does instantiate every ordered K/V pair of
+the compiled types: 16 pairs in the default tier, 121 with the flag.
 
 ## Implementation structure
 
@@ -193,7 +196,7 @@ is large enough for MMA routing.
 Performance is shape- and device-dependent. Removing conversion traffic can
 reduce memory use without guaranteeing a meaningful speedup, and an in-kernel
 dequantization schedule can lose to the materialized path on an untested GPU or
-geometry. This is why both the build and run-time defaults remain off.
+geometry. This is why the run-time default remains off.
 
 ## Validation protocol
 
@@ -230,11 +233,13 @@ Qwen3.8 27B model and homogeneous Q8_0 target and MTP cache types. The detailed
 commands, hashes, and artifacts are recorded in Experiment 022 of
 [`cpu-kv-offload-experiments.md`](cpu-kv-offload-experiments.md).
 
-- Both CMake modes built from the same commit. The disabled build contained no
-  Q8 MMA instances and passed all 98 opted-in cases through the once-warned
-  standard fallback. The enabled build passed the same 98 cases, selecting all
-  registered D=64/128/256 geometries and retaining the mixed-pair and D=72
-  fallbacks.
+- Both CMake modes built from the same commit. This predates the build-policy
+  change below: at the time the family was opt-in, so the disabled build
+  contained no native MMA instances and passed all 98 opted-in cases through the
+  once-warned standard fallback, while the enabled build passed the same 98
+  cases, selecting all registered D=64/128/256 geometries and retaining the
+  mixed-pair and D=72 fallbacks. That fallback-with-warning arm no longer exists
+  for the default types.
 - A maintained 1,000-token MTP exactness comparison changed only the native
   permission. Prompt tokens, request semantics, all output token IDs, and
   response bytes matched exactly.
@@ -250,9 +255,51 @@ commands, hashes, and artifacts are recorded in Experiment 022 of
   single ordered pair.
 
 Enabling the family increased `libggml-cuda.so` by 7,469,120 bytes (7.12 MiB,
-4.02%) in these otherwise matched builds. This build-size cost, the mixed
-short-depth performance, and the limited hardware coverage are why the build
-and run-time defaults remain off.
+4.02%) in these otherwise matched builds. **That figure is historical and must
+not be used to describe the current build policy**: it was measured on the
+earlier symmetric-only implementation, before all-pair coverage, the shared
+attention body, and the removal of the build switch. The mandatory cost of the
+current policy is recorded under "Build cost of the mandatory default family"
+below. The mixed short-depth performance and the limited hardware coverage are
+why the run-time default remains off.
+
+## Build cost of the mandatory default family
+
+The default four types are compiled by every CUDA build, so this cost is paid
+whether or not `--flash-attn-native-quants` is ever used. It is recorded here
+because the decision to make it mandatory rests on it.
+
+Measured by @GenerelSchwerz on PR 4, matched fresh Release builds, CUDA on,
+KVarN off, all-quants off, `CMAKE_CUDA_ARCHITECTURES=120`:
+
+| Build | `libggml-cuda.so` |
+|---|---:|
+| base `53f4439f0`, family not compiled | 170,893,376 B |
+| head `3f9b1d0b3`, family always compiled | 228,075,704 B |
+| **delta** | **+57,182,328 B (+54.53 MiB, +33.46%)** |
+
+Two things this figure is not. It is not the `+7,469,120` bytes quoted in
+"Recorded validation" above: that predates all-pair coverage, the shared
+attention body, and the removal of the build switch, and it must not be used to
+describe current policy. And it is one architecture — `sm_120` — so a build for
+a different `CMAKE_CUDA_ARCHITECTURES` will differ in absolute size, though the
+mandatory nature of the cost does not.
+
+`GGML_CUDA_FA_ALL_QUANTS` adds the other seven types on top of this, taking the
+family from 384 to 1,056 explicit cases.
+
+**Decision: the cost is accepted deliberately.** The feature previously needed a
+build flag *and* a run-time flag before it did anything, which is poor
+ergonomics for a maintained extension: a user who passes
+`--flash-attn-native-quants` on a stock build got a warning and the slow path,
+with no indication that the fix was a rebuild. Making the default types
+unconditional means the run-time flag is the only thing anyone has to know
+about, and it is the flag that actually decides behaviour.
+
+The trade is `+54.53 MiB` of `libggml-cuda.so` on every CUDA build against
+removing a build-time footgun. `GGML_CUDA_FA_ALL_QUANTS` remains available for
+the seven extra types, so the mandatory portion is bounded at the four types
+that cover the common quantized cache configurations.
 
 ## Limitations
 
@@ -272,13 +319,13 @@ and run-time defaults remain off.
   performs synchronous dequantization into shared memory. That is a
   deliberate first implementation, not a claim that every device's optimal
   schedule has been found.
-- Compile time and CUDA-library size increase when the family is built: 384
-  explicit cases by default, 1,056 with `GGML_CUDA_FA_ALL_QUANTS`. Coverage of
-  every ordered pair costs two kernels per type rather than one per pair,
-  because only the symmetric pair specializes V at compile time. Each case is
-  one device kernel rather than two, because the route requires a zero logit
-  softcap and so never names the softcap specialization. Default llama.cpp
-  builds pay neither cost.
+- Compile time and CUDA-library size increase because the family is always
+  built: 384 explicit cases by default, 1,056 with `GGML_CUDA_FA_ALL_QUANTS`.
+  Coverage of every ordered pair costs two kernels per type rather than one per
+  pair, because only the symmetric pair specializes V at compile time. Each case
+  is one device kernel rather than two, because the route requires a zero logit
+  softcap and so never names the softcap specialization. **Every CUDA build pays
+  the default-tier cost**, measured below.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 

@@ -6708,13 +6708,20 @@ The abort is not this feature's:
 - It occurs with an `f16` cache, not only quantized.
 - It occurs with GPU-resident KV at small `ubatch` too, and without
   `--kv-cpu-pinned`, so it is not a pinning or residency property alone.
-- It is **not reachable through default routing**: `f16` and `q8_0`,
-  host-resident, decode at depths 4,096 and 16,384 all complete cleanly, because
-  the shipped rule never sends `n_q = 1` to MMA in these configurations.
+- Default routing did not **abort** in the runs tried here: `f16` and `q8_0`,
+  host-resident, decode at depths 4,096 and 16,384 all completed cleanly.
 
-So it is latent today and becomes reachable exactly when the threshold is
-lowered. Lowering it globally would turn a measured 11.6% decode gain into a
-crash for anyone running host-resident KV.
+That last point was originally written up as "not reachable through default
+routing". **It is wrong, and the root-cause section below supersedes it.**
+Completing cleanly is not evidence of not reaching the defect: the failure is
+undefined behaviour, and `compute-sanitizer --tool synccheck` later showed the
+diverging kernel *is* entered through default routing, reporting 1408 errors on
+an `f16` cache at depth 8,704 with no experiment control set at all. What the
+clean runs establish is only that the shipped rule does not usually make it
+abort, not that it avoids the kernel.
+
+Lowering the threshold globally would still turn a measured 11.6% decode gain
+into frequent aborts for anyone running host-resident KV.
 
 **Disposition: the threshold is not changed here.** The evidence is strong
 enough to say the constant is wrong for high-GQA models with a native quantized
@@ -6723,9 +6730,17 @@ validated on a low-GQA model, and it would need the host-resident MMA path fixed
 first. Both belong in their own change, and the host-resident abort belongs with
 the CPU KV offload work rather than here. The experiment control is reverted.
 
-Reproducer for the abort, on this branch or without it:
+**Historical reproducer — does not run on the committed tree.** The command
+below forced the route with `GGML_CUDA_FATTN_VEC_MAX_NQ`, the experiment control
+that was reverted with the rest of this experiment, so the variable no longer
+exists in the source and the command silently measures default routing instead.
+It is kept only to record what was run at the time. For a reproducer that works
+on the committed tree, use the `synccheck` command in the root-cause section
+below, which needs no experiment control.
 
 ```
+# requires the reverted GGML_CUDA_FATTN_VEC_MAX_NQ control; will not force the
+# route on the committed tree
 GGML_CUDA_FATTN_VEC_MAX_NQ=0 llama-bench -m MODEL -ngl 99 -sm none -mg 0 -t 3 \
   -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
   -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -p 0 -n 64 -d 4096 -r 5
