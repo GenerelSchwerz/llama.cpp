@@ -5958,6 +5958,15 @@ static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_
 #endif
 }
 
+static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+#if defined(FLASH_ATTN_AVAILABLE) && defined(GGML_CUDA_COMPACT_CAUSAL_MASK)
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5980,6 +5989,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_recurrent_sparse_snapshots_supported") == 0) {
         return (void *)ggml_backend_cuda_recurrent_sparse_snapshots_supported;
+    }
+    if (strcmp(name, "ggml_backend_flash_attn_causal_prefix_supported") == 0) {
+        return (void *)ggml_backend_cuda_flash_attn_causal_prefix_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;

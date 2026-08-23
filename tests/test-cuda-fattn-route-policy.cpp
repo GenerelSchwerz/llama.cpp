@@ -67,6 +67,7 @@ int main(int argc, char ** argv) {
     const std::string kvarn_view = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn.cuh");
     const std::string kvarn_mma_case = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh");
     const std::string fattn_mma_f16 = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-f16.cuh");
+    const std::string fattn_vec = read_file(root + "/ggml/src/ggml-cuda/fattn-vec.cuh");
     const std::string kvarn_decode = read_file(root + "/ggml/src/ggml-cuda/fattn-mma-kvarn-decode.cuh");
     const std::string kvarn_dispatch_header = read_file(root + "/ggml/src/ggml-cuda/fattn-kvarn-dispatch.cuh");
     const std::string kvarn_wht = read_file(root + "/ggml/src/ggml-cuda/kvarn-wht.cu");
