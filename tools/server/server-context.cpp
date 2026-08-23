@@ -7,6 +7,7 @@
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
+#include "server-speculative-replay.h"
 #include "server-stream.h"
 
 #include "build-info.h"
@@ -221,45 +222,6 @@ struct server_batch {
     }
 };
 
-struct server_mtp_gpu_replay_state {
-    bool snapshots_active = false;
-    llama_tokens accepted_tokens;
-    common_sampler_ptr accepted_sampler;
-    uint32_t n_accepted = 0;
-
-    bool pending() const {
-        return accepted_sampler != nullptr;
-    }
-
-    void arm(bool enabled) {
-        GGML_ASSERT(!pending());
-        snapshots_active = enabled;
-    }
-
-    void begin(llama_tokens tokens, common_sampler_ptr sampler, uint32_t accepted) {
-        GGML_ASSERT(snapshots_active && !pending() && sampler != nullptr);
-        accepted_tokens = std::move(tokens);
-        accepted_sampler = std::move(sampler);
-        n_accepted = accepted;
-    }
-
-    uint32_t finish(llama_tokens & tokens, common_sampler_ptr & sampler) {
-        GGML_ASSERT(pending());
-        tokens = std::move(accepted_tokens);
-        sampler = std::move(accepted_sampler);
-        const uint32_t accepted = n_accepted;
-        reset();
-        return accepted;
-    }
-
-    void reset() {
-        snapshots_active = false;
-        accepted_tokens.clear();
-        accepted_sampler.reset();
-        n_accepted = 0;
-    }
-};
-
 struct server_slot {
     int id;
 
@@ -279,8 +241,7 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
-    bool spec_is_replay = false;
-    server_mtp_gpu_replay_state spec_gpu_replay;
+    server_speculative_replay_state spec_replay;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -475,8 +436,7 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
-        spec_is_replay = false;
-        spec_gpu_replay.reset();
+        spec_replay.reset();
 
         n_prompt_tokens_cache = 0;
         n_prompt_tokens_lcp = 0;
@@ -679,7 +639,7 @@ struct server_slot {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
 
-            if (spec_is_replay) {
+            if (spec_replay.replaying()) {
                 ++n_spec_replay_cycles;
                 n_spec_replay_batch_tokens += spec_draft.size() + 1;
             }
@@ -3682,7 +3642,7 @@ private:
 
             if (!draft.empty()) {
                 const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
-                slot.spec_gpu_replay.arm(capped_mtp);
+                slot.spec_replay.arm_mtp_gpu_snapshots(capped_mtp);
                 const auto target_policy = server_speculative_checkpoint_policy_for(
                         ctx_tgt_seq_rm_type, common_context_seq_rm_max_rollback(ctx_tgt),
                         draft.size(), 0);
@@ -4623,7 +4583,7 @@ private:
             const size_t n_draft = slot.spec_draft.size();
 
             GGML_ASSERT(n_draft > 0);
-            const bool gpu_snapshot_replay = slot.spec_is_replay && slot.spec_gpu_replay.pending();
+            const bool gpu_snapshot_replay = slot.spec_replay.mtp_gpu_replay_pending();
 
             // verify and try to accept the draft
             const int64_t t_verify_start = ggml_time_us();
@@ -4655,7 +4615,8 @@ private:
                 slot.spec_i_batch.clear();
 
                 if (gpu_snapshot_replay) {
-                    const uint32_t replay_accepted = slot.spec_gpu_replay.finish(accepted, slot.smpl);
+                    const uint32_t replay_accepted =
+                            slot.spec_replay.consume_mtp_gpu_replay(accepted, slot.smpl);
 
                     if (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, -1)) {
                         SLT_ERR(slot, "%s", "failed to restore normal sparse snapshot mode\n");
@@ -4685,7 +4646,7 @@ private:
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
                     const uint32_t direct_horizon = llama_n_rs_seq(ctx_tgt) > 0
                             ? llama_n_rs_seq(ctx_tgt) - 1 : 0;
-                    const bool use_gpu_replay = slot.spec_gpu_replay.snapshots_active &&
+                    const bool use_gpu_replay = slot.spec_replay.mtp_gpu_snapshots_armed() &&
                             n_rollback > direct_horizon;
 
                     if (use_gpu_replay) {
@@ -4721,8 +4682,7 @@ private:
                             return;
                         }
 
-                        slot.spec_is_replay = true;
-                        slot.spec_gpu_replay.begin(
+                        slot.spec_replay.begin_mtp_gpu_replay(
                                 std::move(accepted), std::move(slot.smpl), n_accepted);
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
@@ -4740,7 +4700,7 @@ private:
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                        slot.spec_is_replay = target_policy.replay;
+                        slot.spec_replay.set_checkpoint_replay(target_policy.replay);
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4783,7 +4743,7 @@ private:
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
-                    slot.spec_gpu_replay.reset();
+                    slot.spec_replay.discard_mtp_gpu_snapshot_arm();
                 }
             }
 
@@ -4793,10 +4753,10 @@ private:
             const auto ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
-            if (slot.spec_is_replay && !gpu_snapshot_replay && n_accepted > 0) {
+            if (slot.spec_replay.excludes_replayed_token_from_acceptance() && n_accepted > 0) {
                 n_accepted--;
             }
-            slot.spec_is_replay = false;
+            slot.spec_replay.finish_verification();
 
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
