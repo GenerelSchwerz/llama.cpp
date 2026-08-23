@@ -6402,10 +6402,48 @@ The hybrid does not fully recover the register budget. The symmetric `D = 256`
 kernel sits at 24 bytes of spill against 16 before, because
 `flash_attn_ext_f16` now carries the trailing runtime V-type parameter even in
 instantiations that ignore it. That residual is the honest cost of the
-mechanism. It is measured as a net win against materializing, which is the gate
-this feature is held to; a direct native-versus-native comparison against the
-per-pair binary was not run, because that library had already been overwritten
-by the time the regression was found.
+mechanism, and it was left open whether it costs throughput: the original
+per-pair library had been overwritten by the time the regression was found.
+
+##### The residual spill costs nothing: per-pair against hybrid, natively
+
+The per-pair implementation was rebuilt from its own commit into a separate
+worktree so both libraries could exist at once, and the two were compared
+directly with `--flash-attn-native-quants` enabled on both arms. This is the
+comparison the hybrid entry above could not make.
+
+| `q8_0/q8_0`, 512-token prefill at depth 32,768 | n | Mean | SD |
+|---|---:|---:|---:|
+| per-pair, `35115bf4d`, 5,808 cases | 10 | 829.801 t/s | 4.664 |
+| hybrid, `8b9a5d111`, 1,056 cases | 10 | 829.562 t/s | 4.386 |
+
+`+0.029%`, Welch `t = +0.112` over two reverse-order arm pairs of `r = 5`. The
+two implementations are indistinguishable. The 24-byte spill is real in
+`cuobjdump -res-usage` and costs nothing measurable on the production shape, so
+body deduplication buys 197 MB of library and 5,808 -> 1,056 explicit cases for
+no runtime price.
+
+This also settles the reading of the earlier `-0.73%` regression that killed the
+plain runtime-V variant. That loss cannot be attributed to spill as such: spill
+rose 16 -> 48 B there and 16 -> 24 B here, and only the former lost. What
+distinguishes them is that the plain variant put the runtime switch on the
+symmetric pair's own V load, while the hybrid keeps that pair fully
+compile-time. Consistent with the configuration sweep, which found the register
+ceiling is not this kernel's limit in either direction.
+
+Both binaries were built with identical flags, and after the harness fix below
+their `llama-bench` sources were byte-identical, so the arms differ only in
+`libggml-cuda.so`.
+
+The per-pair binary could not emit JSON on the first attempt: it aborted in the
+output writer with `vector::_M_range_check: __n (which is 127) >= this->size()
+(which is 127)` after all five runs had completed. The rebase resolution had
+kept both branches' additions to the `llama-bench` field-name list, leaving 131
+names against 127 values. `2df2bf4fe` fixes it at branch HEAD, but every commit
+between the rebase and that fix carries it, which matters for any future
+per-commit benchmarking or bisect in that range. Applying the one-line fix to
+the worktree rebuilt only `llama-bench`; `libggml-cuda.so` was verified
+unchanged by size and mtime.
 
 ##### The declaration header was compiling what it only meant to declare
 
