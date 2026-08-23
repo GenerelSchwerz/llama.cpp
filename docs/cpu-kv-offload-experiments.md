@@ -3522,7 +3522,7 @@ published:
 | [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
-| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | published head `565233f79faebb5bace9e41f0e2d0ba9c70930cf`; preserved evidence head `d4183adb8b4902a125b9339cd39032a095fca013`; this investigation composes locally onto `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the historical performance/resource record; current-base results are composition evidence only. |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | measured runtime head `222eec2e7c91296b5f9335389dcff0cfc8a08129`; exact main baseline `4b86269fdf001de44dd96e9c9ae26a9e25091cca` | Compact causal-prefix source and branch-owned evidence. Fresh official main-based exactness, PPL, matched 4K/30K/128K performance, and resource gates pass; PR remains unmerged pending pushed-head checks and review. |
 | [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; merged through `35e179272` and present in current KV base `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. It is an unrelated opt-in and is omitted from compact-mask causal commands. |
 
 The completed parallel-tree audit is preserved at snapshot
@@ -3533,15 +3533,19 @@ neutral trailing merge-barrier edit, and requiring direct-target profiler
 captures. Its cumulative throughput and allocation totals are interaction
 evidence for that uncommitted tree, not isolated KV-base or PR results.
 
-PR 7's isolated c9 dense/Candidate-1/dense A/B/A showed exact serving output
-and matching-batch PPL, context-scaled serving VRAM savings through 128K, and no
-material decode regression in the focused repeated 128K screen. Its separate
-`4a7f9b496` composition gate passed the merged PR 5/PR 6 guards, compact
-CPU/CUDA exactness, adjacent graph/allocator/attention tests, repeated PPL and
-deterministic output, and a non-performance VMM telemetry smoke. It did not
-re-measure A/B/A performance or memory on the composed base. Failed setup and
-identity probes, unmatched launches, and rejected noisy timing are not evidence
-and are not copied here.
+PR 7's isolated c9 lane remains historical evidence for its named binaries.
+The fresh official comparison uses main `4b86269fd` and runtime head
+`222eec2e7`: compiled dense/compact exactness passed 6/6, focused tests passed
+10/10, and main/candidate/main PPL was exactly `2.1674 +/- 0.03849` with the
+same four chunks. Candidate effects were time-adjusted neutral at 4K prefill,
++0.048% at 4K decode, +0.777%/+0.406% at 30K prefill/decode, and
++1.275%/+0.492% at 128K CPU-pinned prefill/decode. Sampled process-VRAM deltas
+were -2/0/-58 MiB at 4K/30K/128K prefill; exact allocation classes and the
+drift-aware 4K chronology are retained in the focused compact investigation.
+The current artifact manifest SHA-256 is
+`d4246230238f39cf643a2a2a1037835cc4a20dd490844abc1dc976d1180206a1`.
+Failed setup and identity probes remain explicitly invalid and contribute no
+measurement.
 
 PR 8's final Experiment 021 validated the live workspace on the merged W02/W06
 base. Omitted/live/explicit-off produced exact 1K token SHA-256

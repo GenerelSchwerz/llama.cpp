@@ -118,7 +118,7 @@ static ggml_tensor * build_attn_inp_kq_mask(
         ggml_backend_sched_t sched = nullptr,
         bool is_reserve = false,
         bool allow_compact = false,
-        bool * causal_prefix = nullptr) {
+        std::optional<uint32_t> * causal_prefix_n_kv = nullptr) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
@@ -134,8 +134,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
                 n_tokens, n_stream);
     }
 
-    if (causal_prefix) {
-        *causal_prefix = false;
+    if (causal_prefix_n_kv) {
+        causal_prefix_n_kv->reset();
     }
 
     // Proven consecutive current-token writes can reuse the existing I64 write
@@ -146,8 +146,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
     // It also keeps CUDA Graph replay aware of each update without another
     // allocation or a replay-unsafe dynamic op parameter.
     if (compact) {
-        GGML_ASSERT(causal_prefix != nullptr && k_idxs != nullptr);
-        *causal_prefix = true;
+        GGML_ASSERT(causal_prefix_n_kv != nullptr && k_idxs != nullptr);
+        *causal_prefix_n_kv = n_kv;
         ggml_set_name(k_idxs, "attn_inp_kq_mask_compact");
         return k_idxs;
     }
@@ -166,17 +166,16 @@ static bool can_reuse_kq_mask(
         const llama_kv_cache_context * mctx,
         const llama_ubatch & ubatch,
         const llama_cparams & cparams,
-        bool causal_prefix = false,
-        uint32_t causal_prefix_n_kv = 0) {
+        std::optional<uint32_t> causal_prefix_n_kv = std::nullopt) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    if (causal_prefix) {
+    if (causal_prefix_n_kv) {
         return kq_mask != nullptr && kq_mask->type == GGML_TYPE_I64 &&
             kq_mask->ne[0] == n_tokens && kq_mask->ne[1] == 1 &&
             kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1 &&
-            causal_prefix_n_kv == n_kv &&
+            *causal_prefix_n_kv == n_kv &&
             mctx->can_use_compact_causal_mask(ubatch, cparams.causal_attn, false);
     }
 
@@ -777,7 +776,7 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     // the mask is left unallocated when the graph only stores K/V without attending
     // (e.g. DFlash's KV-injection pass)
-    if (!self_kq_mask_causal_prefix && self_kq_mask && self_kq_mask->buffer) {
+    if (!self_kq_mask_causal_prefix_n_kv && self_kq_mask && self_kq_mask->buffer) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
         mctx->set_input_kq_mask_tail(self_kq_mask, self_kq_mask_tail,
                 self_tail_read_idxs, self_tail_body_read_idxs, self_tail_bias_read_idxs,
@@ -836,7 +835,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams,
-            self_kq_mask_causal_prefix, self_kq_mask_n_kv);
+            self_kq_mask_causal_prefix_n_kv);
     res &= self_kq_mask_tail == nullptr ||
             (self_kq_mask_tail->ne[0] == tail_attention_stride &&
              self_kq_mask_tail->ne[1] == self_kq_mask->ne[1] &&
@@ -854,7 +853,7 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    if (!self_kq_mask_causal_prefix) {
+    if (!self_kq_mask_causal_prefix_n_kv) {
         mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
     }
 }
@@ -869,7 +868,7 @@ bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams,
-            self_kq_mask_causal_prefix, self_kq_mask_n_kv);
+            self_kq_mask_causal_prefix_n_kv);
 
     return res;
 }
@@ -904,7 +903,7 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
     }
 
     res &= can_reuse_kq_mask(self_kq_mask, this->mctx, params.ubatch, params.cparams,
-            self_kq_mask_causal_prefix, self_kq_mask_n_kv);
+            self_kq_mask_causal_prefix_n_kv);
 
     return res;
 }
@@ -1552,7 +1551,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
   //res &= inp_attn->self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams,
-            inp_attn->self_kq_mask_causal_prefix, inp_attn->self_kq_mask_n_kv);
+            inp_attn->self_kq_mask_causal_prefix_n_kv);
     res &= inp_attn->self_tail_read_idxs == nullptr ||
             (inp_attn->self_tail_read_idxs->ne[0] == tail_attention_stride &&
              inp_attn->self_tail_read_idxs->ne[1] == params.ubatch.n_tokens);
@@ -1585,7 +1584,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    if (!inp_attn->self_kq_mask_causal_prefix) {
+    if (!inp_attn->self_kq_mask_causal_prefix_n_kv) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
@@ -1612,7 +1611,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams,
-            inp_attn->self_kq_mask_causal_prefix, inp_attn->self_kq_mask_n_kv);
+            inp_attn->self_kq_mask_causal_prefix_n_kv);
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -3480,8 +3479,6 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     bool is_reserve) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
-    inp->self_kq_mask_n_kv = mctx_cur->get_n_kv();
-
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
@@ -3491,7 +3488,7 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask = build_attn_inp_kq_mask(
                 ctx0, mctx_cur, ubatch, cparams, inp->self_k_idxs,
                 sched, is_reserve, true,
-                &inp->self_kq_mask_causal_prefix);
+                &inp->self_kq_mask_causal_prefix_n_kv);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
         build_attn_inp_tail(ctx0, ubatch, mctx_cur, inp->self_kq_mask,
                 inp->self_tail_idxs, inp->self_tail_read_idxs, inp->self_tail_body_read_idxs,
@@ -3798,8 +3795,6 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
     bool is_reserve) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
-    inp->self_kq_mask_n_kv = mctx_cur->get_n_kv();
-
     {
         GGML_ASSERT(hparams.swa_type == LLAMA_SWA_TYPE_NONE && "Use llama_kv_cache_iswa for SWA");
 
@@ -3808,7 +3803,7 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
         inp->self_kq_mask = build_attn_inp_kq_mask(
                 ctx0, mctx_cur, ubatch, cparams, inp->self_k_idxs,
                 sched, is_reserve, true,
-                &inp->self_kq_mask_causal_prefix);
+                &inp->self_kq_mask_causal_prefix_n_kv);
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 

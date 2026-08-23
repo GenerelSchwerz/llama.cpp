@@ -89,26 +89,26 @@ It is not evidence that any separate workspace or mask feature is correct.
 
 ### 3. Integrate compact causal masking only from final PR 7
 
-[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) has preserved
-evidence head `d4183adb8b4902a125b9339cd39032a095fca013`. Its evidence publication
-contained six feature commits over exact source baseline `4a7f9b496`; the
-current draft inherits merged PR 9 documentation base
-`8e858fcec39049fa028ce6fcb144a0c08b03abd3` without changing the causal source
-delta or evidence identity. It automatically uses an I64 causal-prefix
-descriptor only for proved
-single-stream contiguous standard-KV layouts and otherwise retains the dense
-mask. Per-consumer views remove the measured allocator fragmentation without
-changing allocator policy, public controls, or attention-kernel ownership.
+[PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) has measured runtime
+head `222eec2e7c91296b5f9335389dcff0cfc8a08129` on exact main baseline
+`4b86269fdf001de44dd96e9c9ae26a9e25091cca`. It automatically passes the
+existing I64 write-index tensor directly as a causal-prefix descriptor only for
+proved single-stream contiguous standard-KV layouts and otherwise retains the
+dense mask. One optional graph value owns representation presence and logical
+K span; no per-consumer views, allocator policy, public control, or unrelated
+attention family is added. The final MMA repair gives the compact first bound
+explicit block-owned shared-memory lifetime without changing the compile-time
+dense/compact vector specializations.
 
 Keep its two evidence lanes distinct:
 
-- isolated c9 dense/Candidate-1/dense A/B/A owns the resource and performance
-  claims: exact output and PPL, serving savings of 20/30/34 MiB at 4K/30K/34K
-  and 64/96/128 MiB at 64K/98K/128K, plus a local 98 MiB 49K allocator-bin
-  result that must not be extrapolated; and
-- `ae60c7321d950937a36af096112525db777ae13f` on the merged base owns only the
-  composed build, correctness, PPL/output, and W02 telemetry coexistence gates.
-  It is not a replacement A/B/A performance or memory comparison.
+- the isolated c9 lane retains its historical profiler and deeper serving
+  evidence for its named binaries only; and
+- the fresh main-based official lane owns the review-readiness result: compiled
+  6/6 exactness, exact PPL, matched 4K/30K/128K prefill/decode with no detected
+  regression, and current allocation/process-VRAM telemetry. Its 135-file
+  artifact manifest has SHA-256
+  `d4246230238f39cf643a2a2a1037835cc4a20dd490844abc1dc976d1180206a1`.
 
 Do not copy invalid setup/probe results or rejected noisy timing. Target-plus-
 MTP and composition with PR 4 and final PR 8 remain integration gates.
