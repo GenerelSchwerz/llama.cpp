@@ -6739,6 +6739,90 @@ perf` would be the better instrument -- it times FlashAttention directly at
 `kv = 4096` and `7680` with no depth cost -- except every perf case carries
 `native_quants=0`, so it cannot reach the native path without new cases.
 
+#### Root cause of the crossover blocker: divergent barriers in the MMA kernel
+
+The abort that blocked the crossover work was diagnosed. It is **not** an
+out-of-bounds access and **not** this feature's defect. It is a divergent
+`__syncthreads()` in upstream's `flash_attn_ext_f16`, and it is reachable
+through default routing today.
+
+`compute-sanitizer --tool memcheck` reports **0 errors** on a run that aborts
+without it, which is the first clue: nothing reads out of bounds.
+`--tool synccheck` reports 512:
+
+```
+Barrier error detected. Divergent thread(s) in block.
+  at flash_attn_ext_f16<256, 256, ncols1=1, ncols2=8, ...>+0x47580
+```
+
+In the SASS, `@P0 BRA 0x47660` at `0x47460` jumps over the `BAR.SYNC` at
+`0x47580`, and the target lands in the combine write-back with no barrier of its
+own. The instructions in between -- `SHFL.BFLY`, `MUFU.EX2` (an `expf`), a
+second shuffle -- place it in the combine reduction, the
+`if (np > 1 && threadIdx.y % np == 0)` block whose source already carries an
+`else if (np > 1) { __syncthreads(); }` balancer written to prevent exactly
+this. Divergent barriers are undefined behaviour, which accounts for every
+symptom: flaky rather than deterministic, depth-dependent, and invisible to
+memcheck.
+
+Affected shapes, measured with synccheck rather than inferred:
+
+| Shape | `n_q` | synccheck |
+|---|---|---:|
+| `ncols1 = 1`, `ncols2 = 8` | 1 | 512 errors |
+| `ncols1 = 2`, `ncols2 = 8` | 2 | 1024 errors |
+| `ncols1 = 4`, `ncols2 = 8` | 3-4 | 1984 errors |
+| `ncols1 = 8`, `ncols2 = 8` | >= 5, including prefill | **0 errors** |
+
+An earlier prediction that only `np > 1` shapes were affected was wrong;
+`ncols1 = 4` diverges too. The boundary is empirical: small-batch shapes
+diverge, the 8x8 production prefill shape does not.
+
+**The production prefill shape is clean, so no measurement in this PR is
+affected.** Every throughput figure recorded here comes from `ncols1 = 8`
+prefill or from the vector kernel.
+
+It is independent of this feature and reachable by default:
+
+- It reproduces with `--no-flash-attn-native-quants` and with an `f16` cache:
+  `flash_attn_ext_f16<256, 256, 1, 8, ..., f16, f16>`, same 512 errors.
+- With **no experiment control at all** -- default routing, `f16` cache,
+  GPU-resident KV, depth 8,704 -- synccheck reports **1408 errors**. The Ada
+  rule sends `n_q = 1` to MMA for non-quantized caches when
+  `gqa_ratio > 4 && K->ne[1] >= 8192`, which this model satisfies.
+- For quantized caches the Ada rule sends `n_q <= 2` to the vector kernel, but
+  `n_q` 3 and 4 route to MMA by default and land on the diverging
+  `ncols1 = 4` shape. Speculative verification at small draft batch sizes sits
+  exactly there.
+
+Whether it aborts depends on timing. Host-resident KV aborted reliably from
+depth 4,096 up and was clean at 2,048; GPU-resident KV aborted occasionally at
+depth 32,768. `test-backend-ops` passes 1695/1695 regardless, because divergent
+barriers on Volta-and-later frequently produce correct results anyway -- which
+is why this survived undetected.
+
+**Consequence for the crossover: the gain and the bug are the same shapes.**
+The measured `+11.59%` decode win at depth 32,768 is `n_q = 1`, which is
+`ncols1 = 1`. Lowering the vector threshold to capture it means routing more
+work onto the diverging shapes, not fewer. There is no threshold setting that
+takes the gain while avoiding the defect, so an opt-in "experimental" flag would
+amount to shipping a switch that enables undefined behaviour, whose failure mode
+includes silently wrong attention output rather than only a crash. It is not
+offered.
+
+The order is therefore: fix the barrier divergence first, in upstream's kernel
+and as its own change; then re-measure the crossover, because undefined
+behaviour can affect timing as well as results and the `+11.59%` was measured on
+a diverging kernel; then decide the threshold, with a low-GQA model to check the
+GQA-aware term.
+
+Reproducer, requiring nothing from this branch:
+
+```
+compute-sanitizer --tool synccheck llama-bench -m MODEL -ngl 99 -sm none -mg 0 \
+  -t 3 -nkvo 0 -fa on -ctk f16 -ctv f16 -b 512 -ub 512 -p 0 -n 4 -d 8704 -r 1
+```
+
 #### Retired without further attempts: the remaining loader-internal work
 
 Four separate interventions inside this kernel's loader have now been measured,
