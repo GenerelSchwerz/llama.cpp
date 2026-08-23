@@ -6645,6 +6645,100 @@ relieved registers and lost 9.35%. The hybrid raised spill and cost nothing.
 Staging lowered spill by 24 bytes and lost 1.7%. Whatever limits this kernel, it
 is not the register file.
 
+#### The vector/MMA crossover: MMA wins everywhere measured, and cannot be adopted
+
+The Ada dispatch rule sends quantized K/V to the vector kernel at `n_q <= 2` and
+to MMA above it (`ggml_cuda_get_best_fattn_kernel` in `fattn.cu`). That constant
+was never measured against this branch's native MMA path, so it was swept.
+
+The vector kernel is compiled only for `cols_per_block` 1 and 2, but it covers
+larger batches by launching more blocks rather than more columns per block, so
+every threshold value is runnable and the constant is a genuine tuning choice
+rather than the edge of what exists. The sweep used an internal
+`GGML_CUDA_FATTN_VEC_MAX_NQ` read once from the environment, defaulting to 2,
+which lets one build measure both sides; `0` forces MMA at every batch size and
+a large value forces vector. Verified before use: `0` and `2` give identical
+routing on the 1694-case audit, and `64` moves 946 of those cases off MMA.
+
+Prompt-side, `q8_0/q8_0`, depth 4,096, GPU-resident KV, ABBA per cell, `r = 5`:
+
+| `n_q` | Vector | MMA | Δ | Welch `t` |
+|---:|---:|---:|---:|---:|
+| 1 | 41.389 t/s | 41.799 t/s | `+0.99%` | `+33.79` |
+| 2 | 73.561 t/s | 74.995 t/s | `+1.95%` | `+27.79` |
+| 3 | 97.972 t/s | 102.213 t/s | `+4.33%` | `+35.90` |
+| 4 | 118.003 t/s | 123.369 t/s | `+4.55%` | `+66.63` |
+| 6 | 145.138 t/s | 152.868 t/s | `+5.33%` | `+33.68` |
+| 8 | 166.107 t/s | 176.877 t/s | `+6.48%` | `+74.86` |
+| 16 | 290.294 t/s | 324.110 t/s | `+11.65%` | `+324.83` |
+| 32 | 438.977 t/s | 521.550 t/s | `+18.81%` | `+389.92` |
+
+Prompt processing at `ubatch = 1` is a proxy for a verification batch, not real
+decode, so decode was measured separately with `-n 64` where `n_q = 1` arises
+naturally:
+
+| Decode, GPU-resident | Vector | MMA | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| depth 4,096 | 39.074 t/s | 39.402 t/s | `+0.84%` | `+6.55` |
+| depth 32,768 | 32.557 t/s | 36.330 t/s | **`+11.59%`** | `+67.75` |
+
+**There is no crossover in the measured range.** MMA wins at every batch size
+from 1 to 32 and at real decode, and its advantage grows monotonically with
+batch size. The shipped rule sends `n_q <= 2` the wrong way, costing 11.6% of
+decode throughput at depth 32,768 on this model.
+
+That is a statement about *this* model, and the rule is global. This model has a
+high GQA ratio, and the dispatcher already contains
+`!gqa_opt_applies && Q->ne[1] == 1 -> VEC`, which implies MMA is expected to win
+when GQA folding applies. The honest reading is that the rule needs a GQA-aware
+term rather than a smaller constant, and confirming that needs a low-GQA model.
+
+**The change the data recommends is currently unimplementable, and that is the
+more important result.** With host-resident KV
+(`-nkvo 1 --kv-cpu-pinned --kv-gpu-layers 0`), forcing MMA at `n_q = 1` aborts
+in `ggml_backend_cuda_synchronize` deterministically: 4 of 4 retries, twice, at
+both depths, while the vector arm at the same settings succeeded on the first
+attempt every time. Host-resident `n_q <= 8` could not be measured at all for
+the same reason; only `n_q` 16 and 32 completed, where MMA wins by `+10.20%` and
+`+17.09%`.
+
+The abort is not this feature's:
+
+- It occurs with `--no-flash-attn-native-quants` as well as with it.
+- It occurs with an `f16` cache, not only quantized.
+- It occurs with GPU-resident KV at small `ubatch` too, and without
+  `--kv-cpu-pinned`, so it is not a pinning or residency property alone.
+- It is **not reachable through default routing**: `f16` and `q8_0`,
+  host-resident, decode at depths 4,096 and 16,384 all complete cleanly, because
+  the shipped rule never sends `n_q = 1` to MMA in these configurations.
+
+So it is latent today and becomes reachable exactly when the threshold is
+lowered. Lowering it globally would turn a measured 11.6% decode gain into a
+crash for anyone running host-resident KV.
+
+**Disposition: the threshold is not changed here.** The evidence is strong
+enough to say the constant is wrong for high-GQA models with a native quantized
+cache, and not strong enough to replace it: it would need a GQA-aware rule
+validated on a low-GQA model, and it would need the host-resident MMA path fixed
+first. Both belong in their own change, and the host-resident abort belongs with
+the CPU KV offload work rather than here. The experiment control is reverted.
+
+Reproducer for the abort, on this branch or without it:
+
+```
+GGML_CUDA_FATTN_VEC_MAX_NQ=0 llama-bench -m MODEL -ngl 99 -sm none -mg 0 -t 3 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -p 0 -n 64 -d 4096 -r 5
+```
+
+Two measurement notes. `llama-bench` applies `-ubatch` to the depth prefill as
+well as to the measured tokens, so `-ub 1 -d 32768` means 32,768 single-token
+forward passes; the first attempt at this sweep was abandoned after one cell ran
+past eleven minutes, and depth 4,096 was used instead. And `test-backend-ops
+perf` would be the better instrument -- it times FlashAttention directly at
+`kv = 4096` and `7680` with no depth cost -- except every perf case carries
+`native_quants=0`, so it cannot reach the native path without new cases.
+
 #### Retired without further attempts: the remaining loader-internal work
 
 Four separate interventions inside this kernel's loader have now been measured,
