@@ -421,9 +421,11 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_NATIVE  = 500, // MMA reading a quantized cache in place, no F16 copy
 };
 
-// The graph opts in per node. The kernels for the default cache types are always
-// compiled, so a request can only be declined by the route predicate below, not
-// by the build.
+// The graph opts in per node. The kernels for the default cache types are
+// compiled by every CUDA FlashAttention build, so a default-tier request is
+// declined only by the route predicate below. An extra-tier request is still
+// declined by the build when GGML_CUDA_FA_ALL_QUANTS was not set, because
+// ggml_cuda_fattn_mma_quant_type() then does not name those types.
 static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
     return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
 }

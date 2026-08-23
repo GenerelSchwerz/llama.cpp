@@ -265,9 +265,9 @@ template <> struct fattn_quant_type_traits<GGML_TYPE_Q2_1>  : fattn_quant_2bit_t
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_0>  : fattn_quant_2bit_traits<block_q3_0,  QK3_0,  false, true>  {};
 template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_2bit_traits<block_q3_1,  QK3_1,  true,  true>  {};
 
-// Compiled type tiers. The default set keeps build time in the same bracket as
-// before; GGML_CUDA_FA_ALL_QUANTS adds the rest, mirroring how the vector
-// FlashAttention pair matrix is tiered.
+// Compiled type tiers. The default set is compiled by every CUDA FlashAttention
+// build and costs it +54.53 MiB of libggml-cuda.so; GGML_CUDA_FA_ALL_QUANTS adds
+// the rest, mirroring how the vector FlashAttention pair matrix is tiered.
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 #define FATTN_MMA_QUANT_TYPES_EXTRA(F) \
     F(GGML_TYPE_Q4_1) F(GGML_TYPE_Q5_1) F(GGML_TYPE_Q6_1) \
@@ -296,11 +296,12 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_type(ggml_ty
 // accepts for K and V, the native path accepts too, so no cache configuration
 // has to reason about a band.
 //
-// That is a deliberate cost decision. Eleven types are 121 ordered pairs, each
-// costing three head sizes times sixteen column shapes, so the full matrix is
-// 5,808 explicit cases against the 121 the symmetric route needed. It falls
-// entirely on GGML_CUDA_FA_ALL_QUANTS builds, which are already the opt-in
-// tier; the default four-type tier is 16 pairs and 768 cases.
+// That is a deliberate cost decision, and the shared attention body is what
+// makes it affordable. Instantiating per pair would cost 5,808 explicit cases
+// for eleven types; sharing one runtime-V kernel per K type across the mixed
+// pairs brings all 121 ordered pairs down to 1,056 cases. The default
+// four-type tier is 16 pairs and 384 cases, and unlike the extra tier it is
+// compiled unconditionally.
 //
 // The bit ladder below is retained because two things still need it: the
 // ordering it defines documents which side of a pair is the precision-sensitive

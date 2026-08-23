@@ -7,8 +7,9 @@ persistent cache format, cache placement, or quantization policy.
 
 The feature is deliberately explicit at run time: `--flash-attn-native-quants`
 is off by default and nothing takes the native route without it. The kernels
-for the default types are always compiled, so there is no build-time switch to
-enable the family. Its current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
+for the default types are compiled by every CUDA FlashAttention build
+(`GGML_CUDA_FA=ON`, its default), so there is no family-specific build switch to
+enable them. Its current type inventory is `Q8_0`, `Q4_0`, `Q5_0`, and `Q6_0` by default, at
 equal head dimensions 64, 128, or 256, on NVIDIA GPUs that use the Ampere MMA
 implementation. `GGML_CUDA_FA_ALL_QUANTS` adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`,
 `Q3_1`, `Q2_0`, and `Q2_1` to the same head-dimension set. K and V need not be
@@ -74,8 +75,8 @@ pair from the K and V tensors themselves.
 ## Build and use
 
 The native MMA family's default types (`Q8_0`, `Q6_0`, `Q5_0`, `Q4_0`) are
-compiled by every CUDA build. `GGML_CUDA_FA_ALL_QUANTS` is the single build flag
-that adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0` and `Q2_1`. This build
+compiled by every CUDA FlashAttention build. `GGML_CUDA_FA_ALL_QUANTS` is the
+single build flag that adds `Q4_1`, `Q5_1`, `Q6_1`, `Q3_0`, `Q3_1`, `Q2_0` and `Q2_1`. This build
 therefore contains the default family:
 
 ```bash
@@ -93,9 +94,12 @@ build/bin/llama-server -m model.gguf --flash-attn on \
 
 The run-time option is exposed by the server, CLI, perplexity, batched,
 parallel, and benchmark tools. Because the default kernels are always present, a
-request can no longer be declined by the build; it is declined only when the
-opted-in quantized pair, head dimension, or device has no registered kernel, and
-that reports a once-only warning. F16/BF16 attention is not treated as an
+default-tier request can no longer be declined by the build. It is still
+declined -- with a once-only warning -- when the opted-in pair, head dimension,
+or device has no registered kernel, and an **extra-tier** request is declined on
+a build without `GGML_CUDA_FA_ALL_QUANTS`, because that build omitted those
+types. Only default-tier requests are independent of a build switch, and only
+when FlashAttention itself is compiled. F16/BF16 attention is not treated as an
 unsupported quantized request.
 
 `GGML_CUDA_FA_ALL_QUANTS` extends this family's own registration list (see
@@ -263,9 +267,38 @@ current policy is recorded under "Build cost of the mandatory default family"
 below. The mixed short-depth performance and the limited hardware coverage are
 why the run-time default remains off.
 
+### Known baseline exception to the full-suite gate
+
+Step 4 of the validation protocol requires the full FlashAttention backend
+suite with the run-time option off. **That suite does not currently pass on this
+fork, for reasons that predate this feature**, and the gate should be claimed
+with that exception stated rather than silently.
+
+The focused selection passes: `test-backend-ops -o FLASH_ATTN_EXT -p
+"native_quants=1"` gives 1695/1695. The unfiltered suite aborts with exit 134
+in `ggml_cuda_flash_attn_ext_vec` at:
+
+```
+hsk=320,hsv=256,nr23=[32,1],kv=512,nb=1
+```
+
+No quantized cache is involved: head dimension 320 with a GQA ratio below 32
+has MMA instances only at `ncols2 = 32`, so it falls through to the vector path,
+which has no `D = 320` case, while `ggml_backend_supports_op` claims support.
+
+Provenance, established by @GenerelSchwerz on PR 4: the exact PR target base
+fails identically, tagged BeeLlama v0.4.3 (`ba27edad2`) fails identically, and
+the mismatch originated in `c9e746733`, an ancestor of v0.4.3 in the v0.4.0
+rebase lineage, whose `fattn.cu` is identical to current `beellama-main`.
+
+This is a BeeLlama vector-routing maintenance defect to be tracked and fixed
+separately. It is recorded here only so that "the full suite was run" is never
+claimed for this feature without the exception attached.
+
 ## Build cost of the mandatory default family
 
-The default four types are compiled by every CUDA build, so this cost is paid
+The default four types are compiled by every CUDA FlashAttention build, so this
+cost is paid
 whether or not `--flash-attn-native-quants` is ever used. It is recorded here
 because the decision to make it mandatory rests on it.
 
@@ -296,7 +329,8 @@ with no indication that the fix was a rebuild. Making the default types
 unconditional means the run-time flag is the only thing anyone has to know
 about, and it is the flag that actually decides behaviour.
 
-The trade is `+54.53 MiB` of `libggml-cuda.so` on every CUDA build against
+The trade is `+54.53 MiB` of `libggml-cuda.so` on every CUDA FlashAttention
+build against
 removing a build-time footgun. `GGML_CUDA_FA_ALL_QUANTS` remains available for
 the seven extra types, so the mandatory portion is bounded at the four types
 that cover the common quantized cache configurations.
@@ -324,8 +358,8 @@ that cover the common quantized cache configurations.
   Coverage of every ordered pair costs two kernels per type rather than one per
   pair, because only the symmetric pair specializes V at compile time. Each case
   is one device kernel rather than two, because the route requires a zero logit
-  softcap and so never names the softcap specialization. **Every CUDA build pays
-  the default-tier cost**, measured below.
+  softcap and so never names the softcap specialization. **Every CUDA
+  FlashAttention build pays the default-tier cost**, measured below.
 - Existing Q8 quality characteristics are unchanged because the cache format
   is unchanged. This option is not a quality or memory-compression setting.
 

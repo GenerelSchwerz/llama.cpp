@@ -63,8 +63,9 @@ policy. Enable KVarN only in worktrees that build or validate that feature.
 `GGML_CUDA_FA_HALF_QUANTS` no longer exists. Valid KVarN pairs outside the fast
 matrix use descriptor-native MMA fallback.
 
-The native MMA FlashAttention family is always compiled for the default cache
-types (`q8_0`, `q6_0`, `q5_0`, `q4_0`); there is no build option to enable it.
+The native MMA FlashAttention family is compiled by every CUDA FlashAttention
+build for the default cache types (`q8_0`, `q6_0`, `q5_0`, `q4_0`); there is no
+family-specific build option to enable it.
 `GGML_CUDA_FA_ALL_QUANTS` is the single build flag that widens it to the other
 seven types, so it does expand native MMA families. Runtime cache types still
 come from the graph;

@@ -6812,7 +6812,9 @@ It is independent of this feature and reachable by default:
 
 Whether it aborts depends on timing. Host-resident KV aborted reliably from
 depth 4,096 up and was clean at 2,048; GPU-resident KV aborted occasionally at
-depth 32,768. `test-backend-ops` passes 1695/1695 regardless, because divergent
+depth 32,768. The focused `native_quants=1` selection of `test-backend-ops`
+passes 1695/1695 regardless -- that is the selection, not the full suite, which
+has its own inherited exception documented in the feature guide -- because divergent
 barriers on Volta-and-later frequently produce correct results anyway -- which
 is why this survived undetected.
 
