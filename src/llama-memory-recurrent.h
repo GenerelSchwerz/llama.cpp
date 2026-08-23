@@ -203,8 +203,6 @@ public:
 
     int32_t s_copy(int i) const;
 
-    bool has_sparse_snapshots() const;
-    int32_t get_selected_snapshot_token() const;
     const llama_recurrent_snapshot_mode & get_snapshot_mode() const;
 
 private:
