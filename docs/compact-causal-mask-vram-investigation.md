@@ -1,7 +1,9 @@
 # Compact causal-prefix design and evidence
 
-Status: PR 7 is the isolated compact causal-prefix publication lane. It remains
-draft while the final main-based readiness gates described below are running.
+Status: PR 7 is the isolated compact causal-prefix publication lane. Its final
+main-based runtime gates passed at measured runtime head `222eec2e7`; review
+readiness still requires the pushed head to pass GitHub checks and report
+cleanly mergeable.
 The complete superseded investigation transcript is available from Git at
 `d86145f50:docs/compact-causal-mask-vram-investigation.md`; it is not a current
 command source.
@@ -260,11 +262,13 @@ flock /tmp/beellama-single-gpu.lock -c '
 '
 ```
 
-Use `DEPTH=4096` and `30000` with no placement extra. Use `DEPTH=131072` with
-`--no-kv-offload --kv-cpu-pinned --recurrent-state-offload`. Prefill coverage
+Use `DEPTH=4096` and `30000` with no placement extra. `llama-bench` requires an
+explicit value for its placement option, so use `DEPTH=131072` with
+`--no-kv-offload 1 --kv-cpu-pinned --recurrent-state-offload`. Prefill coverage
 substitutes `-p 512 -n 0` while retaining the same depth and other arguments.
 A single pair is a screen; small claims require balanced independent-process
-brackets.
+brackets. A missing `1` lets the benchmark parser consume the following option;
+such a context-creation failure is invalid setup, not evidence.
 
 ### Two-turn lifecycle runner
 
@@ -292,29 +296,120 @@ CUDA pinned-memory counter.
 - Historical binaries and measurements remain evidence only for their named
   source/build hashes. Documentation-only or source-identical base merges may
   reuse them only after an explicit path/tree or binary-identity proof.
-- The main merge, MMA lifetime repair, and graph metadata consolidation are a
-  fresh runtime-adjacent boundary. They require the final exactness, PPL, and
-  4K/30K/128K clean-process gates below before review readiness.
+- The main merge, MMA lifetime repair, and graph metadata consolidation created
+  a fresh runtime-adjacent boundary. The official results below, rather than
+  the historical binaries, close that boundary.
 
-## Final official-branch readiness gate
+## Official main-based readiness result (2026-08-23)
 
-The final record must identify the exact `beellama/main` base, candidate head,
-binary and cache hashes, model/corpus hashes, build options, GPU/CPU/driver,
-commands plus deltas, progress artifacts, and disposition. Required coverage:
+### Identity and build
 
-1. compiled CUDA capability and all six dense-versus-compact cases;
-2. focused graph, allocator, vector dispatch, route, and fallback tests;
-3. matching-batch four-chunk PPL with no increase;
-4. balanced clean-process 4K and 30K GPU-KV prefill/decode;
-5. balanced 128K CPU-pinned-KV prefill/decode;
-6. peak process VRAM plus device, accelerator-host, ordinary-host, resident-KV,
-   pinned-memory, and VMM fields; and
-7. a final main-relative scope audit proving no PR 4, KVarN implementation,
-   workspace, allocator-policy, or development-only source entered this branch.
+The clean baseline is `beellama/main` at
+`4b86269fdf001de44dd96e9c9ae26a9e25091cca` (build 11318). The clean candidate
+runtime head is `222eec2e7c91296b5f9335389dcff0cfc8a08129` (build 11340). Both
+fresh caches used Release, native CPU tuning, CUDA FlashAttention, effective
+architecture 120a, the default quant matrix, KVarN off, all-quants off, and the
+same CUDA 13.3/GNU toolchain.
 
-PR 7 may leave draft only after those gates pass and GitHub reports the pushed
-head cleanly mergeable. It must not be merged into `beellama/main` as part of
-this work.
+| artifact | baseline SHA-256 | candidate SHA-256 |
+|---|---|---|
+| `CMakeCache.txt` | `49f215303890f183b578d7d90b5faff198137cc7a361428d8593bc1b3455ed72` | `65bab8b8d350395ea210fed16a42eb96de25330842695dfde2b488d9a3745091` |
+| `llama-server` | `7ba71678c2209d2583c593e925852de1e1fc59a49ad690c3a30be33d24901a4a` | `e80265c04cb57297703c63808fab3e4b5d74f5512eb75f196294ece0e6f59d18` |
+| `llama-bench` | `07fdaefc52d2ab9221447827e39981024b004b613fa396c2f4950880ab297aac` | `762beef3acc5365ff88f928210eaaac48b6ba112b95f2e761370786a85c452a9` |
+| `llama-perplexity` | `cb285a9375e7b7ed2ad1da079218c166a41470c26d8c466b075a99d413a41096` | `c9c156766a8440b4e2cde74ccb935edacfcbf33c101239c0f07b0d8de43cb47c` |
+| `libllama.so` | `70fe086256df33df98740554dfdaf27662f59f6cece20240b6df58dfb0ffdd4e` | `dafc691007346601947b5eb9371bf6cf1dbf98513f16da2874466228013e7852` |
+| `libggml-cuda.so` | `9617d0226a2f44e7700c35754407b656a2fbcc4e0784ee362577d296e88a7cc2` | `5db25529bef9038dffaab7316c9a820c2293b96f971d326fabc455c9af7e9be4` |
+
+The model SHA-256 is
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`;
+the 606,662-byte corpus SHA-256 is
+`8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`.
+Hardware was one NVIDIA GeForce RTX 5070 Ti (15,880 MiB usable, compute
+capability 12.0, VMM enabled, driver 610.57.04) and an Intel Core Ultra 9 285K.
+
+### Correctness and quality
+
+The compiled CUDA capability and dense-versus-compact execution oracle passed
+6/6, including D=256 F16 MMA with no GQA and GQA 6. Ten focused graph,
+allocator, generated-vector, route, fallback, parser, and replay CTests passed
+10/10. The main/candidate/main PPL bracket produced the exact chunk sequence
+`1.9315, 2.1279, 2.2498, 2.1674` and
+`PPL = 2.1674 +/- 0.03849` in all three processes with matching
+`-b 512 -ub 256`; the increase is zero.
+
+### Performance
+
+Every row used fresh processes, native progress, `--kv-memory`, q8_0 K/V,
+batch/ubatch 512/256, and the affinity and placement in the reproduction
+template. Values are process means; profiler and resource-sampler processes do
+not contribute timing.
+
+| gate | baseline process means | candidate process means | candidate effect |
+|---|---|---|---:|
+| 4K GPU-KV prefill | 1810.6711, 1807.4789, 1803.6544, 1798.3230 | 1806.0622, 1803.0656, 1799.8895 | **-0.0736% time-adjusted; neutral** |
+| 4K GPU-KV decode | 49.5585, 49.5890, 49.6129 | 49.5099, 49.6635, 49.6586 | **+0.0482%** |
+| 30K GPU-KV prefill | 1232.2076, 1229.3053 | 1240.3132 | **+0.7765%** |
+| 30K GPU-KV decode | 43.7413, 43.7491 | 43.9228 | **+0.4059%** |
+| 128K CPU-pinned-KV prefill | 452.4388, 452.2785 | 458.1242 | **+1.2745%** |
+| 128K CPU-pinned-KV decode | 8.1422, 8.2597, 8.1686, 8.2778 | 8.0687, 8.3076, 8.3418, 8.2919 | **+0.4923%** |
+
+The user-requested closing A4 anchor makes the 4K prefill chronology
+`A B A B A B A`. Baseline throughput declines monotonically from 1810.6711 to
+1798.3230 tok/s. A linear elapsed-time/source model estimates the compact
+effect as -1.3282 tok/s (-0.0736%), standard error 1.7246 tok/s, against a
+baseline time slope of -8.2511 tok/s/hour. Effects against linearly
+interpolated adjacent baseline anchors are -0.1665%, -0.0330%, and -0.2066%.
+This is neutral within measured time/process variation, not a speedup and not a
+detected regression. The 128K decode campaign was expanded after its first
+candidate process ran low; all four processes per source remain in the final
+mean. Its wide process variance limits the result to a no-aggregate-regression
+finding rather than a strict speedup claim.
+
+### Resources
+
+Independent resource-only A/B prefill processes sampled `nvidia-smi`
+process VRAM and `/proc` RSS every 100 ms. They are excluded from timing:
+
+| depth | baseline peak process VRAM | candidate | delta |
+|---:|---:|---:|---:|
+| 4K | 13,702 MiB | 13,700 MiB | **-2 MiB** |
+| 30K | 14,566 MiB | 14,566 MiB | 0 MiB; another allocation owns the peak |
+| 128K CPU-pinned KV | 14,194 MiB | 14,136 MiB | **-58 MiB** |
+
+Peak `VmHWM` was 14,559,336--14,559,560 KiB across these processes and
+`VmLck` was zero. This does not imply zero CUDA-pinned memory: allocator-class
+telemetry reports the driver-owned pinned buffers directly.
+
+At 128K prefill, synchronized CUDA used high-water falls from 14,916,124,672
+to 14,855,307,264 bytes (-58 MiB). Device compute falls from 934,892,416 to
+872,764,288 bytes (-59.25 MiB), and accelerator-host compute falls from
+78,145,568 to 10,774,560 bytes (-64.25 MiB). Pinned accelerator-host context
+is identical at 4,581,228,544 bytes, resident KV is identical at 4,590,141,440
+bytes, ordinary-host context/compute are zero, and CUDA VMM live/mapped
+high-water is identical at 9,619,456/10,485,760 bytes. The corresponding 128K
+decode high-water also saves 58 MiB; total compute backing saves 123.25 MiB.
+
+At 4K, synchronized peak CUDA usage saves 2 MiB for prefill and decode, while
+total compute backing saves 4.5 and 4.25 MiB respectively. At 30K the
+synchronized peak is equal; compact saves 14.73 MiB prefill and 14.48 MiB
+decode in total compute backing, primarily accelerator-host memory, while the
+device-compute bin is 287,872 bytes larger. KV residency, ordinary-host
+buffers, and VMM high-water are unchanged at each matched depth.
+
+### Artifacts and disposition
+
+The 135-file readiness manifest is
+`/home/gencoolpc/vram-results/2026-08-23-pr7-official-readiness/SHA256SUMS`,
+SHA-256
+`d4246230238f39cf643a2a2a1037835cc4a20dd490844abc1dc976d1180206a1`.
+It contains source/build identity, exact commands, JSONL, progress, PPL,
+exactness, focused-test, resource-sampler, and summary artifacts. The one
+128K setup failure is explicitly named invalid and contributes no result.
+
+All local official-branch gates pass. Final publication readiness additionally
+requires a clean main-relative scope audit, a normal push of the existing head,
+passing GitHub checks, and a cleanly mergeable PR. PR 7 must not be merged into
+`beellama/main` as part of this work.
 
 ## Limitations
 
