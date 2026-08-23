@@ -35,7 +35,7 @@
     {
       "name": "clean-gpu-q8",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"placement": "gpu", "store": "accelerator"},
       "args": ["--alias", "clean-gpu-q8"]
     },

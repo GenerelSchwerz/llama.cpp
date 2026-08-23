@@ -42,7 +42,7 @@
     {
       "name": "golden-cpu-mtp1",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"mtp": {"depth": 1}, "implementation": {"host_buffer": "pageable", "recurrent_residency": "cpu"}},
       "args": ["--alias", "golden-cpu-mtp1", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },
@@ -56,7 +56,7 @@
     {
       "name": "golden-cpu-mtp2",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"mtp": {"depth": 2}, "implementation": {"host_buffer": "pageable", "recurrent_residency": "cpu"}},
       "args": ["--alias", "golden-cpu-mtp2", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },
@@ -70,7 +70,7 @@
     {
       "name": "golden-cpu-mtp6",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"mtp": {"depth": 6}, "implementation": {"host_buffer": "pageable", "recurrent_residency": "cpu"}},
       "args": ["--alias", "golden-cpu-mtp6", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "6", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },

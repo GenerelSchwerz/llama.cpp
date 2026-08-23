@@ -42,7 +42,7 @@
     {
       "name": "golden-cpu-mtp2",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "identity": {"implementation": {"host_buffer": "pageable", "recurrent_residency": "cpu", "draft_ubatch_setting": "inherited"}},
       "args": ["--alias", "golden-cpu-mtp2", "--n-gpu-layers-draft", "999", "--spec-type", "draft-mtp", "--spec-draft-n-max", "2", "--spec-draft-p-min", "0.85", "--spec-draft-type-k", "q8_0", "--spec-draft-type-v", "q8_0"]
     },

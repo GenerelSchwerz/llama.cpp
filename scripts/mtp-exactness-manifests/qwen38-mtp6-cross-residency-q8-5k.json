@@ -46,7 +46,7 @@
     {
       "name": "clean-gpu-mtp6-full",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "args": ["--alias", "clean-gpu-mtp6-full"]
     },
     {

@@ -35,7 +35,7 @@
     {
       "name": "clean-gpu-f16",
       "role": "golden",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "request": {"n_predict": 16},
       "identity": {"placement": "gpu"},
       "args": ["--alias", "clean-gpu-f16"]
@@ -43,7 +43,7 @@
     {
       "name": "clean-cpu-f16",
       "compare_to": "clean-gpu-f16",
-      "server": "/home/gencoolpc/beellama.cpp/build-cuda-all/bin/llama-server",
+      "server": "/home/gencoolpc/beellama-main/build-cuda-all/bin/llama-server",
       "request": {"n_predict": 16},
       "identity": {"placement": "cpu"},
       "args": ["--alias", "clean-cpu-f16", "--no-kv-offload"]
