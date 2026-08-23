@@ -1,5 +1,11 @@
 # CPU KV-offload VRAM roadmap
 
+The current tensor-level attribution of the 245,760-context native-Q8,
+compact-causal server is recorded in
+[`vram-allocation-attribution-240k.md`](vram-allocation-attribution-240k.md).
+It distinguishes real server workspace from `llama-bench` all-logits capacity
+and ranks the remaining full-context losses.
+
 This roadmap ranks shared VRAM work for every future branch derived from exact
 source-bearing KV baseline
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` or its documentation-only
