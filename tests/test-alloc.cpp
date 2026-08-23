@@ -756,6 +756,91 @@ static void test_shared_buffers_single_member_resize() {
     GGML_ASSERT(backend.context->allocated_total() == 0);
 }
 
+static void test_shared_buffers_reuse_member_slot() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto make_add_graph = [](int64_t n_elements) {
+        auto result = make_context();
+        ggml_tensor * a = make_input_1d(result.ctx, n_elements);
+        ggml_tensor * b = make_input_1d(result.ctx, n_elements);
+        ggml_build_forward_expand(result.graph, ggml_add(result.ctx, a, b));
+        return result;
+    };
+
+    auto survivor_graph = make_add_graph(4);
+    auto replacement_graph = make_add_graph(4);
+    auto departing_graph = make_add_graph(24);
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr survivor(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_ptr departing(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(survivor.get(), shared);
+        ggml_gallocr_set_shared_buffers(departing.get(), shared);
+
+        GGML_ASSERT(ggml_gallocr_reserve(survivor.get(), survivor_graph.graph));
+        const size_t small_size = backend.context->allocated_total();
+        GGML_ASSERT(ggml_gallocr_reserve(departing.get(), departing_graph.graph));
+        const size_t large_size = backend.context->allocated_total();
+        GGML_ASSERT(large_size > small_size);
+
+        departing.reset();
+        GGML_ASSERT(backend.context->allocated_total() == large_size);
+
+        ggml_gallocr_ptr replacement(ggml_gallocr_new(&backend.buffer_type));
+        ggml_gallocr_set_shared_buffers(replacement.get(), shared);
+
+        // Reusing the departed member's slot must clear its large plan, while
+        // the pending shrink still waits for the replacement to publish.
+        GGML_ASSERT(ggml_gallocr_reserve(survivor.get(), survivor_graph.graph));
+        GGML_ASSERT(backend.context->allocated_total() == large_size);
+        GGML_ASSERT(ggml_gallocr_reserve(replacement.get(), replacement_graph.graph));
+        GGML_ASSERT(backend.context->allocated_total() == small_size);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(survivor.get(), survivor_graph.graph));
+        check_all_allocated(survivor_graph.graph);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(replacement.get(), replacement_graph.graph));
+        check_all_allocated(replacement_graph.graph);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
+static void test_shared_buffers_alias_duplicate_buffer_types() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * a = make_input_with_size(ctx, 16);
+    ggml_tensor * b = make_input_with_size(ctx, 16);
+    ggml_tensor * out = ggml_add(ctx, a, b);
+    ggml_set_output(out);
+    ggml_build_forward_expand(graph, out);
+
+    GGML_ASSERT(graph->n_leafs == 2);
+    GGML_ASSERT(graph->n_nodes == 1);
+    int leaf_buffer_ids[2] = { 0, 1 };
+    int node_buffer_ids[1] = { 1 };
+    ggml_backend_buffer_type_t bufts[2] = { &backend.buffer_type, &backend.buffer_type };
+
+    ggml_gallocr_shared_buffers_t shared = ggml_gallocr_shared_buffers_new();
+    {
+        ggml_gallocr_ptr alloc(ggml_gallocr_new_n(bufts, 2));
+        ggml_gallocr_set_shared_buffers(alloc.get(), shared);
+        GGML_ASSERT(ggml_gallocr_reserve_n(alloc.get(), graph, node_buffer_ids, leaf_buffer_ids));
+
+        const size_t shared_size = ggml_gallocr_get_buffer_size(alloc.get(), 0);
+        GGML_ASSERT(shared_size > 0);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(alloc.get(), 1) == 0);
+        GGML_ASSERT(backend.context->allocated_total() == shared_size);
+
+        GGML_ASSERT(ggml_gallocr_alloc_graph(alloc.get(), graph));
+        check_all_allocated(graph);
+        check_no_overlap(graph);
+    }
+    ggml_gallocr_shared_buffers_free(shared);
+    GGML_ASSERT(backend.context->allocated_total() == 0);
+}
+
 static void test_shared_buffers_ignore_nonmembers() {
     dummy_backend first_backend  = dummy_backend_init(SIZE_MAX, /*align*/ 4);
     dummy_backend second_backend = dummy_backend_init(SIZE_MAX, /*align*/ 4);
@@ -829,6 +914,8 @@ int main() {
     run("test_reallocation", test_reallocation);
     run("test_shared_buffers_track_maximum_plan", test_shared_buffers_track_maximum_plan);
     run("test_shared_buffers_single_member_resize", test_shared_buffers_single_member_resize);
+    run("test_shared_buffers_reuse_member_slot", test_shared_buffers_reuse_member_slot);
+    run("test_shared_buffers_alias_duplicate_buffer_types", test_shared_buffers_alias_duplicate_buffer_types);
     run("test_shared_buffers_ignore_nonmembers", test_shared_buffers_ignore_nonmembers);
     return 0;
 }

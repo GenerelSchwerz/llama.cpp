@@ -26,7 +26,13 @@ from unittest import mock
 SCRIPTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
-from feature_validation import core, profiler, runner as validation_runner, telemetry  # noqa: E402
+from feature_validation import (  # noqa: E402
+    contracts,
+    core,
+    profiler,
+    runner as validation_runner,
+    telemetry,
+)
 from feature_validation.runner import (  # noqa: E402
     StudyRunner,
     _verify_spec_identity,
@@ -134,6 +140,46 @@ class ArtifactLifecycleTest(FixtureMixin, unittest.TestCase):
                 execute_ncu=False,
             )
         launch.assert_not_called()
+
+
+class CoreContractBoundaryTest(unittest.TestCase):
+    def test_core_reexports_established_contract_objects(self) -> None:
+        names = (
+            "SCHEMA_VERSION",
+            "PURPOSE_ORDER",
+            "PROFILE_TOOLS",
+            "MEMORY_EVIDENCE_CATEGORIES",
+            "FORBIDDEN_TOKENS",
+            "OPAQUE_WRAPPERS",
+            "IMMUTABLE_AB_OPTIONS",
+            "LLAMA_COMMON_OPTION_ARITY",
+            "LLAMA_BENCH_OPTION_ARITY",
+            "ValidationError",
+            "ManifestError",
+            "ProvenanceError",
+            "safe_slug",
+            "validate_sha256",
+            "_basename",
+            "reject_forbidden_tokens",
+            "validate_direct_target",
+            "option_arities",
+            "validate_argv",
+            "option_names",
+            "_forbidden_selection_key",
+            "_validate_selection",
+            "_validate_repetitions",
+            "_validate_screening_policy",
+            "_validate_profiler_details",
+            "_stage_screen_ids",
+            "variant_executables",
+            "validate_artifact_directory_isolation",
+            "validate_manifest",
+            "load_and_validate_manifest",
+            "stage_by_id",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIs(getattr(core, name), getattr(contracts, name))
 
 
 class QuotingAndArityTest(unittest.TestCase):
