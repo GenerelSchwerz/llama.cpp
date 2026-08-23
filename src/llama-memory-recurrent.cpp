@@ -1570,14 +1570,6 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
     return (int32_t)(idx * mem->size) + src0;
 }
 
-bool llama_memory_recurrent_context::has_sparse_snapshots() const {
-    return snapshot_mode.sparse;
-}
-
-int32_t llama_memory_recurrent_context::get_selected_snapshot_token() const {
-    return snapshot_mode.selected_token;
-}
-
 const llama_recurrent_snapshot_mode & llama_memory_recurrent_context::get_snapshot_mode() const {
     return snapshot_mode;
 }
