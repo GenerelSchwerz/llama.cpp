@@ -6645,6 +6645,54 @@ relieved registers and lost 9.35%. The hybrid raised spill and cost nothing.
 Staging lowered spill by 24 bytes and lost 1.7%. Whatever limits this kernel, it
 is not the register file.
 
+#### Retired without further attempts: the remaining loader-internal work
+
+Four separate interventions inside this kernel's loader have now been measured,
+and every one of them lost:
+
+| Attempt | Premise | Result |
+|---|---|---:|
+| Paired-lane block fetch | fewer load instructions | `-4.0%` to `-7.7%` |
+| `Q_in_reg = false` | relieve register pressure | `-9.35%` |
+| `nbatch_fa`, `nbatch_K2`/`nbatch_V2` | better batching | `-2.32%`, `-2.66%` |
+| Raw-byte `cp.async` staging | hide global-memory latency | `-1.65%` |
+
+The two changes that ever won here -- packing the loaders, and subtracting the
+zero point in float -- both kept the loader's structure intact and did the same
+work with fewer or cheaper instructions. Every attempt to change its *structure*
+has lost, whether by removing loads, redistributing them across lanes, moving
+them into a DMA, or changing how much of the tile is in flight at once.
+
+The two remaining planned loader experiments are therefore not attempted:
+
+- **One complete 32-element quant block per lane.** Structurally the paired-lane
+  experiment again -- the same loads, redistributed across lanes -- minus the
+  shuffles. Paired-lane lost decisively on every type with `|t| > 15`.
+- **Per-format field alignment for wider loads.** The nearest thing to packing,
+  which won, so this is the least implausible of the group. It is still narrow:
+  it applies only to formats whose layout guarantees the alignment, and the plan
+  already required stopping if the compiler coalesces the accesses anyway.
+
+**Warp-specialized producer/consumer dequantization is blocked by its own
+prerequisites**, not by this decision. It required either register pressure
+below the ceiling -- the kernel sits at `REG:255` -- or a reason arising from the
+staging result: staging winning with conversion still exposed, or profiling
+showing conversion dominates once DMA latency is hidden. Staging lost, so
+neither holds.
+
+Attributing these losses would need a kernel profiler. Nsight Compute is not
+installed on the benchmark host and the CUDA toolkit there ships neither `ncu`
+nor `nsys`, so establishing the real limiter is itself a piece of setup work.
+Given four consecutive regressions from interventions premised on a bottleneck
+the measurements contradict, the judgement recorded here is that further
+loader-internal attempts are not worth the time without that profiler, and that
+effort is better spent on the vector/MMA crossover, which changes dispatch
+rather than kernel code, and on closing interaction coverage.
+
+Anyone reopening this should install a profiler first and re-derive the premise.
+The evidence above is enough to say what does *not* limit this kernel; it is not
+enough to say what does.
+
 #### Rejected: a quantized-specific MMA configuration
 
 Quantized K/V inherits the F16 configuration table — `nthreads`, `occupancy`,
