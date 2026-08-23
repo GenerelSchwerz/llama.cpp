@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if (( $# != 6 )); then
-    echo "usage: $0 LABEL SERVER PORT CTX REQUEST_JSON OUTPUT_DIR" >&2
+if (( $# != 7 )); then
+    echo "usage: $0 LABEL SERVER PORT CTX MODEL REQUEST_JSON OUTPUT_DIR" >&2
     exit 2
 fi
 
@@ -11,10 +11,10 @@ label=$1
 server=$2
 port=$3
 ctx=$4
-request_json=$5
-output_dir=$6
+model=$5
+request_json=$6
+output_dir=$7
 
-model=/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf
 base_url="http://127.0.0.1:${port}"
 
 mkdir -p "$output_dir"
