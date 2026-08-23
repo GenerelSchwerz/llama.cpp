@@ -1060,15 +1060,25 @@ static void test_draft_kv_gpu_layers_override() {
     common_params params;
     params.no_kv_offload = true;
     params.kv_gpu_layers = 7;
+    params.kv_cpu_pinned = true;
+    params.recurrent_state_offload = true;
 
     const common_params inherited = common_base_params_to_speculative(params);
     assert(inherited.no_kv_offload);
     assert(inherited.kv_gpu_layers == 7);
+    const auto inherited_cparams = common_context_params_to_llama(inherited);
+    assert(!inherited_cparams.offload_kqv);
+    assert(inherited_cparams.kv_gpu_layers == 7);
+    assert(inherited_cparams.kv_cpu_pinned);
+    assert(inherited_cparams.recurrent_state_offload);
 
     params.speculative.draft.kv_gpu_layers = 3;
     const common_params overridden = common_base_params_to_speculative(params);
     assert(overridden.no_kv_offload);
     assert(overridden.kv_gpu_layers == 3);
+    const auto overridden_cparams = common_context_params_to_llama(overridden);
+    assert(!overridden_cparams.offload_kqv);
+    assert(overridden_cparams.kv_gpu_layers == 3);
 
     params.no_kv_offload = false;
     params.speculative.draft.kv_gpu_layers = 0;
@@ -1079,6 +1089,9 @@ static void test_draft_kv_gpu_layers_override() {
     // Converting the draft parameters must not mutate the target policy.
     assert(!params.no_kv_offload);
     assert(params.kv_gpu_layers == 7);
+    const auto target_cparams = common_context_params_to_llama(params);
+    assert(target_cparams.offload_kqv);
+    assert(target_cparams.kv_gpu_layers == 7);
 }
 
 static void test_mtp_draft_ubatch_validation() {

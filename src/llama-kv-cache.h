@@ -131,9 +131,7 @@ public:
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
                  uint32_t   tail_visibility_window = 0,
-                     bool   cpu_pinned = false,
-                 uint32_t   gpu_resident_layers = 0,
-                     bool   offload_attn_compute = false);
+ llama_memory_placement_options placement = {});
 
     ~llama_kv_cache() = default;
 
@@ -371,7 +369,7 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
-    ggml_tensor * stage_store_rows(
+    ggml_tensor * build_store_source(
             ggml_context * ctx,
             ggml_tensor  * source,
             ggml_tensor  * stage) const;
@@ -388,6 +386,12 @@ private:
         ggml_tensor * v;
         ggml_tensor * k_tail;
         ggml_tensor * v_tail;
+
+        // Construction owns the store route: a non-null stage means that an
+        // accelerator conversion was proved and allocated for a host body.
+        // Graph construction consumes this decision without probing placement.
+        // Owned layers keep K and V stages distinct because graph dependencies
+        // do not describe overlapping backing storage across separate views.
         ggml_tensor * k_store_stage;
         ggml_tensor * v_store_stage;
 

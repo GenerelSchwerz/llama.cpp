@@ -19,6 +19,13 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_memory_placement_options {
+    bool     cpu_pinned = false;
+    uint32_t gpu_resident_layers = 0;
+    bool     offload_attn_compute = false;
+    bool     recurrent_offload = false;
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
