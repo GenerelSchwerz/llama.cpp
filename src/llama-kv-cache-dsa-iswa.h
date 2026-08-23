@@ -26,7 +26,8 @@ public:
                      uint32_t   n_pad,
         const layer_filter_cb & filter_mla,
         const layer_filter_cb & filter_lid,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        llama_memory_placement_options placement);
 
     ~llama_kv_cache_dsa_iswa() = default;
 

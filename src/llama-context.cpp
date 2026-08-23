@@ -118,6 +118,9 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
+    cparams.recurrent_state_offload = params.recurrent_state_offload;
+    cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -3542,6 +3545,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.kv_cpu_pinned               =*/ false,
+        /*.recurrent_state_offload     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

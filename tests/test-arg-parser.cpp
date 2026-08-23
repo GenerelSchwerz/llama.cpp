@@ -217,6 +217,29 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        const auto defaults = llama_context_default_params();
+        assert(!defaults.kv_cpu_pinned);
+        assert(!defaults.recurrent_state_offload);
+
+        common_params placement_params;
+        argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--recurrent-state-offload"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
+        assert(placement_params.no_kv_offload);
+        assert(placement_params.kv_cpu_pinned);
+        assert(placement_params.recurrent_state_offload);
+
+        const auto cparams = common_context_params_to_llama(placement_params);
+        assert(!cparams.offload_kqv);
+        assert(cparams.kv_cpu_pinned);
+        assert(cparams.recurrent_state_offload);
+
+        argv = {"binary_name", "--no-kv-cpu-pinned", "--no-recurrent-state-offload"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
+        assert(!placement_params.kv_cpu_pinned);
+        assert(!placement_params.recurrent_state_offload);
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

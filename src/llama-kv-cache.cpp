@@ -17,6 +17,24 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model, uint32_t il, bool cpu_pinned) {
+    if (cpu_pinned) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+            if (buft) {
+                return buft;
+            }
+
+            LLAMA_LOG_DEBUG("%s: layer %u: device %s does not provide a host buffer type\n",
+                    __func__, il, ggml_backend_dev_name(dev));
+        }
+    }
+
+    return ggml_backend_cpu_buffer_type();
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -77,7 +95,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+    llama_memory_placement_options placement) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -209,7 +228,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (offload) {
             auto * dev = model.dev_layer(il);

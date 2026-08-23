@@ -566,6 +566,8 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
+    bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

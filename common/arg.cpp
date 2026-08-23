@@ -2408,6 +2408,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-cpu-pinned"},
+        {"--no-kv-cpu-pinned"},
+        string_format("use pinned host buffers for CPU-resident KV cache storage when available; with operation offload enabled, attention compute can remain on the accelerator (default: %s)",
+                      params.kv_cpu_pinned ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_cpu_pinned = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
+    add_opt(common_arg(
+        {"--recurrent-state-offload"},
+        {"--no-recurrent-state-offload"},
+        string_format("offload recurrent state independently of attention KV storage (default: %s)",
+                      params.recurrent_state_offload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.recurrent_state_offload = value;
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

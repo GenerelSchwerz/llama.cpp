@@ -112,7 +112,8 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        llama_memory_placement_options placement);
 
     ~llama_kv_cache() = default;
 

@@ -28,6 +28,8 @@ public:
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   offload_attn,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -35,7 +37,6 @@ public:
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
