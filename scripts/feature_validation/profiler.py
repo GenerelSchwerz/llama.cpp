@@ -15,6 +15,7 @@ from .core import (
     ManifestError,
     ValidationError,
     flock_argv,
+    load_json,
     quote_argv,
     reject_forbidden_tokens,
     validate_direct_target,
@@ -666,7 +667,7 @@ def agent_profile_summary(profile_root: pathlib.Path) -> dict[str, Any]:
         path = root / name
         if not path.is_file():
             return None
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = load_json(path)
         if not isinstance(value, dict):
             raise ValidationError(f"profiler artifact is not an object: {path}")
         return value

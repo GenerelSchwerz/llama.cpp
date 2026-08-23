@@ -7,8 +7,6 @@ requires a safely quoted shell command.
 
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
 import json
 import math
 import os
@@ -20,6 +18,16 @@ import shutil
 import statistics
 import subprocess
 from typing import Any, Iterable
+
+from .artifacts import (
+    canonical_json,
+    canonical_sha256,
+    load_json,
+    sha256_bytes,
+    sha256_file,
+    utc_now,
+    write_json_atomic,
+)
 
 
 SCHEMA_VERSION = 1
@@ -196,30 +204,6 @@ class ProvenanceError(ValidationError):
     """Observed source/build/input identity does not match the manifest."""
 
 
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat()
-
-
-def canonical_json(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def canonical_sha256(value: Any) -> str:
-    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
-
-
-def sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
-
-
-def sha256_file(path: pathlib.Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        while chunk := source.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def stat_identity(path: pathlib.Path) -> dict[str, int]:
     observed = path.stat()
     return {
@@ -229,13 +213,6 @@ def stat_identity(path: pathlib.Path) -> dict[str, int]:
         "device": observed.st_dev,
         "inode": observed.st_ino,
     }
-
-
-def write_json_atomic(path: pathlib.Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
 
 
 def command_capture(
@@ -1148,7 +1125,7 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
 
 
 def load_and_validate_manifest(path: pathlib.Path) -> tuple[dict[str, Any], str]:
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = load_json(path)
     if not isinstance(manifest, dict):
         raise ManifestError("manifest root must be an object")
     validate_manifest(manifest)
@@ -1454,7 +1431,7 @@ def verify_cmake_build_provenance(
             f"expected {sidecar_spec['sha256']}, observed {observed_sha256}"
         )
     try:
-        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar = load_json(sidecar_path)
     except (OSError, json.JSONDecodeError) as error:
         raise ProvenanceError(
             f"{name}/{role} build provenance sidecar is unreadable: {sidecar_path}: {error}"

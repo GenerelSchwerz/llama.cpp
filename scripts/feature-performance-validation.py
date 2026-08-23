@@ -20,7 +20,7 @@ TOOL_SCRIPT = pathlib.Path(__file__).resolve()
 
 
 def _load_spec(path: pathlib.Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = core.load_json(path)
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise core.ValidationError("run spec must be a schema_version 1 object")
     return value
@@ -62,7 +62,7 @@ def _profile_one(
     plan_path = profile_root / "ncu-plan.json"
     if state_path.exists():
         core.validate_artifact_directory_isolation(manifest, profile_root)
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = core.load_json(state_path)
         if not resume:
             raise core.ValidationError(f"profile artifacts already exist; use --resume: {profile_root}")
         if state.get("manifest_sha256") != manifest_sha:
@@ -238,9 +238,7 @@ def _profile_one(
         state["nsys_discovery_completed"] = True
         core.write_json_atomic(state_path, state)
     elif memory_capability_path.is_file():
-        memory_capability = json.loads(
-            memory_capability_path.read_text(encoding="utf-8")
-        )
+        memory_capability = core.load_json(memory_capability_path)
     elif memory_config is not None:
         raise core.ValidationError(
             "resumed NSYS discovery predates configured memory capability evidence; "
@@ -469,7 +467,7 @@ def _diagnose(manifest_path: pathlib.Path, *, resume: bool) -> dict[str, Any]:
     state_path = study_root / "state.json"
     if not state_path.is_file():
         raise core.ValidationError("early diagnostics require a preserved screening study state")
-    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state = core.load_json(state_path)
     if state.get("manifest_sha256") != manifest_sha:
         raise core.ProvenanceError("diagnostic study manifest identity mismatch")
     if state.get("provenance_identity_fingerprint") != provenance["identity_fingerprint"]:

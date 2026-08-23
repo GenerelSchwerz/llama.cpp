@@ -15,6 +15,11 @@ import time
 from typing import Any
 
 from . import core
+from .lifecycle import (
+    cleanup_process_group as _cleanup_process_group,
+    process_group_exists as _process_group_exists,
+    terminate_process_group as _terminate_process_group,
+)
 from .telemetry import TelemetrySession
 
 
@@ -27,135 +32,6 @@ def _render(value: str, context: dict[str, Any]) -> str:
 
 def _environment_command(environment: dict[str, str], argv: list[str]) -> list[str]:
     return ["env", "-i", *[f"{key}={environment[key]}" for key in sorted(environment)], *argv]
-
-
-def _process_group_exists(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _wait_for_group_disappearance(
-    pgid: int,
-    timeout: float,
-    process: subprocess.Popen[Any] | None = None,
-) -> bool:
-    deadline = time.monotonic() + timeout
-    while True:
-        # poll() also reaps an exited direct child so its zombie cannot keep the
-        # process group observable while descendants are being checked.
-        if process is not None:
-            process.poll()
-        if not _process_group_exists(pgid):
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.02)
-
-
-def _terminate_process_group(
-    pgid: int,
-    *,
-    process: subprocess.Popen[Any] | None = None,
-    term_timeout: float = 3.0,
-    kill_timeout: float = 3.0,
-) -> dict[str, Any]:
-    """Terminate an entire tracked group, including descendants after leader exit."""
-    report: dict[str, Any] = {
-        "pgid": pgid,
-        "term_sent": False,
-        "kill_sent": False,
-        "group_gone": False,
-        "errors": [],
-    }
-    if pgid == os.getpgrp():
-        report["errors"].append("refusing to signal the executor's own process group")
-        return report
-    try:
-        group_exists = _process_group_exists(pgid)
-    except (Exception, KeyboardInterrupt) as caught:
-        group_exists = True
-        report["errors"].append(
-            f"process-group existence check: {type(caught).__name__}: {caught}"
-        )
-    if group_exists:
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-            report["term_sent"] = True
-        except ProcessLookupError:
-            pass
-        except (Exception, KeyboardInterrupt) as caught:
-            report["errors"].append(
-                f"process-group SIGTERM: {type(caught).__name__}: {caught}"
-            )
-        try:
-            report["group_gone"] = _wait_for_group_disappearance(
-                pgid, term_timeout, process
-            )
-        except (Exception, KeyboardInterrupt) as caught:
-            report["errors"].append(
-                f"process-group TERM wait: {type(caught).__name__}: {caught}"
-            )
-    else:
-        report["group_gone"] = True
-    if not report["group_gone"]:
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-            report["kill_sent"] = True
-        except ProcessLookupError:
-            pass
-        except (Exception, KeyboardInterrupt) as caught:
-            report["errors"].append(
-                f"process-group SIGKILL: {type(caught).__name__}: {caught}"
-            )
-        try:
-            report["group_gone"] = _wait_for_group_disappearance(
-                pgid, kill_timeout, process
-            )
-        except (Exception, KeyboardInterrupt) as caught:
-            report["errors"].append(
-                f"process-group KILL wait: {type(caught).__name__}: {caught}"
-            )
-    if not report["group_gone"]:
-        report["errors"].append(f"process group {pgid} remained after SIGKILL")
-    return report
-
-
-def _cleanup_process_group(
-    process: subprocess.Popen[Any],
-    pgid: int,
-    *,
-    term_timeout: float = 3.0,
-    kill_timeout: float = 3.0,
-) -> dict[str, Any]:
-    """Terminate an entire tracked group and always reap its direct leader.
-
-    A leader may exit while descendants keep its process group alive.  Group
-    existence, rather than leader status, therefore controls TERM/KILL
-    escalation.  Cleanup failures are returned as evidence instead of raised so
-    callers can still stop telemetry and serialize the attempt result.
-    """
-    report = _terminate_process_group(
-        pgid,
-        process=process,
-        term_timeout=term_timeout,
-        kill_timeout=kill_timeout,
-    )
-    report["leader_reaped"] = False
-
-    try:
-        if process.poll() is None:
-            process.wait(timeout=max(0.1, kill_timeout))
-        else:
-            process.wait(timeout=0)
-        report["leader_reaped"] = True
-    except (Exception, KeyboardInterrupt) as caught:
-        report["errors"].append(f"leader reap: {type(caught).__name__}: {caught}")
-    return report
 
 
 def _process_identity(pid: int) -> dict[str, int | None]:
@@ -208,7 +84,7 @@ def _read_lifecycle(spec: dict[str, Any]) -> dict[str, Any] | None:
     path = _lifecycle_path(spec)
     if path is None or not path.is_file():
         return None
-    lifecycle = json.loads(path.read_text(encoding="utf-8"))
+    lifecycle = core.load_json(path)
     if lifecycle.get("run_id") != spec["run_id"] or lifecycle.get("attempt") != spec["attempt"]:
         raise core.ValidationError("lifecycle ownership record does not match this attempt")
     expected_identity = spec.get("study_identity")
@@ -697,7 +573,7 @@ def launch_locked_spec(
         _run_launcher_with_interrupt_forwarding(wrapper, spec)
     )
     if result_path.is_file():
-        result = json.loads(result_path.read_text(encoding="utf-8"))
+        result = core.load_json(result_path)
         launcher_seconds = time.monotonic() - spec["launcher_requested_monotonic"]
         result.setdefault("timing", {})["locked_lifecycle_wall_seconds"] = launcher_seconds
         result["timing"]["locked_lifecycle_overhead_seconds"] = max(
@@ -825,7 +701,7 @@ class StudyRunner:
                 raise core.ValidationError(
                     f"deterministic study directory already exists; use --resume: {self.study_root}"
                 )
-            state = json.loads(self.state_path.read_text(encoding="utf-8"))
+            state = core.load_json(self.state_path)
             if state.get("manifest_sha256") != self.manifest_sha256:
                 raise core.ProvenanceError("resume manifest identity mismatch")
             if state.get("provenance_identity_fingerprint") != provenance["identity_fingerprint"]:
@@ -871,7 +747,7 @@ class StudyRunner:
     ) -> dict[str, Any]:
         evidence_path = run_root / _ATTEMPT_EVIDENCE_NAME
         if evidence_path.exists():
-            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence = core.load_json(evidence_path)
             if (
                 evidence.get("run_id") != run_id
                 or evidence.get("attempt") != attempt
@@ -913,7 +789,7 @@ class StudyRunner:
         if not lifecycle_path.is_file():
             return
         try:
-            lifecycle = json.loads(lifecycle_path.read_text(encoding="utf-8"))
+            lifecycle = core.load_json(lifecycle_path)
         except json.JSONDecodeError as error:
             raise core.ProvenanceError(
                 f"cannot establish ownership of incomplete attempt {run_root}: {error}"
@@ -949,7 +825,7 @@ class StudyRunner:
         spec_path = run_root / "run-spec.json"
         preserved_spec: dict[str, Any] | None = None
         if spec_path.is_file():
-            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            spec = core.load_json(spec_path)
             if spec.get("run_id") != run_id or spec.get("attempt") != attempt:
                 raise core.ProvenanceError(
                     f"incomplete run spec does not match its deterministic directory: {spec_path}"
@@ -968,7 +844,7 @@ class StudyRunner:
         child_result_path = run_root / "result.json"
         preserved_child_result: dict[str, Any] | None = None
         if child_result_path.is_file():
-            child_result = json.loads(child_result_path.read_text(encoding="utf-8"))
+            child_result = core.load_json(child_result_path)
             if (
                 child_result.get("run_id") != run_id
                 or child_result.get("attempt") != attempt
@@ -986,7 +862,7 @@ class StudyRunner:
 
         recovered_path = run_root / _RECOVERED_RESULT_NAME
         if recovered_path.exists():
-            recovered = json.loads(recovered_path.read_text(encoding="utf-8"))
+            recovered = core.load_json(recovered_path)
             if (
                 recovered.get("run_id") != run_id
                 or recovered.get("attempt") != attempt
