@@ -1,5 +1,9 @@
 # Instructions for llama.cpp
 
+## Private Fork Automation Policy
+
+This checkout targets the private fork `GenerelSchwerz/llama.cpp`. With explicit approval from the repository owner, agents may commit, push, create or edit pull requests, and post pull-request comments only in that fork. The automated-submission prohibitions below continue to apply without exception to `ggml-org/llama.cpp` and every other upstream repository.
+
 > [!IMPORTANT]
 >
 > AI-generated code is allowed. What is **not** allowed is submitting code you do not understand. You are 100% responsible for every line, however it was produced.
