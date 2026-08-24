@@ -19,13 +19,20 @@ for ct in kvarn5 q8_0; do
     gpu env GGML_SCHED_DEBUG=2 taskset -c $PIN "$BUILD/bin/llama-cli" -m "$MODEL" \
       -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
       -fa on -ctk $ct -ctv $ct -c $CTX -n 1 -p hi --no-warmup -v > "$LOG" 2>&1
+    RC=$?
   else
+    # -v is required: the sched_reserve lines that report the compute buffers are
+    # verbose-only. GGML_SCHED_DEBUG is what makes the output enormous, not -v,
+    # so keep -v and filter.
     gpu taskset -c $PIN "$BUILD/bin/llama-cli" -m "$MODEL" \
       -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
-      -fa on -ctk $ct -ctv $ct -c $CTX -n 1 -p hi --no-warmup 2>&1 \
-      | grep -iE "compute buffer size|KV self size|cannot|error" | head -8 > "$LOG"
+      -fa on -ctk $ct -ctv $ct -c $CTX -n 1 -p hi --no-warmup -v 2>&1 \
+      | grep -iE "compute buffer size|KV self size|cannot be host-resident|error" \
+      | head -12 > "$LOG"
+    # llama-cli is first in the pipeline; $? would report head's status instead.
+    RC=${PIPESTATUS[0]}
   fi
-  echo "   exit=$?"
+  echo "   exit=$RC"
   grep -iE "compute buffer size|KV self size" "$LOG" | sort -u | head -6
 done
 echo

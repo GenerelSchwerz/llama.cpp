@@ -2,7 +2,8 @@
 # The decode cost structure. Needs patches 01 and 02.
 # Differences tg128 against tg64 at fixed depth so prefill and cache population cancel.
 . "$(dirname "$0")/common.sh"
-for D in "${@:-4096 16384 32768}"; do
+DEPTHS=(4096 16384 32768); [ $# -gt 0 ] && DEPTHS=("$@")
+for D in "${DEPTHS[@]}"; do
   for N in 64 128; do
     echo "== d=$D n=$N"
     gpu env GGML_KV_TRANSPORT_STATS=1 taskset -c $PIN "$BUILD/bin/llama-bench" -m "$MODEL" \

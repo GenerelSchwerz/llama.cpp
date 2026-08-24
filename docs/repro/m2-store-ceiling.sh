@@ -7,7 +7,8 @@ run () {
     -b 512 -ub 512 --no-warmup -p 0 -n 128 -d $3 -r $4 -o json 2>/dev/null \
     | python3 -c "import json,sys;d=json.load(sys.stdin);print('  %-10s %.4f +- %.4f'%('$1',d[0]['avg_ts'],d[0]['stddev_ts']))"
 }
-for D in "${@:-4096 32768}"; do
+DEPTHS=(4096 32768); [ $# -gt 0 ] && DEPTHS=("$@")
+for D in "${DEPTHS[@]}"; do
   R=3; [ "$D" -le 4096 ] && R=5
   echo "== depth=$D reps=$R"
   gpu bash -c "$(declare -f run); BUILD='$BUILD'; MODEL='$MODEL'; PIN='$PIN'
