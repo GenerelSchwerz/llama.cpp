@@ -310,6 +310,11 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
+#ifndef GGML_USE_MUSA
+        for (int dim = 0; dim < 3; ++dim) {
+            info.devices[id].max_grid_size[dim] = prop.maxGridSize[dim];
+        }
+#endif
 
 #ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
@@ -2745,7 +2750,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_gated_delta_net_fused_cache & fused_state_cpy) {
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output
-    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+    if (!ggml_gated_delta_net_validate(gdn) ||
         (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
         return 0;
     }
@@ -2757,50 +2762,68 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int64_t       n_seqs    = src_v->ne[3];
     const int64_t       D         = S_v * S_v * H;
     const int64_t       K         = ggml_get_op_params_i32(gdn, 0); // snapshot slot count
-    const int64_t       n_written = std::min<int64_t>(n_tokens, K); // newest n_written slots are written
+    const int32_t       trailing  = ggml_get_op_params_i32(gdn, 1);
+    const int32_t       selected  = ggml_get_op_params_i32(gdn, 2);
+    const bool          reserve   = ggml_get_op_params_i32(gdn, 3) != 0;
+    const int64_t       n_written = selected >= 0 ? 1 : reserve ? trailing : std::min<int64_t>(n_tokens, K);
 
     // snapshot tail starts right after the attention scores
     const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    const size_t state_size = ggml_row_size(GGML_TYPE_F32, D * n_seqs);
 
-    // snapshot cpy is the first real node after the gdn (skip views/no-ops)
-    const ggml_tensor * cpy  = nullptr;
-    int                 skip = 0;
-    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
-        const ggml_tensor * n = cgraph->nodes[j];
-        if (ggml_cuda_is_view_or_noop(n)) {
-            continue;
+    const auto find_cpy = [&](int first, const ggml_tensor ** cpy, int * cpy_idx) {
+        for (int j = first; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * node = cgraph->nodes[j];
+            if (ggml_cuda_is_view_or_noop(node)) {
+                continue;
+            }
+            if (node->op != GGML_OP_CPY || (node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                return false;
+            }
+            *cpy = node;
+            *cpy_idx = j;
+            return true;
         }
-        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    };
+    const auto match_cpy = [&](const ggml_tensor * cpy, int64_t first_slot, int64_t count) {
+        const ggml_tensor * src = cpy->src[0];
+        const ggml_tensor * dst = cpy->src[1];
+        const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, count, 1 };
+        return src != nullptr && dst != nullptr && src->op == GGML_OP_VIEW && src->view_src == gdn &&
+            src->view_offs == tail_off + first_slot * state_size &&
+            std::equal(expected_ne.begin(), expected_ne.end(), src->ne) && ggml_is_contiguous(src) &&
+            dst->op == GGML_OP_VIEW && dst->type == GGML_TYPE_F32 && dst->data != nullptr &&
+            std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) &&
+            dst->nb[0] == ggml_type_size(GGML_TYPE_F32) && dst->nb[1] == (size_t) ggml_row_size(GGML_TYPE_F32, D) &&
+            dst->nb[2] >= state_size && dst->nb[2] % sizeof(float) == 0;
+    };
+
+    const ggml_tensor * cpy = nullptr;
+    int cpy_idx = 0;
+    if (!find_cpy(node_idx + 1, &cpy, &cpy_idx) || !match_cpy(cpy, 0, n_written)) {
+        return 0;
+    }
+
+    const ggml_tensor * dst = cpy->src[1];
+    fused_state_cpy.data        = (float *) dst->data;
+    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+
+    if (reserve) {
+        const ggml_tensor * reserve_cpy = nullptr;
+        int reserve_cpy_idx = 0;
+        if (!find_cpy(cpy_idx + 1, &reserve_cpy, &reserve_cpy_idx) || !match_cpy(reserve_cpy, K - 1, 1)) {
             return 0;
         }
-        cpy  = n;
-        skip = j - node_idx;
-    }
-    if (cpy == nullptr) {
-        return 0;
-    }
-
-    const ggml_tensor * src = cpy->src[0]; // view of the gdn snapshot tail
-    const ggml_tensor * dst = cpy->src[1]; // cache view the kernel writes to
-
-    // src must be this gdn's snapshot tail (contiguous, at the tail offset)
-    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
-        !ggml_is_contiguous(src)) {
-        return 0;
+        const ggml_tensor * reserve_dst = reserve_cpy->src[1];
+        if ((float *) reserve_dst->data != fused_state_cpy.data + (K - 1) * fused_state_cpy.slot_stride ||
+            reserve_dst->nb[2] != dst->nb[2]) {
+            return 0;
+        }
+        cpy_idx = reserve_cpy_idx;
     }
 
-    // dst is the [D, n_seqs, n_written] cache view; require nb[1] == D (the per-seq stride the kernel
-    // assumes). ggml_cpy pins src to the same element count.
-    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, n_written, 1 };
-    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
-        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
-        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
-        return 0;
-    }
-
-    fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
-    fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
-    return skip;
+    return cpy_idx - node_idx;
 }
 
 static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
@@ -5368,12 +5391,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_RWKV_WKV7:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
-#ifdef GGML_USE_MUSA
-            return false;
-#else
-            return true;
-#endif // GGML_USE_MUSA
+            return ggml_cuda_gated_delta_net_supported(dev_ctx->device, op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
@@ -5559,6 +5577,15 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return false;
+#else
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5578,6 +5605,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_recurrent_sparse_snapshots_supported") == 0) {
+        return (void *)ggml_backend_cuda_recurrent_sparse_snapshots_supported;
     }
     return nullptr;
 }

@@ -1805,6 +1805,10 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         tn, ne, flags);
 }
 
+bool llama_model::graph_supports_recurrent_sparse_snapshots() const {
+    return false;
+}
+
 std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }

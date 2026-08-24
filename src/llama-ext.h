@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);
+LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
+        struct llama_context * ctx, bool enabled, int32_t selected_token);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

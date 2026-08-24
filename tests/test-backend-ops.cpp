@@ -19,10 +19,15 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#ifdef GGML_TEST_RPC
+#include "ggml-rpc.h"
+#include "../ggml/src/ggml-impl.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cfloat>
 #include <cinttypes>
 #include <cstdarg>
@@ -33,6 +38,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -4415,16 +4421,26 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
+    const int32_t trailing_snapshots;
+    const int32_t selected_token;
+    const bool    reserve_input;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+        return VARS_TO_STR12(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, trailing_snapshots, selected_token, reserve_input);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
+            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), trailing_snapshots(trailing_snapshots),
+          selected_token(selected_token), reserve_input(reserve_input) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4454,12 +4470,706 @@ struct test_gated_delta_net : public test_case {
         q = ggml_l2_norm(ctx, q, 1e-6f);
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (trailing_snapshots >= 0) {
+            ggml_gated_delta_net_set_snapshots(out, trailing_snapshots, selected_token, reserve_input);
+            const int64_t attn_score_elems = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
+            const int64_t state_elems = head_size * head_size * head_count * v_repeat * n_seqs;
+            const int64_t n_written = selected_token >= 0 ? 1 : reserve_input ? K : trailing_snapshots;
+            return ggml_view_1d(ctx, out, state_elems * n_written, ggml_row_size(GGML_TYPE_F32, attn_score_elems));
+        }
         return out;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+static void test_gated_delta_net_set_support_geometry(
+        ggml_tensor * out, int64_t head_size, int64_t head_count, int64_t n_seqs) {
+    const auto set_shape = [](ggml_tensor * tensor, const std::array<int64_t, 4> & ne) {
+        size_t stride = sizeof(float);
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            GGML_ASSERT(ne[dim] > 0 && (size_t) ne[dim] <= std::numeric_limits<size_t>::max() / stride);
+            tensor->ne[dim] = ne[dim];
+            tensor->nb[dim] = stride;
+            stride *= ne[dim];
+        }
+    };
+
+    int32_t K;
+    memcpy(&K, out->op_params, sizeof(K));
+    set_shape(out->src[0], { head_size, head_count, 1, n_seqs });
+    set_shape(out->src[1], { head_size, head_count, 1, n_seqs });
+    set_shape(out->src[2], { head_size, head_count, 1, n_seqs });
+    set_shape(out->src[3], { 1,         head_count, 1, n_seqs });
+    set_shape(out->src[4], { 1,         head_count, 1, n_seqs });
+    set_shape(out->src[5], { head_size, head_size,  head_count, n_seqs });
+    set_shape(out, { head_size * head_count, n_seqs * (1 + head_size * K), 1, 1 });
+}
+
+static bool test_gated_delta_net_cuda_grid_limits(ggml_backend_dev_t device, ggml_tensor * out) {
+    for (int64_t head_size : { 16, 32, 64, 128 }) {
+        test_gated_delta_net_set_support_geometry(out, head_size, 1, 1);
+        if (!ggml_backend_dev_supports_op(device, out)) {
+            fprintf(stderr, "%s: supported S_v=%" PRId64 " grid was rejected on %s\n", __func__, head_size, ggml_backend_dev_name(device));
+            return false;
+        }
+    }
+
+    const int64_t beyond_int_grid_limit = (int64_t) std::numeric_limits<int>::max() + 1;
+    const auto supported = [&](int64_t head_count, int64_t n_seqs) {
+        test_gated_delta_net_set_support_geometry(out, 16, head_count, n_seqs);
+        return ggml_backend_dev_supports_op(device, out);
+    };
+    const auto check_boundary = [&](bool vary_heads, const char * name) {
+        const auto supports_value = [&](int64_t value) {
+            return vary_heads ? supported(value, 1) : supported(1, value);
+        };
+        if (!supports_value(1) || supports_value(beyond_int_grid_limit)) {
+            fprintf(stderr, "%s: CUDA %s grid support endpoints are invalid on %s\n", __func__, name, ggml_backend_dev_name(device));
+            return false;
+        }
+        int64_t accepted = 1;
+        int64_t rejected = beyond_int_grid_limit;
+        while (accepted + 1 < rejected) {
+            const int64_t mid = accepted + (rejected - accepted) / 2;
+            if (supports_value(mid)) {
+                accepted = mid;
+            } else {
+                rejected = mid;
+            }
+        }
+        if (!supports_value(accepted) || supports_value(rejected)) {
+            fprintf(stderr, "%s: CUDA %s grid boundary is not fail-closed on %s\n", __func__, name, ggml_backend_dev_name(device));
+            return false;
+        }
+        return true;
+    };
+
+    return check_boundary(true, "x") && check_boundary(false, "y");
+}
+
+static bool test_gated_delta_net_rejection() {
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead()*128,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+
+    test_gated_delta_net test(GGML_TYPE_F32, 2, 16, 4, 2, 2, false, false, 4);
+    test.mode = MODE_SUPPORT;
+    ggml_tensor * out = test.build_graph(ctx.get());
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu != nullptr);
+
+    const auto set_params = [&](int32_t k, int32_t trailing, int32_t selected, int32_t reserve) {
+        memcpy(out->op_params + 0, &k,        sizeof(k));
+        memcpy(out->op_params + 1, &trailing, sizeof(trailing));
+        memcpy(out->op_params + 2, &selected, sizeof(selected));
+        memcpy(out->op_params + 3, &reserve,  sizeof(reserve));
+    };
+    const auto rejects_op = [&](ggml_tensor * op, const char * name) {
+        if (ggml_backend_dev_supports_op(cpu, op)) {
+            fprintf(stderr, "%s: malformed %s was accepted\n", __func__, name);
+            return false;
+        }
+        return true;
+    };
+    const auto rejects = [&](const char * name) {
+        return rejects_op(out, name);
+    };
+
+    if (!ggml_backend_dev_supports_op(cpu, out)) {
+        fprintf(stderr, "%s: valid GATED_DELTA_NET was rejected\n", __func__);
+        return false;
+    }
+
+    const int64_t q_batch = out->src[0]->ne[3];
+    const int64_t k_batch = out->src[1]->ne[3];
+    out->src[0]->ne[3] = 1;
+    out->src[1]->ne[3] = 1;
+    if (!ggml_backend_dev_supports_op(cpu, out)) {
+        fprintf(stderr, "%s: valid q/k sequence broadcast was rejected\n", __func__);
+        return false;
+    }
+    out->src[0]->ne[3] = q_batch;
+    out->src[1]->ne[3] = k_batch;
+
+    struct malformed_params {
+        int32_t k;
+        int32_t trailing;
+        int32_t selected;
+        int32_t reserve;
+        const char * name;
+    };
+    const malformed_params malformed[] = {
+        { 0, 0, -1, 0, "K" },
+        { 3, 3, -1, 0, "K geometry" },
+        { 4, 5, -1, 0, "trailing snapshots" },
+        { 4, 0,  4, 0, "selected token" },
+        { 4, 1,  1, 0, "selected and trailing snapshots" },
+        { 4, 3, -1, 2, "reserve input value" },
+        { 4, 4, -1, 1, "reserve input geometry" },
+        { 4, 2, -1, 1, "reserve input trailing count" },
+    };
+    for (const auto & test_params : malformed) {
+        set_params(test_params.k, test_params.trailing, test_params.selected, test_params.reserve);
+        if (!rejects(test_params.name)) {
+            return false;
+        }
+    }
+
+    test_gated_delta_net k1_test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 1);
+    k1_test.mode = MODE_SUPPORT;
+    ggml_tensor * k1_out = k1_test.build_graph(ctx.get());
+    if (!ggml_backend_dev_supports_op(cpu, k1_out)) {
+        fprintf(stderr, "%s: valid K=1 GATED_DELTA_NET was rejected\n", __func__);
+        return false;
+    }
+    const auto set_k1_params = [&](int32_t trailing, int32_t selected, int32_t reserve) {
+        memcpy(k1_out->op_params + 1, &trailing, sizeof(trailing));
+        memcpy(k1_out->op_params + 2, &selected, sizeof(selected));
+        memcpy(k1_out->op_params + 3, &reserve,  sizeof(reserve));
+    };
+    const malformed_params malformed_k1[] = {
+        { 1, 0, -1, 0, "K=1 trailing snapshots" },
+        { 1, 0,  0, 0, "K=1 selected token" },
+        { 1, 1, -1, 1, "K=1 reserve input" },
+    };
+    for (const auto & test_params : malformed_k1) {
+        set_k1_params(test_params.trailing, test_params.selected, test_params.reserve);
+        if (!rejects_op(k1_out, test_params.name)) {
+            return false;
+        }
+    }
+
+    set_params(4, 4, -1, 0);
+    out->ne[1] += 1;
+    if (!rejects("output geometry")) {
+        return false;
+    }
+    out->ne[1] -= 1;
+
+    for (int i = 0; i < 6; ++i) {
+        const ggml_type type = out->src[i]->type;
+        out->src[i]->type = GGML_TYPE_F16;
+        const std::string name = "source " + std::to_string(i) + " type";
+        if (!rejects(name.c_str())) {
+            return false;
+        }
+        out->src[i]->type = type;
+    }
+
+    const ggml_type out_type = out->type;
+    out->type = GGML_TYPE_F16;
+    if (!rejects("output type")) {
+        return false;
+    }
+    out->type = out_type;
+
+    const int shape_dims[6] = { 0, 0, 1, 1, 0, 1 };
+    for (int i = 0; i < 6; ++i) {
+        const int dim = shape_dims[i];
+        const int64_t ne = out->src[i]->ne[dim];
+        out->src[i]->ne[dim] += 1;
+        const std::string name = "source " + std::to_string(i) + " shape";
+        if (!rejects(name.c_str())) {
+            return false;
+        }
+        out->src[i]->ne[dim] = ne;
+    }
+
+    for (int i = 0; i < 3; ++i) {
+        const size_t nb = out->src[i]->nb[0];
+        out->src[i]->nb[0] = 2 * sizeof(float);
+        const std::string name = "source " + std::to_string(i) + " row stride";
+        if (!rejects(name.c_str())) {
+            return false;
+        }
+        out->src[i]->nb[0] = nb;
+    }
+
+    for (int i = 3; i < 6; ++i) {
+        const size_t nb = out->src[i]->nb[1];
+        out->src[i]->nb[1] += sizeof(float);
+        const std::string name = "source " + std::to_string(i) + " full stride";
+        if (!rejects(name.c_str())) {
+            return false;
+        }
+        out->src[i]->nb[1] = nb;
+    }
+
+    const size_t out_nb1 = out->nb[1];
+    out->nb[1] += sizeof(float);
+    if (!rejects("output stride")) {
+        return false;
+    }
+    out->nb[1] = out_nb1;
+
+    const size_t q_nb2 = out->src[0]->nb[2];
+    out->src[0]->nb[2] += sizeof(float);
+    if (!rejects("q and k stride")) {
+        return false;
+    }
+    out->src[0]->nb[2] = q_nb2;
+
+    const size_t v_nb2 = out->src[2]->nb[2];
+    out->src[2]->nb[2] += 1;
+    if (!rejects("float stride divisibility")) {
+        return false;
+    }
+    out->src[2]->nb[2] = v_nb2;
+
+    const int64_t q_heads = out->src[0]->ne[1];
+    const int64_t k_heads = out->src[1]->ne[1];
+    out->src[0]->ne[1] = 3;
+    out->src[1]->ne[1] = 3;
+    if (!rejects("head divisibility")) {
+        return false;
+    }
+    out->src[0]->ne[1] = 0;
+    out->src[1]->ne[1] = 0;
+    if (!rejects("positive head divisor")) {
+        return false;
+    }
+    out->src[0]->ne[1] = q_heads;
+    out->src[1]->ne[1] = k_heads;
+
+    const int64_t q_seqs = out->src[0]->ne[3];
+    const int64_t k_seqs = out->src[1]->ne[3];
+    out->src[0]->ne[3] = 3;
+    out->src[1]->ne[3] = 3;
+    if (!rejects("sequence divisibility")) {
+        return false;
+    }
+    out->src[0]->ne[3] = 0;
+    out->src[1]->ne[3] = 0;
+    if (!rejects("positive sequence divisor")) {
+        return false;
+    }
+    out->src[0]->ne[3] = q_seqs;
+    out->src[1]->ne[3] = k_seqs;
+
+    const size_t q_overflow_nb2 = out->src[0]->nb[2];
+    const size_t k_overflow_nb2 = out->src[1]->nb[2];
+    out->src[0]->nb[2] = std::numeric_limits<size_t>::max() - sizeof(float) + 1;
+    out->src[1]->nb[2] = out->src[0]->nb[2];
+    if (!rejects("overflowing stride geometry")) {
+        return false;
+    }
+    out->src[0]->nb[2] = q_overflow_nb2;
+    out->src[1]->nb[2] = k_overflow_nb2;
+
+    for (int i = 0; i < 6; ++i) {
+        ggml_tensor * src = out->src[i];
+        out->src[i] = nullptr;
+        const std::string name = "missing source " + std::to_string(i);
+        if (!rejects(name.c_str())) {
+            return false;
+        }
+        out->src[i] = src;
+    }
+
+    for (int64_t n_tokens : { 1, 2 }) {
+        test_gated_delta_net sparse_test(GGML_TYPE_F32, 2, 16, n_tokens, 1, 2, false, false, 4,
+                                         (int32_t) n_tokens, -1, true);
+        ggml_tensor * sparse_view = sparse_test.build_graph(ctx.get());
+        GGML_ASSERT(sparse_view->src[0] != nullptr);
+        if (!ggml_backend_dev_supports_op(cpu, sparse_view->src[0])) {
+            fprintf(stderr, "%s: valid sparse T=%" PRId64 " GATED_DELTA_NET was rejected\n", __func__, n_tokens);
+            return false;
+        }
+    }
+
+    test_gated_delta_net cuda_shape_test(GGML_TYPE_F32, 2, 8, 1, 1);
+    ggml_tensor * cuda_shape_out = cuda_shape_test.build_graph(ctx.get());
+    test_gated_delta_net cuda_grid_test(GGML_TYPE_F32, 1, 16, 1, 1);
+    ggml_tensor * cuda_grid_out = cuda_grid_test.build_graph(ctx.get());
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const char * name = ggml_backend_dev_name(dev);
+        const bool is_cuda = strstr(name, "CUDA") != nullptr || strstr(name, "ROCm") != nullptr;
+        const bool is_musa = strstr(name, "MUSA") != nullptr;
+        if (is_cuda || is_musa) {
+            if (ggml_backend_dev_supports_op(dev, cuda_shape_out)) {
+                fprintf(stderr, "%s: %s accepted unsupported S_v=8\n", __func__, name);
+                return false;
+            }
+        }
+        if (is_musa && ggml_backend_dev_supports_op(dev, cuda_grid_out)) {
+            fprintf(stderr, "%s: MUSA accepted GATED_DELTA_NET\n", __func__);
+            return false;
+        }
+        if (is_cuda && !test_gated_delta_net_cuda_grid_limits(dev, cuda_grid_out)) {
+            return false;
+        }
+    }
+
+    return ggml_backend_dev_supports_op(cpu, out);
+}
+
+#ifdef GGML_TEST_RPC
+static ggml_backend_ptr start_gdn_rpc_test_server(
+        const std::vector<ggml_backend_dev_t> & devices,
+        std::string & endpoint) {
+    const uint32_t first_port = 20000 + std::random_device{}() % 30000;
+    for (uint32_t attempt = 0; attempt < 16; ++attempt) {
+        const uint32_t port = 20000 + (first_port - 20000 + 7919*attempt) % 30000;
+        const std::string candidate = "127.0.0.1:" + std::to_string(port);
+        auto ready = std::make_shared<std::promise<bool>>();
+        std::future<bool> ready_future = ready->get_future();
+        std::vector<ggml_backend_dev_t> server_devices = devices;
+
+        // The RPC server has no stop API. A running test server exits with this process.
+        std::thread([candidate, server_devices = std::move(server_devices), ready]() mutable {
+            ggml_backend_rpc_test_start_server(candidate.c_str(), nullptr, 1, server_devices.size(), server_devices.data(),
+                [](bool success, void * user_data) {
+                    static_cast<std::promise<bool> *>(user_data)->set_value(success);
+                }, ready.get());
+        }).detach();
+
+        if (ready_future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+            fprintf(stderr, "%s: RPC server readiness callback timed out\n", __func__);
+            return {};
+        }
+        if (!ready_future.get()) {
+            continue;
+        }
+        ggml_backend_ptr backend(ggml_backend_rpc_init(candidate.c_str(), 0));
+        if (backend != nullptr) {
+            endpoint = candidate;
+            return backend;
+        }
+    }
+    return {};
+}
+
+static bool test_gated_delta_net_rpc_rejection() {
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(cpu != nullptr);
+
+    std::vector<ggml_backend_dev_t> devices = { cpu };
+    int32_t cuda_device = -1;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (strstr(ggml_backend_dev_name(dev), "CUDA") != nullptr) {
+            cuda_device = (int32_t) devices.size();
+            devices.push_back(dev);
+            break;
+        }
+    }
+
+    std::string endpoint;
+    ggml_backend_ptr backend = start_gdn_rpc_test_server(devices, endpoint);
+    if (backend == nullptr) {
+        fprintf(stderr, "%s: failed to start an RPC test server\n", __func__);
+        return false;
+    }
+
+    ggml_init_params params = {
+        /* .mem_size   = */ ggml_tensor_overhead()*96 + 2*ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx != nullptr);
+
+    test_gated_delta_net test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 4);
+    ggml_tensor * out = test.build_graph(ctx.get());
+    ggml_cgraph * graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(graph, out);
+    graph->uid = ggml_graph_next_uid();
+
+    test_gated_delta_net k1_test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 1);
+    ggml_tensor * k1_out = k1_test.build_graph(ctx.get());
+    ggml_cgraph * k1_graph = ggml_new_graph(ctx.get());
+    ggml_build_forward_expand(k1_graph, k1_out);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    if (buffer == nullptr) {
+        fprintf(stderr, "%s: failed to allocate RPC graph tensors\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_clear(buffer.get(), 0);
+
+    const int32_t malformed_reserve = 2;
+    memcpy(out->op_params + 3, &malformed_reserve, sizeof(malformed_reserve));
+    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: malformed wire GATED_DELTA_NET parameters were accepted\n", __func__);
+        return false;
+    }
+
+    const int32_t default_reserve = 0;
+    memcpy(out->op_params + 3, &default_reserve, sizeof(default_reserve));
+    out->ne[1] -= 1;
+    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: malformed wire GATED_DELTA_NET geometry was accepted\n", __func__);
+        return false;
+    }
+    out->ne[1] += 1;
+    ggml_gated_delta_net_set_snapshots(out, 4, -1, false);
+    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: valid wire K=4 GATED_DELTA_NET was rejected\n", __func__);
+        return false;
+    }
+
+    const auto set_k1_params = [&](int32_t trailing, int32_t selected, int32_t reserve) {
+        memcpy(k1_out->op_params + 1, &trailing, sizeof(trailing));
+        memcpy(k1_out->op_params + 2, &selected, sizeof(selected));
+        memcpy(k1_out->op_params + 3, &reserve,  sizeof(reserve));
+    };
+    const int32_t malformed_k1[][3] = {
+        { 0, -1, 0 },
+        { 0,  0, 0 },
+        { 1, -1, 1 },
+    };
+    for (const auto & test_params : malformed_k1) {
+        set_k1_params(test_params[0], test_params[1], test_params[2]);
+        if (ggml_backend_graph_compute(backend.get(), k1_graph) == GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: malformed wire K=1 GATED_DELTA_NET parameters were accepted\n", __func__);
+            return false;
+        }
+    }
+    ggml_gated_delta_net_set_snapshots(k1_out, 1, -1, false);
+    if (ggml_backend_graph_compute(backend.get(), k1_graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: valid wire K=1 GATED_DELTA_NET was rejected\n", __func__);
+        return false;
+    }
+
+    std::vector<uint8_t> sentinel(ggml_nbytes(k1_out), 0x5a);
+    std::vector<uint8_t> observed(sentinel.size());
+    ggml_backend_tensor_set(k1_out, sentinel.data(), 0, sentinel.size());
+    if (ggml_backend_rpc_test_compute_truncated(backend.get()) != 0) {
+        fprintf(stderr, "%s: truncated graph compute did not return protocol failure\n", __func__);
+        return false;
+    }
+    if (ggml_backend_rpc_test_recompute(backend.get()) != 0) {
+        fprintf(stderr, "%s: recompute retained a graph after truncated graph compute\n", __func__);
+        return false;
+    }
+    ggml_backend_tensor_get(k1_out, observed.data(), 0, observed.size());
+    if (observed != sentinel) {
+        fprintf(stderr, "%s: recompute executed the graph invalidated by truncated graph compute\n", __func__);
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: valid graph after truncated graph compute was rejected\n", __func__);
+        return false;
+    }
+
+    if (!ggml_backend_rpc_test_fail_next_recompute(backend.get())) {
+        fprintf(stderr, "%s: failed to inject a recompute backend failure\n", __func__);
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: normal client accepted the injected recompute backend failure\n", __func__);
+        return false;
+    }
+    if (ggml_backend_rpc_test_recompute(backend.get()) != 0) {
+        fprintf(stderr, "%s: raw recompute retained the graph after backend failure\n", __func__);
+        return false;
+    }
+    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: normal client did not resend the graph after recompute backend failure\n", __func__);
+        return false;
+    }
+
+    ggml_init_params larger_params = {
+        /* .mem_size   = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    ggml_context_ptr larger_ctx(ggml_init(larger_params));
+    GGML_ASSERT(larger_ctx != nullptr);
+    test_gated_delta_net larger_test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 4);
+    ggml_tensor * larger_gdn = larger_test.build_graph(larger_ctx.get());
+    ggml_tensor * larger_out = larger_gdn;
+    for (int i = 0; i < 16; ++i) {
+        larger_out = ggml_scale(larger_ctx.get(), larger_out, 1.0f);
+    }
+    ggml_cgraph * larger_graph = ggml_new_graph(larger_ctx.get());
+    ggml_build_forward_expand(larger_graph, larger_out);
+    GGML_ASSERT(ggml_graph_n_nodes(larger_graph) > ggml_graph_n_nodes(k1_graph));
+    ggml_backend_buffer_ptr larger_buffer(ggml_backend_alloc_ctx_tensors(larger_ctx.get(), backend.get()));
+    if (larger_buffer == nullptr) {
+        fprintf(stderr, "%s: failed to allocate the larger RPC graph tensors\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_clear(larger_buffer.get(), 0);
+    memcpy(larger_gdn->op_params + 3, &malformed_reserve, sizeof(malformed_reserve));
+    if (ggml_backend_graph_compute(backend.get(), larger_graph) == GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: larger malformed wire GATED_DELTA_NET was accepted\n", __func__);
+        return false;
+    }
+    const int recompute_result = ggml_backend_rpc_test_recompute(backend.get());
+    if (recompute_result != 0) {
+        fprintf(stderr, "%s: recompute after rejected graph returned %d instead of protocol failure\n", __func__, recompute_result);
+        return false;
+    }
+
+    if (cuda_device >= 0) {
+        ggml_backend_ptr cuda_backend(ggml_backend_rpc_init(endpoint.c_str(), (uint32_t) cuda_device));
+        if (cuda_backend == nullptr) {
+            fprintf(stderr, "%s: failed to initialize the CUDA RPC test backend\n", __func__);
+            return false;
+        }
+        ggml_init_params cuda_params = {
+            /* .mem_size   = */ ggml_tensor_overhead()*64 + 2*ggml_graph_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ggml_context_ptr cuda_ctx(ggml_init(cuda_params));
+        test_gated_delta_net cuda_supported_test(GGML_TYPE_F32, 2, 16, 1, 1);
+        ggml_tensor * cuda_supported_out = cuda_supported_test.build_graph(cuda_ctx.get());
+        ggml_cgraph * cuda_supported_graph = ggml_new_graph(cuda_ctx.get());
+        ggml_build_forward_expand(cuda_supported_graph, cuda_supported_out);
+        test_gated_delta_net cuda_unsupported_test(GGML_TYPE_F32, 2, 8, 1, 1);
+        ggml_tensor * cuda_unsupported_out = cuda_unsupported_test.build_graph(cuda_ctx.get());
+        ggml_cgraph * cuda_unsupported_graph = ggml_new_graph(cuda_ctx.get());
+        ggml_build_forward_expand(cuda_unsupported_graph, cuda_unsupported_out);
+        ggml_backend_buffer_ptr cuda_buffer(ggml_backend_alloc_ctx_tensors(cuda_ctx.get(), cuda_backend.get()));
+        if (cuda_buffer == nullptr) {
+            fprintf(stderr, "%s: failed to allocate CUDA RPC graph tensors\n", __func__);
+            return false;
+        }
+        ggml_backend_buffer_clear(cuda_buffer.get(), 0);
+        if (ggml_backend_graph_compute(cuda_backend.get(), cuda_supported_graph) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: CUDA RPC rejected supported GATED_DELTA_NET S_v=16\n", __func__);
+            return false;
+        }
+        if (ggml_backend_graph_compute(cuda_backend.get(), cuda_unsupported_graph) == GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: CUDA RPC silently accepted unsupported GATED_DELTA_NET S_v=8\n", __func__);
+            return false;
+        }
+    }
+
+    fprintf(stderr, "%s: valid wire GATED_DELTA_NET graphs succeeded and malformed graphs returned failure status\n", __func__);
+    return true;
+}
+#endif
+
+struct test_gated_delta_net_fused_cache : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;
+    const int32_t trailing_snapshots;
+    const int32_t selected_token;
+    const bool    reserve_input;
+
+    ggml_tensor * state_cpy         = nullptr;
+    ggml_tensor * reserve_state_cpy = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, K, trailing_snapshots, selected_token, reserve_input);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_FUSED_CACHE";
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (reserve_state_cpy != nullptr) {
+            return { state_cpy, reserve_state_cpy };
+        }
+        return { state_cpy };
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    test_gated_delta_net_fused_cache(
+            int64_t head_count = 4, int64_t head_size = 16,
+            int64_t n_seq_tokens = 4, int64_t n_seqs = 1, int64_t K = 3,
+            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false)
+        : head_count(head_count), head_size(head_size),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), trailing_snapshots(trailing_snapshots),
+          selected_token(selected_token), reserve_input(reserve_input) {
+        GGML_ASSERT(K > 0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, head_count, n_seqs);
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        if (trailing_snapshots >= 0) {
+            ggml_gated_delta_net_set_snapshots(gdn_out, trailing_snapshots, selected_token, reserve_input);
+        }
+
+        const int64_t D                   = head_size * head_size * head_count;
+        const int64_t attn_score_elems    = head_size * head_count * n_seq_tokens * n_seqs;
+        const int64_t state_size_per_snap = D * n_seqs;
+        ggml_tensor * cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_seqs, K);
+        ggml_set_name(cache, "state_cache");
+        const auto copy_snapshots = [&](int64_t first_slot, int64_t count, const char * name) {
+            ggml_tensor * src = ggml_view_3d(
+                    ctx, gdn_out, D, n_seqs, count,
+                    ggml_row_size(GGML_TYPE_F32, D),
+                    ggml_row_size(GGML_TYPE_F32, state_size_per_snap),
+                    ggml_row_size(GGML_TYPE_F32, attn_score_elems + first_slot * state_size_per_snap));
+            ggml_tensor * dst = ggml_view_3d(
+                    ctx, cache, D, n_seqs, count, cache->nb[1], cache->nb[2], first_slot * cache->nb[2]);
+            ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+            ggml_set_name(cpy, name);
+            if (gf != nullptr) {
+                ggml_build_forward_expand(gf, cpy);
+            }
+            return cpy;
+        };
+
+        const int64_t n_written = trailing_snapshots < 0 ? std::min(n_seq_tokens, K) : selected_token >= 0 ? 1 : trailing_snapshots;
+        state_cpy = copy_snapshots(0, n_written, "state_cpy");
+        if (reserve_input) {
+            reserve_state_cpy = copy_snapshots(K - 1, 1, "reserve_state_cpy");
+        }
+
+        return ggml_view_4d(
+                ctx, gdn_out, head_size, head_count, n_seq_tokens, n_seqs,
+                ggml_row_size(GGML_TYPE_F32, head_size),
+                ggml_row_size(GGML_TYPE_F32, head_size * head_count),
+                ggml_row_size(GGML_TYPE_F32, head_size * head_count * n_seq_tokens), 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) {
+                continue;
+            }
             if (strcmp(t->name, "g") == 0) {
                 init_tensor_uniform(t, -20.0f, -1e-4f);
             } else if (strcmp(t->name, "beta") == 0) {
@@ -10164,9 +10874,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
-    // overflow: n_tokens > K — only the last K snapshots kept.
+    // overflow: n_tokens > K - only the last K snapshots kept.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 16, 1, 2, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 8, 1, 1, false, false, 4, 0, 3, false));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 8, 1, 1, false, false, 4, 3, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 8, 1, 4, 0, 3, false));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 8, 1, 4, 3, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 1, 1, 4, 1, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 2, 1, 4, 2, -1, true));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -11045,6 +11762,9 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+#ifdef GGML_TEST_RPC
+    printf("    --rpc-gdn-rejection runs the malformed wire-level GATED_DELTA_NET regression\n");
+#endif
 }
 
 int main(int argc, char ** argv) {
@@ -11055,6 +11775,9 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
+#ifdef GGML_TEST_RPC
+    bool rpc_gdn_rejection = false;
+#endif
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
@@ -11120,6 +11843,10 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+#ifdef GGML_TEST_RPC
+        } else if (strcmp(argv[i], "--rpc-gdn-rejection") == 0) {
+            rpc_gdn_rejection = true;
+#endif
         } else {
             usage(argv);
             return 1;
@@ -11128,6 +11855,16 @@ int main(int argc, char ** argv) {
 
     // load and enumerate backends
     ggml_backend_load_all();
+
+#ifdef GGML_TEST_RPC
+    if (rpc_gdn_rejection) {
+        return test_gated_delta_net_rpc_rejection() ? 0 : 1;
+    }
+#endif
+
+    if ((mode == MODE_TEST || mode == MODE_SUPPORT) && !test_gated_delta_net_rejection()) {
+        return 1;
+    }
 
     // Create printer for output format
     std::unique_ptr<printer> output_printer = create_printer(output_format);

@@ -106,6 +106,10 @@ struct llama_memory_i {
     // getters
     virtual bool get_can_shift() const = 0;
 
+    virtual bool recurrent_sparse_snapshots_supported() const { return false; }
+    virtual bool recurrent_sparse_snapshot_backend_supported(ggml_backend_dev_t) const { return false; }
+    virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
+
     virtual bool get_supports_partial_kv() const {
         return false;
     }

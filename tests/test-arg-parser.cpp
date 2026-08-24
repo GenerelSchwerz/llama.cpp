@@ -251,6 +251,73 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
     params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes == 0);
+    assert(!params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.mtp_rs_planes_explicit);
+    assert(params.speculative.need_n_rs_seq() == 8);
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.need_n_rs_seq() == 1);
+    assert(params.speculative.is_mtp_rs_capped());
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    assert(params.speculative.need_n_rs_seq() == 8);
+    assert(!params.speculative.is_mtp_rs_capped());
+
+    for (const char * invalid : {"-1", "1", "10"}) {
+        params = common_params();
+        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", invalid};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
     params.model.path = "model_file.gguf";
 
     common_params draft_arg_params;
@@ -497,21 +564,38 @@ static void test_mtp_draft_ubatch_validation() {
     common_params_speculative params;
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
 
-    common_validate_speculative_params(params, 512);
+    common_validate_speculative_params(params, 512, 512);
     params.draft.n_ubatch = 512;
-    common_validate_speculative_params(params, 512);
+    common_validate_speculative_params(params, 512, 512);
 
     params.draft.n_ubatch = 128;
     bool rejected = false;
     try {
-        common_validate_speculative_params(params, 512);
+        common_validate_speculative_params(params, 512, 512);
     } catch (const std::invalid_argument &) {
         rejected = true;
     }
     assert(rejected);
 
+    common_validate_speculative_params(params, 0, 512);
+
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-    common_validate_speculative_params(params, 512);
+    common_validate_speculative_params(params, 512, 512);
+}
+
+static void test_speculative_state_boundaries() {
+    std::vector<uint8_t> state;
+    const std::vector<uint8_t> malformed = { 0x01, 0x02, 0x03 };
+
+    assert(!common_speculative_get_state(nullptr, 0, state));
+    assert(state.empty());
+    assert(common_speculative_set_state(nullptr, 0, {}));
+    assert(!common_speculative_set_state(nullptr, 0, malformed));
+
+    assert(!common_speculative_get_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, state));
+    assert(state.empty());
+    assert(common_speculative_set_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, {}));
+    assert(!common_speculative_set_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, malformed));
 }
 
 int main(void) {
@@ -519,6 +603,7 @@ int main(void) {
         test();
         test_draft_ubatch_override();
         test_mtp_draft_ubatch_validation();
+        test_speculative_state_boundaries();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

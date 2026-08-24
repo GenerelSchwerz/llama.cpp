@@ -212,6 +212,27 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
+bool ggml_backend_dev_supports_recurrent_sparse_snapshots(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
+        for (size_t i = 0; i < n_devs; ++i) {
+            if (!ggml_backend_dev_supports_recurrent_sparse_snapshots(ggml_backend_meta_dev_simple_dev(dev, i))) {
+                return false;
+            }
+        }
+        return n_devs > 0;
+    }
+
+    typedef bool (*supports_recurrent_sparse_snapshots_t)(ggml_backend_dev_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    supports_recurrent_sparse_snapshots_t fn = reg ? reinterpret_cast<supports_recurrent_sparse_snapshots_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_recurrent_sparse_snapshots_supported")) : nullptr;
+    return fn != nullptr && fn(dev);
+}
+
 ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud) {
     GGML_ASSERT(n_devs <= GGML_BACKEND_META_MAX_DEVICES);

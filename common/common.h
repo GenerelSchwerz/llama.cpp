@@ -381,8 +381,15 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    bool mtp_rs_planes_explicit = false;
+
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool is_mtp_rs_capped() const {
+        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
     }
 
     uint32_t need_n_rs_seq() const {
@@ -390,7 +397,12 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        if (has_mtp && mtp_rs_planes > 0) {
+            return uint32_t(mtp_rs_planes - 1);
+        }
+
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
     }
 };
 

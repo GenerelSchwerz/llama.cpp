@@ -2149,6 +2149,10 @@ static bool ggml_hexagon_supported_gated_delta_net(const struct ggml_hexagon_ses
         return false;
     }
 
+    if (!ggml_gated_delta_net_has_default_snapshot_params(op)) {
+        return false;
+    }
+
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F32 || v->type != GGML_TYPE_F32 ||
         g->type != GGML_TYPE_F32 || beta->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
         dst->type != GGML_TYPE_F32) {

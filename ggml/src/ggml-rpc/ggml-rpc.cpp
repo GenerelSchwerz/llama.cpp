@@ -5,6 +5,7 @@
 #include "transport.h"
 
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <optional>
 #include <string>
@@ -196,6 +197,10 @@ struct rpc_msg_get_device_memory_rsp {
 
 struct rpc_msg_graph_recompute_req {
     uint32_t device;
+};
+
+struct rpc_msg_graph_compute_rsp {
+    uint8_t result;
 };
 
 #pragma pack(pop)
@@ -735,16 +740,24 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     if (reuse) {
         rpc_msg_graph_recompute_req request;
         request.device = rpc_ctx->device;
+        rpc_msg_graph_compute_rsp response;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request));
-        RPC_STATUS_ASSERT(status);
+        const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), &response, sizeof(response));
+        if (!status || !response.result) {
+            rpc_dev_ctx->last_graph_uid = 0;
+            return GGML_STATUS_FAILED;
+        }
     } else {
         rpc_dev_ctx->last_graph_uid = cgraph->uid;
         std::vector<uint8_t> input;
         serialize_graph(rpc_ctx->device, cgraph, input);
+        rpc_msg_graph_compute_rsp response;
         auto sock = get_socket(rpc_ctx->endpoint);
-        bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size());
-        RPC_STATUS_ASSERT(status);
+        const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, input.data(), input.size(), &response, sizeof(response));
+        if (!status || !response.result) {
+            rpc_dev_ctx->last_graph_uid = 0;
+            return GGML_STATUS_FAILED;
+        }
     }
     return GGML_STATUS_SUCCESS;
 }
@@ -822,6 +835,47 @@ ggml_backend_t ggml_backend_rpc_init(const char * endpoint, uint32_t device) {
 bool ggml_backend_is_rpc(ggml_backend_t backend) {
     return backend != NULL && ggml_guid_matches(backend->guid, ggml_backend_rpc_guid());
 }
+
+#ifdef GGML_TEST_RPC
+static std::atomic<bool> test_fail_next_recompute(false);
+
+int ggml_backend_rpc_test_compute_truncated(ggml_backend_t backend) {
+    if (!ggml_backend_is_rpc(backend)) {
+        return -1;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    rpc_msg_graph_compute_rsp response;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return -1;
+    }
+    const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_COMPUTE, &rpc_ctx->device, sizeof(rpc_ctx->device), &response, sizeof(response));
+    return status ? response.result : -1;
+}
+
+int ggml_backend_rpc_test_recompute(ggml_backend_t backend) {
+    if (!ggml_backend_is_rpc(backend)) {
+        return -1;
+    }
+    ggml_backend_rpc_context * rpc_ctx = (ggml_backend_rpc_context *) backend->context;
+    rpc_msg_graph_recompute_req request = { rpc_ctx->device };
+    rpc_msg_graph_compute_rsp response;
+    auto sock = get_socket(rpc_ctx->endpoint);
+    if (sock == nullptr) {
+        return -1;
+    }
+    const bool status = send_rpc_cmd(sock, RPC_CMD_GRAPH_RECOMPUTE, &request, sizeof(request), &response, sizeof(response));
+    return status ? response.result : -1;
+}
+
+bool ggml_backend_rpc_test_fail_next_recompute(ggml_backend_t backend) {
+    if (!ggml_backend_is_rpc(backend)) {
+        return false;
+    }
+    test_fail_next_recompute.store(true);
+    return true;
+}
+#endif
 
 static void get_device_memory(const std::shared_ptr<socket_t> & sock, uint32_t device, size_t * free, size_t * total) {
     rpc_msg_get_device_memory_req request;
@@ -1393,13 +1447,18 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+    if (result->op == GGML_OP_GATED_DELTA_NET && !ggml_gated_delta_net_validate(result)) {
+        GGML_LOG_ERROR("[%s] invalid GATED_DELTA_NET node (id=%" PRIu64 ")\n", __func__, id);
+        tensor_map.erase(id);
+        return nullptr;
+    }
     return result;
 }
 
 bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     // serialization format:
     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
-    if (input.size() < 2*sizeof(uint32_t)) {
+    if (input.size() < sizeof(uint32_t)) {
         return false;
     }
     const uint8_t * src = input.data();
@@ -1407,6 +1466,11 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     memcpy(&device, src, sizeof(device));
     src += sizeof(device);
     if (device >= backends.size()) {
+        return false;
+    }
+    stored_graph & stored = stored_graphs[device];
+    stored.graph = nullptr;
+    if (input.size() < 2*sizeof(uint32_t)) {
         return false;
     }
     uint32_t n_nodes;
@@ -1427,12 +1491,12 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     LOG_DBG("[%s] device: %u, n_nodes: %u, n_tensors: %u\n", __func__, device, n_nodes, n_tensors);
 
     size_t buf_size = ggml_tensor_overhead()*(n_nodes + n_tensors) + ggml_graph_overhead_custom(n_nodes, false);
-    if (stored_graphs[device].buffer.size() < buf_size) {
-        stored_graphs[device].buffer.resize(buf_size);
+    if (stored.buffer.size() < buf_size) {
+        stored.buffer.resize(buf_size);
     }
     struct ggml_init_params params = {
         /*.mem_size   =*/ buf_size,
-        /*.mem_buffer =*/ stored_graphs[device].buffer.data(),
+        /*.mem_buffer =*/ stored.buffer.data(),
         /*.no_alloc   =*/ true,
     };
     ggml_context_ptr ctx_ptr { ggml_init(params) };
@@ -1460,13 +1524,19 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
             return false;
         }
         if (graph->nodes[i] != nullptr) {
+            if (graph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && !ggml_backend_supports_op(backends[device], graph->nodes[i])) {
+                GGML_LOG_ERROR("[%s] GATED_DELTA_NET node %d is unsupported by device %u\n", __func__, i, device);
+                return false;
+            }
             const size_t hash_pos = ggml_hash_insert(&graph->visited_hash_set, graph->nodes[i]);
             graph->use_counts[hash_pos] = tensor_ptrs.at(id)->use_count;
         }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
-    stored_graphs[device].graph = graph;
+    if (status != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    stored.graph = graph;
     return true;
 }
 
@@ -1475,13 +1545,21 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (device >= backends.size()) {
         return false;
     }
-    if (stored_graphs[device].graph == nullptr) {
+    stored_graph & stored = stored_graphs[device];
+    if (stored.graph == nullptr) {
         return false;
     }
-    ggml_cgraph * graph = stored_graphs[device].graph;
+    ggml_cgraph * graph = stored.graph;
     LOG_DBG("[%s] device: %u\n", __func__, device);
+#ifdef GGML_TEST_RPC
+    ggml_status status = test_fail_next_recompute.exchange(false) ? GGML_STATUS_FAILED : ggml_backend_graph_compute(backends[device], graph);
+#else
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
-    GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+#endif
+    if (status != GGML_STATUS_SUCCESS) {
+        stored.graph = nullptr;
+        return false;
+    }
     return true;
 }
 
@@ -1748,7 +1826,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, input)) {
                     return;
                 }
-                if (!server.graph_compute(input)) {
+                const rpc_msg_graph_compute_rsp response = { (uint8_t) server.graph_compute(input) };
+                if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
@@ -1758,7 +1837,8 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 if (!recv_msg(sock, &request, sizeof(request))) {
                     return;
                 }
-                if (!server.graph_recompute(request)) {
+                const rpc_msg_graph_compute_rsp response = { (uint8_t) server.graph_recompute(request) };
+                if (!send_msg(sock, &response, sizeof(response))) {
                     return;
                 }
                 break;
@@ -1785,10 +1865,21 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+using rpc_server_ready_fn = void (*)(bool success, void * user_data);
+
+static void rpc_start_server(const char * endpoint, const char * cache_dir,
+                             size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                             rpc_server_ready_fn ready_fn, void * user_data) {
+    bool ready_reported = false;
+    const auto report_ready = [&](bool success) {
+        if (ready_fn != nullptr && !ready_reported) {
+            ready_fn(success, user_data);
+            ready_reported = true;
+        }
+    };
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
+        report_ready(false);
         return;
     }
     std::vector<ggml_backend_t> backends;
@@ -1808,6 +1899,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         auto backend = ggml_backend_dev_init(dev, nullptr);
         if (!backend) {
             fprintf(stderr, "Failed to create backend for device %s\n", dev->iface.get_name(dev));
+            report_ready(false);
             return;
         }
         backends.push_back(backend);
@@ -1823,6 +1915,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     std::string host;
     int port;
     if (!parse_endpoint(endpoint, host, port)) {
+        report_ready(false);
         return;
     }
 
@@ -1833,13 +1926,16 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
 #endif // GGML_RPC_RDMA
     if (!rpc_transport_init()) {
         fprintf(stderr, "Failed to initialize RPC transport\n");
+        report_ready(false);
         return;
     }
     auto server_socket = socket_t::create_server(host.c_str(), port);
     if (server_socket == nullptr) {
         fprintf(stderr, "Failed to create server socket\n");
+        report_ready(false);
         return;
     }
+    report_ready(true);
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
@@ -1857,6 +1953,19 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         ggml_backend_free(backend);
     }
 }
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, nullptr, nullptr);
+}
+
+#ifdef GGML_TEST_RPC
+void ggml_backend_rpc_test_start_server(const char * endpoint, const char * cache_dir,
+                                        size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                        ggml_backend_rpc_test_server_ready_fn ready_fn, void * user_data) {
+    rpc_start_server(endpoint, cache_dir, n_threads, n_devices, devices, ready_fn, user_data);
+}
+#endif
 
 static const char * ggml_backend_rpc_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;

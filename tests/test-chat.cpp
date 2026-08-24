@@ -8,6 +8,7 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-speculative-replay.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -152,6 +153,20 @@ static common_chat_templates_ptr read_templates(const std::string & path) {
 static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_str) {
     return std::unique_ptr<llama_grammar>(
         llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0));
+}
+
+static void test_sparse_batch_failure_slot_scope() {
+    struct test_token {
+        int32_t id_slot;
+    };
+    const std::vector<test_token> tokens = { { 1 }, { 3 }, { 1 } };
+
+    assert_equals(true,  server_sparse_batch_slot_is_affected(2, false, tokens, 2));
+    assert_equals(false, server_sparse_batch_slot_is_affected(2, true,  tokens, 1));
+    assert_equals(true,  server_sparse_batch_slot_is_affected(-1, true, tokens, 1));
+    assert_equals(true,  server_sparse_batch_slot_is_affected(-1, true, tokens, 3));
+    assert_equals(false, server_sparse_batch_slot_is_affected(-1, true, tokens, 4));
+    assert_equals(false, server_sparse_batch_slot_is_affected(-1, false, tokens, 1));
 }
 
 // Helper to format a code point as a readable string
@@ -7238,6 +7253,7 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_sparse_batch_failure_slot_scope();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

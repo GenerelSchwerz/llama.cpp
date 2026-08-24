@@ -6,8 +6,8 @@
 extern "C" {
 #endif
 
-#define RPC_PROTO_MAJOR_VERSION    5
-#define RPC_PROTO_MINOR_VERSION    1
+#define RPC_PROTO_MAJOR_VERSION    6
+#define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
@@ -23,6 +23,16 @@ GGML_BACKEND_API bool ggml_backend_is_rpc(ggml_backend_t backend);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device);
 
 GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, uint32_t device, size_t * free, size_t * total);
+
+#ifdef GGML_TEST_RPC
+typedef void (*ggml_backend_rpc_test_server_ready_fn)(bool success, void * user_data);
+GGML_BACKEND_API void ggml_backend_rpc_test_start_server(const char * endpoint, const char * cache_dir,
+                                                         size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                         ggml_backend_rpc_test_server_ready_fn ready_fn, void * user_data);
+GGML_BACKEND_API int ggml_backend_rpc_test_compute_truncated(ggml_backend_t backend);
+GGML_BACKEND_API int ggml_backend_rpc_test_recompute(ggml_backend_t backend);
+GGML_BACKEND_API bool ggml_backend_rpc_test_fail_next_recompute(ggml_backend_t backend);
+#endif
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
