@@ -2821,8 +2821,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        mctx_cur->build_kv_store(gf, ctx0, k_cur, k_idxs, v_cur, v_idxs, il);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3068,13 +3067,16 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
-    if (k_cur) {
+    if (k_cur && v_cur) {
+        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+
+        mctx_cur->build_kv_store(gf, ctx0, k_cur, k_idxs, v_cur, v_idxs, il);
+    } else if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-    }
-
-    if (v_cur) {
+    } else if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));

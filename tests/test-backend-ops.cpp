@@ -1217,6 +1217,7 @@ struct test_case {
 
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+    virtual bool compare_bytes() { return false; }
     virtual bool use_weight_context() { return false; }
 
     ggml_cgraph * gf = nullptr;
@@ -1443,6 +1444,18 @@ struct test_case {
                     ud->ok = false;
                     return true;
                 }
+            }
+
+            if (ud->tc->compare_bytes()) {
+                std::vector<uint8_t> t1_data(ggml_nbytes(t1));
+                std::vector<uint8_t> t2_data(ggml_nbytes(t2));
+                ggml_backend_tensor_get(t1, t1_data.data(), 0, ggml_nbytes(t1));
+                ggml_backend_tensor_get(t2, t2_data.data(), 0, ggml_nbytes(t2));
+                if (t1_data != t2_data) {
+                    printf("[%s] byte mismatch ", ggml_op_desc(t1));
+                    ud->ok = false;
+                }
+                return true;
             }
 
             std::vector<float> f1 = tensor_to_float(t1);
@@ -3057,6 +3070,63 @@ struct test_cpy : public test_case {
             // test extended range of values to check if casting between f32 and i32 is consistent
             init_tensor_uniform(t, -150.f, 150.f);
         }
+    }
+};
+
+struct test_cpy_f32_q8_0_pair : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens0;
+    const int64_t n_tokens1;
+    const bool strided_src0;
+    ggml_tensor * dst0 = nullptr;
+    ggml_tensor * dst1 = nullptr;
+
+    test_cpy_f32_q8_0_pair(int64_t n_embd, int64_t n_tokens0, int64_t n_tokens1, bool strided_src0)
+        : n_embd(n_embd), n_tokens0(n_tokens0), n_tokens1(n_tokens1), strided_src0(strided_src0) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_F32_Q8_0_PAIR";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_tokens0, n_tokens1, strided_src0);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * src0;
+        if (strided_src0) {
+            ggml_tensor * storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*n_embd, n_tokens0);
+            src0 = ggml_view_2d(ctx, storage, n_embd, n_tokens0, storage->nb[1], 0);
+        } else {
+            src0 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens0);
+        }
+        ggml_tensor * src1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens1);
+        ggml_set_name(src0, "alpha");
+        ggml_set_name(src1, "beta");
+
+        dst0 = ggml_cast(ctx, src0, GGML_TYPE_Q8_0);
+        ggml_set_name(dst0, "gamma");
+
+        dst1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_tokens1);
+        dst1 = ggml_cpy(ctx, src1, dst1);
+        ggml_set_name(dst1, "delta");
+
+        ggml_tensor * out = ggml_concat(ctx, dst0, dst1, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    bool run_whole_graph() override {
+        return true;
+    }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return { dst0, dst1 };
+    }
+
+    bool compare_bytes() override {
+        return true;
     }
 };
 
@@ -8427,6 +8497,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I64, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_I32, { 1, 8, 1, 3 }, { 1, 1 }, 2, false));
     test_cases.emplace_back(new test_set_rows(GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 5, 1, 3 }, { 1, 1, }, 1, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_I64, { 256, 11, 2, 3 }, { 1, 1 }, 3, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_I32, { 256, 11, 2, 3 }, { 1, 1 }, 3, false));
+    test_cases.emplace_back(new test_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_I64, { 256, 11, 2, 3 }, { 1, 1 }, 3, false));
     for (ggml_type src_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type : all_types) {
             for (int b : {1, 7}) {
@@ -8863,6 +8936,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // quant block count not a multiple of the kernel block size
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_Q4_0, {96, 1, 1, 1}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_Q4_0, GGML_TYPE_F32, {96, 1, 1, 1}));
+    test_cases.emplace_back(new test_cpy_f32_q8_0_pair(256, 1, 1, false));
+    test_cases.emplace_back(new test_cpy_f32_q8_0_pair(256, 7, 7, false));
+    test_cases.emplace_back(new test_cpy_f32_q8_0_pair(256, 7, 5, false));
+    test_cases.emplace_back(new test_cpy_f32_q8_0_pair(256, 7, 7, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_I32, {256, 2, 3, 4}, {-1,-1,-1,-1}, {1, 0, 2, 3}));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_I32, GGML_TYPE_F32, {256, 2, 3, 4}));

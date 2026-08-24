@@ -365,8 +365,8 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ggml_build_forward_expand(gf, Qcur);
                 ggml_build_forward_expand(gf, Kcur);
                 ggml_build_forward_expand(gf, Vcur);
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+                mctx_cur->build_kv_store(
+                        gf, ctx0, Kcur, inp_attn->get_k_idxs(), Vcur, inp_attn->get_v_idxs(), il);
                 ggml_tensor * k = mctx_cur->get_k(ctx0, il);
                 ggml_tensor * v = mctx_cur->get_v(ctx0, il);
                 GGML_ASSERT(!(v->nb[1] > v->nb[2]) && "MSA assumes v_trans=false (FA on)");

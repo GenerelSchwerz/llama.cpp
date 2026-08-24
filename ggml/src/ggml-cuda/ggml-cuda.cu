@@ -3021,6 +3021,88 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+static int ggml_cuda_get_graph_stream(const ggml_cuda_stream_context & stream_ctx, const ggml_tensor * node) {
+    int stream = 0;
+
+    for (const auto & entry : stream_ctx.concurrent_events) {
+        const auto it = entry.second.stream_mapping.find(node);
+        if (it == entry.second.stream_mapping.end()) {
+            continue;
+        }
+        if (stream != 0 && stream != it->second) {
+            return -1;
+        }
+        stream = it->second;
+    }
+
+    return stream;
+}
+
+static bool ggml_cuda_can_fuse_f32_q8_0_cpy_pair(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CPY, GGML_OP_CPY }, { node_idx, node_idx + 1 })) {
+        return false;
+    }
+
+    const ggml_tensor * dst0 = cgraph->nodes[node_idx];
+    const ggml_tensor * dst1 = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * src0 = dst0->src[0];
+    const ggml_tensor * src1 = dst1->src[0];
+
+    if (!src0 || !src1 || dst0->src[1] != dst0 || dst1->src[1] != dst1 || src0 == src1) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        dst0->type != GGML_TYPE_Q8_0 || dst1->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src0, src1) || !ggml_are_same_shape(src0, dst0) || !ggml_are_same_shape(src1, dst1)) {
+        return false;
+    }
+    if (dst0->ne[0] <= 0 || dst0->ne[0] % QK8_0 != 0 || dst0->ne[1] <= 0 || dst0->ne[2] != 1 || dst0->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst0) || !ggml_is_contiguous(dst1)) {
+        return false;
+    }
+    if ((uintptr_t) src0->data % alignof(float) != 0 || (uintptr_t) src1->data % alignof(float) != 0 ||
+        (uintptr_t) dst0->data % alignof(block_q8_0) != 0 || (uintptr_t) dst1->data % alignof(block_q8_0) != 0) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(cuda_ctx->device);
+    const ggml_tensor * tensors[4] = { src0, dst0, src1, dst1 };
+    for (const ggml_tensor * tensor : tensors) {
+        if (!tensor->data || !tensor->buffer || tensor->buffer->buft != buft) {
+            return false;
+        }
+    }
+
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a_begin = (uintptr_t) a->data;
+        const uintptr_t b_begin = (uintptr_t) b->data;
+        const size_t a_size = ggml_nbytes(a);
+        const size_t b_size = ggml_nbytes(b);
+        if (a_size > UINTPTR_MAX - a_begin || b_size > UINTPTR_MAX - b_begin) {
+            return true;
+        }
+        const uintptr_t a_end = a_begin + a_size;
+        const uintptr_t b_end = b_begin + b_size;
+        return a_begin < b_end && b_begin < a_end;
+    };
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            if (overlaps(tensors[i], tensors[j])) {
+                return false;
+            }
+        }
+    }
+
+    const ggml_cuda_stream_context & stream_ctx = cuda_ctx->stream_context();
+    const int stream0 = ggml_cuda_get_graph_stream(stream_ctx, dst0);
+    const int stream1 = ggml_cuda_get_graph_stream(stream_ctx, dst1);
+    return stream0 >= 0 && stream0 == stream1 && stream0 == cuda_ctx->curr_stream_no;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3282,6 +3364,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_CPY && ggml_cuda_can_fuse_f32_q8_0_cpy_pair(cuda_ctx, cgraph, i)) {
+        ggml_cuda_cpy_f32_q8_0_pair(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
 
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {

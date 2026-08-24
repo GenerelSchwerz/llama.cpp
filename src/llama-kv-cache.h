@@ -182,8 +182,8 @@ public:
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
 
     //
     // preparation API
@@ -235,6 +235,9 @@ private:
 
         ggml_tensor * k;
         ggml_tensor * v;
+
+        bool k_store_quantize;
+        bool v_store_quantize;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -298,6 +301,13 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    ggml_tensor * stage_store_rows(
+            ggml_context * ctx,
+            ggml_tensor  * source,
+                 ggml_type type,
+                    int32_t il,
+                const char * side) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
@@ -384,8 +394,17 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
+    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
+
+    void build_kv_store(
+            ggml_cgraph  * gf,
+            ggml_context * ctx,
+            ggml_tensor  * k_cur,
+            ggml_tensor  * k_idxs,
+            ggml_tensor  * v_cur,
+            ggml_tensor  * v_idxs,
+            int32_t        il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
