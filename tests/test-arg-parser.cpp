@@ -13,6 +13,22 @@
 #undef NDEBUG
 #include <cassert>
 
+static void set_test_env(const char * name, const char * value) {
+#ifdef _WIN32
+    assert(_putenv_s(name, value) == 0);
+#else
+    assert(setenv(name, value, true) == 0);
+#endif
+}
+
+static void unset_test_env(const char * name) {
+#ifdef _WIN32
+    assert(_putenv_s(name, "") == 0);
+#else
+    assert(unsetenv(name) == 0);
+#endif
+}
+
 static void test(void) {
     common_params params;
 
@@ -42,6 +58,14 @@ static void test(void) {
         const auto draft = common_base_params_to_speculative(base);
         assert(draft.n_outputs_max == 4);
         assert(draft.n_outputs_max_per_seq == 1);
+
+        base.n_batch = 16;
+        base.n_parallel = 2;
+        base.speculative.draft.n_max = 3;
+        base.phase_aware_workspace = true;
+        const auto phase_draft = common_base_params_to_speculative(base);
+        assert(phase_draft.n_outputs_max == 2);
+        assert(phase_draft.n_outputs_max_per_seq == 1);
     }
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -259,6 +283,7 @@ static void test(void) {
         assert(!defaults.kv_cpu_pinned);
         assert(!defaults.recurrent_state_offload);
         assert(defaults.kv_gpu_layers == 0);
+        assert(!defaults.phase_aware_workspace);
 
         common_params placement_params;
         argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--kv-gpu-layers", "4", "--recurrent-state-offload"};
@@ -278,6 +303,32 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
         assert(!placement_params.kv_cpu_pinned);
         assert(!placement_params.recurrent_state_offload);
+    }
+
+    {
+        unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+        common_params phase_params;
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
+        assert(!phase_params.phase_aware_workspace);
+
+        phase_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf", "--phase-aware-workspace"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
+        assert(phase_params.phase_aware_workspace);
+        assert(common_context_params_to_llama(phase_params).phase_aware_workspace);
+
+        phase_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf", "--phase-aware-workspace", "--no-phase-aware-workspace"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
+        assert(!phase_params.phase_aware_workspace);
+
+        set_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE", "1");
+        phase_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
+        assert(phase_params.phase_aware_workspace);
+        unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
     }
 
     {

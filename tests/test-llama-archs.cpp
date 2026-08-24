@@ -1,6 +1,7 @@
 #include "common.h"
 #include "log.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-impl.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-cpp.h"
@@ -9,6 +10,8 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-context.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -65,7 +68,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--test-phase-workspace]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -79,7 +82,7 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 128;
@@ -130,6 +133,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
     }
 
+    GGML_ASSERT(!mtp || arch == LLM_ARCH_QWEN35);
+    const uint32_t n_layer_all = n_layer + (mtp ? 1 : 0);
+
     uint32_t n_head_kv = n_head;
     if (arch == LLM_ARCH_QWEN3) {
         n_head_kv = 1; // MQA coverage
@@ -143,8 +149,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_CONTEXT_LENGTH,            n_ctx);
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
-    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
+    ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer_all);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -365,6 +374,462 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         throw std::runtime_error("failed to create llama context");
     }
     return std::make_pair(std::move(model), std::move(lctx));
+}
+
+static bool phase_workspace_fail_alloc = false;
+static bool phase_workspace_fail_once = false;
+static int phase_workspace_alloc_failures = 0;
+static ggml_backend_buffer_t (*phase_workspace_alloc_buffer)(ggml_backend_buffer_type_t, size_t) = nullptr;
+static ggml_backend_t phase_workspace_sync_backends[2] = {};
+static void (*phase_workspace_synchronize[2])(ggml_backend_t) = {};
+static int phase_workspace_sync_calls[2] = {};
+
+static ggml_backend_buffer_t phase_workspace_cpu_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (phase_workspace_fail_alloc) {
+        phase_workspace_alloc_failures++;
+        if (phase_workspace_fail_once) {
+            phase_workspace_fail_alloc = false;
+        }
+        return nullptr;
+    }
+    return phase_workspace_alloc_buffer(buft, size);
+}
+
+static void phase_workspace_count_synchronize(ggml_backend_t backend) {
+    for (int i = 0; i < 2; ++i) {
+        if (phase_workspace_sync_backends[i] == backend) {
+            phase_workspace_sync_calls[i]++;
+            if (phase_workspace_synchronize[i] != nullptr) {
+                phase_workspace_synchronize[i](backend);
+            }
+            return;
+        }
+    }
+}
+
+static llama_context_ptr make_phase_workspace_context(
+        llama_model * model, llama_context_type type, llama_context * other = nullptr);
+
+static void test_phase_workspace_runtime_reserve(size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    phase_workspace_fail_alloc = false;
+    phase_workspace_fail_once = false;
+    phase_workspace_alloc_failures = 0;
+    phase_workspace_alloc_buffer = cpu_buft->iface.alloc_buffer;
+    cpu_buft->iface.alloc_buffer = phase_workspace_cpu_alloc_buffer;
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 32;
+    ctx_params.n_batch = 32;
+    ctx_params.n_ubatch = 32;
+    ctx_params.n_seq_max = 1;
+    ctx_params.n_outputs_max = 0;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.no_perf = false;
+    ctx_params.phase_aware_workspace = true;
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    GGML_ASSERT(ctx);
+    GGML_ASSERT(llama_n_batch(ctx.get()) == ctx_params.n_batch);
+    GGML_ASSERT(ctx->get_cparams().n_outputs_max == ctx_params.n_batch);
+
+    ggml_backend_sched_t sched = ctx->get_sched();
+    ggml_backend_t backend_cpu = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_cpu = backend;
+            break;
+        }
+    }
+    GGML_ASSERT(backend_cpu != nullptr);
+    const size_t size_small = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_small > 0);
+
+    llama_batch batch = llama_batch_init(16, 0, 1);
+    const std::vector<llama_token> tokens = get_tokens(16, llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed);
+    for (int32_t i = 0; i < 16; ++i) {
+        common_batch_add(batch, tokens[i], i, { 0 }, true);
+    }
+
+    phase_workspace_fail_alloc = true;
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == -2);
+    GGML_ASSERT(phase_workspace_alloc_failures > 0);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == 0);
+
+    phase_workspace_fail_alloc = false;
+    const int64_t retry_start_us = ggml_time_us();
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_synchronize(ctx.get());
+    const int64_t retry_elapsed_us = ggml_time_us() - retry_start_us;
+    const llama_perf_context_data perf = llama_perf_context(ctx.get());
+    GGML_ASSERT(perf.n_p_eval == 16);
+    GGML_ASSERT(perf.t_p_eval_ms >= 0.0);
+    GGML_ASSERT(perf.t_p_eval_ms <= retry_elapsed_us*1e-3 + 0.001);
+    GGML_ASSERT(llama_get_logits_ith(ctx.get(), 0) != nullptr);
+    GGML_ASSERT(llama_get_logits_ith(ctx.get(), 15) != nullptr);
+    const size_t size_grown = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_grown > size_small);
+
+    ctx->sched_reserve(ctx_params.n_ubatch);
+    const size_t size_prompt = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_prompt == size_grown);
+
+    llama_batch_free(batch);
+    ctx.reset();
+
+    ctx_params.n_outputs_max = 4;
+    ctx.reset(llama_init_from_model(model.get(), ctx_params));
+    GGML_ASSERT(ctx);
+    sched = ctx->get_sched();
+    backend_cpu = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_cpu = backend;
+            break;
+        }
+    }
+    GGML_ASSERT(backend_cpu != nullptr);
+    const size_t size_declared = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_declared > 0);
+
+    int32_t pos = 0;
+    for (int32_t width = 1; width <= 4; width *= 2) {
+        llama_batch declared = llama_batch_init(width, 0, 1);
+        for (int32_t i = 0; i < width; ++i) {
+            common_batch_add(declared, tokens[i], pos++, { 0 }, true);
+        }
+        GGML_ASSERT(llama_decode(ctx.get(), declared) == 0);
+        llama_synchronize(ctx.get());
+        GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == size_declared);
+        llama_batch_free(declared);
+    }
+
+    ctx.reset();
+    cpu_buft->iface.alloc_buffer = phase_workspace_alloc_buffer;
+    phase_workspace_alloc_buffer = nullptr;
+}
+
+static void test_phase_workspace_late_pipeline_fallback(size_t seed) {
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.caps.async && props.caps.events) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.size() < 2) {
+        printf("test_phase_workspace_late_pipeline_fallback: skipped, two async GPU devices required\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.n_gpu_layers = 99;
+    ggml_backend_dev_t model_devices[] = { devices[0], devices[1], nullptr };
+    model_params.devices = model_devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    llama_context_ptr ctx = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+    GGML_ASSERT(ctx);
+    GGML_ASSERT(ggml_backend_sched_get_n_copies(ctx->get_sched()) > 1);
+
+    ggml_backend_buffer_type_t gpu_buft = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(ctx->get_sched()); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(ctx->get_sched(), i);
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_buft = ggml_backend_get_default_buffer_type(backend);
+            break;
+        }
+    }
+    GGML_ASSERT(gpu_buft != nullptr);
+
+    phase_workspace_alloc_failures = 0;
+    phase_workspace_alloc_buffer = gpu_buft->iface.alloc_buffer;
+    phase_workspace_fail_once = true;
+    phase_workspace_fail_alloc = true;
+    gpu_buft->iface.alloc_buffer = phase_workspace_cpu_alloc_buffer;
+
+    llama_batch batch = llama_batch_init(16, 0, 1);
+    const std::vector<llama_token> tokens = get_tokens(16,
+            llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed);
+    for (int32_t i = 0; i < 16; ++i) {
+        common_batch_add(batch, tokens[i], i, { 0 }, i == 15);
+    }
+    GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+    llama_synchronize(ctx.get());
+    GGML_ASSERT(phase_workspace_alloc_failures == 1);
+    GGML_ASSERT(ggml_backend_sched_get_n_copies(ctx->get_sched()) == 1);
+
+    gpu_buft->iface.alloc_buffer = phase_workspace_alloc_buffer;
+    phase_workspace_alloc_buffer = nullptr;
+    phase_workspace_fail_alloc = false;
+    phase_workspace_fail_once = false;
+    llama_batch_free(batch);
+}
+
+static llama_batch make_mtp_batch(
+        int32_t n_tokens, int32_t n_embd, int32_t pos, uint32_t n_vocab, size_t seed) {
+    llama_batch batch = llama_batch_init(n_tokens, n_embd, 1);
+    batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens);
+    GGML_ASSERT(batch.token != nullptr);
+
+    const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
+    for (int32_t i = 0; i < n_tokens; ++i) {
+        common_batch_add(batch, tokens[i], pos + i, { 0 }, i == n_tokens - 1);
+        for (int32_t j = 0; j < n_embd; ++j) {
+            batch.embd[(size_t) i * n_embd + j] = (float) ((i + j) % 17) / 17.0f;
+        }
+    }
+    return batch;
+}
+
+static llama_context_ptr make_phase_workspace_context(
+        llama_model * model, llama_context_type type, llama_context * other) {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 32;
+    params.n_batch = 32;
+    params.n_ubatch = 32;
+    params.n_seq_max = 1;
+    params.n_outputs_max = type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 4;
+    params.n_threads = 4;
+    params.n_threads_batch = 4;
+    params.ctx_type = type;
+    params.ctx_other = other;
+    params.phase_aware_workspace = true;
+    return llama_context_ptr(llama_init_from_model(model, params));
+}
+
+static void test_phase_workspace_mtp_lifecycle(size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+    llama_context_ptr draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get());
+    GGML_ASSERT(target && draft);
+    GGML_ASSERT(!llama_contexts_share_workspace(target.get(), draft.get()));
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const int32_t n_embd = llama_model_n_embd_out(model.get());
+    llama_batch target_batch = llama_batch_init(4, 0, 1);
+    const std::vector<llama_token> tokens = get_tokens(4, n_vocab, seed);
+    for (int32_t i = 0; i < 4; ++i) {
+        common_batch_add(target_batch, tokens[i], i, { 0 }, true);
+    }
+    llama_batch draft_batch = make_mtp_batch(4, n_embd, 0, n_vocab, seed + 1);
+
+    GGML_ASSERT(llama_decode(target.get(), target_batch) == 0);
+    GGML_ASSERT(llama_decode(draft.get(), draft_batch) == 0);
+    llama_synchronize(draft.get());
+    llama_synchronize(target.get());
+    llama_batch_free(draft_batch);
+    llama_batch_free(target_batch);
+
+    ggml_backend_t target_cpu = ggml_backend_sched_get_backend(target->get_sched(),
+            ggml_backend_sched_get_n_backends(target->get_sched()) - 1);
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+    phase_workspace_alloc_failures = 0;
+    phase_workspace_alloc_buffer = cpu_buft->iface.alloc_buffer;
+    phase_workspace_fail_once = true;
+    phase_workspace_fail_alloc = true;
+    cpu_buft->iface.alloc_buffer = phase_workspace_cpu_alloc_buffer;
+    GGML_ASSERT(llama_attach_shared_workspace(draft.get(), target.get()) == -1);
+    GGML_ASSERT(phase_workspace_alloc_failures == 1);
+    GGML_ASSERT(draft->get_sched() == nullptr);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu) == 0);
+    cpu_buft->iface.alloc_buffer = phase_workspace_alloc_buffer;
+    phase_workspace_alloc_buffer = nullptr;
+    phase_workspace_fail_alloc = false;
+    phase_workspace_fail_once = false;
+
+    GGML_ASSERT(llama_attach_shared_workspace(draft.get(), target.get()) == 1);
+    GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()));
+    GGML_ASSERT(draft->make_sched_reserve_plan(4).n_tokens == 4);
+
+    ggml_backend_t draft_cpu = ggml_backend_sched_get_backend(draft->get_sched(),
+            ggml_backend_sched_get_n_backends(draft->get_sched()) - 1);
+    const size_t decode_size = ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu);
+    GGML_ASSERT(decode_size > 0);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(draft->get_sched(), draft_cpu) == decode_size);
+    draft->sched_reserve(4);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(draft->get_sched(), draft_cpu) == decode_size);
+
+    phase_workspace_sync_backends[0] = target_cpu;
+    phase_workspace_sync_backends[1] = draft_cpu;
+    phase_workspace_synchronize[0] = target_cpu->iface.synchronize;
+    phase_workspace_synchronize[1] = draft_cpu->iface.synchronize;
+    phase_workspace_sync_calls[0] = 0;
+    phase_workspace_sync_calls[1] = 0;
+    target_cpu->iface.synchronize = phase_workspace_count_synchronize;
+    draft_cpu->iface.synchronize = phase_workspace_count_synchronize;
+
+    llama_batch target_catchup = llama_batch_init(1, 0, 1);
+    common_batch_add(target_catchup, tokens[0], 4, { 0 }, true);
+    llama_batch draft_catchup = make_mtp_batch(1, n_embd, 4, n_vocab, seed + 2);
+    llama_batch target_reacquire = llama_batch_init(1, 0, 1);
+    common_batch_add(target_reacquire, tokens[1], 5, { 0 }, true);
+    GGML_ASSERT(llama_decode(target.get(), target_catchup) == 0);
+    GGML_ASSERT(llama_decode(draft.get(), draft_catchup) == 0);
+    GGML_ASSERT(phase_workspace_sync_calls[0] > 0);
+    const int draft_syncs_before_reacquire = phase_workspace_sync_calls[1];
+    GGML_ASSERT(llama_decode(target.get(), target_reacquire) == 0);
+    GGML_ASSERT(phase_workspace_sync_calls[1] == draft_syncs_before_reacquire + 1);
+    GGML_ASSERT(llama_get_logits_ith(target.get(), 0) != nullptr);
+    target_cpu->iface.synchronize = phase_workspace_synchronize[0];
+    draft_cpu->iface.synchronize = phase_workspace_synchronize[1];
+    memset(phase_workspace_sync_backends, 0, sizeof(phase_workspace_sync_backends));
+    memset(phase_workspace_synchronize, 0, sizeof(phase_workspace_synchronize));
+    memset(phase_workspace_sync_calls, 0, sizeof(phase_workspace_sync_calls));
+    llama_batch_free(target_reacquire);
+    llama_batch_free(draft_catchup);
+    llama_batch_free(target_catchup);
+
+    llama_batch draft_failure = make_mtp_batch(1, n_embd, 5, n_vocab, seed + 3);
+    GGML_ASSERT(llama_decode(draft.get(), draft_failure) == 0);
+    phase_workspace_alloc_failures = 0;
+    phase_workspace_alloc_buffer = cpu_buft->iface.alloc_buffer;
+    phase_workspace_fail_once = true;
+    phase_workspace_fail_alloc = true;
+    cpu_buft->iface.alloc_buffer = phase_workspace_cpu_alloc_buffer;
+    bool reserve_failed = false;
+    try {
+        target->sched_reserve(32);
+    } catch (const std::exception &) {
+        reserve_failed = true;
+    }
+    GGML_ASSERT(reserve_failed);
+    GGML_ASSERT(phase_workspace_alloc_failures == 1);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu) == 0);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(draft->get_sched(), draft_cpu) == 0);
+    cpu_buft->iface.alloc_buffer = phase_workspace_alloc_buffer;
+    phase_workspace_alloc_buffer = nullptr;
+    phase_workspace_fail_alloc = false;
+    phase_workspace_fail_once = false;
+    llama_batch_free(draft_failure);
+
+    target->sched_reserve(32);
+    const size_t prompt_size = ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu);
+    GGML_ASSERT(prompt_size > decode_size);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(draft->get_sched(), draft_cpu) == prompt_size);
+
+    target->sched_reserve(0);
+    draft->sched_reserve(0);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu) == decode_size);
+    target->sched_reserve(32);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(target->get_sched(), target_cpu) == prompt_size);
+
+    draft.reset();
+    draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get());
+    GGML_ASSERT(draft);
+    GGML_ASSERT(!llama_contexts_share_workspace(target.get(), draft.get()));
+    GGML_ASSERT(llama_attach_shared_workspace(draft.get(), target.get()) == 1);
+
+    llama_batch teardown_batch = make_mtp_batch(1, n_embd, 0, n_vocab, seed + 4);
+    GGML_ASSERT(llama_decode(draft.get(), teardown_batch) == 0);
+    target.reset();
+    llama_batch_free(teardown_batch);
+    draft->sched_reserve(0);
+
+    target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+    GGML_ASSERT(target);
+    GGML_ASSERT(llama_attach_shared_workspace(draft.get(), target.get()) == 1);
+    target.reset();
+
+    llama_batch retry_batch = make_mtp_batch(1, n_embd, 4, n_vocab, seed + 2);
+    GGML_ASSERT(llama_decode(draft.get(), retry_batch) == 0);
+    llama_synchronize(draft.get());
+    llama_batch_free(retry_batch);
+    draft.reset();
+}
+
+static void test_phase_workspace_mismatched_placement(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        printf("test_phase_workspace_mismatched_placement: skipped, GPU device required\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params target_params = llama_model_default_params();
+    target_params.progress_callback = silent_model_load_progress;
+    target_params.n_gpu_layers = 99;
+    target_params.load_mtp = true;
+    ggml_backend_dev_t target_devices[] = { gpu, nullptr };
+    target_params.devices = target_devices;
+
+    llama_model_params draft_params = llama_model_default_params();
+    draft_params.progress_callback = silent_model_load_progress;
+    draft_params.load_mtp = true;
+    ggml_backend_dev_t draft_devices[] = { nullptr };
+    draft_params.devices = draft_devices;
+
+    size_t target_seed = seed;
+    size_t draft_seed = seed;
+    llama_model_ptr target_model(llama_model_init_from_user(
+            gguf_ctx.get(), set_tensor_data, &target_seed, target_params));
+    llama_model_ptr draft_model(llama_model_init_from_user(
+            gguf_ctx.get(), set_tensor_data, &draft_seed, draft_params));
+    GGML_ASSERT(target_model && draft_model);
+
+    llama_context_ptr target = make_phase_workspace_context(target_model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+    llama_context_ptr draft = make_phase_workspace_context(
+            draft_model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get());
+    GGML_ASSERT(target && draft);
+    GGML_ASSERT(!llama_contexts_share_workspace(target.get(), draft.get()));
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(target_model.get()));
+    const int32_t n_embd = llama_model_n_embd_out(draft_model.get());
+    llama_batch target_batch = llama_batch_init(1, 0, 1);
+    common_batch_add(target_batch, get_tokens(1, n_vocab, seed)[0], 0, { 0 }, true);
+    llama_batch draft_batch = make_mtp_batch(1, n_embd, 0, n_vocab, seed + 1);
+    GGML_ASSERT(llama_decode(target.get(), target_batch) == 0);
+    GGML_ASSERT(llama_decode(draft.get(), draft_batch) == 0);
+    llama_synchronize(draft.get());
+    llama_synchronize(target.get());
+    llama_batch_free(draft_batch);
+    llama_batch_free(target_batch);
+
+    const int32_t status = llama_attach_shared_workspace(draft.get(), target.get());
+    GGML_ASSERT(status >= 0);
+    GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
 static std::vector<float> get_logits(
@@ -750,6 +1215,7 @@ int main(int argc, char ** argv) {
     size_t seed = rd();
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
+    bool test_phase_workspace = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -785,10 +1251,21 @@ int main(int argc, char ** argv) {
                 return 1;
             }
         }
+        if (strcmp(argv[i], "--test-phase-workspace") == 0) {
+            test_phase_workspace = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
     try {
+        if (test_phase_workspace) {
+            test_phase_workspace_runtime_reserve(seed);
+            test_phase_workspace_mtp_lifecycle(seed);
+            test_phase_workspace_mismatched_placement(seed);
+            test_phase_workspace_late_pipeline_fallback(seed);
+            return 0;
+        }
         if (!out.empty()) {
             return save_models(arch, seed, log_level, out);
         }
