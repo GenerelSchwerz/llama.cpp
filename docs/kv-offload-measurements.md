@@ -57,15 +57,23 @@ and **0.125 ms**.
 
 Same model, cache type and depth with the KV device-resident (`repro/m4`):
 
-| Depth | host KV | ms/tok | device KV | ms/tok | implied copy | measured H2D |
-|---|---:|---:|---:|---:|---:|---:|
-| 4,096 | 31.72 | 31.52 | 39.0152 | 25.63 | 5.89 ms | 6.31 ms |
-| 16,384 | 19.69 | 50.78 | 36.1072 | 27.70 | 23.08 ms | 24.05 ms |
-| 32,768 | 13.03 | 76.77 | 32.5832 | 30.69 | 46.08 ms | 47.10 ms |
+| Depth | host KV | ms/tok | device KV | ms/tok | implied copy | measured H2D | agreement |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 4,096 | 31.72 | 31.53 | 39.5148 | 25.31 | 6.22 ms | 6.31 ms | 1.4% |
+| 16,384 | 19.69 | 50.79 | 36.2507 | 27.59 | 23.20 ms | 24.05 ms | 3.5% |
+| 32,768 | 13.03 | 76.75 | 32.7283 | 30.55 | 46.19 ms | 47.10 ms | 1.9% |
 
 The implied copy term, obtained by subtracting the device-resident arm, agrees
 with the independently measured blocking H2D to within 4% at every depth. The
 token is `copy + compute` in series with **no overlap at all**.
+
+> The device-resident column above is from `docs/repro/m4-device-resident.sh`
+> run against `build-clean`. An earlier pass on a differently configured tree
+> gave 39.0152 / 36.1072 / 32.5832, which is 0.4-1.3% lower and shifts the
+> implied copy by at most 0.33 ms; the agreement with the measured H2D was 6.6%
+> / 4.0% / 2.2% on those figures. Both sets support the same conclusion, and
+> the fresh ones are quoted because they came from the clean build this branch
+> is written against.
 
 ## 3. The overlap ceiling
 
