@@ -13,7 +13,7 @@ from what is written here, that is a bug in this document.
 | # | Defect | Status | Re-confirmed how |
 |---|---|---|---|
 | D1 | D320 routed to a missing vector kernel | **confirmed** | `docs/repro/d1-vector-d320.sh`, exit 134 |
-| D2 | Divergent `__syncthreads()` | **confirmed, localized** | `synccheck` on a `-lineinfo` build of `946c1e5b6`; 100/100 errors at one line |
+| D2 | Divergent `__syncthreads()` | **confirmed, localized** | `synccheck` on a `-lineinfo` build; 100/100 errors at one line — see the provenance note in D2 |
 | D3 | MTP + host KV aborts | **confirmed** | `docs/repro/d3-mtp-abort.sh`, 1 abort in 3 runs, twice independently |
 | D4 | `test-kvarn` on default builds | **confirmed** | `docs/repro/d4-test-kvarn.sh` |
 | D5 | KVarN host-resident workspace | **carried forward, not re-run** | needs a `GGML_CUDA_KVARN=ON` tree; script provided, numbers are from an earlier session |
@@ -129,6 +129,16 @@ Barrier error detected. Divergent thread(s) in block.
 
 Both fixup instantiations appear (`needs_fixup=1,is_fixup=0` and
 `needs_fixup=0,is_fixup=1`) and no other site does.
+
+> **Provenance.** This run was taken on a `-lineinfo` tree whose only difference
+> from `946c1e5b6` was the transport-telemetry patch
+> ([`probes/01`](probes/01-transport-telemetry.patch) and
+> [`02`](probes/02-transport-telemetry-d2h.patch)), which touches only
+> `ggml-cuda.cu` and not `fattn-mma-f16.cuh`, and is inert unless
+> `GGML_KV_TRANSPORT_STATS` is set. The kernel under test is therefore
+> bit-identical to a pristine build. A re-run on a fully pristine `-lineinfo`
+> tree is the one verification step this document does not yet carry; the source
+> lines, the blame and the reasoning below do not depend on it.
 
 ### The code
 
