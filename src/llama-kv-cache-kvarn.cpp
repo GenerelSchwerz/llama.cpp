@@ -1291,6 +1291,34 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         auto * buft = offload ?
                 ggml_backend_dev_buffer_type(dev) :
                 llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
+
+        // Host-resident KVarN records only work when the accelerator that owns
+        // the layer can read the host buffer directly. On a discrete GPU it
+        // cannot, so the scheduler places KVARN_STORE, KVARN_WHT and the
+        // attention math that consumes them on the CPU backend, and then has to
+        // reserve host workspace for every intermediate they produce. That
+        // reservation grows with context -- measured at roughly 0.099 MiB per
+        // context token on an RTX 4070, or 25.9 GiB at 262,144 tokens against
+        // 20 MiB for a standard quantized cache in the same configuration --
+        // and the attention itself runs on the CPU. Both are silent today.
+        //
+        // Fail closed rather than degrade: there is no fast configuration on
+        // this path, so the caller has to choose one that exists.
+        if (!offload) {
+            auto * layer_dev = model.dev_layer(il);
+            if (layer_dev &&
+                    ggml_backend_dev_type(layer_dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+                    buft && !ggml_backend_dev_supports_buft(layer_dev, buft)) {
+                throw std::runtime_error(format(
+                    "KVarN layer %u cannot be host-resident: %s cannot operate on %s, so KVarN "
+                    "store, materialize and attention would fall back to the CPU backend and "
+                    "reserve host workspace proportional to the context. Keep the KVarN cache "
+                    "device-resident (drop --no-kv-offload, or cover these layers with "
+                    "--kv-gpu-layers), or use a standard quantized cache type for host-resident KV",
+                    il, ggml_backend_dev_name(layer_dev), ggml_backend_buft_name(buft)));
+            }
+        }
+
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create KVarN cache tensor context");
