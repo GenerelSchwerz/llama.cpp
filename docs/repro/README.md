@@ -20,7 +20,10 @@ like defects and are not.
 | `d4-test-kvarn.sh` | D4, `test-kvarn` on a default build | run against real binaries, produced the recorded output |
 | `d5-kvarn-workspace.sh` | D5, KVarN host-resident workspace, needs `build-kvarn` | both arms run against real binaries |
 | `d6-softcap.sh` | D6, the softcap coverage gap | run against real binaries, produced the recorded output |
-| `d7-kvarn-build.sh` | D7, the KVarN build failure | the build failure and the patched build were both reproduced |
+| `d7-kvarn-build.sh` | D7, the historical KVarN build failure | the base failure and the patched build were both reproduced; PR #34 carries the repair |
+| `d8-q2-fa64.sh` | D8, `q2_0s` FlashAttention wrong output at `hsk=64` | run against real CUDA binaries at three seeds |
+| `d9-kvarn-device.sh` | D9, KVarN refused for a device-resident cache on a default build | run against real binaries; requires `LLAMA_KV_MODEL` |
+| `d10-agents-static.sh` | D10, `test-upstream-merge-keepers-static` failure | run against a clean build; no GPU or model |
 | `m1-cost-structure.sh` | The decode cost structure, needs patches 01+02 | argument handling verified against a stub; the recorded numbers were taken with an equivalent ad-hoc command, not this script |
 | `m2-store-ceiling.sh` | The store-side ceiling, needs patch 03 | as m1 |
 | `m3-overlap-ceiling.sh` | The copy/compute overlap ceiling, needs patch 04 | as m1 |

@@ -20,7 +20,7 @@ layer either cannot be merged or has to be maintained forever as a fork patch.
 | Layer | Owns | Items |
 |---|---|---|
 | **upstream llama.cpp** | `ggml`, the CUDA backend, FlashAttention kernels, the scheduler | R1 |
-| **BeeLlama** | KVarN in all its forms, its tests, its GGUF formats, vector-kernel routing | R2, R6, R7 |
+| **BeeLlama** | KVarN in all its forms, its tests, its GGUF formats, vector-kernel routing, the fork's own cache types | R2, R6, R7, R10, R11, R12 |
 | **this fork** | the KV-offload line: `--no-kv-offload`, `--kv-cpu-pinned`, `--kv-gpu-layers`, `offload_attn_compute`, `--recurrent-state-offload` | R3, R4, R5 |
 
 A usable test for "is this ours": BeeLlama v0.4.3 carries KVarN across 89 files
@@ -37,10 +37,13 @@ ours; touching KVarN internals is BeeLlama's.
 | **R3** | Interim guard for MTP + `-nkvo` | this fork | S-M | medium | — |
 | **R4** | Correct copy/compute overlap | this fork | **XL** | high | design decision |
 | **R5** | Re-measure the vector/MMA crossover | this fork | S | low | R1 |
-| **R6** | KVarN in the KV-offload line | BeeLlama + us | **XL** | high | R9, ownership decision |
-| **R7** | `test-kvarn` on default builds | BeeLlama | S | none | — |
+| **R6** | KVarN in the KV-offload line | BeeLlama + us | **XL** | high | R9 integration, ownership decision |
+| **R7** | `test-kvarn` on default builds | BeeLlama | — | — | **not planned**; default-build coverage would add unacceptable build time |
 | **R8** | Widen quantized × softcap test coverage | BeeLlama | S | none | — |
-| **R9** | Fix the `GGML_CUDA_KVARN=ON` build | BeeLlama | **S** | none | — |
+| **R9** | Fix the `GGML_CUDA_KVARN=ON` build | BeeLlama | **S** | none | **implemented in PR #34; pending merge and validation** |
+| **R10** | Fix `q2_0s` FlashAttention at `hsk=64` | BeeLlama | S-M | **medium** | — |
+| **R11** | Make KVarN reachable on a device-resident cache | BeeLlama | M | high | PR #34 merge and validation |
+| **R12** | Repair `test-upstream-merge-keepers-static` | BeeLlama | **S** | none | — |
 
 ---
 
@@ -59,19 +62,24 @@ Localized to `ggml/src/ggml-cuda/fattn-mma-f16.cuh:1732`, guarded by
 - MTP with a host-resident cache is **+17.7%** at `-c 8192` and **+75.9%** on a
   24,000-token prompt where it completes, and it aborts (defect
   [D3](kv-offload-defects.md#d3-mtp-with-a-host-resident-kv-cache-aborts-during-sustained-generation)).
+  D2 is a confirmed upstream defect in a kernel this workload uses, but it is
+  not yet proven to cause D3.
 - The vector/MMA crossover is **+11.59%** on decode at depth 32,768 (PR #4), and
   cannot be taken because lowering the threshold routes *more* work onto exactly
   the diverging shapes.
 
-**What to do.** File upstream with the reproduction, the `synccheck` output and
-the blame. The fix is theirs to choose; the obvious shapes are hoisting the
+**Status.** The upstream-only report is open as
+[ggml-org/llama.cpp#27678](https://github.com/ggml-org/llama.cpp/issues/27678).
+The fix is theirs to choose; the obvious shapes are hoisting the
 barrier so every warp reaches the same one, or replacing the block-wide barrier
 with a `cooperative_groups` partition over the participating warps. **Do not
 patch this quietly in the fork** -- the blast radius is every FA user, and a
 silent fork divergence in a barrier is the worst possible thing to maintain.
 
-**Acceptance.** `repro/d2-barrier.sh` reports zero barrier errors, and
-`repro/d3-mtp-abort.sh` completes 10 of 10 runs.
+**Acceptance.** After the upstream repair is merged and incorporated here,
+the upstream-only `synccheck` reproducer reports zero barrier errors. Re-run
+`repro/d3-mtp-abort.sh` separately as a downstream follow-up; its result cannot
+by itself establish or refute D2-to-D3 causation.
 
 ## R2. Fix D320 vector routing
 
@@ -225,16 +233,18 @@ are built, which is BeeLlama's area, driven by a requirement that exists only in
 our line. **This is a conversation, not a technical question**, and it should
 happen before anyone estimates the work.
 
-## R7. `test-kvarn` on default builds
+## R7. `test-kvarn` on default builds -- not planned
 
-**Owner: BeeLlama.** Size **S**. Blast radius none.
+**Disposition: not planned.** Making default-build validation cover this KVarN
+path would add unacceptable CUDA build time. D4 remains documented as a known
+default-build test limitation, but it is not a work item.
 
 Defect [D4](kv-offload-defects.md#d4-test-kvarn-aborts-on-any-default-build-with-a-cuda-device-present).
 The test exercises CUDA KVarN paths a default build does not compile, so
 `ctest -R "test-kvarn|test-adaptive-dm|test-server-loop-guard"` -- the command
 `CLAUDE.md` documents for KVarN changes -- cannot pass as written on a stock
-CUDA build. It should skip them when `GGML_CUDA_KVARN` is off, the way the four
-static KVarN tests already do.
+CUDA build. Do not extend the default build to make this path pass; run the
+focused KVarN suite only in an explicitly enabled KVarN build when needed.
 
 ## R8. Widen quantized × softcap test coverage
 
@@ -252,8 +262,9 @@ tell.
 
 ## R9. Fix the `GGML_CUDA_KVARN=ON` build
 
-**Owner: BeeLlama.** Size **S** -- two lines. Blast radius **none**: the
-configuration does not build today, so nothing can regress.
+**Owner: BeeLlama. Status: implemented in
+[PR #34](https://github.com/GenerelSchwerz/llama.cpp/pull/34), pending merge and
+validation on `beellama/dev`.** Size **S** -- two lines. Blast radius **none**.
 
 Defect [D7](kv-offload-defects.md#d7-ggml_cuda_kvarnon-does-not-compile).
 `flash_attn_ext_f16_process_tile` gained a parameter in `0a85856ee` and both
@@ -263,26 +274,93 @@ stale call sites to the same author.
 
 [`probes/06-kvarn-build-fix.patch`](probes/06-kvarn-build-fix.patch) applies
 cleanly and was **verified to produce a clean build** -- exit 0, zero errors.
-It is included as a reference; per the shape of this branch it should land as
-its own change rather than here.
+PR #34 carries that repair. Its merge plus a clean enabled-KVarN build on the
+merge result closes R9.
 
-**Do this first among the KVarN items.** It blocks D5's measurement and every
-other KVarN item: as the tree stands, nobody can build the configuration, which
-is also why D5 is the one defect in the register carried forward rather than
-re-measured.
+**Integration gate for the KVarN items.** Until PR #34 is merged and validated,
+D5 and the remaining KVarN work must retain their base-state qualification.
+
+## R10. Fix `q2_0s` FlashAttention at `hsk=64`
+
+**Owner: BeeLlama.** Size **S-M**. Blast radius **medium** -- one type at one
+head dimension, but the failure mode is silent.
+
+Defect [D8](kv-offload-defects.md#d8-q2_0s-flashattention-returns-wrong-values-at-head-dimension-64).
+`FLASH_ATTN_EXT` with `type_K=type_V=q2_0s` at `hsk=64, kv=256, nb=2` returns
+values uncorrelated with the CPU reference (`ERR` 1.70-2.11 against a 5e-4
+threshold) while every other pair at that shape, and `q2_0s` at every other
+covered shape, passes.
+
+`q2_0s` is the fork's own type -- upstream owns `GGML_TYPE_Q2_0`, and Bee's
+32-element variant is presented as `q2_0` on the command line while keeping a
+distinct internal name. So this is ours in the strict sense of the ownership
+test above.
+
+**First step is a bisection of the comparison, not a kernel fix**:
+`test-backend-ops` compares CUDA against the CPU backend, and a wrong `q2_0s`
+CPU reference at this shape reports identically. Dump both sides before
+touching a kernel.
+
+**Second step is coverage.** `nb=2` at `hsk=64` is generated once, for one pair.
+Whatever the cause turns out to be, the shape family around it is one case wide,
+which is the same gap R8 records for softcap.
+
+## R11. Make KVarN reachable on a device-resident cache
+
+**Owner: BeeLlama.** Size **M**. Blast radius **high**. **Blocked by PR #34's
+merge and validation.**
+
+Defect [D9](kv-offload-defects.md#d9-kvarn-is-refused-for-a-device-resident-cache-on-a-default-build).
+On a default build, `-ctk kvarn4 -ctv kvarn4 -ngl 99` fails context creation:
+the CUDA backend exports no `ggml_backend_kvarn_ops`, because `kvarn.cu` is
+filtered out of the build. On the documented base, the opt-in build that would
+export it also did not compile; PR #34 supplies that repair. The remaining
+policy question is therefore independent of the stale-call-site fix.
+
+The decision is a policy one, and it is BeeLlama's to make:
+
+- **Compile the KVarN store unconditionally** and keep `GGML_CUDA_KVARN` as the
+  fast-decode *pair matrix* switch, which is what `CLAUDE.md` and `AGENTS.md`
+  already describe; or
+- **Keep the current split** and make the refusal honest -- name
+  `GGML_CUDA_KVARN=ON` in the error text, and correct both documents, which
+  today promise descriptor-native MMA coverage that a default build does not
+  have.
+
+Either way the CPU-side asymmetry should go with it: `-nkvo` passes `nullptr`
+into the capability probe and is accepted unconditionally, which is exactly how
+D5's slow arm stays reachable while the fast one is not.
+
+## R12. Repair `test-upstream-merge-keepers-static`
+
+**Owner: BeeLlama.** Size **S**. Blast radius none.
+
+Defect [D10](kv-offload-defects.md#d10-test-upstream-merge-keepers-static-fails-on-a-clean-checkout).
+`AGENTS.md` was rewrapped in `775450a68` and the literal the test requires now
+straddles a line break, so a clean checkout of `beellama/dev` has a red test.
+Rewrapping the line fixes it in one edit; normalizing whitespace in `require()`
+fixes the class, at the cost of changing every other check in that file.
+
+Worth doing early for the same reason as R9: it is small, and a permanently red
+test costs more than it looks like it does.
+
 
 ---
 
 ## Order
 
 1. **R1** -- largest measured payoff, gates R3 and R5, and it is a defect fix
-   rather than a feature. Localization is done; the next step is an upstream
-   report.
-2. **R9** -- two lines, and until it lands the KVarN configuration cannot be
-   built at all, so nothing else in that area can be measured or verified.
-3. **R7, R8, R2** -- small, independent, and R2 unblocks the full test suite.
-4. **R4** -- largest engineering payoff. Settle the ring question first.
-5. **R6** -- settle ownership before estimating, and land R9 first.
+   rather than a feature. The upstream report is filed; wait for an upstream
+   repair, then incorporate and validate it here.
+2. **R9** -- PR #34 implements the two-line repair. Merge it, then validate a
+   clean enabled-KVarN build on `beellama/dev` before treating it as closed.
+3. **R12, R8, R2** -- small and independent. R12 is one edit and takes the
+   tree back to green; R2 unblocks the full test suite.
+4. **R10** -- the only silent-wrong-output defect on the register. Small, and it
+   does not wait on anything.
+5. **R4** -- largest engineering payoff. Settle the ring question first.
+6. **R6** -- settle ownership before estimating, and validate PR #34 then R11
+   first. R7 is deliberately not planned.
 
 R3 is optional and only worth writing if R1 will take a while.
 

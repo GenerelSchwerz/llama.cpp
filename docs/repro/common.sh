@@ -6,4 +6,8 @@ LOCK=/tmp/beellama-single-gpu.lock
 PIN="${LLAMA_KV_TASKSET:-0,2,4}"
 OUT="${LLAMA_KV_OUT:-$(pwd)/kv-offload-repro-out}"
 mkdir -p "$OUT"
-gpu() { flock "$LOCK" "$@"; }
+gpu() {
+  local command
+  printf -v command '%q ' "$@"
+  flock "$LOCK" -c "$command"
+}
