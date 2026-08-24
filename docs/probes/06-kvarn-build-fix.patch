@@ -1,0 +1,48 @@
+commit 183308e2bc919d629f320024bb30c30973a96fcd
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 16:14:03 2026 +0200
+
+    cuda: update the KVarN tile calls to the current process_tile signature
+    
+    Both KVarN call sites in fattn-mma-kvarn-case.cuh still passed the
+    argument list from before compact causal masking added
+    causal_prefix_first_bound_smem, so they supplied 26 arguments to a
+    27-parameter function and GGML_CUDA_KVARN=ON failed to compile here with
+    
+      error: no instance of function template
+      "flash_attn_ext_f16_process_tile" matches the argument list
+    
+    Both sites pass compact_causal_prefix = false, so the new parameter takes
+    nullptr: this path does not use a compact causal bound. There is one
+    definition of the function (fattn-mma-f16.cuh:1252) and the two remaining
+    callers in that file already pass the parameter, so this brings the KVarN
+    instances back in line with them rather than changing any behaviour.
+    
+    Only the KVarN instances are affected, and they are compiled only under
+    GGML_CUDA_KVARN=ON, which is off by default.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh b/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh
+index f8ee45627..07e7544c7 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-kvarn-case.cuh
+@@ -176,7 +176,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
+     constexpr bool needs_fixup = false;
+     constexpr bool is_fixup = true;
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+-        (Q_f2, K_h2, V_h2, mask_h, false, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
++        (Q_f2, K_h2, V_h2, mask_h, false, nullptr, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
+          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
+          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
+          jt, zt_gqa, 0, iter_k, (int) GGML_TYPE_COUNT); // V is a template argument here
+@@ -243,7 +243,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
+     constexpr bool needs_fixup = false;
+     constexpr bool is_fixup = false;
+     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+-        (Q_f2, K_h2, V_h2, mask_h, false, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
++        (Q_f2, K_h2, V_h2, mask_h, false, nullptr, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
+          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
+          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
+          jt, zt_gqa, 0, iter_k, (int) GGML_TYPE_COUNT); // V is a template argument here

@@ -37,9 +37,10 @@ ours; touching KVarN internals is BeeLlama's.
 | **R3** | Interim guard for MTP + `-nkvo` | this fork | S-M | medium | — |
 | **R4** | Correct copy/compute overlap | this fork | **XL** | high | design decision |
 | **R5** | Re-measure the vector/MMA crossover | this fork | S | low | R1 |
-| **R6** | KVarN in the KV-offload line | BeeLlama + us | **XL** | high | ownership decision |
+| **R6** | KVarN in the KV-offload line | BeeLlama + us | **XL** | high | R9, ownership decision |
 | **R7** | `test-kvarn` on default builds | BeeLlama | S | none | — |
 | **R8** | Widen quantized × softcap test coverage | BeeLlama | S | none | — |
+| **R9** | Fix the `GGML_CUDA_KVARN=ON` build | BeeLlama | **S** | none | — |
 
 ---
 
@@ -249,6 +250,27 @@ Widening it either reproduces the defect PR #4 recorded or retires the claim.
 Either outcome is worth more than the current state, which is that nobody can
 tell.
 
+## R9. Fix the `GGML_CUDA_KVARN=ON` build
+
+**Owner: BeeLlama.** Size **S** -- two lines. Blast radius **none**: the
+configuration does not build today, so nothing can regress.
+
+Defect [D7](kv-offload-defects.md#d7-ggml_cuda_kvarnon-does-not-compile).
+`flash_attn_ext_f16_process_tile` gained a parameter in `0a85856ee` and both
+KVarN call sites in `fattn-mma-kvarn-case.cuh` still pass the old argument list,
+giving 82 compile errors. `git blame` attributes the signature change and both
+stale call sites to the same author.
+
+[`probes/06-kvarn-build-fix.patch`](probes/06-kvarn-build-fix.patch) applies
+cleanly and was **verified to produce a clean build** -- exit 0, zero errors.
+It is included as a reference; per the shape of this branch it should land as
+its own change rather than here.
+
+**Do this first among the KVarN items.** It blocks D5's measurement and every
+other KVarN item: as the tree stands, nobody can build the configuration, which
+is also why D5 is the one defect in the register carried forward rather than
+re-measured.
+
 ---
 
 ## Order
@@ -256,9 +278,11 @@ tell.
 1. **R1** -- largest measured payoff, gates R3 and R5, and it is a defect fix
    rather than a feature. Localization is done; the next step is an upstream
    report.
-2. **R7, R8, R2** -- small, independent, and R2 unblocks the full test suite.
-3. **R4** -- largest engineering payoff. Settle the ring question first.
-4. **R6** -- settle ownership before estimating.
+2. **R9** -- two lines, and until it lands the KVarN configuration cannot be
+   built at all, so nothing else in that area can be measured or verified.
+3. **R7, R8, R2** -- small, independent, and R2 unblocks the full test suite.
+4. **R4** -- largest engineering payoff. Settle the ring question first.
+5. **R6** -- settle ownership before estimating, and land R9 first.
 
 R3 is optional and only worth writing if R1 will take a while.
 
