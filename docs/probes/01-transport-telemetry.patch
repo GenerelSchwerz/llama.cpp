@@ -1,0 +1,158 @@
+commit 7ae304da154936d98764e2ce83d15ef6ac912984
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 11:38:36 2026 +0200
+
+    cuda: add opt-in host-KV transport telemetry
+    
+    Counts and times the blocking host-to-device deliveries performed by
+    ggml_backend_cuda_buffer_set_tensor and the compute-stream drains
+    performed by ggml_backend_cuda_synchronize. Opt-in through
+    GGML_KV_TRANSPORT_STATS; no routing decision reads it and the counters
+    are not touched when it is unset.
+    
+    Measured on RTX 4070 / Qwen3.8-27B-UD-IQ2_M, q8_0 K/V, -nkvo 1
+    --kv-cpu-pinned, by differencing tg128 against tg64 at fixed depth so
+    prefill and cache population cancel:
+    
+      depth 4,096:  31.6 t/s, 31.6 ms/token
+                    6.31 ms/token blocking H2D, 151.8 MB/token (24.1 GB/s)
+                    24.89 ms/token backend sync, 108 syncs/token
+      depth 32,768: 12.98 t/s, 77.0 ms/token
+                    47.02 ms/token blocking H2D, 1.150 GB/token (24.5 GB/s)
+                    29.28 ms/token backend sync, 108 syncs/token
+    
+    The two terms account for 31.2 of 31.6 ms and 76.3 of 77.0 ms, so decode
+    with host-resident KV is entirely host-thread blocking and the transfer
+    is fully serialized against compute. Effective bandwidth is already at
+    the practical PCIe 4.0 x16 ceiling, so the headroom is in overlap and in
+    bytes moved, not in copy efficiency.
+    
+    Disabled-path no-op check, A/B/A at depth 4,096, r=5:
+      base 31.79 +/- 0.12, telemetry build 31.73 +/- 0.11, base 31.70 +/- 0.13.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7675d2b31..7a71658ed 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -76,6 +76,7 @@
+ #include <array>
+ #include <atomic>
+ #include <charconv>
++#include <chrono>
+ #include <cinttypes>
+ #include <condition_variable>
+ #include <cstddef>
+@@ -984,6 +985,72 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++// Host-KV transport telemetry. Opt-in through GGML_KV_TRANSPORT_STATS=1 and
++// never consulted by any routing decision. It exists to attribute decode time
++// between the blocking host-to-device delivery of host-resident KV and the
++// compute-stream drains that the scheduler performs around it.
++struct ggml_cuda_transport_stats {
++    std::atomic<uint64_t> h2d_calls{0};
++    std::atomic<uint64_t> h2d_bytes{0};
++    std::atomic<uint64_t> h2d_ns{0};
++    std::atomic<uint64_t> h2d_async_calls{0};
++    std::atomic<uint64_t> h2d_async_bytes{0};
++    std::atomic<uint64_t> sync_calls{0};
++    std::atomic<uint64_t> sync_ns{0};
++};
++
++static ggml_cuda_transport_stats g_cuda_transport_stats;
++
++static bool ggml_cuda_transport_stats_enabled() {
++    static const bool enabled = getenv("GGML_KV_TRANSPORT_STATS") != nullptr;
++    return enabled;
++}
++
++static uint64_t ggml_cuda_transport_now_ns() {
++    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
++void ggml_cuda_transport_stats_reset() {
++    g_cuda_transport_stats.h2d_calls.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.h2d_bytes.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.h2d_ns.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.h2d_async_calls.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.h2d_async_bytes.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.sync_calls.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.sync_ns.store(0, std::memory_order_relaxed);
++}
++
++static void ggml_cuda_transport_stats_report(const char * tag) {
++    const uint64_t h2d_calls = g_cuda_transport_stats.h2d_calls.load(std::memory_order_relaxed);
++    const uint64_t h2d_bytes = g_cuda_transport_stats.h2d_bytes.load(std::memory_order_relaxed);
++    const uint64_t h2d_ns    = g_cuda_transport_stats.h2d_ns.load(std::memory_order_relaxed);
++    const uint64_t async_calls = g_cuda_transport_stats.h2d_async_calls.load(std::memory_order_relaxed);
++    const uint64_t async_bytes = g_cuda_transport_stats.h2d_async_bytes.load(std::memory_order_relaxed);
++    const uint64_t sync_calls  = g_cuda_transport_stats.sync_calls.load(std::memory_order_relaxed);
++    const uint64_t sync_ns     = g_cuda_transport_stats.sync_ns.load(std::memory_order_relaxed);
++
++    fprintf(stderr,
++            "KV-TRANSPORT %s: blocking_h2d_calls=%llu blocking_h2d_bytes=%llu blocking_h2d_ms=%.3f "
++            "async_h2d_calls=%llu async_h2d_bytes=%llu backend_sync_calls=%llu backend_sync_ms=%.3f\n",
++            tag,
++            (unsigned long long) h2d_calls, (unsigned long long) h2d_bytes, h2d_ns/1e6,
++            (unsigned long long) async_calls, (unsigned long long) async_bytes,
++            (unsigned long long) sync_calls, sync_ns/1e6);
++    fflush(stderr);
++}
++
++namespace {
++struct ggml_cuda_transport_stats_at_exit {
++    ~ggml_cuda_transport_stats_at_exit() {
++        if (ggml_cuda_transport_stats_enabled()) {
++            ggml_cuda_transport_stats_report("total");
++        }
++    }
++};
++static ggml_cuda_transport_stats_at_exit g_cuda_transport_stats_at_exit;
++} // namespace
++
+ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
+@@ -995,9 +1062,19 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
+ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    const bool stats = ggml_cuda_transport_stats_enabled();
++    const uint64_t t0 = stats ? ggml_cuda_transport_now_ns() : 0;
++
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++
++    if (stats) {
++        g_cuda_transport_stats.h2d_calls.fetch_add(1, std::memory_order_relaxed);
++        g_cuda_transport_stats.h2d_bytes.fetch_add(size, std::memory_order_relaxed);
++        g_cuda_transport_stats.h2d_ns.fetch_add(
++                ggml_cuda_transport_now_ns() - t0, std::memory_order_relaxed);
++    }
+ }
+ 
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -2749,8 +2826,17 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+ 
++    const bool stats = ggml_cuda_transport_stats_enabled();
++    const uint64_t t0 = stats ? ggml_cuda_transport_now_ns() : 0;
++
+     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+ 
++    if (stats) {
++        g_cuda_transport_stats.sync_calls.fetch_add(1, std::memory_order_relaxed);
++        g_cuda_transport_stats.sync_ns.fetch_add(
++                ggml_cuda_transport_now_ns() - t0, std::memory_order_relaxed);
++    }
++
+     GGML_UNUSED(backend);
+ }
+ 

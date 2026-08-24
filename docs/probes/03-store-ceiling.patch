@@ -1,0 +1,76 @@
+commit e22b7721a72da9b3724fd52c5313823225acc0c1
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 21:24:20 2026 +0200
+
+    kv-cache: bound the payoff of removing the host KV store
+    
+    N5 -- writing new KV rows into pinned host memory directly from CUDA -- was
+    the structural candidate this lane kept deferring to, and Experiment 026
+    closed by naming it as the prerequisite for retrying overlap. Building it
+    means two ggml buffers over one allocation plus a fork-local predicate at the
+    scheduler's split-input sites, because placement consults supports_buft and
+    supports_op jointly while copy elision consults supports_buft alone. Before
+    paying for that, measure what it buys.
+    
+    GGML_KV_STORE_CEILING retargets the store at a scratch device tensor of the
+    body's shape. The graph keeps its shape and its indices stay valid, but the
+    store now runs entirely on CUDA: no device-to-host stage copy, no CPU
+    set_rows, and the per-layer splits collapse. Attention still reads the host
+    body host-to-device. Output is incorrect; this is an upper bound on N5 and
+    nothing else, since a real N5 would additionally pay for a kernel writing
+    across PCIe rather than into device memory.
+    
+    A/B/A/B, llama-bench -n 128:
+    
+      depth  4,096, r=5: store 31.7528/31.7305, removed 31.7514/31.7460  (+0.02%)
+      depth 32,768, r=3: store 13.0294/13.0275, removed 13.0524/13.0518  (+0.18%)
+    
+    Removing the entire store side -- 32 blocking device-to-host copies, 32 CPU
+    set_rows nodes, and 32 of the 33 scheduler splits per token -- is worth 0.18%
+    at the depth where it is largest, and nothing at 4,096.
+    
+    This rejects N5, and N3 with it: splitting the per-token copy into a stable
+    prefix and one new row exists to remove the write-then-read dependency the
+    store creates, and removing that dependency completely does not make the token
+    faster. It also falsifies this lane's recorded attribution that the store side
+    is the serializer. The drains are free because the token is already bound on
+    the host-to-device read of the body and the GPU has no independent work to do
+    during the store windows.
+    
+    Reverted with the other measurement-only changes once dispositioned.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 4b8a2bbc1..12ea0d4c9 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -3180,6 +3180,15 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
+         k = ggml_reshape_2d(ctx, k, n_embd_gqa, kv_size*n_stream);
+     }
+ 
++    // N5 ceiling probe: keep the graph shape but retarget the store at a scratch
++    // device tensor, so the store runs entirely on CUDA with no device-to-host copy
++    // and no CPU node, while the body is still read host-to-device by attention.
++    // Output is incorrect; this only bounds the payoff of removing the host store.
++    if (getenv("GGML_KV_STORE_CEILING")) {
++        ggml_tensor * scratch = ggml_new_tensor_2d(ctx, k->type, k->ne[0], k->ne[1]);
++        return ggml_set_rows(ctx, scratch, k_cur, k_idxs);
++    }
++
+     // store the current K values into the cache
+     return ggml_set_rows(ctx, k, k_cur, k_idxs);
+ }
+@@ -3221,6 +3230,11 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
+             v = ggml_reshape_2d(ctx, v, n_embd_gqa, kv_size*n_stream);
+         }
+ 
++        if (getenv("GGML_KV_STORE_CEILING")) {
++            ggml_tensor * scratch = ggml_new_tensor_2d(ctx, v->type, v->ne[0], v->ne[1]);
++            return ggml_set_rows(ctx, scratch, v_cur, v_idxs);
++        }
++
+         return ggml_set_rows(ctx, v, v_cur, v_idxs);
+     }
+ 

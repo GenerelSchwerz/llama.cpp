@@ -1,0 +1,188 @@
+commit 7ed7f7f02f471cc5d261d9e6a15d26faa1258502
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 21:03:52 2026 +0200
+
+    cuda: measure the pinned host KV allocation properties
+    
+    N8 from the decode survey: the pinned KV body is one large cudaMallocHost,
+    and the survey asked whether the allocation's own properties -- write
+    combining, huge-page backing, NUMA affinity -- are worth anything on the
+    transport side.
+    
+    Three opt-in, mutually exclusive modes, all no-ops unless the environment
+    variable is set:
+    
+      GGML_CUDA_PINNED_WC      cudaHostAlloc with cudaHostAllocWriteCombined.
+                               The steady-state pattern is host-write /
+                               device-read, which is what write combining is
+                               for; host reads of the body (state
+                               serialization, prompt cache, rollback) become
+                               uncached.
+      GGML_CUDA_PINNED_HUGE    2 MiB-aligned posix_memalign + MADV_HUGEPAGE +
+                               cudaHostRegister.
+      GGML_CUDA_PINNED_NOHUGE  the same path with MADV_NOHUGEPAGE. This is what
+                               makes the huge-page question answerable on a host
+                               whose THP policy is already "always": HUGE
+                               against NOHUGE isolates the page size from the
+                               allocation path.
+    
+    Registered allocations are tracked so the free path can unregister them
+    instead of calling cudaFreeHost.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index edf0540dc..c41d08975 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2,6 +2,11 @@
+ #include "ggml-impl.h"
+ #include "ggml-backend-impl.h"
+ 
++#ifdef __linux__
++#include <sys/mman.h>
++#include <errno.h>
++#endif
++
+ #include "ggml-cuda/allreduce.cuh"
+ #include "ggml-cuda/common.cuh"
+ #include "ggml-cuda/acc.cuh"
+@@ -87,9 +92,11 @@
+ #include <map>
+ #include <memory>
+ #include <mutex>
++#include <unordered_set>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ #include <string>
+ #include <vector>
+ 
+@@ -1596,17 +1603,123 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
+     return buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+ }
+ 
++// Pinned host allocation properties, for measuring the transport-side value of the
++// allocation itself with a host-resident KV cache. Opt-in and mutually exclusive;
++// with none of them set this is upstream cudaMallocHost verbatim.
++//
++//   GGML_CUDA_PINNED_WC     write-combined: uncached on the CPU side, so host writes
++//                           stream out through the write-combine buffers and device
++//                           reads over PCIe do not snoop. Correct only because the
++//                           steady-state pattern is host-write / device-read; any
++//                           host *read* of the body (state serialization, prompt
++//                           cache, rollback, defrag) becomes uncached and very slow.
++//   GGML_CUDA_PINNED_HUGE   explicitly ask for transparent huge pages.
++//   GGML_CUDA_PINNED_NOHUGE explicitly refuse them, which is what makes the huge-page
++//                           question measurable on a host whose THP policy is already
++//                           "always": the delta against the default arm is what the
++//                           2 MiB backing is worth.
++enum ggml_cuda_host_alloc_kind {
++    GGML_CUDA_HOST_ALLOC_DEFAULT = 0,
++    GGML_CUDA_HOST_ALLOC_WC,
++    GGML_CUDA_HOST_ALLOC_HUGE,
++    GGML_CUDA_HOST_ALLOC_NOHUGE,
++};
++
++static ggml_cuda_host_alloc_kind ggml_cuda_host_alloc_mode() {
++    static const ggml_cuda_host_alloc_kind kind = []() {
++        if (getenv("GGML_CUDA_PINNED_WC")     != nullptr) return GGML_CUDA_HOST_ALLOC_WC;
++        if (getenv("GGML_CUDA_PINNED_HUGE")   != nullptr) return GGML_CUDA_HOST_ALLOC_HUGE;
++        if (getenv("GGML_CUDA_PINNED_NOHUGE") != nullptr) return GGML_CUDA_HOST_ALLOC_NOHUGE;
++        return GGML_CUDA_HOST_ALLOC_DEFAULT;
++    }();
++    return kind;
++}
++
++// Allocations that were registered rather than allocated by CUDA, and therefore need
++// cudaHostUnregister + free instead of cudaFreeHost.
++static std::mutex                ggml_cuda_host_registered_mutex;
++static std::unordered_set<void *> ggml_cuda_host_registered;
++
+ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+-    CUDA_CHECK(cudaFreeHost(buffer->context));
++    void * ptr = buffer->context;
++
++    bool registered = false;
++    {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_registered_mutex);
++        registered = ggml_cuda_host_registered.erase(ptr) > 0;
++    }
++
++    if (registered) {
++        CUDA_CHECK(cudaHostUnregister(ptr));
++        free(ptr);
++        return;
++    }
++
++    CUDA_CHECK(cudaFreeHost(ptr));
+ }
+ 
++#ifdef __linux__
++// Page-aligned allocation with an explicit transparent-huge-page advice, pinned
++// afterwards with cudaHostRegister. Returns nullptr on any failure so the caller can
++// fall back to the plain path.
++static void * ggml_cuda_host_malloc_advised(size_t size, int advice) {
++    const size_t huge = 2ull * 1024 * 1024;
++    const size_t padded = (size + huge - 1) / huge * huge;
++
++    void * ptr = nullptr;
++    if (posix_memalign(&ptr, huge, padded) != 0 || ptr == nullptr) {
++        return nullptr;
++    }
++
++    if (madvise(ptr, padded, advice) != 0) {
++        GGML_LOG_DEBUG("%s: madvise(%d) failed: %s\n", __func__, advice, strerror(errno));
++        free(ptr);
++        return nullptr;
++    }
++
++    // Fault the pages in before registering so the advice is applied at fault time.
++    memset(ptr, 0, padded);
++
++    cudaError_t err = cudaHostRegister(ptr, padded, cudaHostRegisterPortable);
++    if (err != cudaSuccess) {
++        (void)cudaGetLastError();
++        GGML_LOG_DEBUG("%s: cudaHostRegister of %.2f MiB failed: %s\n", __func__,
++                       padded / 1024.0 / 1024.0, cudaGetErrorString(err));
++        free(ptr);
++        return nullptr;
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(ggml_cuda_host_registered_mutex);
++        ggml_cuda_host_registered.insert(ptr);
++    }
++
++    return ptr;
++}
++#endif // __linux__
++
+ static void * ggml_cuda_host_malloc(size_t size) {
+     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+         return nullptr;
+     }
+ 
++    const ggml_cuda_host_alloc_kind kind = ggml_cuda_host_alloc_mode();
++
++#ifdef __linux__
++    if (kind == GGML_CUDA_HOST_ALLOC_HUGE || kind == GGML_CUDA_HOST_ALLOC_NOHUGE) {
++        void * ptr = ggml_cuda_host_malloc_advised(
++            size, kind == GGML_CUDA_HOST_ALLOC_HUGE ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
++        if (ptr != nullptr) {
++            return ptr;
++        }
++        // fall through to the plain pinned path
++    }
++#endif // __linux__
++
+     void * ptr = nullptr;
+-    cudaError_t err = cudaMallocHost((void **) &ptr, size);
++    cudaError_t err = kind == GGML_CUDA_HOST_ALLOC_WC
++        ? cudaHostAlloc((void **) &ptr, size, cudaHostAllocWriteCombined)
++        : cudaMallocHost((void **) &ptr, size);
+     if (err != cudaSuccess) {
+         // clear the error
+         (void)cudaGetLastError();

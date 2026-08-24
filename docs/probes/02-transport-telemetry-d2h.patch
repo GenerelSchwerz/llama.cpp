@@ -1,0 +1,111 @@
+commit 40621f7e1269a1b8f0e3840f489b25fd5de3ab6d
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 13:12:37 2026 +0200
+
+    cuda: extend transport telemetry with D2H and CUDA-split counts
+    
+    The host-to-device counters alone did not explain why decode with
+    host-resident KV cannot overlap. Counting device-to-host copies and
+    CUDA graph_compute invocations does: at depth 32,768 a decode token
+    carries 33 CUDA splits and 32 device-to-host copies totalling 2.2 MB.
+    The bytes are negligible; each copy is what matters, because the
+    scheduler has no async path for a CUDA source into a CPU destination and
+    drains the GPU on every one of them.
+    
+    That is the store side of the cache -- new rows are quantized on the
+    accelerator, pulled back, and written into the host body by a CPU
+    set_rows -- and it is what caps read-side overlap at zero.
+    
+    Still opt-in through GGML_KV_TRANSPORT_STATS and still untouched when
+    unset.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7a71658ed..edf0540dc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -993,8 +993,10 @@ struct ggml_cuda_transport_stats {
+     std::atomic<uint64_t> h2d_calls{0};
+     std::atomic<uint64_t> h2d_bytes{0};
+     std::atomic<uint64_t> h2d_ns{0};
+-    std::atomic<uint64_t> h2d_async_calls{0};
+-    std::atomic<uint64_t> h2d_async_bytes{0};
++    std::atomic<uint64_t> d2h_calls{0};
++    std::atomic<uint64_t> d2h_bytes{0};
++    std::atomic<uint64_t> d2h_ns{0};
++    std::atomic<uint64_t> split_calls{0};
+     std::atomic<uint64_t> sync_calls{0};
+     std::atomic<uint64_t> sync_ns{0};
+ };
+@@ -1015,8 +1017,10 @@ void ggml_cuda_transport_stats_reset() {
+     g_cuda_transport_stats.h2d_calls.store(0, std::memory_order_relaxed);
+     g_cuda_transport_stats.h2d_bytes.store(0, std::memory_order_relaxed);
+     g_cuda_transport_stats.h2d_ns.store(0, std::memory_order_relaxed);
+-    g_cuda_transport_stats.h2d_async_calls.store(0, std::memory_order_relaxed);
+-    g_cuda_transport_stats.h2d_async_bytes.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.d2h_calls.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.d2h_bytes.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.d2h_ns.store(0, std::memory_order_relaxed);
++    g_cuda_transport_stats.split_calls.store(0, std::memory_order_relaxed);
+     g_cuda_transport_stats.sync_calls.store(0, std::memory_order_relaxed);
+     g_cuda_transport_stats.sync_ns.store(0, std::memory_order_relaxed);
+ }
+@@ -1025,17 +1029,21 @@ static void ggml_cuda_transport_stats_report(const char * tag) {
+     const uint64_t h2d_calls = g_cuda_transport_stats.h2d_calls.load(std::memory_order_relaxed);
+     const uint64_t h2d_bytes = g_cuda_transport_stats.h2d_bytes.load(std::memory_order_relaxed);
+     const uint64_t h2d_ns    = g_cuda_transport_stats.h2d_ns.load(std::memory_order_relaxed);
+-    const uint64_t async_calls = g_cuda_transport_stats.h2d_async_calls.load(std::memory_order_relaxed);
+-    const uint64_t async_bytes = g_cuda_transport_stats.h2d_async_bytes.load(std::memory_order_relaxed);
++    const uint64_t d2h_calls   = g_cuda_transport_stats.d2h_calls.load(std::memory_order_relaxed);
++    const uint64_t d2h_bytes   = g_cuda_transport_stats.d2h_bytes.load(std::memory_order_relaxed);
++    const uint64_t d2h_ns      = g_cuda_transport_stats.d2h_ns.load(std::memory_order_relaxed);
++    const uint64_t splits      = g_cuda_transport_stats.split_calls.load(std::memory_order_relaxed);
+     const uint64_t sync_calls  = g_cuda_transport_stats.sync_calls.load(std::memory_order_relaxed);
+     const uint64_t sync_ns     = g_cuda_transport_stats.sync_ns.load(std::memory_order_relaxed);
+ 
+     fprintf(stderr,
+             "KV-TRANSPORT %s: blocking_h2d_calls=%llu blocking_h2d_bytes=%llu blocking_h2d_ms=%.3f "
+-            "async_h2d_calls=%llu async_h2d_bytes=%llu backend_sync_calls=%llu backend_sync_ms=%.3f\n",
++            "d2h_calls=%llu d2h_bytes=%llu d2h_ms=%.3f cuda_splits=%llu "
++            "backend_sync_calls=%llu backend_sync_ms=%.3f\n",
+             tag,
+             (unsigned long long) h2d_calls, (unsigned long long) h2d_bytes, h2d_ns/1e6,
+-            (unsigned long long) async_calls, (unsigned long long) async_bytes,
++            (unsigned long long) d2h_calls, (unsigned long long) d2h_bytes, d2h_ns/1e6,
++            (unsigned long long) splits,
+             (unsigned long long) sync_calls, sync_ns/1e6);
+     fflush(stderr);
+ }
+@@ -1080,9 +1088,19 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
+ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+ 
++    const bool d2h_stats = ggml_cuda_transport_stats_enabled();
++    const uint64_t d2h_t0 = d2h_stats ? ggml_cuda_transport_now_ns() : 0;
++
+     ggml_cuda_set_device(ctx->device);
+     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
++
++    if (d2h_stats) {
++        g_cuda_transport_stats.d2h_calls.fetch_add(1, std::memory_order_relaxed);
++        g_cuda_transport_stats.d2h_bytes.fetch_add(size, std::memory_order_relaxed);
++        g_cuda_transport_stats.d2h_ns.fetch_add(
++                ggml_cuda_transport_now_ns() - d2h_t0, std::memory_order_relaxed);
++    }
+ }
+ 
+ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
+@@ -4575,6 +4593,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    if (ggml_cuda_transport_stats_enabled()) {
++        g_cuda_transport_stats.split_calls.fetch_add(1, std::memory_order_relaxed);
++    }
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;

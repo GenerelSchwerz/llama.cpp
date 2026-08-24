@@ -1,0 +1,120 @@
+commit ffe2999baf036cc9447f0710f1dbed5e9db90fe3
+Author: piggidragon <piggidragon.dev@proton.me>
+Date:   Mon Aug 24 21:26:13 2026 +0200
+
+    cuda: measure the achievable copy/compute overlap for host KV
+    
+    With the store side eliminated as a suspect, the decode token is copy plus
+    compute in series and the only lever left is running them concurrently. The
+    ceiling is max(copy, compute) instead of copy + compute. Both terms are
+    measurable: the device-resident arm gives compute, and the difference against
+    the host-resident arm gives copy.
+    
+      depth   host KV  ms/tok   device KV  ms/tok   copy     perfect overlap
+      4,096   31.72    31.52    39.0152    25.63    5.89 ms  39.02 t/s (+23.0%)
+      16,384  19.69    50.78    36.1072    27.70    23.08 ms 36.11 t/s (+83.4%)
+      32,768  13.03    76.77    32.5832    30.69    46.08 ms 21.71 t/s (+66.6%)
+    
+    The implied copy at 32,768 is 46.08 ms against 47.02 ms of blocking
+    host-to-device from the telemetry, so the no-overlap model holds to within 2%.
+    
+    GGML_KV_OVERLAP_PROBE issues the pinned-host delivery on a dedicated
+    non-blocking copy stream and returns true without recording an event the
+    compute stream ever waits on. Same bytes, same order; the attention kernels
+    simply do not wait and read what the destination held from the previous token.
+    Output is incorrect by construction. The arm measures exactly one thing: how
+    much of the copy the copy engine retires underneath the kernels.
+    
+    A/B/A/B:
+    
+      depth  4,096, r=5: 31.7287/31.7165 -> 38.4860/38.5025  (+21.3%, 98.6% of device)
+      depth 16,384, r=3: 19.7025/19.6820 -> 34.8800/34.8439  (+77.0%, 96.5% of device)
+      depth 32,768, r=3: 13.0142         -> 20.8258          (+60.0%, 95.9% of ceiling)
+    
+    The copy engine on this device overlaps host-to-device transfer with kernel
+    execution almost perfectly. With the ordering gone, host-resident decode
+    reaches 96-99% of its own predicted ceiling at every depth. The entire host-KV
+    decode penalty is the ordering, not the bandwidth -- transfers already run at
+    the practical PCIe 4.0 x16 rate.
+    
+    This also corrects Experiment 026, which rejected prefetching partly because
+    "the host blocks for essentially the whole token, so there is no window to
+    prefetch into." The ceiling probe shows removing the host blocking is worth
+    0.18%, and this probe shows the window hides 96-99% of the copy. That +1.38%
+    was an implementation that did not collect the overlap available to it.
+    
+    The probe is not a candidate implementation and cannot become one by adding a
+    wait: a correct version issues split k+1's delivery while split k's kernels
+    run, which needs staging buffers ggml-alloc cannot recycle underneath an
+    in-flight copy. Reverted with the other measurement-only changes.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01E8bBMKTLSzVbDBSUfdQc9N
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index c41d08975..5a7d6ccc9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1763,9 +1763,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
+     return &ggml_backend_cuda_buffer_type_host;
+ }
+ 
+-//static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
+-//    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
+-//}
++static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
++    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
++}
+ 
+ /// kernels
+ 
+@@ -2895,10 +2895,49 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
++// N7 feasibility probe. Issues the pinned-host KV delivery on a dedicated copy
++// stream and deliberately does NOT order the compute stream behind it, so the
++// attention kernels read whatever is in the destination from the previous token.
++// Output is incorrect by construction. The only thing this measures is how much
++// of the host-to-device copy this hardware can actually hide behind compute,
++// which is the ceiling on any chunked or pipelined staging scheme.
++static bool ggml_cuda_overlap_probe_enabled() {
++    static const bool enabled = getenv("GGML_KV_OVERLAP_PROBE") != nullptr;
++    return enabled;
++}
++
++static cudaStream_t ggml_cuda_overlap_probe_stream(int device) {
++    static std::mutex mutex;
++    static std::map<int, cudaStream_t> streams;
++    std::lock_guard<std::mutex> lock(mutex);
++    auto it = streams.find(device);
++    if (it != streams.end()) {
++        return it->second;
++    }
++    cudaStream_t stream = nullptr;
++    ggml_cuda_set_device(device);
++    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
++    streams[device] = stream;
++    return stream;
++}
++
+ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+ 
++    if (ggml_cuda_overlap_probe_enabled() &&
++            ggml_backend_is_cuda(backend_dst) && ggml_backend_buffer_is_cuda(buf_dst) &&
++            !ggml_backend_is_cuda(backend_src) && ggml_backend_buffer_is_cuda_host(buf_src)) {
++        ggml_backend_cuda_context * cuda_ctx_dst = (ggml_backend_cuda_context *) backend_dst->context;
++        ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
++        if (cuda_ctx_dst->device == buf_ctx_dst->device) {
++            ggml_cuda_set_device(cuda_ctx_dst->device);
++            CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst),
++                    cudaMemcpyHostToDevice, ggml_cuda_overlap_probe_stream(cuda_ctx_dst->device)));
++            return true;
++        }
++    }
++
+     if (!ggml_backend_is_cuda(backend_src) || !ggml_backend_is_cuda(backend_dst)) {
+         return false;
+     }
