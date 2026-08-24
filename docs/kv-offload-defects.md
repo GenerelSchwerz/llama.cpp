@@ -16,7 +16,7 @@ from what is written here, that is a bug in this document.
 | D2 | Divergent `__syncthreads()` | **confirmed, localized** | `docs/repro/d2-barrier.sh` on a pristine `-lineinfo` build; 100/100 errors at one line |
 | D3 | MTP + host KV aborts | **confirmed** | `docs/repro/d3-mtp-abort.sh`, 1 abort in 3 runs, twice independently |
 | D4 | `test-kvarn` on default builds | **confirmed** | `docs/repro/d4-test-kvarn.sh` |
-| D5 | KVarN host-resident workspace | **partly re-confirmed** | the `kvarn5` arm re-measured on a fresh build once D7 was patched: 2,195.90 MiB, matching the carried-forward figure exactly; the scaling table is still from an earlier session |
+| D5 | KVarN host-resident workspace | **confirmed**, both arms | re-measured on a fresh build once D7 was patched: 2,195.90 MiB vs 20.28 MiB, matching the carried-forward figures exactly; only the context-scaling table is from an earlier session |
 | D6 | Quantized × `logit_softcap` | **not reproduced** | `docs/repro/d6-softcap.sh`; coverage is one case wide |
 | D7 | `GGML_CUDA_KVARN=ON` does not compile | **confirmed**, and the fix verified | `docs/repro/d7-kvarn-build.sh`; 82 errors, and a clean build with the two-line patch |
 
@@ -282,7 +282,7 @@ default CUDA build.
 
 ## D5. KVarN and host-resident KV: silent CPU fallback with unbounded workspace
 
-**Status: the headline figure re-confirmed on a fresh build; the scaling table
+**Status: CONFIRMED on a fresh build, both arms; the context-scaling table is
 carried forward.** **Owner: BeeLlama and this fork jointly -- unresolved.**
 Severity: not a crash; a configuration that is silently many times more
 expensive than the alternative.
@@ -292,14 +292,19 @@ expensive than the alternative.
 not compile on this base. With the two-line D7 patch applied and a fresh build,
 `kvarn5` at `-c 8192` host-resident reserves:
 
-```
-CUDA0      compute buffer size =   122.01 MiB
-CUDA_Host  compute buffer size = 2195.90 MiB
-```
+| Cache, `-c 8192` host-resident | CUDA0 compute buffer | **CUDA_Host compute buffer** |
+|---|---:|---:|
+| `kvarn5` | 122.01 MiB | **2,195.90 MiB** |
+| `q8_0` | 142.27 MiB | **20.28 MiB** |
 
-which reproduces the carried-forward figure exactly. The context-scaling table
-below and the per-node breakdown are from an earlier session and are labelled as
-such.
+Both arms reproduce the carried-forward figures exactly: **108x more host
+workspace** for the cache that is supposed to be the smaller one. The
+context-scaling table below and the per-node breakdown are from an earlier
+session and are labelled as such.
+
+Note the device side moves the other way -- `kvarn5` reserves *less* on the GPU
+(122.01 against 142.27 MiB) -- which is the tell that the work moved to the host
+rather than being avoided.
 
 ### Reproduce
 
@@ -324,6 +329,8 @@ Compare the reported host compute buffer against the same command with
 integrated GPU. On a discrete one it refuses, so every node touching the
 host-resident KVarN records is placed on the CPU backend and host workspace is
 reserved for their intermediates.
+
+Per-node breakdown, from an earlier session with `GGML_SCHED_DEBUG=2`:
 
 | Cache | CPU-assigned nodes | host compute buffer |
 |---|---|---:|
