@@ -326,6 +326,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_rs::llm_graph_input_rs(const llama_memory_recurrent_context * mctx) :
+        mctx(mctx),
+        snapshot_mode(mctx->get_snapshot_mode()) {
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -356,6 +361,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= snapshot_mode == mctx->get_snapshot_mode();
 
     return res;
 }
@@ -1129,6 +1135,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }
@@ -1172,6 +1179,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }
@@ -1260,6 +1268,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }

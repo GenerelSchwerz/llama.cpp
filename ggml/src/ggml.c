@@ -6291,6 +6291,139 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
+static bool ggml_add_size_checked(size_t a, size_t b, size_t * result) {
+    if (a > SIZE_MAX - b) {
+        return false;
+    }
+    *result = a + b;
+    return true;
+}
+
+static bool ggml_mul_size_checked(size_t a, size_t b, size_t * result) {
+    if (b != 0 && a > SIZE_MAX / b) {
+        return false;
+    }
+    *result = a * b;
+    return true;
+}
+
+static bool ggml_f32_tensor_layout_valid(const struct ggml_tensor * tensor, bool contiguous) {
+    if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    size_t row_size = sizeof(float);
+    size_t span     = sizeof(float);
+    size_t stride   = sizeof(float);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] <= 0 || (uint64_t) tensor->ne[i] > SIZE_MAX) {
+            return false;
+        }
+
+        if (contiguous) {
+            if (tensor->nb[i] != stride || !ggml_mul_size_checked(stride, (size_t) tensor->ne[i], &stride)) {
+                return false;
+            }
+        } else if (i == 0) {
+            if (tensor->nb[0] != sizeof(float) ||
+                !ggml_mul_size_checked(sizeof(float), (size_t) tensor->ne[0], &row_size)) {
+                return false;
+            }
+        } else {
+            if (tensor->nb[i] % sizeof(float) != 0 || (tensor->ne[i] > 1 && tensor->nb[i] < row_size)) {
+                return false;
+            }
+            if (tensor->ne[i] > 1) {
+                size_t dim_span;
+                if (!ggml_mul_size_checked(tensor->nb[i], (size_t) tensor->ne[i] - 1, &dim_span) ||
+                    !ggml_add_size_checked(span, dim_span, &span)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return contiguous || ggml_add_size_checked(span, row_size - sizeof(float), &span);
+}
+
+bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
+    if (tensor == NULL || tensor->op != GGML_OP_GATED_DELTA_NET) {
+        return false;
+    }
+    for (int i = 0; i < 7; ++i) {
+        const struct ggml_tensor * operand = i < 6 ? tensor->src[i] : tensor;
+        if (!ggml_f32_tensor_layout_valid(operand, i >= 3)) {
+            return false;
+        }
+    }
+
+    const struct ggml_tensor * q     = tensor->src[0];
+    const struct ggml_tensor * k     = tensor->src[1];
+    const struct ggml_tensor * v     = tensor->src[2];
+    const struct ggml_tensor * g     = tensor->src[3];
+    const struct ggml_tensor * beta  = tensor->src[4];
+    const struct ggml_tensor * state = tensor->src[5];
+    const int64_t s_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+    const int32_t K                  = ggml_get_op_params_i32(tensor, 0);
+    const int32_t trailing_snapshots = ggml_get_op_params_i32(tensor, 1);
+    const int32_t selected_token     = ggml_get_op_params_i32(tensor, 2);
+    const int32_t reserve_input      = ggml_get_op_params_i32(tensor, 3);
+
+    if (!ggml_are_same_shape(q, k)) {
+        return false;
+    }
+    const int64_t H_k = q->ne[1];
+    if (q->ne[0] != s_v || q->ne[2] != n_tokens || n_seqs % q->ne[3] != 0 || H_k <= 0 || H % H_k != 0 ||
+        (g->ne[0] != 1 && g->ne[0] != s_v) || g->ne[1] != H || g->ne[2] != n_tokens || g->ne[3] != n_seqs ||
+        beta->ne[0] != 1 || beta->ne[1] != H || beta->ne[2] != n_tokens || beta->ne[3] != n_seqs ||
+        state->ne[0] != s_v || state->ne[1] != s_v || state->ne[2] != H || state->ne[3] != n_seqs) {
+        return false;
+    }
+
+    size_t output_width;
+    size_t attention_rows;
+    size_t state_rows;
+    size_t output_rows;
+    size_t snapshot_rows;
+    size_t state_elems;
+    if (K < 1 ||
+        !ggml_mul_size_checked((size_t) s_v, (size_t) H, &output_width) ||
+        !ggml_mul_size_checked((size_t) n_tokens, (size_t) n_seqs, &attention_rows) ||
+        !ggml_mul_size_checked((size_t) s_v, (size_t) n_seqs, &state_rows) ||
+        !ggml_mul_size_checked(state_rows, (size_t) K, &snapshot_rows) ||
+        !ggml_add_size_checked(attention_rows, snapshot_rows, &output_rows) ||
+        !ggml_mul_size_checked((size_t) s_v, (size_t) s_v, &state_elems) ||
+        !ggml_mul_size_checked(state_elems, (size_t) H, &state_elems) ||
+        !ggml_mul_size_checked(state_elems, (size_t) n_seqs, &state_elems) ||
+        output_width > INT64_MAX || output_rows > INT64_MAX || state_elems > INT64_MAX) {
+        return false;
+    }
+    if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != (int64_t) output_width || tensor->ne[1] != (int64_t) output_rows ||
+        tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+
+    size_t output_elems;
+    size_t state_bytes;
+    if (!ggml_mul_size_checked(output_width, output_rows, &output_elems) ||
+        !ggml_mul_size_checked(output_elems, sizeof(float), &output_elems) ||
+        !ggml_mul_size_checked(state_elems, sizeof(float), &state_bytes)) {
+        return false;
+    }
+    if (trailing_snapshots < 0 || trailing_snapshots > K ||
+        selected_token < -1 || selected_token >= n_tokens ||
+        (K == 1 && (trailing_snapshots != 1 || selected_token != -1 || reserve_input != 0)) ||
+        (selected_token >= 0 && trailing_snapshots > 0) ||
+        (reserve_input != 0 && reserve_input != 1) ||
+        (reserve_input == 1 && (selected_token >= 0 || K <= 1 || trailing_snapshots != MIN(n_tokens, K - 1)))) {
+        return false;
+    }
+
+    return true;
+}
+
 struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -6343,7 +6476,39 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    ggml_gated_delta_net_set_snapshots(result, (int32_t) K, -1, false);
+
     return result;
+}
+
+void ggml_gated_delta_net_set_snapshots(
+        struct ggml_tensor * tensor,
+        int32_t              trailing_snapshots,
+        int32_t              selected_token,
+        bool                 reserve_input) {
+    GGML_ASSERT(tensor != NULL && tensor->op == GGML_OP_GATED_DELTA_NET);
+
+    const int32_t K = ggml_get_op_params_i32(tensor, 0);
+    const int64_t n_tokens = tensor->src[2]->ne[2];
+    GGML_ASSERT(trailing_snapshots >= 0 && trailing_snapshots <= K);
+    GGML_ASSERT(selected_token >= -1 && selected_token < n_tokens);
+    GGML_ASSERT(!(selected_token >= 0 && trailing_snapshots > 0));
+    GGML_ASSERT(!reserve_input || selected_token < 0);
+    GGML_ASSERT(!reserve_input || (K > 1 && trailing_snapshots == MIN(n_tokens, K - 1)));
+    GGML_ASSERT(K != 1 || (trailing_snapshots == 1 && selected_token == -1 && !reserve_input));
+
+    ggml_set_op_params_i32(tensor, 1, trailing_snapshots);
+    ggml_set_op_params_i32(tensor, 2, selected_token);
+    ggml_set_op_params_i32(tensor, 3, reserve_input ? 1 : 0);
+}
+
+bool ggml_gated_delta_net_has_default_snapshot_params(
+        const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor != NULL && tensor->op == GGML_OP_GATED_DELTA_NET);
+
+    return ggml_get_op_params_i32(tensor, 1) == ggml_get_op_params_i32(tensor, 0) &&
+           ggml_get_op_params_i32(tensor, 2) == -1 &&
+           ggml_get_op_params_i32(tensor, 3) == 0;
 }
 
 // ggml_lightning_indexer

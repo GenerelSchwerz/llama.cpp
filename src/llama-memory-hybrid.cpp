@@ -137,6 +137,14 @@ bool llama_memory_hybrid::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
+    return mem_recr->recurrent_sparse_snapshots_supported();
+}
+
+bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
+    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+}
+
 void llama_memory_hybrid::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);

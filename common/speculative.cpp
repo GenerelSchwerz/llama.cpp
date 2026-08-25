@@ -172,6 +172,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    virtual bool get_mtp_replay_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+    virtual bool set_mtp_replay_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1728,6 +1731,50 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
+
+    bool get_mtp_replay_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
+                pending_h[seq_id].size() != (size_t) n_embd) {
+            return false;
+        }
+
+        const uint32_t header[3] = { 0x3150544d, 1, uint32_t(n_embd) }; // MTP1
+        const size_t row_size = (size_t) n_embd * sizeof(float);
+
+        data.resize(sizeof(header) + row_size);
+        std::memcpy(data.data(), header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), pending_h[seq_id].data(), row_size);
+        return true;
+    }
+
+    bool set_mtp_replay_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+        if (data.empty()) {
+            verify_h[seq_id].clear();
+            verify_h_rows[seq_id] = 0;
+            i_last[seq_id] = -1;
+            std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+            return true;
+        }
+
+        uint32_t header[3];
+        if (data.size() != sizeof(header) + (size_t) n_embd * sizeof(float)) {
+            return false;
+        }
+
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x3150544d || header[1] != 1 || header[2] != uint32_t(n_embd)) {
+            return false;
+        }
+
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id] = -1;
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), (size_t) n_embd * sizeof(float));
+        return true;
+    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
@@ -2224,15 +2271,53 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
 
 void common_validate_speculative_params(
         const common_params_speculative & params,
-        int32_t target_ubatch) {
+        int32_t target_ubatch_raw,
+        int32_t target_ubatch_effective) {
     const bool has_mtp = std::find(
             params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
 
-    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch > 0 && params.draft.n_ubatch != target_ubatch) {
+    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch_raw > 0 && params.draft.n_ubatch != target_ubatch_raw) {
         throw std::invalid_argument(string_format(
                 "draft-mtp requires spec-draft-ubatch-size (%d) to match the target ubatch (%d); "
                 "omit the draft override or use the target ubatch",
-                params.draft.n_ubatch, target_ubatch));
+                params.draft.n_ubatch, target_ubatch_raw));
+    }
+
+    if (params.mtp_rs_planes == 0) {
+        return;
+    }
+
+    if (!has_mtp) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires --spec-type draft-mtp");
+    }
+
+    if (params.draft.n_max < 1) {
+        throw std::invalid_argument("spec-mtp-rs-planes requires spec-draft-n-max >= 1");
+    }
+
+    const int64_t max_planes = int64_t(params.draft.n_max) + 1;
+    if (params.mtp_rs_planes < 2 || int64_t(params.mtp_rs_planes) > max_planes) {
+        throw std::invalid_argument(string_format(
+                "spec-mtp-rs-planes must be 0 or in [2, %" PRId64 "] for spec-draft-n-max=%d",
+                max_planes, params.draft.n_max));
+    }
+
+    const bool has_other_recurrent_mode = std::any_of(
+            params.types.begin(), params.types.end(), [](common_speculative_type type) {
+                return type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                       type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    if (params.is_mtp_rs_capped() && has_other_recurrent_mode) {
+        throw std::invalid_argument(
+                "spec-mtp-rs-planes cannot be combined with another speculative mode that requires recurrent rollback");
+    }
+
+    if (params.is_mtp_rs_capped() && target_ubatch_effective > 0 &&
+            int64_t(params.draft.n_max) + 1 > target_ubatch_effective) {
+        throw std::invalid_argument(string_format(
+                "capped spec-mtp-rs-planes requires ubatch-size >= spec-draft-n-max + 1 (%" PRId64 ")",
+                int64_t(params.draft.n_max) + 1));
     }
 }
 
@@ -2788,7 +2873,6 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
     }
 }
 
-// TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     if (spec == nullptr) {
         return false;
@@ -2811,6 +2895,36 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     for (auto & impl : spec->impls) {
         impl->set_state(seq_id, data);
     }
+}
+
+bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->get_mtp_replay_state(seq_id, data)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool common_speculative_set_mtp_state(
+        common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    if (spec == nullptr) {
+        return data.empty();
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->set_mtp_replay_state(seq_id, data)) {
+            return true;
+        }
+    }
+
+    return data.empty();
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

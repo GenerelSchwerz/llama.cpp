@@ -6,8 +6,10 @@
 //    cmake -B build && cmake --build build --parallel && ./build/bin/test-chat ../minja/build/tests/*.jinja 2>/dev/null
 //
 #include "../src/llama-grammar.h"
+#include "../src/llama-model.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-speculative-replay.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -15,6 +17,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -152,6 +155,95 @@ static common_chat_templates_ptr read_templates(const std::string & path) {
 static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_str) {
     return std::unique_ptr<llama_grammar>(
         llama_grammar_init_impl(nullptr, grammar_str.c_str(), "root", false, nullptr, 0, nullptr, 0));
+}
+
+static void test_speculative_replay_state_transitions() {
+    server_speculative_replay_state state;
+
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+    assert_equals(false, state.mtp_gpu_replay_pending());
+    assert_equals(false, state.excludes_replayed_token_from_acceptance());
+
+    state.arm_mtp_gpu_snapshots();
+    state.arm_mtp_gpu_snapshots();
+    assert_equals(true, state.mtp_gpu_snapshots_armed());
+    state.discard_mtp_gpu_snapshot_arm();
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    state.begin_checkpoint_replay();
+    state.begin_checkpoint_replay();
+    assert_equals(true, state.excludes_replayed_token_from_acceptance());
+    state.discard_mtp_gpu_snapshot_arm();
+    assert_equals(true, state.excludes_replayed_token_from_acceptance());
+    state.finish_verification();
+    assert_equals(false, state.excludes_replayed_token_from_acceptance());
+
+    const llama_tokens expected_tokens = { 11, 22, 33 };
+    llama_model_ptr sampler_model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    common_params_sampling sampler_params;
+    sampler_params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+    common_sampler_ptr sampler(common_sampler_init(sampler_model.get(), sampler_params));
+    common_sampler * sampler_ptr = sampler.get();
+
+    state.arm_mtp_gpu_snapshots();
+    state.begin_mtp_gpu_replay(expected_tokens, std::move(sampler), 2);
+    const bool sampler_moved = sampler == nullptr;
+    const bool replay_pending = state.mtp_gpu_replay_pending();
+    const uint32_t selected_token = state.mtp_gpu_replay_selected_token();
+
+    llama_tokens replayed_tokens = { 99 };
+    common_sampler_ptr replayed_sampler;
+    const uint32_t accepted = state.consume_mtp_gpu_replay(replayed_tokens, replayed_sampler);
+    const bool sampler_transferred = replayed_sampler.get() == sampler_ptr;
+    state.reset();
+
+    assert_equals(true, sampler_moved);
+    assert_equals(true, replay_pending);
+    assert_equals(uint32_t(2), selected_token);
+    assert_equals(true, replayed_tokens == expected_tokens);
+    assert_equals(true, sampler_transferred);
+    assert_equals(uint32_t(2), accepted);
+    assert_equals(false, state.mtp_gpu_replay_pending());
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    state.arm_mtp_gpu_snapshots();
+    state.reset();
+    assert_equals(false, state.mtp_gpu_snapshots_armed());
+}
+
+static void test_speculative_replay_failure_slot_scope() {
+    struct test_token {
+        int32_t id_slot;
+    };
+    struct test_case {
+        int32_t replay_slot_id;
+        bool sparse_verification;
+        std::array<bool, 5> affected;
+    };
+
+    const std::vector<test_token> tokens = { { 1 }, { 3 }, { 1 } };
+    const std::array<test_case, 4> cases = {
+        test_case {  2, false, { false, false, true,  false, false } },
+        test_case {  2, true,  { false, false, true,  false, false } },
+        test_case { -1, true,  { false, true,  false, true,  false } },
+        test_case { -1, false, { false, false, false, false, false } },
+    };
+
+    for (const auto & test : cases) {
+        std::array<server_speculative_replay_state, 5> states;
+        for (auto & state : states) {
+            state.arm_mtp_gpu_snapshots();
+        }
+        for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
+            if (server_sparse_batch_slot_is_affected(
+                        test.replay_slot_id, test.sparse_verification, tokens, int32_t(slot_id))) {
+                states[slot_id].reset();
+            }
+        }
+        for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
+            assert_equals(test.affected[slot_id], !states[slot_id].mtp_gpu_snapshots_armed());
+        }
+    }
 }
 
 // Helper to format a code point as a readable string
@@ -7238,6 +7330,8 @@ int main(int argc, char ** argv) {
         test_reasoning_effort_caps();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_speculative_replay_state_transitions();
+        test_speculative_replay_failure_slot_scope();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

@@ -28,6 +28,8 @@
 extern "C" {
 #endif
 
+GGML_API bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor);
+
 void ggml_print_backtrace(void);
 
 uint64_t ggml_graph_next_uid(void);

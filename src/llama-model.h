@@ -732,6 +732,8 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    virtual bool graph_supports_recurrent_sparse_snapshots() const;
+
 protected:
     llama_model_params params;
 
