@@ -1098,12 +1098,6 @@ private:
                     params_base.speculative.draft.n_max + 1, llama_n_ubatch(ctx_tgt));
             return false;
         }
-        if (capped_mtp && (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, -1) ||
-                           !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1))) {
-            SRV_ERR("%s", "failed to enable capped MTP sparse recurrent snapshots\n");
-            return false;
-        }
-
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -2722,6 +2716,9 @@ private:
         send_error(slot, reason, ERROR_TYPE_SERVER);
         slot.prompt_clear();
         slot.release();
+        if (batch.replay_slot == &slot) {
+            batch.replay_slot = nullptr;
+        }
     }
 
     // @ngxson : for debugging only
@@ -2960,19 +2957,15 @@ private:
 
             if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, ckpt.pos_max + 1, -1)) {
                 fail_speculative_replay(slot, "failed to restore the pre-verification recurrent plane");
-                batch.replay_slot = nullptr;
                 return;
             }
             if (ctx_dft != nullptr && !llama_memory_seq_rm(
                         llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
                 fail_speculative_replay(slot, "failed to rewind the MTP draft context for GPU replay");
-                batch.replay_slot = nullptr;
                 return;
             }
-            if (!common_speculative_set_state_for_type(
-                        spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP, slot.id, ckpt.data_spec)) {
+            if (!common_speculative_set_mtp_state(spec.get(), slot.id, ckpt.data_spec)) {
                 fail_speculative_replay(slot, "failed to restore speculative state for GPU replay");
-                batch.replay_slot = nullptr;
                 return;
             }
         }
@@ -3020,8 +3013,7 @@ private:
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
                         slot.spec_ckpt.data_spec.clear();
                         if (params_base.speculative.is_mtp_rs_capped()) {
-                            if (!common_speculative_get_state_for_type(
-                                        spec.get(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP, slot.id, slot.spec_ckpt.data_spec)) {
+                            if (!common_speculative_get_mtp_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
                                 throw std::runtime_error("failed to capture capped MTP speculative state");
                             }
                         }
@@ -3076,7 +3068,9 @@ private:
 
             if (!draft.empty()) {
                 const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
-                slot.spec_replay.arm_mtp_gpu_snapshots(capped_mtp);
+                if (capped_mtp) {
+                    slot.spec_replay.arm_mtp_gpu_snapshots();
+                }
                 const bool use_ckpt_tgt =
                     !capped_mtp && (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)));
@@ -3433,16 +3427,11 @@ private:
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         // restore the draft's speculative state
-                                        if (!common_speculative_set_state(spec.get(), slot.id, it->data_spec)) {
-                                            GGML_ASSERT(common_speculative_set_state(spec.get(), slot.id, {}));
-                                            do_reset = true;
-                                        }
+                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        if (!do_reset) {
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
-                                        }
+                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
@@ -4088,7 +4077,7 @@ private:
                             }
 
                             // partial acceptance is not supported by the context -> truncate the draft and restore the state
-                            slot.spec_replay.set_checkpoint_replay(true);
+                            slot.spec_replay.begin_checkpoint_replay();
                             slot.spec_draft = std::move(accepted);
 
                             const auto & ckpt = slot.spec_ckpt;

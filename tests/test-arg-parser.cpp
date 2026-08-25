@@ -246,76 +246,45 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "-1"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
 
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.mtp_rs_planes == 0);
-    assert(!params.speculative.mtp_rs_planes_explicit);
-    assert(params.speculative.need_n_rs_seq() == 8);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.mtp_rs_planes_explicit);
-    assert(params.speculative.need_n_rs_seq() == 8);
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.need_n_rs_seq() == 1);
-    assert(params.speculative.is_mtp_rs_capped());
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9"};
-    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-    assert(params.speculative.need_n_rs_seq() == 8);
-    assert(!params.speculative.is_mtp_rs_capped());
-
-    for (const char * invalid : {"-1", "1", "10"}) {
+    struct mtp_parse_case {
+        std::vector<std::string> args;
+        bool valid;
+        int32_t planes;
+        int32_t planes_explicit;
+        int32_t n_rs_seq;
+        int32_t capped;
+    };
+    const mtp_parse_case mtp_cases[] = {
+        { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512" }, true, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8" }, true, 0, false, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0" }, true, 0, true, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2" }, true, 2, true, 1, true },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, true, 2, true, 1, true },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9" }, true, 9, true, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "-1" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "1" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "10" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1, -1 },
+    };
+    for (const auto & test_case : mtp_cases) {
         params = common_params();
-        argv = {"binary_name", "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", invalid};
-        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        argv = { "binary_name" };
+        argv.insert(argv.end(), test_case.args.begin(), test_case.args.end());
+        assert(test_case.valid == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        if (test_case.planes >= 0) {
+            assert(params.speculative.mtp_rs_planes == test_case.planes);
+            assert(params.speculative.mtp_rs_planes_explicit == (bool) test_case.planes_explicit);
+            assert(params.speculative.need_n_rs_seq() == (uint32_t) test_case.n_rs_seq);
+            assert(params.speculative.is_mtp_rs_capped() == (bool) test_case.capped);
+        }
     }
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
-
-    params = common_params();
-    argv = {"binary_name", "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4"};
-    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
 
     params = common_params();
     params.model.path = "model_file.gguf";
@@ -583,19 +552,14 @@ static void test_mtp_draft_ubatch_validation() {
     common_validate_speculative_params(params, 512, 512);
 }
 
-static void test_speculative_state_boundaries() {
+static void test_mtp_state_boundaries() {
     std::vector<uint8_t> state;
     const std::vector<uint8_t> malformed = { 0x01, 0x02, 0x03 };
 
-    assert(!common_speculative_get_state(nullptr, 0, state));
+    assert(!common_speculative_get_mtp_state(nullptr, 0, state));
     assert(state.empty());
-    assert(common_speculative_set_state(nullptr, 0, {}));
-    assert(!common_speculative_set_state(nullptr, 0, malformed));
-
-    assert(!common_speculative_get_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, state));
-    assert(state.empty());
-    assert(common_speculative_set_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, {}));
-    assert(!common_speculative_set_state_for_type(nullptr, COMMON_SPECULATIVE_TYPE_DRAFT_MTP, 0, malformed));
+    assert(common_speculative_set_mtp_state(nullptr, 0, {}));
+    assert(!common_speculative_set_mtp_state(nullptr, 0, malformed));
 }
 
 int main(void) {
@@ -603,7 +567,7 @@ int main(void) {
         test();
         test_draft_ubatch_override();
         test_mtp_draft_ubatch_validation();
-        test_speculative_state_boundaries();
+        test_mtp_state_boundaries();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

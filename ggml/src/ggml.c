@@ -6291,14 +6291,6 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-static bool ggml_mul_i64_checked(int64_t a, int64_t b, int64_t * result) {
-    if (a <= 0 || b <= 0 || a > INT64_MAX / b) {
-        return false;
-    }
-    *result = a * b;
-    return true;
-}
-
 static bool ggml_add_size_checked(size_t a, size_t b, size_t * result) {
     if (a > SIZE_MAX - b) {
         return false;
@@ -6307,72 +6299,59 @@ static bool ggml_add_size_checked(size_t a, size_t b, size_t * result) {
     return true;
 }
 
-static bool ggml_mul_size_i64_checked(size_t a, int64_t b, size_t * result) {
-    if (b <= 0 || a > SIZE_MAX / (size_t) b) {
+static bool ggml_mul_size_checked(size_t a, size_t b, size_t * result) {
+    if (b != 0 && a > SIZE_MAX / b) {
         return false;
     }
-    *result = a * (size_t) b;
+    *result = a * b;
     return true;
 }
 
-static bool ggml_f32_tensor_dims_valid(const struct ggml_tensor * tensor) {
+static bool ggml_f32_tensor_layout_valid(const struct ggml_tensor * tensor, bool contiguous) {
     if (tensor == NULL || tensor->type != GGML_TYPE_F32) {
         return false;
     }
+
+    size_t row_size = sizeof(float);
+    size_t span     = sizeof(float);
+    size_t stride   = sizeof(float);
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (tensor->ne[i] <= 0) {
+        if (tensor->ne[i] <= 0 || (uint64_t) tensor->ne[i] > SIZE_MAX) {
             return false;
         }
-    }
-    return true;
-}
 
-static bool ggml_f32_tensor_rows_valid(const struct ggml_tensor * tensor) {
-    if (!ggml_f32_tensor_dims_valid(tensor) || tensor->nb[0] != sizeof(float)) {
-        return false;
-    }
-
-    size_t row_size;
-    if (!ggml_mul_size_i64_checked(sizeof(float), tensor->ne[0], &row_size)) {
-        return false;
-    }
-
-    size_t span = sizeof(float);
-    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
-        if (tensor->nb[i] % sizeof(float) != 0 || (tensor->ne[i] > 1 && tensor->nb[i] < row_size)) {
-            return false;
-        }
-        if (tensor->ne[i] > 1) {
-            size_t dim_span;
-            if (!ggml_mul_size_i64_checked(tensor->nb[i], tensor->ne[i] - 1, &dim_span) ||
-                !ggml_add_size_checked(span, dim_span, &span)) {
+        if (contiguous) {
+            if (tensor->nb[i] != stride || !ggml_mul_size_checked(stride, (size_t) tensor->ne[i], &stride)) {
                 return false;
+            }
+        } else if (i == 0) {
+            if (tensor->nb[0] != sizeof(float) ||
+                !ggml_mul_size_checked(sizeof(float), (size_t) tensor->ne[0], &row_size)) {
+                return false;
+            }
+        } else {
+            if (tensor->nb[i] % sizeof(float) != 0 || (tensor->ne[i] > 1 && tensor->nb[i] < row_size)) {
+                return false;
+            }
+            if (tensor->ne[i] > 1) {
+                size_t dim_span;
+                if (!ggml_mul_size_checked(tensor->nb[i], (size_t) tensor->ne[i] - 1, &dim_span) ||
+                    !ggml_add_size_checked(span, dim_span, &span)) {
+                    return false;
+                }
             }
         }
     }
-    return ggml_add_size_checked(span, row_size - sizeof(float), &span);
-}
-
-static bool ggml_f32_tensor_contiguous_valid(const struct ggml_tensor * tensor) {
-    if (!ggml_f32_tensor_dims_valid(tensor)) {
-        return false;
-    }
-
-    size_t stride = sizeof(float);
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (tensor->nb[i] != stride || !ggml_mul_size_i64_checked(stride, tensor->ne[i], &stride)) {
-            return false;
-        }
-    }
-    return true;
+    return contiguous || ggml_add_size_checked(span, row_size - sizeof(float), &span);
 }
 
 bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
     if (tensor == NULL || tensor->op != GGML_OP_GATED_DELTA_NET) {
         return false;
     }
-    for (int i = 0; i < 6; ++i) {
-        if (!ggml_f32_tensor_dims_valid(tensor->src[i])) {
+    for (int i = 0; i < 7; ++i) {
+        const struct ggml_tensor * operand = i < 6 ? tensor->src[i] : tensor;
+        if (!ggml_f32_tensor_layout_valid(operand, i >= 3)) {
             return false;
         }
     }
@@ -6392,11 +6371,6 @@ bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
     const int32_t selected_token     = ggml_get_op_params_i32(tensor, 2);
     const int32_t reserve_input      = ggml_get_op_params_i32(tensor, 3);
 
-    if (!ggml_f32_tensor_rows_valid(q) || !ggml_f32_tensor_rows_valid(k) || !ggml_f32_tensor_rows_valid(v) ||
-        !ggml_f32_tensor_contiguous_valid(g) || !ggml_f32_tensor_contiguous_valid(beta) ||
-        !ggml_f32_tensor_contiguous_valid(state) || !ggml_f32_tensor_contiguous_valid(tensor)) {
-        return false;
-    }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         if (q->ne[i] != k->ne[i] || q->nb[i] != k->nb[i]) {
             return false;
@@ -6410,34 +6384,34 @@ bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
         return false;
     }
 
-    int64_t output_width;
-    int64_t attention_rows;
-    int64_t state_rows;
-    int64_t output_rows;
-    int64_t snapshot_rows;
-    int64_t state_elems;
+    size_t output_width;
+    size_t attention_rows;
+    size_t state_rows;
+    size_t output_rows;
+    size_t snapshot_rows;
+    size_t state_elems;
     if (K < 1 ||
-        !ggml_mul_i64_checked(s_v, H, &output_width) ||
-        !ggml_mul_i64_checked(n_tokens, n_seqs, &attention_rows) ||
-        !ggml_mul_i64_checked(s_v, n_seqs, &state_rows) ||
-        !ggml_mul_i64_checked(state_rows, K, &snapshot_rows) ||
-        attention_rows > INT64_MAX - snapshot_rows ||
-        (output_rows = attention_rows + snapshot_rows) <= 0 ||
-        !ggml_mul_i64_checked(s_v, s_v, &state_elems) ||
-        !ggml_mul_i64_checked(state_elems, H, &state_elems) ||
-        !ggml_mul_i64_checked(state_elems, n_seqs, &state_elems)) {
+        !ggml_mul_size_checked((size_t) s_v, (size_t) H, &output_width) ||
+        !ggml_mul_size_checked((size_t) n_tokens, (size_t) n_seqs, &attention_rows) ||
+        !ggml_mul_size_checked((size_t) s_v, (size_t) n_seqs, &state_rows) ||
+        !ggml_mul_size_checked(state_rows, (size_t) K, &snapshot_rows) ||
+        !ggml_add_size_checked(attention_rows, snapshot_rows, &output_rows) ||
+        !ggml_mul_size_checked((size_t) s_v, (size_t) s_v, &state_elems) ||
+        !ggml_mul_size_checked(state_elems, (size_t) H, &state_elems) ||
+        !ggml_mul_size_checked(state_elems, (size_t) n_seqs, &state_elems) ||
+        output_width > INT64_MAX || output_rows > INT64_MAX || state_elems > INT64_MAX) {
         return false;
     }
-    if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != output_width || tensor->ne[1] != output_rows ||
+    if (tensor->type != GGML_TYPE_F32 || tensor->ne[0] != (int64_t) output_width || tensor->ne[1] != (int64_t) output_rows ||
         tensor->ne[2] != 1 || tensor->ne[3] != 1) {
         return false;
     }
 
     size_t output_elems;
     size_t state_bytes;
-    if (!ggml_mul_size_i64_checked((size_t) output_width, output_rows, &output_elems) ||
-        !ggml_mul_size_i64_checked(output_elems, sizeof(float), &output_elems) ||
-        !ggml_mul_size_i64_checked((size_t) state_elems, sizeof(float), &state_bytes)) {
+    if (!ggml_mul_size_checked(output_width, output_rows, &output_elems) ||
+        !ggml_mul_size_checked(output_elems, sizeof(float), &output_elems) ||
+        !ggml_mul_size_checked(state_elems, sizeof(float), &state_bytes)) {
         return false;
     }
     if (trailing_snapshots < 0 || trailing_snapshots > K ||

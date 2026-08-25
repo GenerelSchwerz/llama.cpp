@@ -171,7 +171,7 @@ struct common_speculative_impl {
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
-    virtual bool set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & data) { return data.empty(); }
+    virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -884,32 +884,23 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         return true;
     }
 
-    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (!need_boundary_stash()) {
-            return data.empty();
+            return;
         }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return false;
-        }
-        if (data.empty()) {
-            pending_pos_last[seq_id] = -1;
-            std::fill(pending_g_last[seq_id].begin(), pending_g_last[seq_id].end(), 0.0f);
-            return true;
+            return;
         }
         if (data.size() != sizeof(llama_pos) + (size_t) n_embd_dec * sizeof(float)) {
-            return false;
+            return;
         }
 
         llama_pos pos = -1;
         std::memcpy(&pos, data.data(), sizeof(llama_pos));
-        if (pos < 0) {
-            return false;
-        }
 
         pending_pos_last[seq_id] = pos;
-        GGML_ASSERT(pending_g_last[seq_id].size() == (size_t) n_embd_dec);
+        pending_g_last[seq_id].resize(n_embd_dec);
         std::memcpy(pending_g_last[seq_id].data(), data.data() + sizeof(llama_pos), (size_t) n_embd_dec * sizeof(float));
-        return true;
     }
 };
 
@@ -1738,31 +1729,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
-    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+    bool get_replay_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
                 pending_h[seq_id].size() != (size_t) n_embd) {
             return false;
         }
 
-        constexpr uint32_t magic   = 0x3150544d; // MTP1
-        constexpr uint32_t version = 1;
-        const uint32_t width = uint32_t(n_embd);
-        const size_t header_size = sizeof(magic) + sizeof(version) + sizeof(width);
+        const uint32_t header[3] = { 0x3150544d, 1, uint32_t(n_embd) }; // MTP1
         const size_t row_size = (size_t) n_embd * sizeof(float);
 
-        data.resize(header_size + row_size);
-        uint8_t * dst = data.data();
-        std::memcpy(dst, &magic, sizeof(magic));
-        dst += sizeof(magic);
-        std::memcpy(dst, &version, sizeof(version));
-        dst += sizeof(version);
-        std::memcpy(dst, &width, sizeof(width));
-        dst += sizeof(width);
-        std::memcpy(dst, pending_h[seq_id].data(), row_size);
+        data.resize(sizeof(header) + row_size);
+        std::memcpy(data.data(), header, sizeof(header));
+        std::memcpy(data.data() + sizeof(header), pending_h[seq_id].data(), row_size);
         return true;
     }
 
-    bool set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+    bool set_replay_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
@@ -1774,27 +1756,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
-        constexpr uint32_t expected_magic   = 0x3150544d; // MTP1
-        constexpr uint32_t expected_version = 1;
-        constexpr size_t header_size = sizeof(uint32_t) * 3;
-        if (data.size() != header_size + (size_t) n_embd * sizeof(float)) {
+        uint32_t header[3];
+        if (data.size() != sizeof(header) + (size_t) n_embd * sizeof(float)) {
             return false;
         }
 
-        uint32_t magic;
-        uint32_t version;
-        uint32_t width;
-        std::memcpy(&magic,   data.data(),                      sizeof(magic));
-        std::memcpy(&version, data.data() + sizeof(uint32_t),   sizeof(version));
-        std::memcpy(&width,   data.data() + sizeof(uint32_t)*2, sizeof(width));
-        if (magic != expected_magic || version != expected_version || width != uint32_t(n_embd)) {
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x3150544d || header[1] != 1 || header[2] != uint32_t(n_embd)) {
             return false;
         }
 
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
         i_last[seq_id] = -1;
-        std::memcpy(pending_h[seq_id].data(), data.data() + header_size, (size_t) n_embd * sizeof(float));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(header), (size_t) n_embd * sizeof(float));
         return true;
     }
 };
@@ -2900,15 +2875,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 }
 
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
-    data.clear();
     if (spec == nullptr) {
         return false;
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            continue;
-        }
         if (impl->get_state(seq_id, data)) {
             return true;
         }
@@ -2917,53 +2888,40 @@ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id
     return false;
 }
 
-bool common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
-        return data.empty();
+        return;
     }
 
-    bool restored = data.empty();
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            continue;
-        }
-        const bool impl_restored = impl->set_state(seq_id, data);
-        restored = data.empty() ? restored && impl_restored : restored || impl_restored;
+        impl->set_state(seq_id, data);
     }
-    return restored;
 }
 
-bool common_speculative_get_state_for_type(
-        common_speculative * spec,
-        common_speculative_type type,
-        llama_seq_id seq_id,
-        std::vector<uint8_t> & data) {
+bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
     data.clear();
     if (spec == nullptr) {
         return false;
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type == type) {
-            return impl->get_state(seq_id, data);
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return static_cast<common_speculative_impl_draft_mtp *>(impl.get())->get_replay_state(seq_id, data);
         }
     }
 
     return false;
 }
 
-bool common_speculative_set_state_for_type(
-        common_speculative * spec,
-        common_speculative_type type,
-        llama_seq_id seq_id,
-        const std::vector<uint8_t> & data) {
+bool common_speculative_set_mtp_state(
+        common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data) {
     if (spec == nullptr) {
         return data.empty();
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type == type) {
-            return impl->set_state(seq_id, data);
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return static_cast<common_speculative_impl_draft_mtp *>(impl.get())->set_replay_state(seq_id, data);
         }
     }
 

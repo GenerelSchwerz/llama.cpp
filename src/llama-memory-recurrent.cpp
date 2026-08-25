@@ -13,6 +13,27 @@
 #include <map>
 #include <stdexcept>
 
+static bool recurrent_sparse_snapshots_device_supported(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return false;
+    }
+    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+        const size_t n_devs = ggml_backend_meta_device_count(dev);
+        for (size_t i = 0; i < n_devs; ++i) {
+            if (!recurrent_sparse_snapshots_device_supported(ggml_backend_meta_device_get(dev, i))) {
+                return false;
+            }
+        }
+        return n_devs > 0;
+    }
+
+    typedef bool (*supports_recurrent_sparse_snapshots_t)(ggml_backend_dev_t);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    supports_recurrent_sparse_snapshots_t fn = reg ? reinterpret_cast<supports_recurrent_sparse_snapshots_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_recurrent_sparse_snapshots_supported")) : nullptr;
+    return fn != nullptr && fn(dev);
+}
+
 //
 // llama_memory_recurrent
 //
@@ -496,12 +517,12 @@ bool llama_memory_recurrent::recurrent_sparse_snapshots_supported() const {
     }
     return std::all_of(ctxs_bufs.begin(), ctxs_bufs.end(), [](const auto & entry) {
         const auto buft = ggml_backend_buffer_get_type(entry.second.get());
-        return ggml_backend_dev_supports_recurrent_sparse_snapshots(ggml_backend_buft_get_device(buft));
+        return recurrent_sparse_snapshots_device_supported(ggml_backend_buft_get_device(buft));
     });
 }
 
 bool llama_memory_recurrent::recurrent_sparse_snapshot_backend_supported(ggml_backend_dev_t dev) const {
-    return ggml_backend_dev_supports_recurrent_sparse_snapshots(dev);
+    return recurrent_sparse_snapshots_device_supported(dev);
 }
 
 bool llama_memory_recurrent::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
@@ -1391,45 +1412,32 @@ bool llama_memory_recurrent_context::apply() {
         return true;
     }
 
-    const uint32_t n_planes = mem->n_rs_seq + 1;
-    std::vector<llama_pos> plane_positions((size_t) ubatch.n_seqs * n_planes, -1);
-
-    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-        const uint32_t i = s * ubatch.n_seq_tokens;
-        const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        if (!mem->seq_id_valid(seq_id)) {
-            return false;
-        }
-        std::copy_n(mem->rs_plane_pos.begin() + (size_t) seq_id * n_planes, n_planes,
-                plane_positions.begin() + (size_t) s * n_planes);
-
-        GGML_ASSERT(n_planes >= 2 && ubatch.n_seq_tokens >= 1);
-        if (snapshot_mode.selected_token >= 0) {
-            GGML_ASSERT((uint32_t) snapshot_mode.selected_token < ubatch.n_seq_tokens);
-            plane_positions[(size_t) s * n_planes] = ubatch.pos[i + snapshot_mode.selected_token];
-        } else {
-            const uint32_t n_written = std::min(ubatch.n_seq_tokens, n_planes - 1);
-            for (uint32_t plane = 0; plane < n_written; ++plane) {
-                const int32_t token = (int32_t) ubatch.n_seq_tokens - 1 - (int32_t) plane;
-                plane_positions[(size_t) s * n_planes + plane] = ubatch.pos[i + token];
-            }
-            plane_positions[(size_t) s * n_planes + n_planes - 1] = ubatch.pos[i] - 1;
-        }
-    }
-
     if (!mem->find_slot(ubatch)) {
         return false;
     }
 
+    const uint32_t n_planes = mem->n_rs_seq + 1;
+    GGML_ASSERT(n_planes >= 2 && ubatch.n_seq_tokens >= 1);
     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
         const uint32_t i = s * ubatch.n_seq_tokens;
-        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
-            const llama_seq_id seq_id = ubatch.seq_id[i][j];
-            if (!mem->seq_id_valid(seq_id)) {
-                return false;
+        const llama_seq_id seq_id = ubatch.seq_id[i][0];
+        auto plane_positions = mem->rs_plane_pos.begin() + (size_t) seq_id * n_planes;
+        if (snapshot_mode.selected_token >= 0) {
+            GGML_ASSERT((uint32_t) snapshot_mode.selected_token < ubatch.n_seq_tokens);
+            plane_positions[0] = ubatch.pos[i + snapshot_mode.selected_token];
+        } else {
+            const uint32_t n_written = std::min(ubatch.n_seq_tokens, n_planes - 1);
+            for (uint32_t plane = 0; plane < n_written; ++plane) {
+                const int32_t token = (int32_t) ubatch.n_seq_tokens - 1 - (int32_t) plane;
+                plane_positions[plane] = ubatch.pos[i + token];
             }
-            std::copy_n(plane_positions.begin() + (size_t) s * n_planes, n_planes,
-                    mem->rs_plane_pos.begin() + (size_t) seq_id * n_planes);
+            plane_positions[n_planes - 1] = ubatch.pos[i] - 1;
+        }
+        mem->rs_plane_pos_sparse[seq_id] = true;
+
+        for (int32_t j = 1; j < ubatch.n_seq_id[i]; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            std::copy_n(plane_positions, n_planes, mem->rs_plane_pos.begin() + (size_t) seq_id * n_planes);
             mem->rs_plane_pos_sparse[seq_id] = true;
         }
     }

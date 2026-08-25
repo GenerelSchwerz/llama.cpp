@@ -44,16 +44,14 @@ struct server_speculative_replay_state {
         return n_accepted;
     }
 
-    void arm_mtp_gpu_snapshots(bool enabled) {
-        // Re-arming replaces an unused arm left when a failed checkpoint capture clears its draft.
+    void arm_mtp_gpu_snapshots() {
         GGML_ASSERT(phase == phase_type::IDLE || phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED);
-        phase = enabled ? phase_type::MTP_GPU_SNAPSHOTS_ARMED : phase_type::IDLE;
+        phase = phase_type::MTP_GPU_SNAPSHOTS_ARMED;
     }
 
-    void set_checkpoint_replay(bool enabled) {
-        // Re-entering checkpoint replay preserves the previous boolean assignment's idempotent transition.
+    void begin_checkpoint_replay() {
         GGML_ASSERT(phase == phase_type::IDLE || phase == phase_type::CHECKPOINT_REPLAY);
-        phase = enabled ? phase_type::CHECKPOINT_REPLAY : phase_type::IDLE;
+        phase = phase_type::CHECKPOINT_REPLAY;
     }
 
     void begin_mtp_gpu_replay(llama_tokens tokens, common_sampler_ptr sampler, uint32_t accepted) {
@@ -70,7 +68,7 @@ struct server_speculative_replay_state {
         sampler = std::move(accepted_sampler);
         const uint32_t accepted = n_accepted;
         clear_payload();
-        phase = phase_type::MTP_GPU_REPLAY_CONSUMED;
+        phase = phase_type::IDLE;
         return accepted;
     }
 
@@ -81,7 +79,6 @@ struct server_speculative_replay_state {
         if (phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED) {
             phase = phase_type::IDLE;
         }
-        clear_payload();
     }
 
     void finish_verification() {
@@ -101,7 +98,6 @@ private:
         MTP_GPU_SNAPSHOTS_ARMED,
         CHECKPOINT_REPLAY,
         MTP_GPU_REPLAY_PENDING,
-        MTP_GPU_REPLAY_CONSUMED,
     };
 
     void clear_payload() {

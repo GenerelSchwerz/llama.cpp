@@ -21,7 +21,6 @@
 #include "ggml-cpp.h"
 #ifdef GGML_TEST_RPC
 #include "ggml-rpc.h"
-#include "../ggml/src/ggml-impl.h"
 #endif
 
 #include <algorithm>
@@ -50,6 +49,18 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+
+#ifdef GGML_TEST_RPC
+#include <arpa/inet.h>
+#include <cerrno>
+#include <csignal>
+#include <netinet/in.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 #ifdef __EMSCRIPTEN__
 #   define N_THREADS 1
@@ -4410,6 +4421,23 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+static void initialize_gated_delta_net_tensors(ggml_context * ctx) {
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (ggml_is_view_op(t->op)) {
+            continue;
+        }
+        if (strcmp(t->name, "g") == 0) {
+            init_tensor_uniform(t, -20.0f, -1e-4f);
+        } else if (strcmp(t->name, "beta") == 0) {
+            init_tensor_uniform(t, 0.0f, 1.0f);
+        } else if (strcmp(t->name, "v") == 0) {
+            init_tensor_uniform(t, -0.3f, 5.0f);
+        } else {
+            init_tensor_uniform(t);
+        }
+    }
+}
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -4481,18 +4509,7 @@ struct test_gated_delta_net : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_is_view_op(t->op)) { continue; }
-            if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
-            } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, 1.0f);
-            } else if (strcmp(t->name, "v") == 0) {
-                init_tensor_uniform(t, -0.3f, 5.0f);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
+        initialize_gated_delta_net_tensors(ctx);
     }
 };
 
@@ -4592,6 +4609,13 @@ static bool test_gated_delta_net_rejection() {
     const auto rejects = [&](const char * name) {
         return rejects_op(out, name);
     };
+    const auto rejects_change = [&](auto & value, auto malformed, const char * name) {
+        const auto original = value;
+        value = malformed;
+        const bool rejected = rejects(name);
+        value = original;
+        return rejected;
+    };
 
     if (!ggml_backend_dev_supports_op(cpu, out)) {
         fprintf(stderr, "%s: valid GATED_DELTA_NET was rejected\n", __func__);
@@ -4658,81 +4682,55 @@ static bool test_gated_delta_net_rejection() {
     }
 
     set_params(4, 4, -1, 0);
-    out->ne[1] += 1;
-    if (!rejects("output geometry")) {
+    if (!rejects_change(out->ne[1], out->ne[1] + 1, "output geometry")) {
         return false;
     }
-    out->ne[1] -= 1;
 
     for (int i = 0; i < 6; ++i) {
-        const ggml_type type = out->src[i]->type;
-        out->src[i]->type = GGML_TYPE_F16;
         const std::string name = "source " + std::to_string(i) + " type";
-        if (!rejects(name.c_str())) {
+        if (!rejects_change(out->src[i]->type, GGML_TYPE_F16, name.c_str())) {
             return false;
         }
-        out->src[i]->type = type;
     }
 
-    const ggml_type out_type = out->type;
-    out->type = GGML_TYPE_F16;
-    if (!rejects("output type")) {
+    if (!rejects_change(out->type, GGML_TYPE_F16, "output type")) {
         return false;
     }
-    out->type = out_type;
 
     const int shape_dims[6] = { 0, 0, 1, 1, 0, 1 };
     for (int i = 0; i < 6; ++i) {
         const int dim = shape_dims[i];
-        const int64_t ne = out->src[i]->ne[dim];
-        out->src[i]->ne[dim] += 1;
         const std::string name = "source " + std::to_string(i) + " shape";
-        if (!rejects(name.c_str())) {
+        if (!rejects_change(out->src[i]->ne[dim], out->src[i]->ne[dim] + 1, name.c_str())) {
             return false;
         }
-        out->src[i]->ne[dim] = ne;
     }
 
     for (int i = 0; i < 3; ++i) {
-        const size_t nb = out->src[i]->nb[0];
-        out->src[i]->nb[0] = 2 * sizeof(float);
         const std::string name = "source " + std::to_string(i) + " row stride";
-        if (!rejects(name.c_str())) {
+        if (!rejects_change(out->src[i]->nb[0], 2 * sizeof(float), name.c_str())) {
             return false;
         }
-        out->src[i]->nb[0] = nb;
     }
 
     for (int i = 3; i < 6; ++i) {
-        const size_t nb = out->src[i]->nb[1];
-        out->src[i]->nb[1] += sizeof(float);
         const std::string name = "source " + std::to_string(i) + " full stride";
-        if (!rejects(name.c_str())) {
+        if (!rejects_change(out->src[i]->nb[1], out->src[i]->nb[1] + sizeof(float), name.c_str())) {
             return false;
         }
-        out->src[i]->nb[1] = nb;
     }
 
-    const size_t out_nb1 = out->nb[1];
-    out->nb[1] += sizeof(float);
-    if (!rejects("output stride")) {
+    if (!rejects_change(out->nb[1], out->nb[1] + sizeof(float), "output stride")) {
         return false;
     }
-    out->nb[1] = out_nb1;
 
-    const size_t q_nb2 = out->src[0]->nb[2];
-    out->src[0]->nb[2] += sizeof(float);
-    if (!rejects("q and k stride")) {
+    if (!rejects_change(out->src[0]->nb[2], out->src[0]->nb[2] + sizeof(float), "q and k stride")) {
         return false;
     }
-    out->src[0]->nb[2] = q_nb2;
 
-    const size_t v_nb2 = out->src[2]->nb[2];
-    out->src[2]->nb[2] += 1;
-    if (!rejects("float stride divisibility")) {
+    if (!rejects_change(out->src[2]->nb[2], out->src[2]->nb[2] + 1, "float stride divisibility")) {
         return false;
     }
-    out->src[2]->nb[2] = v_nb2;
 
     const int64_t q_heads = out->src[0]->ne[1];
     const int64_t k_heads = out->src[1]->ne[1];
@@ -4775,13 +4773,10 @@ static bool test_gated_delta_net_rejection() {
     out->src[1]->nb[2] = k_overflow_nb2;
 
     for (int i = 0; i < 6; ++i) {
-        ggml_tensor * src = out->src[i];
-        out->src[i] = nullptr;
         const std::string name = "missing source " + std::to_string(i);
-        if (!rejects(name.c_str())) {
+        if (!rejects_change(out->src[i], nullptr, name.c_str())) {
             return false;
         }
-        out->src[i] = src;
     }
 
     for (int64_t n_tokens : { 1, 2 }) {
@@ -4823,65 +4818,111 @@ static bool test_gated_delta_net_rejection() {
 }
 
 #ifdef GGML_TEST_RPC
-static ggml_backend_ptr start_gdn_rpc_test_server(
-        const std::vector<ggml_backend_dev_t> & devices,
-        std::string & endpoint) {
-    const uint32_t first_port = 20000 + std::random_device{}() % 30000;
-    for (uint32_t attempt = 0; attempt < 16; ++attempt) {
-        const uint32_t port = 20000 + (first_port - 20000 + 7919*attempt) % 30000;
-        const std::string candidate = "127.0.0.1:" + std::to_string(port);
-        auto ready = std::make_shared<std::promise<bool>>();
-        std::future<bool> ready_future = ready->get_future();
-        std::vector<ggml_backend_dev_t> server_devices = devices;
+struct rpc_test_process {
+    pid_t pid = -1;
 
-        // The RPC server has no stop API. A running test server exits with this process.
-        std::thread([candidate, server_devices = std::move(server_devices), ready]() mutable {
-            ggml_backend_rpc_test_start_server(candidate.c_str(), nullptr, 1, server_devices.size(), server_devices.data(),
-                [](bool success, void * user_data) {
-                    static_cast<std::promise<bool> *>(user_data)->set_value(success);
-                }, ready.get());
-        }).detach();
-
-        if (ready_future.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
-            fprintf(stderr, "%s: RPC server readiness callback timed out\n", __func__);
-            return {};
-        }
-        if (!ready_future.get()) {
-            continue;
-        }
-        ggml_backend_ptr backend(ggml_backend_rpc_init(candidate.c_str(), 0));
-        if (backend != nullptr) {
-            endpoint = candidate;
-            return backend;
-        }
+    ~rpc_test_process() {
+        stop();
     }
-    return {};
+
+    void stop() {
+        if (pid <= 0) {
+            return;
+        }
+        if (kill(pid, SIGTERM) != 0 && errno != ESRCH) {
+            fprintf(stderr, "%s: failed to terminate process %d\n", __func__, int(pid));
+        }
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {
+        }
+        pid = -1;
+    }
+
+    bool wait_for(int & status, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const pid_t result = waitpid(pid, &status, WNOHANG);
+            if (result == pid) {
+                pid = -1;
+                return true;
+            }
+            if (result < 0 && errno != EINTR) {
+                return false;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    }
+};
+
+static int rpc_test_find_loopback_port() {
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+    sockaddr_in address = {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0) {
+        close(fd);
+        return -1;
+    }
+    socklen_t address_size = sizeof(address);
+    if (getsockname(fd, reinterpret_cast<sockaddr *>(&address), &address_size) != 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return ntohs(address.sin_port);
 }
 
-static bool test_gated_delta_net_rpc_rejection() {
-    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-    GGML_ASSERT(cpu != nullptr);
-
-    std::vector<ggml_backend_dev_t> devices = { cpu };
-    int32_t cuda_device = -1;
-    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-        if (strstr(ggml_backend_dev_name(dev), "CUDA") != nullptr) {
-            cuda_device = (int32_t) devices.size();
-            devices.push_back(dev);
-            break;
+static bool rpc_test_wait_for_server(int port) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd >= 0) {
+            sockaddr_in address = {};
+            address.sin_family = AF_INET;
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            address.sin_port = htons(port);
+            const bool connected = connect(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) == 0;
+            close(fd);
+            if (connected) {
+                return true;
+            }
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    return false;
+}
 
-    std::string endpoint;
-    ggml_backend_ptr backend = start_gdn_rpc_test_server(devices, endpoint);
+static int test_gated_delta_net_rpc_server(const char * endpoint) {
+    ggml_backend_load_all();
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu == nullptr) {
+        return 2;
+    }
+    fprintf(stderr, "RPC GDN wire test: server starting at %s\n", endpoint);
+    ggml_backend_rpc_start_server(endpoint, nullptr, 1, 1, &cpu);
+    return 3;
+}
+
+static int test_gated_delta_net_rpc_client(const char * endpoint, int marker_fd) {
+    const rlimit no_core = { 0, 0 };
+    setrlimit(RLIMIT_CORE, &no_core);
+    signal(SIGPIPE, SIG_IGN);
+    ggml_backend_load_all();
+
+    if (ggml_backend_rpc_add_server(endpoint) == nullptr) {
+        return 2;
+    }
+    ggml_backend_ptr backend(ggml_backend_rpc_init(endpoint, 0));
     if (backend == nullptr) {
-        fprintf(stderr, "%s: failed to start an RPC test server\n", __func__);
-        return false;
+        return 3;
     }
 
     ggml_init_params params = {
-        /* .mem_size   = */ ggml_tensor_overhead()*96 + 2*ggml_graph_overhead(),
+        /* .mem_size   = */ ggml_tensor_overhead()*96 + ggml_graph_overhead(),
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
@@ -4892,175 +4933,105 @@ static bool test_gated_delta_net_rpc_rejection() {
     ggml_tensor * out = test.build_graph(ctx.get());
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, out);
-    graph->uid = ggml_graph_next_uid();
-
-    test_gated_delta_net k1_test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 1);
-    ggml_tensor * k1_out = k1_test.build_graph(ctx.get());
-    ggml_cgraph * k1_graph = ggml_new_graph(ctx.get());
-    ggml_build_forward_expand(k1_graph, k1_out);
 
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     if (buffer == nullptr) {
-        fprintf(stderr, "%s: failed to allocate RPC graph tensors\n", __func__);
-        return false;
+        return 4;
     }
     ggml_backend_buffer_clear(buffer.get(), 0);
 
     const int32_t malformed_reserve = 2;
     memcpy(out->op_params + 3, &malformed_reserve, sizeof(malformed_reserve));
-    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: malformed wire GATED_DELTA_NET parameters were accepted\n", __func__);
-        return false;
-    }
-
-    const int32_t default_reserve = 0;
-    memcpy(out->op_params + 3, &default_reserve, sizeof(default_reserve));
-    out->ne[1] -= 1;
-    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: malformed wire GATED_DELTA_NET geometry was accepted\n", __func__);
-        return false;
-    }
-    out->ne[1] += 1;
-    ggml_gated_delta_net_set_snapshots(out, 4, -1, false);
     if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: valid wire K=4 GATED_DELTA_NET was rejected\n", __func__);
-        return false;
+        return 5;
     }
 
-    const auto set_k1_params = [&](int32_t trailing, int32_t selected, int32_t reserve) {
-        memcpy(k1_out->op_params + 1, &trailing, sizeof(trailing));
-        memcpy(k1_out->op_params + 2, &selected, sizeof(selected));
-        memcpy(k1_out->op_params + 3, &reserve,  sizeof(reserve));
-    };
-    const int32_t malformed_k1[][3] = {
-        { 0, -1, 0 },
-        { 0,  0, 0 },
-        { 1, -1, 1 },
-    };
-    for (const auto & test_params : malformed_k1) {
-        set_k1_params(test_params[0], test_params[1], test_params[2]);
-        if (ggml_backend_graph_compute(backend.get(), k1_graph) == GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: malformed wire K=1 GATED_DELTA_NET parameters were accepted\n", __func__);
+    const char marker = 'G';
+    if (write(marker_fd, &marker, sizeof(marker)) != sizeof(marker)) {
+        return 6;
+    }
+    fprintf(stderr, "RPC GDN wire test: malformed graph sent without an acknowledgement; issuing synchronous buffer clear\n");
+    ggml_backend_buffer_clear(buffer.get(), 0);
+    fprintf(stderr, "RPC GDN wire test: server unexpectedly accepted the malformed graph\n");
+    return 7;
+}
+
+static bool test_gated_delta_net_rpc_rejection(const char * executable) {
+    rpc_test_process server;
+    std::string endpoint;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const int port = rpc_test_find_loopback_port();
+        if (port < 0) {
+            continue;
+        }
+        endpoint = "127.0.0.1:" + std::to_string(port);
+        fprintf(stderr, "RPC GDN wire test: launching server at %s (attempt %d/4)\n", endpoint.c_str(), attempt + 1);
+        server.pid = fork();
+        if (server.pid == 0) {
+            execl(executable, executable, "--rpc-gdn-rejection-server", endpoint.c_str(), static_cast<char *>(nullptr));
+            _exit(127);
+        }
+        if (server.pid < 0) {
+            server.pid = -1;
             return false;
         }
-    }
-    ggml_gated_delta_net_set_snapshots(k1_out, 1, -1, false);
-    if (ggml_backend_graph_compute(backend.get(), k1_graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: valid wire K=1 GATED_DELTA_NET was rejected\n", __func__);
-        return false;
-    }
-
-    std::vector<uint8_t> sentinel(ggml_nbytes(k1_out), 0x5a);
-    std::vector<uint8_t> observed(sentinel.size());
-    ggml_backend_tensor_set(k1_out, sentinel.data(), 0, sentinel.size());
-    if (ggml_backend_rpc_test_compute_truncated(backend.get()) != 0) {
-        fprintf(stderr, "%s: truncated graph compute did not return protocol failure\n", __func__);
-        return false;
-    }
-    if (ggml_backend_rpc_test_recompute(backend.get()) != 0) {
-        fprintf(stderr, "%s: recompute retained a graph after truncated graph compute\n", __func__);
-        return false;
-    }
-    ggml_backend_tensor_get(k1_out, observed.data(), 0, observed.size());
-    if (observed != sentinel) {
-        fprintf(stderr, "%s: recompute executed the graph invalidated by truncated graph compute\n", __func__);
-        return false;
-    }
-    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: valid graph after truncated graph compute was rejected\n", __func__);
-        return false;
-    }
-
-    if (!ggml_backend_rpc_test_fail_next_recompute(backend.get())) {
-        fprintf(stderr, "%s: failed to inject a recompute backend failure\n", __func__);
-        return false;
-    }
-    if (ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: normal client accepted the injected recompute backend failure\n", __func__);
-        return false;
-    }
-    if (ggml_backend_rpc_test_recompute(backend.get()) != 0) {
-        fprintf(stderr, "%s: raw recompute retained the graph after backend failure\n", __func__);
-        return false;
-    }
-    if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: normal client did not resend the graph after recompute backend failure\n", __func__);
-        return false;
-    }
-
-    ggml_init_params larger_params = {
-        /* .mem_size   = */ ggml_tensor_overhead()*128 + ggml_graph_overhead(),
-        /* .mem_buffer = */ nullptr,
-        /* .no_alloc   = */ true,
-    };
-    ggml_context_ptr larger_ctx(ggml_init(larger_params));
-    GGML_ASSERT(larger_ctx != nullptr);
-    test_gated_delta_net larger_test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 4);
-    ggml_tensor * larger_gdn = larger_test.build_graph(larger_ctx.get());
-    ggml_tensor * larger_out = larger_gdn;
-    for (int i = 0; i < 16; ++i) {
-        larger_out = ggml_scale(larger_ctx.get(), larger_out, 1.0f);
-    }
-    ggml_cgraph * larger_graph = ggml_new_graph(larger_ctx.get());
-    ggml_build_forward_expand(larger_graph, larger_out);
-    GGML_ASSERT(ggml_graph_n_nodes(larger_graph) > ggml_graph_n_nodes(k1_graph));
-    ggml_backend_buffer_ptr larger_buffer(ggml_backend_alloc_ctx_tensors(larger_ctx.get(), backend.get()));
-    if (larger_buffer == nullptr) {
-        fprintf(stderr, "%s: failed to allocate the larger RPC graph tensors\n", __func__);
-        return false;
-    }
-    ggml_backend_buffer_clear(larger_buffer.get(), 0);
-    memcpy(larger_gdn->op_params + 3, &malformed_reserve, sizeof(malformed_reserve));
-    if (ggml_backend_graph_compute(backend.get(), larger_graph) == GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: larger malformed wire GATED_DELTA_NET was accepted\n", __func__);
-        return false;
-    }
-    const int recompute_result = ggml_backend_rpc_test_recompute(backend.get());
-    if (recompute_result != 0) {
-        fprintf(stderr, "%s: recompute after rejected graph returned %d instead of protocol failure\n", __func__, recompute_result);
-        return false;
-    }
-
-    if (cuda_device >= 0) {
-        ggml_backend_ptr cuda_backend(ggml_backend_rpc_init(endpoint.c_str(), (uint32_t) cuda_device));
-        if (cuda_backend == nullptr) {
-            fprintf(stderr, "%s: failed to initialize the CUDA RPC test backend\n", __func__);
-            return false;
+        if (rpc_test_wait_for_server(port)) {
+            break;
         }
-        ggml_init_params cuda_params = {
-            /* .mem_size   = */ ggml_tensor_overhead()*64 + 2*ggml_graph_overhead(),
-            /* .mem_buffer = */ nullptr,
-            /* .no_alloc   = */ true,
-        };
-        ggml_context_ptr cuda_ctx(ggml_init(cuda_params));
-        test_gated_delta_net cuda_supported_test(GGML_TYPE_F32, 2, 16, 1, 1);
-        ggml_tensor * cuda_supported_out = cuda_supported_test.build_graph(cuda_ctx.get());
-        ggml_cgraph * cuda_supported_graph = ggml_new_graph(cuda_ctx.get());
-        ggml_build_forward_expand(cuda_supported_graph, cuda_supported_out);
-        test_gated_delta_net cuda_unsupported_test(GGML_TYPE_F32, 2, 8, 1, 1);
-        ggml_tensor * cuda_unsupported_out = cuda_unsupported_test.build_graph(cuda_ctx.get());
-        ggml_cgraph * cuda_unsupported_graph = ggml_new_graph(cuda_ctx.get());
-        ggml_build_forward_expand(cuda_unsupported_graph, cuda_unsupported_out);
-        ggml_backend_buffer_ptr cuda_buffer(ggml_backend_alloc_ctx_tensors(cuda_ctx.get(), cuda_backend.get()));
-        if (cuda_buffer == nullptr) {
-            fprintf(stderr, "%s: failed to allocate CUDA RPC graph tensors\n", __func__);
-            return false;
-        }
-        ggml_backend_buffer_clear(cuda_buffer.get(), 0);
-        if (ggml_backend_graph_compute(cuda_backend.get(), cuda_supported_graph) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: CUDA RPC rejected supported GATED_DELTA_NET S_v=16\n", __func__);
-            return false;
-        }
-        if (ggml_backend_graph_compute(cuda_backend.get(), cuda_unsupported_graph) == GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "%s: CUDA RPC silently accepted unsupported GATED_DELTA_NET S_v=8\n", __func__);
-            return false;
-        }
+        server.stop();
+        endpoint.clear();
+    }
+    if (endpoint.empty()) {
+        fprintf(stderr, "RPC GDN wire test: server readiness timed out\n");
+        return false;
+    }
+    fprintf(stderr, "RPC GDN wire test: server ready\n");
+
+    int marker_pipe[2];
+    if (pipe(marker_pipe) != 0) {
+        return false;
+    }
+    const std::string marker_fd = std::to_string(marker_pipe[1]);
+    rpc_test_process client;
+    client.pid = fork();
+    if (client.pid == 0) {
+        close(marker_pipe[0]);
+        execl(executable, executable, "--rpc-gdn-rejection-client", endpoint.c_str(), marker_fd.c_str(), static_cast<char *>(nullptr));
+        _exit(127);
+    }
+    close(marker_pipe[1]);
+    if (client.pid < 0) {
+        close(marker_pipe[0]);
+        client.pid = -1;
+        return false;
     }
 
-    fprintf(stderr, "%s: valid wire GATED_DELTA_NET graphs succeeded and malformed graphs returned failure status\n", __func__);
+    fprintf(stderr, "RPC GDN wire test: client started; waiting up to 5 seconds for teardown\n");
+    int status = 0;
+    if (!client.wait_for(status, std::chrono::seconds(5))) {
+        fprintf(stderr, "RPC GDN wire test: client teardown observation timed out\n");
+        close(marker_pipe[0]);
+        return false;
+    }
+    char marker = 0;
+    ssize_t marker_size;
+    do {
+        marker_size = read(marker_pipe[0], &marker, sizeof(marker));
+    } while (marker_size < 0 && errno == EINTR);
+    close(marker_pipe[0]);
+    if (marker_size != sizeof(marker) || marker != 'G') {
+        fprintf(stderr, "RPC GDN wire test: client failed before sending the malformed graph\n");
+        return false;
+    }
+    if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGABRT) {
+        fprintf(stderr, "RPC GDN wire test: synchronous follow-up did not observe server teardown (status=%d)\n", status);
+        return false;
+    }
+    fprintf(stderr, "RPC GDN wire test: synchronous follow-up observed server rejection and teardown\n");
     return true;
 }
 #endif
+
 
 struct test_gated_delta_net_fused_cache : public test_case {
     const int64_t head_count;
@@ -5166,20 +5137,7 @@ struct test_gated_delta_net_fused_cache : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_is_view_op(t->op)) {
-                continue;
-            }
-            if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -20.0f, -1e-4f);
-            } else if (strcmp(t->name, "beta") == 0) {
-                init_tensor_uniform(t, 0.0f, 1.0f);
-            } else if (strcmp(t->name, "v") == 0) {
-                init_tensor_uniform(t, -0.3f, 5.0f);
-            } else {
-                init_tensor_uniform(t);
-            }
-        }
+        initialize_gated_delta_net_tensors(ctx);
     }
 };
 
@@ -11768,6 +11726,14 @@ static void usage(char ** argv) {
 }
 
 int main(int argc, char ** argv) {
+#ifdef GGML_TEST_RPC
+    if (argc == 3 && strcmp(argv[1], "--rpc-gdn-rejection-server") == 0) {
+        return test_gated_delta_net_rpc_server(argv[2]);
+    }
+    if (argc == 4 && strcmp(argv[1], "--rpc-gdn-rejection-client") == 0) {
+        return test_gated_delta_net_rpc_client(argv[2], atoi(argv[3]));
+    }
+#endif
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
     const char * op_names_filter = nullptr;
@@ -11858,7 +11824,7 @@ int main(int argc, char ** argv) {
 
 #ifdef GGML_TEST_RPC
     if (rpc_gdn_rejection) {
-        return test_gated_delta_net_rpc_rejection() ? 0 : 1;
+        return test_gated_delta_net_rpc_rejection(argv[0]) ? 0 : 1;
     }
 #endif
 
