@@ -6,6 +6,7 @@
 //    cmake -B build && cmake --build build --parallel && ./build/bin/test-chat ../minja/build/tests/*.jinja 2>/dev/null
 //
 #include "../src/llama-grammar.h"
+#include "../src/llama-model.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
 #include "../tools/server/server-speculative-replay.h"
@@ -178,9 +179,11 @@ static void test_speculative_replay_state_transitions() {
     assert_equals(false, state.excludes_replayed_token_from_acceptance());
 
     const llama_tokens expected_tokens = { 11, 22, 33 };
-    // This opaque sampler sentinel is never dereferenced or freed.
-    auto * sampler_sentinel = reinterpret_cast<common_sampler *>(&state);
-    common_sampler_ptr sampler(sampler_sentinel);
+    llama_model_ptr sampler_model(llama_model_create(LLM_ARCH_LLAMA, llama_model_default_params()));
+    common_params_sampling sampler_params;
+    sampler_params.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
+    common_sampler_ptr sampler(common_sampler_init(sampler_model.get(), sampler_params));
+    common_sampler * sampler_ptr = sampler.get();
 
     state.arm_mtp_gpu_snapshots();
     state.begin_mtp_gpu_replay(expected_tokens, std::move(sampler), 2);
@@ -191,8 +194,7 @@ static void test_speculative_replay_state_transitions() {
     llama_tokens replayed_tokens = { 99 };
     common_sampler_ptr replayed_sampler;
     const uint32_t accepted = state.consume_mtp_gpu_replay(replayed_tokens, replayed_sampler);
-    const bool sampler_transferred = replayed_sampler.get() == sampler_sentinel;
-    replayed_sampler.release();
+    const bool sampler_transferred = replayed_sampler.get() == sampler_ptr;
     state.reset();
 
     assert_equals(true, sampler_moved);
