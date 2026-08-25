@@ -1,6 +1,7 @@
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "ggml-cpu.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 
@@ -143,7 +144,7 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.handle = std::make_unique<ggml_backend>();
     b.handle->iface.get_name      = dummy_backend_get_name;
     b.handle->iface.graph_compute = dummy_backend_graph_compute;
-    b.handle->device              = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    b.handle->device              = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
     b.handle->context             = b.context.get();
     return b;
 }
