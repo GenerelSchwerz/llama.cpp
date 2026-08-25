@@ -76,6 +76,21 @@ goes by the recorded answer. How much of a staged input can go early moves with
 every ubatch; *which* input copies live in the ring must not, because their
 addresses were handed out at allocation time.
 
+Two things disqualify an input that otherwise looks eligible:
+
+- **A reader further down the graph.** The scheduler creates one input copy per
+  (tensor, backend), not per split, so a later split can be pointed at the same
+  copy without appearing to consume it -- and by then the ring may have recycled
+  the slot. The plan scans the splits after the owner for such a reader and puts
+  those inputs back on the ordered path. Attention does not produce this shape,
+  but nothing in the scheduler forbids it.
+- **No room on the device.** A slot holds one split's whole delivery, so the ring
+  grows with the context: 27 MiB at 4k, 213 MiB at 32k, 1.7 GiB at 256k. The ring
+  is allocated after the graph allocator has reserved its buffers, so it must not
+  take the room those buffers may still have to grow into; it declines unless it
+  can leave `GGML_SCHED_TRANSPORT_HEADROOM` (512 MiB) free, says so once, and
+  stays on the ordered path.
+
 ### 3. A look-ahead that stays clear of the ring's tail
 
 A delivery running `L` splits ahead recycles the slot of the split `L - n_slots`
@@ -173,8 +188,13 @@ transport never enabled because the scheduler is given a depth of 0.
 ## Scope and limits
 
 - Only inputs carrying a stable prefix are eligible. Everything else -- weights,
-  user inputs, a transposed V cache, any backend that cannot transfer
-  asynchronously or record events -- keeps the ordered path untouched.
+  user inputs, a transposed V cache, an input copy with a reader in a later
+  split, any backend that cannot transfer asynchronously or record events --
+  keeps the ordered path untouched.
+- The ring costs `(depth + 2) x (largest staged split)` of device memory, and a
+  staged split is both K and V of one attention layer over the whole context. That
+  is linear in context length, and it is what bounds the feature at depth rather
+  than anything about the transfer itself.
 - One ring, on the first backend that qualifies. Additional accelerators keep the
   ordered path; multi-GPU host-KV is not covered.
 - The scheduler must be configured with the device's own default buffer type. A
