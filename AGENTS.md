@@ -18,9 +18,23 @@ small:
   `GGML_TYPE_Q2_0S` so it cannot collide with upstream's serialized Q2_0 weight
   format.
 - A profit-only adaptive draft-max controller for DFlash.
+- Pipelined delivery of a host-resident KV cache, selected with
+  `--kv-pipeline-depth` and bounded by `--kv-pipeline-budget`.
 - Reasoning-loop detection and the opted-in realtime
   `/v1/chat/completions/control` endpoint.
 - INI presets and KLD measurement support in `llama-perplexity`.
+
+`--kv-pipeline-depth N` issues the host-to-device delivery of a host-resident KV
+cache N splits ahead of the split that reads it, on a transfer stream of its own,
+so a decode token stops paying transfer and attention in series. It is on by
+default at `N = 1`, `0` restores the ordered path exactly, and it only engages
+where a host-resident cache produces the deliveries (`--no-kv-offload`, with or
+without `--kv-cpu-pinned`). Output is byte-identical either way. The staging it
+needs grows with the context, so `--kv-pipeline-budget` (default 128 MiB) caps it
+outright and the scheduler declines past the cap rather than spending the device
+memory a host-resident cache exists to save. Measured single-GPU only. See
+[`docs/kv-transport-pipelining.md`](docs/kv-transport-pipelining.md) for the
+design, the numbers, the limits, and the reproduction scripts.
 
 DFlash GGUFs must use upstream's `dflash` architecture, metadata, and tensor
 names.
