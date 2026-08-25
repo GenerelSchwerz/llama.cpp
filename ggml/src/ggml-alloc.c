@@ -518,30 +518,30 @@ struct ggml_gallocr {
     bool shrink_requested;
     uint64_t generation;
 
-    struct ggml_gallocr_resizable_buffers * resizable_buffers;
-    int resizable_role;
-    int * resizable_entry_ids; // [n_buffers], -1 for private buffers
+    struct ggml_gallocr_shared_buffers * shared_buffers;
+    int shared_role;
+    int * shared_entry_ids; // [n_buffers], -1 for private buffers
 };
 
-enum ggml_gallocr_resizable_role {
-    GGML_GALLOCR_RESIZABLE_ROLE_OWNER    = 0,
-    GGML_GALLOCR_RESIZABLE_ROLE_BORROWER = 1,
-    GGML_GALLOCR_RESIZABLE_ROLE_COUNT    = 2,
+enum ggml_gallocr_shared_role {
+    GGML_GALLOCR_SHARED_ROLE_OWNER    = 0,
+    GGML_GALLOCR_SHARED_ROLE_BORROWER = 1,
+    GGML_GALLOCR_SHARED_ROLE_COUNT    = 2,
 };
 
-struct ggml_gallocr_resizable_entry {
+struct ggml_gallocr_shared_entry {
     ggml_backend_buffer_type_t buft;
     struct vbuffer * buffer;
-    size_t requirements[GGML_GALLOCR_RESIZABLE_ROLE_COUNT][GGML_VBUFFER_MAX_CHUNKS];
+    size_t requirements[GGML_GALLOCR_SHARED_ROLE_COUNT][GGML_VBUFFER_MAX_CHUNKS];
 };
 
-struct ggml_gallocr_resizable_buffers {
-    struct ggml_gallocr_resizable_entry * entries;
+struct ggml_gallocr_shared_buffers {
+    struct ggml_gallocr_shared_entry * entries;
     int n_entries;
     int refs;
 
-    bool active[GGML_GALLOCR_RESIZABLE_ROLE_COUNT];
-    bool shrink_seen[GGML_GALLOCR_RESIZABLE_ROLE_COUNT];
+    bool active[GGML_GALLOCR_SHARED_ROLE_COUNT];
+    bool shrink_seen[GGML_GALLOCR_SHARED_ROLE_COUNT];
     bool shrink_pending;
 
     uint64_t generation;
@@ -600,7 +600,7 @@ static bool ggml_gallocr_resize_buffer(
 
 static bool ggml_gallocr_resize_private_buffers(ggml_gallocr_t galloc) {
     for (int i = 0; i < galloc->n_buffers; ++i) {
-        if (galloc->resizable_buffers != NULL && galloc->resizable_entry_ids[i] >= 0) {
+        if (galloc->shared_buffers != NULL && galloc->shared_entry_ids[i] >= 0) {
             continue;
         }
 
@@ -622,12 +622,12 @@ static bool ggml_gallocr_resize_private_buffers(ggml_gallocr_t galloc) {
     return true;
 }
 
-static bool ggml_gallocr_resizable_resize_entry(
-        struct ggml_gallocr_resizable_buffers * shared,
-        struct ggml_gallocr_resizable_entry * entry,
+static bool ggml_gallocr_resize_shared_entry(
+        struct ggml_gallocr_shared_buffers * shared,
+        struct ggml_gallocr_shared_entry * entry,
         bool shrink) {
     size_t required[GGML_VBUFFER_MAX_CHUNKS] = {0};
-    for (int role = 0; role < GGML_GALLOCR_RESIZABLE_ROLE_COUNT; ++role) {
+    for (int role = 0; role < GGML_GALLOCR_SHARED_ROLE_COUNT; ++role) {
         if (!shared->active[role]) {
             continue;
         }
@@ -665,19 +665,19 @@ static bool ggml_gallocr_resizable_resize_entry(
     return true;
 }
 
-static bool ggml_gallocr_resizable_publish(ggml_gallocr_t galloc) {
-    struct ggml_gallocr_resizable_buffers * shared = galloc->resizable_buffers;
+static bool ggml_gallocr_publish_shared_requirements(ggml_gallocr_t galloc) {
+    struct ggml_gallocr_shared_buffers * shared = galloc->shared_buffers;
     GGML_ASSERT(shared != NULL);
 
     for (int i = 0; i < galloc->n_buffers; ++i) {
-        const int entry_id = galloc->resizable_entry_ids[i];
+        const int entry_id = galloc->shared_entry_ids[i];
         if (entry_id < 0) {
             continue;
         }
 
         bool duplicate = false;
         for (int j = 0; j < i; ++j) {
-            if (galloc->resizable_entry_ids[j] == entry_id) {
+            if (galloc->shared_entry_ids[j] == entry_id) {
                 duplicate = true;
                 break;
             }
@@ -686,7 +686,7 @@ static bool ggml_gallocr_resizable_publish(ggml_gallocr_t galloc) {
             continue;
         }
 
-        size_t * requirements = shared->entries[entry_id].requirements[galloc->resizable_role];
+        size_t * requirements = shared->entries[entry_id].requirements[galloc->shared_role];
         memset(requirements, 0, GGML_VBUFFER_MAX_CHUNKS * sizeof(*requirements));
         for (int chunk = 0; chunk < galloc->buf_tallocs[i]->n_chunks; ++chunk) {
             requirements[chunk] = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], chunk);
@@ -695,9 +695,9 @@ static bool ggml_gallocr_resizable_publish(ggml_gallocr_t galloc) {
 
     bool shrink = false;
     if (shared->shrink_pending) {
-        shared->shrink_seen[galloc->resizable_role] = true;
+        shared->shrink_seen[galloc->shared_role] = true;
         shrink = true;
-        for (int role = 0; role < GGML_GALLOCR_RESIZABLE_ROLE_COUNT; ++role) {
+        for (int role = 0; role < GGML_GALLOCR_SHARED_ROLE_COUNT; ++role) {
             if (shared->active[role] && !shared->shrink_seen[role]) {
                 shrink = false;
                 break;
@@ -706,7 +706,7 @@ static bool ggml_gallocr_resizable_publish(ggml_gallocr_t galloc) {
     }
 
     for (int i = 0; i < shared->n_entries; ++i) {
-        if (!ggml_gallocr_resizable_resize_entry(shared, &shared->entries[i], shrink)) {
+        if (!ggml_gallocr_resize_shared_entry(shared, &shared->entries[i], shrink)) {
             return false;
         }
     }
@@ -719,7 +719,7 @@ static bool ggml_gallocr_resizable_publish(ggml_gallocr_t galloc) {
 }
 
 static bool ggml_gallocr_resize_buffers(ggml_gallocr_t galloc) {
-    if (galloc->resizable_buffers != NULL && !ggml_gallocr_resizable_publish(galloc)) {
+    if (galloc->shared_buffers != NULL && !ggml_gallocr_publish_shared_requirements(galloc)) {
         return false;
     }
     if (!ggml_gallocr_resize_private_buffers(galloc)) {
@@ -730,10 +730,10 @@ static bool ggml_gallocr_resize_buffers(ggml_gallocr_t galloc) {
 }
 
 static struct vbuffer * ggml_gallocr_get_vbuffer(ggml_gallocr_t galloc, int buffer_id) {
-    if (galloc->resizable_buffers != NULL) {
-        const int entry_id = galloc->resizable_entry_ids[buffer_id];
+    if (galloc->shared_buffers != NULL) {
+        const int entry_id = galloc->shared_entry_ids[buffer_id];
         if (entry_id >= 0) {
-            return galloc->resizable_buffers->entries[entry_id].buffer;
+            return galloc->shared_buffers->entries[entry_id].buffer;
         }
     }
     return galloc->buffers[buffer_id];
@@ -779,13 +779,13 @@ ggml_gallocr_t ggml_gallocr_new(ggml_backend_buffer_type_t buft) {
     return ggml_gallocr_new_n(&buft, 1);
 }
 
-static void ggml_gallocr_resizable_start_shrink(struct ggml_gallocr_resizable_buffers * shared) {
+static void ggml_gallocr_shared_start_shrink(struct ggml_gallocr_shared_buffers * shared) {
     shared->shrink_pending = true;
     memset(shared->shrink_seen, 0, sizeof(shared->shrink_seen));
     shared->shrink_generation++;
 }
 
-static void ggml_gallocr_resizable_free(struct ggml_gallocr_resizable_buffers * shared) {
+static void ggml_gallocr_shared_free(struct ggml_gallocr_shared_buffers * shared) {
     for (int i = 0; i < shared->n_entries; ++i) {
         ggml_vbuffer_free(shared->entries[i].buffer);
     }
@@ -793,14 +793,14 @@ static void ggml_gallocr_resizable_free(struct ggml_gallocr_resizable_buffers * 
     free(shared);
 }
 
-static void ggml_gallocr_resizable_detach(ggml_gallocr_t galloc) {
-    struct ggml_gallocr_resizable_buffers * shared = galloc->resizable_buffers;
+static void ggml_gallocr_detach_shared_buffers(ggml_gallocr_t galloc) {
+    struct ggml_gallocr_shared_buffers * shared = galloc->shared_buffers;
     if (shared == NULL) {
         return;
     }
 
-    const int role = galloc->resizable_role;
-    GGML_ASSERT(role >= 0 && role < GGML_GALLOCR_RESIZABLE_ROLE_COUNT);
+    const int role = galloc->shared_role;
+    GGML_ASSERT(role >= 0 && role < GGML_GALLOCR_SHARED_ROLE_COUNT);
     GGML_ASSERT(shared->active[role]);
     shared->active[role] = false;
     shared->shrink_seen[role] = false;
@@ -810,11 +810,11 @@ static void ggml_gallocr_resizable_detach(ggml_gallocr_t galloc) {
 
     shared->refs--;
     if (shared->refs == 0) {
-        ggml_gallocr_resizable_free(shared);
+        ggml_gallocr_shared_free(shared);
     } else {
-        ggml_gallocr_resizable_start_shrink(shared);
+        ggml_gallocr_shared_start_shrink(shared);
     }
-    galloc->resizable_buffers = NULL;
+    galloc->shared_buffers = NULL;
 }
 
 void ggml_gallocr_free(ggml_gallocr_t galloc) {
@@ -822,7 +822,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
         return;
     }
 
-    ggml_gallocr_resizable_detach(galloc);
+    ggml_gallocr_detach_shared_buffers(galloc);
 
     for (int i = 0; i < galloc->n_buffers; i++) {
         if (galloc->buffers != NULL) {
@@ -860,7 +860,7 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
-    free(galloc->resizable_entry_ids);
+    free(galloc->shared_entry_ids);
     free(galloc);
 }
 
@@ -872,15 +872,15 @@ static void ggml_gallocr_set_resizable_owner(ggml_gallocr_t galloc) {
         GGML_ASSERT(galloc->buffers[i] == NULL);
     }
 
-    struct ggml_gallocr_resizable_buffers * shared =
-            (struct ggml_gallocr_resizable_buffers *) calloc(1, sizeof(*shared));
+    struct ggml_gallocr_shared_buffers * shared =
+            (struct ggml_gallocr_shared_buffers *) calloc(1, sizeof(*shared));
     GGML_ASSERT(shared != NULL);
-    shared->entries = (struct ggml_gallocr_resizable_entry *) calloc(
+    shared->entries = (struct ggml_gallocr_shared_entry *) calloc(
             (size_t) galloc->n_buffers, sizeof(*shared->entries));
     GGML_ASSERT(shared->entries != NULL);
 
-    galloc->resizable_entry_ids = (int *) malloc((size_t) galloc->n_buffers * sizeof(int));
-    GGML_ASSERT(galloc->resizable_entry_ids != NULL);
+    galloc->shared_entry_ids = (int *) malloc((size_t) galloc->n_buffers * sizeof(int));
+    GGML_ASSERT(galloc->shared_entry_ids != NULL);
     for (int i = 0; i < galloc->n_buffers; ++i) {
         int entry_id = -1;
         for (int j = 0; j < shared->n_entries; ++j) {
@@ -893,15 +893,15 @@ static void ggml_gallocr_set_resizable_owner(ggml_gallocr_t galloc) {
             entry_id = shared->n_entries++;
             shared->entries[entry_id].buft = galloc->bufts[i];
         }
-        galloc->resizable_entry_ids[i] = entry_id;
+        galloc->shared_entry_ids[i] = entry_id;
     }
 
     shared->refs = 1;
-    shared->active[GGML_GALLOCR_RESIZABLE_ROLE_OWNER] = true;
+    shared->active[GGML_GALLOCR_SHARED_ROLE_OWNER] = true;
 
     galloc->resizable = true;
-    galloc->resizable_buffers = shared;
-    galloc->resizable_role = GGML_GALLOCR_RESIZABLE_ROLE_OWNER;
+    galloc->shared_buffers = shared;
+    galloc->shared_role = GGML_GALLOCR_SHARED_ROLE_OWNER;
 }
 
 static bool ggml_gallocr_set_resizable_borrower(ggml_gallocr_t galloc, ggml_gallocr_t owner) {
@@ -910,9 +910,9 @@ static bool ggml_gallocr_set_resizable_borrower(ggml_gallocr_t galloc, ggml_gall
     GGML_ASSERT(galloc != owner);
     GGML_ASSERT(!galloc->resizable);
 
-    struct ggml_gallocr_resizable_buffers * shared = owner->resizable_buffers;
-    if (shared == NULL || owner->resizable_role != GGML_GALLOCR_RESIZABLE_ROLE_OWNER ||
-            shared->active[GGML_GALLOCR_RESIZABLE_ROLE_BORROWER]) {
+    struct ggml_gallocr_shared_buffers * shared = owner->shared_buffers;
+    if (shared == NULL || owner->shared_role != GGML_GALLOCR_SHARED_ROLE_OWNER ||
+            shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER]) {
         return false;
     }
 
@@ -940,13 +940,13 @@ static bool ggml_gallocr_set_resizable_borrower(ggml_gallocr_t galloc, ggml_gall
     }
 
     shared->refs++;
-    shared->active[GGML_GALLOCR_RESIZABLE_ROLE_BORROWER] = true;
-    shared->shrink_seen[GGML_GALLOCR_RESIZABLE_ROLE_BORROWER] = false;
+    shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER] = true;
+    shared->shrink_seen[GGML_GALLOCR_SHARED_ROLE_BORROWER] = false;
 
     galloc->resizable = true;
-    galloc->resizable_buffers = shared;
-    galloc->resizable_role = GGML_GALLOCR_RESIZABLE_ROLE_BORROWER;
-    galloc->resizable_entry_ids = entry_ids;
+    galloc->shared_buffers = shared;
+    galloc->shared_role = GGML_GALLOCR_SHARED_ROLE_BORROWER;
+    galloc->shared_entry_ids = entry_ids;
     return true;
 }
 
@@ -967,16 +967,16 @@ void ggml_gallocr_get_resizable_state(
     GGML_ASSERT(generation != NULL);
     GGML_ASSERT(shrink_generation != NULL);
     *generation = galloc->generation +
-            (galloc->resizable_buffers ? galloc->resizable_buffers->generation : 0);
-    *shrink_generation = galloc->resizable_buffers ? galloc->resizable_buffers->shrink_generation : 0;
+            (galloc->shared_buffers ? galloc->shared_buffers->generation : 0);
+    *shrink_generation = galloc->shared_buffers ? galloc->shared_buffers->shrink_generation : 0;
 }
 
 void ggml_gallocr_request_shrink(ggml_gallocr_t galloc) {
     GGML_ASSERT(galloc != NULL);
     GGML_ASSERT(galloc->resizable);
     galloc->shrink_requested = true;
-    if (galloc->resizable_buffers != NULL && !galloc->resizable_buffers->shrink_pending) {
-        ggml_gallocr_resizable_start_shrink(galloc->resizable_buffers);
+    if (galloc->shared_buffers != NULL && !galloc->shared_buffers->shrink_pending) {
+        ggml_gallocr_shared_start_shrink(galloc->shared_buffers);
     }
 }
 

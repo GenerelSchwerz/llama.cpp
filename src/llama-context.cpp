@@ -630,6 +630,18 @@ llama_context * llama_context::shared_workspace_peer() const {
     return sched_buffer_owner != nullptr ? sched_buffer_owner : sched_buffer_borrower;
 }
 
+void llama_context::reset_sched_workspace() {
+    sched.reset();
+    gf_res_prev.reset();
+    gf_res_reserve.reset();
+    sched_buffer_generation = 0;
+    sched_shrink_generation = 0;
+    sched_buffers_shared = false;
+    workspace_in_flight = false;
+    sched_reserved_tokens = 0;
+    sched_need_reserve = true;
+}
+
 void llama_context::acquire_shared_workspace() {
     llama_context * peer = shared_workspace_peer();
     if (peer != nullptr && peer->workspace_in_flight) {
@@ -928,13 +940,7 @@ int llama_context::attach_shared_workspace(llama_context & owner) {
 
     synchronize();
     owner.synchronize();
-    sched.reset();
-    gf_res_prev.reset();
-    gf_res_reserve.reset();
-    sched_buffer_generation = 0;
-    sched_shrink_generation = 0;
-    sched_reserved_tokens = 0;
-    sched_need_reserve = true;
+    reset_sched_workspace();
 
     try {
         const auto owner_plan = owner.make_sched_reserve_plan(0);
@@ -952,13 +958,8 @@ int llama_context::attach_shared_workspace(llama_context & owner) {
         sched_reserve(0);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to attach the draft workspace: %s\n", __func__, err.what());
-        sched.reset();
+        reset_sched_workspace();
         sched_buffer_owner = nullptr;
-        sched_buffers_shared = false;
-        sched_buffer_generation = 0;
-        sched_shrink_generation = 0;
-        sched_reserved_tokens = 0;
-        sched_need_reserve = true;
         return -1;
     }
 
