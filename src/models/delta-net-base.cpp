@@ -563,6 +563,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
+    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+    if (n_seq_tokens < K) {
+        // A full-ubatch rollback needs the state from before the first token.
+        ggml_tensor * state_in = ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_tensor * state_in_update = ggml_view_2d(ctx0, ssm_states_all,
+            D, n_seqs, ssm_states_all->nb[1],
+            ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_in, state_in_update));
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
@@ -581,8 +593,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
-
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
     const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
