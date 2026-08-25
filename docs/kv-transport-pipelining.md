@@ -133,6 +133,12 @@ RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F,
 | 16,384 | 3 | 19.6765, 19.6854 | 31.5352, 31.5807 | **+60.4%** | 34.88 | 90.4% |
 | 32,768 | 3 | 13.0264, 13.0254 | 15.5325, 15.5329 | **+19.3%** | 20.83 | 74.6% |
 
+These are the uncapped numbers, measured before `--kv-pipeline-budget` existed;
+they are what the ring can buy, and the 32,768 row needs
+`--kv-pipeline-budget 512` to reproduce, because 213 MiB is over the 128 MiB
+default. At the default the 4,096 and 16,384 rows stand and 32,768 declines to
+the ordered path. See [The budget](#the-budget).
+
 Server decode behind an 18,422-token prompt
 (`docs/repro/r4-kv-pipeline-exact.sh`): **18.468 -> 30.685 t/s, +66.2%**.
 
@@ -264,8 +270,11 @@ transport never enabled because the scheduler is given a depth of 0.
   staged split is both K and V of one attention layer over the whole context. That
   is linear in context length, and it is what bounds the feature at depth rather
   than anything about the transfer itself.
-- One ring, on the first backend that qualifies. Additional accelerators keep the
-  ordered path; multi-GPU host-KV is not covered.
+- **One ring, on the first backend that qualifies. Additional accelerators keep
+  the ordered path, and nothing here has been measured on more than one GPU** --
+  every number in this document is `-sm none -mg 0` on a single RTX 4070. A
+  multi-GPU host-resident cache needs its own validation before any of this is
+  claimed for it.
 - The scheduler must be configured with the device's own default buffer type. A
   scheduler built on a split or host buffer type keeps the ordered path.
 - `GGML_KV_PIPELINE_DEPTH` overrides the depth for tools that do not expose the
