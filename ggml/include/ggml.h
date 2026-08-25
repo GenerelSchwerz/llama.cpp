@@ -732,10 +732,26 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        // number of leading bytes of this tensor's storage that are guaranteed not to be
+        // written during a single graph evaluation. 0 means "not known".
+        // set on the tensor that owns the storage, by whoever knows what the graph will write;
+        // a view inherits the part of it that its own byte window covers. read by the backend
+        // scheduler, which may use it to deliver a host-resident split input to an accelerator
+        // before the split that reads it runs, see
+        // ggml_backend_sched_set_transport_pipeline_depth().
+        // (kept last, in place of the former trailing padding, so that sizeof(struct ggml_tensor)
+        // does not change)
+        size_t stable_prefix;
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
+
+    // declare that the first nbytes bytes of tensor->data cannot change while a graph that
+    // reads this tensor is being evaluated. nbytes is clamped to ggml_nbytes(tensor).
+    // set it on the tensor that owns the storage, not on a view of it, and keep it current:
+    // it must describe the graph that is about to run, including when that graph is reused.
+    GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);
+    GGML_API size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor);
 
     // Abort callback
     // If not NULL, called before ggml computation

@@ -512,6 +512,11 @@ extern "C" {
                                       // Fit/no-alloc contexts still measure the full prompt reservation.
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent.
                                       // false preserves the full-context reservation and initialization order.
+        uint32_t kv_pipeline_depth;   // how many splits ahead the scheduler delivers a host-resident KV cache to the
+                                      // accelerator, so that the transfer runs while the previous split computes.
+                                      // 0 keeps the ordered path, where a decode token pays the transfer and the
+                                      // attention kernels in series. Costs (kv_pipeline_depth + 2) * (largest staged
+                                      // split) of device memory.
     };
 
     struct llama_model_tensor_override {

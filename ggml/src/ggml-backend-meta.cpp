@@ -434,7 +434,10 @@ struct ggml_backend_meta_buffer_context {
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
-    static constexpr size_t nbtc = GGML_TENSOR_SIZE - sizeof(ggml_tensor::padding);
+    // ggml_tensor::stable_prefix is a hint for the backend scheduler that this backend does
+    // not consume, and it changes from graph to graph, so keep it out of the compared image
+    // together with the trailing padding.
+    static constexpr size_t nbtc = offsetof(ggml_tensor, stable_prefix);
     std::map<std::pair<const ggml_tensor *, bool>, std::pair<ggml_backend_meta_split_state, char[nbtc]>> split_state_cache;
 
     int debug;

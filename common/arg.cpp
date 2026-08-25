@@ -2588,6 +2588,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
     add_opt(common_arg(
+        {"--kv-pipeline-depth"}, "N",
+        string_format("how many splits ahead the scheduler delivers a host-resident KV cache to the accelerator, so "
+                      "that the transfer runs while the previous split computes; 0 keeps the ordered path, where a "
+                      "decode token pays the transfer and the attention kernels in series. Only takes effect with a "
+                      "host-resident cache, e.g. --no-kv-offload or --kv-cpu-pinned, and costs (N + 2) * (largest "
+                      "staged split) of device memory (default: %d)", params.kv_pipeline_depth),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 14) {
+                throw std::invalid_argument("--kv-pipeline-depth must be between 0 and 14");
+            }
+            params.kv_pipeline_depth = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIPELINE_DEPTH"));
+    add_opt(common_arg(
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},
         string_format("for hybrid attention/recurrent models, keep the fixed recurrent (R/S) state GPU-resident "
