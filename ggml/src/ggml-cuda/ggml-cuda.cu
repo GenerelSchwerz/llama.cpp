@@ -5577,15 +5577,6 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_dev_t dev) {
-    GGML_UNUSED(dev);
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    return false;
-#else
-    return true;
-#endif
-}
-
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5605,9 +5596,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
-    }
-    if (strcmp(name, "ggml_backend_recurrent_sparse_snapshots_supported") == 0) {
-        return (void *)ggml_backend_cuda_recurrent_sparse_snapshots_supported;
     }
     return nullptr;
 }

@@ -10,6 +10,14 @@ bool ggml_cuda_gated_delta_net_supported(int device, const ggml_tensor * dst) {
     if (!ggml_gated_delta_net_validate(dst)) {
         return false;
     }
+#ifdef GGML_USE_HIP
+    if (!ggml_gated_delta_net_has_default_snapshot_params(dst)) {
+        return false;
+    }
+#endif
+    if (!ggml_are_same_stride(dst->src[0], dst->src[1])) {
+        return false;
+    }
     const int64_t S_v = dst->src[2]->ne[0];
     if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
         return false;
@@ -269,9 +277,7 @@ static void launch_gated_delta_net(
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
-    if (!ggml_cuda_gated_delta_net_supported(ctx.device, dst)) {
-        return;
-    }
+    GGML_ASSERT(ggml_cuda_gated_delta_net_supported(ctx.device, dst));
 
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];

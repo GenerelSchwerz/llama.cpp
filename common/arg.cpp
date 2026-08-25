@@ -4171,7 +4171,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "total target recurrent-state planes for draft-mtp, including the current state (default: 0, allocate spec-draft-n-max + 1)",
         [](common_params & params, int value) {
             params.speculative.mtp_rs_planes = value;
-            params.speculative.mtp_rs_planes_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_RS_PLANES"));
     add_opt(common_arg(

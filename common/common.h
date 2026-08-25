@@ -382,7 +382,6 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
-    bool mtp_rs_planes_explicit = false;
 
     bool has_dft() const {
         return !draft.mparams.empty();

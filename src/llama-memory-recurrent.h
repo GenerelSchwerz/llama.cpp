@@ -61,7 +61,6 @@ public:
 
     bool get_can_shift() const override;
     bool recurrent_sparse_snapshots_supported() const override;
-    bool recurrent_sparse_snapshot_backend_supported(ggml_backend_dev_t dev) const override;
     bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
     // state write/load
@@ -128,6 +127,7 @@ private:
     const uint32_t n_seq_max = 1;
 
     llama_recurrent_snapshot_mode next_snapshot_mode;
+    bool sparse_metadata_active = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;

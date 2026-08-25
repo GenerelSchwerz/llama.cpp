@@ -261,7 +261,7 @@ Unsupported samplers and device layouts fall back to CPU sampling. Tensor split 
 
 The effective target ubatch is `min(batch-size, ubatch-size)`, or `batch-size` when `ubatch-size` is zero. For capped replay it must be at least `--spec-draft-n-max + 1`. A nonzero draft ubatch override must equal the target ubatch.
 
-Every device that stores recurrent state and every device selected for the recurrent graph operations must support sparse snapshots. The server rejects an unsupported device layout at startup; it does not move recurrent state to another device or fall back to CPU.
+Every device selected for the recurrent graph operations must support sparse snapshots. The server rejects an unsupported device layout at startup; it does not move the operations to another device or fall back to CPU.
 
 Plane 0 contains the newest trailing state. The following planes contain older trailing states, and plane `K - 1` preserves the state from before verification. If a verification batch has fewer than `K - 1` tokens, the gap between its trailing states and the reserved input plane remains untouched, including the recorded positions. Rollbacks inside the retained trailing range select a plane directly. A deeper partial acceptance restores the reserved pre-verification plane and replays the full verification batch while writing only the selected boundary.
 

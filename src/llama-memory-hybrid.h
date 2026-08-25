@@ -60,7 +60,6 @@ public:
     bool get_can_shift() const override;
 
     bool recurrent_sparse_snapshots_supported() const override;
-    bool recurrent_sparse_snapshot_backend_supported(ggml_backend_dev_t dev) const override;
     bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
     bool get_supports_partial_kv() const override {

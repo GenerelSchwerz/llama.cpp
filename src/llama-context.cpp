@@ -532,6 +532,30 @@ llama_context::~llama_context() {
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
+
+    const auto supports_sparse_gdn = [](ggml_backend_dev_t device, const ggml_tensor * op) {
+        if (device == nullptr || op == nullptr || op->op != GGML_OP_GATED_DELTA_NET || op->src[2] == nullptr) {
+            return false;
+        }
+
+        int32_t n_snapshots;
+        memcpy(&n_snapshots, op->op_params, sizeof(n_snapshots));
+        const int64_t n_tokens = op->src[2]->ne[2];
+        if (n_snapshots <= 1 || n_tokens <= 0) {
+            return false;
+        }
+
+        ggml_tensor probe = *op;
+        ggml_gated_delta_net_set_snapshots(
+                &probe, (int32_t) std::min<int64_t>(n_tokens, n_snapshots - 1), -1, true);
+        if (!ggml_backend_dev_supports_op(device, &probe)) {
+            return false;
+        }
+
+        ggml_gated_delta_net_set_snapshots(&probe, 0, 0, false);
+        return ggml_backend_dev_supports_op(device, &probe);
+    };
+
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled, bool * sparse_snapshot_backend_supported = nullptr) {
         if (!enabled) {
             if (sparse_snapshot_backend_supported) {
@@ -558,7 +582,7 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
                 found = true;
                 ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node.tensor);
                 ggml_backend_dev_t device = backend ? ggml_backend_get_device(backend) : nullptr;
-                supported = supported && memory && memory->recurrent_sparse_snapshot_backend_supported(device);
+                supported = supported && supports_sparse_gdn(device, node.tensor);
             }
             *sparse_snapshot_backend_supported = found && supported;
         }

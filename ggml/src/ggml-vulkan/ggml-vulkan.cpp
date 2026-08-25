@@ -18538,7 +18538,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
         case GGML_OP_GATED_DELTA_NET:
             {
-                if (!ggml_gated_delta_net_has_default_snapshot_params(op)) {
+                if (!ggml_gated_delta_net_has_default_snapshot_params(op) ||
+                    !ggml_are_same_stride(op->src[0], op->src[1])) {
                     return false;
                 }
                 const uint32_t S_v = op->src[2]->ne[0];

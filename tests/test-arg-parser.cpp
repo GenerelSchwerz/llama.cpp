@@ -250,28 +250,27 @@ static void test(void) {
         std::vector<std::string> args;
         bool valid;
         int32_t planes;
-        int32_t planes_explicit;
         int32_t n_rs_seq;
         int32_t capped;
     };
     const mtp_parse_case mtp_cases[] = {
-        { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512" }, true, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8" }, true, 0, false, 8, false },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0" }, true, 0, true, 8, false },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2" }, true, 2, true, 1, true },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, true, 2, true, 1, true },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9" }, true, 9, true, 8, false },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "-1" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "1" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "10" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512" }, true, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8" }, true, 0, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0" }, true, 0, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2" }, true, 2, 1, true },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, true, 2, 1, true },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9" }, true, 9, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "-1" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "1" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "10" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
     };
     for (const auto & test_case : mtp_cases) {
         params = common_params();
@@ -280,7 +279,6 @@ static void test(void) {
         assert(test_case.valid == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
         if (test_case.planes >= 0) {
             assert(params.speculative.mtp_rs_planes == test_case.planes);
-            assert(params.speculative.mtp_rs_planes_explicit == (bool) test_case.planes_explicit);
             assert(params.speculative.need_n_rs_seq() == (uint32_t) test_case.n_rs_seq);
             assert(params.speculative.is_mtp_rs_capped() == (bool) test_case.capped);
         }
@@ -549,6 +547,20 @@ static void test_mtp_draft_ubatch_validation() {
     common_validate_speculative_params(params, 0, 512);
 
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    common_validate_speculative_params(params, 512, 512);
+
+    params.draft.n_ubatch = 0;
+    params.draft.n_max = 8;
+    params.mtp_rs_planes = 2;
+    rejected = false;
+    try {
+        common_validate_speculative_params(params, 512, 512);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
     common_validate_speculative_params(params, 512, 512);
 }
 

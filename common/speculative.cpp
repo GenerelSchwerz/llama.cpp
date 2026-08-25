@@ -172,6 +172,9 @@ struct common_speculative_impl {
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+
+    virtual bool get_mtp_replay_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+    virtual bool set_mtp_replay_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) { return false; }
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -1729,7 +1732,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
     }
 
-    bool get_replay_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const {
+    bool get_mtp_replay_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq ||
                 pending_h[seq_id].size() != (size_t) n_embd) {
             return false;
@@ -1744,7 +1747,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
-    bool set_replay_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) {
+    bool set_mtp_replay_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return false;
         }
@@ -2280,16 +2283,12 @@ void common_validate_speculative_params(
                 params.draft.n_ubatch, target_ubatch_raw));
     }
 
-    if (!params.mtp_rs_planes_explicit) {
+    if (params.mtp_rs_planes == 0) {
         return;
     }
 
     if (!has_mtp) {
         throw std::invalid_argument("spec-mtp-rs-planes requires --spec-type draft-mtp");
-    }
-
-    if (params.mtp_rs_planes == 0) {
-        return;
     }
 
     if (params.draft.n_max < 1) {
@@ -2905,8 +2904,8 @@ bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id se
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            return static_cast<common_speculative_impl_draft_mtp *>(impl.get())->get_replay_state(seq_id, data);
+        if (impl->get_mtp_replay_state(seq_id, data)) {
+            return true;
         }
     }
 
@@ -2920,8 +2919,8 @@ bool common_speculative_set_mtp_state(
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-            return static_cast<common_speculative_impl_draft_mtp *>(impl.get())->set_replay_state(seq_id, data);
+        if (impl->set_mtp_replay_state(seq_id, data)) {
+            return true;
         }
     }
 

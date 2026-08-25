@@ -1197,6 +1197,8 @@ private:
         }
 
         slots.clear();
+        capped_mtp_next_verification_slot = 0;
+        capped_mtp_prompt_turn = false;
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {

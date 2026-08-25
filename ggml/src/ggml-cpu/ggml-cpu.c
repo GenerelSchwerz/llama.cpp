@@ -2988,9 +2988,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
-                        if (!ggml_gated_delta_net_validate(node)) {
-                            break;
-                        }
+                        GGML_ASSERT(ggml_gated_delta_net_validate(node));
                         const int64_t S_v = node->src[2]->ne[0];
                         const int64_t K   = ggml_get_op_params_i32(node, 0);
                         const int64_t per_thread = S_v + (K > 1 ? S_v * S_v : 0);

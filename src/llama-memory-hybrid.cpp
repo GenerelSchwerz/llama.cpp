@@ -141,10 +141,6 @@ bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
     return mem_recr->recurrent_sparse_snapshots_supported();
 }
 
-bool llama_memory_hybrid::recurrent_sparse_snapshot_backend_supported(ggml_backend_dev_t dev) const {
-    return mem_recr->recurrent_sparse_snapshot_backend_supported(dev);
-}
-
 bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
     return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
 }

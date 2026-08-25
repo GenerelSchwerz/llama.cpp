@@ -4500,6 +4500,9 @@ struct test_gated_delta_net : public test_case {
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         if (trailing_snapshots >= 0) {
             ggml_gated_delta_net_set_snapshots(out, trailing_snapshots, selected_token, reserve_input);
+            if (mode == MODE_SUPPORT) {
+                return out;
+            }
             const int64_t attn_score_elems = head_size * head_count * v_repeat * n_seq_tokens * n_seqs;
             const int64_t state_elems = head_size * head_size * head_count * v_repeat * n_seqs;
             const int64_t n_written = selected_token >= 0 ? 1 : reserve_input ? K : trailing_snapshots;
@@ -4724,7 +4727,9 @@ static bool test_gated_delta_net_rejection() {
         return false;
     }
 
-    if (!rejects_change(out->src[0]->nb[2], out->src[0]->nb[2] + sizeof(float), "q and k stride")) {
+    out->src[0]->nb[2] += sizeof(float);
+    if (!ggml_backend_dev_supports_op(cpu, out)) {
+        fprintf(stderr, "%s: CPU rejected valid independent q/k strides\n", __func__);
         return false;
     }
 
@@ -4807,6 +4812,10 @@ static bool test_gated_delta_net_rejection() {
         }
         if (is_musa && ggml_backend_dev_supports_op(dev, cuda_grid_out)) {
             fprintf(stderr, "%s: MUSA accepted GATED_DELTA_NET\n", __func__);
+            return false;
+        }
+        if (is_cuda && ggml_backend_dev_supports_op(dev, out)) {
+            fprintf(stderr, "%s: %s accepted unsupported independent q/k strides\n", __func__, name);
             return false;
         }
         if (is_cuda && !test_gated_delta_net_cuda_grid_limits(dev, cuda_grid_out)) {

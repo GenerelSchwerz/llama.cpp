@@ -6371,10 +6371,8 @@ bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
     const int32_t selected_token     = ggml_get_op_params_i32(tensor, 2);
     const int32_t reserve_input      = ggml_get_op_params_i32(tensor, 3);
 
-    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
-        if (q->ne[i] != k->ne[i] || q->nb[i] != k->nb[i]) {
-            return false;
-        }
+    if (!ggml_are_same_shape(q, k)) {
+        return false;
     }
     const int64_t H_k = q->ne[1];
     if (q->ne[0] != s_v || q->ne[2] != n_tokens || n_seqs % q->ne[3] != 0 || H_k <= 0 || H % H_k != 0 ||
