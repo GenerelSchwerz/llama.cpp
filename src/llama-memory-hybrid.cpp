@@ -18,6 +18,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                     bool   offload_attn,
+ llama_memory_placement_options placement,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -25,7 +27,6 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
-                     bool   offload,
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
@@ -37,7 +38,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         type_k,
         type_v,
         v_trans,
-        offload,
+        offload_attn,
         unified,
         kv_size,
         n_seq_max,
@@ -49,13 +50,14 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        placement
     )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
         type_s,
-        offload,
+        placement.recurrent_offload,
         rs_size,
         n_seq_max,
         n_rs_seq,

@@ -24,7 +24,8 @@ llama_kv_cache_msa::llama_kv_cache_msa(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const layer_filter_cb & filter_idx,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    llama_memory_placement_options placement) :
     hparams_idx(model.hparams),
     n_stream(unified ? 1 : n_seq_max), n_seq_max(n_seq_max), n_pad(n_pad),
     n_swa(n_swa), swa_type(swa_type) {
@@ -34,7 +35,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter, reuse, nullptr, placement);
 
     // the MSA indexer uses a single key head per layer
     std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
@@ -46,7 +47,7 @@ llama_kv_cache_msa::llama_kv_cache_msa(
     kv_idx = std::make_unique<llama_kv_cache>(
             model, hparams_idx, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_idx, reuse, nullptr, placement);
 }
 
 void llama_kv_cache_msa::clear(bool data) {

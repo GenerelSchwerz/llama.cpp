@@ -125,6 +125,12 @@ static void test(void) {
     argv = {"binary_name", "-ngl", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    argv = {"binary_name", "--kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    argv = {"binary_name", "--spec-draft-kv-gpu-layers", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
     // wrong value (enum)
     argv = {"binary_name", "-sm", "hello"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -197,6 +203,37 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
     assert(params.speculative.draft.n_max == 123);
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "64"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 64);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--ubatch-size-draft", "32"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 32);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "-ubd", "16"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 16);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    params = common_params();
+    argv = {"binary_name", "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+
+    params = common_params();
+    params.model.path = "model_file.gguf";
+
+    common_params draft_arg_params;
+    assert(draft_arg_params.speculative.draft.kv_gpu_layers == -1);
+    argv = {"binary_name", "-m", "model_file.gguf", "--kv-gpu-layers-draft", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), draft_arg_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(draft_arg_params.speculative.draft.kv_gpu_layers == 0);
     argv = {"binary_name", "-lm", "none"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_NONE);
@@ -217,6 +254,60 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    {
+        const auto defaults = llama_context_default_params();
+        assert(!defaults.kv_cpu_pinned);
+        assert(!defaults.recurrent_state_offload);
+        assert(defaults.kv_gpu_layers == 0);
+
+        common_params placement_params;
+        argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--kv-gpu-layers", "4", "--recurrent-state-offload"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
+        assert(placement_params.no_kv_offload);
+        assert(placement_params.kv_cpu_pinned);
+        assert(placement_params.kv_gpu_layers == 4);
+        assert(placement_params.recurrent_state_offload);
+
+        const auto cparams = common_context_params_to_llama(placement_params);
+        assert(!cparams.offload_kqv);
+        assert(cparams.kv_cpu_pinned);
+        assert(cparams.kv_gpu_layers == 4);
+        assert(cparams.recurrent_state_offload);
+
+        argv = {"binary_name", "--no-kv-cpu-pinned", "--no-recurrent-state-offload"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), placement_params, LLAMA_EXAMPLE_COMMON));
+        assert(!placement_params.kv_cpu_pinned);
+        assert(!placement_params.recurrent_state_offload);
+    }
+
+    {
+        common_params draft_placement_params;
+        draft_placement_params.no_kv_offload = true;
+        draft_placement_params.kv_gpu_layers = 7;
+
+        const auto inherited = common_base_params_to_speculative(draft_placement_params);
+        assert(inherited.no_kv_offload);
+        assert(inherited.kv_gpu_layers == 7);
+
+        draft_placement_params.no_kv_offload = false;
+        draft_placement_params.speculative.draft.kv_gpu_layers = 3;
+        const auto overridden = common_base_params_to_speculative(draft_placement_params);
+        assert(overridden.no_kv_offload);
+        assert(overridden.kv_gpu_layers == 3);
+
+        const auto cparams = common_context_params_to_llama(overridden);
+        assert(!cparams.offload_kqv);
+        assert(cparams.kv_gpu_layers == 3);
+
+        draft_placement_params.speculative.draft.kv_gpu_layers = 0;
+        const auto host_only = common_base_params_to_speculative(draft_placement_params);
+        assert(host_only.no_kv_offload);
+        assert(host_only.kv_gpu_layers == 0);
+
+        assert(!draft_placement_params.no_kv_offload);
+        assert(draft_placement_params.kv_gpu_layers == 7);
+    }
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
@@ -231,6 +322,20 @@ static void test(void) {
     printf("test-arg-parser: skip on windows build\n");
 #else
     printf("test-arg-parser: test environment variables (valid + invalid usages)\n\n");
+
+    setenv("LLAMA_ARG_SPEC_DRAFT_UBATCH", "32", true);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_ubatch == 32);
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_UBATCH");
+
+    setenv("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS", "3", true);
+    common_params draft_env_params;
+    argv = {"binary_name", "-m", "model_file.gguf"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), draft_env_params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(draft_env_params.speculative.draft.kv_gpu_layers == 3);
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS");
 
     setenv("LLAMA_ARG_THREADS", "blah", true);
     argv = {"binary_name"};
@@ -320,9 +425,49 @@ static void test(void) {
     printf("test-arg-parser: all tests OK\n\n");
 }
 
+static void test_draft_ubatch_override() {
+    common_params params;
+    params.n_ubatch = 512;
+
+    const common_params inherited = common_base_params_to_speculative(params);
+    assert(inherited.n_ubatch == 512);
+
+    params.speculative.draft.n_ubatch = 64;
+    const common_params overridden = common_base_params_to_speculative(params);
+    assert(overridden.n_ubatch == 64);
+
+    const llama_context_params cparams = common_context_params_to_llama(overridden);
+    assert(cparams.n_ubatch == 64);
+
+    assert(params.n_ubatch == 512);
+}
+
+static void test_mtp_draft_ubatch_validation() {
+    common_params_speculative params;
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+
+    common_validate_speculative_params(params, 512);
+    params.draft.n_ubatch = 512;
+    common_validate_speculative_params(params, 512);
+
+    params.draft.n_ubatch = 128;
+    bool rejected = false;
+    try {
+        common_validate_speculative_params(params, 512);
+    } catch (const std::invalid_argument &) {
+        rejected = true;
+    }
+    assert(rejected);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    common_validate_speculative_params(params, 512);
+}
+
 int main(void) {
     try {
         test();
+        test_draft_ubatch_override();
+        test_mtp_draft_ubatch_validation();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;

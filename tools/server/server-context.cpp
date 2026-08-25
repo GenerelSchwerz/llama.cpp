@@ -967,6 +967,13 @@ private:
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
 
+        try {
+            common_validate_speculative_params(params_base.speculative, params_base.n_ubatch);
+        } catch (const std::invalid_argument & e) {
+            SRV_ERR("invalid speculative configuration: %s\n", e.what());
+            return false;
+        }
+
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),

@@ -324,6 +324,8 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_ubatch = 0; // physical draft batch size (0 = inherit target)
+    int32_t kv_gpu_layers = -1; // independently owned draft KV layers on GPU (-1 = inherit target policy)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -566,6 +568,9 @@ struct common_params {
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
+    bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
+    bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
+    int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

@@ -1303,6 +1303,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
             common_params_print_completion(ctx_arg);
             exit(0);
         }
+        common_validate_speculative_params(ctx_arg.params.speculative, ctx_arg.params.n_ubatch);
         params.lr.init();
     } catch (const std::invalid_argument & ex) {
         fprintf(stderr, "%s\n", ex.what());
@@ -2407,6 +2408,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_kv_offload = !value;
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
+    add_opt(common_arg(
+        {"--kv-cpu-pinned"},
+        {"--no-kv-cpu-pinned"},
+        string_format("use pinned host buffers for CPU-resident KV cache storage when available; with operation offload enabled, attention compute can remain on the accelerator (default: %s)",
+                      params.kv_cpu_pinned ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.kv_cpu_pinned = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
+    add_opt(common_arg(
+        {"--recurrent-state-offload"},
+        {"--no-recurrent-state-offload"},
+        string_format("offload recurrent state independently of attention KV storage (default: %s)",
+                      params.recurrent_state_offload ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.recurrent_state_offload = value;
+        }
+    ).set_env("LLAMA_ARG_RECURRENT_STATE_OFFLOAD"));
+    add_opt(common_arg(
+        {"--kv-gpu-layers"}, "N",
+        string_format("with --no-kv-offload, keep the first N independently owned attention KV layers device-resident "
+                      "for standard and direct hybrid caches. Unsupported specialized caches ignore this option "
+                      "(default: %d)", params.kv_gpu_layers),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-gpu-layers must not be negative");
+            }
+            params.kv_gpu_layers = value;
+        }
+    ).set_env("LLAMA_ARG_KV_GPU_LAYERS"));
     add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
@@ -4065,6 +4096,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--spec-draft-kv-gpu-layers", "--kv-gpu-layers-draft"}, "N",
+        "override target KV placement for the separate draft context and keep the first N independently owned "
+        "draft attention KV layers device-resident; shared KV layers follow their owner "
+        "(default: inherit target KV placement)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--spec-draft-kv-gpu-layers must not be negative");
+            }
+            params.speculative.draft.kv_gpu_layers = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_KV_GPU_LAYERS"));
+    add_opt(common_arg(
         {"--spec-draft-override-tensor", "-otd", "--override-tensor-draft"}, "<tensor name pattern>=<buffer type>,...",
         "override tensor buffer type for draft model", [](common_params & params, const std::string & value) {
             parse_tensor_buffer_overrides(value, params.speculative.draft.tensor_buft_overrides);
@@ -4109,6 +4153,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "--ubatch-size-draft", "-ubd"}, "N",
+        "physical maximum batch size for the draft context (default: 0, inherit target ubatch); "
+        "draft-mtp requires 0 or the target ubatch",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",
