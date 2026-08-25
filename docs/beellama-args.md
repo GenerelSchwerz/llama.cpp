@@ -5,6 +5,17 @@ BeeLlama extends. Run `llama-server --help` or `llama-cli --help` for the full
 upstream surface. See [BeeLlama features](beellama-features.md) for use cases,
 limits, and measurement guidance.
 
+## Quantized-native FlashAttention
+
+| Argument | Env var | Default | Behavior |
+|---|---|---|---|
+| `--flash-attn-native-quants`, `--no-flash-attn-native-quants` | `LLAMA_ARG_FLASH_ATTN_NATIVE_QUANTS` | disabled | Permits a backend to consume the K/V cache types already selected by `--cache-type-k` and `--cache-type-v` through a registered direct FlashAttention loader. It does not select cache formats. Every CUDA FlashAttention build (`GGML_CUDA_FA=ON`, its default) contains the family for `q8_0`, `q6_0`, `q5_0`, and `q4_0`, in every ordered K/V pairing of those types, at equal D=64/128/256 on the NVIDIA Ampere MMA implementation. `q4_1`, `q5_1`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1` require `GGML_CUDA_FA_ALL_QUANTS`, and are declined on a build without it. Unsupported layouts, head dimensions, and devices retain the standard materializing path and report a once-only warning. |
+
+CUDA FlashAttention builds contain the default native family; there is no
+separate build option to enable it. `GGML_CUDA_FA_ALL_QUANTS` is the single build flag
+that widens it to the remaining seven types. See the
+[design and validation guide](quantized-native-flash-attention.md).
+
 ## KVarN cache types and SWA overrides
 
 KVarN values are `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and

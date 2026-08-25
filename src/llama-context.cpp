@@ -586,6 +586,7 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.flash_attn_native_quants = params.flash_attn_native_quants;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -626,6 +627,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: causal_attn   = %d\n",   __func__, cparams.causal_attn);
     LLAMA_LOG_INFO("%s: flash_attn    = %s\n",   __func__, llama_flash_attn_type_name(params.flash_attn_type));
     LLAMA_LOG_INFO("%s: kv_unified    = %s\n",   __func__, cparams.kv_unified ? "true" : "false");
+    LLAMA_LOG_INFO("%s: fa_nat_quants = %s\n",   __func__, cparams.flash_attn_native_quants ? "true" : "false");
     LLAMA_LOG_INFO("%s: freq_base     = %.1f\n", __func__, cparams.rope_freq_base);
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
@@ -3163,7 +3165,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type), true);
 
     res->reset();
 
@@ -3191,13 +3193,15 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                   bool   is_reserve) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.is_reserve  =*/ is_reserve,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -4551,6 +4555,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.flash_attn_native_quants    =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

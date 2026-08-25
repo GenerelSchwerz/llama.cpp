@@ -13,6 +13,7 @@ BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing
 - **Variance-normalized KV-cache quantization (KVarN)**: provides higher precision at similar memory costs. Independent K and V bit widths at `kvarn2`, `kvarn3`, `kvarn4`, `kvarn5`, `kvarn6`, and `kvarn8`, set with `--cache-type-k` and `--cache-type-v`.
 - **KV cache precision tail**: keep most of the KV cache quantized while storing recent tokens in F16/BF16, enabled with `--kv-tail-tokens`. A single global softmax merges the quantized body and the precision tail under FlashAttention, without materializing the whole cache.
 - **Standard low-bit KV cache types**: `q2_0`, `q2_1`, `q3_0`, `q3_1`, `q6_0`, and `q6_1`, usable for either target or draft caches alongside the upstream `q4`/`q5`/`q8` types.
+- **Opt-in quantized-native CUDA FlashAttention**: pass `--flash-attn-native-quants` to let the CUDA MMA kernel consume supported quantized K/V caches in place, without a transient F16 copy. The default build supports `q8_0`, `q4_0`, `q5_0`, and `q6_0`; `q4_1`, `q5_1`, `q6_1`, `q3_0`, `q3_1`, `q2_0`, and `q2_1` additionally require `GGML_CUDA_FA_ALL_QUANTS=ON`. See the [design, limits, and validation protocol](docs/quantized-native-flash-attention.md).
 - **Adaptive draft-max for DFlash**: adjusts the active DFlash draft horizon at runtime instead of using a fixed `--spec-draft-n-max`, comparing speculative throughput against a no-spec baseline.
 - **Reasoning-loop protection**: the server detects repeated hidden reasoning output and intervenes.
 
@@ -40,6 +41,7 @@ still control cache representation and quality.
 | Live-context workspace | `--live-context-workspace` | Off | Grows supported attention workspace with the padded live KV extent instead of reserving full-context compute space at startup. |
 | MTP recurrent-plane cap | `--spec-mtp-rs-planes N` | Full (`draft max + 1`) | Saves recurrent-state VRAM; deep rejections may require deterministic GPU replay. |
 | KV allocation telemetry | `llama-bench --kv-memory` | Off | Reports allocation classes and CUDA VMM live, mapped, and high-water state without changing allocation policy. |
+| Native quantized FlashAttention | `--flash-attn-native-quants` | Off | Lets supported CUDA MMA kernels read quantized K/V directly, removing the transient F16 attention-window copy. |
 
 ### Put Attention KV in Pinned Host Memory
 
@@ -263,6 +265,18 @@ cmake --build build -j
 ```
 
 The minimal fresh-cache CUDA FlashAttention build covers 50 standard cache pairs, including the homogeneous F16 and BF16 pairs needed by precision tails, and omits KVarN. Add `-DGGML_CUDA_KVARN=ON` when building KVarN; that compiles 15 KVarN fast-decode pairs. `-DGGML_CUDA_FA_ALL_QUANTS=ON` expands the standard matrix to 169 pairs and, with KVarN enabled, its matrix to all 36 ordered pairs. Existing CMake caches retain their previously selected value.
+
+### Native Quantized FlashAttention
+
+CUDA builds include native MMA support for `q8_0`, `q6_0`, `q5_0`, and `q4_0`. Enable it per invocation with `--flash-attn-native-quants`; the selected `--cache-type-k` and `--cache-type-v` still determine the cache formats.
+
+```sh
+llama-server -m model.gguf --flash-attn on \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --flash-attn-native-quants
+```
+
+For the seven additional low-bit formats, configure with `-DGGML_CUDA_FA_ALL_QUANTS=ON`. Unsupported cache layouts, head dimensions, or devices automatically retain the normal FlashAttention path.
 
 ### Other Backends
 

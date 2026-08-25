@@ -3512,17 +3512,18 @@ passed 1/1 after the source comparison.
 This document preserves the complete valid integrated KV-line evidence record:
 Experiments 001-020 and W06. Its exact source-bearing baseline is
 `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9`; PR 5 and PR 6 source and evidence
-are present there. The 2026-08-21 readiness audit cleared PR 9 to carry this
-shared index into the KV line without changing that production-source identity,
-while the remaining feature lanes stay independently published:
+are present there. PR 9 merged this shared documentation and index as
+`8e858fcec39049fa028ce6fcb144a0c08b03abd3` without changing that production-
+source identity, while the remaining feature lanes stay independently
+published:
 
 | Lane | Exact published or merged identity | Evidence ownership and status |
 |---|---|---|
 | [PR 4](https://github.com/GenerelSchwerz/llama.cpp/pull/4) | `72ee96bbfcf91c17a7fb5b3b32703aae812af330` | Native same-type standard-quant FlashAttention source, tests, focused documentation, and archived composed manifests. |
 | [PR 5](https://github.com/GenerelSchwerz/llama.cpp/pull/5) | evidence head `8d2f8452eb140ba52d8472ecd791cc90212a9307`; merge `50ee5b2d765c91a0d9cd23728ac17a27ac510e3e` | Merged `llama-perplexity` output-capacity correction and exact A/B/A quality evidence (W06 above). |
 | [PR 6](https://github.com/GenerelSchwerz/llama.cpp/pull/6) | merged head `3bd7a088199922b1e5e20973cd8cb6d970cde111`; merge/base `4a7f9b496b58a5c782b4d4c97597cd076fe0b2e9` | Merged physical buffer classes and CUDA VMM live/mapped/high-water extension to `--kv-memory`; telemetry only, not a trim policy (Experiment 020 above). |
-| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | final head `d4183adb8b4902a125b9339cd39032a095fca013`; composed source checkpoint `ae60c7321d950937a36af096112525db777ae13f` | Final draft compact causal-prefix source and branch-owned evidence. Isolated c9 A/B/A remains the performance/resource record; rebased-base validation is composition evidence only. |
-| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; refreshed source checkpoint `107b926e5`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; exact base `8e858fcec39049fa028ce6fcb144a0c08b03abd3` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. The prior enabled evidence remains authoritative, and the fresh exact-base A/B/A gate separately proves omission and explicit off neutral. |
+| [PR 7](https://github.com/GenerelSchwerz/llama.cpp/pull/7) | measured runtime head `222eec2e7c91296b5f9335389dcff0cfc8a08129`; exact main baseline `4b86269fdf001de44dd96e9c9ae26a9e25091cca` | Compact causal-prefix source and branch-owned evidence. Fresh official main-based exactness, PPL, matched 4K/30K/128K performance, and resource gates pass; PR remains unmerged pending pushed-head checks and review. |
+| [PR 8](https://github.com/GenerelSchwerz/llama.cpp/pull/8) | enabled evidence head `0c8df007a504f16aa35fc5982303e3e1b9883331`; disabled-gate runtime head `4cdd2d74e7acc432fcdde4a9d1e5e832fe80e148`; merged through `35e179272` and present in current KV base `f6341a15779eb58fe6ad9e1b890e331c32b676c7` | Default-off live-context workspace growth, exact prepared-batch publication, all-idle trim, Experiment 021 below, and source-coupled user/preset/generated argument documentation. It is an unrelated opt-in and is omitted from compact-mask causal commands. |
 
 The completed parallel-tree audit is preserved at snapshot
 `f52988ee150cd27a94d6897cc049326c1e77c3e2`. Its durable decisions include
@@ -3532,15 +3533,19 @@ neutral trailing merge-barrier edit, and requiring direct-target profiler
 captures. Its cumulative throughput and allocation totals are interaction
 evidence for that uncommitted tree, not isolated KV-base or PR results.
 
-PR 7's isolated c9 dense/Candidate-1/dense A/B/A showed exact serving output
-and matching-batch PPL, context-scaled serving VRAM savings through 128K, and no
-material decode regression in the focused repeated 128K screen. Its separate
-`4a7f9b496` composition gate passed the merged PR 5/PR 6 guards, compact
-CPU/CUDA exactness, adjacent graph/allocator/attention tests, repeated PPL and
-deterministic output, and a non-performance VMM telemetry smoke. It did not
-re-measure A/B/A performance or memory on the composed base. Failed setup and
-identity probes, unmatched launches, and rejected noisy timing are not evidence
-and are not copied here.
+PR 7's isolated c9 lane remains historical evidence for its named binaries.
+The fresh official comparison uses main `4b86269fd` and runtime head
+`222eec2e7`: compiled dense/compact exactness passed 6/6, focused tests passed
+10/10, and main/candidate/main PPL was exactly `2.1674 +/- 0.03849` with the
+same four chunks. Candidate effects were time-adjusted neutral at 4K prefill,
++0.048% at 4K decode, +0.777%/+0.406% at 30K prefill/decode, and
++1.275%/+0.492% at 128K CPU-pinned prefill/decode. Sampled process-VRAM deltas
+were -2/0/-58 MiB at 4K/30K/128K prefill; exact allocation classes and the
+drift-aware 4K chronology are retained in the focused compact investigation.
+The current artifact manifest SHA-256 is
+`d4246230238f39cf643a2a2a1037835cc4a20dd490844abc1dc976d1180206a1`.
+Failed setup and identity probes remain explicitly invalid and contribute no
+measurement.
 
 PR 8's final Experiment 021 validated the live workspace on the merged W02/W06
 base. Omitted/live/explicit-off produced exact 1K token SHA-256
@@ -3587,6 +3592,176 @@ claim here.
 PR 8 source, generated arguments, presets, and feature-specific reproductions
 remain with that PR until source lands; shared protocol, research, roadmap,
 isolation, and identity indexing belong in the KV line.
+
+## 2026-08-20: pre-PR4 compact causal-mask isolation
+
+### Scope and source identity
+
+This experiment migrates only the compact causal-prefix descriptor from the
+isolated source diff `591337d4d..b2f0c93b` onto baseline
+`c9f727c1e1995c4a871a719ab05b5f2478588efd`. The source was reconciled manually;
+`591337d4d` is not an ancestor of the candidate. The candidate is the committed
+tree containing this record on `exp/compact-causal-mask-pre-pr4`.
+
+The implementation has no CLI argument or user-configurable CMake option. It
+automatically replaces the dense F16 causal mask with an I64 exclusive-prefix
+descriptor only when FlashAttention is active, attention compute is offloaded,
+every scheduled accelerator advertises descriptor support, and the standard KV
+cache proves a single-stream contiguous physical prefix with consecutive writes.
+ALiBi, explicit attention bias, SWA, exact tails, multiple streams or sequences,
+holes, reordered positions, and unsupported backends keep the dense path. KVarN
+does not advertise the capability and therefore remains on its established
+path. The migration contains generic CPU handling plus CUDA F16 vector, tile,
+and MMA handling; it contains no PR-4 native-Q8 implementation or tests.
+
+Both builds used Release, native CPU tuning, CUDA FlashAttention, CUDA
+architecture 120, tests enabled, and at most six build jobs. The baseline source
+was an in-worktree read-only archive of c9 rather than another Git worktree:
+
+```bash
+git archive c9f727c1e | tar -x -C tmp/compact-baseline-src
+cmake -S tmp/compact-baseline-src -B build-compact-baseline-cuda \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_TESTS=ON
+cmake -S . -B build-compact-cuda \
+  -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_TESTS=ON
+cmake --build build-compact-cuda \
+  --target llama-perplexity llama-bench llama-cli test-backend-ops -j 6
+```
+
+The baseline reports build `11243-c9f727c1e`; the post-commit candidate reports
+build `11244-b05ddfdd8`. The executable and loaded-library hashes further pin the
+binary identity:
+
+| Artifact | baseline SHA-256 | candidate SHA-256 |
+|---|---|---|
+| `llama-bench` | `1f6229604db5092e79b42b38579194423f0fe249f57366749f619465ec450071` | `48fe4e4e56169a26546d8f6cd8a4137744ff7dba3482cfa8d66acdd44803cb2e` |
+| `llama-perplexity` | `453966fcb89e105e0a3e9e8fb39935801b4b1df616ea5611482cde897dda7aff` | `0a73bb071322119838c3bd77aa8b98e1fa4ddbedea3375f47139ff0657b882bc` |
+| `llama-cli` | `ce4676a1c976fd7bf52b0bfcb7b0ec63e80ad2540e1ac58a2e53742ece5a506a` | `13b1cc469d8d710a876980cf7f47a36319e3c2b632b5108390573ed0f3b67dd7` |
+| `libllama.so` | `92ef6eb76261ef76c56598bb0dfcb71a0b29b2f9d7542f245cb78b8991963520` | `c947fab8a134d67691bcf4bac34df96e5502a639c11b83f32c5f20011884d816` |
+| `libggml-cuda.so` | `0ea097eafed04cee5f7b8221a44d5d341c3906cacf7db1c8806243d3211d4e94` | `26a012172bf181cbd44467700a22cd836a9ec19f970a5af480901d09e7ccf2d0` |
+
+### Correctness and quality
+
+The focused test constructs compact and dense attention in the same graph and
+requires byte-identical F32 outputs. It covers CUDA vector (`D=64, nb=1`), tile
+(`D=40, nb=16`), and F16 MMA (`D=128, nb=64`) routes. The CPU and CUDA commands
+both passed 3/3:
+
+```bash
+build-compact-cpu/bin/test-backend-ops test -b CPU \
+  -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+  --seed 0x6a09e667f3bcc909
+flock /tmp/beellama-single-gpu.lock -c \
+  'build-compact-cuda/bin/test-backend-ops test -b CUDA0 \
+   -o COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE -j 1 \
+   --seed 0x6a09e667f3bcc909'
+```
+
+Seven adjacent static regressions also passed: backend-op seed stability, CUDA
+Graph source properties, standard KV tails, KVarN eager workspace, rollback,
+HIP tail capability, and HIP runtime validation.
+
+Quality used the 606,662-byte corpus
+`/home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt`
+(SHA-256 `8a2f79a2f4601cfe6e25830c29c1a25c7a3d906285a989948117568f8077ab2c`)
+and matching `-b 512 -ub 256`. A fresh baseline/candidate/baseline bracket
+printed the identical four-chunk sequence `1.9315, 2.1279, 2.2498, 2.1674`
+in all three processes and the identical final estimate
+`PPL = 2.1674 +/- 0.03849`:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{build}/bin/llama-perplexity \
+   -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   --file /home/gencoolpc/.cache/llama-benchy/cc6a0b5782734ee3b9069aa3b64cc62c.txt \
+   --ctx-size 4096 --batch-size 512 --ubatch-size 256 --chunks 4 \
+   --cache-type-k q8_0 --cache-type-v q8_0 --threads 3 --threads-batch 24 \
+   --cpu-range 0-2 --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+   --n-gpu-layers 999 --split-mode none --main-gpu 0 \
+   --no-kv-offload --kv-cpu-pinned --flash-attn on'
+```
+
+Here `{build}` was replaced in order with `build-compact-baseline-cuda`,
+`build-compact-cuda`, and `build-compact-baseline-cuda`; every invocation was a
+fresh locked process. The native `[1]` through `[4]` chunk counter exposed
+progress. An earlier one-chunk baseline/candidate screen also matched at
+`1.9312 +/- 0.06681`, but it is not the acceptance evidence.
+
+A deterministic 16-token CLI comparison used the same model and runtime
+placement, prompt `Write one concise sentence about causal attention.`, seed
+1234, temperature zero, context 4096, `--single-turn --simple-io`, and fresh
+locked baseline/candidate processes. After removing the build-identity and
+timing-only `[ Prompt: ... | Generation: ... ]` lines, both complete streams
+had SHA-256
+`cd35be773ca9520e5f79474c94ee1d07784433199b1c3c4f531dffbbcc353c6c`
+and `diff` was empty. The only raw-output differences were the expected build
+identity and timing lines.
+
+### Performance and resources
+
+Hardware was an Intel Core Ultra 9 285K and NVIDIA GeForce RTX 5070 Ti
+(15,880 MiB, compute capability 12.0). The model was the Qwen3.8 27B mixed
+GGUF above (`model_size=14,426,476,544`, `n_params=27,320,697,856`). Each row
+is one clean fresh process; no compiler or other model process was active.
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c \
+  '{build}/bin/llama-bench -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+   -pg 512,64 -d {4096|30000} -r 1 --no-warmup --progress --kv-memory \
+   -ctk q8_0 -ctv q8_0 -t 3 -C 0x7 --cpu-strict 1 --poll 100 \
+   -ngl 999 -sm none -mg 0 -nkvo 1 --kv-cpu-pinned -fa on \
+   -b 1024 -ub 512 -o jsonl'
+```
+
+The acceptance performance screen also used fresh baseline/candidate/baseline
+processes in that order at both depths. The delta uses the midpoint of the two
+reference samples; each candidate value remains a single sample and therefore
+supports only a no-large-regression screen, not a small throughput claim.
+
+| depth | build/order | prompt 512 | decode 128 | combined 512/64 | peak process VRAM | pinned KV resident |
+|---:|---|---:|---:|---:|---:|---:|
+| 4,096 | c9 baseline A1 | 1,433.21 t/s | 19.877 t/s | 157.255 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | compact B | 1,439.86 t/s | 19.906 t/s | 159.015 t/s | 14,410,711,040 B | 187,170,816 B |
+| 4,096 | c9 baseline A2 | 1,434.06 t/s | 19.580 t/s | 158.740 t/s | 14,389,739,520 B | 187,170,816 B |
+| 4,096 | B vs A midpoint | +0.43% | +0.90% | +0.64% | +20 MiB | 0 B |
+| 30,000 | c9 baseline A1 | 1,035.82 t/s | 13.975 t/s | 111.872 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | compact B | 1,054.77 t/s | 13.890 t/s | 112.029 t/s | 14,427,488,256 B | 1,087,373,312 B |
+| 30,000 | c9 baseline A2 | 1,061.78 t/s | 13.962 t/s | 112.077 t/s | 14,381,350,912 B | 1,087,373,312 B |
+| 30,000 | B vs A midpoint | +0.57% | -0.56% | +0.05% | +44 MiB | 0 B |
+
+The bracket does not reproduce a material 30K performance loss. The one-sample
+`-0.56%` 30K decode movement is neutral at this resolution, while combined
+throughput is effectively unchanged. Peak process VRAM increased by 20 MiB at
+4K and 44 MiB at 30K. Pinned KV residency was identical and
+`kv_staging_bytes` was zero in all runs. A separate matched 30K resource-only
+pair reported maximum RSS of
+14,592,992 KiB baseline and 14,597,024 KiB candidate (+4,032 KiB, effectively
+identical at this process scale). Pageable host memory was not separately
+attributable from process RSS; the patch does not alter model mapping, KV
+allocation, pinned-memory, or host-staging code.
+
+The fresh bracket artifacts are retained at
+`/tmp/beellama-prepr4-compact-aba-20260820`. They include all three raw PPL
+logs, all six raw performance/progress logs, extracted JSONL, the GPU preflight,
+fresh CPU/CUDA 3/3 descriptor-oracle logs, the seven-test static regression log,
+and binary/library/model/corpus identities. `SHA256SUMS` covers every retained
+file other than itself and has SHA-256
+`17a19eb95b3d8f9af176017a8c4ac934392c2672b1e273abe8349208e152bb94`.
+
+### Disposition
+
+Retain the compact descriptor. It is bit-exact in direct CPU/CUDA coverage and
+end-to-end generation, has exactly matching four-chunk A/B/A PPL, shows no
+material performance regression in the fresh 4K/30K A/B/A screen, and fails
+closed to the dense mask for unproved layouts or capabilities. The measured
+cost is up to 44 MiB additional peak process VRAM in this CUDA configuration.
+Other models, multi-sequence layouts, KVarN native attention, and non-CUDA
+accelerators remain dense and require separate evidence before enabling compact
+selection.
 
 ## Post-PR9 test-only regression: F32 GDN recurrent snapshot fusion
 
@@ -5020,3 +5195,1768 @@ ubatch-matched MTP protocol (Characterization 025's caveat) to get a
 current-provenance number is future work, not expected to change the
 qualitative finding since this entry's own DSpark half of the pair already
 used the unaffected, always-current DSpark configuration.
+## Experiment 022: quantized-native quantized K/V in the MMA FlashAttention kernel
+
+Status: retained, behind an off-by-default build flag. The CUDA MMA kernel can
+read a `Q8_0` cache in place instead of casting it to F16 first. Output is
+byte-identical. The primary effect is memory: reserve-time device compute
+buffer falls by 41% to 54% over the context range tested, from 140 MiB at
+32,768 tokens to 972 MiB at 245,760, released at model load with an empty
+cache. 512-token prefill additionally improves by 1.2% to 1.8% at depth.
+
+An earlier revision of this entry reported the allocation effect as "22 MiB in
+one of four configurations, unchanged in the other three." That figure was
+measured under `llama-bench` at 512-token prefill and does not generalise; see
+the reconciliation section below, which is not yet closed.
+
+Revision note: this experiment records the original PR implementation and its
+commands verbatim. Its process-wide `GGML_CUDA_FATTN_Q8_NATIVE=0/1` test
+override was removed by the later structural cleanup; it is not a current
+run-time control. Current builds use `GGML_CUDA_FATTN_Q8_NATIVE=ON/OFF` only as
+a CMake option and use `--flash-attn-native-quants` for per-context run-time
+opt-in. See `docs/quantized-native-flash-attention.md` for the maintained
+architecture and current validation protocol. Historical commands below must
+be run at their recorded commits if exact reproduction is required.
+
+### Motivation
+
+The MMA/tile flash-attention path casts K and V to F16 before running,
+regardless of the cache's storage type or where `--kv-gpu-layers` places it
+(`ggml_cuda_flash_attn_ext_get_alloc_size` sets `need_f16_K = need_f16_V =
+true` for `BEST_FATTN_KERNEL_TILE` and `BEST_FATTN_KERNEL_MMA_F16`). That cast
+allocates a transient F16 copy of the attention window and re-materializes it
+on every graph execution. The maintained scope is documented in
+`docs/quantized-native-flash-attention.md`; this entry records the original
+implementation's outcome.
+
+### Scope correction made during implementation
+
+The plan scoped the first pass to `DKQ = DV = 128`. That scope was never
+checked against the model the work exists to serve.
+`Qwen3.8-27B-UD-IQ2_M.gguf` is `qwen35` with
+`attention.key_length = attention.value_length = 256`, so a kernel gated at 128
+never engages on it at all. Head dimension 256 was added (commit `223964887`)
+and needs no loader change: the Ampere config table gives
+`nbatch_K2 = nbatch_V2 = 128` at `DKQ = DV = 256`, so a tile chunk is eight
+whole `Q8_0` blocks rather than four and every alignment invariant the loader
+asserts still holds.
+
+### Integration, source, hardware, and inputs
+
+The implementation was committed as `7d0c6cdbb`, its test coverage as
+`a2f523786`, the head-256 extension as `223964887`, and route observability as
+`4af38f91d`. Scope is `Q8_0` K with `Q8_0` V at head dimension 128 or 256 on
+Ampere/Ada, behind `GGML_CUDA_FATTN_Q8_NATIVE` (default off). Within such a
+build `GGML_CUDA_FATTN_Q8_NATIVE=0` disables the route at run time, so every
+comparison below is a same-binary A/B rather than a two-build comparison.
+
+Hardware and model follow Experiment 011's configuration: RTX 4070 12 GiB
+(compute capability 8.9), Intel Core i5-13400F, 31 GiB RAM, PCIe 4.0 x16,
+driver 610.57.04, CUDA 13.3, GNU 16.2.1. Release CUDA build, architecture 890,
+`GGML_CUDA_FA_ALL_QUANTS=OFF`, `GGML_CUDA_KVARN=ON`,
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`. Model
+`/home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf`,
+10,319,907,904 bytes, SHA-256
+`04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`
+(`qwen35`, 27.32B, 9.60 GiB, 16 attention layers of 65, head dimension 256,
+24 attention heads, 4 KV heads, vocabulary 248,320).
+
+Libraries at `223964887`:
+
+- `build/bin/libggml-cuda.so`, SHA-256
+  `6b96fd50a2d1040627ada2935d5ac9894201d1f22a8a62b522cd9a1118c1678a`
+- `build/bin/libllama-bench-impl.so`, SHA-256
+  `731b3e26f4f879243aa2100dcda58441ac3e3a72f01f784e25b4b735edfc44bf`
+- `build/bin/libllama-completion-impl.so`, SHA-256
+  `9b8613de878d16d292e2fd374ad4dd1aa883160c81f7eafc88a7a65b163715eb`
+
+The `llama-bench` and `llama-completion` files in `build/bin` are thin
+wrappers that load these; hashing them identifies nothing.
+
+### The route was confirmed to engage, not assumed
+
+The first measurement pass found an unchanged compute buffer and a throughput
+delta inside noise. That is equally consistent with the route being a no-op on
+this model and with the route never engaging, so the two were separated
+directly rather than by inference:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1 \
+  build/bin/llama-completion -m Qwen3.8-27B-UD-IQ2_M.gguf -f prompt.txt \
+  -n 4 --temp 0 -s 1234 --no-warmup --simple-io -v \
+  -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 8192 </dev/null 2>&1 \
+  | grep -c "fattn-q8-native: D="
+```
+
+112 launches with the flag on, 0 with it off, reported as
+`D=256 n_q=512 n_kv=... n_head=24 n_head_kv=4`. That is 16 attention layers
+times 7 graph executions. Note that `-v` is required: without it llama.cpp's
+log filter discards these lines, and an earlier count of 0 was an artifact of
+that filter rather than of routing.
+
+### Correctness
+
+The F16 cast (`dequantize_block_q8_0_f16`, `ggml/src/ggml-cuda/convert.cu`)
+computes the dequantized pair as `__hmul2(make_half2(qs.x, qs.y),
+__half2half2(d))`, and the new loader performs the same `half2` multiply, so
+both paths feed identical `half` values to identical `mma()` calls. The bar is
+therefore bit-identity, not tolerance.
+
+| Gate | Result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "type_K=q8_0"`, native off | 413/413 passed |
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "type_K=q8_0"`, native on | 413/413 passed |
+| `test-backend-ops -o FLASH_ATTN_EXT -b CUDA0 -p "hsk=256"`, native on | 165/165 passed |
+| `ctest -R "test-kvarn\|test-adaptive-dm\|test-server-loop-guard"` | 8/8 passed |
+
+The `type_K=q8_0` count is 413 rather than the plan's recorded 349 because this
+work added 32 head-128 and 32 head-256 `Q8_0`/`Q8_0` cases; the general sweep
+had paired quantized K/V only with head sizes 64 and 72.
+
+Greedy generation, 128 tokens from a 12,000-byte prompt:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V build/bin/llama-completion \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -f prompt.txt -n 128 --temp 0 -s 1234 \
+  --no-warmup --simple-io -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 8192
+```
+
+Both settings produced 12,624 bytes with SHA-256
+`717035f38f5485f44bdb53f4ad9b38a18e47fd32c2a0a41fb60543fb3e33eaf0`.
+
+### Prefill throughput
+
+Experiment 011's command shape, with `-r 10` rather than `-r 3`. Ten
+repetitions were needed: at three the deltas were 0.8 to 1.6 combined standard
+deviations from zero, which does not support a claim in either direction.
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V taskset -c 0,2,4 build/bin/llama-bench \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -ngl 99 -t 3 --poll 100 -nkvo 1 -fa on \
+  -ctk q8_0 -ctv q8_0 --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers $N -p 512 -n 0 -d 16384,32768 -r 10 --kv-memory -o json
+```
+
+| `--kv-gpu-layers` | Depth | Native off (t/s) | Native on (t/s) | Change | Welch t |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 16,384 | 999.52 +/- 5.47 | 1016.27 +/- 5.17 | +1.68% | 7.0 |
+| 0 | 32,768 | 819.33 +/- 4.61 | 828.99 +/- 4.93 | +1.18% | 4.5 |
+| 16 | 16,384 | 1046.00 +/- 11.11 | 1064.94 +/- 11.77 | +1.81% | 3.7 |
+| 16 | 32,768 | 875.71 +/- 5.43 | 891.71 +/- 5.67 | +1.83% | 6.5 |
+
+All four are significant at n = 10 per side. The native-off column reproduces
+Experiment 011's independent figures for the same shape (984.72 and 1033.99 t/s
+at N = 0 and 16, depth 16,384), so the harness is measuring the same thing.
+
+The size of the effect is what the removed traffic accounts for, which is worth
+stating because it bounds what this kernel can ever be worth here. At depth
+32,768 the cast touches 16 attention layers times 32,768 tokens times 1,024
+elements times two tensors, so it reads about 1.1 GB of `Q8_0` and writes about
+2.1 GB of F16 per graph execution. At roughly 500 GB/s that is near 6.4 ms
+against a 512-token prefill of about 587 ms at 875.71 t/s, or close to 1.1% of
+runtime. Measured 1.18% to 1.83% is the same order.
+
+This model is a poor case for the optimization by construction: only 16 of 65
+layers are attention layers, and IQ2_M weight matmuls dominate the rest. A
+model whose layers are all attention would expose proportionally more.
+
+### Decode
+
+Single-token decode never reaches this path.
+`ggml_cuda_get_best_fattn_kernel` sends quantized K/V with `Q->ne[1] <= 2` to
+the vector kernel on Ada, which already reads `Q8_0` natively. This work is a
+prefill and large-batch optimization only, and does not interact with the
+decode residency results in Experiments 010 and 011.
+
+### Transient allocation under `llama-bench`
+
+| `--kv-gpu-layers` | Depth | Native off | Native on | Saved |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 16,384 | 541.79 MiB | 541.79 MiB | none |
+| 0 | 32,768 | 669.79 MiB | 669.79 MiB | none |
+| 16 | 16,384 | 541.79 MiB | 541.79 MiB | none |
+| 16 | 32,768 | 579.79 MiB | 557.79 MiB | 22.00 MiB |
+
+These figures are correct for the harness that produced them and were, for a
+time, read as the allocation result for the change as a whole. That reading was
+wrong: they are specific to `llama-bench` at 512-token prefill, and the section
+below supersedes them as the general claim.
+
+### Reserve-time allocation under `llama-server`
+
+Compute-buffer allocation is deterministic, so one run per cell suffices and no
+prefill is required: `llama-server` reserves the worst-case graph at startup,
+reports the buffer, and idles. `sched_reserve` builds that graph against
+`memory->init_full()` (`src/llama-context.cpp`), which sets
+`n_kv = kv->get_size()` (`src/llama-kv-cache.cpp`) — the entire allocated cache,
+not the occupied part. The reservation therefore tracks the context size that
+was configured, not the tokens actually present, and the measurement below is
+taken with an empty cache.
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE=$V build/bin/llama-server \
+  -m Qwen3.8-27B-UD-IQ2_M.gguf -ngl 99 -fa on -ctk q8_0 -ctv q8_0 \
+  -nkvo --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  --parallel 1 -c $CTX --host 127.0.0.1 --port 8099 -v
+```
+
+`-v` is required: llama.cpp's log filter discards the buffer lines without it.
+`--parallel 1` is required so that `-c` maps to one slot unambiguously.
+
+| `n_ctx` | Native off | Native on | Saved | Reduction |
+| ---: | ---: | ---: | ---: | ---: |
+| 32,768 | 342.27 MiB | 202.27 MiB | 140.00 MiB | 40.9% |
+| 65,536 | 536.27 MiB | 268.27 MiB | 268.00 MiB | 50.0% |
+| 131,072 | 992.27 MiB | 468.27 MiB | 524.00 MiB | 52.8% |
+| 245,760 | 1790.27 MiB | 818.27 MiB | 972.00 MiB | 54.3% |
+
+The saving fits `4 KiB per token of context + 12 MiB` exactly at all four
+points. That slope is one attention layer's K and V in F16: two tensors times
+four KV heads times head dimension 256 times two bytes is 4,096 bytes per token.
+The graph allocator reuses the arena across all sixteen attention layers, so the
+peak holds one layer's copy and removing it removes exactly that.
+
+The saving is not displaced to the host. `CUDA_Host` compute buffer is identical
+within every pair (52.28, 84.28, 148.28, and 260.28 MiB), as is `CUDA_Host` KV
+buffer, which is unchanged because cache placement is untouched.
+
+### Reconciling the two allocation measurements
+
+The same code shows 22 MiB or nothing under `llama-bench` and 140 to 972 MiB
+under `llama-server`. Both measurements reproduce on demand, so the difference
+is a property of the harnesses rather than of the kernel.
+
+The mechanism is the logits reservation, and the controlling variable is
+`n_outputs_max`, not the physical ubatch, which is 512 in both harnesses.
+`llama-bench` does not set `n_outputs_max`, so `llama_context` defaults it to
+`n_batch` (`src/llama-context.cpp`, `cparams.n_outputs_max = ... : cparams.n_batch`).
+Reservation then uses `n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max)`
+with `n_tokens = min(n_ctx, n_ubatch) = 512`, so the logits tensor reserves
+512 x 248,320 x 4 bytes = 485.0 MiB — the same figure derived independently
+when the `llama-bench` allocation table was first read. `llama-server` sets the
+value explicitly (`tools/server/server-context.cpp` via `server_n_outputs_max`)
+and reports `n_outputs_max = 1`, giving a 0.95 MiB output buffer, so nothing
+covers the F16 copy.
+
+The two harnesses therefore measure the same allocation. `llama-bench` masks
+the saving below the context at which the F16 copy exceeds 485 MiB, which for
+4 KiB per token is about 124,000 tokens; `llama-server` exposes it at every
+context. There is no CLI option for `n_outputs_max`, so this was established by
+reading the reservation path rather than by toggling it. The remaining
+empirical cross-check is to run `llama-bench` above that crossover, where the
+saving should reappear as roughly `4 KiB x n_ctx - 485 MiB`; that has not been
+done.
+
+The throughput gain is present in all four `llama-bench` configurations
+regardless, because the bandwidth cost of writing and re-reading the copy is
+real whether or not it raises the reported peak.
+
+### Disposition
+
+Retain the kernel behind `GGML_CUDA_FATTN_Q8_NATIVE`. It is output-exact,
+faster in every configuration measured, never slower, and reduces reserve-time
+device allocation by 41% to 54% across the context range tested — 972 MiB at
+245,760 tokens, freed at model load with an empty cache.
+
+This reverses the earlier disposition, which weighed roughly 1.5% of prefill
+and at most 22 MiB against sixteen template instantiations per head dimension
+and a full flash-attention rebuild on toggle, and concluded that default-off
+was the honest setting. The allocation figure in that judgement was a
+`llama-bench` artifact. On the measurement that matches how the fork is
+deployed, the change removes over half of the device compute buffer at long
+context, which is a different class of result and justifies the build cost. The
+throughput gain is now the secondary effect.
+
+The default has not been changed here. The harness discrepancy is now explained
+by `n_outputs_max`, but that explanation rests on reading the reservation path
+rather than on a measurement that toggles it, and output exactness has not been
+rechecked at the contexts where the allocation result lives. Those two items
+gate a change of default, not this entry.
+
+The empirical claim is limited to `Q8_0`/`Q8_0` at head dimensions 128 and 256
+on `sm_89`, one model, and one host. Reserve-time allocation was measured at
+`--kv-gpu-layers 0` only, so the saving is not yet shown to be independent of
+persistent cache placement. Output exactness was established at short context;
+it has not been rechecked at the long contexts where the allocation result
+lives. The
+model's GQA ratio of 6 selects `ncols2 = 8`, so inference exercises only that
+column geometry; the other three are covered by `test-backend-ops` against the
+CPU reference rather than end to end. Other quantized pairs, Turing, Volta,
+AMD, multi-GPU, MTP/DSpark speculative geometries, and the serving-level
+protocol in `cpu-kv-offload-current-testing.md` are all unmeasured. The plan's
+remaining non-goals stand.
+
+### Structural cleanup and final integrated validation
+
+This section supersedes the implementation structure, controls, and untested
+scope described earlier in Experiment 020. It does not rewrite the original
+measurements, which remain tied to their recorded commits and host.
+
+The cleaned implementation is source commit
+`afaf37c31a23cf4933ef127527dde366e545f669`, based on PR head `c70051e01`.
+The same Release build produced build number 11254. The enabled server SHA-256
+was `e6bcadd8a140d623cabfcb1359fbae76b9727186ada34c6353a9f47166f976f1`;
+`libggml-cuda.so.0.19.0` was
+`9ff09c018930c9a0d04a5b96abc8d163d1700420f2cbb6609da504f36e4b1783`.
+
+The cleanup follows the existing upstream MMA organization:
+
+- the established F16 launcher, case, and `ncols1`/`ncols2` selectors are
+  templated on K and V storage types, with F16 defaults preserving existing
+  call sites;
+- a 61-line Q8 adapter supplies only the Q8_0 tile loader and calls the shared
+  launcher and selectors;
+- the two copied Q8 launcher/selector headers, totaling 321 lines, were
+  removed;
+- the normal instance generator emits the 16 supported tile translation units,
+  each explicitly instantiating D=64/128/256, for 48 bounded cases;
+- `GGML_CUDA_FATTN_Q8_NATIVE=ON` is a build allowlist, independent of
+  `GGML_CUDA_FA_ALL_QUANTS`; the default is off;
+- `--flash-attn-native-quants` is only run-time permission. The graph's actual
+  K/V tensor types choose the concrete layout, so there is no second
+  `q8_0:q8_0` selector that can disagree with the cache configuration;
+- the historical run-time `GGML_CUDA_FATTN_Q8_NATIVE=0/1` override was removed.
+  `GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` remains audit-only and never selects a
+  route; and
+- `llama-bench` accepts the same option and records the requested boolean in
+  JSON/JSONL/CSV/Markdown results.
+
+Relative to `c70051e01`, implementation checkpoint `afaf37c31` is 572
+insertions and 589 deletions, including its design documentation and focused
+tests. This final evidence note is a later documentation-only addition. The
+principal CUDA change removes duplicate control flow rather than adding another
+parallel kernel framework.
+
+#### Final build and route gates
+
+Both builds used `CMAKE_BUILD_TYPE=Release`, CUDA architecture 120,
+`GGML_CUDA_FA_ALL_QUANTS=OFF`, and the same source commit. One set
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`; the other set it `OFF`. The enabled CUDA shared
+library was 193,300,096 bytes versus 185,830,976 bytes disabled: a 7,469,120
+byte (7.12 MiB, 4.02%) build-size cost.
+
+The generated source pass was byte-idempotent. The disabled Ninja graph had no
+`fattn-mma-q8-instance` source and the following opted-in selection passed
+98/98 through the standard materializing route after one build-missing warning:
+
+```bash
+build-cuda-default/bin/test-backend-ops test \
+  -b CUDA0 -o FLASH_ATTN_EXT -p 'native_quants=1'
+```
+
+The enabled build passed the same 98/98 cases, with audit logs proving native
+launches for every registered D=64/128/256 and tile geometry:
+
+```bash
+GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1 \
+  build-cuda-all/bin/test-backend-ops test \
+  -b CUDA0 -o FLASH_ATTN_EXT -p 'native_quants=1'
+```
+
+The set covers four GQA-selected column ratios, query batches 3/16/32/64, KV
+lengths 113 and 512, and the three supported head dimensions. A Q8_0/Q4_0 pair
+and homogeneous Q8_0 at D=72 both passed through their once-warned standard
+fallbacks.
+
+The broader FlashAttention sweep was attempted with native permission off and
+on. Both reached the same pre-existing fatal dispatcher case after thousands
+of prior cases: F16/F16, `DQ=DK=320`, `DV=256`, `nq=1`, `nkv=512`. The isolated
+case reproduced in the untouched `/home/gencoolpc/beellama-kv-offload` binary.
+It is outside the registered Q8 family and is not evidence of a regression in
+this change; fixing that generic vector-dispatch/test-order issue is outside
+this PR.
+
+#### Final MTP token and byte exactness
+
+The current `scripts/mtp-exactness.py` oracle ran two fresh instances of the
+same enabled binary. Both used CPU-resident pinned target and inherited draft
+KV, Q8_0/Q8_0 target and draft caches, phase-aware workspace, MTP depth 6,
+three recurrent planes, physical target/effective-draft ubatch 512, greedy
+sampling, and seed 1234. Only
+`--no-flash-attn-native-quants` versus
+`--flash-attn-native-quants` changed.
+
+The 1,000-token comparison reported `contract_exact=true`,
+`prompt_tokens_exact=true`, `tokens_exact=true`, and `content_exact=true`.
+Both outputs had token SHA-256
+`842b39c1982b2ef8aabf1c70a3f6dc5576ba3f90d80e35704c7c47c499e1de00`
+and content SHA-256
+`41dd817295f51516f3750049cfe3ecd2b5de9ae0f4d08df7a58a1408318f3bb2`.
+Both also performed 470 draft generations, accepted 428, and replayed 56 batch
+tokens in 10 cycles. This is the same-MTP-geometry oracle required by the
+current protocol, not a target-only comparison.
+
+The exact runner invocation was:
+
+```bash
+python3 scripts/mtp-exactness.py \
+  /tmp/q8-native-mma-exact-afaf37c31.json
+```
+
+The temporary manifest SHA-256 was
+`62301e7dcf529b76d93d3170ec3a862ac379dc21e4efc4d502fecd52c08e2092`.
+It used the committed
+`scripts/mtp-exactness-manifests/requests/qwen38-orbital-greedy-1k.json`
+request and the server arguments enumerated above. The retained output
+directory was `/tmp/q8-native-mma-exact-afaf37c31-20260819-v2`; its
+`summary.json` and `comparisons.json` SHA-256 values were
+`e7c228e61203b7ea6f6f31382af82fd4ecca90b9452ed4293e3aeb8b3368323c`
+and `1181f578dc2390944a592399eeb4bf3adfd59ea0a282ac54ed9b4fe87508b32d`.
+
+#### Final short, medium, and very-long prefill screen
+
+Hardware was an NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, driver
+610.57.04, with 15,880 MiB usable process memory, and an Intel Core Ultra 9
+285K. Model
+`/home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf`
+had SHA-256
+`ca5c3fab5c68a00a7c4fc04a0467946e2069f3cdb073601e7158ae7977e73f6c`.
+Each row ran three prompt repetitions after one depth fill, with native
+permission as the only changed setting:
+
+```bash
+taskset -c 0,2,4 build-cuda-all/bin/llama-bench \
+  -m /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  -ngl 999 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 -fa on -ctk q8_0 -ctv q8_0 \
+  --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  --flash-attn-native-quants \
+  -b 1024 -ub 512 -p 512 -n 0 -d DEPTH -r 3 \
+  --kv-memory --progress -o json
+```
+
+The reference substituted `--no-flash-attn-native-quants`. JSON records
+confirmed build commit `afaf37c31`, selected Q8_0/Q8_0, CPU KV, and the
+requested native boolean.
+
+| Depth | Native off (t/s) | Native on (t/s) | Change | Peak off / on | CUDA compute off / on |
+|---:|---:|---:|---:|---:|---:|
+| 4,096 | 1797.10 +/- 26.60 | 1767.11 +/- 25.31 | -1.67% | 13,849.94 / 13,849.94 MiB | 529.79 / 529.79 MiB |
+| 32,768 | 1183.84 +/- 11.61 | 1224.68 +/- 12.66 | +3.45% | 13,963.94 / 13,963.94 MiB | 669.79 / 669.79 MiB |
+| 245,760 | 295.90 +/- 13.17 | 363.07 +/- 6.30 | +22.70% | 15,153.94 / 14,179.94 MiB | 2,054.62 / 1,080.62 MiB |
+
+The short-depth ranges overlap; this does not establish a short-context
+regression. At depth 32,768 the larger logits arena masks the removed
+allocation. At 245,760, where materialization is larger than that arena, the
+native route saves exactly 974 MiB in both the synchronized process peak and
+the reserved CUDA compute buffer. The three repetitions and single order make
+these performance results a screen rather than a universal claim.
+
+#### Realistic live MTP screen
+
+The current server layout from
+`cpu-kv-offload-current-testing.md` was used with the multimodal projector,
+CPU-resident pinned Q8_0/Q8_0 target and inherited draft KV, MTP depth 6,
+three recurrent planes, phase-aware workspace, physical target/effective-draft
+ubatch 512, context 32,768, and one fresh server per side. `llama-benchy` 0.4.0
+used NumPy seed 1234, its independently loaded Qwen3.5 tokenizer, the recorded
+Gutenberg corpus cache, `--pp 512 --tg 64 --depth 30000 --runs 1`, exact TG,
+greedy seed 1234, cache disabled in the request, and `--emit-progress -`.
+
+Both sides observed 30,565 prompt tokens and 64 generated tokens. Draft work
+was identical: 28/41 accepted, mean length 2.75, and 27 replay batch tokens in
+five cycles.
+
+The exact server template was the following, with `NATIVE_FLAG` set first to
+`--no-flash-attn-native-quants` and then to
+`--flash-attn-native-quants`, using a fresh process each time:
+
+```bash
+NATIVE_FLAG=--no-flash-attn-native-quants
+build-cuda-all/bin/llama-server \
+  --model /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/Qwen3.8-27B-AD-IQ4_XS-IQ3_S.gguf \
+  --mmproj /home/gencoolpc/llm_models/AtomicChat/Qwen3.8-27B-GGUF/mmproj-Qwen3.8-27B-F16.gguf \
+  --no-mmproj-offload --n-gpu-layers 999 --n-gpu-layers-draft 999 \
+  --fit off --split-mode none --main-gpu 0 --flash-attn on "$NATIVE_FLAG" \
+  --no-kv-offload --kv-cpu-pinned --recurrent-state-offload \
+  --kv-gpu-layers 0 --ctx-size 32768 --parallel 1 \
+  --cont-batching --kv-unified --batch-size 1024 --ubatch-size 512 \
+  --phase-aware-workspace --spec-type draft-mtp --spec-draft-n-max 6 \
+  --spec-mtp-rs-planes 3 --spec-draft-p-min 0.85 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --spec-draft-type-k q8_0 --spec-draft-type-v q8_0 \
+  --threads 3 --threads-batch 24 --cpu-range 0-2 \
+  --cpu-range-batch 0-23 --cpu-strict 1 --poll 100 \
+  --reasoning-loop-guard force-close --seed 1234 --cache-ram 0 \
+  --alias qwen38-q8-native --host 127.0.0.1 --port 8098
+```
+
+Each server was driven with:
+
+```bash
+python3 -c \
+  'import numpy as np; np.random.seed(1234); from llama_benchy.__main__ import main; main()' \
+  --base-url http://127.0.0.1:8098/v1 \
+  --model Qwen/Qwen3.5-27B --served-model-name qwen38-q8-native \
+  --book-url https://www.gutenberg.org/files/1661/1661-0.txt \
+  --pp 512 --tg 64 --depth 30000 --runs 1 --no-warmup \
+  --skip-coherence --no-adapt-prompt --latency-mode none --exact-tg \
+  --extra-body temperature=0,seed=1234,cache_prompt=false \
+  --emit-progress - --save-result RESULT.json --format json
+```
+
+One-second `nvidia-smi` process samples ran from startup through completion.
+The off/on result JSON SHA-256 values were
+`4f1154b39c4c1579c38cec948c433bc196e2912115b171a6bc5b4eb935f8f02a`
+and `ec55e1c16f2eb26808750666fab78def623b5d1f54f8081ab842f7291dc5dcff`.
+
+| Measurement | Native off | Native on | Change |
+|---|---:|---:|---:|
+| llama-benchy prefill | 1444.23 t/s | 1425.12 t/s | -1.32% |
+| llama-benchy generation | 26.88 t/s | 27.77 t/s | +3.32% |
+| server generation | 27.37 t/s | 28.21 t/s | +3.07% |
+| sampled peak process VRAM | 14,212 MiB | 14,072 MiB | -140 MiB |
+
+This proves that speculative verification can reach the optimization even
+though ordinary one-token decode remains on the existing native vector path.
+The decode improvement and small prefill loss are single-run observations;
+alternating repetitions are required before treating either small delta as
+stable.
+
+#### Packed Q5/Q6 loader follow-up
+
+Status: retained. The scalar Q5_0/Q6_0 loaders and generic Q5_1/Q6_1
+functor path were replaced with shared packed Q5/Q6 traits. Each lane now
+extracts four codes with 32-bit operations while preserving the materializing
+cast path's float arithmetic and final `float2`-to-`half2` conversion. This is
+the commit containing this entry, based on `5aa21a48164bb09cc398826cec26bc57dbb80905`.
+The benchmarked CUDA source reports `6b0f9bc7d`; the intervening commits
+`a59f7d419` and `5aa21a481` change only tests and documentation, so the
+benchmark candidate is that same CUDA tree plus this commit's loader diff.
+
+The measurement host was an RTX 4070 (compute capability 8.9, driver
+610.57.04) and Intel Core i5-13400F. The model was
+`/home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf`,
+10,319,907,904 bytes, SHA-256
+`04a89ef4fa9c8726d09331433346809bbab692b4851d49d0738ba8d58a1ae740`.
+The Release build used CUDA architecture 89,
+`GGML_CUDA_FATTN_Q8_NATIVE=ON`, and `GGML_CUDA_FA_ALL_QUANTS=ON`.
+
+Prefill used two reverse-order pairs, five repetitions per process and ten
+samples per arm. One-second process-VRAM sampling ran concurrently and the
+benchmark's `--kv-memory` checkpoints were retained:
+
+```bash
+LD_PRELOAD=CUDA_LIBRARY taskset -c 0,2,4 build/bin/llama-bench \
+  --progress --kv-memory \
+  -m /home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf \
+  -ngl 99 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on NATIVE_FLAG -ctk TYPE -ctv TYPE \
+  -b 512 -ub 512 -p 512 -n 0 -d 32768 -r 5 \
+  -o json
+```
+
+First, the packed candidate was compared with the previous native loader,
+with native attention enabled in both arms:
+
+| Type | Previous native | Packed native | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q5_0` | 820.698 +/- 4.942 t/s | 835.205 +/- 4.590 t/s | +1.768% | 6.80 |
+| `q5_1` | 803.123 +/- 5.234 t/s | 863.561 +/- 5.714 t/s | +7.525% | 24.66 |
+| `q6_0` | 798.008 +/- 4.064 t/s | 812.164 +/- 4.570 t/s | +1.774% | 7.32 |
+| `q6_1` | 771.329 +/- 4.083 t/s | 844.264 +/- 5.575 t/s | +9.456% | 33.38 |
+
+The final behavior comparison used the same candidate library for both arms
+and changed only `--no-flash-attn-native-quants` versus
+`--flash-attn-native-quants`:
+
+| Type | Materialized | Packed native | Change | Welch t | Disposition at 32K |
+|---|---:|---:|---:|---:|---|
+| `q5_0` | 834.570 +/- 5.529 t/s | 834.872 +/- 4.821 t/s | +0.036% | 0.13 | neutral |
+| `q5_1` | 831.470 +/- 4.864 t/s | 863.817 +/- 4.800 t/s | +3.890% | 14.97 | gain |
+| `q6_0` | 821.803 +/- 4.855 t/s | 811.768 +/- 4.754 t/s | -1.221% | -4.67 | regression remains |
+| `q6_1` | 819.584 +/- 4.430 t/s | 844.467 +/- 4.906 t/s | +3.036% | 11.90 | gain |
+
+Ordinary one-token decode does not select the MMA path on Ada and is therefore
+unchanged by this loader-only diff; the vector kernel remains responsible at
+both 4K and long-context decode depths. No decode throughput claim is made.
+
+Allocation is also unchanged by the unpacking rewrite. The native route still
+removes the same F16 materialization. A clean reserve-time server process used
+the command shape below, once per type and arm, with process VRAM sampled once
+per second:
+
+```bash
+LD_PRELOAD=PACKED_CUDA_LIBRARY build/bin/llama-server \
+  -m /home/piggidragon/Services/models/llama-cpp/Qwen3.8-27b/Qwen3.8-27B-UD-IQ2_M.gguf \
+  -ngl 99 --fit off -sm none -mg 0 -fa on NATIVE_FLAG \
+  -nkvo --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -c 245760 --parallel 1 -b 512 -ub 512 -ctk TYPE -ctv TYPE \
+  -t 3 --host 127.0.0.1 --port PORT -v
+```
+
+| Type | CUDA compute off -> on | Process peak off -> on | Saved |
+|---|---:|---:|---:|
+| `q5_0` | 1610.27 -> 638.27 MiB | 11176 -> 10204 MiB | 972 MiB |
+| `q5_1` | 1640.27 -> 668.27 MiB | 11206 -> 10234 MiB | 972 MiB |
+| `q6_0` | 1670.27 -> 698.27 MiB | 11238 -> 10266 MiB | 972 MiB |
+| `q6_1` | 1700.27 -> 728.27 MiB | 11268 -> 10296 MiB | 972 MiB |
+
+`CUDA_Host` compute remained 260.28 MiB in every arm. The previous-loader
+CUDA library was 372,970,464 bytes, SHA-256
+`2fbf59fe60298c9ecf588270190327cb16de9693bccbde11ae817ae6dce6381b`;
+the packed library was 360,588,000 bytes, SHA-256
+`b134e5fac4a98a050e62297c363b3ded1afd12c1455ec381ccdbf284fba4ee0d`.
+The rewrite therefore reduced this all-quants library by 12,382,464 bytes
+(11.81 MiB, 3.32%).
+
+Correctness gates passed: all 16 generated quantized-MMA translation units
+compiled; the generator was byte-idempotent; the focused Q5/Q6
+`FLASH_ATTN_EXT` matrix passed 384/384 against the CPU reference over
+D=64/128/256 and the generated geometries; and 128-token greedy generation
+was byte-identical with native permission off and on for all four types.
+Audited model runs recorded 144 native D=256 launches per type. No changed
+kernel reported local-memory spills.
+
+Retain the packed Q5/Q6 rewrite. It improves every previous native loader,
+fixes both `_1` regressions, makes Q5_0 neutral against materialization, and
+reduces but does not eliminate the Q6_0 regression. Q6_0 remains the next
+contained performance target; Q3 packing, paired-lane loading, and later
+pipelining remain separate experiments. This result does not justify flipping
+either default.
+
+#### Completed packed loader family
+
+Status: retained, except for one rejected variant recorded below. Three
+commits finish the packed-loader work the Q5/Q6 entry left open:
+`864cf8e2c` packs Q3, `f5b975136` packs the last generic-functor types and
+consolidates the family, and `8c54d5265` changes how zero-point types apply
+their bias. Measurement host, model, and build are the same as the Q5/Q6
+entry above: an RTX 4070 (compute capability 8.9), Intel Core i5-13400F,
+`Qwen3.8-27B-UD-IQ2_M.gguf`, Release CUDA architecture 89 with
+`GGML_CUDA_FATTN_Q8_NATIVE=ON` and `GGML_CUDA_FA_ALL_QUANTS=ON`.
+
+Four libraries were kept so each step could be attributed separately:
+
+| Tag | Contents | Bytes | SHA-256 |
+|---|---|---:|---|
+| L0 | packed Q5/Q6 only (`8bcf9d10a`) | 360,588,000 | `b134e5fac4a98a050e62297c363b3ded1afd12c1455ec381ccdbf284fba4ee0d` |
+| L1 | + packed Q3, Q4_1, Q2 | 353,063,904 | `acd44f47d674f0eb3df3974223bc7d64f7c67c76fd80e22fc0c2785b048c128c` |
+| L2 | + float-domain zero point | 348,070,880 | `3671a863db2c9f4cc92323b7090c9f7bdf8b0b47a50873d82d54e7f4b9e82d35` |
+| L3 | + paired-lane block fetch (rejected) | 350,729,184 | not retained |
+
+Throughput used `llama-bench`, 512-token prefill at depth 32,768,
+batch/ubatch 512, three pinned CPU threads, CPU-resident pinned KV, and
+`--kv-gpu-layers 0`. Every arm is two reverse-order runs of `r=5`, ten
+samples per arm, with the library selected by `LD_PRELOAD`:
+
+```bash
+LD_PRELOAD=CUDA_LIBRARY taskset -c 0,2,4 build/bin/llama-bench \
+  --progress -m MODEL -ngl 99 -sm none -mg 0 -t 3 --poll 100 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on NATIVE_FLAG -ctk TYPE -ctv TYPE \
+  -b 512 -ub 512 -p 512 -n 0 -d 32768 -r 5 -o json
+```
+
+Packing the four types that still walked their blocks per element, with
+native attention enabled in both arms (L0 against L2):
+
+| Type | Generic functor | Packed | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q4_1` | 857.933 +/- 5.441 t/s | 888.953 +/- 4.902 t/s | +3.616% | 13.39 |
+| `q3_0` | 838.604 +/- 4.784 t/s | 896.683 +/- 5.097 t/s | +6.926% | 26.27 |
+| `q3_1` | 835.034 +/- 4.706 t/s | 895.900 +/- 4.887 t/s | +7.289% | 28.37 |
+| `q2_0` | 908.586 +/- 5.653 t/s | 927.692 +/- 5.437 t/s | +2.103% | 7.70 |
+| `q2_1` | 905.351 +/- 5.261 t/s | 918.592 +/- 4.983 t/s | +1.463% | 5.78 |
+
+Replacing `__vsubss4` with the cast path's own `(code - bias)*d` (L1 against
+L2). The last two rows are controls that do not execute the changed branch:
+
+| Type | `__vsubss4` | Float bias | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q2_0` | 903.933 t/s | 927.692 t/s | +2.628% | 9.79 |
+| `q3_0` | 882.232 t/s | 896.683 t/s | +1.638% | 6.27 |
+| `q5_0` | 833.428 t/s | 850.550 t/s | +2.054% | 7.24 |
+| `q6_0` | 811.346 t/s | 826.107 t/s | +1.819% | 6.19 |
+| `q5_1` | 862.555 t/s | 864.081 t/s | +0.177% | 0.58 |
+| `q6_1` | 845.285 t/s | 843.941 t/s | -0.159% | -0.56 |
+
+Only the zero-point types move. That is the claimed mechanism rather than a
+general speedup, and it explains the pattern the Q5/Q6 entry left
+unexplained: every `_0` type trailed its `_1` sibling because the bias went
+through an intrinsic that is emulated on this architecture.
+
+Final behavior, same library in both arms, changing only
+`--no-flash-attn-native-quants` against `--flash-attn-native-quants`:
+
+| Type | Materialized | Native | Change | Welch t | Disposition at 32K |
+|---|---:|---:|---:|---:|---|
+| `q2_0` | 866.815 +/- 4.782 t/s | 927.692 +/- 5.437 t/s | +7.023% | 26.59 | gain |
+| `q2_1` | 855.903 +/- 4.253 t/s | 918.592 +/- 4.983 t/s | +7.324% | 30.26 | gain |
+| `q3_0` | 847.444 +/- 4.716 t/s | 896.683 +/- 5.097 t/s | +5.810% | 22.42 | gain |
+| `q3_1` | 842.916 +/- 4.488 t/s | 895.900 +/- 4.887 t/s | +6.286% | 25.25 | gain |
+| `q4_1` | 837.097 +/- 5.235 t/s | 888.953 +/- 4.902 t/s | +6.195% | 22.86 | gain |
+| `q5_0` | 835.070 +/- 4.857 t/s | 850.550 +/- 4.994 t/s | +1.854% | 7.03 | gain |
+| `q5_1` | 830.077 +/- 5.693 t/s | 864.081 +/- 4.843 t/s | +4.096% | 14.39 | gain |
+| `q6_0` | 821.871 +/- 4.931 t/s | 826.107 +/- 5.113 t/s | +0.515% | 1.89 | neutral |
+| `q6_1` | 818.956 +/- 5.218 t/s | 843.941 +/- 5.653 t/s | +3.051% | 10.27 | gain |
+
+No tested type loses to materialization any more. `q6_0` is the one that is
+merely no longer negative: at `t = 1.89` its `+0.515%` is not an established
+gain, only the removal of the `-1.22%` regression.
+
+##### Rejected: paired-lane block fetch
+
+Adjacent lanes of a row consume the two halves of one quant block and
+therefore issue the same byte loads twice. L3 had each lane load only its own
+half and trade words with its partner through `__shfl_xor_sync`, using a
+two-lane mask so a row that skipped an out-of-bounds load could not
+desynchronize one that did not. It compiled without spills and passed the
+same `test-backend-ops` sweep as L2, so it was correct; it was simply slower
+on every type:
+
+| Type | L2 | L3 paired | Change | Welch t |
+|---|---:|---:|---:|---:|
+| `q4_1` | 888.953 t/s | 820.878 t/s | -7.658% | -25.75 |
+| `q3_1` | 895.900 t/s | 840.684 t/s | -6.163% | -24.82 |
+| `q2_1` | 918.592 t/s | 878.366 t/s | -4.379% | -17.72 |
+| `q3_0` | 896.683 t/s | 860.808 t/s | -4.001% | -15.63 |
+| `q2_0` | 927.692 t/s | 881.008 t/s | -5.032% | -20.34 |
+| `q5_0` | 850.550 t/s | 813.871 t/s | -4.312% | -17.75 |
+| `q6_0` | 826.107 t/s | 782.941 t/s | -5.225% | -20.37 |
+| `q5_1` | 864.081 t/s | 808.638 t/s | -6.416% | -26.41 |
+| `q6_1` | 843.941 t/s | 781.025 t/s | -7.455% | -28.35 |
+
+The duplicated loads were never the cost they appeared to be. Partner lanes
+read the same address, so the coalescer already served both from one
+transaction; the split removed load instructions but added shuffle latency on
+the critical path and grew the library by 2,658,304 bytes. The variant is not
+kept. Its exchange did not change any result, so the loss is scheduling, not
+work.
+
+##### Correctness
+
+`test-backend-ops FLASH_ATTN_EXT` passed for every natively loadable type at
+each step: `q8_0` 447/447, `q4_0` 472/472, `q4_1` 432/432, `q5_0` 432/432,
+`q5_1` 432/432, `q6_0` 98/98, `q6_1` 97/97, `q3_0` 98/98, `q3_1` 97/97,
+`q2_1` 97/97, and `q2_0s` 97 of 98 with the single failure being the
+pre-existing materializing `hsk=hsv=64` `n_tail=16` case documented for this
+branch, which reports `native_quants=0`.
+
+128-token greedy generation was byte-identical with the native option off and
+on for `q3_0`, `q3_1`, `q4_1`, `q2_1`, `q5_0`, `q5_1`, `q6_0` and `q6_1`,
+each with 128 audited native D=256 launches on and 0 off, and the values did
+not change when the zero point moved into float.
+
+`q2_0` cannot be gated that way and this is worth recording, because a naive
+reading of it looks like a native-path bug. Its model-level output is not
+reproducible across processes in either arm: ten native perplexity runs
+returned 4.0533 seven times and 4.0475, 4.0510 and 4.0516 once each, and six
+materializing runs spread over 4.0519 to 4.0579, while `q8_0` repeated
+3.8565 exactly in both arms. The spread belongs to the 2-bit cache type, not
+to either attention route. `q2_0`'s evidence is therefore the backend-ops
+sweep against the CPU reference plus a host-side check of its extraction
+against `dequantize_q2_0s` over 200,000 random blocks; every other packed
+extraction was checked the same way against its own functor.
+
+#### Long-context exactness and the allocation ceiling
+
+Status: both gates closed. Same host, model and build as the packed-loader
+entry above.
+
+##### Long-context byte identity
+
+The earlier byte-identity gate used an 8,192-token context, which is not where
+the allocation benefit lives. This repeats it at 131,072 and 245,760 with a
+deterministic prompt built from repository text, `temperature 0`, `seed 1234`,
+`cache_prompt` off, and `ignore_eos` so the model cannot end the comparison
+early. Both the text and the returned token IDs are compared, and native
+launches are counted from `GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE` so a fallback
+cannot produce a false green.
+
+| Context | Prompt tokens | Types | Result | Native D=256 launches (off / on) |
+|---:|---:|---|---|---|
+| 131,072 | 106,549 | `q8_0`, `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q3_0`, `q6_0`, `q6_1`, `q2_1` | all byte-identical | 0 / 3,360 |
+| 245,760 | 231,985 | `q8_0`, `q3_0` | all byte-identical | 0 / 7,280 |
+
+That is 26x and 57x the launch count of the original 8,192-token gate.
+
+`q2_0` is excluded on purpose. Its model-level output is not reproducible
+across processes in either arm, as recorded in the packed-loader entry, so
+there is nothing for a byte comparison to mean.
+
+##### A measurement artifact worth recording
+
+The first pass of this sweep reported `q4_0` and `q6_0` as differing at
+131,072, diverging at generated token 0 and 1 respectively. They do not.
+
+Both were native-arm runs from a batch that started each server immediately
+after killing the previous one. Re-running every arm twice under proper
+isolation produced one value per type across all four runs, with the native
+arm equal to the materializing arm, and re-running the two failures through the
+*same* verbose harness with a teardown wait reproduced byte identity. The
+batch's own reserve samples show device memory differing between arms of one
+pair (`peak_mib` 9,540 against 9,970), which is the likely route to a different
+kernel launch configuration and therefore a different reduction order.
+
+The lesson is procedural: an incompletely exited `llama-server` does not only
+cause loud "unable to allocate CUDA0 buffer" failures, it can also silently
+perturb a run that otherwise looks valid. Serialize GPU work and wait for
+teardown before trusting a long-context comparison.
+
+##### The allocation saving has a closed form
+
+The reserve-time saving was measured against context for `q8_0` and `q3_0`,
+one clean `llama-server --parallel 1 -v` process per point:
+
+| Context | `q8_0` saved | `q3_0` saved | `tail + dst` |
+|---:|---:|---:|---:|
+| 16,384 | 42 MiB | 8 MiB | 76 MiB |
+| 32,768 | 140 MiB | 106 MiB | 140 MiB |
+| 49,152 | 204 MiB | 170 MiB | 204 MiB |
+| 65,536 | 268 MiB | 268 MiB | 268 MiB |
+| 98,304 | 396 MiB | 396 MiB | 396 MiB |
+| 131,072 | 524 MiB | 524 MiB | 524 MiB |
+| 163,840 | 652 MiB | 652 MiB | 652 MiB |
+| 196,608 | 780 MiB | 780 MiB | 780 MiB |
+| 245,760 | 972 MiB | 972 MiB | 972 MiB |
+
+`tail` is the F16 copy, which `ggml_cuda_flash_attn_ext_get_alloc_size` appends
+to the FlashAttention output tensor rather than allocating separately, so it is
+`2*(nelem(K) + nelem(V))` and does not depend on the cache type. `dst` is that
+output tensor, `256 * 512 * 24 * 4 B` = 12 MiB here.
+
+From 65,536 upward both types hit `tail + dst` exactly, with no residual. Below
+it they fall short, because the allocator can still overlap the attention
+output allocation with other transients. So the saving is
+`min(tail + dst, what the allocator cannot overlap)`, and above roughly 64K the
+tail is too large for anything to overlap.
+
+This closes the 140-against-106 discrepancy at 32,768 that earlier entries left
+open. It was never a property of the cache type: `q8_0` reaches the ceiling at
+32,768 and the lower-bit types do not, because the smaller tail still leaves
+the allocator room to overlap.
+
+#### Parallel slots
+
+Every earlier allocation and exactness measurement on this branch used
+`--parallel 1`. That left two questions open: whether the saving survives more
+slots, and whether the multi-sequence graph shapes that continuous batching
+produces are still bit-exact. Both are answered here, same host and model.
+
+##### The saving is invariant under `--parallel N`
+
+Reserve-time, `-c 245760`, one clean process per point:
+
+| Slots | `n_ctx_slot` | `q8_0` off -> on | Saved | Reduction | `q3_0` off -> on | Saved | Reduction |
+|---:|---:|---|---:|---:|---|---:|---:|
+| 1 | 245,760 | 1790.27 -> 818.27 MiB | 972 | -54.3% | 1490.27 -> 518.27 MiB | 972 | -65.2% |
+| 2 | 122,880 | 1670.27 -> 698.27 MiB | 972 | -58.2% | 1370.27 -> 398.27 MiB | 972 | -70.9% |
+| 4 | 61,440 | 1610.27 -> 638.27 MiB | 972 | -60.4% | 1310.27 -> 338.27 MiB | 972 | -74.2% |
+| 8 | 30,720 | (out of memory) 1580.27 | 972 | -61.5% | 1280.27 -> 308.27 MiB | 972 | -75.9% |
+
+The saved figure is exactly 972 MiB at every slot count for both types, which
+follows from the closed form. With a non-unified cache `--parallel N` divides
+the per-slot context by N but presents N sequences, so `nelem(K)` and
+`nelem(V)` over the whole attention window are unchanged and so is the F16 tail
+appended to the attention output allocation.
+
+The baseline shrinks with N — a roughly 240 MiB term that scales as `1/N`, so
+818.27, 698.27, 638.27, 608.27 for `q8_0` — which means the *relative*
+reduction grows with slot count even though the absolute saving does not.
+
+##### At eight slots the option decides whether the server starts
+
+`q8_0` at `-c 245760 --parallel 8` cannot create a context on this 11,902 MiB
+card with the materializing path:
+
+```
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1580.27 MiB on device 0: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 1657037696
+graph_reserve: failed to allocate compute buffers
+llama_init_from_model: failed to initialize the context: failed to allocate compute pp buffers
+```
+
+The native arm reserves 608.27 MiB for the same configuration and starts
+normally. This is card-, model- and type-specific rather than a general claim:
+`q3_0` at the same slot count fits in both arms, because its baseline is
+300 MiB lower. It is recorded because it is the first configuration found where
+the option is not an optimization but the difference between a server that
+starts and one that does not.
+
+##### A unified cache does not shrink with slots, so the option matters more
+
+`--kv-unified` gives every slot the full context instead of `n_ctx / N`, and the
+reserved compute buffer stops depending on the slot count entirely:
+
+| Slots | `q8_0` off -> on | `q3_0` off -> on |
+|---:|---|---|
+| 1 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 2 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 4 | 1790.27 -> 818.27 MiB | 1490.27 -> 518.27 MiB |
+| 8 | (out of memory) 1790.27 | (out of memory) 1490.27 |
+
+`n_ctx_slot` is 245,760 at every row. The saving is again exactly 972 MiB, but
+unlike the non-unified case the baseline does not fall as slots are added, so a
+unified cache is the memory-hungrier configuration and the one where removing
+the F16 copy is worth most.
+
+That also widens the failure found above. With a non-unified cache only `q8_0`
+failed to start at eight slots. With `--kv-unified` **both** types fail in the
+materializing arm — `q8_0` on 1790.27 MiB and `q3_0` on 1490.27 MiB, both
+`cudaMalloc failed: out of memory` — while the native arm starts both at
+818.27 MiB and 518.27 MiB.
+
+##### Concurrent multi-slot output is bit-exact
+
+`--parallel 4 --cont-batching`, `-c 32768`, `q8_0`, four distinct prompts issued
+concurrently, 64 forced tokens each, comparing the concatenated token IDs of all
+four slots. Two runs per arm:
+
+| Arm | Run a | Run b |
+|---|---|---|
+| materializing | `552aeeeb…` | `552aeeeb…` |
+| native | `552aeeeb…` | `552aeeeb…` |
+
+All four hashes are equal, with 448 audited native launches in the native arm
+and 0 in the materializing arm. This matters because batching produces shapes
+that `--parallel 1` never generates: the recorded launches include
+`D=256 n_q=3 n_kv=2560`, a decode step covering three sequences in one launch,
+alongside the familiar `n_q=512` prefill shapes. The loader is exercised on
+those shapes and remains exact.
+
+Repeating the same test with `--kv-unified` gives the same four equal hashes,
+with 720 native launches against 0. Its recorded shapes reach further into
+multi-sequence territory — `n_q=4 n_kv=9984` and `n_q=8 n_kv=3328`, several
+sequences attending one shared window that is roughly four times the
+non-unified `n_kv` — and the output is unchanged.
+
+#### Mixed K/V cache types
+
+The route required `K->type == V->type`. That restriction was never a property
+of the kernel: `flash_attn_ext_f16` already carries `type_K` and `type_V` as
+separate template parameters, K and V reach the tile loader through separate
+`flash_attn_ext_quant_load_tile` calls, and the row strides are already derived
+per side from `nb11` and `nb21`. The symmetry was imposed in five places
+outside the kernel — the route gate, the dispatcher, one `static_assert`, the
+`DECL_FATTN_MMA_QUANT_CASE` macro, and the generator — each of which simply
+passed one type twice.
+
+##### Every ordered pair, and what that costs
+
+An earlier revision compiled only the 48 ordered pairs the vector FlashAttention
+path admits, on the reasoning that K enters the softmax and is the more
+precision-sensitive side. That band was removed: the route now compiles **every
+ordered pair of native types**, so whatever the F16-casting path accepts for K
+and V, the native path accepts too and no cache configuration has to reason
+about eligibility.
+
+`ggml_cuda_fattn_mma_quant_pair()` is therefore just "both types have a loader".
+The bit-ladder helpers survive only because the *vector* path still has a band
+and `fattn.cu` should not carry a second copy of it. The two coverage sets now
+intentionally diverge, and a newly admitted native pair outside the vector band
+has no compiled vector alternative.
+
+##### Cost
+
+| | Symmetric | Paired | Factor |
+|---|---:|---:|---:|
+| Compiled cases, default tier | 192 | 432 | 2.25x |
+| Compiled cases, `GGML_CUDA_FA_ALL_QUANTS` | 528 | 2,304 | 4.36x |
+| Quant instance object code | 77 MB | 315 MB | 4.09x |
+| `libggml-cuda.so`, `GGML_CUDA_FA_ALL_QUANTS` | 348,042,208 B | 578,918,992 B | 1.66x |
+| Full CUDA rebuild, `-j16` | — | 50 min 53 s | — |
+
+Widening from that band to every ordered pair costs again, and this is now the
+dominant cost of the feature:
+
+| | 48-pair band | Every pair |
+|---|---:|---:|
+| All-quants ordered pairs | 48 | **121** |
+| All-quants explicit cases | 2,304 | **5,808** |
+| Default-tier explicit cases | 432 | **768** |
+| Quant instance object code | 315 MB | **688 MB** |
+| `libggml-cuda.so` | 578,918,992 B | **962,082,712 B** |
+| Clean CUDA rebuild, `-j16` | 50 min 53 s | **1 h 45 min 55 s** |
+
+Adding an nth native type costs `2n-1` new pairs, so the type list is not a
+place to add speculatively. Every pair duplicates the entire attention body;
+the intended fix is a K- or loader-family-specialized kernel with a uniform
+runtime V-loader switch, so coverage costs one loader per type rather than one
+body per pair.
+
+The library figures are both measured, the first from a worktree built at the
+parent commit with identical flags rather than estimated from the object delta.
++220.2 MiB is a real cost and it falls entirely on `GGML_CUDA_FA_ALL_QUANTS`
+builds, which are already the opt-in tier.
+
+The generated instances are now split one file per K type as well as per
+`(ncols1, ncols2)` shape, 176 files instead of 16. Without that split the 4.4x
+would have landed inside 16 translation units and serialised the build behind
+them. In a default-tier build the seven extra-tier K files contribute no cases
+at all, so CMake excludes them rather than paying an nvcc invocation over the
+full MMA header for an empty translation unit.
+
+##### Correctness
+
+`test-backend-ops -o FLASH_ATTN_EXT -p native_quants=1`: **1695/1695**. That
+covers 550 mixed-pair cases — all 110 non-symmetric ordered pairs at head sizes
+64 and 256, at `kv=512` and the unpadded `kv=113` that forces both loaders onto
+their bounds-checked tail path with K and V disagreeing about the row stride,
+plus one sinks geometry per pair at head size 128.
+
+Numerical success alone would be a false green, because a pair without a kernel
+falls back and still produces the right answer. The sweep was therefore run with
+`GGML_CUDA_FATTN_Q8_NATIVE_VERBOSE=1` and the launch log audited: **all 121
+distinct ordered pairs appear**, between 5 and 104 launches each. The only
+fallback warning in the run is `DQ=96`, an unsupported head dimension.
+
+Model-level byte identity, Qwen3.8-27B-UD-IQ2_M, `-c 8192`, GPU-resident KV,
+128 forced tokens, comparing the native arm against the materializing arm:
+
+Under the 48-pair band, with the prompt taken from a repository document:
+
+| K / V | Result | Launches off / on | CUDA0 KV |
+|---|---|---|---:|
+| `q8_0 / q6_0` | `6e85f8fc…` identical | 0 / 128 | 240.00 MiB |
+| `q8_0 / q5_1` | `e7423afd…` identical | 0 / 128 | 232.00 MiB |
+| `q6_0 / q4_0` | `ba8184ad…` identical | 0 / 128 | 176.00 MiB |
+| `q5_0 / q4_0` | `8407576a…` identical | 0 / 128 | 160.00 MiB |
+| `q5_1 / q3_0` | `ea17cc51…` identical | 0 / 128 | 152.00 MiB |
+| `q4_1 / q2_0` | `3bbd082b…` identical | 0 / 128 | 120.00 MiB |
+| `q8_0 / q4_0` | `e31eea4d…` identical | 0 / **0** | 208.00 MiB |
+
+The last row was the control for the band: `q8_0 / q4_0` sat three positions
+apart on the ladder, so with the option on it took zero native launches. After
+the band was removed it is an ordinary native pair, and the rows above remain
+valid identity evidence for their pairs.
+
+Repeated after the widening, for the pairs the band used to exclude:
+
+| K / V | | Result | Launches off / on |
+|---|---|---|---|
+| `q8_0 / q2_0` | widest precision gap | `f2636244…` identical | 0 / 128 |
+| `q2_0 / q8_0` | reverse direction, V more precise than K | `e83b3066…` identical | 0 / 128 |
+| `q4_0 / q4_1` | `_0`/`_1` reverse at equal bit width | `ee46dc15…` identical | 0 / 128 |
+| `q8_0 / q6_0` | control, admitted under both policies | `0baae9cf…` identical | 0 / 128 |
+
+`q4_1 / q2_0` and `q8_0 / q2_0` are the most demanding admitted pairs: K carries
+a min or eight-bit codes while V unpacks two-bit fields, and the two sides use
+different row strides into the same shared tile. Both are exact.
+
+A methodology note, because it produced a hash that looks like a regression and
+is not: the identity harness built its prompt from
+`docs/quantized-native-flash-attention.md`, a file this work edits. `q8_0/q6_0`
+therefore hashes `6e85f8fc…` in the first table and `0baae9cf…` in the second.
+Within a single build the off and on arms read the same file at the same moment,
+so every comparison above is sound, but hashes are **not** comparable across
+builds. The harness now reads a frozen corpus instead.
+
+##### Where the benefit is, and where it is not
+
+Prefill throughput for a mixed pair is **neutral**. `q8_0 / q6_0` at depth
+32,768, `-p 512 -n 0 -r 5`, two reverse-order arm pairs so run order cannot
+carry the result:
+
+| Arm | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 823.575 t/s | 4.732 |
+| native | 10 | 825.419 t/s | 4.670 |
+
+`+1.844 t/s`, `+0.22%`, Welch `t = 0.877` on 18 degrees of freedom. That is not
+a result, and it should not be reported as one.
+
+The allocation saving is where mixed pairs pay, and it is large. Reserve-time
+`CUDA0 compute` from `llama-server --parallel 1 -v`, same pair:
+
+| Depth | Materializing | Native | Saved |
+|---:|---:|---:|---:|
+| 32,768 | 300.27 MiB | 160.27 MiB | **140.00 MiB, 46.6%** |
+| 131,072 | 960.27 MiB | 436.27 MiB | **524.00 MiB, 54.6%** |
+
+This is consistent with the mechanism established for the symmetric pairs: what
+the native route removes is the transient F16 copy of the attention window,
+whose size depends on the window and not on the source quantization. So a mixed
+pair saves what a symmetric pair of the same head dimension saves. The reason to
+support mixed pairs is that the configuration becomes eligible for that saving
+at all, not that the kernel runs faster once it is.
+
+#### Not compiling the unreachable softcap half
+
+Every quantized explicit case emitted two device kernels, one per
+`use_logit_softcap` specialization, because
+`ggml_cuda_flash_attn_ext_mma_f16_case()` names both unconditionally. The
+softcap-`true` half of that pair can never be selected: quantized K/V with a
+non-zero logit softcap aborts the CUDA backend on **both** the native and the
+materializing route, a pre-existing defect documented above. So half of
+everything this family compiled was unreachable code.
+
+The route now requires `logit_softcap == 0.0f` in
+`ggml_cuda_fattn_native_applies()`, and the quantized branch of the case
+function no longer names the softcap specialization. F16 and BF16 MMA softcap
+variants are untouched. This does not fix the underlying abort and does not
+claim to; it stops paying to compile a kernel that nothing can dispatch to.
+
+| | Every pair | With softcap pruned | Δ |
+|---|---:|---:|---:|
+| All-quants device kernels | 11,616 | **5,808** | −50% |
+| Default-tier device kernels | 1,536 | **768** | −50% |
+| Quant instance object code | 720,491,416 B | **489,731,256 B** | −32.0% |
+| `libggml-cuda.so` | 962,082,712 B | **736,400,096 B** | −23.5% |
+| Clean CUDA rebuild, `-j16` | 1 h 45 min 55 s | **1 h 00 min 15 s** | **−43.2%** |
+
+The kernel count is verified in the binary rather than inferred: `cuobjdump
+-symbols` on `fattn-mma-quant-instance-q8_0-ncols1_8-ncols2_8.cu.o` reports 33
+`flash_attn_ext_f16` kernels for the file's 33 explicit cases, exactly one
+each, and every mangled name carries `Lb0` for the `use_logit_softcap`
+template argument.
+
+Correctness is unchanged: `test-backend-ops -o FLASH_ATTN_EXT -p
+native_quants=1` gives the same **1695/1695** with the same 121 distinct
+ordered pairs audited in the launch log. That is the expected result — the
+change removes an unreachable specialization and does not alter generated
+hot-path code — and any throughput movement would have to be investigated as
+unexplained rather than banked.
+
+One gate from the plan could not be implemented as written. A backend test
+asserting that a quantized non-zero-softcap node takes zero native launches
+would have to execute that node, and doing so aborts the process on either
+route. The binary-level kernel audit above is the substitute, and it is the
+stronger check: it shows the kernel is not merely unselected but absent.
+
+#### Deduplicating the attention body across the pair matrix
+
+Covering every ordered pair by instantiating the kernel per pair costs 5,808
+explicit cases, because each pair duplicates the whole attention body for the
+sake of two tile-loader calls. The fix is to stop making V a template argument:
+one kernel per K type, choosing its V loader from a runtime switch at the
+tile-load site. The switch runs once per K/V tile -- at `D = 256` with
+`nbatch_V2 = 128` the V loop body executes once per tile -- so it is nowhere
+near the per-element path the packed loaders optimize.
+
+Mechanically this is constrained by a shared signature. The kernel needs a
+runtime V-type argument, but `flash_attn_ext_f16`'s pointer is stored as
+`fattn_kernel_t`, a typedef shared with the vector and tile kernels and with
+`fattn-mma-kvarn-case.cuh`, which takes pointers to the same kernel with KVarN
+template types. Widening that typedef would reach every FlashAttention kernel in
+the backend. Instead the MMA path gets its own `fattn_kernel_mma_t` with the
+trailing argument, `launch_fattn` becomes templated on the kernel pointer type
+with a forwarded argument pack, and the vector and tile kernels are untouched.
+
+Two traps worth recording. `GGML_CUDA_FATTN_KVARN_TYPE` is already
+`GGML_TYPE_COUNT` and `..._ORIGINAL_TYPE` is `GGML_TYPE_COUNT + 1`, so the
+obvious sentinel value aliases KVarN's: it makes
+`ggml_cuda_fattn_kvarn_template_type()` true for quantized kernels and drags the
+KVarN tile loader into translation units that never define it, which surfaces as
+"Broken module found" rather than as a type error. The runtime-V sentinel
+therefore sits at `+2`. Separately, `flash_attn_ext_f16_process_tile` has call
+sites inside the KVarN case file as well as in `fattn-mma-f16.cuh`; both need
+the new argument.
+
+##### The first version was measurably worse and was not kept
+
+Making V runtime for every pair reduces the inventory to 528 cases and the
+library to 493,431,264 bytes, and it passes correctness exactly: 1695/1695 with
+all 121 ordered pairs audited in the launch log. It also **loses**:
+
+| `q8_0/q8_0`, 512-token prefill at depth 32,768 | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 819.182 t/s | 4.705 |
+| native, V runtime everywhere | 10 | 813.220 t/s | 4.538 |
+
+`-0.73%`, Welch `t = -2.88`. That puts the native path *behind* the
+materializing path it exists to replace, on the most common cache
+configuration. The mechanism is visible in `cuobjdump -res-usage`: the `D = 256`
+production kernel goes from `REG:255 STACK:16` to `REG:255 STACK:48`. Spills
+were already present before this change -- every quantized kernel spilled 16
+bytes and 11 of 33 in a representative object were already at the register
+ceiling -- but tripling the spill on the production shape was enough to erase
+the feature's advantage.
+
+##### Hybrid: compile-time V for the symmetric pair, runtime V for the rest
+
+The regression is on `K == V`, which is also the common case, so the symmetric
+pair keeps V as a template argument and every mixed pair shares one runtime-V
+kernel per K type. Coverage of all n^2 ordered pairs then costs 2n kernels.
+
+| `q8_0/q8_0`, same shape | n | Mean | SD |
+|---|---:|---:|---:|
+| materializing | 10 | 819.491 t/s | 4.389 |
+| native, hybrid | 10 | 828.439 t/s | 5.839 |
+
+`+1.09%`, Welch `t = +3.87`. The native path is ahead again.
+
+| | Per-pair (Phase 2) | V runtime everywhere | Hybrid |
+|---|---:|---:|---:|
+| All-quants explicit cases | 5,808 | 528 | **1,056** |
+| Default-tier explicit cases | 768 | 192 | **384** |
+| Quant instance object code | 489,731,256 B | 230,358,920 B | **286,159,048 B** |
+| `libggml-cuda.so` | 736,400,096 B | 493,431,264 B | **539,733,488 B** |
+| Symmetric `D=256` spill | 16 B | n/a | **24 B** |
+| `q8_0/q8_0` vs materializing | faster | **-0.73%** | **+1.33%** |
+
+The hybrid's library size and throughput in that table are the corrected
+figures. The first hybrid build measured 659,399,296 B and `+1.09%` at
+`t = +3.87`; both moved when the declaration defect described below was fixed,
+which changed no generated hot-path code.
+
+Correctness is unchanged in both variants: **1695/1695** with all 121 distinct
+ordered pairs audited in the launch log. Model-level byte identity against the
+materializing arm holds for the hybrid on `q8_0/q8_0` (`759a5cea…`),
+`q8_0/q2_0` (`55ffa404…`), `q2_0/q8_0` (`52c51225…`) and `q4_0/q4_1`
+(`1fdbf861…`), each with 112 audited native launches, covering both the
+compile-time-V and runtime-V kernels.
+
+The hybrid does not fully recover the register budget. The symmetric `D = 256`
+kernel sits at 24 bytes of spill against 16 before, because
+`flash_attn_ext_f16` now carries the trailing runtime V-type parameter even in
+instantiations that ignore it. That residual is the honest cost of the
+mechanism, and it was left open whether it costs throughput: the original
+per-pair library had been overwritten by the time the regression was found.
+
+##### The residual spill costs nothing: per-pair against hybrid, natively
+
+The per-pair implementation was rebuilt from its own commit into a separate
+worktree so both libraries could exist at once, and the two were compared
+directly with `--flash-attn-native-quants` enabled on both arms. This is the
+comparison the hybrid entry above could not make.
+
+| `q8_0/q8_0`, 512-token prefill at depth 32,768 | n | Mean | SD |
+|---|---:|---:|---:|
+| per-pair, `35115bf4d`, 5,808 cases | 10 | 829.801 t/s | 4.664 |
+| hybrid, `8b9a5d111`, 1,056 cases | 10 | 829.562 t/s | 4.386 |
+
+`+0.029%`, Welch `t = +0.112` over two reverse-order arm pairs of `r = 5`. The
+two implementations are indistinguishable. The 24-byte spill is real in
+`cuobjdump -res-usage` and costs nothing measurable on the production shape, so
+body deduplication buys 197 MB of library and 5,808 -> 1,056 explicit cases for
+no runtime price.
+
+A single ordered pair at one shape is a screen, not a result, so the comparison
+was widened to a depth and prompt-length matrix, both arms native, ABBA-ordered
+per configuration, `r = 5`. Prefill and decode come from the same invocation
+wherever both are present, so they share a process and a cache state.
+
+| Configuration | Test | Per-pair | Hybrid | Δ | Welch `t` |
+|---|---|---:|---:|---:|---:|
+| depth 0, ubatch 512 | `pp512` | 1248.382 | 1249.024 | `-0.051%` | `-0.07` |
+| depth 0, ubatch 512 | `tg64` | 39.192 | 39.221 | `-0.075%` | `-0.77` |
+| depth 4,096 | `pp512` | 1187.883 | 1187.367 | `+0.043%` | `+0.13` |
+| depth 4,096 | `tg64` | 31.710 | 31.721 | `-0.033%` | `-0.30` |
+| depth 32,768 | `pp512` | 829.736 | 829.439 | `+0.036%` | `+0.14` |
+| depth 32,768 | `tg64` | 13.049 | 13.052 | `-0.027%` | `-0.89` |
+| depth 32,768, ubatch 2,048 | `pp2048` | 877.019 | 877.012 | `+0.001%` | `+0.01` |
+| depth 32,768, ubatch 2,048 | `pp8192` | 858.301 | 858.377 | `-0.009%` | `-0.58` |
+| depth 131,072 | `pp512` | 395.376 | 395.090 | `+0.072%` | `+0.21` |
+| depth 131,072 | `tg64` | 4.305 | 4.305 | `+0.004%` | `+0.14` |
+
+Ten comparisons, largest `|Δ|` `0.075%`, largest `|t|` `0.89`. Nothing is
+distinguishable. The two `ubatch = 2048` rows matter beyond prompt length:
+`ubatch` selects the MMA kernel's `ncols` geometry, so those arms run different
+compiled shapes from the `512` ones and would expose a shape-dependent cost of
+sharing one body if there were one.
+
+One caution about reading this matrix while it runs: at the point where only
+one hybrid arm of the `131,072` configuration had landed, `tg64` there read
+`-0.066%` at `t = -3.11`, which crosses the usual significance threshold. With
+the second arm complete it is `+0.004%` at `t = +0.14`. A half-finished ABBA
+pair is not a small sample of the result, it is a biased one, because the two
+arms of a pair sit at different points in any thermal or clock drift.
+
+Allocation was measured separately, because `llama-bench` hides compute-buffer
+differences behind its logits reservation. `llama-server --parallel 1 -v`,
+reserve-time buffers plus a one-second `nvidia-smi` sample across a real
+prefill and decode:
+
+| Context | Peak process VRAM | `CUDA0` compute | `CUDA_Host` compute | `CUDA0` KV | `CUDA_Host` KV |
+|---|---:|---:|---:|---:|---:|
+| 4,096 | 9,762 MiB | 150.27 MiB | 24.28 MiB | 17.00 MiB | 136.00 MiB |
+| 32,768 | 9,814 MiB | 202.27 MiB | 52.28 MiB | 17.00 MiB | 1,088.00 MiB |
+| 131,072 | 10,080 MiB | 468.27 MiB | 148.28 MiB | 17.00 MiB | 4,352.00 MiB |
+
+Every figure is identical between the two builds at every context, which is the
+expected result and worth stating as a check rather than an achievement: the
+hybrid changes which kernel is compiled, not the shared-memory request or the
+cache layout, so any allocation difference would have indicated a defect. The
+per-request server timings in those runs are single unrepeated requests and are
+not used as throughput evidence.
+
+This also settles the reading of the earlier `-0.73%` regression that killed the
+plain runtime-V variant. That loss cannot be attributed to spill as such: spill
+rose 16 -> 48 B there and 16 -> 24 B here, and only the former lost. What
+distinguishes them is that the plain variant put the runtime switch on the
+symmetric pair's own V load, while the hybrid keeps that pair fully
+compile-time. Consistent with the configuration sweep, which found the register
+ceiling is not this kernel's limit in either direction.
+
+Both binaries were built with identical flags, and after the harness fix below
+their `llama-bench` sources were byte-identical, so the arms differ only in
+`libggml-cuda.so`.
+
+The per-pair binary could not emit JSON on the first attempt: it aborted in the
+output writer with `vector::_M_range_check: __n (which is 127) >= this->size()
+(which is 127)` after all five runs had completed. The rebase resolution had
+kept both branches' additions to the `llama-bench` field-name list, leaving 131
+names against 127 values. `2df2bf4fe` fixes it at branch HEAD, but every commit
+between the rebase and that fix carries it, which matters for any future
+per-commit benchmarking or bisect in that range. Applying the one-line fix to
+the worktree rebuilt only `llama-bench`; `libggml-cuda.so` was verified
+unchanged by size and mtime.
+
+##### The declaration header was compiling what it only meant to declare
+
+The hybrid emits two kernels per K type, and the macro that names them expanded
+to two `template void ...` statements. `fattn-mma-quant-decl.cuh` writes
+`extern DECL_FATTN_MMA_QUANT_CASE(...)`, and in C++ the `extern` binds to the
+*first* statement only. The second was therefore not an explicit instantiation
+declaration but an explicit instantiation **definition**, in every translation
+unit that included the header.
+
+Only `fattn.cu` includes it, so only `fattn.cu` paid, but it paid the full
+price: 528 complete attention kernels compiled into a translation unit whose
+job was to declare them. Nothing was wrong with the resulting binary --
+duplicate explicit instantiations resolve as weak symbols and the generated
+instance files supply the same definitions -- so no test, no launch audit and no
+model hash could see it. Only the build time and the library size could, and
+they were attributed to full pair coverage.
+
+The fix splits the macro into `DECL_FATTN_MMA_QUANT_CASE_SYMMETRIC` and
+`DECL_FATTN_MMA_QUANT_CASE_RUNTIME_V`, one statement each, and the declaration
+header applies `extern` to both. The definition-side macro composes the two, so
+the generated instance files are unchanged.
+
+| | Before | After | Δ |
+|---|---:|---:|---:|
+| `fattn.cu` compile | 1 h 28 min+ | **17.9 s** | −99.7% |
+| `fattn.cu.o` | n/a, dominated by 528 kernels | **1,345,032 B** | |
+| `libggml-cuda.so` | 659,399,296 B | **539,733,488 B** | −114 MiB |
+| Clean CUDA rebuild, `-j16` | 1 h 16 min | **40 min 13 s** | −47.1% |
+| Quant instance object code | 286,159,048 B | **286,159,048 B** | unchanged |
+
+The unchanged instance-object total is the check that the fix touched only the
+declaration side.
+
+Re-measuring throughput on the corrected binary, same 512-token prefill at
+depth 32,768, reverse-order arm pairs:
+
+| `q8_0/q8_0` | Arm a | Arm b |
+|---|---:|---:|
+| materializing | 818.959 +/- 5.762 t/s | 817.791 +/- 4.907 t/s |
+| native, hybrid | 829.290 +/- 4.839 t/s | 829.156 +/- 5.166 t/s |
+
+818.375 against 829.223 t/s pooled: `+1.33%`, Welch `t = +4.95`, up from
+`+1.09%` at `t = +3.87` on the defective build. The two builds contain the same
+device code, so this is run-to-run and binary-layout movement rather than a
+speedup from the fix; the fix is a build-cost change only.
+
+Correctness on the corrected binary is unchanged: **1695/1695** with 121
+distinct ordered pairs audited, and model-level byte identity holds with the
+same hashes as before -- `q8_0/q8_0` `759a5cea1cb597ca`, `q8_0/q2_0`
+`55ffa404f1bf4348`, `q4_0/q4_1` `1fdbf861874c6da4`, 112 native launches each.
+
+The general lesson is worth keeping: a multi-statement macro is unsafe to
+prefix with `extern`, and the failure mode is silent. Both macros above are
+commented to say so.
+
+#### Rejected: raw-byte `cp.async` staging of quantized rows
+
+`nstages` is forced to `0` for quantized caches because `cp.async` is a
+byte-for-byte DMA and cannot dequantize. Design A of
+[`docs/quantized-native-fa-staging-plan.md`](quantized-native-fa-staging-plan.md)
+works around that by staging the *raw* quantized rows into shared memory and
+letting the existing packed loaders read shared instead of global, with their
+arithmetic untouched. **It was implemented, it is exact, and it loses on every
+arm measured. It is not retained.**
+
+The prototype was the narrowest one the plan allows: `D = 256`, `ncols2 >= 2`,
+symmetric `q3_0` and `q2_1` only -- the types whose raw region fits underneath
+the shared-memory floor `nbytes_shared_Q` already sets, so occupancy is held
+fixed and the experiment measures overlap alone. Single raw buffer, whole-row
+16-byte transfers, synchronous fallback for the `oob_check` tail.
+
+Two mechanisms had to be added that the plan did not anticipate. `cp-async.cuh`
+exposed only `cp_async_wait_all()`, which waits for *every* outstanding copy;
+waiting for staged K that way would also wait for staged V and destroy the
+overlap the design exists to create, so K and V are committed as separate groups
+via new `cp_async_commit_group()` / `cp_async_wait_group<n>()` helpers, and K
+waits with one group still in flight. Separately, `cp-async.cuh` has no include
+guard -- most `.cuh` files in this backend rely on being included once per
+translation unit -- so including it from `fattn-mma-quant.cuh` gave `fattn.cu`
+two definitions of everything in it. That one failed loudly in 32 seconds,
+unlike the `extern` defect above.
+
+Both arms were built from identical source, separated only by an internal
+build-time `GGML_CUDA_FATTN_QUANT_STAGE`, with `0` generating the shipped code
+path so the baseline is the real implementation and not a staging-shaped rewrite
+of it. `GGML_CUDA_FA_ALL_QUANTS=ON` (the prototype types are extra-tier),
+`GGML_CUDA_KVARN=OFF`.
+
+Every gate before the benchmark passed, including one that improved:
+
+| `D = 256`, 8x8 | Synchronous | Staged |
+|---|---|---|
+| `q3_0` symmetric | `REG:255 STACK:40` | `REG:255` **`STACK:16`** |
+| `q2_1` symmetric | `REG:255 STACK:16` | `REG:255 STACK:16` |
+| `q3_0`/`q2_1` runtime-V | `REG:255 STACK:48` | `REG:255 STACK:48` |
+
+Spill *fell* by 24 bytes on `q3_0`, because `cp.async` writes global to shared
+directly and skips the register round-trip the synchronous loader needs for raw
+bytes. `libggml-cuda.so` shrank by 602,112 bytes for the same reason.
+Correctness is exact: **1695/1695** with 36 `D = 256` native launches for each
+prototype pair, and model-level output is byte-identical to the synchronous
+build -- `q3_0/q3_0` `64b940e5df0aa624`, `q2_1/q2_1` `e176079d5562e702`, 112
+native launches each.
+
+Then it lost, at 512-token prefill and depth 32,768, two reverse-order arm pairs
+of `r = 5` per cell:
+
+| Pair / KV residency | Synchronous | Staged | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| `q3_0/q3_0`, GPU | 933.569 t/s | 918.096 t/s | **`-1.657%`** | `-4.77` |
+| `q3_0/q3_0`, host | 897.305 t/s | 882.548 t/s | **`-1.645%`** | `-5.75` |
+| `q2_1/q2_1`, GPU | 947.657 t/s | 941.258 t/s | `-0.675%` | `-1.94` |
+| `q2_1/q2_1`, host | 918.890 t/s | 912.253 t/s | `-0.722%` | `-2.60` |
+
+The SASS says exactly what was traded, for the `q3_0` `D = 256` 8x8 kernel:
+
+| | Synchronous | Staged |
+|---|---:|---:|
+| `LDG` (global loads) | 360 | **60** |
+| `LDGSTS` (`cp.async`) | 0 | **24** |
+| `LDS` | 493 | 529 |
+| `STS` | 337 | 355 |
+| `BAR.SYNC` | 36 | **48** |
+| `HMMA` | 768 | 768 |
+
+The DMA did its job: 300 global load instructions became 24 whole-row
+transfers, and the loads are genuine shared-memory `LDS` rather than generic
+`LD`, so the address space resolved correctly. `HMMA` is unchanged, confirming
+the math is untouched. What it cost is **12 additional barriers per tile**, and
+that is more than the overlap is worth.
+
+Structurally, only half the transfer can overlap anything. K is issued and then
+waited on almost immediately, because the KQ multiply needs it; only V's fetch
+spans the multiply. So the design pays two barriers' worth of synchronization to
+hide one of its two fetches, against a synchronous loader whose global loads the
+compiler was already overlapping with math inside the unrolled loop. `q3_0`
+loses roughly twice as much as `q2_1`, consistent with its wider row: more bytes
+staged, same barrier count.
+
+Per the plan's disposition rule this stops here. No double buffering, no `q8_0`
+(whose occupancy cliff was already priced at about `-9.3%`), no `D = 64` or
+`D = 128` (which would additionally need `cp.async` widths that `cp-async.cuh`
+does not have). The source changes are reverted; the attempted diff and both
+SASS dumps are preserved outside the tree.
+
+This is the third independent result on this branch showing that register and
+spill relief does not predict throughput for this kernel. `Q_in_reg = false`
+relieved registers and lost 9.35%. The hybrid raised spill and cost nothing.
+Staging lowered spill by 24 bytes and lost 1.7%. Whatever limits this kernel, it
+is not the register file.
+
+#### The vector/MMA crossover: MMA wins everywhere measured, and cannot be adopted
+
+The Ada dispatch rule sends quantized K/V to the vector kernel at `n_q <= 2` and
+to MMA above it (`ggml_cuda_get_best_fattn_kernel` in `fattn.cu`). That constant
+was never measured against this branch's native MMA path, so it was swept.
+
+The vector kernel is compiled only for `cols_per_block` 1 and 2, but it covers
+larger batches by launching more blocks rather than more columns per block, so
+every threshold value is runnable and the constant is a genuine tuning choice
+rather than the edge of what exists. The sweep used an internal
+`GGML_CUDA_FATTN_VEC_MAX_NQ` read once from the environment, defaulting to 2,
+which lets one build measure both sides; `0` forces MMA at every batch size and
+a large value forces vector. Verified before use: `0` and `2` give identical
+routing on the 1694-case audit, and `64` moves 946 of those cases off MMA.
+
+Prompt-side, `q8_0/q8_0`, depth 4,096, GPU-resident KV, ABBA per cell, `r = 5`:
+
+| `n_q` | Vector | MMA | Δ | Welch `t` |
+|---:|---:|---:|---:|---:|
+| 1 | 41.389 t/s | 41.799 t/s | `+0.99%` | `+33.79` |
+| 2 | 73.561 t/s | 74.995 t/s | `+1.95%` | `+27.79` |
+| 3 | 97.972 t/s | 102.213 t/s | `+4.33%` | `+35.90` |
+| 4 | 118.003 t/s | 123.369 t/s | `+4.55%` | `+66.63` |
+| 6 | 145.138 t/s | 152.868 t/s | `+5.33%` | `+33.68` |
+| 8 | 166.107 t/s | 176.877 t/s | `+6.48%` | `+74.86` |
+| 16 | 290.294 t/s | 324.110 t/s | `+11.65%` | `+324.83` |
+| 32 | 438.977 t/s | 521.550 t/s | `+18.81%` | `+389.92` |
+
+Prompt processing at `ubatch = 1` is a proxy for a verification batch, not real
+decode, so decode was measured separately with `-n 64` where `n_q = 1` arises
+naturally:
+
+| Decode, GPU-resident | Vector | MMA | Δ | Welch `t` |
+|---|---:|---:|---:|---:|
+| depth 4,096 | 39.074 t/s | 39.402 t/s | `+0.84%` | `+6.55` |
+| depth 32,768 | 32.557 t/s | 36.330 t/s | **`+11.59%`** | `+67.75` |
+
+**There is no crossover in the measured range.** MMA wins at every batch size
+from 1 to 32 and at real decode, and its advantage grows monotonically with
+batch size. The shipped rule sends `n_q <= 2` the wrong way, costing 11.6% of
+decode throughput at depth 32,768 on this model.
+
+That is a statement about *this* model, and the rule is global. This model has a
+high GQA ratio, and the dispatcher already contains
+`!gqa_opt_applies && Q->ne[1] == 1 -> VEC`, which implies MMA is expected to win
+when GQA folding applies. The honest reading is that the rule needs a GQA-aware
+term rather than a smaller constant, and confirming that needs a low-GQA model.
+
+**The change the data recommends is currently unimplementable, and that is the
+more important result.** With host-resident KV
+(`-nkvo 1 --kv-cpu-pinned --kv-gpu-layers 0`), forcing MMA at `n_q = 1` aborts
+in `ggml_backend_cuda_synchronize` deterministically: 4 of 4 retries, twice, at
+both depths, while the vector arm at the same settings succeeded on the first
+attempt every time. Host-resident `n_q <= 8` could not be measured at all for
+the same reason; only `n_q` 16 and 32 completed, where MMA wins by `+10.20%` and
+`+17.09%`.
+
+The abort is not this feature's:
+
+- It occurs with `--no-flash-attn-native-quants` as well as with it.
+- It occurs with an `f16` cache, not only quantized.
+- It occurs with GPU-resident KV at small `ubatch` too, and without
+  `--kv-cpu-pinned`, so it is not a pinning or residency property alone.
+- Default routing did not **abort** in the runs tried here: `f16` and `q8_0`,
+  host-resident, decode at depths 4,096 and 16,384 all completed cleanly.
+
+That last point was originally written up as "not reachable through default
+routing". **It is wrong, and the root-cause section below supersedes it.**
+Completing cleanly is not evidence of not reaching the defect: the failure is
+undefined behaviour, and `compute-sanitizer --tool synccheck` later showed the
+diverging kernel *is* entered through default routing, reporting 1408 errors on
+an `f16` cache at depth 8,704 with no experiment control set at all. What the
+clean runs establish is only that the shipped rule does not usually make it
+abort, not that it avoids the kernel.
+
+Lowering the threshold globally would still turn a measured 11.6% decode gain
+into frequent aborts for anyone running host-resident KV.
+
+**Disposition: the threshold is not changed here.** The evidence is strong
+enough to say the constant is wrong for high-GQA models with a native quantized
+cache, and not strong enough to replace it: it would need a GQA-aware rule
+validated on a low-GQA model, and it would need the host-resident MMA path fixed
+first. Both belong in their own change, and the host-resident abort belongs with
+the CPU KV offload work rather than here. The experiment control is reverted.
+
+**Historical reproducer — does not run on the committed tree.** The command
+below forced the route with `GGML_CUDA_FATTN_VEC_MAX_NQ`, the experiment control
+that was reverted with the rest of this experiment, so the variable no longer
+exists in the source and the command silently measures default routing instead.
+It is kept only to record what was run at the time. For a reproducer that works
+on the committed tree, use the `synccheck` command in the root-cause section
+below, which needs no experiment control.
+
+```
+# requires the reverted GGML_CUDA_FATTN_VEC_MAX_NQ control; will not force the
+# route on the committed tree
+GGML_CUDA_FATTN_VEC_MAX_NQ=0 llama-bench -m MODEL -ngl 99 -sm none -mg 0 -t 3 \
+  -nkvo 1 --kv-cpu-pinned --recurrent-state-offload --kv-gpu-layers 0 \
+  -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -p 0 -n 64 -d 4096 -r 5
+```
+
+Two measurement notes. `llama-bench` applies `-ubatch` to the depth prefill as
+well as to the measured tokens, so `-ub 1 -d 32768` means 32,768 single-token
+forward passes; the first attempt at this sweep was abandoned after one cell ran
+past eleven minutes, and depth 4,096 was used instead. And `test-backend-ops
+perf` would be the better instrument -- it times FlashAttention directly at
+`kv = 4096` and `7680` with no depth cost -- except every perf case carries
+`native_quants=0`, so it cannot reach the native path without new cases.
+
+#### Root cause of the crossover blocker: divergent barriers in the MMA kernel
+
+The abort that blocked the crossover work was diagnosed. It is **not** an
+out-of-bounds access and **not** this feature's defect. It is a divergent
+`__syncthreads()` in upstream's `flash_attn_ext_f16`, and it is reachable
+through default routing today.
+
+`compute-sanitizer --tool memcheck` reports **0 errors** on a run that aborts
+without it, which is the first clue: nothing reads out of bounds.
+`--tool synccheck` reports 512:
+
+```
+Barrier error detected. Divergent thread(s) in block.
+  at flash_attn_ext_f16<256, 256, ncols1=1, ncols2=8, ...>+0x47580
+```
+
+In the SASS, `@P0 BRA 0x47660` at `0x47460` jumps over the `BAR.SYNC` at
+`0x47580`, and the target lands in the combine write-back with no barrier of its
+own. The instructions in between -- `SHFL.BFLY`, `MUFU.EX2` (an `expf`), a
+second shuffle -- place it in the combine reduction, the
+`if (np > 1 && threadIdx.y % np == 0)` block whose source already carries an
+`else if (np > 1) { __syncthreads(); }` balancer written to prevent exactly
+this. Divergent barriers are undefined behaviour, which accounts for every
+symptom: flaky rather than deterministic, depth-dependent, and invisible to
+memcheck.
+
+Affected shapes, measured with synccheck rather than inferred:
+
+| Shape | `n_q` | synccheck |
+|---|---|---:|
+| `ncols1 = 1`, `ncols2 = 8` | 1 | 512 errors |
+| `ncols1 = 2`, `ncols2 = 8` | 2 | 1024 errors |
+| `ncols1 = 4`, `ncols2 = 8` | 3-4 | 1984 errors |
+| `ncols1 = 8`, `ncols2 = 8` | >= 5, including prefill | **0 errors** |
+
+An earlier prediction that only `np > 1` shapes were affected was wrong;
+`ncols1 = 4` diverges too. The boundary is empirical: small-batch shapes
+diverge, the 8x8 production prefill shape does not.
+
+**The production prefill shape is clean, so no measurement in this PR is
+affected.** Every throughput figure recorded here comes from `ncols1 = 8`
+prefill or from the vector kernel.
+
+It is independent of this feature and reachable by default:
+
+- It reproduces with `--no-flash-attn-native-quants` and with an `f16` cache:
+  `flash_attn_ext_f16<256, 256, 1, 8, ..., f16, f16>`, same 512 errors.
+- With **no experiment control at all** -- default routing, `f16` cache,
+  GPU-resident KV, depth 8,704 -- synccheck reports **1408 errors**. The Ada
+  rule sends `n_q = 1` to MMA for non-quantized caches when
+  `gqa_ratio > 4 && K->ne[1] >= 8192`, which this model satisfies.
+- For quantized caches the Ada rule sends `n_q <= 2` to the vector kernel, but
+  `n_q` 3 and 4 route to MMA by default and land on the diverging
+  `ncols1 = 4` shape. Speculative verification at small draft batch sizes sits
+  exactly there.
+
+Whether it aborts depends on timing. Host-resident KV aborted reliably from
+depth 4,096 up and was clean at 2,048; GPU-resident KV aborted occasionally at
+depth 32,768. The focused `native_quants=1` selection of `test-backend-ops`
+passes 1695/1695 regardless -- that is the selection, not the full suite, which
+has its own inherited exception documented in the feature guide -- because divergent
+barriers on Volta-and-later frequently produce correct results anyway -- which
+is why this survived undetected.
+
+**Consequence for the crossover: the gain and the bug are the same shapes.**
+The measured `+11.59%` decode win at depth 32,768 is `n_q = 1`, which is
+`ncols1 = 1`. Lowering the vector threshold to capture it means routing more
+work onto the diverging shapes, not fewer. There is no threshold setting that
+takes the gain while avoiding the defect, so an opt-in "experimental" flag would
+amount to shipping a switch that enables undefined behaviour, whose failure mode
+includes silently wrong attention output rather than only a crash. It is not
+offered.
+
+The order is therefore: fix the barrier divergence first, in upstream's kernel
+and as its own change; then re-measure the crossover, because undefined
+behaviour can affect timing as well as results and the `+11.59%` was measured on
+a diverging kernel; then decide the threshold, with a low-GQA model to check the
+GQA-aware term.
+
+Reproducer, requiring nothing from this branch:
+
+```
+compute-sanitizer --tool synccheck llama-bench -m MODEL -ngl 99 -sm none -mg 0 \
+  -t 3 -nkvo 0 -fa on -ctk f16 -ctv f16 -b 512 -ub 512 -p 0 -n 4 -d 8704 -r 1
+```
+
+#### Retired without further attempts: the remaining loader-internal work
+
+Four separate interventions inside this kernel's loader have now been measured,
+and every one of them lost:
+
+| Attempt | Premise | Result |
+|---|---|---:|
+| Paired-lane block fetch | fewer load instructions | `-4.0%` to `-7.7%` |
+| `Q_in_reg = false` | relieve register pressure | `-9.35%` |
+| `nbatch_fa`, `nbatch_K2`/`nbatch_V2` | better batching | `-2.32%`, `-2.66%` |
+| Raw-byte `cp.async` staging | hide global-memory latency | `-1.65%` |
+
+The two changes that ever won here -- packing the loaders, and subtracting the
+zero point in float -- both kept the loader's structure intact and did the same
+work with fewer or cheaper instructions. Every attempt to change its *structure*
+has lost, whether by removing loads, redistributing them across lanes, moving
+them into a DMA, or changing how much of the tile is in flight at once.
+
+The two remaining planned loader experiments are therefore not attempted:
+
+- **One complete 32-element quant block per lane.** Structurally the paired-lane
+  experiment again -- the same loads, redistributed across lanes -- minus the
+  shuffles. Paired-lane lost decisively on every type with `|t| > 15`.
+- **Per-format field alignment for wider loads.** The nearest thing to packing,
+  which won, so this is the least implausible of the group. It is still narrow:
+  it applies only to formats whose layout guarantees the alignment, and the plan
+  already required stopping if the compiler coalesces the accesses anyway.
+
+**Warp-specialized producer/consumer dequantization is blocked by its own
+prerequisites**, not by this decision. It required either register pressure
+below the ceiling -- the kernel sits at `REG:255` -- or a reason arising from the
+staging result: staging winning with conversion still exposed, or profiling
+showing conversion dominates once DMA latency is hidden. Staging lost, so
+neither holds.
+
+Attributing these losses would need a kernel profiler. Nsight Compute is not
+installed on the benchmark host and the CUDA toolkit there ships neither `ncu`
+nor `nsys`, so establishing the real limiter is itself a piece of setup work.
+Given four consecutive regressions from interventions premised on a bottleneck
+the measurements contradict, the judgement recorded here is that further
+loader-internal attempts are not worth the time without that profiler, and that
+effort is better spent on the vector/MMA crossover, which changes dispatch
+rather than kernel code, and on closing interaction coverage.
+
+Anyone reopening this should install a profiler first and re-derive the premise.
+The evidence above is enough to say what does *not* limit this kernel; it is not
+enough to say what does.
+
+#### Rejected: a quantized-specific MMA configuration
+
+Quantized K/V inherits the F16 configuration table — `nthreads`, `occupancy`,
+`nbatch_fa`, `nbatch_K2`, `nbatch_V2`, `Q_in_reg` — which was tuned for a kernel
+that performs no dequantization, and then forces `nstages = 0`. With 255-register
+kernels and visible spills, retuning it looked like the obvious next lever.
+**It is not: every deviation tried lost, and the inherited table is retained
+unchanged.**
+
+The experiment applied a quant-only override on top of the arch table, threaded
+through the existing accessors behind an `is_quant` flag defaulting to false so
+F16, BF16 and KVarN read exactly the table they read before, selected by a
+build-time value with `0` verified as a no-op against the shipped build. All
+arms ran on `q6_0` — the type whose native advantage is merely neutral, so a
+configuration win would show most clearly — at 512-token prefill and depth
+32,768, reverse-order arm pairs, in a default-tier `GGML_CUDA_KVARN=OFF` build
+shared by every arm.
+
+| Configuration | Native vs materializing | Welch t | `D=256` spill |
+|---|---:|---:|---|
+| Inherited (control) | `+0.41%` | `+1.53` | 16 B |
+| `Q_in_reg = false`, prefill shapes | **`-9.35%`** | `-41.45` | 16 B, `REG:255` -> `219/222` |
+| `nbatch_fa` 32 -> 64, prefill shapes | **`-2.32%`** | `-9.89` | 40 / 112 B |
+| `nbatch_K2`/`nbatch_V2` 128 -> 64 | **`-2.66%`** | `-10.81` | 64 / 40 B |
+
+Two findings are worth more than the disposition.
+
+**The 255-register ceiling is not what limits this kernel.** `Q_in_reg = false`
+did exactly what it was meant to at the register level, dropping the production
+kernel from `REG:255` to `REG:219/222` with spill unchanged, and lost 9.35%.
+Keeping Q out of registers forces a shared-memory read per MMA that costs far
+more than the returned budget. Spill does not predict throughput in either
+direction here: the variant that *reduced* register pressure lost the most, and
+the variant that raised spill sevenfold lost the least. Anything proposing to
+tune this kernel by chasing registers or spill — including the residual 24 bytes
+introduced by the runtime-V parameter — should account for this result first.
+
+**`nthreads` and `occupancy` cannot be swept one field at a time.** The
+originally planned "128-thread/occupancy-2 versus 256-thread/occupancy-1" and
+"64-thread/occupancy-4 versus 128-thread/occupancy-2" arms do not compile:
+`zero-sized variable "KQ_C" is not allowed in device code`, and repeated
+`static assertion failed with "bad loop size"`. Each `fattn_mma_config` row is an
+internally consistent tuple coupled to the warp-tile geometry, so an occupancy
+experiment must move a whole valid row. The two arms above replaced them with
+changes the loader's own constraints admit.
+
+The override was reverted after measurement; no build-time knob is left in the
+tree.
+
+##### Methodology: a failed build in a sweep reports the previous arm
+
+Two arms of the first attempt produced believable numbers for configurations
+that were never compiled. The driver did not check the build status, a failed
+build left the previous variant's library in place, and the benchmark measured
+that. The tell was a 37-second "build" beside a 15-minute one, not any error
+message; the two arms landed within 0.07% of the preceding arm, which read as
+consistency rather than as the duplicate it was. Deleting the stale binaries was
+not enough either — leftover result files reproduced the same wrong numbers on
+the retry. The driver now aborts on a non-zero build status and reads only files
+written by the current run. Recorded because the failure mode is silent and the
+output is plausible.
+
+#### Revised disposition
+
+Retain the cleaned family as an explicit build and run-time opt-in. It removes
+a substantial long-context transient allocation, produces bit-exact output in
+the maintained same-MTP comparison, and shows useful medium/long prefill and
+MTP verification screens on the measured host. Keep both defaults off because
+the enabled build costs 7.12 MiB, short-depth performance is mixed, and only
+one recent NVIDIA architecture and one model have received integrated
+performance coverage. Future native cache pairs must be separately registered
+and evidenced; they must not be inferred from `GGML_CUDA_FA_ALL_QUANTS`.

@@ -5514,6 +5514,23 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_IQ4_NL) {
                     return true;
                 }
+                // ggml_cuda_cpy also implements these pairs; they were missing here,
+                // which made ggml_backend_dev_supports_op deny a conversion the
+                // backend can perform. llama_kv_cache probes exactly this to decide
+                // whether a quantized cache may live in host memory, so a q6_0 cache
+                // with --no-kv-offload failed to build a context at all.
+                if (src0_type == GGML_TYPE_F32 &&
+                    (src1_type == GGML_TYPE_Q6_0 || src1_type == GGML_TYPE_Q6_1 ||
+                     src1_type == GGML_TYPE_Q3_0 || src1_type == GGML_TYPE_Q3_1 ||
+                     src1_type == GGML_TYPE_Q2_0S || src1_type == GGML_TYPE_Q2_1)) {
+                    return true;
+                }
+                if (src1_type == GGML_TYPE_F32 &&
+                    (src0_type == GGML_TYPE_Q6_0 || src0_type == GGML_TYPE_Q6_1 ||
+                     src0_type == GGML_TYPE_Q3_0 || src0_type == GGML_TYPE_Q3_1 ||
+                     src0_type == GGML_TYPE_Q2_0S || src0_type == GGML_TYPE_Q2_1)) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_I32) {
                     return true;
                 }
@@ -5958,6 +5975,15 @@ static bool ggml_backend_cuda_recurrent_sparse_snapshots_supported(ggml_backend_
 #endif
 }
 
+static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+#if defined(FLASH_ATTN_AVAILABLE) && defined(GGML_CUDA_COMPACT_CAUSAL_MASK)
+    return true;
+#else
+    return false;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5980,6 +6006,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_recurrent_sparse_snapshots_supported") == 0) {
         return (void *)ggml_backend_cuda_recurrent_sparse_snapshots_supported;
+    }
+    if (strcmp(name, "ggml_backend_flash_attn_causal_prefix_supported") == 0) {
+        return (void *)ggml_backend_cuda_flash_attn_causal_prefix_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;
