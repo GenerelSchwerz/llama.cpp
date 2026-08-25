@@ -1297,6 +1297,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     int32_t n_mtp_layers  = 1;
     bool    is_mem_shared = false;   // gemma4
     bool    chain_heads   = false;   // derived in the ctor: n_mtp_layers > 1 && !is_mem_shared
+    bool    shared_workspace = false;
 
     // Per-sequence cross-batch carryover: pair (h_p, x_{p+1}) at MTP pos p+1.
     // The last h-row of one process() call needs the first token of the NEXT
@@ -1373,6 +1374,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+        shared_workspace = llama_contexts_share_workspace(ctx_tgt, ctx_dft);
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -1462,6 +1464,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
+        if (shared_workspace && is_mem_shared) {
+            llama_synchronize(ctx_tgt);
+        }
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
@@ -1524,6 +1529,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
             }
             if (!ok) {
+                if (shared_workspace) {
+                    llama_synchronize(ctx_dft);
+                }
                 return false;
             }
         }
@@ -1582,6 +1590,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         int i = 0;
+        bool decode_failed = false;
 
         while (n_drafting > 0) {
             // each step decodes under a different head, i.e. a different decoder layer, and
@@ -1603,6 +1612,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             int ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
+                decode_failed = true;
                 break;
             }
 
@@ -1686,6 +1696,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         if (chain_heads) {
             llama_set_nextn_layer_offset(ctx_dft, 0); // restore default for non-draft decodes
+        }
+
+        if (shared_workspace && (is_mem_shared || decode_failed)) {
+            llama_synchronize(ctx_dft);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -2449,6 +2463,18 @@ common_speculative_init_result::common_speculative_init_result(
         }
 
         pimpl->context.reset(ctx_dft);
+    }
+
+    if (pimpl->context && spec_mtp && params.phase_aware_workspace) {
+        const int32_t status = llama_attach_shared_workspace(pimpl->context.get(), ctx_tgt);
+        if (status < 0) {
+            LOG_ERR("%s: failed to prepare shared target/MTP workspaces\n", __func__);
+            pimpl->context.reset();
+            return;
+        }
+        if (status == 0) {
+            LOG_INF("%s: target and MTP placements do not share a compute buffer type\n", __func__);
+        }
     }
 }
 

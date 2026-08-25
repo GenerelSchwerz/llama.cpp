@@ -2036,6 +2036,7 @@ int llama_perplexity(int argc, char ** argv) {
     }
     params.n_ctx = params.n_parallel * n_ctx;
     params.n_batch = std::min(params.n_batch, params.n_ctx);
+    params.n_outputs_max = params.n_batch;
 
     if (params.ppl_stride > 0) {
         LOG_INF("Will perform strided perplexity calculation -> adjusting context size from %d to %d\n",

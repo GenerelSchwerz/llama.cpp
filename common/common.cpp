@@ -1746,6 +1746,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.kv_cpu_pinned     = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
+    cparams.phase_aware_workspace = params.phase_aware_workspace;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
