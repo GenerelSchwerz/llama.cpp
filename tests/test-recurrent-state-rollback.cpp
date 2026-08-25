@@ -11,6 +11,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -94,6 +95,10 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     constexpr uint32_t  n_replay   = 40; // > n_ubatch so each seq spans multiple ubatches
     constexpr llama_pos p0         = n_prompt - n_rollback;
 
+    char arch[32] = {};
+    const bool check_exact_recurrent_state =
+        llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch)) > 0 && strcmp(arch, "qwen35") == 0;
+
     const auto make_ctx_multi = [&]() {
         auto cparams = common_context_params_to_llama(params);
         cparams.n_seq_max  = n_seqs;
@@ -150,6 +155,19 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     if (!ok) {
         fprintf(stderr, "%s : multi-seq prefill/rollback failed\n", __func__);
         return false;
+    }
+
+    if (check_exact_recurrent_state) {
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            common_prompt_checkpoint ckpt_roll;
+            common_prompt_checkpoint ckpt_ref;
+            ckpt_roll.update_tgt(ctx_roll, s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            ckpt_ref.update_tgt(ctx_ref, s, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (ckpt_roll.data_tgt != ckpt_ref.data_tgt) {
+                fprintf(stderr, "%s : seq %u recurrent state mismatch after rollback\n", __func__, s);
+                return false;
+            }
+        }
     }
 
     llama_batch batch = llama_batch_init(n_seqs*n_replay, 0, 1);
@@ -575,6 +593,7 @@ int main(int argc, char ** argv) {
     if (!replay_and_compare("full")) {
         return 1;
     }
+    const auto logits_src_replay_full = logits_src_replay;
 
     if (!llama_memory_seq_rm(llama_get_memory(ctx_src), 0, rollback_pos, -1) ||
         !llama_memory_seq_rm(llama_get_memory(ctx_dst), 0, rollback_pos, -1)) {
@@ -632,9 +651,9 @@ int main(int argc, char ** argv) {
         }
 
         for (int token = 0; token < n_vocab; ++token) {
-            if (std::fabs(logits_src_replay[i][token] - logits_dirty[token]) > eps) {
+            if (std::fabs(logits_src_replay_full[i][token] - logits_dirty[token]) > eps) {
                 fprintf(stderr, "%s : dirty-ctx logits mismatch at position %d, token %d (%g != %g)\n",
-                        __func__, pos, token, (double) logits_src_replay[i][token], (double) logits_dirty[token]);
+                        __func__, pos, token, (double) logits_src_replay_full[i][token], (double) logits_dirty[token]);
                 return 1;
             }
         }

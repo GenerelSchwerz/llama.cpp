@@ -580,6 +580,18 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const bool sparse = snapshot_mode.sparse;
     const int32_t selected = snapshot_mode.selected_token;
 
+    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+
+    if (!sparse && n_seq_tokens < K) {
+        // A full-ubatch rollback needs the state from before the first token.
+        ggml_tensor * state_in = ggml_reshape_2d(ctx0, s, D, n_seqs);
+        ggml_tensor * state_in_update = ggml_view_2d(ctx0, ssm_states_all,
+            D, n_seqs, ssm_states_all->nb[1],
+            ((size_t) n_seq_tokens * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, state_in, state_in_update));
+    }
+
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (sparse) {
@@ -602,8 +614,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
-
-    const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
     const auto copy_snapshots = [&](int64_t first_slot, int64_t count) {
         ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
