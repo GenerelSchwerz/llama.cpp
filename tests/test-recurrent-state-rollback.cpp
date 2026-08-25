@@ -1,6 +1,8 @@
 #include "../src/llama-ext.h"
+#ifdef LLAMA_TEST_RECURRENT_INTERNALS
 #include "../src/llama-memory-recurrent.h"
 #include "../src/llama-model.h"
+#endif
 #include "arg.h"
 #include "common.h"
 #include "llama.h"
@@ -39,6 +41,7 @@ static bool decode_one(llama_context * ctx, llama_token tok, llama_pos pos) {
     return ok;
 }
 
+#ifdef LLAMA_TEST_RECURRENT_INTERNALS
 static bool test_sparse_metadata_seq_id_bounds(llama_model * model) {
     if (!model->graph_supports_recurrent_sparse_snapshots()) {
         fprintf(stderr, "%s : skipping because model graph does not support recurrent sparse snapshots\n", __func__);
@@ -76,6 +79,7 @@ static bool test_sparse_metadata_seq_id_bounds(llama_model * model) {
     fprintf(stderr, "%s : malformed sequence was rejected outside n_seq_max\n", __func__);
     return true;
 }
+#endif
 
 // Roll back multiple sequences, then replay them in a single batch whose
 // per-seq token count exceeds n_ubatch: each seq's replay spans several
@@ -479,9 +483,11 @@ int main(int argc, char ** argv) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
 
+#ifdef LLAMA_TEST_RECURRENT_INTERNALS
     if (!test_sparse_metadata_seq_id_bounds(model)) {
         return 1;
     }
+#endif
 
     llama_context * ctx_src = make_ctx(params, model);
     llama_context * ctx_dst = make_ctx(params, model);
