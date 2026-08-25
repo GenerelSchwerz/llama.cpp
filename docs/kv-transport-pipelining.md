@@ -15,6 +15,11 @@ kernels of the split before it.
 an effect where a host-resident cache produces the deliveries; `0` restores the
 ordered path exactly.
 
+The staging it needs is bounded by `--kv-pipeline-budget` (default 128 MiB), so
+that a cache which lives on the host to keep device memory free never quietly
+spends that memory back. Past the cap the scheduler declines and the ordered path
+runs, at no cost. See [The budget](#the-budget).
+
 ## What it changes, and what it must not
 
 R4 pipelines *deliveries*, not attention. Every byte and every attention
@@ -131,10 +136,74 @@ RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F,
 Server decode behind an 18,422-token prompt
 (`docs/repro/r4-kv-pipeline-exact.sh`): **18.468 -> 30.685 t/s, +66.2%**.
 
-Device allocation high-water at 32,768, sampled with `nvidia-smi` across a
-`tg64 @ d32768` run: **10,271 -> 10,477 MiB, +206 MiB**, against a ring of
-3 x 71 MiB. The ring competes with the model, and at 32,768 it is the largest
-single new allocation the feature makes.
+### Across context depth, with device memory
+
+`docs/repro/r4-kv-pipeline-context-sweep.sh`, A/B/A/B, peak device memory sampled
+with `nvidia-smi` across each arm. Both passes agreed to the digits shown.
+
+| Context | ordered | pipelined | gain | peak device memory | delta | ring |
+|---|---:|---:|---:|---|---:|---:|
+| 4,096 | 31.66 | 37.01 | **+16.9%** | 10,169 -> 10,197 MiB | +28 MiB | 27 MiB |
+| 16,384 | 19.64 | 31.43 | **+60.1%** | 10,159 -> 10,263 MiB | +104 MiB | 107 MiB |
+| 32,768 | 12.99 | 15.49 | **+19.2%** | 10,161 -> 10,367 MiB | +206 MiB | 213 MiB |
+| 65,536 | 7.74 | 8.74 | **+12.9%** | 10,163 -> 10,573 MiB | +410 MiB | 428 MiB |
+| 131,072 | 4.29 | 4.68 | **+9.1%** | 10,537 -> 11,355 MiB | +818 MiB | 855 MiB |
+| 262,144 | 2.25 | 2.24 | **declined** | 11,329 -> 11,391 MiB | +62 MiB | not allocated |
+
+Two curves run in opposite directions here, and both matter.
+
+**The gain narrows with depth.** A token is copy plus compute; as the context
+grows the copy grows with it while the compute per staged split does not, so the
+share of the token that can hide a transfer shrinks. At 16,384 compute still
+covers most of the copy; by 131,072 it covers a tenth of it. That is arithmetic,
+not an implementation limit, and no amount of look-ahead changes it.
+
+**The ring's cost does not narrow.** It is `(depth + 2)` slots of one staged
+split, and a staged split is K and V of one attention layer over the whole
+context: it doubles every time the context doubles. At 131,072 it claims 818 MiB
+of an 11,902 MiB card to buy 9.1%.
+
+At 262,144 the ring would need 1.7 GiB against 573 MiB free, so it declines and
+the run stays on the ordered path -- 2.25 against 2.24 t/s, inside the spread of
+the ordered arm's own two passes, and 62 MiB of device memory for the transfer
+backend's context. Declining is the intended outcome, not a failure: the +62 MiB
+and the unchanged throughput are what "the guard did its job" looks like.
+
+**On a memory-constrained card, past roughly 64k the same device memory is
+probably better spent on `--kv-gpu-layers`.** At 131,072 a staged split is
+285 MiB, so the 818 MiB the ring takes is about three attention layers' worth of
+K and V; making three of sixteen layers device-resident removes about 19% of the
+host-to-device traffic against the 9.1% the ring buys. That comparison has not
+been measured here and it will move with the model's layer count and the card, so
+it is a pointer for whoever tunes a deployment, not a recommendation.
+
+### The budget
+
+The table above is what the feature costs uncapped, and it is the reason it is
+capped. A host-resident KV cache exists to keep device memory free; a transport
+that speeds it up by spending hundreds of MiB of that memory is working against
+the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an
+absolute cap on the ring, not a fraction of what happens to be free:
+
+- Under the cap the ring is allocated and the deliveries pipeline: 4,096 and
+  16,384 in the table, at 28 MiB and 104 MiB.
+- Over it the scheduler declines and keeps the ordered path, and the decision is
+  latched, because a context only grows and a ring allocated for the small
+  windows of early prefill would only have to be given back later.
+- Declining costs nothing in steady state. Both the ring and the transfer
+  backend's device context are released: at 32,768 with the default budget,
+  device memory settles at 10,161 MiB, the same as the ordered path, and
+  throughput matches it (12.965 against 12.984 t/s).
+
+Raising the budget trades that memory back for speed where it is worth it:
+`--kv-pipeline-budget 512` at 32,768 gives 15.487 t/s for 206 MiB.
+
+**Known limitation.** The cap is applied per graph, so a run whose context grows
+past it still allocates a ring for the early prefill graphs and releases it once
+the window outgrows the budget -- at 32,768 that shows up as a transient peak of
++112 MiB even though the steady state is +0. Deciding against the context's final
+size rather than the current graph's would remove it, and needs the KV geometry
+the scheduler does not have.
 
 Where the split-loop host time goes, per decode graph at 18.5k
 (`GGML_SCHED_TRANSPORT_DEBUG=2`):

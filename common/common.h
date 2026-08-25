@@ -643,6 +643,7 @@ struct common_params {
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
     bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     int32_t kv_pipeline_depth = 1;  // splits of look-ahead for pipelined delivery of a host-resident KV cache (0 = off)
+    int32_t kv_pipeline_budget_mib = 128; // hard cap on the device memory that delivery may use (0 = uncapped)
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

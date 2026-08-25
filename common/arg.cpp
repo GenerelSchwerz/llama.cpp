@@ -2615,6 +2615,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_PIPELINE_DEPTH"));
     add_opt(common_arg(
+        {"--kv-pipeline-budget"}, "N",
+        string_format("hard cap, in MiB, on the device memory that pipelined delivery of a host-resident KV cache "
+                      "may use. A staging slot holds one attention layer's K or V over the whole context, so the "
+                      "requirement grows with the context; past this cap the scheduler declines and keeps the "
+                      "ordered path, so a host-resident cache never quietly trades away the device memory it exists "
+                      "to save. 0 removes the cap (default: %d)", params.kv_pipeline_budget_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-pipeline-budget must not be negative");
+            }
+            params.kv_pipeline_budget_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIPELINE_BUDGET"));
+    add_opt(common_arg(
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},
         string_format("for hybrid attention/recurrent models, keep the fixed recurrent (R/S) state GPU-resident "

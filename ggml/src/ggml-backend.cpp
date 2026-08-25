@@ -807,6 +807,14 @@ static bool ggml_backend_sched_allows_bufferless_kvarn_src(
 #define GGML_SCHED_TRANSPORT_HEADROOM (512u*1024*1024)
 #endif
 
+// Default cap on the ring itself. A host-resident KV cache exists to keep device memory free, so
+// the transport that speeds it up has to stay small whether or not the device has room to spare:
+// a slot is one attention layer's K or V over the whole context, which grows without bound as the
+// context does. Past this the feature declines rather than quietly spending hundreds of MiB.
+#ifndef GGML_SCHED_TRANSPORT_BUDGET
+#define GGML_SCHED_TRANSPORT_BUDGET (128u*1024*1024)
+#endif
+
 // One staging slot of the transport ring. A slot is owned by the transfer stream while it is
 // being filled and by the consumer stream while it is being read; the two events below are the
 // handover in each direction.
@@ -834,6 +842,7 @@ struct ggml_backend_sched_transport {
     ggml_backend_buffer_t buffer;   // the ring itself
     size_t                slot_size;
     size_t                alignment;
+    size_t                budget;   // hard cap on the ring, in bytes
 
     struct ggml_backend_sched_transport_slot slots[GGML_SCHED_MAX_TRANSPORT_SLOTS];
 
@@ -866,6 +875,7 @@ struct ggml_backend_sched_transport {
     int64_t p_graph_us, p_sync_us, p_copy_us, p_issue_us, p_bytes_early, p_bytes_late;
 
     bool reported_no_room; // the "no room for the ring" warning is worth saying once, not per graph
+    bool over_budget;      // latched: the ring has been asked for more than it may have
 
     int debug;
 };
@@ -1724,8 +1734,11 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 // pipelined transport of host-resident split inputs
 //
 
+static void ggml_backend_sched_transport_teardown(ggml_backend_sched_t sched);
+
 static bool ggml_backend_sched_transport_enabled(ggml_backend_sched_t sched) {
-    return sched->transport.depth >= 1 && sched->transport.n_slots >= 2 && sched->transport.transfer != NULL;
+    const struct ggml_backend_sched_transport * tr = &sched->transport;
+    return tr->depth >= 1 && tr->n_slots >= 2 && tr->backend_id >= 0 && !tr->over_budget;
 }
 
 // The annotation lives on the tensor that owns the storage; a split input is normally a view of
@@ -1750,9 +1763,13 @@ static size_t ggml_backend_sched_input_stable_prefix(const struct ggml_tensor * 
     return avail < bytes ? avail : bytes;
 }
 
-// Whether a split input belongs in the ring. Decided once per plan; from then on execution
-// consults the recorded answer rather than asking again, because the write position this depends
-// on moves between ubatches while the plan and the addresses it handed out do not.
+// Whether a split input belongs in the ring.
+//
+// Deliberately independent of the stable prefix. Membership decides where an input copy lives,
+// which the graph allocator has to know when it reserves -- and at reserve time there is no
+// ubatch yet, so no prefix. The prefix decides only how much of a staged input can go early;
+// zero means all of it waits for the split, which is the ordered path's timing with the ring's
+// storage, and is still correct.
 static bool ggml_backend_sched_input_can_stage(
         ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, int input_id) {
     if (split->backend_id != sched->transport.backend_id) {
@@ -1763,11 +1780,6 @@ static bool ggml_backend_sched_input_can_stage(
 
     // user inputs must be copied immediately, before the user can overwrite them
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-        return false;
-    }
-
-    // an input with no stable prefix has nothing that could be delivered ahead of its split
-    if (ggml_backend_sched_input_stable_prefix(input) == 0) {
         return false;
     }
 
@@ -1817,6 +1829,48 @@ static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, b
     for (int i = 0; i < GGML_SCHED_MAX_TRANSPORT_SLOTS; i++) {
         tr->slots[i].release_armed = false;
     }
+}
+
+// The transfer backend and the slot events are created on demand, so that a scheduler which
+// never gets to stage anything -- no eligible inputs, or no room within the budget -- does not
+// carry a second device context for nothing.
+static bool ggml_backend_sched_transport_ensure_backend(ggml_backend_sched_t sched) {
+    struct ggml_backend_sched_transport * tr = &sched->transport;
+
+    if (tr->transfer != NULL) {
+        return true;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[tr->backend_id]);
+    if (dev == NULL) {
+        return false;
+    }
+
+    ggml_backend_t transfer = ggml_backend_dev_init(dev, NULL);
+    if (transfer == NULL) {
+        return false;
+    }
+
+    bool ok = true;
+    for (int slot = 0; slot < tr->n_slots && ok; slot++) {
+        tr->slots[slot].ready   = ggml_backend_event_new(dev);
+        tr->slots[slot].release = ggml_backend_event_new(dev);
+        ok = tr->slots[slot].ready != NULL && tr->slots[slot].release != NULL;
+    }
+
+    if (!ok) {
+        for (int slot = 0; slot < tr->n_slots; slot++) {
+            ggml_backend_event_free(tr->slots[slot].ready);
+            ggml_backend_event_free(tr->slots[slot].release);
+            tr->slots[slot].ready   = NULL;
+            tr->slots[slot].release = NULL;
+        }
+        ggml_backend_free(transfer);
+        return false;
+    }
+
+    tr->transfer = transfer;
+    return true;
 }
 
 // Lay the ring out over the current split list and point the staged input copies at it. Called
@@ -1902,7 +1956,19 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                 }
             }
 
-            if (late_reader) {
+            // a view of the copy would have had its address resolved from the copy's own, so
+            // redirecting the copy afterwards would leave the view pointing at the old block
+            bool viewed = false;
+            for (int k = 0; k < sched->n_splits && !viewed; k++) {
+                const struct ggml_cgraph * g = &sched->splits[k].graph;
+                for (int n = 0; n < g->n_nodes && !viewed; n++) {
+                    if (g->nodes[n]->view_src == input_cpy) {
+                        viewed = true;
+                    }
+                }
+            }
+
+            if (late_reader || viewed) {
                 tr->input_staged[tr->split_input_ofs[i] + j] = 0;
             }
         }
@@ -1934,11 +2000,39 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         return;
     }
 
+    ggml_backend_buffer_type_t buft = sched->bufts[tr->backend_id];
+    const size_t ring_size = slot_size * tr->n_slots;
+
+    // Checked before anything is allocated, and on every plan rather than only when the ring has
+    // to grow: a graph the ring already fits does not license keeping it once a later graph needs
+    // more than it may have. Declining has to cost nothing, so a ring in hand is given back.
+    //
+    // The point of a host-resident cache is to leave device memory alone, so the cap is absolute
+    // and not merely a fraction of what happens to be free.
+    // Latched, because a context only grows: the early prefill graphs have a small window and
+    // would fit, and allocating a ring for them only to give it back once the window outgrows the
+    // budget claims device memory that a host-resident cache is supposed to be leaving alone.
+    if (tr->budget > 0 && (ring_size > tr->budget || tr->over_budget)) {
+        tr->over_budget = true;
+        if (!tr->reported_no_room) {
+            GGML_LOG_WARN("%s: transport ring would need %zu MiB against a %zu MiB budget, "
+                    "staying on the ordered path (raise --kv-pipeline-budget to spend more "
+                    "device memory on it)\n", __func__, ring_size >> 20, tr->budget >> 20);
+            tr->reported_no_room = true;
+        }
+        ggml_backend_sched_transport_teardown(sched);
+        tr->n_staged = 0;
+        return;
+    }
+
+    // nothing has been allocated for the transport until here
+    if (!ggml_backend_sched_transport_ensure_backend(sched)) {
+        tr->n_staged = 0;
+        return;
+    }
+
     if (tr->buffer == NULL || tr->slot_size < slot_size) {
         ggml_backend_sched_transport_free_ring(sched, true);
-
-        ggml_backend_buffer_type_t buft = sched->bufts[tr->backend_id];
-        const size_t ring_size = slot_size * tr->n_slots;
 
         // A slot has to hold one split's whole delivery, so the ring grows with the context and
         // at some depth it stops fitting. The graph allocator has already reserved its buffers by
@@ -2499,6 +2593,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->op_offload = op_offload;
 
     sched->transport.backend_id = -1;
+    sched->transport.budget     = GGML_SCHED_TRANSPORT_BUDGET;
     {
         const char * GGML_SCHED_TRANSPORT_DEBUG = getenv("GGML_SCHED_TRANSPORT_DEBUG");
         sched->transport.debug = GGML_SCHED_TRANSPORT_DEBUG ? atoi(GGML_SCHED_TRANSPORT_DEBUG) : 0;
@@ -2527,9 +2622,7 @@ static void ggml_backend_sched_transport_teardown(ggml_backend_sched_t sched) {
         tr->transfer = NULL;
     }
 
-    tr->n_slots    = 0;
-    tr->backend_id = -1;
-    tr->n_staged   = 0;
+    tr->n_staged = 0;
 }
 
 void ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth) {
@@ -2546,7 +2639,7 @@ void ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
     }
 
     struct ggml_backend_sched_transport * tr = &sched->transport;
-    if (tr->depth == depth && (depth < 1 || tr->transfer != NULL)) {
+    if (tr->depth == depth && (depth < 1 || tr->backend_id >= 0)) {
         return;
     }
 
@@ -2583,37 +2676,16 @@ void ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
             continue;
         }
 
-        // a second backend on the same device gives the deliveries a stream of their own
-        ggml_backend_t transfer = ggml_backend_dev_init(dev, NULL);
-        if (transfer == NULL) {
-            continue;
-        }
-
-        bool ok = true;
-        for (int slot = 0; slot < n_slots && ok; slot++) {
-            tr->slots[slot].ready   = ggml_backend_event_new(dev);
-            tr->slots[slot].release = ggml_backend_event_new(dev);
-            ok = tr->slots[slot].ready != NULL && tr->slots[slot].release != NULL;
-        }
-
-        if (!ok) {
-            for (int slot = 0; slot < n_slots; slot++) {
-                ggml_backend_event_free(tr->slots[slot].ready);
-                ggml_backend_event_free(tr->slots[slot].release);
-                tr->slots[slot].ready   = NULL;
-                tr->slots[slot].release = NULL;
-            }
-            ggml_backend_free(transfer);
-            continue;
-        }
-
-        tr->transfer   = transfer;
+        // The transfer backend is a second backend on the same device, which gives the deliveries
+        // a stream of their own -- and costs a device context of its own. It is created on the
+        // first graph that actually stages something, not here: a scheduler that never has room
+        // for a ring must not pay for a context it will not use.
         tr->backend_id = i;
         tr->n_slots    = n_slots;
         tr->alignment  = std::max<size_t>(ggml_backend_buft_get_alignment(sched->bufts[i]), 128);
 
         if (tr->debug > 0) {
-            GGML_LOG_INFO("%s: pipelined host transport enabled on %s, %d splits ahead, %d slots\n",
+            GGML_LOG_INFO("%s: pipelined host transport selected %s, %d splits ahead, %d slots\n",
                     __func__, ggml_backend_name(backend), depth, n_slots);
         }
         return;
@@ -2621,6 +2693,23 @@ void ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
 
     if (tr->debug > 0) {
         GGML_LOG_INFO("%s: no backend supports pipelined host transport, staying on the ordered path\n", __func__);
+    }
+}
+
+void ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched, size_t bytes) {
+    GGML_ASSERT(sched);
+
+    const char * env = getenv("GGML_KV_PIPELINE_BUDGET_MIB");
+    if (env != NULL) {
+        bytes = (size_t) strtoull(env, NULL, 10) * 1024 * 1024;
+    }
+
+    if (sched->transport.budget != bytes) {
+        sched->transport.budget            = bytes;
+        sched->transport.reported_no_room  = false;
+        sched->transport.over_budget       = false;
+        // the ring in hand may no longer be allowed
+        ggml_backend_sched_transport_free_ring(sched, true);
     }
 }
 

@@ -66,6 +66,7 @@ struct llama_cparams {
     bool phase_aware_workspace;
     bool live_context_workspace;
     uint32_t kv_pipeline_depth;
+    uint32_t kv_pipeline_budget_mib;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

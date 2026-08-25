@@ -392,6 +392,11 @@ extern "C" {
     // allocated.
     GGML_API void                 ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth);
 
+    // Hard cap on the staging ring, in bytes. A host-resident cache exists to keep device memory
+    // free, so the ring is capped outright and not merely against what happens to be free: past
+    // the cap the scheduler declines and keeps the ordered path. 0 removes the cap. Default 128 MiB.
+    GGML_API void                 ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched, size_t bytes);
+
     // Number of staged deliveries and staged bytes issued since the scheduler was created.
     GGML_API void                 ggml_backend_sched_get_transport_pipeline_stats(ggml_backend_sched_t sched, int64_t * n_deliveries, int64_t * n_bytes_early, int64_t * n_bytes_late);
 
