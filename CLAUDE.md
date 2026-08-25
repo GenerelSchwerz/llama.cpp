@@ -8,6 +8,7 @@ keeps a small set of maintained extensions:
   `q6_1`).
 - Quantized-native CUDA MMA FlashAttention (`--flash-attn-native-quants`).
 - Profit-only adaptive draft depth for upstream `draft-dflash` speculation.
+- Pipelined delivery of a host-resident KV cache (`--kv-pipeline-depth`).
 - Server-side reasoning-loop protection.
 - KLD save/load support in `llama-perplexity` for KVarN validation.
 
@@ -72,6 +73,15 @@ There is no `GGML_CUDA_FA_HALF_QUANTS` tier. Fresh CMake caches omit KVarN.
 pairs; combining it with `GGML_CUDA_FA_ALL_QUANTS=ON` selects all 36. Every valid
 KVarN bit pair remains available through descriptor-native MMA when it is
 outside the fast matrix. Existing CMake caches retain earlier selections.
+
+`--kv-pipeline-depth N` issues the host-to-device delivery of a host-resident KV
+cache N splits ahead of the split that reads it, on a transfer stream of its own,
+so a decode token stops paying transfer and attention in series. It is on by
+default at `N = 1`, `0` restores the ordered path exactly, and it only engages
+where a host-resident cache produces the deliveries (`--no-kv-offload`, with or
+without `--kv-cpu-pinned`). Output is byte-identical either way. See
+[`docs/kv-transport-pipelining.md`](docs/kv-transport-pipelining.md) for the
+design, the numbers, the limits, and the two reproduction scripts.
 
 ## Layout
 
