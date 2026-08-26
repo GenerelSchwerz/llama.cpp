@@ -9,7 +9,7 @@
 //   4. No expert is ever resident in two slots simultaneously.
 //   5. Hit rate for a Zipf-ish access pattern is non-trivial (>40%).
 //   6. Registry keys distinguish tensors that have the same name.
-//   7. Cache-assisted staging orders mixed D2D and H2D copies after prior compute.
+//   7. Cache-assisted staging orders coalesced D2D and H2D copies after prior compute.
 //
 // The workload is a synthetic stand-in for MoE routing: most tokens land on a
 // hot subset of experts. Real Gemma 4 / Mixtral / Qwen3 routing has stronger
@@ -172,27 +172,36 @@ int main(int argc, char ** argv) {
 
     ggml_cuda_moe_cache_free(cache);
 
-    auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 1, false, 0, 0);
+    auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2, false, 0, 0);
     CHECK(staging_cache != nullptr);
     cudaStream_t staging_copy_stream = ggml_cuda_moe_cache_copy_stream(staging_cache);
     CHECK(staging_copy_stream != nullptr);
 
-    const void * resident_src = host_experts;
-    const void * nonresident_src = host_experts + N_FLOATS;
+    const void * resident_src_0 = host_experts;
+    const void * resident_src_1 = host_experts + N_FLOATS;
     CHECK(ggml_cuda_moe_cache_acquire(
-        staging_cache, resident_src, SLOT_BYTES, staging_copy_stream, false, false, false) == 0);
+        staging_cache, resident_src_0, SLOT_BYTES, staging_copy_stream, false, false, false) == 0);
+    CHECK(ggml_cuda_moe_cache_acquire(
+        staging_cache, resident_src_1, SLOT_BYTES, staging_copy_stream, false, false, false) == 1);
     CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
 
     cudaStream_t compute_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
     void * staging_dst = nullptr;
-    CUDA_OK(cudaMalloc(&staging_dst, 2 * SLOT_BYTES));
-    const void * staging_srcs[] = {resident_src, nonresident_src};
-    std::vector<float> staging_readback(2 * N_FLOATS);
+    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES));
+    const void * staging_srcs[] = {
+        resident_src_0,
+        resident_src_1,
+        host_experts + 2 * N_FLOATS,
+        host_experts + 3 * N_FLOATS,
+    };
+    std::vector<float> staging_readback(4 * N_FLOATS);
 
     for (int repeat = 0; repeat < 2; ++repeat) {
-        float nonresident_value = 100.0f + repeat;
-        std::fill_n(host_experts + N_FLOATS, N_FLOATS, nonresident_value);
+        float nonresident_value_0 = 100.0f + repeat;
+        float nonresident_value_1 = 200.0f + repeat;
+        std::fill_n(host_experts + 2 * N_FLOATS, N_FLOATS, nonresident_value_0);
+        std::fill_n(host_experts + 3 * N_FLOATS, N_FLOATS, nonresident_value_1);
 
         host_barrier barrier;
         CUDA_OK(cudaLaunchHostFunc(compute_stream, wait_on_host_barrier, &barrier));
@@ -201,7 +210,7 @@ int main(int argc, char ** argv) {
         }
 
         CHECK(ggml_cuda_moe_cache_copy_to_staging(
-            staging_cache, staging_srcs, 2, SLOT_BYTES, staging_dst, compute_stream));
+            staging_cache, staging_srcs, 4, SLOT_BYTES, staging_dst, compute_stream));
         cudaError_t staging_copy_status = cudaErrorNotReady;
         for (int attempt = 0; attempt < 100 && staging_copy_status == cudaErrorNotReady; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -212,15 +221,17 @@ int main(int argc, char ** argv) {
         barrier.released.store(true, std::memory_order_release);
         CUDA_OK(cudaStreamSynchronize(compute_stream));
         CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
-        CUDA_OK(cudaMemcpy(staging_readback.data(), staging_dst, 2 * SLOT_BYTES, cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(staging_readback.data(), staging_dst, 4 * SLOT_BYTES, cudaMemcpyDeviceToHost));
         for (int j = 0; j < N_FLOATS; ++j) {
             CHECK(staging_readback[j] == 0.0f);
-            CHECK(staging_readback[N_FLOATS + j] == nonresident_value);
+            CHECK(staging_readback[N_FLOATS + j] == 1.0f);
+            CHECK(staging_readback[2 * N_FLOATS + j] == nonresident_value_0);
+            CHECK(staging_readback[3 * N_FLOATS + j] == nonresident_value_1);
         }
     }
 
     CHECK(!ggml_cuda_moe_cache_copy_to_staging(
-        staging_cache, staging_srcs, 2, SLOT_BYTES + 1, staging_dst, compute_stream));
+        staging_cache, staging_srcs, 4, SLOT_BYTES + 1, staging_dst, compute_stream));
     CHECK(cudaStreamQuery(staging_copy_stream) == cudaSuccess);
     CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
 
