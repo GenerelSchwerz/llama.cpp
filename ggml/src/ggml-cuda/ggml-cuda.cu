@@ -1925,6 +1925,11 @@ struct ggml_cuda_mul_mat_id_host_route {
     size_t nb0;
     size_t nb1;
     const int32_t * expert_map;
+    void * secondary_data = nullptr;
+    int32_t secondary_begin = 0;
+    int32_t secondary_count = 0;
+    const int32_t * source_wait_class = nullptr;
+    const uint32_t * stage_ready = nullptr;
 };
 
 // Shared by the regular and cached-buffer dispatch paths.
@@ -2069,55 +2074,78 @@ static void ggml_cuda_mul_mat_id_impl(
         ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
 
-    char * src1_data_cur = (char *) src1_sorted.ptr;
-    char *  dst_data_cur = (char *)  dst_sorted.ptr;
+    std::vector<size_t> expert_row_offset(ne02);
+    size_t row_offset = 0;
     for (int64_t i02 = 0; i02 < ne02; ++i02) {
-        if (tokens_per_expert[i02] == 0) {
-            continue;
+        expert_row_offset[i02] = row_offset;
+        row_offset += tokens_per_expert[i02];
+    }
+    GGML_ASSERT(row_offset == (size_t) ne_get_rows);
+
+    const int n_wait_classes = host_route && host_route->source_wait_class ? 3 : 1;
+    for (int wait_class = 0; wait_class < n_wait_classes; ++wait_class) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+        if (wait_class > 0) {
+            GGML_ASSERT(host_route->stage_ready != nullptr);
+            CU_CHECK(cuStreamWaitValue32(
+                stream, (CUdeviceptr)(host_route->stage_ready + wait_class - 1), 1, CU_STREAM_WAIT_VALUE_EQ));
         }
+#else
+        GGML_ASSERT(wait_class == 0);
+#endif
 
-        ggml_tensor src0_slice = *src0;
-        src0_slice.ne[2]    = 1;
-        src0_slice.nb[3]    = src0_slice.nb[2];
-        src0_slice.op       = GGML_OP_VIEW;
-        src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        const int32_t physical_expert = host_route && host_route->expert_map ? host_route->expert_map[i02] : i02;
-        GGML_ASSERT(physical_expert >= 0);
-        src0_slice.data     = (char *) src0->data + physical_expert*nb02;
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            if (tokens_per_expert[i02] == 0 ||
+                (host_route && host_route->source_wait_class && host_route->source_wait_class[i02] != wait_class)) {
+                continue;
+            }
 
-        ggml_tensor src1_slice;
-        memset(&src1_slice, 0, sizeof(src1_slice));
-        src1_slice.buffer = src1->buffer;
-        src1_slice.type   = type_src1_sorted;
-        src1_slice.ne[0]  = ne10;
-        src1_slice.ne[1]  = tokens_per_expert[i02];
-        src1_slice.ne[2]  = 1;
-        src1_slice.ne[3]  = 1;
-        src1_slice.nb[0]  = ts_src1_sorted;
-        src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
-        src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
-        src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
-        src1_slice.data   = src1_data_cur;
+            ggml_tensor src0_slice = *src0;
+            src0_slice.ne[2]    = 1;
+            src0_slice.nb[3]    = src0_slice.nb[2];
+            src0_slice.op       = GGML_OP_VIEW;
+            src0_slice.view_src = dst->src[0]; // non-const pointer to src0
+            int32_t physical_expert = host_route && host_route->expert_map ? host_route->expert_map[i02] : i02;
+            GGML_ASSERT(physical_expert >= 0);
+            char * expert_base = (char *) src0->data;
+            if (host_route && host_route->secondary_data && physical_expert >= host_route->secondary_begin) {
+                physical_expert -= host_route->secondary_begin;
+                GGML_ASSERT(physical_expert < host_route->secondary_count);
+                expert_base = (char *) host_route->secondary_data;
+            }
+            src0_slice.data = expert_base + physical_expert*nb02;
 
-        ggml_tensor dst_slice;
-        memset(&dst_slice, 0, sizeof(dst_slice));
-        dst_slice.buffer = dst->buffer;
-        dst_slice.type   = type_dst_sorted;
-        dst_slice.ne[0]  = ne0;
-        dst_slice.ne[1]  = tokens_per_expert[i02];
-        dst_slice.ne[2]  = 1;
-        dst_slice.ne[3]  = 1;
-        dst_slice.nb[0]  = ts_dst_sorted;
-        dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
-        dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
-        dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
-        dst_slice.data   = dst_data_cur;
+            ggml_tensor src1_slice;
+            memset(&src1_slice, 0, sizeof(src1_slice));
+            src1_slice.buffer = src1->buffer;
+            src1_slice.type   = type_src1_sorted;
+            src1_slice.ne[0]  = ne10;
+            src1_slice.ne[1]  = tokens_per_expert[i02];
+            src1_slice.ne[2]  = 1;
+            src1_slice.ne[3]  = 1;
+            src1_slice.nb[0]  = ts_src1_sorted;
+            src1_slice.nb[1]  = src1_slice.ne[0] * src1_slice.nb[0];
+            src1_slice.nb[2]  = src1_slice.ne[1] * src1_slice.nb[1];
+            src1_slice.nb[3]  = src1_slice.ne[2] * src1_slice.nb[2];
+            src1_slice.data   = (char *) src1_sorted.ptr + expert_row_offset[i02]*src1_slice.nb[1];
 
-        ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
-        CUDA_CHECK(cudaGetLastError());
+            ggml_tensor dst_slice;
+            memset(&dst_slice, 0, sizeof(dst_slice));
+            dst_slice.buffer = dst->buffer;
+            dst_slice.type   = type_dst_sorted;
+            dst_slice.ne[0]  = ne0;
+            dst_slice.ne[1]  = tokens_per_expert[i02];
+            dst_slice.ne[2]  = 1;
+            dst_slice.ne[3]  = 1;
+            dst_slice.nb[0]  = ts_dst_sorted;
+            dst_slice.nb[1]  = dst_slice.ne[0] * dst_slice.nb[0];
+            dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
+            dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
+            dst_slice.data   = (char *) dst_sorted.ptr + expert_row_offset[i02]*dst_slice.nb[1];
 
-        src1_data_cur += src1_slice.nb[2];
-        dst_data_cur  +=  dst_slice.nb[2];
+            ggml_cuda_mul_mat(ctx, &src0_slice, &src1_slice, &dst_slice);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
@@ -2300,17 +2328,16 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int> split_slot_ids(n_unique, -1);
     std::vector<int32_t> source_wait_class_host;
     ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
-    if (overflow && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+    if (overflow && !is_decode && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
         source_wait_class_host.resize(n_unique);
         stage_ready.alloc(2);
     }
     int n_resident = 0;
     bool split_staged = false;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
-        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
         const int min_resident = (n_slots + 5) / 6;
-        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
+        if (!source_wait_class_host.empty()) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
@@ -2339,59 +2366,33 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
     if (split_staged) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-        std::vector<int32_t> source_map_host(n_unique);
+        std::vector<int32_t> expert_source_host(n_experts_total, -1);
+        std::vector<int32_t> expert_wait_class_host(n_experts_total, -1);
         int n_misses = 0;
         for (int i = 0; i < n_unique; ++i) {
+            const int32_t eid = unique_experts[i];
             if (split_slot_ids[i] < 0) {
-                source_map_host[i] = n_slots + n_misses++;
+                expert_source_host[eid] = n_slots + n_misses++;
             } else {
-                source_map_host[i] = split_slot_ids[i];
+                expert_source_host[eid] = split_slot_ids[i];
             }
+            expert_wait_class_host[eid] = source_wait_class_host[i];
         }
         GGML_ASSERT(n_resident > 0 && n_misses > 0 && n_resident + n_misses == n_unique);
 
-        std::vector<int32_t> remapped_ids_host;
-        remapped_ids_host.reserve(ids_total_elems);
-        for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
-            for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
-                for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
-                    const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
-                        + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
-                    remapped_ids_host.push_back(expert_to_pos[eid]);
-                }
-            }
-        }
-
-        ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
-        ggml_cuda_pool_alloc<int32_t> source_map(ctx.pool(), n_unique);
-        ggml_cuda_pool_alloc<int32_t> source_wait_class(ctx.pool());
-        if (!source_wait_class_host.empty()) {
-            source_wait_class.alloc(n_unique);
-        }
-        CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
-                                   ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(source_map.get(), source_map_host.data(),
-                                   n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        if (source_wait_class.get() != nullptr) {
-            CUDA_CHECK(cudaMemcpyAsync(source_wait_class.get(), source_wait_class_host.data(),
-                                       n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        }
-
         ggml_tensor src0_synth = *src0;
-        src0_synth.ne[2] = n_unique;
-        src0_synth.nb[3] = src0_synth.nb[2] * (size_t)n_unique;
+        src0_synth.ne[2] = n_experts_total;
+        src0_synth.nb[3] = src0_synth.nb[2] * (size_t)n_experts_total;
         src0_synth.data = ggml_cuda_moe_cache_slot_ptr(cache, 0);
 
-        ggml_tensor ids_synth = *ids;
-        ids_synth.data = scratch_ids.get();
-        ids_synth.nb[0] = sizeof(int32_t);
-        ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
-        ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
-        ids_synth.nb[3] = ids_synth.nb[2];
-
-        ggml_cuda_mul_mat_q_mapped(
-            ctx, &src0_synth, scratch_experts.get(), dst->src[1], &ids_synth, dst,
-            source_map.get(), n_slots, source_wait_class.get(), stage_ready.get());
+        ggml_tensor * orig_src0 = dst->src[0];
+        dst->src[0] = &src0_synth;
+        const ggml_cuda_mul_mat_id_host_route host_route = {
+            ids_host_bytes.data(), ids_host_nb0, ids_host_nb1, expert_source_host.data(),
+            scratch_experts.get(), n_slots, n_misses, expert_wait_class_host.data(), stage_ready.get(),
+        };
+        ggml_cuda_mul_mat_id_impl(ctx, dst, false, &host_route);
+        dst->src[0] = orig_src0;
 
         if (stage_ready.get() != nullptr) {
             const bool staging_finished = ggml_cuda_moe_cache_finish_split_staging(cache, stream);
