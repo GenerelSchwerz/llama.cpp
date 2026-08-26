@@ -66,6 +66,16 @@ int ggml_cuda_moe_cache_acquire(
     bool         is_decode,
     bool         is_prefetch);
 
+// Copy host slabs into consecutive staging slots, using resident cache slots when available.
+// Returns false without enqueuing work if the arguments are invalid.
+bool ggml_cuda_moe_cache_copy_to_staging(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    void *               dst,
+    cudaStream_t         compute_stream);
+
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
     bool     staged,
