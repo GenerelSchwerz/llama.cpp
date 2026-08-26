@@ -2181,6 +2181,7 @@ enum ggml_cuda_moe_ids_kind {
 
 struct ggml_cuda_moe_ids_cache_state {
     int device = -1;
+    int published_device = -1;
     bool pending = false;
     ggml_cuda_moe_ids_kind kind = GGML_CUDA_MOE_IDS_KIND_NONE;
     ggml_cuda_moe_ids_cache_key key = {};
@@ -2188,6 +2189,43 @@ struct ggml_cuda_moe_ids_cache_state {
     size_t nb0 = 0;
     size_t nb1 = 0;
     size_t nb2 = 0;
+
+    struct published_entry {
+        int32_t * host_ids = nullptr;
+        int32_t * device_ids = nullptr;
+        uint32_t * host_ready = nullptr;
+        uint32_t * device_ready = nullptr;
+        size_t count = 0;
+    };
+    struct published_key {
+        const void * data;
+        cudaStream_t stream;
+
+        bool operator==(const published_key & other) const {
+            return data == other.data && stream == other.stream;
+        }
+    };
+    struct published_key_hash {
+        size_t operator()(const published_key & key) const {
+            size_t h = std::hash<const void *>{}(key.data);
+            h ^= std::hash<void *>{}((void *) key.stream) + 0x9e3779b9 + (h << 6) + (h >> 2);
+            return h;
+        }
+    };
+    std::unordered_map<published_key, published_entry, published_key_hash> published;
+
+    void clear_published() {
+        for (auto & item : published) {
+            if (item.second.host_ids) {
+                cudaFreeHost(item.second.host_ids);
+            }
+        }
+        published.clear();
+    }
+
+    ~ggml_cuda_moe_ids_cache_state() {
+        clear_published();
+    }
 };
 
 static thread_local ggml_cuda_moe_ids_cache_state ggml_cuda_moe_ids_cache;
@@ -2201,6 +2239,11 @@ struct ggml_cuda_moe_ids_host {
     uint64_t d2h_sync_count = 0;
     bool cache_hit = false;
     bool group_pending = false;
+};
+
+struct ggml_cuda_moe_ids_publish {
+    int32_t * ids = nullptr;
+    uint32_t * ready = nullptr;
 };
 
 static void ggml_cuda_moe_ids_cache_clear_pending(ggml_cuda_moe_ids_cache_state & state) {
@@ -2277,6 +2320,52 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
     };
 }
 
+static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * ids) {
+    const size_t count = (size_t) ids->ne[0];
+    if (ggml_backend_cuda_moe_get_cache_slots() <= 0 || ids->ne[1] * ids->ne[2] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ggml_nbytes(ids) != count*sizeof(int32_t)) {
+        return {};
+    }
+
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_moe_ids_cache.published_device != device) {
+        ggml_cuda_moe_ids_cache.clear_published();
+        ggml_cuda_moe_ids_cache.published_device = device;
+    }
+
+    const ggml_cuda_moe_ids_cache_state::published_key key{ids->data, ctx.stream()};
+    auto & entry = ggml_cuda_moe_ids_cache.published[key];
+    if (entry.host_ids && entry.count != count) {
+        CUDA_CHECK(cudaFreeHost(entry.host_ids));
+        entry = {};
+    }
+    if (!entry.host_ids) {
+        void * host = nullptr;
+        const size_t bytes = count*sizeof(int32_t) + sizeof(uint32_t);
+        cudaError_t err = cudaHostAlloc(&host, bytes, cudaHostAllocMapped);
+        if (err != cudaSuccess) {
+            cudaGetLastError();
+            return {};
+        }
+        void * device_ptr = nullptr;
+        err = cudaHostGetDevicePointer(&device_ptr, host, 0);
+        if (err != cudaSuccess || !device_ptr) {
+            cudaGetLastError();
+            cudaFreeHost(host);
+            return {};
+        }
+        entry.host_ids = (int32_t *) host;
+        entry.device_ids = (int32_t *) device_ptr;
+        entry.host_ready = (uint32_t *) (entry.host_ids + count);
+        entry.device_ready = (uint32_t *) (entry.device_ids + count);
+        entry.count = count;
+        __atomic_store_n(entry.host_ready, 0, __ATOMIC_RELEASE);
+    }
+    return {entry.device_ids, entry.device_ready};
+}
+
 static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * ids,
@@ -2284,6 +2373,10 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
         std::vector<char> & storage) {
     ggml_cuda_moe_ids_host result;
     const int device = ggml_cuda_get_device();
+    if (ggml_cuda_moe_ids_cache.published_device != device) {
+        ggml_cuda_moe_ids_cache.clear_published();
+        ggml_cuda_moe_ids_cache.published_device = device;
+    }
     const int layer = ggml_cuda_moe_layer_from_name(tensor_name);
     const ggml_cuda_moe_ids_cache_key key = ggml_cuda_moe_ids_cache_make_key(ids, layer);
     const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(tensor_name);
@@ -2330,21 +2423,50 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
         if (compact_ids) {
             const size_t rows = (size_t) ids->ne[1] * ids->ne[2];
             target->resize(row_bytes * rows);
-            CUDA_CHECK(cudaMemcpy2DAsync(
-                target->data(), row_bytes, ids->data, ids->nb[1],
-                row_bytes, rows, cudaMemcpyDeviceToHost, ctx.stream()));
             result.nb0 = sizeof(int32_t);
             result.nb1 = row_bytes;
             result.nb2 = row_bytes * (size_t) ids->ne[1];
         } else {
             target->resize(ggml_nbytes(ids));
-            CUDA_CHECK(cudaMemcpyAsync(target->data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, ctx.stream()));
             result.nb0 = ids->nb[0];
             result.nb1 = ids->nb[1];
             result.nb2 = ids->nb[2];
         }
-        CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
-        result.d2h_sync_count = 1;
+
+        const ggml_cuda_moe_ids_cache_state::published_key published_key{ids->data, ctx.stream()};
+        auto published = ggml_cuda_moe_ids_cache.published.find(published_key);
+        const bool can_use_published = ids->ne[1] * ids->ne[2] == 1 && published != ggml_cuda_moe_ids_cache.published.end() &&
+            published->second.count == (size_t) ids->ne[0] && target->size() == published->second.count*sizeof(int32_t);
+        bool ready = false;
+        if (can_use_published) {
+            const int64_t spin_start_us = ggml_time_us();
+            do {
+                for (int spin = 0; spin < 1024; ++spin) {
+                    if (__atomic_load_n(published->second.host_ready, __ATOMIC_ACQUIRE) != 0) {
+                        ready = true;
+                        break;
+                    }
+                }
+            } while (!ready && ggml_time_us() - spin_start_us < 1000);
+            if (ready) {
+                memcpy(target->data(), published->second.host_ids, target->size());
+            }
+        }
+        if (!ready) {
+            if (compact_ids) {
+                const size_t rows = (size_t) ids->ne[1] * ids->ne[2];
+                CUDA_CHECK(cudaMemcpy2DAsync(
+                    target->data(), row_bytes, ids->data, ids->nb[1],
+                    row_bytes, rows, cudaMemcpyDeviceToHost, ctx.stream()));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(target->data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, ctx.stream()));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            result.d2h_sync_count = 1;
+        }
+        if (can_use_published) {
+            __atomic_store_n(published->second.host_ready, 0, __ATOMIC_RELEASE);
+        }
         result.d2h_time_us = (uint64_t) (ggml_time_us() - start_us);
         result.bytes = target;
 
@@ -4474,7 +4596,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    const ggml_cuda_moe_ids_publish publish = ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -4489,7 +4612,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    const ggml_cuda_moe_ids_publish publish = ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
             }
