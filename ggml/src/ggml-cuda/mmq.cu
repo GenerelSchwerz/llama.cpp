@@ -86,7 +86,8 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 static void ggml_cuda_mul_mat_q_impl(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t * source_map, int32_t source_split) {
+        const int32_t * source_map, int32_t source_split,
+        const int32_t * source_wait_class, const uint32_t * stage_ready) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -261,6 +262,8 @@ static void ggml_cuda_mul_mat_q_impl(
     args.x_secondary = (const char *) src0_secondary;
     args.x_channel_map = source_map;
     args.x_channel_split = source_split;
+    args.x_wait_class = source_wait_class;
+    args.x_stage_ready = stage_ready;
     if (source_map) {
         ggml_cuda_mul_mat_q_switch_type<true>(ctx, args, stream);
     } else {
@@ -271,16 +274,20 @@ static void ggml_cuda_mul_mat_q_impl(
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst) {
-    ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr, 0);
+    ggml_cuda_mul_mat_q_impl(ctx, src0, nullptr, src1, ids, dst, nullptr, 0, nullptr, nullptr);
 }
 
 void ggml_cuda_mul_mat_q_mapped(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t * source_map, int32_t source_split) {
+        const int32_t * source_map, int32_t source_split,
+        const int32_t * source_wait_class, const uint32_t * stage_ready) {
     GGML_ASSERT(src0_secondary != nullptr && source_map != nullptr && source_split > 0);
+    GGML_ASSERT((source_wait_class == nullptr) == (stage_ready == nullptr));
     GGML_ASSERT(src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4);
-    ggml_cuda_mul_mat_q_impl(ctx, src0, src0_secondary, src1, ids, dst, source_map, source_split);
+    ggml_cuda_mul_mat_q_impl(
+        ctx, src0, src0_secondary, src1, ids, dst,
+        source_map, source_split, source_wait_class, stage_ready);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {

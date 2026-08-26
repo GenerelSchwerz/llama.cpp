@@ -953,7 +953,8 @@ static __global__ void mul_mat_q(
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 ntx, const char * __restrict__ x_secondary, const int32_t * __restrict__ x_channel_map,
-        const int32_t x_channel_split) {
+        const int32_t x_channel_split, const int32_t * __restrict__ x_wait_class,
+        const uint32_t * __restrict__ x_stage_ready) {
 
     // Skip unused template specializations for faster compilation:
     if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT) {
@@ -1047,6 +1048,17 @@ static __global__ void mul_mat_q(
         int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
         if constexpr (use_x_map) {
+            if (x_stage_ready != nullptr) {
+                const int wait_class = x_wait_class[x_channel];
+                if (wait_class != 0) {
+                    if (threadIdx.x == 0 && threadIdx.y == 0) {
+                        const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
+                        while (*ready == 0) {
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
             x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
@@ -1150,6 +1162,17 @@ static __global__ void mul_mat_q(
         int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
         if constexpr (use_x_map) {
+            if (x_stage_ready != nullptr) {
+                const int wait_class = x_wait_class[x_channel];
+                if (wait_class != 0) {
+                    if (threadIdx.x == 0 && threadIdx.y == 0) {
+                        const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
+                        while (*ready == 0) {
+                        }
+                    }
+                    __syncthreads();
+                }
+            }
             x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
@@ -1243,6 +1266,17 @@ static __global__ void mul_mat_q(
     int x_channel = fastdiv(zt, channel_ratio);
     const char * x_cur = x;
     if constexpr (use_x_map) {
+        if (x_stage_ready != nullptr) {
+            const int wait_class = x_wait_class[x_channel];
+            if (wait_class != 0) {
+                if (threadIdx.x == 0 && threadIdx.y == 0) {
+                    const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
+                    while (*ready == 0) {
+                    }
+                }
+                __syncthreads();
+            }
+        }
         x_channel = x_channel_map[x_channel];
         if (x_channel >= x_channel_split) {
             x_cur = x_secondary;
@@ -1406,6 +1440,8 @@ struct mmq_args {
     const char * x_secondary = nullptr;
     const int32_t * x_channel_map = nullptr;
     int32_t x_channel_split = 0;
+    const int32_t * x_wait_class = nullptr;
+    const uint32_t * x_stage_ready = nullptr;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1455,7 +1491,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split);
+             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
         return;
     }
 
@@ -1484,7 +1520,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split);
+         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
 
     if (!fixup_needed) {
         return;
@@ -1628,6 +1664,7 @@ void ggml_cuda_mul_mat_q(
 void ggml_cuda_mul_mat_q_mapped(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t * source_map, int32_t source_split);
+        const int32_t * source_map, int32_t source_split,
+        const int32_t * source_wait_class = nullptr, const uint32_t * stage_ready = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);

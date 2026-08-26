@@ -83,8 +83,14 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     size_t               byte_count,
     int                  min_resident,
     int *                slot_ids,
+    int32_t *            source_wait_class,
     int *                out_n_resident,
     void *               miss_dst,
+    uint32_t *           stage_ready,
+    cudaStream_t         compute_stream);
+
+bool ggml_cuda_moe_cache_finish_split_staging(
+    struct ggml_cuda_moe_cache * cache,
     cudaStream_t         compute_stream);
 
 bool ggml_cuda_moe_cache_release_split_slots(

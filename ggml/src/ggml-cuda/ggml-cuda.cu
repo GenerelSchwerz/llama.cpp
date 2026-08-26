@@ -2248,6 +2248,12 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     std::vector<int> split_slot_ids(n_unique, -1);
+    std::vector<int32_t> source_wait_class_host;
+    ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    source_wait_class_host.resize(n_unique);
+    stage_ready.alloc(2);
+#endif
     int n_resident = 0;
     bool split_staged = false;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
@@ -2257,7 +2263,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         if (ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
-                split_slot_ids.data(), &n_resident, scratch_experts.get(), stream);
+                split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
+                &n_resident, scratch_experts.get(), stage_ready.get(), stream);
         }
     }
 
@@ -2307,10 +2314,18 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
         ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
         ggml_cuda_pool_alloc<int32_t> source_map(ctx.pool(), n_unique);
+        ggml_cuda_pool_alloc<int32_t> source_wait_class(ctx.pool());
+        if (!source_wait_class_host.empty()) {
+            source_wait_class.alloc(n_unique);
+        }
         CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
                                    ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(source_map.get(), source_map_host.data(),
                                    n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        if (source_wait_class.get() != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(source_wait_class.get(), source_wait_class_host.data(),
+                                       n_unique * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        }
 
         ggml_tensor src0_synth = *src0;
         src0_synth.ne[2] = n_unique;
@@ -2326,7 +2341,12 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
         ggml_cuda_mul_mat_q_mapped(
             ctx, &src0_synth, scratch_experts.get(), dst->src[1], &ids_synth, dst,
-            source_map.get(), n_slots);
+            source_map.get(), n_slots, source_wait_class.get(), stage_ready.get());
+
+        if (stage_ready.get() != nullptr) {
+            const bool staging_finished = ggml_cuda_moe_cache_finish_split_staging(cache, stream);
+            GGML_ASSERT(staging_finished);
+        }
 
         const bool slots_released = ggml_cuda_moe_cache_release_split_slots(
             cache, split_slot_ids.data(), n_unique, stream);

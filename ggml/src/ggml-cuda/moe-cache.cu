@@ -1262,12 +1262,15 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     size_t               byte_count,
     int                  min_resident,
     int *                slot_ids,
+    int32_t *            source_wait_class,
     int *                out_n_resident,
     void *               miss_dst,
+    uint32_t *           stage_ready,
     cudaStream_t         compute_stream) {
 
     if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
-        !slot_ids || !out_n_resident || !miss_dst || !compute_stream) {
+        !slot_ids || !out_n_resident || !miss_dst || !compute_stream ||
+        ((source_wait_class == nullptr) != (stage_ready == nullptr))) {
         return false;
     }
     for (int i = 0; i < n_host_srcs; ++i) {
@@ -1281,16 +1284,31 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         return false;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    const bool overlap = stage_ready != nullptr;
+#else
+    const bool overlap = false;
+    if (stage_ready != nullptr) {
+        return false;
+    }
+#endif
+
     int n_resident = 0;
     for (int i = 0; i < n_host_srcs; ++i) {
         const auto it = cache->host_to_slot.find(host_srcs[i]);
         slot_ids[i] = it == cache->host_to_slot.end() ? -1 : it->second;
         n_resident += slot_ids[i] >= 0;
+        if (source_wait_class != nullptr) {
+            source_wait_class[i] = slot_ids[i] >= 0 ? 0 : 2;
+        }
     }
     if (n_resident == n_host_srcs) {
         return false;
     }
 
+    if (overlap) {
+        CUDA_CHECK(cudaMemsetAsync(stage_ready, 0, 2 * sizeof(uint32_t), compute_stream));
+    }
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
@@ -1311,6 +1329,9 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
             break;
         }
         slot_ids[i] = slot;
+        if (source_wait_class != nullptr) {
+            source_wait_class[i] = 1;
+        }
         cache->slot_pin_count[slot]++;
         n_resident++;
     }
@@ -1323,6 +1344,13 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         }
         return false;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    if (overlap) {
+        CU_CHECK(cuStreamWriteValue32(
+            cache->copy_stream, (CUdeviceptr)(stage_ready + 0), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+    }
+#endif
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     std::vector<void *> batch_dsts;
@@ -1361,14 +1389,37 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     cudaMemcpyAttributes attributes = {};
     attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
     size_t attributes_index = 0;
     CUDA_CHECK(cudaMemcpyBatchAsync(
         batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
         &attributes, &attributes_index, 1, cache->copy_stream));
 #endif
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    if (overlap) {
+        CU_CHECK(cuStreamWriteValue32(
+            cache->copy_stream, (CUdeviceptr)(stage_ready + 1), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+    }
+#endif
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
-    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
+    if (!overlap) {
+        CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
+    }
     *out_n_resident = n_resident;
+    return true;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_finish_split_staging(
+    struct ggml_cuda_moe_cache * cache,
+    cudaStream_t         compute_stream) {
+
+    if (!cache || !compute_stream) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     return true;
 }
 

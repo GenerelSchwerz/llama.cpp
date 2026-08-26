@@ -268,7 +268,8 @@ int main(int argc, char ** argv) {
         int slot_ids[4] = {-1, -1, -1, -1};
         int n_resident = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, 4, SLOT_BYTES, 1, slot_ids, &n_resident, staging_dst, compute_stream));
+            split_cache, split_srcs, 4, SLOT_BYTES, 1, slot_ids, nullptr,
+            &n_resident, staging_dst, nullptr, compute_stream));
         CHECK(n_resident == 2);
         CHECK(slot_ids[0] >= 0 && slot_ids[1] >= 0);
         CHECK(slot_ids[0] != slot_ids[1]);
@@ -300,7 +301,7 @@ int main(int argc, char ** argv) {
     int non_overflow_resident = 0;
     CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
         split_cache, non_overflow_srcs, 2, SLOT_BYTES, 1, non_overflow_slots,
-        &non_overflow_resident, staging_dst, compute_stream));
+        nullptr, &non_overflow_resident, staging_dst, nullptr, compute_stream));
     CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
     CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
 
