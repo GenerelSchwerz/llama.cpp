@@ -1,7 +1,6 @@
 #include "ggml-alloc.h"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "ggml-cpp.h"
-#include "ggml-cpu.h"
 #include "../ggml/src/ggml-impl.h"
 #include "ggml.h"
 
@@ -105,6 +104,7 @@ static void dummy_backend_buffer_clear(ggml_backend_buffer_t, uint8_t) {}
 
 struct dummy_backend {
     std::unique_ptr<dummy_backend_context> context;
+    std::unique_ptr<ggml_backend_device>   device;
     std::unique_ptr<ggml_backend>          handle;
     ggml_backend_buffer_type               buffer_type;
 };
@@ -117,6 +117,18 @@ static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml
     dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
     ctx->graph_compute_count++;
     return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t) {
+    return GGML_BACKEND_DEVICE_TYPE_CPU;
+}
+
+static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
+    return true;
+}
+
+static bool dummy_backend_device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t) {
+    return true;
 }
 
 static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false) {
@@ -141,10 +153,15 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.buffer_type.iface.get_max_size  = dummy_backend_buffer_type_get_max_size;
     b.buffer_type.iface.is_host       = dummy_backend_buffer_type_is_host;
 
+    b.device = std::make_unique<ggml_backend_device>();
+    b.device->iface.get_type      = dummy_backend_device_get_type;
+    b.device->iface.supports_op   = dummy_backend_device_supports_op;
+    b.device->iface.supports_buft = dummy_backend_device_supports_buft;
+
     b.handle = std::make_unique<ggml_backend>();
     b.handle->iface.get_name      = dummy_backend_get_name;
     b.handle->iface.graph_compute = dummy_backend_graph_compute;
-    b.handle->device              = ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0);
+    b.handle->device              = b.device.get();
     b.handle->context             = b.context.get();
     return b;
 }
