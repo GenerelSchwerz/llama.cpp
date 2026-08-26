@@ -2248,7 +2248,7 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
 
 static bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
     const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
-    return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens >= 512;
+    return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens > 1;
 }
 
 static const char * ggml_cuda_moe_ids_kind_pattern(ggml_cuda_moe_ids_kind kind) {
