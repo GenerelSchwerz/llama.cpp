@@ -1385,6 +1385,11 @@ ggml_tensor * rpc_server::create_node(uint64_t id,
         }
     }
     result->view_offs = tensor->view_offs;
+    if (result->op == GGML_OP_GATED_DELTA_NET && !ggml_gated_delta_net_validate(result)) {
+        GGML_LOG_ERROR("[%s] invalid GATED_DELTA_NET node (id=%" PRIu64 ")\n", __func__, id);
+        tensor_map.erase(id);
+        return nullptr;
+    }
     return result;
 }
 
@@ -1450,6 +1455,13 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
         if (graph->nodes[i] == nullptr && id != 0) {
             GGML_LOG_ERROR("[%s] failed to create graph node %d (id=%" PRId64 ")\n", __func__, i, id);
             return false;
+        }
+        if (graph->nodes[i] != nullptr) {
+            if (graph->nodes[i]->op == GGML_OP_GATED_DELTA_NET &&
+                !ggml_backend_supports_op(backends[device], graph->nodes[i])) {
+                GGML_LOG_ERROR("[%s] GATED_DELTA_NET node %d is unsupported by device %u\n", __func__, i, device);
+                return false;
+            }
         }
     }
     ggml_status status = ggml_backend_graph_compute(backends[device], graph);

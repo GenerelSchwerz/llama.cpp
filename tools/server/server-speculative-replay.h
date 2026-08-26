@@ -6,6 +6,23 @@
 #include <cstdint>
 #include <utility>
 
+template <class TokenRange>
+bool server_sparse_batch_slot_is_affected(
+        int32_t replay_slot_id, bool sparse_verification, const TokenRange & tokens, int32_t slot_id) {
+    if (replay_slot_id >= 0) {
+        return replay_slot_id == slot_id;
+    }
+    if (!sparse_verification) {
+        return false;
+    }
+    for (const auto & token : tokens) {
+        if (token.id_slot == slot_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Owns the server-side lifecycle of a replayed speculative batch.  Checkpoint
 // replay and capped-MTP GPU replay share the same slot-level lifetime, while
 // only GPU replay carries accepted tokens and their sampler snapshot.
@@ -22,6 +39,11 @@ struct server_speculative_replay_state {
 
     bool mtp_gpu_replay_pending() const {
         return phase == phase_type::MTP_GPU_REPLAY_PENDING;
+    }
+
+    uint32_t mtp_gpu_replay_selected_token() const {
+        GGML_ASSERT(mtp_gpu_replay_pending());
+        return n_accepted;
     }
 
     bool excludes_replayed_token_from_acceptance() const {

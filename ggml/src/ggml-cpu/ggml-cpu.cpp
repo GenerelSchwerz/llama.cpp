@@ -425,6 +425,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src1 = op->src[1];
     const struct ggml_tensor * src2 = op->src[2];
 
+    if (op->op == GGML_OP_GATED_DELTA_NET && !ggml_gated_delta_net_validate(op)) {
+        return false;
+    }
+
     const auto kvarn_view_base = [](const struct ggml_tensor * t) {
         if (t == nullptr || t->op != GGML_OP_PERMUTE ||
                 ggml_get_op_params_i32(t, 0) != 0 ||

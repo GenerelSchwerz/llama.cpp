@@ -3,21 +3,6 @@
 #include "llama-impl.h"
 #include "llama-memory-recurrent.h"
 
-extern "C" {
-GGML_API ggml_tensor * ggml_gated_delta_net_ext(
-        ggml_context * ctx,
-        ggml_tensor  * q,
-        ggml_tensor  * k,
-        ggml_tensor  * v,
-        ggml_tensor  * g,
-        ggml_tensor  * beta,
-        ggml_tensor  * state,
-        int64_t        K,
-        int32_t        trailing_snapshots,
-        int32_t        selected_token,
-        bool           reserve_input);
-}
-
 // utility to get one slice from the third dimension
 // input dim:  [x, y, c, b]
 // output dim: [x, y, 1, b]
@@ -600,10 +585,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int32_t selected = snapshot_mode.selected_token;
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
-    ggml_tensor * gdn_out = sparse
-            ? ggml_gated_delta_net_ext(ctx0, q, k, v, g, b, s, K,
-                    selected >= 0 ? 0 : K - 1, selected, selected < 0)
-            : ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    if (sparse) {
+        GGML_ASSERT(selected < n_seq_tokens);
+        ggml_gated_delta_net_set_snapshots(
+                gdn_out,
+                selected >= 0 ? 0 : (int32_t) std::min<int64_t>(n_seq_tokens, K - 1),
+                selected,
+                selected < 0);
+    }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -623,25 +613,29 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 
-    // op writes the last min(n_seq_tokens, K) snapshots; trailing slots are left unwritten
-    const int64_t n_written = sparse
-            ? (selected >= 0 ? 1 : K)
-            : std::min<int64_t>(n_seq_tokens, K);
+    const auto copy_snapshots = [&](int64_t first_slot, int64_t count) {
+        ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
+            D, n_seqs, count,
+            ggml_row_size(gdn_out->type, D),
+            ggml_row_size(gdn_out->type, state_size_per_snap),
+            ggml_row_size(gdn_out->type, attn_score_elems + first_slot * state_size_per_snap));
 
-    // write the produced snapshots into the recurrent cache (snapshot slot i -> rollback group i)
-    ggml_tensor * src = ggml_view_3d(ctx0, gdn_out,
-        D, n_seqs, n_written,
-        ggml_row_size(gdn_out->type, D),
-        ggml_row_size(gdn_out->type, state_size_per_snap),
-        ggml_row_size(gdn_out->type, attn_score_elems));
+        ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
+            D, n_seqs, count,
+            ssm_states_all->nb[1],
+            (size_t) mem_size * row_size,
+            ((size_t) first_slot * mem_size + kv_head) * row_size);
 
-    ggml_tensor * dst = ggml_view_3d(ctx0, ssm_states_all,
-        D, n_seqs, n_written,
-        ssm_states_all->nb[1],
-        (size_t) mem_size * row_size,
-        (size_t) kv_head * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    };
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    if (sparse && selected < 0) {
+        const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1);
+        copy_snapshots(0, n_trailing);
+        copy_snapshots(K - 1, 1);
+    } else {
+        copy_snapshots(0, sparse ? 1 : std::min<int64_t>(n_seq_tokens, K));
+    }
 
     return output;
 }

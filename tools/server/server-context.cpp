@@ -111,6 +111,8 @@ struct server_batch {
 
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
+    server_slot * replay_slot = nullptr;
+    bool mtp_sparse_snapshots = false;
 
     // in embd mode, we temporarily swap out the tokens arr and restore it on clear()
     bool has_embd = false;
@@ -165,6 +167,8 @@ struct server_batch {
         embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
+        replay_slot       = nullptr;
+        mtp_sparse_snapshots = false;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         batch_rendered    = false;
@@ -1158,6 +1162,8 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
+    llama_seq_id capped_mtp_next_verification_slot = 0;
+    bool capped_mtp_prompt_turn = false;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1446,15 +1452,20 @@ private:
                     params_base.speculative.mtp_rs_planes, llama_n_rs_seq(ctx_tgt) + 1);
             return false;
         }
+        if (capped_mtp) {
+            const int64_t verification_size = int64_t(params_base.speculative.draft.n_max) + 1;
+            const int64_t batch_limit = int64_t(std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt)));
+            if (verification_size > batch_limit) {
+                SRV_ERR("capped MTP verification requires up to %" PRId64
+                        " tokens per slot, but min(n_batch, n_ubatch) is %" PRId64 "\n",
+                        verification_size, batch_limit);
+                return false;
+            }
+        }
         if (capped_mtp &&
                 !llama_recurrent_sparse_snapshots_supported(ctx_tgt)) {
             SRV_ERR("%s", "capped MTP recurrent planes require a model graph and recurrent-state backend "
                     "with selected sparse-snapshot support\n");
-            return false;
-        }
-        if (capped_mtp &&
-                !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, -1)) {
-            SRV_ERR("%s", "failed to enable capped MTP sparse recurrent snapshots\n");
             return false;
         }
         vocab = llama_model_get_vocab(model_tgt);
@@ -1556,6 +1567,8 @@ private:
         }
 
         slots.clear();
+        capped_mtp_next_verification_slot = 0;
+        capped_mtp_prompt_turn = false;
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -3282,12 +3295,46 @@ private:
         }
     }
 
+    void iterate_post_decode(std::function<void(server_slot &)> callback) {
+        if (batch.replay_slot == nullptr && !batch.mtp_sparse_snapshots) {
+            iterate(slots, std::move(callback));
+            return;
+        }
+        // Sparse decode commits recurrent planes for every sequence in the batch, so a post-decode exception must invalidate the whole batch.
+        for (auto & slot : slots) {
+            callback(slot);
+        }
+    }
+
     void abort_all_slots(const std::string & reason) {
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);
                 slot.release();
             }
+        }
+    }
+
+    void clear_failed_sparse_batch_state() {
+        const int32_t replay_slot_id = batch.replay_slot != nullptr ? batch.replay_slot->id : -1;
+        if (replay_slot_id < 0 && !batch.mtp_sparse_snapshots) {
+            return;
+        }
+        for (auto & slot : slots) {
+            if (slot.is_processing() && server_sparse_batch_slot_is_affected(
+                        replay_slot_id, batch.mtp_sparse_snapshots, batch.tokens, slot.id)) {
+                slot.prompt_clear();
+            }
+        }
+    }
+
+    void fail_speculative_replay(server_slot & slot, const std::string & reason) {
+        SLT_ERR(slot, "%s\n", reason.c_str());
+        send_error(slot, reason, ERROR_TYPE_SERVER);
+        slot.prompt_clear();
+        slot.release();
+        if (batch.replay_slot == &slot) {
+            batch.replay_slot = nullptr;
         }
     }
 
@@ -3416,6 +3463,7 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
+                clear_failed_sparse_batch_state();
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
@@ -3425,6 +3473,7 @@ private:
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
+                clear_failed_sparse_batch_state();
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
@@ -3499,6 +3548,34 @@ private:
         // start populating the batch for this iteration
         batch.clear();
 
+        if (params_base.speculative.is_mtp_rs_capped()) {
+            iterate(slots, [&](server_slot & slot) {
+                if (batch.replay_slot == nullptr && slot.state == SLOT_STATE_GENERATING &&
+                        slot.spec_replay.mtp_gpu_replay_pending()) {
+                    batch.replay_slot = &slot;
+                }
+            });
+        }
+
+        if (batch.replay_slot != nullptr) {
+            auto & slot = *batch.replay_slot;
+            const auto & ckpt = slot.spec_ckpt;
+
+            if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, ckpt.pos_max + 1, -1)) {
+                fail_speculative_replay(slot, "failed to restore the pre-verification recurrent plane");
+                return;
+            }
+            if (ctx_dft != nullptr && !llama_memory_seq_rm(
+                        llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
+                fail_speculative_replay(slot, "failed to rewind the MTP draft context for GPU replay");
+                return;
+            }
+            if (!common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec)) {
+                fail_speculative_replay(slot, "failed to restore speculative state for GPU replay");
+                return;
+            }
+        }
+
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
@@ -3508,6 +3585,9 @@ private:
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            if (batch.replay_slot != nullptr && batch.replay_slot != &slot) {
                 return;
             }
 
@@ -3700,9 +3780,75 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
-        iterate(generating, [&](server_slot & slot) {
-            slot.handle_last_sampled_token(batch);
-        });
+        bool batch_pending_prompts = true;
+        if (params_base.speculative.is_mtp_rs_capped()) {
+            const bool capped_mtp_verification = batch.replay_slot == nullptr && !generating.empty();
+            if (capped_mtp_verification) {
+                const auto first = std::find_if(generating.begin(), generating.end(), [&](const server_slot * slot) {
+                    return slot->id >= capped_mtp_next_verification_slot;
+                });
+                if (first != generating.end()) {
+                    std::rotate(generating.begin(), first, generating.end());
+                }
+            }
+
+            const bool capped_mtp_empty_draft_class =
+                    capped_mtp_verification && generating.front()->spec_draft.empty();
+            const size_t capped_mtp_verification_size = capped_mtp_verification && !capped_mtp_empty_draft_class
+                    ? generating.front()->spec_draft.size() + 1 : 0;
+            const bool capped_mtp_prompt_ready = capped_mtp_verification && std::any_of(
+                    slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.is_processing() &&
+                        (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
+            });
+            bool capped_mtp_prompt_only = false;
+            if (capped_mtp_verification_size > 1 && capped_mtp_prompt_ready) {
+                capped_mtp_prompt_only = capped_mtp_prompt_turn;
+                capped_mtp_prompt_turn = !capped_mtp_prompt_turn;
+            }
+            if (capped_mtp_prompt_only) {
+                slot_batched = nullptr;
+            }
+
+            const size_t capped_mtp_batch_limit = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+            size_t capped_mtp_verification_tokens = 0;
+            server_slot * capped_mtp_scheduled_anchor = nullptr;
+            if (!capped_mtp_prompt_only) {
+                iterate(generating, [&](server_slot & slot) {
+                    if (capped_mtp_verification) {
+                        if (slot.spec_draft.empty() != capped_mtp_empty_draft_class) {
+                            return;
+                        }
+                        if (!capped_mtp_empty_draft_class &&
+                                slot.spec_draft.size() + 1 != capped_mtp_verification_size) {
+                            return;
+                        }
+                        if (!capped_mtp_empty_draft_class &&
+                                capped_mtp_verification_tokens + capped_mtp_verification_size > capped_mtp_batch_limit) {
+                            return;
+                        }
+                    }
+                    slot.handle_last_sampled_token(batch);
+                    if (capped_mtp_verification && capped_mtp_scheduled_anchor == nullptr) {
+                        capped_mtp_scheduled_anchor = &slot;
+                    }
+                    if (!capped_mtp_empty_draft_class && capped_mtp_verification_size != 0) {
+                        capped_mtp_verification_tokens += capped_mtp_verification_size;
+                        batch.mtp_sparse_snapshots = true;
+                    }
+                });
+            }
+            if (capped_mtp_scheduled_anchor != nullptr) {
+                capped_mtp_next_verification_slot = capped_mtp_scheduled_anchor->id + 1;
+            }
+
+            batch_pending_prompts = batch.replay_slot == nullptr &&
+                    (capped_mtp_prompt_only || capped_mtp_verification_size == 0);
+        } else {
+            iterate(generating, [&](server_slot & slot) {
+                slot.handle_last_sampled_token(batch);
+            });
+        }
 
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
@@ -3712,7 +3858,7 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if (batch_pending_prompts && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
@@ -4358,9 +4504,69 @@ private:
             }
         }
 
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        server_slot * replay_slot = batch.replay_slot;
+        if (replay_slot != nullptr) {
+            GGML_ASSERT(off == 0);
+            GGML_ASSERT(batch_view.n_tokens == batch.size());
+            GGML_ASSERT(batch_view.n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt));
+            for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
+                GGML_ASSERT(batch.tokens[i].id_slot == replay_slot->id);
+            }
+            GGML_ASSERT(replay_slot->spec_replay.mtp_gpu_replay_selected_token() <
+                    (uint32_t) batch_view.n_tokens);
+        }
+
+        const bool sparse_snapshots = replay_slot != nullptr || batch.mtp_sparse_snapshots;
+        const int32_t selected_token = replay_slot != nullptr
+                ? (int32_t) replay_slot->spec_replay.mtp_gpu_replay_selected_token() : -1;
+        if (sparse_snapshots) {
+            GGML_ASSERT(off == 0);
+            GGML_ASSERT(batch_view.n_tokens == batch.size());
+            GGML_ASSERT(batch_view.n_tokens <= (int32_t) llama_n_ubatch(ctx_tgt));
+        }
+
+        int ret = 0;
+        if (sparse_snapshots) {
+            bool snapshot_mode_restored = true;
+            std::exception_ptr decode_error;
+            queue_tasks.yield_to_queue([&]() {
+                if (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token)) {
+                    snapshot_mode_restored = false;
+                    return;
+                }
+                try {
+                    ret = llama_decode(ctx_tgt, batch_view);
+                    if (ret == 0) {
+                        llama_synchronize(ctx_tgt);
+                    }
+                } catch (...) {
+                    decode_error = std::current_exception();
+                }
+                if (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1)) {
+                    snapshot_mode_restored = false;
+                }
+            });
+
+            if (!snapshot_mode_restored) {
+                if (replay_slot != nullptr) {
+                    fail_speculative_replay(*replay_slot, "failed to set or restore the recurrent replay boundary");
+                }
+                throw std::runtime_error("failed to set or restore the recurrent snapshot mode");
+            }
+            if (decode_error != nullptr) {
+                std::rethrow_exception(decode_error);
+            }
+        } else {
+            ret = llama_decode(ctx_tgt, batch_view);
+        }
 
         metrics.on_decoded(slots);
+
+        if (ret != 0 && sparse_snapshots) {
+            SRV_ERR("sparse recurrent snapshot decode failed, off = %d, n_batch = %d, ret = %d\n",
+                    off, n_batch, ret);
+            throw std::runtime_error("sparse recurrent snapshot decode failed");
+        }
 
         if (ret != 0) {
             {
@@ -4456,7 +4662,7 @@ private:
 
         // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
         // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
-        iterate(slots, [&](server_slot & slot) {
+        iterate_post_decode([&](server_slot & slot) {
             for (auto & i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
@@ -4469,7 +4675,7 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
-        iterate(slots, [&](server_slot & slot) {
+        iterate_post_decode([&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
@@ -4574,8 +4780,9 @@ private:
         });
 
         // speculative decoding - main model sample and accept
-        iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() || slot.spec_draft.empty()) {
+        iterate_post_decode([&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
             }
 
@@ -4618,23 +4825,15 @@ private:
                     const uint32_t replay_accepted =
                             slot.spec_replay.consume_mtp_gpu_replay(accepted, slot.smpl);
 
-                    if (!llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, -1)) {
-                        SLT_ERR(slot, "%s", "failed to restore normal sparse snapshot mode\n");
-                        slot.release();
-                        return;
-                    }
-
                     const auto & ckpt = slot.spec_ckpt;
                     const llama_pos accepted_end = ckpt.pos_max + 2 + replay_accepted;
                     if (!llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, accepted_end, -1)) {
-                        SLT_ERR(slot, "%s", "failed to select the replayed recurrent boundary\n");
-                        slot.release();
+                        fail_speculative_replay(slot, "failed to select the replayed recurrent boundary");
                         return;
                     }
                     if (ctx_dft != nullptr && !llama_memory_seq_rm(
                                 llama_get_memory(ctx_dft), slot.id, accepted_end, -1)) {
-                        SLT_ERR(slot, "%s", "failed to align the MTP draft context after GPU replay\n");
-                        slot.release();
+                        fail_speculative_replay(slot, "failed to align the MTP draft context after GPU replay");
                         return;
                     }
 
@@ -4656,30 +4855,6 @@ private:
                         if (trace > 0) {
                             SLT_INF(slot, "accepted %2u/%2zu draft tokens (full-shape GPU replay)\n",
                                     n_accepted, slot.spec_draft.size());
-                        }
-
-                        if (!llama_memory_seq_rm(
-                                    llama_get_memory(ctx_tgt), slot.id, ckpt.pos_max + 1, -1)) {
-                            SLT_ERR(slot, "%s", "failed to restore the pre-verification recurrent plane\n");
-                            slot.release();
-                            return;
-                        }
-                        if (ctx_dft != nullptr && !llama_memory_seq_rm(
-                                    llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                            SLT_ERR(slot, "%s", "failed to rewind the MTP draft context for GPU replay\n");
-                            slot.release();
-                            return;
-                        }
-                        if (!common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec)) {
-                            SLT_ERR(slot, "%s", "failed to restore speculative state for GPU replay\n");
-                            slot.release();
-                            return;
-                        }
-                        if (!llama_recurrent_set_sparse_snapshot_mode(
-                                    ctx_tgt, true, (int32_t) n_accepted)) {
-                            SLT_ERR(slot, "%s", "failed to select a recurrent replay boundary\n");
-                            slot.release();
-                            return;
                         }
 
                         slot.spec_replay.begin_mtp_gpu_replay(

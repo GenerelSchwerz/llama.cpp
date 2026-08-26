@@ -1,6 +1,41 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+bool ggml_cuda_gated_delta_net_supported(int device, const ggml_tensor * dst) {
+#ifdef GGML_USE_MUSA
+    GGML_UNUSED(device);
+    GGML_UNUSED(dst);
+    return false;
+#else
+    if (!ggml_gated_delta_net_validate(dst)) {
+        return false;
+    }
+#ifdef GGML_USE_HIP
+    if (!ggml_gated_delta_net_has_default_snapshot_params(dst)) {
+        return false;
+    }
+#endif
+    if (!ggml_are_same_stride(dst->src[0], dst->src[1])) {
+        return false;
+    }
+    const int64_t S_v = dst->src[2]->ne[0];
+    if (S_v != 16 && S_v != 32 && S_v != 64 && S_v != 128) {
+        return false;
+    }
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    const int64_t grid_size[3] = { dst->src[2]->ne[1], dst->src[2]->ne[3], (S_v + 3) / 4 };
+    for (int dim = 0; dim < 3; ++dim) {
+        if (grid_size[dim] > info.devices[device].max_grid_size[dim]) {
+            return false;
+        }
+    }
+    return true;
+#endif
+}
+
 template <int S_v, bool KDA, bool keep_rs_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
@@ -243,6 +278,8 @@ static void launch_gated_delta_net(
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
+    GGML_ASSERT(ggml_cuda_gated_delta_net_supported(ctx.device, dst));
+
     ggml_tensor * src_q     = dst->src[0];
     ggml_tensor * src_k     = dst->src[1];
     ggml_tensor * src_v     = dst->src[2];
