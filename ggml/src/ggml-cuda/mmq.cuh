@@ -1475,8 +1475,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
-    const int J_max = type == GGML_TYPE_Q4_K && args.ids_dst != nullptr ? 64 : 128;
-    for (int J = 8; J <= J_max && ntiles_J_best > 1; J += 8) {
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
             continue;
