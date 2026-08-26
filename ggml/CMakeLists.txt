@@ -295,6 +295,44 @@ find_package(Threads REQUIRED)
 
 include(GNUInstallDirs)
 
+# The extra-tier quantized-native MMA cache types, read from their single
+# source: ggml/src/ggml-cuda/fattn-mma-quant-types.h. The route predicate, the
+# extern declarations, the instance generator and the backend-ops coverage read
+# the same manifest, so the build cannot exclude a stem the generator no longer
+# emits, or keep compiling one that moved into the default tier.
+#
+# Returns the file-name stems, which is what the generated instance file names
+# carry. A manifest that parses to nothing is a configure error, not an empty
+# filter that would quietly compile the whole matrix.
+# Resolved here rather than inside the function: CMAKE_CURRENT_LIST_DIR follows
+# the caller, and the caller is ggml/src/ggml-cuda.
+set(GGML_CUDA_FATTN_MMA_QUANT_MANIFEST
+    "${CMAKE_CURRENT_LIST_DIR}/src/ggml-cuda/fattn-mma-quant-types.h")
+
+function(ggml_cuda_fattn_mma_quant_extra_stems OUT_VAR)
+    set(_manifest "${GGML_CUDA_FATTN_MMA_QUANT_MANIFEST}")
+    if (NOT EXISTS "${_manifest}")
+        message(FATAL_ERROR "Missing native MMA cache type manifest: ${_manifest}")
+    endif()
+
+    file(READ "${_manifest}" _manifest_text)
+    string(REGEX MATCHALL "ENTRY\\( *GGML_TYPE_[A-Z0-9_]+ *, *[a-z0-9_]+ *, *EXTRA *,"
+           _entries "${_manifest_text}")
+
+    set(_stems "")
+    foreach(_entry ${_entries})
+        string(REGEX REPLACE "^ENTRY\\( *GGML_TYPE_[A-Z0-9_]+ *, *([a-z0-9_]+) *,.*$" "\\1"
+               _stem "${_entry}")
+        list(APPEND _stems "${_stem}")
+    endforeach()
+
+    if (NOT _stems)
+        message(FATAL_ERROR "No EXTRA tier entries parsed from ${_manifest}")
+    endif()
+
+    set(${OUT_VAR} ${_stems} PARENT_SCOPE)
+endfunction()
+
 #
 # build the library
 #

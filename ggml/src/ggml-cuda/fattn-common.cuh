@@ -41,6 +41,34 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
+// The MMA kernels carry one extra trailing argument: the runtime V cache type,
+// used only when the V loader is selected at runtime rather than instantiated.
+// It is a separate typedef rather than an extension of fattn_kernel_t so that
+// the vector and tile kernels keep their existing signature untouched.
+typedef void (* fattn_kernel_mma_t)(
+        const char * __restrict__ Q,
+        const char * __restrict__ K,
+        const char * __restrict__ V,
+        const char * __restrict__ mask,
+        const char * __restrict__ sinks,
+        const int  * __restrict__ KV_max,
+        float      * __restrict__ dst,
+        float2     * __restrict__ dst_meta,
+        const float scale,
+        const float max_bias,
+        const float m0,
+        const float m1,
+        const uint32_t n_head_log2,
+        const float logit_softcap,
+        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
+                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
+        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
+                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
+                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
+                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
+                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
+        const int type_V_rt);
+
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
@@ -718,24 +746,6 @@ static __global__ void flash_attn_mask_to_KV_max(
     KV_max[sequence*ne31 + jt] = KV_max_sj;
 }
 
-static __device__ __forceinline__ int32_t flash_attn_causal_prefix_bound(
-        const int64_t * write_indices, int64_t index) {
-    return int32_t(write_indices[index] + 1);
-}
-
-template <int ncols1>
-__launch_bounds__(1, 1)
-static __global__ void flash_attn_causal_prefix_to_KV_max(
-        const int64_t * write_indices_ptr, int * KV_max_ptr,
-        const int ne11, const int64_t s31) {
-    const int sequence = blockIdx.y;
-    const int jt = blockIdx.x;
-    const int64_t * write_indices = write_indices_ptr + jt*ncols1*s31;
-    const int32_t bound = flash_attn_causal_prefix_bound(write_indices, 0) + ncols1 - 1;
-    const int rounded = ((bound + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE;
-    KV_max_ptr[sequence*gridDim.x + jt] = min(ne11, rounded);
-}
-
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -987,10 +997,11 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, typename kernel_t = fattn_kernel_t, typename... Extra>
 void launch_fattn(
-    ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
-    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE
+    ggml_backend_cuda_context & ctx, ggml_tensor * dst, kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
+    const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
+    Extra... extra
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1012,11 +1023,7 @@ void launch_fattn(
     GGML_ASSERT(K->nb[0] == ggml_element_size(K));
     GGML_ASSERT(V->nb[0] == ggml_element_size(V));
 
-    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I64);
-    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
-    GGML_ASSERT(!compact_causal_prefix ||
-        (mask->ne[0] == Q->ne[1] && mask->ne[1] == 1 && mask->ne[2] == 1 &&
-         mask->ne[3] == 1 && mask->nb[0] == ggml_type_size(mask->type)));
+    GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
     ggml_cuda_pool & pool = ctx.pool();
     cudaStream_t main_stream = ctx.stream();
@@ -1113,19 +1120,7 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    const bool use_KV_max = K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1);
-    if (compact_causal_prefix && use_KV_max) {
-        const dim3 blocks_num_KV_max(ntiles_x, Q->ne[3], 1);
-        const dim3 block_dim_KV_max(1, 1, 1);
-
-        KV_max.alloc(blocks_num_KV_max.x*blocks_num_KV_max.y);
-        ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
-            blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
-        ggml_cuda_kernel_launch(flash_attn_causal_prefix_to_KV_max<ncols1>, launch_params,
-            (const int64_t *) mask->data, KV_max.ptr, int(K->ne[1]),
-            mask->nb[0] / sizeof(int64_t));
-        CUDA_CHECK(cudaGetLastError());
-    } else if (mask && use_KV_max) {
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);
         const int64_t s33 = mask->nb[3] / sizeof(half2);
 
@@ -1254,10 +1249,9 @@ void launch_fattn(
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
         K->ne[0], K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13,
         nb21, nb22, nb23,
-        compact_causal_prefix ? -int32_t(Q->ne[1]) : (mask ? int32_t(mask->ne[1]) : 0),
-        mask ? int32_t(mask->ne[2]) : 0, mask ? mask->ne[3] : 0,
-        mask ? (compact_causal_prefix ? mask->nb[0] : mask->nb[1]) : 0,
-        mask ? int32_t(mask->nb[2]) : 0, mask ? mask->nb[3] : 0
+        mask ? mask->ne[1] : 0, mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0,
+        mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0, mask ? mask->nb[3] : 0,
+        extra...
     );
     CUDA_CHECK(cudaGetLastError());
 
