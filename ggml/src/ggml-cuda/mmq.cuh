@@ -1045,20 +1045,11 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        int x_channel;
+        int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
         if constexpr (use_x_map) {
-            x_channel = 0;
-            if (threadIdx.x == 0) {
-                x_channel = fastdiv(zt, channel_ratio);
-            }
-            x_channel = __shfl_sync(0xFFFFFFFF, x_channel, 0, warp_size);
             if (x_stage_ready != nullptr) {
-                int wait_class = 0;
-                if (threadIdx.x == 0) {
-                    wait_class = x_wait_class[x_channel];
-                }
-                wait_class = __shfl_sync(0xFFFFFFFF, wait_class, 0, warp_size);
+                const int wait_class = x_wait_class[x_channel];
                 if (wait_class != 0) {
                     if (threadIdx.x == 0 && threadIdx.y == 0) {
                         const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
@@ -1068,17 +1059,11 @@ static __global__ void mul_mat_q(
                     __syncthreads();
                 }
             }
-            int mapped_channel = 0;
-            if (threadIdx.x == 0) {
-                mapped_channel = x_channel_map[x_channel];
-            }
-            x_channel = __shfl_sync(0xFFFFFFFF, mapped_channel, 0, warp_size);
+            x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
                 x_channel -= x_channel_split;
             }
-        } else {
-            x_channel = fastdiv(zt, channel_ratio);
         }
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + it*I*stride_row_x;
 
@@ -1174,20 +1159,11 @@ static __global__ void mul_mat_q(
         const int tile_x_max_i = nrows_x  - it*I - 1;
         const int tile_y_max_j = col_diff - jt*J - 1;
 
-        int x_channel;
+        int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
         if constexpr (use_x_map) {
-            x_channel = 0;
-            if (threadIdx.x == 0) {
-                x_channel = fastdiv(zt, channel_ratio);
-            }
-            x_channel = __shfl_sync(0xFFFFFFFF, x_channel, 0, warp_size);
             if (x_stage_ready != nullptr) {
-                int wait_class = 0;
-                if (threadIdx.x == 0) {
-                    wait_class = x_wait_class[x_channel];
-                }
-                wait_class = __shfl_sync(0xFFFFFFFF, wait_class, 0, warp_size);
+                const int wait_class = x_wait_class[x_channel];
                 if (wait_class != 0) {
                     if (threadIdx.x == 0 && threadIdx.y == 0) {
                         const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
@@ -1197,17 +1173,11 @@ static __global__ void mul_mat_q(
                     __syncthreads();
                 }
             }
-            int mapped_channel = 0;
-            if (threadIdx.x == 0) {
-                mapped_channel = x_channel_map[x_channel];
-            }
-            x_channel = __shfl_sync(0xFFFFFFFF, mapped_channel, 0, warp_size);
+            x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
                 x_channel -= x_channel_split;
             }
-        } else {
-            x_channel = fastdiv(zt, channel_ratio);
         }
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + it*I*stride_row_x;
 
@@ -1293,20 +1263,11 @@ static __global__ void mul_mat_q(
     const int tile_x_max_i = nrows_x  - it*I - 1;
     const int tile_y_max_j = col_diff - jt*J - 1;
 
-    int x_channel;
+    int x_channel = fastdiv(zt, channel_ratio);
     const char * x_cur = x;
     if constexpr (use_x_map) {
-        x_channel = 0;
-        if (threadIdx.x == 0) {
-            x_channel = fastdiv(zt, channel_ratio);
-        }
-        x_channel = __shfl_sync(0xFFFFFFFF, x_channel, 0, warp_size);
         if (x_stage_ready != nullptr) {
-            int wait_class = 0;
-            if (threadIdx.x == 0) {
-                wait_class = x_wait_class[x_channel];
-            }
-            wait_class = __shfl_sync(0xFFFFFFFF, wait_class, 0, warp_size);
+            const int wait_class = x_wait_class[x_channel];
             if (wait_class != 0) {
                 if (threadIdx.x == 0 && threadIdx.y == 0) {
                     const volatile uint32_t * ready = x_stage_ready + wait_class - 1;
@@ -1316,17 +1277,11 @@ static __global__ void mul_mat_q(
                 __syncthreads();
             }
         }
-        int mapped_channel = 0;
-        if (threadIdx.x == 0) {
-            mapped_channel = x_channel_map[x_channel];
-        }
-        x_channel = __shfl_sync(0xFFFFFFFF, mapped_channel, 0, warp_size);
+        x_channel = x_channel_map[x_channel];
         if (x_channel >= x_channel_split) {
             x_cur = x_secondary;
             x_channel -= x_channel_split;
         }
-    } else {
-        x_channel = fastdiv(zt, channel_ratio);
     }
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + x_channel*stride_channel_x + it*I*stride_row_x;
 
