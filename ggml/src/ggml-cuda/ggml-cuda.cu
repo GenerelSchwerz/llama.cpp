@@ -722,6 +722,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 static uint64_t ggml_backend_cuda_trim_transient_pools(ggml_backend_t backend) {
     auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
+    // Pool frees precede this call, but kernels and copies are asynchronous.
     for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
         for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
             if (cuda_ctx->streams[device][stream] != nullptr) {

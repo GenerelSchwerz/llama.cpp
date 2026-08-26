@@ -444,6 +444,7 @@ static void test_live_context_workspace_reserve(size_t seed) {
     ctx_params.n_outputs_max = 1;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.phase_aware_workspace = true;
     ctx_params.live_context_workspace = true;
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
@@ -482,6 +483,51 @@ static void test_live_context_workspace_reserve(size_t seed) {
     const auto contraction = ctx->make_sched_reserve_plan(1, 256);
     GGML_ASSERT(contraction.n_kv == 256);
     ctx->sched_reserve(1, 256);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == size_256);
+
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+    const std::vector<llama_token> tokens = get_tokens(10*ctx_params.n_batch, n_vocab, seed);
+    int32_t pos = 0;
+    for (int32_t chunk = 0; chunk < 9; ++chunk) {
+        llama_batch batch = llama_batch_init(ctx_params.n_batch, 0, 1);
+        for (int32_t i = 0; i < (int32_t) ctx_params.n_batch; ++i) {
+            common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
+            ++pos;
+        }
+        GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+        llama_synchronize(ctx.get());
+        llama_batch_free(batch);
+    }
+
+    const auto runtime_high = ctx->make_sched_reserve_plan(ctx_params.n_batch);
+    GGML_ASSERT(runtime_high.n_tokens == ctx_params.n_batch);
+    GGML_ASSERT(runtime_high.n_kv == 1024);
+
+    GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(ctx.get()), 0, 0, 512));
+    llama_memory_seq_add(llama_get_memory(ctx.get()), 0, 512, pos, -512);
+
+    llama_batch shifted = llama_batch_init(1, 0, 1);
+    common_batch_add(shifted, tokens[pos], pos - 512, { 0 }, true);
+    GGML_ASSERT(llama_decode(ctx.get(), shifted) == 0);
+    llama_synchronize(ctx.get());
+    llama_batch_free(shifted);
+
+    // Logical positions are compacted, but live rows at the physical tail still require the high reserve.
+    const auto physical_high = ctx->make_sched_reserve_plan(0);
+    GGML_ASSERT(physical_high.n_tokens == 1);
+    GGML_ASSERT(physical_high.n_kv == 1024);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) > size_256);
+
+    llama_memory_clear(llama_get_memory(ctx.get()), false);
+    llama_batch short_batch = llama_batch_init(1, 0, 1);
+    common_batch_add(short_batch, tokens[0], 0, { 0 }, true);
+    GGML_ASSERT(llama_decode(ctx.get(), short_batch) == 0);
+    llama_synchronize(ctx.get());
+    llama_batch_free(short_batch);
+
+    const auto runtime_contraction = ctx->make_sched_reserve_plan(0);
+    GGML_ASSERT(runtime_contraction.n_tokens == 1);
+    GGML_ASSERT(runtime_contraction.n_kv == 256);
     GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == size_256);
     GGML_ASSERT(llama_trim_transient_memory(ctx.get()) == 0);
 }

@@ -700,8 +700,10 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
             std::max(cparams.n_seq_max, sched_decode_outputs));
     plan.n_tokens = plan.n_tokens_max;
 
-    plan.n_kv_capacity = memory ? memory->get_attn_reserve_capacity() : 0;
-    plan.live_kv = cparams.live_context_workspace && !model.hparams.no_alloc && plan.n_kv_capacity > 0;
+    if (cparams.live_context_workspace && !model.hparams.no_alloc && memory) {
+        plan.n_kv_capacity = memory->get_attn_reserve_capacity();
+        plan.live_kv = plan.n_kv_capacity > 0;
+    }
 
     if (plan.live_kv) {
         const uint32_t required = n_kv_req > 0 ? n_kv_req :
@@ -783,6 +785,12 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 
 void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     acquire_shared_workspace();
+
+    const bool sched_resizable_requested = (cparams.phase_aware_workspace || cparams.live_context_workspace) &&
+            !model.hparams.no_alloc;
+    if (!sched_need_reserve && !sched_resizable_requested) {
+        return;
+    }
 
     const auto plan = make_sched_reserve_plan(n_tokens_req, n_kv_req);
     const bool sched_resizable = (cparams.phase_aware_workspace || plan.live_kv) && !model.hparams.no_alloc;

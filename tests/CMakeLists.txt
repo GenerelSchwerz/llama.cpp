@@ -206,6 +206,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-phase-workspace
     )
 
+    llama_test(
+        test-llama-archs
+        NAME test-live-context-workspace
+        LABEL main
+        ARGS --test-live-context-workspace
+    )
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
