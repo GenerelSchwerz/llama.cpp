@@ -1905,21 +1905,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 #endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 }
 
-// The MMA attention body. It is not the kernel entry: the two entry points below
-// are, and they exist so that the runtime V cache type is a parameter only of
-// the kernels that actually have one.
-//
-// A mixed native K/V pair chooses its V loader inside the kernel, which is what
-// keeps the pair matrix linear instead of quadratic. Expressing that as one
-// trailing argument on the single shared entry put the argument on every F16,
-// BF16 and KVarN kernel as well, where an `if constexpr` removes its only use:
-// those kernels declared a parameter they cannot read, and their call sites had
-// to pass a dummy value for it. Only flash_attn_ext_f16_v_rt takes it now, and
-// every other kernel keeps fattn_kernel_t and reaches this body with its
-// compile-time type_V.
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view,
-    ggml_type type_K, ggml_type type_V>
-static __device__ __forceinline__ void flash_attn_ext_f16_body(
+    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
+__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
+static __global__ void flash_attn_ext_f16(
         const char * Q_ptr,
         const char * K_ptr,
         const char * V_ptr,
@@ -2130,86 +2119,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_body(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-// The static-V kernel entry: F16, BF16, KVarN, and the symmetric native pairs.
-// Its signature is fattn_kernel_t, the same one the vector and tile kernels use,
-// so nothing outside the mixed native pairs had to change shape to accommodate
-// them.
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view,
-    ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
-static __global__ void flash_attn_ext_f16(
-        const char * Q_ptr,
-        const char * K_ptr,
-        const char * V_ptr,
-        const char * mask_ptr,
-        const char * sinks_ptr,
-        const int  * KV_max_ptr,
-        float      * dst_ptr,
-        float2     * dst_meta_ptr,
-        float2     * dst_final_meta_ptr,
-        const float scale,
-        const float max_bias,
-        const float m0,
-        const float m1,
-        const uint32_t n_head_log2,
-        const float logit_softcap,
-        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
-                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
-        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
-                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
-                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
-                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33) {
-    flash_attn_ext_f16_body<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>
-        (Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, dst_final_meta_ptr,
-         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
-         ne10, ne11, ne12, ne13, nb11, nb12, nb13,
-         nb21, nb22, nb23,
-         ne31, ne32, ne33, nb31, nb32, nb33,
-         (int) type_V);
-}
-
-// The runtime-V kernel entry, for a mixed native pair. Only these kernels read
-// type_V_rt, so only these kernels carry it.
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view,
-    ggml_type type_K>
-__launch_bounds__(ggml_cuda_fattn_mma_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_mma_get_occupancy(DKQ, DV, ncols1*ncols2))
-static __global__ void flash_attn_ext_f16_v_rt(
-        const char * Q_ptr,
-        const char * K_ptr,
-        const char * V_ptr,
-        const char * mask_ptr,
-        const char * sinks_ptr,
-        const int  * KV_max_ptr,
-        float      * dst_ptr,
-        float2     * dst_meta_ptr,
-        float2     * dst_final_meta_ptr,
-        const float scale,
-        const float max_bias,
-        const float m0,
-        const float m1,
-        const uint32_t n_head_log2,
-        const float logit_softcap,
-        const int32_t ne00, const uint3   ne01, const int32_t ne02, const int32_t ne03,
-                            const int32_t nb01, const int32_t nb02, const int32_t nb03,
-        const int32_t ne10, const int32_t ne11, const int32_t ne12, const int32_t ne13,
-                            const int32_t nb11, const int32_t nb12, const int64_t nb13,
-                            const int32_t nb21, const int32_t nb22, const int64_t nb23,
-                            const int32_t ne31, const int32_t ne32, const int32_t ne33,
-                            const int32_t nb31, const int32_t nb32, const int64_t nb33,
-        const int type_V_rt) {
-    flash_attn_ext_f16_body<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K,
-        GGML_CUDA_FATTN_QUANT_V_RUNTIME>
-        (Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, dst_final_meta_ptr,
-         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
-         ne00, ne01, ne02, ne03, nb01, nb02, nb03,
-         ne10, ne11, ne12, ne13, nb11, nb12, nb13,
-         nb21, nb22, nb23,
-         ne31, ne32, ne33, nb31, nb32, nb33,
-         type_V_rt);
-}
-
 template <int DKQ, int DV, int ncols1, int ncols2,
     ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2256,82 +2165,53 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    constexpr bool need_f16_K = type_K == GGML_TYPE_F16;
-    constexpr bool need_f16_V = type_V == GGML_TYPE_F16; // the runtime sentinel is always quantized
-
-    // Where the two kernel entry points part. A mixed native pair launches
-    // flash_attn_ext_f16_v_rt and passes the V cache type as a trailing launch
-    // argument; every other instantiation launches flash_attn_ext_f16, whose
-    // signature is the same fattn_kernel_t the vector and tile kernels use and
-    // which has no V type to pass.
-    if constexpr (ggml_cuda_fattn_mma_quant_v_runtime(type_V)) {
-        // ggml_cuda_fattn_native_applies() requires a zero logit softcap before
-        // anything routes here, so the softcap specialization is deliberately
-        // never named. Naming it would emit a second device kernel for every
-        // quantized K/V pair and tile shape that no dispatch can select, which
-        // is half of everything this family compiles.
-        GGML_ASSERT(logit_softcap == 0.0f && "quantized-native MMA reached with a non-zero logit softcap");
-
 #if defined(GGML_USE_HIP)
-        using fattn_kernel_v_rt_ptr_t = const void*;
+    using fattn_kernel_ptr_t = const void*;
 #else
-        using fattn_kernel_v_rt_ptr_t = fattn_kernel_mma_v_rt_t;
+    using fattn_kernel_ptr_t = fattn_kernel_mma_t;
 #endif // defined(GGML_USE_HIP)
-
+    fattn_kernel_mma_t fattn_kernel;
+    if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
-        fattn_kernel_mma_v_rt_t fattn_kernel =
-            flash_attn_ext_f16_v_rt<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K>;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
         static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
         if (!shared_memory_limit_raised[id]) {
-            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_v_rt_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
             shared_memory_limit_raised[id] = true;
         }
 #endif // !defined(GGML_USE_MUSA)
-
-        launch_fattn<DV, ncols1, ncols2>
-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host,
-             (int) KQV->src[2]->type);
+    } else if constexpr (is_quant_kv) {
+        // Unreachable: ggml_cuda_fattn_native_applies() requires a zero logit
+        // softcap before anything routes here. Not naming the softcap
+        // specialization in this branch is the point of the branch. Otherwise
+        // every quantized K/V pair and tile shape emits a second device kernel
+        // that no dispatch can ever select, which is half of everything this
+        // family compiles.
+        GGML_ABORT("quantized-native MMA reached with a non-zero logit softcap");
     } else {
-#if defined(GGML_USE_HIP)
-        using fattn_kernel_ptr_t = const void*;
-#else
-        using fattn_kernel_ptr_t = fattn_kernel_t;
-#endif // defined(GGML_USE_HIP)
-
-        fattn_kernel_t fattn_kernel;
-        if (logit_softcap == 0.0f) {
-            constexpr bool use_logit_softcap = false;
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
+        constexpr bool use_logit_softcap = true;
+        fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
 
 #if !defined(GGML_USE_MUSA)
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-            if (!shared_memory_limit_raised[id]) {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                shared_memory_limit_raised[id] = true;
-            }
-#endif // !defined(GGML_USE_MUSA)
-        } else if constexpr (is_quant_kv) {
-            // Same reasoning as the runtime-V branch above: unreachable, and
-            // not naming the softcap specialization is the point.
-            GGML_ABORT("quantized-native MMA reached with a non-zero logit softcap");
-        } else {
-            constexpr bool use_logit_softcap = true;
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, type_K, type_V>;
-
-#if !defined(GGML_USE_MUSA)
-            static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
-            if (!shared_memory_limit_raised[id]) {
-                CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
-                shared_memory_limit_raised[id] = true;
-            }
-#endif // !defined(GGML_USE_MUSA)
+        static bool shared_memory_limit_raised[GGML_CUDA_MAX_DEVICES] = {false};
+        if (!shared_memory_limit_raised[id]) {
+            CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));
+            shared_memory_limit_raised[id] = true;
         }
-
-        launch_fattn<DV, ncols1, ncols2>
-            (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host);
+#endif // !defined(GGML_USE_MUSA)
     }
+
+    constexpr bool need_f16_K = type_K == GGML_TYPE_F16;
+    constexpr bool need_f16_V = type_V == GGML_TYPE_F16; // the runtime sentinel is always quantized
+    // Only meaningful when type_V is the runtime sentinel; the compile-time
+    // instantiations ignore it.
+    const int type_V_rt = (int) KQV->src[2]->type;
+
+    launch_fattn<DV, ncols1, ncols2>
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, need_f16_K, need_f16_V, true, warp_size_host,
+         type_V_rt);
 }
 
 

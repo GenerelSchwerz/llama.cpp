@@ -42,16 +42,11 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
-// The mixed-native-pair MMA kernels, and only those, carry one extra trailing
-// argument: the V cache type, chosen at runtime inside the kernel instead of
-// being instantiated. Every other FlashAttention kernel -- vector, tile, F16,
-// BF16, KVarN, and the symmetric native pairs -- keeps fattn_kernel_t above.
-//
-// That separation is the reason for the second typedef. Putting the argument on
-// one shared MMA signature meant kernels that never read it still declared it,
-// so KVarN call sites passed a dummy and the symmetric native D=256 kernel
-// carried spill for a value it did not use.
-typedef void (* fattn_kernel_mma_v_rt_t)(
+// The MMA kernels carry one extra trailing argument: the runtime V cache type,
+// used only when the V loader is selected at runtime rather than instantiated.
+// It is a separate typedef rather than an extension of fattn_kernel_t so that
+// the vector and tile kernels keep their existing signature untouched.
+typedef void (* fattn_kernel_mma_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
         const char * __restrict__ V,
