@@ -88,6 +88,8 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
+    bool recurrent_sparse_snapshots_supported() const;
+
     // return true if the memory was updated
     llama_memory_status memory_update(bool optimize);
     llama_memory_status memory_update(bool optimize, uint32_t n_tokens_req);
@@ -376,6 +378,8 @@ private:
     uint64_t workspace_kv_grow_count = 0;
     uint64_t workspace_kv_shrink_count = 0;
     int64_t  workspace_reserve_us    = 0;
+
+    bool recurrent_sparse_snapshot_ops_supported = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

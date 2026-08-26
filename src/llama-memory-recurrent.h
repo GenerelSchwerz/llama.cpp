@@ -137,6 +137,7 @@ private:
     // use one selected-token value for the entire decode batch. init_batch()
     // captures it so an in-flight memory context has immutable graph identity.
     llama_recurrent_snapshot_mode next_snapshot_mode;
+    bool sparse_metadata_active = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
@@ -148,6 +149,7 @@ private:
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
 
+    bool seq_id_valid(llama_seq_id seq_id) const;
     int32_t find_sparse_snapshot_plane(llama_seq_id seq_id, llama_pos pos) const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;

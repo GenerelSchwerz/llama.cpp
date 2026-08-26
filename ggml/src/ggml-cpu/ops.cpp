@@ -11314,6 +11314,7 @@ static void ggml_compute_forward_gated_delta_net_f32(
 void ggml_compute_forward_gated_delta_net(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    GGML_ASSERT(ggml_gated_delta_net_validate(dst));
     const ggml_tensor * src0 = dst->src[0];
 
     switch (src0->type) {

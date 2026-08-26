@@ -13,34 +13,6 @@
 #include <map>
 #include <stdexcept>
 
-namespace {
-
-using backend_recurrent_sparse_snapshots_supported_t = bool (*)(ggml_backend_dev_t);
-
-bool backend_supports_recurrent_sparse_snapshots(ggml_backend_dev_t dev) {
-    if (dev == nullptr) {
-        return false;
-    }
-    if (ggml_backend_dev_is_meta(dev)) {
-        const size_t count = ggml_backend_meta_device_count(dev);
-        for (size_t i = 0; i < count; ++i) {
-            if (!backend_supports_recurrent_sparse_snapshots(
-                        ggml_backend_meta_device_get(dev, i))) {
-                return false;
-            }
-        }
-        return count > 0;
-    }
-
-    auto * reg = ggml_backend_dev_backend_reg(dev);
-    auto * fn = reg ? reinterpret_cast<backend_recurrent_sparse_snapshots_supported_t>(
-            ggml_backend_reg_get_proc_address(
-                reg, "ggml_backend_recurrent_sparse_snapshots_supported")) : nullptr;
-    return fn != nullptr && fn(dev);
-}
-
-} // namespace
-
 //
 // llama_memory_recurrent
 //
@@ -178,8 +150,11 @@ void llama_memory_recurrent::clear(bool data) {
     }
 
     std::fill(rs_idx.begin(), rs_idx.end(), 0);
-    std::fill(rs_plane_pos.begin(), rs_plane_pos.end(), -1);
-    std::fill(rs_plane_pos_sparse.begin(), rs_plane_pos_sparse.end(), false);
+    if (sparse_metadata_active) {
+        std::fill(rs_plane_pos.begin(), rs_plane_pos.end(), -1);
+        std::fill(rs_plane_pos_sparse.begin(), rs_plane_pos_sparse.end(), false);
+        sparse_metadata_active = false;
+    }
 }
 
 bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
@@ -190,13 +165,13 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if (seq_id >= int64_t(size)) {
-        return false;
-    }
     if (seq_id < 0) {
         // A negative sequence selector can remove either the complete memory
         // or an empty range, matching seq_rm()'s mutation contract.
         return p0 == p1 || (p0 == 0 && p1 == std::numeric_limits<llama_pos>::max());
+    }
+    if (!seq_id_valid(seq_id) || seq_id >= int64_t(size)) {
+        return false;
     }
 
     const int32_t tail_id = cells[seq_id].tail;
@@ -205,7 +180,7 @@ bool llama_memory_recurrent::can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama
     }
     const auto & cell = cells[tail_id];
     if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-        if (rs_plane_pos_sparse[seq_id]) {
+        if (sparse_metadata_active && rs_plane_pos_sparse[seq_id]) {
             return find_sparse_snapshot_plane(seq_id, p0 - 1) >= 0;
         }
         const llama_pos rollback = cell.pos - (p0 - 1);
@@ -233,13 +208,18 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (rm_all) {
         if (seq_id >= 0) {
             set_rs_idx(seq_id, 0);
-            const uint32_t K = n_rs_seq + 1;
-            std::fill_n(rs_plane_pos.begin() + (size_t) seq_id * K, K, -1);
-            rs_plane_pos_sparse[seq_id] = false;
+            if (sparse_metadata_active) {
+                const uint32_t K = n_rs_seq + 1;
+                std::fill_n(rs_plane_pos.begin() + (size_t) seq_id * K, K, -1);
+                rs_plane_pos_sparse[seq_id] = false;
+            }
         } else {
             std::fill(rs_idx.begin(), rs_idx.end(), 0);
-            std::fill(rs_plane_pos.begin(), rs_plane_pos.end(), -1);
-            std::fill(rs_plane_pos_sparse.begin(), rs_plane_pos_sparse.end(), false);
+            if (sparse_metadata_active) {
+                std::fill(rs_plane_pos.begin(), rs_plane_pos.end(), -1);
+                std::fill(rs_plane_pos_sparse.begin(), rs_plane_pos_sparse.end(), false);
+                sparse_metadata_active = false;
+            }
         }
     }
 
@@ -256,7 +236,7 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
 
             // partial rollback via per-token snapshot index (bounded by n_rs_seq)
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                if (rs_plane_pos_sparse[seq_id]) {
+                if (sparse_metadata_active && rs_plane_pos_sparse[seq_id]) {
                     const llama_pos target_pos = p0 - 1;
                     const int32_t plane = find_sparse_snapshot_plane(seq_id, target_pos);
                     if (plane >= 0) {
@@ -371,6 +351,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
         return;
     }
 
+    if (!seq_id_valid(seq_id_src) || !seq_id_valid(seq_id_dst)) {
+        LLAMA_LOG_ERROR("%s: invalid sequence IDs (%d -> %d), valid range is [0, %u)\n",
+                __func__, seq_id_src, seq_id_dst, n_seq_max);
+        return;
+    }
+
     if (p0 < 0) {
         p0 = 0;
     }
@@ -380,10 +366,12 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
     }
 
     if ((uint32_t) seq_id_dst < size && (uint32_t) seq_id_src < size) {
-        const uint32_t K = n_rs_seq + 1;
-        std::copy_n(rs_plane_pos.begin() + (size_t) seq_id_src * K, K,
-                rs_plane_pos.begin() + (size_t) seq_id_dst * K);
-        rs_plane_pos_sparse[seq_id_dst] = rs_plane_pos_sparse[seq_id_src];
+        if (sparse_metadata_active) {
+            const uint32_t K = n_rs_seq + 1;
+            std::copy_n(rs_plane_pos.begin() + (size_t) seq_id_src * K, K,
+                    rs_plane_pos.begin() + (size_t) seq_id_dst * K);
+            rs_plane_pos_sparse[seq_id_dst] = rs_plane_pos_sparse[seq_id_src];
+        }
         auto & tail_src = cells[seq_id_src];
         auto & tail_dst = cells[seq_id_dst];
         if (tail_dst.tail >= 0) {
@@ -408,11 +396,18 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
 }
 
 void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+    if (!seq_id_valid(seq_id)) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id %d, valid range is [0, %u)\n", __func__, seq_id, n_seq_max);
+        return;
+    }
+
     uint32_t new_head = size;
 
-    for (size_t i = 0; i < rs_plane_pos_sparse.size(); ++i) {
-        if ((llama_seq_id) i != seq_id) {
-            rs_plane_pos_sparse[i] = false;
+    if (sparse_metadata_active) {
+        for (size_t i = 0; i < rs_plane_pos_sparse.size(); ++i) {
+            if ((llama_seq_id) i != seq_id) {
+                rs_plane_pos_sparse[i] = false;
+            }
         }
     }
 
@@ -464,12 +459,14 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     // for Mamba-like or RWKV models, only the pos needs to be shifted
-    if (0 <= seq_id && seq_id < (int64_t) size) {
-        const uint32_t K = n_rs_seq + 1;
-        for (uint32_t plane = 0; plane < K; ++plane) {
-            llama_pos & pos = rs_plane_pos[(size_t) seq_id * K + plane];
-            if (p0 <= pos && pos < p1) {
-                pos += shift;
+    if (seq_id_valid(seq_id) && seq_id < (int64_t) size) {
+        if (sparse_metadata_active) {
+            const uint32_t K = n_rs_seq + 1;
+            for (uint32_t plane = 0; plane < K; ++plane) {
+                llama_pos & pos = rs_plane_pos[(size_t) seq_id * K + plane];
+                if (p0 <= pos && pos < p1) {
+                    pos += shift;
+                }
             }
         }
         const int32_t tail_id = cells[seq_id].tail;
@@ -501,12 +498,14 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
     }
 
     // for Mamba-like or RWKV models, only the pos needs to be changed
-    if (0 <= seq_id && seq_id < (int64_t) size) {
-        const uint32_t K = n_rs_seq + 1;
-        for (uint32_t plane = 0; plane < K; ++plane) {
-            llama_pos & pos = rs_plane_pos[(size_t) seq_id * K + plane];
-            if (p0 <= pos && pos < p1) {
-                pos /= d;
+    if (seq_id_valid(seq_id) && seq_id < (int64_t) size) {
+        if (sparse_metadata_active) {
+            const uint32_t K = n_rs_seq + 1;
+            for (uint32_t plane = 0; plane < K; ++plane) {
+                llama_pos & pos = rs_plane_pos[(size_t) seq_id * K + plane];
+                if (p0 <= pos && pos < p1) {
+                    pos /= d;
+                }
             }
         }
         const int32_t tail_id = cells[seq_id].tail;
@@ -548,15 +547,26 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 }
 
 void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
-    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+    if (!seq_id_valid(seq_id)) {
+        LLAMA_LOG_ERROR("%s: invalid seq_id %d, valid range is [0, %u)\n", __func__, seq_id, n_seq_max);
         return;
     }
-    rs_idx[seq_id] = (idx > n_rs_seq) ? n_rs_seq : idx;
+    GGML_ASSERT(idx <= n_rs_seq);
+    rs_idx[seq_id] = idx;
+}
+
+bool llama_memory_recurrent::seq_id_valid(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max ||
+        (size_t) seq_id >= rs_idx.size() || (size_t) seq_id >= rs_plane_pos_sparse.size()) {
+        return false;
+    }
+
+    const size_t n_planes = (size_t) n_rs_seq + 1;
+    return (size_t) seq_id < rs_plane_pos.size()/n_planes;
 }
 
 int32_t llama_memory_recurrent::find_sparse_snapshot_plane(llama_seq_id seq_id, llama_pos pos) const {
-    if (seq_id < 0 || (size_t) seq_id >= rs_plane_pos_sparse.size() ||
-            !rs_plane_pos_sparse[seq_id]) {
+    if (!sparse_metadata_active || !seq_id_valid(seq_id) || !rs_plane_pos_sparse[seq_id]) {
         return -1;
     }
 
@@ -575,20 +585,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_brea
 }
 
 bool llama_memory_recurrent::recurrent_sparse_snapshots_supported() const {
-    if (n_rs_seq == 0 || ctxs_bufs.empty() || !graph_supports_sparse_snapshots) {
-        return false;
-    }
-    return std::all_of(ctxs_bufs.begin(), ctxs_bufs.end(), [](const auto & entry) {
-        const auto buft = ggml_backend_buffer_get_type(entry.second.get());
-        return backend_supports_recurrent_sparse_snapshots(
-                ggml_backend_buft_get_device(buft));
-    });
+    return n_rs_seq > 0 && !ctxs_bufs.empty() && graph_supports_sparse_snapshots;
 }
 
 bool llama_memory_recurrent::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
-    if (enabled && !recurrent_sparse_snapshots_supported()) {
-        return false;
-    }
     if (selected_token < -1) {
         return false;
     }
@@ -654,6 +654,34 @@ llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lct
 }
 
 bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches) {
+    if (next_snapshot_mode.sparse) {
+        std::vector<int32_t> seq_ubatch(n_seq_max, -1);
+        for (size_t i_ubatch = 0; i_ubatch < ubatches.size(); ++i_ubatch) {
+            const auto & ubatch = ubatches[i_ubatch];
+            if (next_snapshot_mode.selected_token >= (int32_t) ubatch.n_seq_tokens) {
+                LLAMA_LOG_ERROR("%s: sparse recurrent token %d is outside a physical ubatch with %u tokens per sequence\n",
+                        __func__, next_snapshot_mode.selected_token, ubatch.n_seq_tokens);
+                return false;
+            }
+            for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                const uint32_t i = s * ubatch.n_seq_tokens;
+                for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                    const llama_seq_id seq_id = ubatch.seq_id[i][j];
+                    if (!seq_id_valid(seq_id)) {
+                        LLAMA_LOG_ERROR("%s: invalid seq_id %d, valid range is [0, %u)\n", __func__, seq_id, n_seq_max);
+                        return false;
+                    }
+                    if (seq_ubatch[seq_id] >= 0 && seq_ubatch[seq_id] != (int32_t) i_ubatch) {
+                        LLAMA_LOG_ERROR("%s: sparse recurrent sequence %d spans physical ubatches %d and %zu\n",
+                                __func__, seq_id, seq_ubatch[seq_id], i_ubatch);
+                        return false;
+                    }
+                    seq_ubatch[seq_id] = (int32_t) i_ubatch;
+                }
+            }
+        }
+    }
+
     // simply remember the full state because it is very small for this type of cache
     // TODO: optimize
     auto org_cells = cells;
@@ -705,25 +733,32 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
         for (uint32_t j = 0; j < n_seq_id; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
 
-            if (seq_id < 0 || (uint32_t) seq_id >= size) {
+            if (!seq_id_valid(seq_id) || (uint32_t) seq_id >= size) {
                 // too big seq_id
                 // TODO: would it be possible to resize the cache instead?
                 LLAMA_LOG_ERROR("%s: seq_id=%d >= n_seq_max=%u Try using a bigger --parallel value\n", __func__, seq_id, n_seq_max);
                 return false;
             }
-            if (j > 0) {
-                auto & seq = cells[seq_id];
-                if (seq.tail >= 0) {
-                    auto & cell = cells[seq.tail];
-                    // clear cells from seq_ids that become shared
-                    // (should not normally happen, but let's handle it anyway)
-                    cell.seq_id.erase(seq_id);
-                    seq.tail = -1;
-                    if (cell.seq_id.empty()) {
-                        cell.pos = -1;
-                        cell.src = -1;
-                        used -= 1;
-                    }
+        }
+    }
+
+    for (uint32_t s = 0; s < n_seqs; ++s) {
+        const uint32_t i = s*n_seq_tokens;
+        const uint32_t n_seq_id = ubatch.n_seq_id[i];
+
+        for (uint32_t j = 1; j < n_seq_id; ++j) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][j];
+            auto & seq = cells[seq_id];
+            if (seq.tail >= 0) {
+                auto & cell = cells[seq.tail];
+                // clear cells from seq_ids that become shared
+                // (should not normally happen, but let's handle it anyway)
+                cell.seq_id.erase(seq_id);
+                seq.tail = -1;
+                if (cell.seq_id.empty()) {
+                    cell.pos = -1;
+                    cell.src = -1;
+                    used -= 1;
                 }
             }
         }
@@ -1017,6 +1052,10 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     GGML_UNUSED(flags);
 
+    if (seq_id != -1 && !seq_id_valid(seq_id)) {
+        throw std::runtime_error("invalid recurrent state sequence ID");
+    }
+
     uint32_t cell_count;
     io.read(&cell_count, sizeof(cell_count));
 
@@ -1025,7 +1064,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     const int32_t old_rs_z = rs_z;
     auto old_cells = cells;
     auto old_rs_idx = rs_idx;
+    auto old_rs_plane_pos = rs_plane_pos;
     auto old_rs_plane_pos_sparse = rs_plane_pos_sparse;
+    const bool old_sparse_metadata_active = sparse_metadata_active;
 
     bool res = false;
     try {
@@ -1036,7 +1077,9 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
         rs_z = old_rs_z;
         cells = std::move(old_cells);
         rs_idx = std::move(old_rs_idx);
+        rs_plane_pos = std::move(old_rs_plane_pos);
         rs_plane_pos_sparse = std::move(old_rs_plane_pos_sparse);
+        sparse_metadata_active = old_sparse_metadata_active;
         throw;
     }
 
@@ -1052,16 +1095,11 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     const uint32_t new_head = head;
     const uint32_t new_used = used;
     const int32_t new_rs_z = rs_z;
-    auto new_cells = cells;
-    auto new_rs_idx = rs_idx;
-    auto new_rs_plane_pos_sparse = rs_plane_pos_sparse;
-    if (res) {
-        if (seq_id == -1) {
-            std::fill(new_rs_plane_pos_sparse.begin(), new_rs_plane_pos_sparse.end(), false);
-        } else {
-            new_rs_plane_pos_sparse[seq_id] = false;
-        }
-    }
+    auto new_cells = std::move(cells);
+    auto new_rs_idx = std::move(rs_idx);
+    auto new_rs_plane_pos = std::move(rs_plane_pos);
+    auto new_rs_plane_pos_sparse = std::move(rs_plane_pos_sparse);
+    bool new_sparse_metadata_active = sparse_metadata_active;
 
     // Parsing and destination selection must not mutate the live cache. The
     // host/device IO implementations already stage tensor writes, so stage the
@@ -1071,7 +1109,23 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
     rs_z = old_rs_z;
     cells = std::move(old_cells);
     rs_idx = std::move(old_rs_idx);
+    rs_plane_pos = std::move(old_rs_plane_pos);
     rs_plane_pos_sparse = std::move(old_rs_plane_pos_sparse);
+    sparse_metadata_active = old_sparse_metadata_active;
+
+    if (res) {
+        if (seq_id == -1) {
+            std::fill(new_rs_plane_pos.begin(), new_rs_plane_pos.end(), -1);
+            std::fill(new_rs_plane_pos_sparse.begin(), new_rs_plane_pos_sparse.end(), false);
+            new_sparse_metadata_active = false;
+        } else {
+            const uint32_t n_planes = n_rs_seq + 1;
+            std::fill_n(new_rs_plane_pos.begin() + (size_t) seq_id * n_planes, n_planes, -1);
+            new_rs_plane_pos_sparse[seq_id] = false;
+            new_sparse_metadata_active = std::any_of(
+                    new_rs_plane_pos_sparse.begin(), new_rs_plane_pos_sparse.end(), [](bool active) { return active; });
+        }
+    }
 
     try {
         res = res && state_read_data(io, cell_count, restore_head);
@@ -1089,13 +1143,17 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
                   new_rs_z,
                   new_cells = std::move(new_cells),
                   new_rs_idx = std::move(new_rs_idx),
-                  new_rs_plane_pos_sparse = std::move(new_rs_plane_pos_sparse)]() mutable {
+                  new_rs_plane_pos = std::move(new_rs_plane_pos),
+                  new_rs_plane_pos_sparse = std::move(new_rs_plane_pos_sparse),
+                  new_sparse_metadata_active]() mutable {
         head = new_head;
         used = new_used;
         rs_z = new_rs_z;
         cells = std::move(new_cells);
         rs_idx = std::move(new_rs_idx);
+        rs_plane_pos = std::move(new_rs_plane_pos);
         rs_plane_pos_sparse = std::move(new_rs_plane_pos_sparse);
+        sparse_metadata_active = new_sparse_metadata_active;
     });
 }
 
@@ -1473,43 +1531,50 @@ bool llama_memory_recurrent_context::apply() {
 
     const auto & ubatch = ubatches[i_next];
 
-    const uint32_t K = mem->n_rs_seq + 1;
-    std::vector<llama_pos> plane_positions((size_t) ubatch.n_seqs * K, -1);
+    if (!snapshot_mode.sparse) {
+        if (!mem->find_slot(ubatch)) {
+            return false;
+        }
+        if (mem->sparse_metadata_active) {
+            for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+                const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+                if (!mem->seq_id_valid(seq_id)) {
+                    return false;
+                }
+                mem->rs_plane_pos_sparse[seq_id] = false;
+            }
+        }
+        return true;
+    }
 
+    if (!mem->find_slot(ubatch)) {
+        return false;
+    }
+
+    mem->sparse_metadata_active = true;
+    const uint32_t K = mem->n_rs_seq + 1;
+    GGML_ASSERT(K >= 2 && ubatch.n_seq_tokens >= 1);
     for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
         const uint32_t i = s * ubatch.n_seq_tokens;
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
-        GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < mem->rs_plane_pos_sparse.size());
-        std::copy_n(mem->rs_plane_pos.begin() + (size_t) seq_id * K, K,
-                plane_positions.begin() + (size_t) s * K);
-
-        if (snapshot_mode.sparse) {
-            GGML_ASSERT(K >= 2 && ubatch.n_seq_tokens >= 1);
-            if (snapshot_mode.selected_token >= 0) {
-                GGML_ASSERT((uint32_t) snapshot_mode.selected_token < ubatch.n_seq_tokens);
-                plane_positions[(size_t) s * K] = ubatch.pos[i + snapshot_mode.selected_token];
-            } else {
-                const uint32_t K_write = K - 1;
-                for (uint32_t plane = 0; plane < K_write; ++plane) {
-                    const int32_t token = (int32_t) ubatch.n_seq_tokens - 1 - (int32_t) plane;
-                    if (token >= 0) {
-                        plane_positions[(size_t) s * K + plane] = ubatch.pos[i + token];
-                    }
-                }
-                plane_positions[(size_t) s * K + K - 1] = ubatch.pos[i] - 1;
+        auto plane_positions = mem->rs_plane_pos.begin() + (size_t) seq_id * K;
+        if (snapshot_mode.selected_token >= 0) {
+            GGML_ASSERT((uint32_t) snapshot_mode.selected_token < ubatch.n_seq_tokens);
+            plane_positions[0] = ubatch.pos[i + snapshot_mode.selected_token];
+        } else {
+            const uint32_t n_written = std::min(ubatch.n_seq_tokens, K - 1);
+            for (uint32_t plane = 0; plane < n_written; ++plane) {
+                const int32_t token = (int32_t) ubatch.n_seq_tokens - 1 - (int32_t) plane;
+                plane_positions[plane] = ubatch.pos[i + token];
             }
+            plane_positions[K - 1] = ubatch.pos[i] - 1;
         }
-    }
+        mem->rs_plane_pos_sparse[seq_id] = true;
 
-    mem->find_slot(ubatch);
-
-    for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
-        const uint32_t i = s * ubatch.n_seq_tokens;
-        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+        for (int32_t j = 1; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
-            std::copy_n(plane_positions.begin() + (size_t) s * K, K,
-                    mem->rs_plane_pos.begin() + (size_t) seq_id * K);
-            mem->rs_plane_pos_sparse[seq_id] = snapshot_mode.sparse;
+            std::copy_n(plane_positions, K, mem->rs_plane_pos.begin() + (size_t) seq_id * K);
+            mem->rs_plane_pos_sparse[seq_id] = true;
         }
     }
 
