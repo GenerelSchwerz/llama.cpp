@@ -2253,7 +2253,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-        const int min_resident = (n_slots + 2) / 3;
+        const int min_resident = (n_slots + 5) / 6;
         if (ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
