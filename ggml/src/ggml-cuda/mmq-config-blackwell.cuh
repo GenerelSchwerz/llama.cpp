@@ -33,5 +33,11 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
 
-    return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+    if (type == GGML_TYPE_Q4_K && config.type != GGML_TYPE_COUNT) {
+        config.nthreads = 128;
+        config.occupancy = 3;
+        config.I = 64;
+    }
+    return config;
 }
