@@ -2250,10 +2250,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int> split_slot_ids(n_unique, -1);
     std::vector<int32_t> source_wait_class_host;
     ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
-    source_wait_class_host.resize(n_unique);
-    stage_ready.alloc(2);
-#endif
+    if (overflow && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+        source_wait_class_host.resize(n_unique);
+        stage_ready.alloc(2);
+    }
     int n_resident = 0;
     bool split_staged = false;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {

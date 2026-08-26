@@ -690,6 +690,7 @@ struct ggml_cuda_moe_cache {
     cudaStream_t copy_stream;
     cudaEvent_t  compute_done;
     cudaEvent_t  stage_done;
+    bool         stream_mem_ops_supported;
 
     // Per-slot state.
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
@@ -805,10 +806,25 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->copy_stream     = nullptr;
     c->compute_done    = nullptr;
     c->stage_done      = nullptr;
+    c->stream_mem_ops_supported = false;
     c->access_counter  = 0;
     c->source_is_mmap  = source_is_mmap;
     c->l2_budget_bytes = l2_budget_bytes;
     c->l2_target_slots = l2_target_slots;
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    CUdevice cu_device;
+    int can_use_stream_mem_ops = 0;
+#if CUDA_VERSION >= 13000
+    const CUdevice_attribute stream_mem_ops_attribute = CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1;
+#else
+    const CUdevice_attribute stream_mem_ops_attribute = CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS;
+#endif
+    if (cuDeviceGet(&cu_device, device) == CUDA_SUCCESS &&
+        cuDeviceGetAttribute(&can_use_stream_mem_ops, stream_mem_ops_attribute, cu_device) == CUDA_SUCCESS) {
+        c->stream_mem_ops_supported = can_use_stream_mem_ops != 0;
+    }
+#endif
 
     err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
     if (err != cudaSuccess) {
@@ -1284,14 +1300,10 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         return false;
     }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
-    const bool overlap = stage_ready != nullptr;
-#else
-    const bool overlap = false;
-    if (stage_ready != nullptr) {
+    const bool overlap = stage_ready != nullptr && cache->stream_mem_ops_supported;
+    if (stage_ready != nullptr && !overlap) {
         return false;
     }
-#endif
 
     int n_resident = 0;
     for (int i = 0; i < n_host_srcs; ++i) {
@@ -1407,6 +1419,13 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     }
     *out_n_resident = n_resident;
     return true;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_can_overlap_staging(
+    const struct ggml_cuda_moe_cache * cache) {
+
+    return cache != nullptr && cache->stream_mem_ops_supported;
 }
 
 extern "C"
