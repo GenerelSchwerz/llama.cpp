@@ -145,6 +145,8 @@ llama_context::llama_context(
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
+    cparams.kv_pipeline_depth       = params.kv_pipeline_depth;
+    cparams.kv_pipeline_budget_mib  = params.kv_pipeline_budget_mib;
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
@@ -869,6 +871,11 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, pipeline_parallel, cparams.op_offload));
         cparams.flash_attn_causal_prefix_supported = llama_sched_supports_flash_attn_causal_prefix(sched.get());
+        // only a host-resident KV cache produces the deliveries this pipelines
+        ggml_backend_sched_set_transport_pipeline_budget(sched.get(),
+                (size_t) cparams.kv_pipeline_budget_mib * 1024 * 1024);
+        ggml_backend_sched_set_transport_pipeline_depth(sched.get(),
+                cparams.kv_cpu_pinned || !cparams.offload_kqv ? (int) cparams.kv_pipeline_depth : 0);
         if (sched_resizable) {
             sched_buffers_shared = sched_buffer_owner != nullptr && sched_buffer_owner->get_sched() != nullptr &&
                     ggml_backend_sched_set_resizable(sched.get(), sched_buffer_owner->get_sched());
@@ -3988,6 +3995,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_pipeline_depth           =*/ 1,
+        /*.kv_pipeline_budget_mib      =*/ 128,
     };
 
     return result;

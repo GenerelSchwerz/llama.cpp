@@ -1323,6 +1323,17 @@ size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
     return GGML_PAD(ggml_nbytes(tensor), GGML_MEM_ALIGN);
 }
 
+void ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes) {
+    GGML_ASSERT(tensor);
+    const size_t total = ggml_nbytes(tensor);
+    tensor->stable_prefix = nbytes < total ? nbytes : total;
+}
+
+size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    return tensor->stable_prefix;
+}
+
 int64_t ggml_blck_size(enum ggml_type type) {
     assert(type >= 0);
     assert(type < GGML_TYPE_COUNT);
@@ -1819,7 +1830,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.padding      =*/ { 0 },
+        /*.stable_prefix=*/ 0,
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads
