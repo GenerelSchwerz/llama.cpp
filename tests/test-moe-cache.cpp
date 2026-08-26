@@ -8,6 +8,7 @@
 //   3. hits + misses == total acquires.
 //   4. No expert is ever resident in two slots simultaneously.
 //   5. Hit rate for a Zipf-ish access pattern is non-trivial (>40%).
+//   6. Registry keys distinguish tensors that have the same name.
 //
 // The workload is a synthetic stand-in for MoE routing: most tokens land on a
 // hot subset of experts. Real Gemma 4 / Mixtral / Qwen3 routing has stronger
@@ -90,7 +91,7 @@ int main(int argc, char ** argv) {
     cudaStream_t copy_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
 
-    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS);
+    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS, false, 0, 0);
     CHECK(cache != nullptr);
 
     std::mt19937 rng(SEED);
@@ -100,7 +101,7 @@ int main(int argc, char ** argv) {
         int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
         const void * src = host_experts + (size_t)eid * N_FLOATS;
 
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         trace.push_back(eid);
     }
@@ -133,7 +134,7 @@ int main(int argc, char ** argv) {
     int verified = 0;
     for (int eid = 0; eid < N_EXPERTS; ++eid) {
         const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         CUDA_OK(cudaStreamSynchronize(copy_stream));
 
@@ -153,6 +154,16 @@ int main(int argc, char ** argv) {
     CHECK(hits + misses == (uint64_t)(N_ACCESS + N_EXPERTS));
 
     ggml_cuda_moe_cache_free(cache);
+
+    auto * registry_cache_a = ggml_cuda_moe_cache_get_or_create_for_tensor(
+        dev, host_experts, SLOT_BYTES, 1, 1, "duplicate.name");
+    auto * registry_cache_b = ggml_cuda_moe_cache_get_or_create_for_tensor(
+        dev, host_experts + N_FLOATS, SLOT_BYTES, 1, 1, "duplicate.name");
+    CHECK(registry_cache_a != nullptr);
+    CHECK(registry_cache_b != nullptr);
+    CHECK(registry_cache_a != registry_cache_b);
+    ggml_cuda_moe_cache_free_all();
+
     CUDA_OK(cudaStreamDestroy(copy_stream));
     CUDA_OK(cudaFreeHost(host_experts));
 

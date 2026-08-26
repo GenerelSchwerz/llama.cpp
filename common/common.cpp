@@ -1297,6 +1297,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+#ifdef GGML_USE_CUDA
+        if (params.n_moe_expert_cache_slots > 0) {
+            COM_WRN("%s", "--fit does not account for MoE expert cache pools; set -fit off and size --moe-expert-cache-size manually\n");
+        }
+#endif
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 

@@ -1915,7 +1915,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 }
 
 // Shared by the regular and cached-buffer dispatch paths.
-static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool use_mmq) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -1945,7 +1945,7 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
@@ -1957,7 +1957,7 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    GGML_ASSERT(!use_mmq || ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -2225,6 +2225,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     ggml_tensor src0_synth = *src0;
     src0_synth.ne[2] = n_unique;
+    src0_synth.nb[3] = src0_synth.nb[2] * (size_t) n_unique;
     src0_synth.data  = scratch_experts.get();
 
     ggml_tensor ids_synth = *ids;
@@ -2239,7 +2240,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst);
+    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
@@ -2391,7 +2392,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     //    on the OTHER two tensors' caches *now* so they're warm by the time
     //    their dispatch arrives. Each sibling cache has its own copy stream,
     //    so these run in parallel with our own acquires below.
-    if (src0->name && src0->name[0]) {
+    if (src0->name[0]) {
         static const char * const kinds[3] = {"_up_", "_gate_", "_down_"};
         const char * this_name = src0->name;
         const char * this_kind = nullptr;
@@ -2508,7 +2509,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst);
+    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
+    ggml_cuda_moe_cache_mark_used(cache, stream);
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
@@ -2548,7 +2550,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_mul_mat_id_cached(ctx, dst);
         return;
     }
-    ggml_cuda_mul_mat_id_impl(ctx, dst);
+    ggml_cuda_mul_mat_id_impl(ctx, dst, true);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -3053,6 +3055,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
+            if (node->src[0] && node->src[0]->buffer &&
+                    ggml_backend_buft_is_cuda_moe_cached(node->src[0]->buffer->buft)) {
+                use_cuda_graph = false;
+                break;
+            }
+
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
@@ -4665,6 +4673,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                               ggml_backend_buft_is_cuda_moe_cached(node->src[j]->buffer->buft) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }

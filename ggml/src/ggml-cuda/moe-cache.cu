@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <sstream>
@@ -488,7 +489,12 @@ static int moe_cache_l2_select_slot(moe_cache_l2 & l2) {
     return slot;
 }
 
-static const void * moe_cache_l2_acquire(moe_cache_l2 & l2, const void * host_src, size_t byte_count, bool is_decode) {
+static const void * moe_cache_l2_acquire(
+        moe_cache_l2 & l2,
+        const void * host_src,
+        size_t byte_count,
+        bool is_decode,
+        cudaStream_t copy_stream) {
     const int phase = moe_cache_phase_index(is_decode);
     auto it = l2.host_to_slot.find(host_src);
     if (it != l2.host_to_slot.end()) {
@@ -509,6 +515,11 @@ static const void * moe_cache_l2_acquire(moe_cache_l2 & l2, const void * host_sr
 
     const void * evicted = l2.slot_to_host[slot];
     if (evicted != nullptr) {
+        cudaError_t err = cudaStreamSynchronize(copy_stream);
+        if (err != cudaSuccess) {
+            GGML_LOG_ERROR("moe-cache-l2: cudaStreamSynchronize failed: %s\n", cudaGetErrorString(err));
+            return nullptr;
+        }
         l2.host_to_slot.erase(evicted);
         l2.evictions.fetch_add(1, std::memory_order_relaxed);
         l2.phase_evictions[phase].fetch_add(1, std::memory_order_relaxed);
@@ -679,6 +690,7 @@ struct ggml_cuda_moe_cache {
     // stream's kernel work. The dispatch hook records `copy_done` after all
     // acquires for an op finish, then makes the compute stream wait on it.
     cudaStream_t copy_stream;
+    cudaEvent_t  compute_done;
 
     // Per-slot state.
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
@@ -791,6 +803,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->n_slots         = n_slots;
     c->slot_pool_d     = nullptr;
     c->copy_stream     = nullptr;
+    c->compute_done    = nullptr;
     c->access_counter  = 0;
     c->source_is_mmap  = source_is_mmap;
     c->l2_budget_bytes = l2_budget_bytes;
@@ -808,6 +821,16 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     err = cudaStreamCreateWithFlags(&c->copy_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaStreamCreate failed: %s\n", cudaGetErrorString(err));
+        cudaFree(c->slot_pool_d);
+        delete c;
+        cudaSetDevice(prev_device);
+        return nullptr;
+    }
+
+    err = cudaEventCreateWithFlags(&c->compute_done, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(c->copy_stream);
         cudaFree(c->slot_pool_d);
         delete c;
         cudaSetDevice(prev_device);
@@ -858,6 +881,9 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
         cudaStreamSynchronize(cache->copy_stream);
         cudaStreamDestroy(cache->copy_stream);
     }
+    if (cache->compute_done) {
+        cudaEventDestroy(cache->compute_done);
+    }
     if (cache->slot_pool_d) {
         cudaFree(cache->slot_pool_d);
     }
@@ -867,7 +893,12 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     delete cache;
 }
 
-static const void * ggml_cuda_moe_cache_l2_source(struct ggml_cuda_moe_cache * cache, const void * host_src, size_t byte_count, bool is_decode) {
+static const void * ggml_cuda_moe_cache_l2_source(
+        struct ggml_cuda_moe_cache * cache,
+        const void * host_src,
+        size_t byte_count,
+        bool is_decode,
+        cudaStream_t copy_stream) {
     if (!cache->source_is_mmap || cache->l2_target_slots <= 0 || cache->l2_budget_bytes == 0 || cache->l2_alloc_failed) {
         return host_src;
     }
@@ -879,7 +910,7 @@ static const void * ggml_cuda_moe_cache_l2_source(struct ggml_cuda_moe_cache * c
         }
     }
 
-    const void * l2_src = moe_cache_l2_acquire(cache->l2, host_src, byte_count, is_decode);
+    const void * l2_src = moe_cache_l2_acquire(cache->l2, host_src, byte_count, is_decode, copy_stream);
     return l2_src ? l2_src : host_src;
 }
 
@@ -1078,7 +1109,7 @@ int ggml_cuda_moe_cache_acquire(
     const bool debug_mm = moe_cache_mm_debug_enabled();
     int64_t enqueue_start_us = 0;
     void * dst = (char *)cache->slot_pool_d + (size_t)lru_slot * cache->slot_size_bytes;
-    const void * copy_src = use_l2 ? ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode) : host_src;
+    const void * copy_src = use_l2 ? ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode, copy_stream) : host_src;
     if (debug_mm && copy_src == host_src) {
         const uint64_t miss_index = g_moe_cache_mm_miss_counter.fetch_add(1, std::memory_order_relaxed) + 1;
         if ((miss_index % MOE_CACHE_MM_SAMPLE_RATE) == 0) {
@@ -1095,7 +1126,13 @@ int ggml_cuda_moe_cache_acquire(
     if (debug_mm) {
         enqueue_start_us = ggml_time_us();
     }
-    cudaError_t err = cudaMemcpyAsync(
+    cudaError_t err = cudaStreamWaitEvent(copy_stream, cache->compute_done, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaStreamWaitEvent failed: %s\n", cudaGetErrorString(err));
+        rollback_miss();
+        return -1;
+    }
+    err = cudaMemcpyAsync(
         dst, copy_src, byte_count,
         cudaMemcpyHostToDevice, copy_stream);
     if (debug_mm) {
@@ -1201,6 +1238,21 @@ int ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache) {
 extern "C"
 cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache) {
     return cache ? cache->copy_stream : nullptr;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_mark_used(
+    struct ggml_cuda_moe_cache * cache,
+    cudaStream_t compute_stream) {
+    if (!cache || !compute_stream) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    cudaError_t err = cudaEventRecord(cache->compute_done, compute_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaEventRecord failed: %s\n", cudaGetErrorString(err));
+    }
 }
 
 extern "C"
@@ -1864,15 +1916,11 @@ ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * p
 // via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
 // ---------------------------------------------------------------------------
 
-// Per-tensor cache registry: one cache per (device, tensor_name).
+// Per-tensor cache registry: one cache per (device, tensor_data).
 // "Tensor" here means a model expert weight tensor like blk.0.ffn_up_exps.weight.
 // Each name is unique and identifies a (layer, matrix_kind) pair. The N slots
 // in that tensor's cache are dedicated to that tensor's experts only -- no
 // cross-layer competition.
-//
-// We key by name (not data ptr) because t_meta->data isn't reliably set at
-// the point the model loader observes tensors (it's pre-allocation in the
-// override-matching loop). Names are set with metadata and stay stable.
 //
 // User-facing N is slots-per-tensor, not slots-total. For Qwen3.6 35B-A3B
 // with 40 layers x 3 matrices = 120 expert tensors and N=32:
@@ -1883,11 +1931,11 @@ ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * p
 namespace {
 
 struct moe_cache_key {
-    int         device;
-    std::string tensor_name;
+    int          device;
+    const void * tensor_data;
     bool operator<(const moe_cache_key & o) const {
         if (device != o.device) return device < o.device;
-        return tensor_name < o.tensor_name;
+        return std::less<const void *>{}(tensor_data, o.tensor_data);
     }
 };
 
@@ -1914,14 +1962,14 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     int64_t      n_experts,
     const char * tensor_name_for_log) {
 
-    if (tensor_name_for_log == nullptr || tensor_name_for_log[0] == '\0') {
+    if (tensor_data == nullptr || tensor_name_for_log == nullptr || tensor_name_for_log[0] == '\0') {
         return nullptr;
     }
 
     auto & reg = get_registry();
     std::lock_guard<std::mutex> lk(reg.mu);
 
-    moe_cache_key k{device, std::string(tensor_name_for_log)};
+    moe_cache_key k{device, tensor_data};
     auto it = reg.by_key.find(k);
     if (it != reg.by_key.end()) {
         return it->second;
@@ -2116,7 +2164,7 @@ void ggml_backend_cuda_moe_prefetch_experts(
     ggml_cuda_moe_cache * cache = nullptr;
     {
         std::lock_guard<std::mutex> lk(reg.mu);
-        moe_cache_key k{device, std::string(tensor_name)};
+        moe_cache_key k{device, tensor_data};
         auto it = reg.by_key.find(k);
         if (it == reg.by_key.end()) return; // cache not created yet
         cache = it->second;
