@@ -1200,17 +1200,29 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
-    for (int i = 0; i < n_host_srcs; ++i) {
+    for (int i = 0; i < n_host_srcs;) {
         const auto it = cache->host_to_slot.find(host_srcs[i]);
         const bool resident = it != cache->host_to_slot.end();
         const void * src = resident ?
             (const char *)cache->slot_pool_d + (size_t)it->second * cache->slot_size_bytes : host_srcs[i];
+        int run = 1;
+        while (i + run < n_host_srcs) {
+            const auto next_it = cache->host_to_slot.find(host_srcs[i + run]);
+            const bool next_resident = next_it != cache->host_to_slot.end();
+            const void * next_src = next_resident ?
+                (const char *)cache->slot_pool_d + (size_t)next_it->second * cache->slot_size_bytes : host_srcs[i + run];
+            if (next_resident != resident || (uintptr_t)next_src != (uintptr_t)src + (size_t)run * byte_count) {
+                break;
+            }
+            ++run;
+        }
         CUDA_CHECK(cudaMemcpyAsync(
             (char *)dst + (size_t)i * byte_count,
             src,
-            byte_count,
+            (size_t)run * byte_count,
             resident ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
             cache->copy_stream));
+        i += run;
     }
 
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
