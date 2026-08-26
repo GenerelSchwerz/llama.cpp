@@ -6975,3 +6975,170 @@ Future native cache pairs must be separately registered and evidenced; they must
 not be inferred from `GGML_CUDA_FA_ALL_QUANTS`. What registration means is now
 one entry in `ggml/src/ggml-cuda/fattn-mma-quant-types.h` plus the evidence the
 scope policy requires; see Experiment 023.
+
+## Experiment 023: post-merge maintenance of the quantized-native MMA route
+
+Base commit `a4bada5e0` (`beellama/dev`). Retained candidate commits
+`293d55f72`, `39fe4837d`, `a3fcfca7c`, `4ab7040f5`; rejected prototype
+`98d6f9a10` with its revert `1701c90e5`. Raised by the post-merge maintenance
+review of PR 4, which asked for a single-source type inventory, a measured
+prototype of a split kernel entry, a corrected pair-policy comment, CI over the
+real build-coupling axes, and an explicit scope boundary.
+
+### Host, build, and inputs
+
+- GPU: NVIDIA GeForce RTX 4070, 12,282 MiB, driver 610.57.04, compute
+  capability 8.9. `CUDA_VISIBLE_DEVICES=0` on a two-GPU host, so the second
+  device never participates in a measurement.
+- CUDA 13.3 (V13.3.73), 16-core host.
+- Both arms built in separate worktrees, serialized on
+  `/tmp/beellama-cuda-build.lock` at 12 jobs:
+
+  ```bash
+  cmake -B build -DGGML_CUDA=ON -DGGML_NATIVE=ON -DGGML_CUDA_FA=ON \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=89 -DLLAMA_CURL=OFF \
+    -DGGML_CUDA_KVARN=OFF -DGGML_CUDA_FA_ALL_QUANTS=OFF
+  cmake --build build -j12
+  ```
+
+- Model: `Qwen3.8-27B-UD-IQ2_M.gguf` (10,319,907,904 bytes), the model PR 4's
+  own prefill screens used.
+
+### 023a: single-source cache-type manifest — retained
+
+The inventory was written out in five places that nothing tied together, so a
+type could end up routable but not generated, or generated but not tested. It is
+now `ggml/src/ggml-cuda/fattn-mma-quant-types.h`, holding `{enum, file-name
+stem, tier}`; the route predicate, the extern declarations, both dispatch
+switches, the generator, the CMake source filter and the `test-backend-ops`
+coverage all derive from it.
+
+This is a refactor with no intended code-generation change, so it is evidenced
+by identity rather than by throughput:
+
+- Regenerating the template instances from the manifest reproduces the committed
+  files byte for byte: `generate_cu_files.py` leaves `git status` clean.
+- `libggml-cuda.so` is **222,927,112 bytes on both arms** — the same byte count
+  as the base build, from an independent compile.
+- The focused `FLASH_ATTN_EXT` sweep passes **1695/1695** with
+  `native_quants=1` on the retained tree.
+- `scripts/fattn-native-inventory.py` reads the built library back: the default
+  build has 48 symmetric and 48 runtime-V kernels for each of `q8_0`, `q6_0`,
+  `q5_0`, `q4_0` — 16 tile shapes times three head dimensions — and zero for
+  every extra-tier type. The same checker passes unchanged against the *base*
+  library, so it validates the shipped design rather than the refactor, and it
+  fails as intended when a build's declared flags do not match its contents.
+- The generator now rejects a manifest entry whose stem does not match
+  `get_short_name()` of its enum, and CMake fails the configure if the manifest
+  parses to no extra-tier entries rather than silently filtering nothing.
+
+All four build-coupling configurations were compiled from the retained tree and
+checked, which is the same matrix the new CI workflow runs:
+
+| `GGML_CUDA_KVARN` | `GGML_CUDA_FA_ALL_QUANTS` | Build | `libggml-cuda.so` | Inventory |
+|---|---|---|---:|---|
+| OFF | OFF | clean | 222,927,112 B | 4 types x 48 + 48 |
+| ON | OFF | clean | 301,066,992 B | 4 types x 48 + 48 |
+| OFF | ON | clean | 605,261,984 B | 11 types x 48 + 48 |
+| ON | ON | clean | 693,378,960 B | 11 types x 48 + 48 |
+
+The all-quants arms are the documented 1,056 explicit cases read back out of the
+binary: eleven types, 48 symmetric and 48 runtime-V kernels each, which is 16
+tile shapes times three head dimensions times two entries.
+
+A matched prefill A/B of the retained tree against the base confirms the
+refactor is not a performance change, using the same protocol as 023b below at
+n = 20 per arm:
+
+| Depth | Base (t/s) | Retained (t/s) | Change | Welch t |
+|---:|---:|---:|---:|---:|
+| 4,096 | 1011.594 +/- 7.002 | 1010.963 +/- 3.003 | -0.06% | -0.37 |
+| 32,768 | 680.707 +/- 5.634 | 682.866 +/- 4.377 | +0.32% | +1.35 |
+
+### 023b: static-V / runtime-V kernel entry split — rejected
+
+The review proposed keeping the original `fattn_kernel_t` entry signature for
+F16, KVarN and symmetric native kernels and adding a runtime-V entry only for
+mixed native pairs, on the hypothesis that the shared entry's trailing
+`type_V_rt` costs the kernels that never read it — specifically that the
+symmetric `D = 256` native kernel carried 24 bytes of spill because of it. The
+prototype was built (`98d6f9a10`): the attention body moved into
+`flash_attn_ext_f16_body`, with two `__global__` entries over it.
+
+**The hypothesis does not hold. There were no registers to recover.** An
+`if constexpr` already removes the parameter's only use for every static-V
+instantiation, so those kernels never paid for declaring it. Compiling
+`fattn-mma-quant-instance-q8_0-ncols1_8-ncols2_8.cu` for `sm_120a` — the
+architecture the review measured — gives identical ptxas output with and
+without the split:
+
+| Kernel | regs | stack | spill st | spill ld | split changes it? |
+|---|---:|---:|---:|---:|:--:|
+| symmetric `D = 64` | 238 | 16 | 0 | 0 | no |
+| symmetric `D = 128` | 255 | 40 | 20 | 34 | no |
+| symmetric `D = 256` | 255 | 32 | 16 | 24 | no |
+| runtime-V `D = 64` | 254 | 16 | 0 | 0 | no |
+| runtime-V `D = 128` | 255 | 48 | 24 | 62 | no |
+| runtime-V `D = 256` | 255 | 40 | 28 | 42 | no |
+
+The symmetric `D = 256` kernel's 16-byte store / 24-byte load spill is its own.
+It is present identically with and without the runtime-V parameter in the
+signature, so it was never attributable to that parameter.
+
+On the `sm_89` build the split is not neutral, because moving the body behind an
+inlining boundary perturbs ptxas scheduling. Registers move without any spill
+appearing (symmetric `D = 64` 182 -> 191, `D = 128` 246 -> 251, `D = 256`
+255 -> 254; stack 16 B and zero spill throughout), and the code grows:
+
+| | base | split | delta |
+|---|---:|---:|---:|
+| native quant instance objects | 67,115,496 B | 69,032,208 B | **+1,916,712 B** |
+| `f16` MMA instance objects | 14,909,928 B | 14,861,776 B | -48,152 B |
+| tile instance objects | 10,171,400 B | 10,162,760 B | -8,640 B |
+| `libggml-cuda.so` | 222,927,112 B | 225,854,616 B | **+2,927,504 B (+1.31%)** |
+
+Matched 512-token prefill, both arms native-on, differing only in the library
+under test, fresh process per block under `/tmp/beellama-single-gpu.lock`, two
+sessions of reverse-order blocks (base, split, split, base) at `-r 5`, so
+n = 20 per arm and any monotone session drift cancels:
+
+```bash
+flock /tmp/beellama-single-gpu.lock -c '
+  CUDA_VISIBLE_DEVICES=0 BUILD/bin/llama-bench \
+    -m Qwen3.8-27B-UD-IQ2_M.gguf -ngl 99 -t 3 --poll 100 -nkvo 1 -fa on \
+    -ctk q8_0 -ctv q8_0 --flash-attn-native-quants \
+    -C 0x7 --cpu-strict 1 \
+    -p 512 -n 0 -d 4096,32768 -r 5 --progress -o json
+'
+```
+
+| Depth | Base (t/s) | Split (t/s) | Change | Welch t |
+|---:|---:|---:|---:|---:|
+| 4,096 | 1012.579 +/- 3.543 | 1009.046 +/- 6.862 | **-0.35%** | -2.05 |
+| 32,768 | 684.584 +/- 2.426 | 684.147 +/- 2.522 | -0.06% | -0.56 |
+
+Every gate the review named was checked — ptxas register and spill output on
+both the measured architecture and the one the hypothesis came from, library
+size, `q8_0/q8_0` prefill, and KVarN on/off builds (the prototype compiled clean
+in every configuration; compiling is not the question). None improved; two got
+worse. **The split is reverted in `1701c90e5`, and the prototype is kept in
+history at `98d6f9a10` so the attempted diff is not lost.**
+
+The dummy `GGML_TYPE_COUNT` arguments at the KVarN launch sites therefore stay.
+They are a naming cost with no code-generation cost, and the fix for their
+readability is a comment, not a second kernel entry family.
+
+Anyone reopening this should note what the evidence does and does not say. It
+says the runtime-V *parameter* is free for kernels that do not read it. It does
+not say the runtime-V *design* is free: on `sm_120a` the mixed-pair kernels do
+carry more spill than the symmetric ones (24/62 versus 20/34 at `D = 128`,
+28/42 versus 16/24 at `D = 256`). That is a property of the runtime V switch
+itself and is unrelated to where the parameter is declared, so it is not
+addressable by moving the entry point.
+
+### Disposition
+
+Retained: the manifest, the corrected pair-policy comment, the build-coupling CI
+with its inventory checker, and the documented scope boundary. Rejected and
+reverted: the kernel entry split. No change to the compiled kernel set, the
+route predicate, the pair policy, or any runtime default.
