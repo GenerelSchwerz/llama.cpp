@@ -2392,7 +2392,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     //    on the OTHER two tensors' caches *now* so they're warm by the time
     //    their dispatch arrives. Each sibling cache has its own copy stream,
     //    so these run in parallel with our own acquires below.
-    if (src0->name[0]) {
+    if ((!is_decode || !ids_cache_hit) && src0->name[0]) {
         static const char * const kinds[3] = {"_up_", "_gate_", "_down_"};
         const char * this_name = src0->name;
         const char * this_kind = nullptr;
