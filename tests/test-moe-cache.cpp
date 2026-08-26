@@ -155,10 +155,35 @@ int main(int argc, char ** argv) {
 
     ggml_cuda_moe_cache_free(cache);
 
+    auto * segmented_cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
+        dev, host_experts, SLOT_BYTES, 4, 8, "segmented.cache");
+    CHECK(segmented_cache != nullptr);
+    auto segmented_acquire = [&](int eid, bool is_prefetch) {
+        const void * src = host_experts + (size_t) eid * N_FLOATS;
+        return ggml_cuda_moe_cache_acquire(segmented_cache, src, SLOT_BYTES, copy_stream, false, true, is_prefetch);
+    };
+    for (int eid = 0; eid < 4; ++eid) {
+        CHECK(segmented_acquire(eid, false) >= 0);
+    }
+    CHECK(segmented_acquire(0, false) >= 0);
+    for (int eid = 1; eid < 4; ++eid) {
+        CHECK(segmented_acquire(eid, true) >= 0);
+    }
+    CHECK(segmented_acquire(4, false) >= 0);
+    ggml_cuda_moe_cache_stats(segmented_cache, &hits, &misses, &evictions);
+    CHECK(hits == 4 && misses == 5 && evictions == 1);
+    CHECK(segmented_acquire(0, false) >= 0);
+    ggml_cuda_moe_cache_stats(segmented_cache, &hits, &misses, &evictions);
+    CHECK(hits == 5 && misses == 5 && evictions == 1);
+    CHECK(segmented_acquire(1, false) >= 0);
+    ggml_cuda_moe_cache_stats(segmented_cache, &hits, &misses, &evictions);
+    CHECK(hits == 5 && misses == 6 && evictions == 2);
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+
     auto * registry_cache_a = ggml_cuda_moe_cache_get_or_create_for_tensor(
-        dev, host_experts, SLOT_BYTES, 1, 1, "duplicate.name");
+        dev, host_experts + 16 * N_FLOATS, SLOT_BYTES, 1, 1, "duplicate.name");
     auto * registry_cache_b = ggml_cuda_moe_cache_get_or_create_for_tensor(
-        dev, host_experts + N_FLOATS, SLOT_BYTES, 1, 1, "duplicate.name");
+        dev, host_experts + 17 * N_FLOATS, SLOT_BYTES, 1, 1, "duplicate.name");
     CHECK(registry_cache_a != nullptr);
     CHECK(registry_cache_b != nullptr);
     CHECK(registry_cache_a != registry_cache_b);

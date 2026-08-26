@@ -696,6 +696,7 @@ struct ggml_cuda_moe_cache {
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
     std::vector<uint64_t>     last_used;     // [n_slots]
     std::vector<char>         slot_prefetched;
+    std::vector<char>         slot_protected;
     std::vector<uint64_t>     slot_hit_count;
     std::vector<uint64_t>     slot_fill_access;
 
@@ -746,6 +747,7 @@ struct ggml_cuda_moe_cache {
     std::string tensor_name;
     const void * tensor_data = nullptr;
     int64_t n_experts = 0;
+    bool use_protected = false;
     uint64_t expert_access_counter = 0;
     std::vector<uint64_t> expert_access_counts;
     std::vector<uint64_t> expert_last_access;
@@ -840,6 +842,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->slot_to_host.assign(n_slots, nullptr);
     c->last_used  .assign(n_slots, 0);
     c->slot_prefetched.assign(n_slots, 0);
+    c->slot_protected.assign(n_slots, 0);
     c->slot_hit_count.assign(n_slots, 0);
     c->slot_fill_access.assign(n_slots, 0);
     c->host_to_slot.reserve(n_slots * 2);
@@ -1010,6 +1013,30 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
     }
 }
 
+static void ggml_cuda_moe_cache_promote(struct ggml_cuda_moe_cache * cache, int slot) {
+    if (cache->slot_protected[slot]) {
+        return;
+    }
+
+    const int protected_limit = std::max(1, 5 * cache->n_slots / 8);
+    int protected_count = 0;
+    int demote_slot = -1;
+    uint64_t demote_time = std::numeric_limits<uint64_t>::max();
+    for (int i = 0; i < cache->n_slots; ++i) {
+        if (cache->slot_protected[i]) {
+            ++protected_count;
+            if (cache->last_used[i] < demote_time) {
+                demote_time = cache->last_used[i];
+                demote_slot = i;
+            }
+        }
+    }
+    if (protected_count >= protected_limit && demote_slot >= 0) {
+        cache->slot_protected[demote_slot] = 0;
+    }
+    cache->slot_protected[slot] = 1;
+}
+
 extern "C"
 int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
@@ -1038,15 +1065,18 @@ int ggml_cuda_moe_cache_acquire(
     auto it = cache->host_to_slot.find(host_src);
     if (it != cache->host_to_slot.end()) {
         int slot = it->second;
+        const bool was_prefetched = cache->slot_prefetched[slot];
         cache->last_used[slot] = ++cache->access_counter;
         cache->slot_hit_count[slot]++;
         cache->hits.fetch_add(1, std::memory_order_relaxed);
         cache->phase_hits[phase].fetch_add(1, std::memory_order_relaxed);
         if (is_prefetch) {
             cache->phase_prefetch_hits[phase].fetch_add(1, std::memory_order_relaxed);
-        } else if (cache->slot_prefetched[slot]) {
+        } else if (was_prefetched) {
             cache->phase_prefetch_used[phase].fetch_add(1, std::memory_order_relaxed);
             cache->slot_prefetched[slot] = 0;
+        } else if (is_decode && cache->use_protected) {
+            ggml_cuda_moe_cache_promote(cache, slot);
         }
         return slot;
     }
@@ -1054,10 +1084,30 @@ int ggml_cuda_moe_cache_acquire(
     // Miss: pick the LRU slot. Empty slots (last_used==0) win automatically.
     int      lru_slot = 0;
     uint64_t lru_t    = std::numeric_limits<uint64_t>::max();
-    for (int i = 0; i < cache->n_slots; ++i) {
-        if (cache->last_used[i] < lru_t) {
-            lru_t    = cache->last_used[i];
-            lru_slot = i;
+    int      base_lru_slot = 0;
+    const bool use_protected = is_decode && cache->use_protected;
+    if (!use_protected) {
+        for (int i = 0; i < cache->n_slots; ++i) {
+            if (cache->last_used[i] < lru_t) {
+                lru_t    = cache->last_used[i];
+                lru_slot = i;
+            }
+        }
+    } else {
+        lru_slot = -1;
+        uint64_t base_lru_t = std::numeric_limits<uint64_t>::max();
+        for (int i = 0; i < cache->n_slots; ++i) {
+            if (cache->last_used[i] < base_lru_t) {
+                base_lru_t = cache->last_used[i];
+                base_lru_slot = i;
+            }
+            if (!cache->slot_protected[i] && cache->last_used[i] < lru_t) {
+                lru_t = cache->last_used[i];
+                lru_slot = i;
+            }
+        }
+        if (lru_slot < 0) {
+            lru_slot = base_lru_slot;
         }
     }
 
@@ -1093,6 +1143,7 @@ int ggml_cuda_moe_cache_acquire(
     cache->host_to_slot[host_src] = lru_slot;
     cache->last_used[lru_slot]    = ++cache->access_counter;
     cache->slot_prefetched[lru_slot] = is_prefetch ? 1 : 0;
+    cache->slot_protected[lru_slot] = 0;
     cache->slot_hit_count[lru_slot] = 0;
     cache->slot_fill_access[lru_slot] = cache->access_counter;
     cache->misses.fetch_add(1, std::memory_order_relaxed);
@@ -1104,6 +1155,7 @@ int ggml_cuda_moe_cache_acquire(
         cache->slot_to_host[lru_slot] = nullptr;
         cache->host_to_slot.erase(host_src);
         cache->slot_prefetched[lru_slot] = 0;
+        cache->slot_protected[lru_slot] = 0;
     };
 
     const bool debug_mm = moe_cache_mm_debug_enabled();
@@ -1202,6 +1254,7 @@ bool ggml_cuda_moe_cache_grow_pool(
     std::fill(cache->slot_to_host.begin(), cache->slot_to_host.end(), nullptr);
     std::fill(cache->last_used.begin(),    cache->last_used.end(),    0ull);
     std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
+    std::fill(cache->slot_protected.begin(), cache->slot_protected.end(), 0);
     std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0ull);
     std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0ull);
     cache->host_to_slot.clear();
@@ -1998,6 +2051,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     c->tensor_name = tensor_name_for_log;
     c->tensor_data = tensor_data;
     c->n_experts = n_experts;
+    c->use_protected = 2 * (int64_t) n_slots <= n_experts;
     reg.by_key.emplace(k, c);
     GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots x %.2f MiB)\n",
                   tensor_name_for_log,
