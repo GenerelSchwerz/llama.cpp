@@ -149,13 +149,21 @@ structure:
   parallelises instead of serialising behind a few very large files.
 - The explicit instantiation declarations live in `fattn-mma-quant-decl.cuh`
   rather than in `fattn-mma-f16.cuh`, and only `fattn.cu` includes them. They are
-  the full unfiltered cross product; declaring the pairs the policy rejects costs
-  nothing because they are never odr-used, and it removes any chance of the
-  declaration list and the generator disagreeing.
+  two per compiled type — the symmetric kernel and the runtime-V kernel — and
+  they expand from the same manifest the generator reads, so the declaration list
+  and the definitions cannot disagree.
+- The cache-type inventory itself is `fattn-mma-quant-types.h`, a preprocessor
+  manifest of `{enum, file-name stem, tier}` and nothing else. The route
+  predicate, the declarations, the two dispatch switches, the generator, the
+  CMake source filter and the `test-backend-ops` coverage all derive from it, so
+  a type cannot be routable, generated, declared or tested in only some of those
+  places. See *Adding a cache type* below.
 - CMake always includes the generated sources for the default types. Without
   `GGML_CUDA_FA_ALL_QUANTS` the extra-tier K-type files are filtered out, since
   they would contribute no cases and each would still cost an `nvcc` invocation
-  over the full MMA header.
+  over the full MMA header. The stems it filters on are parsed from the manifest,
+  and a manifest that parses to no extra-tier entries fails the configure rather
+  than silently compiling the whole matrix.
 
 There are 16 tile shapes and three supported head dimensions, and two kernels
 per type: one specializing V for the symmetric pair, one selecting V at runtime
@@ -432,15 +440,39 @@ helper. The two do not always agree:
   16-element run the tile loader issues.
 
 A new type therefore needs a `fattn_quant_type_traits` specialization whose
-`dequant()` matches its cast kernel, an entry in `FATTN_MMA_QUANT_TYPES` in
-`fattn-mma-quant.cuh`, one line in each of `DECL_FATTN_MMA_QUANT_CASE_V` and
-`DECL_FATTN_MMA_QUANT_CASE_TYPES` in `fattn-mma-quant-decl.cuh`, an entry in the
-generator's `FATTN_MMA_QUANT_TYPES`, and an entry in the `native_types` array in
-the `test-backend-ops` sweep, which pairs it against every existing type
-automatically. It also wants a rung in `ggml_cuda_fattn_quant_pair_rank` if the
-vector path should carry it. The routing switch needs no change: it expands from
-the same type list. Tolerance-based tests are not
-sufficient evidence on their own: with random inputs they would accept a loader
-that permuted elements within a block. A byte-identical generation comparison
-against the same build with the option off is what actually gates a
-reconstructed dequantization.
+`dequant()` matches its cast kernel, and one line in the type manifest,
+`ggml/src/ggml-cuda/fattn-mma-quant-types.h`:
+
+```c
+    ENTRY(GGML_TYPE_Q4_1,  q4_1,  EXTRA,   ARGS) \
+```
+
+The entry names the ggml enum, the stem the generated instance file carries, and
+the tier: `DEFAULT` for the types every CUDA FlashAttention build compiles,
+`EXTRA` for the ones behind `GGML_CUDA_FA_ALL_QUANTS`. Everything that has to
+agree about the type set reads that one list:
+
+| Consumer | What it derives |
+|---|---|
+| `fattn-mma-quant.cuh` | the route predicate `ggml_cuda_fattn_mma_quant_type()` |
+| `fattn-mma-quant-decl.cuh` | the extern instantiation declarations |
+| `fattn.cu` | the host-side K dispatch switch |
+| `fattn-mma-f16.cuh` | the device-side runtime V selection switch |
+| `template-instances/generate_cu_files.py` | which instance files exist |
+| `ggml/src/ggml-cuda/CMakeLists.txt` | the extra-tier source filter |
+| `tests/test-backend-ops.cpp` | the symmetric sweep and every ordered pair |
+
+The generator and CMake parse the header textually, so an entry has to stay on
+one line in that form, and the stem has to match the generator's
+`get_short_name()` spelling of the enum; the generator fails rather than emitting
+a mismatched file name. That is the whole point of the manifest: before it, the
+same inventory was written out in five places, and a type could end up routable
+but not generated, or generated but not tested. A rung in
+`ggml_cuda_fattn_quant_pair_rank` is still a separate decision, because that
+ladder is the *vector* path's compiled pair band and is not widened by the
+native route.
+
+Tolerance-based tests are not sufficient evidence on their own: with random
+inputs they would accept a loader that permuted elements within a block. A
+byte-identical generation comparison against the same build with the option off
+is what actually gates a reconstructed dequantization.

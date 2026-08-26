@@ -21,6 +21,14 @@
 #include "ggml-cpp.h"
 #include "arg.h"
 
+// The single-source cache-type manifest for the quantized-native MMA
+// FlashAttention route. It is plain preprocessor with no CUDA dependency, and
+// including it here is what keeps the coverage below from being a hand-copied
+// second inventory. GGML_CUDA_FA_ALL_QUANTS is not defined in this translation
+// unit, so only FATTN_MMA_QUANT_TYPE_LIST (the complete inventory) is used, not
+// the tier-gated FATTN_MMA_QUANT_TYPES.
+#include "../ggml/src/ggml-cuda/fattn-mma-quant-types.h"
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -10321,16 +10329,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 256, 256, 4, {6, 1}, 512, 256, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true, true));
 
+    // Every type with a native tile loader, expanded from the same manifest that
+    // drives the route predicate, the extern declarations and the generated
+    // instance inventory. Adding a type there adds it here, so a type cannot
+    // become routable without being covered.
+    //
+    // The complete inventory is used rather than the compiled tier: the types
+    // past the default tier are only compiled with GGML_CUDA_FA_ALL_QUANTS, and
+    // in a build without it these same cases check the F16-casting fallback.
+    static const ggml_type fattn_native_types[] = {
+#define FATTN_MMA_QUANT_TEST_TYPE(type, stem, tier, args) type,
+        FATTN_MMA_QUANT_TYPE_LIST(FATTN_MMA_QUANT_TEST_TYPE, ())
+#undef FATTN_MMA_QUANT_TEST_TYPE
+    };
+
     // Quantized-native K/V coverage, one pass per type with a native loader.
     // These sweep the supported head sizes, GQA ratios that select ncols2,
     // query batches that select ncols1, and an unpadded KV length that
     // exercises the loader's bounds-checked path.
-    // Every type with a native tile loader. The ones past the default tier are
-    // only compiled with GGML_CUDA_FA_ALL_QUANTS; without it they fall back to
-    // the F16-casting path and these cases still check that fallback.
-    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
-                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
-                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+    for (ggml_type tkv : fattn_native_types) {
         for (int hs : { 64, 128, 256 }) {
             for (int nr2 : { 1, 2, 4, 16 }) {
                 for (int kv : { 512, 113 }) {
@@ -10356,9 +10373,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 120/120. Adding cases for it here would abort the whole FLASH_ATTN_EXT
     // suite rather than report a failure, so it is documented in
     // docs/quantized-native-flash-attention.md instead.
-    for (ggml_type tkv : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q6_0,
-                           GGML_TYPE_Q4_1, GGML_TYPE_Q5_1, GGML_TYPE_Q6_1, GGML_TYPE_Q3_0,
-                           GGML_TYPE_Q3_1, GGML_TYPE_Q2_0S, GGML_TYPE_Q2_1 }) {
+    for (ggml_type tkv : fattn_native_types) {
         for (int hs : { 64, 256 }) {
             // attention sinks
             test_cases.emplace_back(new test_flash_attn_ext(
@@ -10387,21 +10402,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // layouts in one kernel.
     //
     // Every ordered pair is covered, in both directions, because every ordered
-    // pair has a kernel. The list is built from the type array rather than
+    // pair has a kernel. The list comes from the manifest rather than being
     // written out so that adding a native type cannot silently leave its
     // pairings untested.
     {
-        static const ggml_type native_types[] = {
-            GGML_TYPE_Q8_0,
-            GGML_TYPE_Q6_1, GGML_TYPE_Q6_0,
-            GGML_TYPE_Q5_1, GGML_TYPE_Q5_0,
-            GGML_TYPE_Q4_1, GGML_TYPE_Q4_0,
-            GGML_TYPE_Q3_1, GGML_TYPE_Q3_0,
-            GGML_TYPE_Q2_1, GGML_TYPE_Q2_0S,
-        };
-
-        for (ggml_type tk : native_types) {
-            for (ggml_type tv : native_types) {
+        for (ggml_type tk : fattn_native_types) {
+            for (ggml_type tv : fattn_native_types) {
                 if (tk == tv) {
                     continue; // covered by the symmetric sweep above
                 }

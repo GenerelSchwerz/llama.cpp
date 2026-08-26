@@ -116,6 +116,13 @@ Key binaries are `llama-server`, `llama-cli`, `llama-bench`, and
   `kvarn_materialize.comp`, `kvarn_wht.comp`, and `kvarn_flash_attn.comp` -
   Vulkan KVarN storage, fallback materialization, transforms, and direct
   attention shaders.
+- `ggml/src/ggml-cuda/fattn-mma-quant-types.h` - single-source cache-type
+  manifest for the quantized-native MMA FlashAttention route. The route
+  predicate, extern declarations, dispatch switches, instance generator, CMake
+  source filter, and `test-backend-ops` coverage all derive from it; add a type
+  here and nowhere else.
+- `ggml/src/ggml-cuda/fattn-mma-quant.cuh` - native quantized tile loaders and
+  the pair policy for that route.
 - `tools/server/server-adaptive-dm.h` - profit adaptive draft-max controller.
 - `tools/server/server-loop-guard.cpp` / `.h` - reasoning loop detection.
 ### Key Docs

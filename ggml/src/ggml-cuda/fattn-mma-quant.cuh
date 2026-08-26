@@ -3,6 +3,7 @@
 #include "fattn-common.cuh"
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "fattn-mma-quant-types.h"
 
 // Native quantized K/V tile loading for the MMA FlashAttention kernel.
 //
@@ -268,18 +269,9 @@ template <> struct fattn_quant_type_traits<GGML_TYPE_Q3_1>  : fattn_quant_2bit_t
 // Compiled type tiers. The default set is compiled by every CUDA FlashAttention
 // build, at a library-size cost that is architecture dependent and recorded in
 // docs/quantized-native-flash-attention.md; GGML_CUDA_FA_ALL_QUANTS adds the
-// rest, mirroring how the vector FlashAttention pair matrix is tiered.
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-#define FATTN_MMA_QUANT_TYPES_EXTRA(F) \
-    F(GGML_TYPE_Q4_1) F(GGML_TYPE_Q5_1) F(GGML_TYPE_Q6_1) \
-    F(GGML_TYPE_Q3_0) F(GGML_TYPE_Q3_1) F(GGML_TYPE_Q2_0S) F(GGML_TYPE_Q2_1)
-#else
-#define FATTN_MMA_QUANT_TYPES_EXTRA(F)
-#endif
-
-#define FATTN_MMA_QUANT_TYPES(F) \
-    F(GGML_TYPE_Q8_0) F(GGML_TYPE_Q4_0) F(GGML_TYPE_Q5_0) F(GGML_TYPE_Q6_0) \
-    FATTN_MMA_QUANT_TYPES_EXTRA(F)
+// rest, mirroring how the vector FlashAttention pair matrix is tiered. Which
+// type sits in which tier is declared once, in fattn-mma-quant-types.h, and
+// FATTN_MMA_QUANT_TYPES(F) expands to the ones this build compiles.
 
 // Cache types with a compiled native tile loader. Both the host-side route
 // decision and the device-side kernel selection ask this same question.

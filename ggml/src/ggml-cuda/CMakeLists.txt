@@ -132,8 +132,17 @@ if (CUDAToolkit_FOUND)
         # GGML_CUDA_FA_ALL_QUANTS the extra-tier K types contribute no cases
         # at all, so their files would each cost an nvcc invocation over the
         # full MMA header for an empty translation unit.
+        #
+        # Which stems those are is not written here. It is read from
+        # fattn-mma-quant-types.h, the same manifest the route predicate, the
+        # extern declarations, the generator and the backend-ops coverage use,
+        # so this filter cannot name a type the generator stopped emitting or
+        # miss one it started emitting. A failed parse fails the configure
+        # rather than silently excluding nothing.
+        ggml_cuda_fattn_mma_quant_extra_stems(FATTN_MMA_QUANT_EXTRA_STEMS)
+        string(JOIN "|" FATTN_MMA_QUANT_EXTRA_RE ${FATTN_MMA_QUANT_EXTRA_STEMS})
         list(FILTER SRCS EXCLUDE REGEX
-            "fattn-mma-quant-instance-(q4_1|q5_1|q6_1|q3_0|q3_1|q2_0s|q2_1)-.*[.]cu$")
+            "fattn-mma-quant-instance-(${FATTN_MMA_QUANT_EXTRA_RE})-.*[.]cu$")
     endif()
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
