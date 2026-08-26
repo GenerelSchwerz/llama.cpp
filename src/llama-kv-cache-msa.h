@@ -27,7 +27,8 @@ public:
                llama_swa_type   swa_type,
         const layer_filter_cb & filter,
         const layer_filter_cb & filter_idx,
-        const  layer_reuse_cb & reuse);
+        const  layer_reuse_cb & reuse,
+        llama_memory_placement_options placement);
 
     ~llama_kv_cache_msa() = default;
 

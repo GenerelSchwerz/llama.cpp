@@ -357,6 +357,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t kv_gpu_layers;         // with offload_kqv=false, keep this many standard or direct hybrid attention KV layers on their assigned devices
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -399,6 +400,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
+        bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

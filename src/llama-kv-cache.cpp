@@ -17,6 +17,24 @@ static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
 
+static ggml_backend_buffer_type_t llama_kv_cache_get_host_buft(
+        const llama_model & model, uint32_t il, bool cpu_pinned) {
+    if (cpu_pinned) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (dev) {
+            ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(dev);
+            if (buft) {
+                return buft;
+            }
+
+            LLAMA_LOG_DEBUG("%s: layer %u: device %s does not provide a host buffer type\n",
+                    __func__, il, ggml_backend_dev_name(dev));
+        }
+    }
+
+    return ggml_backend_cpu_buffer_type();
+}
+
 // orthonormal Walsh-Hadamard rotation matrix
 // note: res^2 == I
 static void ggml_gen_hadamard(ggml_tensor * tensor) {
@@ -77,7 +95,8 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+    llama_memory_placement_options placement) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -159,6 +178,7 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+    uint32_t n_gpu_resident = 0;
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -209,13 +229,18 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
+        ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
-        if (offload) {
+        if (layer_offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        }
+
+        if (!offload && layer_offload) {
+            ++n_gpu_resident;
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -245,6 +270,11 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+    }
+
+    if (!offload && placement.gpu_resident_layers > 0) {
+        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested owned attention layers device-resident\n",
+                __func__, n_gpu_resident, placement.gpu_resident_layers);
     }
 
     if (reuse) {
