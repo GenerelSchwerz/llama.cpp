@@ -2146,8 +2146,7 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
 
 static bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0) {
     const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
-    return kind == GGML_CUDA_MOE_IDS_KIND_GATE || kind == GGML_CUDA_MOE_IDS_KIND_UP ||
-        kind == GGML_CUDA_MOE_IDS_KIND_GATE_UP;
+    return kind == GGML_CUDA_MOE_IDS_KIND_DOWN;
 }
 
 static const char * ggml_cuda_moe_ids_kind_pattern(ggml_cuda_moe_ids_kind kind) {
