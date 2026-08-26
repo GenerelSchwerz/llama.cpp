@@ -45,6 +45,9 @@ struct llama_context {
         uint32_t n_tokens_max    = 0;
         uint32_t n_tokens_decode = 0;
         uint32_t n_tokens        = 0;
+        uint32_t n_kv_capacity   = 0;
+        uint32_t n_kv            = 0;
+        bool live_kv             = false;
     };
 
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -60,11 +63,12 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve(uint32_t n_tokens = 0);
-    sched_reserve_plan make_sched_reserve_plan(uint32_t n_tokens) const;
+    void sched_reserve(uint32_t n_tokens = 0, uint32_t n_kv = 0);
+    sched_reserve_plan make_sched_reserve_plan(uint32_t n_tokens, uint32_t n_kv = 0) const;
     void prepare_sched_reserve(const sched_reserve_plan & plan);
     int attach_shared_workspace(llama_context & owner);
     bool shares_workspace_with(const llama_context & other) const;
+    uint64_t trim_transient_memory();
 
     void synchronize();
 
@@ -88,6 +92,7 @@ struct llama_context {
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
+    bool memory_update(bool optimize, uint32_t n_tokens_req);
 
     enum llama_pooling_type pooling_type() const;
 
@@ -370,6 +375,7 @@ private:
 
     bool sched_need_reserve = true;
     uint32_t sched_reserved_tokens = 0;
+    uint32_t sched_reserved_kv = 0;
     uint32_t sched_decode_outputs = 0;
 
     bool recurrent_sparse_snapshot_ops_supported = false;

@@ -1262,8 +1262,25 @@ private:
 
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
-            slot.callback_on_release = [this](int id_slot) {
+            const bool trim_live_context = params_base.live_context_workspace;
+            slot.callback_on_release = [this, trim_live_context](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                if (!trim_live_context) {
+                    return;
+                }
+
+                const bool all_idle = std::all_of(slots.begin(), slots.end(),
+                    [](const server_slot & item) { return !item.is_processing(); });
+                if (all_idle) {
+                    const uint64_t target_released = llama_trim_transient_memory(ctx_tgt);
+                    const uint64_t draft_released = llama_trim_transient_memory(ctx_dft);
+                    if (target_released + draft_released > 0) {
+                        SRV_TRC("trimmed transient backend pools: target %.2f MiB, draft %.2f MiB\n",
+                                target_released/1024.0/1024.0,
+                                draft_released/1024.0/1024.0);
+                    }
+                }
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {

@@ -127,6 +127,8 @@ LLAMA_API bool llama_contexts_share_workspace(
         const struct llama_context * ctx_a,
         const struct llama_context * ctx_b);
 
+LLAMA_API uint64_t llama_trim_transient_memory(struct llama_context * ctx);
+
 //
 // model/context data extraction
 //

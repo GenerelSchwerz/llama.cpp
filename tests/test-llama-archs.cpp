@@ -424,6 +424,68 @@ static void phase_workspace_count_synchronize(ggml_backend_t backend) {
 static llama_context_ptr make_phase_workspace_context(
         llama_model * model, llama_context_type type, llama_context * other = nullptr);
 
+static void test_live_context_workspace_reserve(size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    llama_context_params ctx_params = llama_context_default_params();
+    ctx_params.n_ctx = 1024;
+    ctx_params.n_batch = 64;
+    ctx_params.n_ubatch = 64;
+    ctx_params.n_seq_max = 1;
+    ctx_params.n_outputs_max = 1;
+    ctx_params.n_threads = 4;
+    ctx_params.n_threads_batch = 4;
+    ctx_params.live_context_workspace = true;
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    GGML_ASSERT(ctx);
+
+    ggml_backend_sched_t sched = ctx->get_sched();
+    ggml_backend_t backend_cpu = nullptr;
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            backend_cpu = backend;
+            break;
+        }
+    }
+    GGML_ASSERT(backend_cpu != nullptr);
+
+    const auto initial = ctx->make_sched_reserve_plan(1, 1);
+    GGML_ASSERT(initial.live_kv);
+    GGML_ASSERT(initial.n_kv_capacity == ctx_params.n_ctx);
+    GGML_ASSERT(initial.n_kv == 256);
+    const size_t size_256 = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+
+    ctx->sched_reserve(1, 257);
+    const size_t size_512 = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_512 > size_256);
+
+    const auto half_bin = ctx->make_sched_reserve_plan(1, 256);
+    GGML_ASSERT(half_bin.n_kv == 512);
+    ctx->sched_reserve(1, 256);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == size_512);
+
+    ctx->sched_reserve(1, 513);
+    const size_t size_1024 = ggml_backend_sched_get_buffer_size(sched, backend_cpu);
+    GGML_ASSERT(size_1024 > size_512);
+
+    const auto contraction = ctx->make_sched_reserve_plan(1, 256);
+    GGML_ASSERT(contraction.n_kv == 256);
+    ctx->sched_reserve(1, 256);
+    GGML_ASSERT(ggml_backend_sched_get_buffer_size(sched, backend_cpu) == size_256);
+    GGML_ASSERT(llama_trim_transient_memory(ctx.get()) == 0);
+}
+
 static void test_phase_workspace_runtime_reserve(size_t seed) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
 
@@ -1214,6 +1276,7 @@ int main(int argc, char ** argv) {
     ggml_log_level log_level = GGML_LOG_LEVEL_ERROR;
     std::string out;
     bool test_phase_workspace = false;
+    bool test_live_context_workspace = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1253,6 +1316,10 @@ int main(int argc, char ** argv) {
             test_phase_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-live-context-workspace") == 0) {
+            test_live_context_workspace = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1262,6 +1329,10 @@ int main(int argc, char ** argv) {
             test_phase_workspace_mtp_lifecycle(seed);
             test_phase_workspace_mismatched_placement(seed);
             test_phase_workspace_late_pipeline_fallback(seed);
+            return 0;
+        }
+        if (test_live_context_workspace) {
+            test_live_context_workspace_reserve(seed);
             return 0;
         }
         if (!out.empty()) {

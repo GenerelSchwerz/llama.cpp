@@ -55,6 +55,10 @@ public:
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
+    uint32_t get_attn_reserve_capacity() const override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
@@ -108,6 +112,10 @@ public:
     // init full
     explicit llama_memory_hybrid_context(llama_memory_hybrid * mem);
 
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        llama_memory_context_ptr   ctx_attn);
+
     // init update
     explicit llama_memory_hybrid_context(
         llama_memory_hybrid * mem,
@@ -127,6 +135,7 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    uint32_t get_attn_reserve_n_kv() const override;
 
     //
     // llama_memory_hybrid_context

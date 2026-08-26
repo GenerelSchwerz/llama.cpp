@@ -318,6 +318,7 @@ static void test(void) {
         assert(!defaults.recurrent_state_offload);
         assert(defaults.kv_gpu_layers == 0);
         assert(!defaults.phase_aware_workspace);
+        assert(!defaults.live_context_workspace);
 
         common_params placement_params;
         argv = {"binary_name", "-m", "model.gguf", "--no-kv-offload", "--kv-cpu-pinned", "--kv-gpu-layers", "4", "--recurrent-state-offload"};
@@ -363,6 +364,35 @@ static void test(void) {
         assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), phase_params, LLAMA_EXAMPLE_SERVER));
         assert(phase_params.phase_aware_workspace);
         unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
+    }
+
+    {
+        unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
+        common_params live_params;
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), live_params, LLAMA_EXAMPLE_SERVER));
+        assert(!live_params.live_context_workspace);
+        assert(!common_context_params_to_llama(live_params).live_context_workspace);
+
+        live_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf", "--live-context-workspace"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), live_params, LLAMA_EXAMPLE_SERVER));
+        assert(live_params.live_context_workspace);
+        assert(!live_params.phase_aware_workspace);
+        assert(common_context_params_to_llama(live_params).live_context_workspace);
+
+        live_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf", "--live-context-workspace", "--no-live-context-workspace"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), live_params, LLAMA_EXAMPLE_SERVER));
+        assert(!live_params.live_context_workspace);
+
+        set_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE", "1");
+        live_params = common_params();
+        argv = {"binary_name", "-m", "model.gguf"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), live_params, LLAMA_EXAMPLE_SERVER));
+        assert(live_params.live_context_workspace);
+        assert(!live_params.phase_aware_workspace);
+        unset_test_env("LLAMA_ARG_LIVE_CONTEXT_WORKSPACE");
     }
 
     {

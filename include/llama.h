@@ -402,6 +402,7 @@ extern "C" {
         bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
+        bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
