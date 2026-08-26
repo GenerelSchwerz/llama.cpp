@@ -2240,7 +2240,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
+    ggml_cuda_mul_mat_id_impl(ctx, dst, true);
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
@@ -2509,7 +2509,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
+    ggml_cuda_mul_mat_id_impl(ctx, dst, true);
     ggml_cuda_moe_cache_mark_used(cache, stream);
 
     dst->src[0] = orig_src0;
