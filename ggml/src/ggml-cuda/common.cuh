@@ -1536,6 +1536,7 @@ struct ggml_backend_cuda_context {
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
+    const ggml_tensor * gate_ids = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
@@ -1544,6 +1545,7 @@ struct ggml_cuda_mm_fusion_args_host {
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
     const void * gate = nullptr;
+    const int32_t * gate_ids = nullptr;
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
