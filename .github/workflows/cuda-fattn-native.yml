@@ -1,0 +1,177 @@
+name: CUDA FA native quants
+
+# Compile the coupling axis of the quantized-native MMA FlashAttention route.
+#
+# GGML_CUDA_FA_ALL_QUANTS decides which cache types get native kernels at all,
+# and with them every runtime V-loader switch arm, extern declaration and
+# generated instance file. Nothing else in CI crosses it against this route.
+#
+# The failure this guards against is a build/inventory failure, not a wrong
+# result: an extern-macro mistake can instantiate hundreds of full attention
+# kernels in one translation unit while every runtime test still passes. So each
+# job reads the built library back and checks its kernel inventory against the
+# type manifest, and records object and library size.
+#
+# The focused FLASH_ATTN_EXT run needs a GPU, which GitHub-hosted runners do not
+# have. It is defined here and runs only where a CUDA self-hosted runner is
+# registered; see the job comment.
+
+on:
+  pull_request:
+    paths:
+      - 'ggml/src/ggml-cuda/**'
+      - 'ggml/CMakeLists.txt'
+      - 'tests/test-backend-ops.cpp'
+      - 'scripts/fattn-native-inventory.py'
+      - '.github/workflows/cuda-fattn-native.yml'
+  push:
+    branches:
+      - 'llama/dev'
+    paths:
+      - 'ggml/src/ggml-cuda/**'
+      - 'ggml/CMakeLists.txt'
+      - 'tests/test-backend-ops.cpp'
+      - 'scripts/fattn-native-inventory.py'
+      - '.github/workflows/cuda-fattn-native.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compile-matrix:
+    name: Compile ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }}
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:12.6.2-devel-ubuntu24.04
+    # The all-quants arm compiles every native type and both kernel entries.
+    # Give it room, but stay inside GitHub's 6 h ceiling so a timeout is
+    # reported rather than killed.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - all_quants: 'OFF'
+            fa: 'ON'
+            slug: allq-off
+          - all_quants: 'ON'
+            fa: 'ON'
+            slug: allq-on
+          # The route must also compile out cleanly where FlashAttention itself
+          # is disabled, which is the one build with no native kernels at all.
+          - all_quants: 'OFF'
+            fa: 'OFF'
+            slug: fa-off
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Install dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt update
+          apt install -y cmake build-essential ninja-build libgomp1 git python3 binutils bc
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: cuda-fattn-native-${{ matrix.slug }}
+          save: true
+          max-size: 5G
+
+      - name: Configure
+        # One real architecture on purpose. The point of this job is the source
+        # inventory and the coupling between the switches, and both are
+        # architecture independent; compiling the default architecture list would
+        # multiply the nvcc work for no extra coverage.
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=${{ matrix.fa }} \
+            -DGGML_CUDA_FA_ALL_QUANTS=${{ matrix.all_quants }} \
+            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_CURL=OFF \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+      - name: Build ggml-cuda
+        run: cmake --build build --target ggml-cuda -j "$(nproc)"
+
+      - name: Kernel inventory
+        # A GGML_CUDA_FA=OFF build has no FlashAttention kernels to inventory.
+        if: ${{ matrix.fa == 'ON' }}
+        run: |
+          LIB=$(find build -name 'libggml-cuda.so' -print -quit)
+          test -n "$LIB"
+          ARGS=""
+          if [ "${{ matrix.all_quants }}" = "ON" ]; then ARGS="--all-quants"; fi
+          python3 scripts/fattn-native-inventory.py "$LIB" $ARGS \
+            --json "inventory-${{ matrix.slug }}.json"
+
+      - name: Object and library size
+        run: |
+          LIB=$(find build -name 'libggml-cuda.so' -print -quit)
+          {
+            echo "### ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }}"
+            echo
+            echo "libggml-cuda.so: $(stat -c %s "$LIB") bytes"
+            echo
+            echo "Largest native MMA objects:"
+            find build -name 'fattn-mma-quant-instance-*.o' -printf '%s %p\n' \
+              | sort -rn | head -10
+            echo
+            echo "Native MMA object count: $(find build -name 'fattn-mma-quant-instance-*.o' | wc -l)"
+          } | tee "size-${{ matrix.slug }}.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload inventory
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-fattn-native-${{ matrix.slug }}
+          path: |
+            inventory-${{ matrix.slug }}.json
+            size-${{ matrix.slug }}.txt
+
+  focused-test:
+    name: Focused FLASH_ATTN_EXT native route
+    needs: compile-matrix
+    # GitHub-hosted runners have no GPU, so this cannot run there. It executes
+    # only where the repository has a CUDA self-hosted runner registered and the
+    # repository variable CUDA_SELF_HOSTED_RUNNER is set to 'true'; otherwise it
+    # is skipped, which is reported as skipped rather than as a pass.
+    if: ${{ vars.CUDA_SELF_HOSTED_RUNNER == 'true' }}
+    runs-on: [self-hosted, linux, x64, cuda]
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        all_quants: ['OFF', 'ON']
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Build test-backend-ops
+        run: |
+          cmake -S . -B build-test -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_FA=ON \
+            -DGGML_CUDA_FA_ALL_QUANTS=${{ matrix.all_quants }} \
+            -DLLAMA_CURL=OFF
+          cmake --build build-test --target test-backend-ops -j "$(nproc)"
+
+      - name: Focused native-quant coverage
+        # Both routes are exercised in one run: the compiled tier takes the
+        # native path and the rest fall back to the F16-casting path, which is
+        # why the extra-tier cases are in the sweep even in a default build.
+        env:
+          GGML_CUDA_FATTN_NATIVE_VERBOSE: '1'
+        run: |
+          ./build-test/bin/test-backend-ops -b CUDA0 -o FLASH_ATTN_EXT -p "native_quants=1"
