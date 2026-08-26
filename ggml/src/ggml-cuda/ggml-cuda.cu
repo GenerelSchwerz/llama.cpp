@@ -2116,9 +2116,17 @@ struct ggml_cuda_moe_ids_cache_state {
     std::vector<char> bytes;
     std::vector<int32_t> unique_eids;
     std::vector<int32_t> expert_to_pos;
+    int32_t * first_positions_host = nullptr;
+    size_t first_positions_capacity = 0;
     size_t nb0 = 0;
     size_t nb1 = 0;
     size_t nb2 = 0;
+
+    ~ggml_cuda_moe_ids_cache_state() {
+        if (first_positions_host != nullptr) {
+            (void) cudaFreeHost(first_positions_host);
+        }
+    }
 };
 
 static void ggml_cuda_moe_ids_cache_clear_pending(ggml_cuda_moe_ids_cache_state & state) {
@@ -2229,11 +2237,23 @@ static __global__ void ggml_cuda_moe_remap_ids(
 static bool ggml_cuda_moe_prepare_ids_device(
         ggml_backend_cuda_context & ctx, const ggml_tensor * ids, int64_t n_experts,
         std::vector<int32_t> & unique_eids, std::vector<int32_t> & expert_to_pos,
-        uint64_t & d2h_time_us) {
+        int32_t *& first_positions_host, size_t & first_positions_capacity, uint64_t & d2h_time_us) {
     constexpr int32_t sentinel = 0x7f7f7f7f;
     const int64_t n_elements = ids->ne[0] * ids->ne[1] * ids->ne[2];
     if (n_elements <= 0 || n_elements > INT32_MAX || n_experts <= 0 || n_experts > 4096) {
         return false;
+    }
+
+    if (first_positions_capacity < (size_t) n_experts + 1) {
+        int32_t * new_host = (int32_t *) ggml_cuda_host_malloc((n_experts + 1) * sizeof(int32_t));
+        if (new_host == nullptr) {
+            return false;
+        }
+        if (first_positions_host != nullptr) {
+            CUDA_CHECK(cudaFreeHost(first_positions_host));
+        }
+        first_positions_host = new_host;
+        first_positions_capacity = n_experts + 1;
     }
 
     ggml_cuda_pool_alloc<int32_t> first_positions(ctx.pool(), n_experts + 1);
@@ -2245,8 +2265,7 @@ static bool ggml_cuda_moe_prepare_ids_device(
     CUDA_CHECK(cudaGetLastError());
 
     const int64_t d2h_start_us = ggml_time_us();
-    std::vector<int32_t> first_positions_host(n_experts + 1);
-    CUDA_CHECK(cudaMemcpyAsync(first_positions_host.data(), first_positions.get(),
+    CUDA_CHECK(cudaMemcpyAsync(first_positions_host, first_positions.get(),
                                (n_experts + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, ctx.stream()));
     CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
     d2h_time_us = (uint64_t) (ggml_time_us() - d2h_start_us);
@@ -2563,7 +2582,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
             ids->nb[2] == ids->nb[1] * (size_t) ids->ne[1];
         device_routing = !is_decode && starts_group && compact_ids &&
             ggml_cuda_moe_prepare_ids_device(
-                ctx, ids, src0->ne[2], ids_cache.unique_eids, ids_cache.expert_to_pos, ids_d2h_time_us);
+                ctx, ids, src0->ne[2], ids_cache.unique_eids, ids_cache.expert_to_pos,
+                ids_cache.first_positions_host, ids_cache.first_positions_capacity, ids_d2h_time_us);
         if (device_routing) {
             ids_d2h_sync_count = 1;
             prepared_unique_eids = &ids_cache.unique_eids;
