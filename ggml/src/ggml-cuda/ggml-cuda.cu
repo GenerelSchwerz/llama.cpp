@@ -2895,6 +2895,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     const char * src_base = (const char *)src0->data;
     cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
     bool any_cache_failure = false;
+    std::vector<int> pinned_slots;
+    pinned_slots.reserve(unique_eids.size());
 
     for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
@@ -2904,12 +2906,13 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, false);
+                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, false, true);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
                 }
                 expert_to_slot[eid] = slot;
+                pinned_slots.push_back(slot);
             }
             if (any_cache_failure) break;
         }
@@ -2917,6 +2920,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     if (any_cache_failure) {
+        ggml_cuda_moe_cache_release_slots(cache, pinned_slots.data(), (int) pinned_slots.size());
         // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
         // Fall back so we still produce correct output.
         ggml_cuda_mul_mat_id_staged(
@@ -2994,7 +2998,10 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         ggml_cuda_mul_mat_id_impl(ctx, dst, false, &host_route);
         dst->src[0] = orig_src0;
     }
-    ggml_cuda_moe_cache_mark_used(cache, stream);
+    if (!ggml_cuda_moe_cache_mark_used(cache, stream)) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    ggml_cuda_moe_cache_release_slots(cache, pinned_slots.data(), (int) pinned_slots.size());
 
     ggml_cuda_moe_record_op_stats(
         is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
@@ -3005,6 +3012,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 struct ggml_cuda_moe_fused_tensor {
     ggml_cuda_moe_cache * cache = nullptr;
     std::vector<int32_t> expert_to_slot;
+    std::vector<int> pinned_slots;
     uint64_t acquire_time_us = 0;
     uint64_t wait_time_us = 0;
 };
@@ -3029,16 +3037,19 @@ static bool ggml_cuda_moe_prepare_fused_tensor(
     }
 
     result.expert_to_slot.assign(src0->ne[2], -1);
+    result.pinned_slots.reserve(expert_ids.size());
     cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(result.cache);
     const char * src_base = (const char *) src0->data;
     const int64_t acquire_start_us = ggml_time_us();
     for (int32_t eid : expert_ids) {
         const void * host_ptr = src_base + (size_t) eid * src0->nb[2];
-        const int slot = ggml_cuda_moe_cache_acquire(result.cache, host_ptr, src0->nb[2], copy_stream, use_l2, is_decode, false);
+        const int slot = ggml_cuda_moe_cache_acquire(result.cache, host_ptr, src0->nb[2], copy_stream, use_l2, is_decode, false, true);
         if (slot < 0) {
+            ggml_cuda_moe_cache_release_slots(result.cache, result.pinned_slots.data(), (int) result.pinned_slots.size());
             return false;
         }
         result.expert_to_slot[eid] = slot;
+        result.pinned_slots.push_back(slot);
     }
     result.acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
 
@@ -3099,30 +3110,31 @@ static bool ggml_cuda_mul_mat_vec_q_cached_fused(
     ggml_cuda_moe_fused_tensor up_state;
     ggml_cuda_moe_fused_tensor gate_state;
     cudaStream_t stream = ctx.stream();
-    if (!ggml_cuda_moe_prepare_fused_tensor(device, src0, expert_ids, true, use_l2, stream, up_state) ||
-            !ggml_cuda_moe_prepare_fused_tensor(device, gate, expert_ids, true, use_l2, stream, gate_state)) {
+    if (!ggml_cuda_moe_prepare_fused_tensor(device, src0, expert_ids, true, use_l2, stream, up_state)) {
+        return false;
+    }
+    if (!ggml_cuda_moe_prepare_fused_tensor(device, gate, expert_ids, true, use_l2, stream, gate_state)) {
+        ggml_cuda_moe_cache_release_slots(up_state.cache, up_state.pinned_slots.data(), (int) up_state.pinned_slots.size());
         return false;
     }
 
     const int64_t remap_start_us = ggml_time_us();
     const size_t n_ids = (size_t) ids->ne[0] * ids->ne[1] * ids->ne[2];
-    std::vector<int32_t> up_ids_host;
-    std::vector<int32_t> gate_ids_host;
-    up_ids_host.reserve(n_ids);
-    gate_ids_host.reserve(n_ids);
+    std::vector<int32_t> remapped_ids_host(2*n_ids);
+    size_t remapped_index = 0;
     for (int64_t i2 = 0; i2 < ids->ne[2]; ++i2) {
         for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
             for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
                 const int32_t eid = *(const int32_t *) (ids_host.bytes->data() + i2*ids_host.nb2 + i1*ids_host.nb1 + i0*ids_host.nb0);
-                up_ids_host.push_back(up_state.expert_to_slot[eid]);
-                gate_ids_host.push_back(gate_state.expert_to_slot[eid]);
+                remapped_ids_host[remapped_index] = up_state.expert_to_slot[eid];
+                remapped_ids_host[n_ids + remapped_index] = gate_state.expert_to_slot[eid];
+                remapped_index++;
             }
         }
     }
 
     ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), 2*n_ids);
-    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), up_ids_host.data(), n_ids*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get() + n_ids, gate_ids_host.data(), n_ids*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(), 2*n_ids*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     const uint64_t remap_time_us = (uint64_t) (ggml_time_us() - remap_start_us);
 
     ggml_tensor src0_synth = *src0;
@@ -3149,8 +3161,13 @@ static bool ggml_cuda_mul_mat_vec_q_cached_fused(
     fusion_cached.gate = &gate_synth;
     fusion_cached.gate_ids = &gate_ids_synth;
     ggml_cuda_mul_mat_vec_q(ctx, &src0_synth, src1, &up_ids_synth, dst, &fusion_cached);
-    ggml_cuda_moe_cache_mark_used(up_state.cache, stream);
-    ggml_cuda_moe_cache_mark_used(gate_state.cache, stream);
+    const bool up_recorded = ggml_cuda_moe_cache_mark_used(up_state.cache, stream);
+    const bool gate_recorded = ggml_cuda_moe_cache_mark_used(gate_state.cache, stream);
+    if (!up_recorded || !gate_recorded) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
+    ggml_cuda_moe_cache_release_slots(up_state.cache, up_state.pinned_slots.data(), (int) up_state.pinned_slots.size());
+    ggml_cuda_moe_cache_release_slots(gate_state.cache, gate_state.pinned_slots.data(), (int) gate_state.pinned_slots.size());
 
     ggml_cuda_moe_record_op_stats(
         true, false, false, (uint64_t) expert_ids.size(), (uint64_t) ggml_nbytes(ids),
