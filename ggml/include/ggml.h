@@ -2577,16 +2577,20 @@ extern "C" {
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306
     //
-    // tensor shapes (S_k == S_v, H_v % H_k == 0):
-    //   q, k  : [S_k, H_k, n_tokens, n_seqs]
+    // tensor shapes (S_k == S_v, H_v % H_k == 0, n_seqs % n_seqs_qk == 0):
+    //   q, k  : [S_k, H_k, n_tokens, n_seqs_qk]
     //   v     : [S_v, H_v, n_tokens, n_seqs]
     //   g     : [1, H_v, n_tokens, n_seqs] (scalar gate) or [S_v, H_v, n_tokens, n_seqs] (KDA)
     //   beta  : [1, H_v, n_tokens, n_seqs]
     //   state : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0
     //
-    // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
-    // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
-    // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // The output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state slots [S_v, S_v, H_v, n_seqs].
+    // By default, slot 0 is the final state and up to min(n_tokens, K) trailing states are written most-recent first.
+    // For K > 1, trailing-only mode accepts (trailing_snapshots, selected_token, reserve_input) == ([0, K], -1, false) and writes up to min(n_tokens, trailing_snapshots) states most-recent first.
+    // Selected-token mode requires (trailing_snapshots, selected_token, reserve_input) == (0, [0, n_tokens), false) and writes only the state after selected_token to slot 0.
+    // Reserved-input mode requires (trailing_snapshots, selected_token, reserve_input) == (min(n_tokens, K - 1), -1, true) and writes the input state to slot K - 1 and trailing states most-recent first from slot 0.
+    // State slots not selected by these modes stay untouched.
+    // K == 1 requires (trailing_snapshots, selected_token, reserve_input) == (1, -1, false) and writes the final state to slot 0.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2596,6 +2600,15 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    GGML_API void ggml_gated_delta_net_set_snapshots(
+            struct ggml_tensor * tensor,
+            int32_t              trailing_snapshots,
+            int32_t              selected_token,
+            bool                 reserve_input);
+
+    GGML_API bool ggml_gated_delta_net_has_default_snapshot_params(
+            const struct ggml_tensor * tensor);
 
     // DSA lightning indexer
     //

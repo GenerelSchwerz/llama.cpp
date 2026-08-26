@@ -16,6 +16,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);
+LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
+        struct llama_context * ctx, bool enabled, int32_t selected_token);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
@@ -115,6 +119,13 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
+// Returns 1 when shared, 0 for incompatible placement, and -1 with an empty borrower scheduler after failure.
+LLAMA_API int32_t llama_attach_shared_workspace(
+              struct llama_context * borrower,
+              struct llama_context * owner);
+LLAMA_API bool llama_contexts_share_workspace(
+        const struct llama_context * ctx_a,
+        const struct llama_context * ctx_b);
 
 //
 // model/context data extraction

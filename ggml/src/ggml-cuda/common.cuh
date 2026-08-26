@@ -1148,6 +1148,7 @@ struct ggml_cuda_device_info {
         size_t  vmm_granularity;                // granularity of virtual memory
         size_t  total_vram;
         int     warp_size;                      // Number of threads in a dispatch
+        int     max_grid_size[3];                // Maximum grid dimensions
         bool    supports_cooperative_launch;    // whether cooperative launch is supported
         int     physical_device;                // backing physical CUDA device for this (virtual) device
         int     physical_share_count;           // number of (virtual) devices sharing this device's physical GPU
@@ -1673,4 +1674,3 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
-

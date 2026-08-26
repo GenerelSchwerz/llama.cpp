@@ -326,6 +326,11 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+llm_graph_input_rs::llm_graph_input_rs(const llama_memory_recurrent_context * mctx) :
+        mctx(mctx),
+        snapshot_mode(mctx->get_snapshot_mode()) {
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
@@ -356,6 +361,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= snapshot_mode == mctx->get_snapshot_mode();
 
     return res;
 }
@@ -1129,6 +1135,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }
@@ -1172,6 +1179,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }
@@ -1260,6 +1268,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->snapshot_mode == mctx->get_recr()->get_snapshot_mode();
 
     return res;
 }
@@ -2821,8 +2830,7 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        mctx_cur->build_kv_store(gf, ctx0, k_cur, k_idxs, v_cur, v_idxs, il);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3068,13 +3076,16 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto * mctx_cur = is_swa ? mctx_iswa->get_swa() : mctx_iswa->get_base();
 
     // optionally store to KV cache
-    if (k_cur) {
+    if (k_cur && v_cur) {
+        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
+        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
+
+        mctx_cur->build_kv_store(gf, ctx0, k_cur, k_idxs, v_cur, v_idxs, il);
+    } else if (k_cur) {
         const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-    }
-
-    if (v_cur) {
+    } else if (v_cur) {
         const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
 
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));

@@ -1581,7 +1581,10 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
-        ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
+            GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+            return false;
+        }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1888,6 +1891,24 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+bool ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner) {
+    GGML_ASSERT(sched != nullptr);
+    return ggml_gallocr_set_resizable(sched->galloc, owner ? owner->galloc : nullptr);
+}
+
+void ggml_backend_sched_get_buffer_state(
+        ggml_backend_sched_t sched,
+        uint64_t * generation,
+        uint64_t * shrink_generation) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_get_resizable_state(sched->galloc, generation, shrink_generation);
+}
+
+void ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched != nullptr);
+    ggml_gallocr_request_shrink(sched->galloc);
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {

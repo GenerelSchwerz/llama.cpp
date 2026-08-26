@@ -2230,6 +2230,7 @@ struct llama_model_qwen35 : public llama_model_base {
     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    bool graph_supports_recurrent_sparse_snapshots() const override { return true; }
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2276,6 +2277,7 @@ struct llama_model_qwen35moe : public llama_model_base {
     llama_model_qwen35moe(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+    bool graph_supports_recurrent_sparse_snapshots() const override { return true; }
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);

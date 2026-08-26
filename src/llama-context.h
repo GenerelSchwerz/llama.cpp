@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <map>
+#include <memory>
 #include <vector>
 
 struct llama_model;
@@ -40,6 +41,12 @@ struct llama_memory_buffer {
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
 struct llama_context {
+    struct sched_reserve_plan {
+        uint32_t n_tokens_max    = 0;
+        uint32_t n_tokens_decode = 0;
+        uint32_t n_tokens        = 0;
+    };
+
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
             const llama_model & model,
@@ -53,7 +60,11 @@ struct llama_context {
     //   - changing samplers
     //   - changing attention type
     //   - etc.
-    void sched_reserve();
+    void sched_reserve(uint32_t n_tokens = 0);
+    sched_reserve_plan make_sched_reserve_plan(uint32_t n_tokens) const;
+    void prepare_sched_reserve(const sched_reserve_plan & plan);
+    int attach_shared_workspace(llama_context & owner);
+    bool shares_workspace_with(const llama_context & other) const;
 
     void synchronize();
 
@@ -72,6 +83,8 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    bool recurrent_sparse_snapshots_supported() const;
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -254,6 +267,10 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void reset_sched_workspace();
+    llama_context * shared_workspace_peer() const;
+    void acquire_shared_workspace();
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -342,8 +359,19 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    uint64_t sched_buffer_generation = 0;
+    uint64_t sched_shrink_generation = 0;
+    // Paired contexts must be serialized; do not execute or destroy them concurrently.
+    llama_context * sched_buffer_owner = nullptr;
+    llama_context * sched_buffer_borrower = nullptr;
+    bool sched_buffers_shared = false;
+    bool workspace_in_flight = false;
 
     bool sched_need_reserve = true;
+    uint32_t sched_reserved_tokens = 0;
+    uint32_t sched_decode_outputs = 0;
+
+    bool recurrent_sparse_snapshot_ops_supported = false;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;

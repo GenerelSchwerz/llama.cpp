@@ -381,8 +381,14 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+
     bool has_dft() const {
         return !draft.mparams.empty();
+    }
+
+    bool is_mtp_rs_capped() const {
+        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
     }
 
     uint32_t need_n_rs_seq() const {
@@ -390,7 +396,12 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+        if (has_mtp && mtp_rs_planes > 0) {
+            return uint32_t(mtp_rs_planes - 1);
+        }
+
+        return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;
     }
 };
 
@@ -574,6 +585,7 @@ struct common_params {
     bool kv_cpu_pinned     = false; // use pinned host buffers for CPU-resident KV cache storage
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
+    bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

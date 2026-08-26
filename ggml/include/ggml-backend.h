@@ -319,6 +319,10 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    GGML_API bool                 ggml_backend_sched_set_resizable(ggml_backend_sched_t sched, ggml_backend_sched_t owner);
+    GGML_API void                 ggml_backend_sched_get_buffer_state(ggml_backend_sched_t sched, uint64_t * generation, uint64_t * shrink_generation);
+    GGML_API void                 ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

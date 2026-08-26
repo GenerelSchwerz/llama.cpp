@@ -149,6 +149,25 @@ static __global__ void cpy_f32_q(const char * cx, char * cdst, const int64_t ne,
     cpy_blck(cx + x_offset, cdst + dst_offset);
 }
 
+static __global__ void cpy_f32_q8_0_pair(
+        const char * cx0, char * cdst0,
+        const char * cx1, char * cdst1,
+        int64_t n_blocks) {
+    const int64_t i = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= 2*n_blocks) {
+        return;
+    }
+
+    const bool second = i >= n_blocks;
+    const int64_t ib = second ? i - n_blocks : i;
+    const char * cx = second ? cx1 : cx0;
+    char * cdst = second ? cdst1 : cdst0;
+
+    ggml_cuda_pdl_sync();
+    cpy_blck_f32_q8_0(cx + ib*QK8_0*sizeof(float), cdst + ib*sizeof(block_q8_0));
+}
+
 template <cpy_kernel_t cpy_blck, int qk>
 static __global__ void cpy_q_f32(const char * cx, char * cdst, const int64_t ne,
                                  const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
@@ -257,6 +276,28 @@ static void ggml_cpy_f32_q8_0_cuda(
     GGML_ASSERT(num_blocks <= INT_MAX);
     cpy_f32_q<cpy_blck_f32_q8_0, QK8_0><<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream>>>
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+}
+
+void ggml_cuda_cpy_f32_q8_0_pair(ggml_backend_cuda_context & ctx, ggml_tensor * dst0, ggml_tensor * dst1) {
+    const ggml_tensor * src0 = dst0->src[0];
+    const ggml_tensor * src1 = dst1->src[0];
+    const int64_t ne = ggml_nelements(src0);
+
+    GGML_ASSERT(ne == ggml_nelements(src1));
+    GGML_ASSERT(ne == ggml_nelements(dst0));
+    GGML_ASSERT(ne == ggml_nelements(dst1));
+    GGML_ASSERT(ne % QK8_0 == 0);
+
+    const int64_t n_blocks = ne/QK8_0;
+    GGML_ASSERT(n_blocks <= INT64_MAX/2);
+    const int64_t num_blocks = (2*n_blocks + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+    GGML_ASSERT(num_blocks <= INT_MAX);
+
+    cpy_f32_q8_0_pair<<<num_blocks, CUDA_CPY_BLOCK_SIZE, 0, ctx.stream()>>>(
+        (const char *) src0->data, (char *) dst0->data,
+        (const char *) src1->data, (char *) dst1->data,
+        n_blocks);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 static void ggml_cpy_q8_0_f32_cuda(
