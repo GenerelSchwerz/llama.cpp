@@ -2144,11 +2144,6 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
     return GGML_CUDA_MOE_IDS_KIND_NONE;
 }
 
-static bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
-    const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
-    return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens >= 512;
-}
-
 static const char * ggml_cuda_moe_ids_kind_pattern(ggml_cuda_moe_ids_kind kind) {
     switch (kind) {
         case GGML_CUDA_MOE_IDS_KIND_GATE:    return "_gate_";
@@ -2213,6 +2208,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * ids  = dst->src[2];
     cudaStream_t  stream = ctx.stream();
+    const bool    use_mmq = false;
 
     const int64_t n_experts_total = src0->ne[2];
     const size_t  expert_stride   = src0->nb[2];
@@ -2265,8 +2261,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
         const int min_resident = (n_slots + 5) / 6;
-        if (ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]) &&
-                ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
+        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
@@ -2397,7 +2392,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]));
+    ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq);
 
     dst->src[0] = orig_src0;
     dst->src[2] = orig_ids;
@@ -2743,7 +2738,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = &src0_synth;
     dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]));
+    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
     ggml_cuda_moe_cache_mark_used(cache, stream);
 
     dst->src[0] = orig_src0;
