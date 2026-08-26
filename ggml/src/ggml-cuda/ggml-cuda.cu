@@ -2136,6 +2136,16 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
     return GGML_CUDA_MOE_IDS_KIND_NONE;
 }
 
+static const char * ggml_cuda_moe_ids_kind_pattern(ggml_cuda_moe_ids_kind kind) {
+    switch (kind) {
+        case GGML_CUDA_MOE_IDS_KIND_GATE:    return "_gate_";
+        case GGML_CUDA_MOE_IDS_KIND_UP:      return "_up_";
+        case GGML_CUDA_MOE_IDS_KIND_GATE_UP: return "_gate_up_";
+        case GGML_CUDA_MOE_IDS_KIND_DOWN:    return "_down_";
+        default:                             return nullptr;
+    }
+}
+
 static int ggml_cuda_moe_layer_from_name(const char * name) {
     if (name == nullptr) {
         return -1;
@@ -2383,6 +2393,8 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         }
     }
 
+    const bool ids_group_pending = ids_cache.pending && ids_cache.device == device && ids_cache.key == ids_cache_key;
+
     // 2. Look up the per-tensor cache. Each MoE expert tensor (one per
     //    layer-and-matrix-kind) gets its own pool of N slots; only that
     //    tensor's experts compete for those slots. Slot size = this tensor's
@@ -2443,6 +2455,34 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     if (overflow) {
+        if (ids_group_pending) {
+            auto prefetch_kind = [&](ggml_cuda_moe_ids_kind sibling_kind) {
+                const char * this_pattern = ggml_cuda_moe_ids_kind_pattern(ids_kind);
+                const char * sibling_pattern = ggml_cuda_moe_ids_kind_pattern(sibling_kind);
+                if (!this_pattern || !sibling_pattern) {
+                    return;
+                }
+                std::string sibling(src0->name);
+                const size_t pos = sibling.find(this_pattern);
+                if (pos == std::string::npos) {
+                    return;
+                }
+                sibling.replace(pos, std::strlen(this_pattern), sibling_pattern);
+                ggml_backend_cuda_moe_prefetch_experts(
+                    device, sibling.c_str(), unique_eids.data(), (int) unique_eids.size(), use_l2, is_decode);
+            };
+
+            if (ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE && ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE) {
+                prefetch_kind(GGML_CUDA_MOE_IDS_KIND_UP);
+            } else if (ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_UP && ids_kind == GGML_CUDA_MOE_IDS_KIND_UP) {
+                prefetch_kind(GGML_CUDA_MOE_IDS_KIND_GATE);
+            } else if (ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE_UP && ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE_UP) {
+                prefetch_kind(GGML_CUDA_MOE_IDS_KIND_DOWN);
+            } else if (ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE_AND_UP &&
+                    (ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE || ids_kind == GGML_CUDA_MOE_IDS_KIND_UP)) {
+                prefetch_kind(GGML_CUDA_MOE_IDS_KIND_DOWN);
+            }
+        }
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
         ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, true, cache);
