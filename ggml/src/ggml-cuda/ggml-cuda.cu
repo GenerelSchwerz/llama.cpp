@@ -2078,39 +2078,63 @@ struct ggml_cuda_moe_ids_cache_key {
     int64_t      ne0;
     int64_t      ne1;
     int64_t      ne2;
+    int64_t      ne3;
     size_t       nb0;
     size_t       nb1;
     size_t       nb2;
+    size_t       nb3;
     int          layer;
-};
-
-struct ggml_cuda_moe_ids_cache_key_hash {
-    size_t operator()(const ggml_cuda_moe_ids_cache_key & k) const {
-        size_t h = std::hash<const void *>{}(k.data);
-        h ^= std::hash<size_t>{}(k.nbytes) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>{}(k.ne0) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>{}(k.ne1) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int64_t>{}(k.ne2) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<size_t>{}(k.nb0) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<size_t>{}(k.nb1) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<size_t>{}(k.nb2) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(k.layer) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        return h;
-    }
 };
 
 static bool operator==(const ggml_cuda_moe_ids_cache_key & a, const ggml_cuda_moe_ids_cache_key & b) {
     return a.data == b.data && a.nbytes == b.nbytes &&
-        a.ne0 == b.ne0 && a.ne1 == b.ne1 && a.ne2 == b.ne2 &&
-        a.nb0 == b.nb0 && a.nb1 == b.nb1 && a.nb2 == b.nb2 &&
+        a.ne0 == b.ne0 && a.ne1 == b.ne1 && a.ne2 == b.ne2 && a.ne3 == b.ne3 &&
+        a.nb0 == b.nb0 && a.nb1 == b.nb1 && a.nb2 == b.nb2 && a.nb3 == b.nb3 &&
         a.layer == b.layer;
 }
 
+enum ggml_cuda_moe_ids_kind {
+    GGML_CUDA_MOE_IDS_KIND_NONE,
+    GGML_CUDA_MOE_IDS_KIND_GATE,
+    GGML_CUDA_MOE_IDS_KIND_UP,
+    GGML_CUDA_MOE_IDS_KIND_GATE_UP,
+    GGML_CUDA_MOE_IDS_KIND_GATE_AND_UP,
+    GGML_CUDA_MOE_IDS_KIND_DOWN,
+};
+
 struct ggml_cuda_moe_ids_cache_state {
     int device = -1;
-    int last_layer = -1;
-    std::unordered_map<ggml_cuda_moe_ids_cache_key, std::vector<char>, ggml_cuda_moe_ids_cache_key_hash> entries;
+    bool pending = false;
+    ggml_cuda_moe_ids_kind kind = GGML_CUDA_MOE_IDS_KIND_NONE;
+    ggml_cuda_moe_ids_cache_key key = {};
+    std::vector<char> bytes;
 };
+
+static void ggml_cuda_moe_ids_cache_clear_pending(ggml_cuda_moe_ids_cache_state & state) {
+    state.device = -1;
+    state.pending = false;
+    state.kind = GGML_CUDA_MOE_IDS_KIND_NONE;
+    state.key = {};
+}
+
+static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name) {
+    if (name == nullptr) {
+        return GGML_CUDA_MOE_IDS_KIND_NONE;
+    }
+    if (strstr(name, "_gate_up_") != nullptr) {
+        return GGML_CUDA_MOE_IDS_KIND_GATE_UP;
+    }
+    if (strstr(name, "_gate_") != nullptr) {
+        return GGML_CUDA_MOE_IDS_KIND_GATE;
+    }
+    if (strstr(name, "_up_") != nullptr) {
+        return GGML_CUDA_MOE_IDS_KIND_UP;
+    }
+    if (strstr(name, "_down_") != nullptr) {
+        return GGML_CUDA_MOE_IDS_KIND_DOWN;
+    }
+    return GGML_CUDA_MOE_IDS_KIND_NONE;
+}
 
 static int ggml_cuda_moe_layer_from_name(const char * name) {
     if (name == nullptr) {
@@ -2141,9 +2165,11 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
         ids->ne[0],
         ids->ne[1],
         ids->ne[2],
+        ids->ne[3],
         ids->nb[0],
         ids->nb[1],
         ids->nb[2],
+        ids->nb[3],
         layer,
     };
 }
@@ -2256,8 +2282,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 // cache and skip the H2D copy.
 //
 // Steps:
-//   1. D2H the routing decision (ids tensor); decode reuses this across
-//      sibling expert matrices in the same layer when possible.
+//   1. D2H the routing decision (ids tensor); recognized sibling expert
+//      matrices reuse it only within one FFN group.
 //   2. Get-or-create the per-device cache, slot_size = this op's expert stride.
 //      If a cache exists with a different slot size, fall back to per-op
 //      staging (the iteration-1 path) for this op.
@@ -2285,37 +2311,61 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
 
     // 1. Read ids -> host so we can drive acquire() per unique expert.
     thread_local ggml_cuda_moe_ids_cache_state ids_cache;
-    std::vector<char> ids_host_bytes;
+    std::vector<char> ids_host_storage;
+    const std::vector<char> * ids_host_bytes = nullptr;
     uint64_t ids_d2h_time_us = 0;
     uint64_t ids_d2h_sync_count = 0;
     bool ids_cache_hit = false;
     const int layer = ggml_cuda_moe_layer_from_name(src0->name);
-    if (!is_decode || layer < 0 || ids_cache.device != device ||
-            (ids_cache.last_layer >= 0 && layer < ids_cache.last_layer)) {
-        ids_cache.entries.clear();
-        ids_cache.device = device;
-    }
-    ids_cache.last_layer = is_decode ? layer : -1;
-
     const ggml_cuda_moe_ids_cache_key ids_cache_key = ggml_cuda_moe_ids_cache_make_key(ids, layer);
-    if (is_decode && layer >= 0) {
-        auto it = ids_cache.entries.find(ids_cache_key);
-        if (it != ids_cache.entries.end()) {
-            ids_host_bytes = it->second;
+    const ggml_cuda_moe_ids_kind ids_kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
+
+    if (layer < 0) {
+        ggml_cuda_moe_ids_cache_clear_pending(ids_cache);
+    } else if (ids_cache.pending && (ids_cache.device != device || !(ids_cache.key == ids_cache_key))) {
+        ggml_cuda_moe_ids_cache_clear_pending(ids_cache);
+    }
+
+    if (ids_cache.pending) {
+        if ((ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE && ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_UP) ||
+            (ids_kind == GGML_CUDA_MOE_IDS_KIND_UP && ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE)) {
+            ids_cache.kind = GGML_CUDA_MOE_IDS_KIND_GATE_AND_UP;
             ids_cache_hit = true;
+        } else if (ids_kind == GGML_CUDA_MOE_IDS_KIND_DOWN &&
+                (ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_UP ||
+                 ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE_UP ||
+                 ids_cache.kind == GGML_CUDA_MOE_IDS_KIND_GATE_AND_UP)) {
+            ids_cache_hit = true;
+            ggml_cuda_moe_ids_cache_clear_pending(ids_cache);
+        } else {
+            ggml_cuda_moe_ids_cache_clear_pending(ids_cache);
+        }
+
+        if (ids_cache_hit) {
+            ids_host_bytes = &ids_cache.bytes;
         }
     }
 
     if (!ids_cache_hit) {
-        ids_host_bytes.resize(ggml_nbytes(ids));
+        const bool starts_group = layer >= 0 && (ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE ||
+            ids_kind == GGML_CUDA_MOE_IDS_KIND_UP || ids_kind == GGML_CUDA_MOE_IDS_KIND_GATE_UP);
+        std::vector<char> * ids_d2h_target = starts_group ? &ids_cache.bytes : &ids_host_storage;
+        ids_d2h_target->resize(ggml_nbytes(ids));
         const int64_t ids_d2h_start_us = ggml_time_us();
-        CUDA_CHECK(cudaMemcpyAsync(ids_host_bytes.data(), ids->data, ggml_nbytes(ids),
+        CUDA_CHECK(cudaMemcpyAsync(ids_d2h_target->data(), ids->data, ggml_nbytes(ids),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         ids_d2h_sync_count = 1;
         ids_d2h_time_us = (uint64_t) (ggml_time_us() - ids_d2h_start_us);
-        if (is_decode && layer >= 0) {
-            ids_cache.entries[ids_cache_key] = ids_host_bytes;
+        ids_host_bytes = ids_d2h_target;
+
+        if (starts_group) {
+            ids_cache.device = device;
+            ids_cache.key = ids_cache_key;
+            ids_cache.kind = ids_kind;
+            ids_cache.pending = true;
+        } else {
+            ggml_cuda_moe_ids_cache_clear_pending(ids_cache);
         }
     }
 
@@ -2334,7 +2384,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     if (cache == nullptr) {
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, false);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false);
         return;
     }
 
@@ -2364,7 +2414,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     for (int64_t i2 = 0; i2 < ids_ne2 && !overflow; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1 && !overflow; ++i1) {
             for (int64_t i0 = 0; i0 < ids_ne0 && !overflow; ++i0) {
-                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                const int32_t eid = *(const int32_t *)(ids_host_bytes->data()
                     + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
                 GGML_ASSERT(eid >= 0 && eid < n_experts_total);
                 if (expert_to_slot[eid] == -2) continue;
@@ -2381,7 +2431,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (overflow) {
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, true);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, true);
         return;
     }
 
@@ -2425,7 +2475,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
             for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
-                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                const int32_t eid = *(const int32_t *)(ids_host_bytes->data()
                     + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
                 if (expert_to_slot[eid] >= 0) continue;
 
@@ -2445,7 +2495,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (any_cache_failure) {
         // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
         // Fall back so we still produce correct output.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, ids_host_bytes, is_decode, false);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false);
         return;
     }
     const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
@@ -2472,7 +2522,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
         for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
             for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
-                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                const int32_t eid = *(const int32_t *)(ids_host_bytes->data()
                     + i2*ids_nb2 + i1*ids_nb1 + i0*ids_nb0);
                 remapped_ids_host.push_back(expert_to_slot[eid]);
             }
