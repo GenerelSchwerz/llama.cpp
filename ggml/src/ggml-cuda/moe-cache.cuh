@@ -80,7 +80,6 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,
     const void * const * host_srcs,
     int                  n_host_srcs,
-    const int *          admission_order,
     size_t               byte_count,
     int                  min_resident,
     int *                slot_ids,
