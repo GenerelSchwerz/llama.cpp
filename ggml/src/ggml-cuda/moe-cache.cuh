@@ -128,6 +128,7 @@ void * ggml_cuda_moe_cache_slot_ptr(
 size_t       ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * cache);
 int          ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache);
 cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache);
+const void * ggml_cuda_moe_cache_mapped_source(const struct ggml_cuda_moe_cache * cache);
 
 void ggml_cuda_moe_cache_mark_used(
     struct ggml_cuda_moe_cache * cache,
