@@ -2192,22 +2192,6 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
     };
 }
 
-static __global__ void ggml_cuda_copy_mapped_experts(
-        const char * src, char * dst, const int32_t * expert_ids, size_t expert_stride, int n_experts) {
-    const int expert = (int) blockIdx.y;
-    if (expert >= n_experts) {
-        return;
-    }
-
-    const char * expert_src = src + (size_t) expert_ids[expert] * expert_stride;
-    char * expert_dst = dst + (size_t) expert * expert_stride;
-    const size_t offset0 = ((size_t) blockIdx.x * blockDim.x + threadIdx.x) * sizeof(uint4);
-    const size_t step = (size_t) gridDim.x * blockDim.x * sizeof(uint4);
-    for (size_t offset = offset0; offset < expert_stride; offset += step) {
-        *(uint4 *) (expert_dst + offset) = *(const uint4 *) (expert_src + offset);
-    }
-}
-
 // Per-op staging fallback for the cached path. Used when the persistent cache
 // either isn't initialized or its slot size doesn't match this op's expert
 // stride. Same approach as iteration 1: stage every unique expert touched by
@@ -2266,10 +2250,6 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int> split_slot_ids(n_unique, -1);
     int n_resident = 0;
     bool split_staged = false;
-    const void * mapped_source = cache ? ggml_cuda_moe_cache_mapped_source(cache) : nullptr;
-    const bool use_mapped_source = mapped_source && expert_stride % sizeof(uint4) == 0 &&
-        (uintptr_t) mapped_source % alignof(uint4) == 0 &&
-        (uintptr_t) scratch_experts.get() % alignof(uint4) == 0;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
@@ -2277,28 +2257,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         if (ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
-                split_slot_ids.data(), &n_resident, use_mapped_source ? nullptr : scratch_experts.get(), stream);
+                split_slot_ids.data(), &n_resident, scratch_experts.get(), stream);
         }
-    }
-
-    if (split_staged && use_mapped_source) {
-        std::vector<int32_t> miss_experts_host;
-        miss_experts_host.reserve(n_unique - n_resident);
-        for (int i = 0; i < n_unique; ++i) {
-            if (split_slot_ids[i] < 0) {
-                miss_experts_host.push_back(unique_experts[i]);
-            }
-        }
-
-        ggml_cuda_pool_alloc<int32_t> miss_experts(ctx.pool(), miss_experts_host.size());
-        CUDA_CHECK(cudaMemcpyAsync(miss_experts.get(), miss_experts_host.data(),
-                                   miss_experts_host.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        const int copy_blocks = (int) std::min<size_t>(
-            128, (expert_stride + 256 * sizeof(uint4) - 1) / (256 * sizeof(uint4)));
-        ggml_cuda_copy_mapped_experts<<<dim3(copy_blocks, miss_experts_host.size()), 256, 0, stream>>>(
-            (const char *) mapped_source, scratch_experts.get(), miss_experts.get(),
-            expert_stride, (int) miss_experts_host.size());
-        CUDA_CHECK(cudaGetLastError());
     }
 
     bool cache_staged = false;

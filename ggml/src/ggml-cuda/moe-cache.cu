@@ -745,7 +745,6 @@ struct ggml_cuda_moe_cache {
 
     std::string tensor_name;
     const void * tensor_data = nullptr;
-    const void * tensor_device_data = nullptr;
     int64_t n_experts = 0;
     uint64_t expert_access_counter = 0;
     std::vector<uint64_t> expert_access_counts;
@@ -1252,7 +1251,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     cudaStream_t         compute_stream) {
 
     if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
-        !slot_ids || !out_n_resident || (!miss_dst && !cache->tensor_device_data) || !compute_stream) {
+        !slot_ids || !out_n_resident || !miss_dst || !compute_stream) {
         return false;
     }
     for (int i = 0; i < n_host_srcs; ++i) {
@@ -1276,25 +1275,13 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         return false;
     }
 
-    int miss = 0;
-    for (int i = 0; i < n_host_srcs; ++i) {
-        if (slot_ids[i] >= 0) {
-            cache->slot_pin_count[slot_ids[i]]++;
-        }
-    }
-
-    if (!miss_dst) {
-        CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
-        CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
-        *out_n_resident = n_resident;
-        return true;
-    }
-
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
+    int miss = 0;
     for (int i = 0; i < n_host_srcs;) {
         if (slot_ids[i] >= 0) {
+            cache->slot_pin_count[slot_ids[i]]++;
             ++i;
             continue;
         }
@@ -1436,11 +1423,6 @@ int ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache) {
 extern "C"
 cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache) {
     return cache ? cache->copy_stream : nullptr;
-}
-
-extern "C"
-const void * ggml_cuda_moe_cache_mapped_source(const struct ggml_cuda_moe_cache * cache) {
-    return cache ? cache->tensor_device_data : nullptr;
 }
 
 extern "C"
@@ -2201,15 +2183,6 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
     c->tensor_name = tensor_name_for_log;
     c->tensor_data = tensor_data;
     c->n_experts = n_experts;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    cudaPointerAttributes attributes = {};
-    cudaError_t attr_err = cudaPointerGetAttributes(&attributes, tensor_data);
-    if (attr_err == cudaSuccess && attributes.type == cudaMemoryTypeHost && attributes.devicePointer != nullptr) {
-        c->tensor_device_data = attributes.devicePointer;
-    } else if (attr_err != cudaSuccess) {
-        (void) cudaGetLastError();
-    }
-#endif
     reg.by_key.emplace(k, c);
     GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots x %.2f MiB)\n",
                   tensor_name_for_log,
