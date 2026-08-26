@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
+#include "ggml-cuda/mmid.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
@@ -1919,8 +1920,17 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+struct ggml_cuda_mul_mat_id_host_route {
+    const char * data;
+    size_t nb0;
+    size_t nb1;
+    const int32_t * expert_map;
+};
+
 // Shared by the regular and cached-buffer dispatch paths.
-static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool use_mmq) {
+static void ggml_cuda_mul_mat_id_impl(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool use_mmq,
+        const ggml_cuda_mul_mat_id_host_route * host_route = nullptr) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -1931,11 +1941,12 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool mapped_experts = host_route != nullptr && host_route->expert_map != nullptr;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+        if (!mapped_experts && ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
@@ -1950,19 +1961,19 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
             }
         }
 
-        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (!mapped_experts && use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
 
-        if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if (!mapped_experts && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return;
         }
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
-    GGML_ASSERT(!use_mmq || ggml_cuda_mul_mat_id_needs_sync(dst, cc));
+    GGML_ASSERT(mapped_experts || !use_mmq || ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(nb12 % nb11 == 0);
@@ -1976,45 +1987,81 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
 
     const int64_t n_expert_used = ids->ne[0];
     const int64_t ne_get_rows = ne12 * n_expert_used;
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    const bool ids_helper_fits = ne12 < (1 << 22) && (size_t) ne12*sizeof(uint32_t) <= smpbo &&
+        n_expert_used < (1 << 10) && ne02 <= INT_MAX;
+    const bool use_device_ids = host_route != nullptr && ids->type == GGML_TYPE_I32 &&
+        ids->ne[1] == ne12 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
+        ids->nb[0] == ggml_element_size(ids) && host_route->nb0 == sizeof(int32_t) &&
+        ids_helper_fits;
 
     std::vector<int32_t> ids_to_sorted_host;
-    ids_to_sorted_host.reserve(2*ne_get_rows);
-    std::vector<int32_t> ids_from_sorted_host(ne_get_rows);
+    std::vector<int32_t> ids_from_sorted_host;
+    if (!use_device_ids) {
+        ids_to_sorted_host.reserve(2*ne_get_rows);
+        ids_from_sorted_host.resize(ne_get_rows);
+    }
 
-    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), 2*ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_buf_dev(ctx.pool(), (use_device_ids ? 3 : 2)*ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool());
+    if (use_device_ids) {
+        expert_bounds.alloc(ne02 + 1);
+    }
 
     std::vector<int32_t> tokens_per_expert(ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
-    std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::vector<char> ids_host;
+    const char * ids_host_data = host_route ? host_route->data : nullptr;
+    size_t ids_host_nb0 = host_route ? host_route->nb0 : 0;
+    size_t ids_host_nb1 = host_route ? host_route->nb1 : 0;
+    if (!use_device_ids) {
+        ids_host.resize(ggml_nbytes(ids));
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        ids_host_data = ids_host.data();
+        ids_host_nb0 = ids->nb[0];
+        ids_host_nb1 = ids->nb[1];
+    }
 
-    for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
+    for (int64_t i02 = 0; i02 < ne02; ++i02) {
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
-                const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
+                const int32_t expert_to_use = *(const int32_t *)(ids_host_data + i12*ids_host_nb1 + iex*ids_host_nb0);
                 assert(expert_to_use >= 0 && expert_to_use < ne02);
                 if (expert_to_use == i02) {
-                    ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
-                    ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+                    if (!use_device_ids) {
+                        ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
+                        ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
+                    }
                     tokens_per_expert[i02]++;
                     break;
                 }
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
-
-    ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
-
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
     const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    if (use_device_ids) {
+        int32_t * ids_dst = ids_buf_dev.ptr + 2*ne_get_rows;
+        const int si1 = ids->nb[1] / ggml_element_size(ids);
+        const int sis1 = nb12 / nb11;
+        ggml_cuda_launch_mm_ids_helper(
+            (const int32_t *) ids->data, ids_buf_dev.ptr, ids_dst, expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
+        ggml_cuda_launch_mm_ids_helper(
+            (const int32_t *) ids->data, ids_buf_dev.ptr + ne_get_rows, ids_dst, expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, si1, sis1, true, stream);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
+        ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
+        CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
@@ -2034,7 +2081,9 @@ static void ggml_cuda_mul_mat_id_impl(ggml_backend_cuda_context & ctx, ggml_tens
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        const int32_t physical_expert = host_route && host_route->expert_map ? host_route->expert_map[i02] : i02;
+        GGML_ASSERT(physical_expert >= 0);
+        src0_slice.data     = (char *) src0->data + physical_expert*nb02;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -2358,44 +2407,20 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         return;
     }
 
-    std::vector<int32_t> remapped_ids_host;
-    remapped_ids_host.reserve(ids_total_elems);
-    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
-        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
-            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
-                const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
-                    + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
-                remapped_ids_host.push_back(expert_to_pos[eid]);
-            }
-        }
-    }
-
-    ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
-    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
-                               ids_total_elems * sizeof(int32_t),
-                               cudaMemcpyHostToDevice, stream));
-
     ggml_tensor src0_synth = *src0;
-    src0_synth.ne[2] = n_unique;
-    src0_synth.nb[3] = src0_synth.nb[2] * (size_t) n_unique;
+    src0_synth.ne[2] = n_experts_total;
+    src0_synth.nb[3] = src0_synth.nb[2] * (size_t) n_experts_total;
     src0_synth.data  = scratch_experts.get();
 
-    ggml_tensor ids_synth = *ids;
-    ids_synth.data  = scratch_ids.get();
-    ids_synth.nb[0] = sizeof(int32_t);
-    ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
-    ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
-    ids_synth.nb[3] = ids_synth.nb[2];
-
     ggml_tensor * orig_src0 = dst->src[0];
-    ggml_tensor * orig_ids  = dst->src[2];
     dst->src[0] = &src0_synth;
-    dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq);
+    const ggml_cuda_mul_mat_id_host_route host_route = {
+        ids_host_bytes.data(), ids_host_nb0, ids_host_nb1, expert_to_pos.data(),
+    };
+    ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route);
 
     dst->src[0] = orig_src0;
-    dst->src[2] = orig_ids;
 
     ggml_cuda_moe_record_op_stats(
         is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
@@ -2692,57 +2717,24 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         copy_wait_event_time_us = (uint64_t) (ggml_time_us() - event_start_us);
     }
 
-    // 4. Build remapped ids on host and push to a scratch GPU buffer. Each
-    //    entry now points at slot_id within the cache pool.
-    const int64_t remap_start_us = ggml_time_us();
-    const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
-    std::vector<int32_t> remapped_ids_host;
-    remapped_ids_host.reserve(ids_total_elems);
-    for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
-        for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
-            for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
-                const int32_t eid = *(const int32_t *)(ids_host_bytes->data()
-                    + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
-                remapped_ids_host.push_back(expert_to_slot[eid]);
-            }
-        }
-    }
-
-    ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), ids_total_elems);
-    CUDA_CHECK(cudaMemcpyAsync(scratch_ids.get(), remapped_ids_host.data(),
-                               ids_total_elems * sizeof(int32_t),
-                               cudaMemcpyHostToDevice, stream));
-    const uint64_t remap_time_us = (uint64_t) (ggml_time_us() - remap_start_us);
-
-    // 5. Synthetic src0 points at the cache slot pool. Slots in this pool
-    //    are tightly packed at expert_stride apart, so the original src0
-    //    nb[0]/nb[1]/nb[2] stay valid; only ne[2] (now n_slots) and the
-    //    base data pointer change. ggml_is_contiguous(src0_synth) holds.
-    const int    n_slots         = ggml_cuda_moe_cache_n_slots(cache);
-    void *       pool_d          = ggml_cuda_moe_cache_slot_ptr(cache, 0); // base of slot 0
+    const uint64_t remap_time_us = 0;
+    void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0);
 
     ggml_tensor src0_synth = *src0;
-    src0_synth.ne[2] = n_slots;
-    src0_synth.nb[3] = src0_synth.nb[2] * (size_t)n_slots;
+    src0_synth.ne[2] = n_experts_total;
+    src0_synth.nb[3] = src0_synth.nb[2] * (size_t)n_experts_total;
     src0_synth.data  = pool_d;
 
-    ggml_tensor ids_synth = *ids;
-    ids_synth.data  = scratch_ids.get();
-    ids_synth.nb[0] = sizeof(int32_t);
-    ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
-    ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
-    ids_synth.nb[3] = ids_synth.nb[2];
-
     ggml_tensor * orig_src0 = dst->src[0];
-    ggml_tensor * orig_ids  = dst->src[2];
     dst->src[0] = &src0_synth;
-    dst->src[2] = &ids_synth;
 
-    ggml_cuda_mul_mat_id_impl(ctx, dst, false);
+    const ggml_cuda_mul_mat_id_host_route host_route = {
+        ids_host_bytes->data(), ids_host_nb0, ids_host_nb1, expert_to_slot.data(),
+    };
+    ggml_cuda_mul_mat_id_impl(ctx, dst, false, &host_route);
     ggml_cuda_moe_cache_mark_used(cache, stream);
 
     dst->src[0] = orig_src0;
-    dst->src[2] = orig_ids;
 
     ggml_cuda_moe_record_op_stats(
         is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
