@@ -1966,8 +1966,33 @@ static void ggml_cuda_mul_mat_id_impl(
             }
         }
 
-        if (!mapped_experts && use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (mapped_experts) {
+                int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : 0;
+                if (source_split == 0) {
+                    for (int64_t i02 = 0; i02 < ne02; ++i02) {
+                        source_split = std::max(source_split, host_route->expert_map[i02] + 1);
+                    }
+                }
+                GGML_ASSERT(source_split > 0);
+
+                ggml_cuda_pool_alloc<int32_t> expert_map(ctx.pool(), ne02);
+                ggml_cuda_pool_alloc<int32_t> source_wait_class(ctx.pool());
+                CUDA_CHECK(cudaMemcpyAsync(expert_map.get(), host_route->expert_map,
+                                           ne02 * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+                if (host_route->source_wait_class != nullptr) {
+                    source_wait_class.alloc(ne02);
+                    CUDA_CHECK(cudaMemcpyAsync(source_wait_class.get(), host_route->source_wait_class,
+                                               ne02 * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+                }
+
+                ggml_cuda_mul_mat_q_mapped(
+                    ctx, src0, host_route->secondary_data ? host_route->secondary_data : src0->data,
+                    src1, ids, dst, expert_map.get(), source_split,
+                    source_wait_class.get(), host_route->stage_ready);
+            } else {
+                ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            }
             return;
         }
 
@@ -2221,6 +2246,11 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
     return GGML_CUDA_MOE_IDS_KIND_NONE;
 }
 
+static bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
+    const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
+    return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens >= 512;
+}
+
 static const char * ggml_cuda_moe_ids_kind_pattern(ggml_cuda_moe_ids_kind kind) {
     switch (kind) {
         case GGML_CUDA_MOE_IDS_KIND_GATE:    return "_gate_";
@@ -2285,7 +2315,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * ids  = dst->src[2];
     cudaStream_t  stream = ctx.stream();
-    const bool    use_mmq = false;
+    const bool    use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
 
     const int64_t n_experts_total = src0->ne[2];
     const size_t  expert_stride   = src0->nb[2];
@@ -2391,7 +2421,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             ids_host_bytes.data(), ids_host_nb0, ids_host_nb1, expert_source_host.data(),
             scratch_experts.get(), n_slots, n_misses, expert_wait_class_host.data(), stage_ready.get(),
         };
-        ggml_cuda_mul_mat_id_impl(ctx, dst, false, &host_route);
+        ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route);
         dst->src[0] = orig_src0;
 
         if (stage_ready.get() != nullptr) {
@@ -2503,6 +2533,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     cudaStream_t stream = ctx.stream();
     const int    device = ggml_cuda_get_device();
     const bool   is_decode = ids->ne[1] * ids->ne[2] == 1;
+    const bool   use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
 
     // 1. Read ids -> host so we can drive acquire() per unique expert.
     thread_local ggml_cuda_moe_ids_cache_state ids_cache;
@@ -2800,7 +2831,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         ggml_tensor * orig_ids = dst->src[2];
         dst->src[0] = &src0_synth;
         dst->src[2] = &ids_synth;
-        ggml_cuda_mul_mat_id_impl(ctx, dst, false);
+        ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq);
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
     } else {
@@ -2814,7 +2845,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
         const ggml_cuda_mul_mat_id_host_route host_route = {
             ids_host_bytes->data(), ids_host_nb0, ids_host_nb1, expert_to_slot.data(),
         };
-        ggml_cuda_mul_mat_id_impl(ctx, dst, false, &host_route);
+        ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route);
         dst->src[0] = orig_src0;
     }
     ggml_cuda_moe_cache_mark_used(cache, stream);
