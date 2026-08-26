@@ -2446,6 +2446,17 @@ extern "C" {
     GGML_API enum ggml_prec ggml_flash_attn_ext_get_prec(
             const struct ggml_tensor * a);
 
+    enum ggml_flash_attn_ext_op_param {
+        // scale, max_bias, logit_softcap and prec occupy slots 0-3
+        GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS = 4,
+    };
+
+    // Let backends consume supported quantized K/V layouts directly instead
+    // of materializing an intermediate cache representation.
+    GGML_API void ggml_flash_attn_ext_set_native_quants(
+            struct ggml_tensor * a,
+            bool                 enabled);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

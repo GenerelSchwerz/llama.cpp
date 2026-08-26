@@ -402,6 +402,10 @@ extern "C" {
         bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
+        bool flash_attn_native_quants; // let Flash Attention read a quantized K/V cache in place instead of
+                                       // casting it to F16 first; removes the transient F16 copy of the
+                                       // attention window. Backend support is optional: where it is absent
+                                       // the F16-casting path is used and the backend may report a warning.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
