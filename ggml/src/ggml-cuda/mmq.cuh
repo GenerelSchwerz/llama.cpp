@@ -969,21 +969,21 @@ static __global__ void mul_mat_q(
 
     const uint32_t nty = (nrows_x + I - 1) / I; // Number of tiles y
 
-    // Initialize the ids for writing back data with just the index.
-    // For regular matrix multiplications this is never changed.
-    // For MoE the correct indices are loaded from ids_dst.
     extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+    if constexpr (!use_x_map) {
+        // Initialize the ids for regular matrix multiplication.
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
-        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+        for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+            const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
 
-        if (j0 + nwarps*warp_size > J && j >= J) {
-            break;
+            if (j0 + nwarps*warp_size > J && j >= J) {
+                break;
+            }
+
+            ids_dst_shared[j] = j;
         }
-
-        ids_dst_shared[j] = j;
+        __syncthreads();
     }
-    __syncthreads();
 
     if constexpr (!ggml_cuda_mmq_get_stream_k(type, J, fallback)) {
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
