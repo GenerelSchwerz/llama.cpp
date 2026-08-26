@@ -2280,52 +2280,89 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
     if (split_staged) {
-        std::vector<int32_t> resident_expert_to_slot(n_experts_total, -1);
         std::vector<int32_t> miss_expert_to_pos(n_experts_total, -1);
         int n_misses = 0;
         for (int i = 0; i < n_unique; ++i) {
             const int32_t eid = unique_experts[i];
-            if (split_slot_ids[i] >= 0) {
-                resident_expert_to_slot[eid] = split_slot_ids[i];
-            } else {
+            if (split_slot_ids[i] < 0) {
                 miss_expert_to_pos[eid] = n_misses++;
             }
         }
         GGML_ASSERT(n_resident > 0 && n_misses > 0 && n_resident + n_misses == n_unique);
 
-        const int32_t inactive = (int32_t)n_experts_total;
-        std::vector<int32_t> resident_ids_host;
-        std::vector<int32_t> miss_ids_host;
-        resident_ids_host.reserve(ids_total_elems);
-        miss_ids_host.reserve(ids_total_elems);
-        int64_t n_resident_rows = 0;
-        int64_t n_miss_rows = 0;
+        const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
+        const int n_split_experts = n_slots + n_misses;
+        std::vector<int32_t> expert_to_split(n_experts_total, -1);
+        for (int i = 0; i < n_unique; ++i) {
+            const int32_t eid = unique_experts[i];
+            expert_to_split[eid] = split_slot_ids[i] >= 0 ? split_slot_ids[i] : n_slots + miss_expert_to_pos[eid];
+        }
+
+        std::vector<int32_t> split_counts(n_split_experts, 0);
         for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
             for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
                 for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
                     const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
                         + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
-                    const int32_t resident_slot = resident_expert_to_slot[eid];
-                    const int32_t miss_pos = miss_expert_to_pos[eid];
-                    resident_ids_host.push_back(resident_slot >= 0 ? resident_slot : inactive);
-                    miss_ids_host.push_back(miss_pos >= 0 ? miss_pos : inactive);
-                    n_resident_rows += resident_slot >= 0;
-                    n_miss_rows += miss_pos >= 0;
+                    split_counts[expert_to_split[eid]]++;
                 }
             }
         }
-        GGML_ASSERT(n_resident_rows > 0 && n_miss_rows > 0 &&
-                    n_resident_rows + n_miss_rows == (int64_t)ids_total_elems);
 
-        ggml_cuda_pool_alloc<int32_t> resident_ids(ctx.pool(), ids_total_elems);
-        ggml_cuda_pool_alloc<int32_t> miss_ids(ctx.pool(), ids_total_elems);
-        CUDA_CHECK(cudaMemcpyAsync(resident_ids.get(), resident_ids_host.data(),
+        std::vector<int32_t> split_bounds(n_split_experts + 1, 0);
+        for (int i = 0; i < n_split_experts; ++i) {
+            split_bounds[i + 1] = split_bounds[i] + split_counts[i];
+        }
+        const int32_t n_resident_rows = split_bounds[n_slots];
+        const int32_t n_miss_rows = split_bounds[n_split_experts] - n_resident_rows;
+        GGML_ASSERT(n_resident_rows > 0 && n_miss_rows > 0 &&
+                    n_resident_rows + n_miss_rows == (int32_t)ids_total_elems);
+
+        const ggml_tensor * src1 = dst->src[1];
+        const bool dedup_bcast = src1->ne[1] == 1 && ids_ne0 > 1;
+        const int64_t sis1 = src1->nb[2] / src1->nb[1];
+        std::vector<int32_t> ids_src1_host(ids_total_elems);
+        std::vector<int32_t> ids_dst_host(ids_total_elems);
+        std::vector<int32_t> split_next(split_bounds.begin(), split_bounds.end() - 1);
+        for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+                const int64_t token = i2 * ids_ne1 + i1;
+                for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                    const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                        + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
+                    const int32_t compact = split_next[expert_to_split[eid]]++;
+                    const int32_t dst_row = (int32_t)(token * ids_ne0 + i0);
+                    ids_dst_host[compact] = dst_row;
+                    if (dedup_bcast) {
+                        ids_src1_host[dst_row] = compact;
+                    } else {
+                        ids_src1_host[compact] = (int32_t)(token * sis1 + i0 % src1->ne[1]);
+                    }
+                }
+            }
+        }
+
+        std::vector<int32_t> resident_bounds(split_bounds.begin(), split_bounds.begin() + n_slots + 1);
+        std::vector<int32_t> miss_bounds(split_bounds.begin() + n_slots, split_bounds.end());
+        for (int32_t & bound : miss_bounds) {
+            bound -= n_resident_rows;
+        }
+
+        ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ids_total_elems);
+        ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ids_total_elems);
+        ggml_cuda_pool_alloc<int32_t> resident_bounds_dev(ctx.pool(), resident_bounds.size());
+        ggml_cuda_pool_alloc<int32_t> miss_bounds_dev(ctx.pool(), miss_bounds.size());
+        CUDA_CHECK(cudaMemcpyAsync(ids_src1.get(), ids_src1_host.data(),
                                    ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(miss_ids.get(), miss_ids_host.data(),
+        CUDA_CHECK(cudaMemcpyAsync(ids_dst.get(), ids_dst_host.data(),
                                    ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(resident_bounds_dev.get(), resident_bounds.data(),
+                                   resident_bounds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(miss_bounds_dev.get(), miss_bounds.data(),
+                                   miss_bounds.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
 
         ggml_tensor resident_src0 = *src0;
-        resident_src0.ne[2] = ggml_cuda_moe_cache_n_slots(cache);
+        resident_src0.ne[2] = n_slots;
         resident_src0.nb[3] = resident_src0.nb[2] * (size_t)resident_src0.ne[2];
         resident_src0.data = ggml_cuda_moe_cache_slot_ptr(cache, 0);
 
@@ -2334,24 +2371,9 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         miss_src0.nb[3] = miss_src0.nb[2] * (size_t)n_misses;
         miss_src0.data = scratch_experts.get();
 
-        ggml_tensor ids_synth = *ids;
-        ids_synth.nb[0] = sizeof(int32_t);
-        ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
-        ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
-        ids_synth.nb[3] = ids_synth.nb[2];
-
-        ggml_tensor * orig_src0 = dst->src[0];
-        ggml_tensor * orig_ids = dst->src[2];
-        dst->src[0] = &resident_src0;
-        ids_synth.data = resident_ids.get();
-        dst->src[2] = &ids_synth;
-        ggml_cuda_mul_mat_q_active(ctx, &resident_src0, dst->src[1], &ids_synth, dst, n_resident_rows);
-
-        dst->src[0] = &miss_src0;
-        ids_synth.data = miss_ids.get();
-        ggml_cuda_mul_mat_q_active(ctx, &miss_src0, dst->src[1], &ids_synth, dst, n_miss_rows);
-        dst->src[0] = orig_src0;
-        dst->src[2] = orig_ids;
+        ggml_cuda_mul_mat_q_split(
+            ctx, &resident_src0, &miss_src0, src1, dst, ids_src1.get(), ids_dst.get(),
+            resident_bounds_dev.get(), miss_bounds_dev.get(), n_resident_rows, n_miss_rows);
 
         const bool slots_released = ggml_cuda_moe_cache_release_split_slots(
             cache, split_slot_ids.data(), n_unique, stream);

@@ -1594,8 +1594,9 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
-void ggml_cuda_mul_mat_q_active(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        int64_t n_active_rows);
+void ggml_cuda_mul_mat_q_split(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * resident_src0, const ggml_tensor * miss_src0,
+        const ggml_tensor * src1, ggml_tensor * dst, const int32_t * ids_src1, const int32_t * ids_dst,
+        const int32_t * resident_bounds, const int32_t * miss_bounds, int64_t n_resident_rows, int64_t n_miss_rows);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
