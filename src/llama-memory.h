@@ -14,6 +14,12 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+struct llama_memory_placement_options {
+    bool cpu_pinned = false;
+    uint32_t gpu_resident_layers = 0;
+    bool recurrent_offload = false;
+};
+
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
@@ -99,6 +105,13 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+
+    virtual bool recurrent_sparse_snapshots_supported() const { return false; }
+    virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
+
+    virtual bool get_supports_partial_kv() const {
+        return false;
+    }
 
     //
     // ops

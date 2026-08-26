@@ -7715,7 +7715,9 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
         case GGML_OP_GATED_DELTA_NET:
             {
                 // Match the Vulkan backend: only F32 -> F32, S_v in {16, 32, 64, 128}.
-                if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+                if (op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+                    !ggml_gated_delta_net_has_default_snapshot_params(op) ||
+                    !ggml_are_same_stride(op->src[0], op->src[1])) {
                     return false;
                 }
                 const int64_t S_v = op->src[2]->ne[0];

@@ -357,6 +357,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
+        uint32_t kv_gpu_layers;         // with offload_kqv=false, keep this many standard or direct hybrid attention KV layers on their assigned devices
         int32_t  n_threads;             // number of threads to use for generation
         int32_t  n_threads_batch;       // number of threads to use for batch processing
 
@@ -399,6 +400,9 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+        bool kv_cpu_pinned;           // use pinned host buffers for CPU-resident KV cache storage when available
+        bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
+        bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
@@ -406,8 +410,7 @@ extern "C" {
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
 
-        // a source/target/parent context
-        // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+        // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
     };
 
@@ -962,6 +965,7 @@ extern "C" {
     // For encode-decoder contexts, processes the batch using the encoder.
     // Can store the encoder output internally for later use by the decoder's cross-attention layers.
     //   0 - success
+    //  -2 - failed to prepare or allocate execution resources
     // < 0 - error. the memory state is restored to the state before this call
     LLAMA_API int32_t llama_encode(
             struct llama_context * ctx,
@@ -978,6 +982,7 @@ extern "C" {
     //    1 - could not find a KV slot for the batch (try reducing the size of the batch or increase the context)
     //    2 - aborted     (processed ubatches will remain in the context's memory)
     //   -1 - invalid input batch
+    //   -2 - failed to prepare or allocate execution resources
     // < -1 - fatal error (processed ubatches will remain in the context's memory)
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,

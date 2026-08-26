@@ -425,6 +425,10 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
+    if (op->op == GGML_OP_GATED_DELTA_NET && !ggml_gated_delta_net_validate(op)) {
+        return false;
+    }
+
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
     }
@@ -440,8 +444,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
-        case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
+            if (op->src[0] != nullptr && op->src[0]->type == op->type) {
+                return true;
+            }
+            [[fallthrough]];
+        case GGML_OP_CPY:
             return
                 op->type != GGML_TYPE_IQ3_XXS &&
                 op->type != GGML_TYPE_IQ3_S   &&

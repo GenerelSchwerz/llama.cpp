@@ -25,7 +25,8 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter_mla,
     const layer_filter_cb & filter_lid,
-    const  layer_reuse_cb & reuse) :
+    const  layer_reuse_cb & reuse,
+    llama_memory_placement_options placement) :
     hparams_lid(model.hparams), n_stream(unified ? 1 : n_seq_max) {
 
     LLAMA_LOG_INFO("%s: creating main KV cache, size = %u cells\n", __func__, kv_size);
@@ -33,7 +34,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_mla = std::make_unique<llama_kv_cache>(
             model, model.hparams, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_mla, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_mla, reuse, nullptr, placement);
 
     // we use llama_kv_cache for caching indexer keys
     // by hand-tweaking some hparams we fool it to create
@@ -50,7 +51,7 @@ llama_kv_cache_dsa::llama_kv_cache_dsa(
     kv_lid = std::make_unique<llama_kv_cache>(
             model, hparams_lid, type_k, type_v,
             v_trans, offload, unified, kv_size, n_seq_max, n_pad,
-            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr);
+            n_swa, swa_type, nullptr, filter_lid, reuse, nullptr, placement);
 }
 
 void llama_kv_cache_dsa::clear(bool data) {

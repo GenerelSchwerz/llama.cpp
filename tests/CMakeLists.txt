@@ -151,6 +151,8 @@ endif ()
 llama_build(test-recurrent-state-rollback.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_RECURRENT_INTERNALS)
+
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
     llama_build_and_test(test-unicode.cpp)
     llama_build_and_test(test-sampling.cpp)
@@ -196,6 +198,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # llama_build_and_test(test-double-float.cpp) # SLOW
 
     llama_build_and_test(test-llama-archs.cpp)
+
+    llama_test(
+        test-llama-archs
+        NAME test-phase-aware-workspace
+        LABEL main
+        ARGS --test-phase-workspace
+    )
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
@@ -289,6 +298,12 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+if (GGML_RPC AND UNIX)
+    target_compile_definitions(test-backend-ops PRIVATE GGML_TEST_RPC)
+    target_link_libraries(test-backend-ops PRIVATE ggml-rpc)
+    llama_test(test-backend-ops NAME test-backend-ops-rpc-gdn-rejection LABEL main ARGS --rpc-gdn-rejection)
+    set_tests_properties(test-backend-ops-rpc-gdn-rejection PROPERTIES TIMEOUT 15)
+endif()
 
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
