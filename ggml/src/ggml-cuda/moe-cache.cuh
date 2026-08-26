@@ -76,6 +76,23 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     void *               dst,
     cudaStream_t         compute_stream);
 
+bool ggml_cuda_moe_cache_prepare_split_staging(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    int                  min_resident,
+    int *                slot_ids,
+    int *                out_n_resident,
+    void *               miss_dst,
+    cudaStream_t         compute_stream);
+
+bool ggml_cuda_moe_cache_release_split_slots(
+    struct ggml_cuda_moe_cache * cache,
+    const int *          slot_ids,
+    int                  n_slot_ids,
+    cudaStream_t         compute_stream);
+
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
     bool     staged,

@@ -697,6 +697,7 @@ struct ggml_cuda_moe_cache {
     std::vector<char>         slot_prefetched;
     std::vector<uint64_t>     slot_hit_count;
     std::vector<uint64_t>     slot_fill_access;
+    std::vector<uint32_t>     slot_pin_count;
 
     // host_ptr -> slot_id, O(1) lookup.
     std::unordered_map<const void *, int> host_to_slot;
@@ -853,6 +854,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->slot_prefetched.assign(n_slots, 0);
     c->slot_hit_count.assign(n_slots, 0);
     c->slot_fill_access.assign(n_slots, 0);
+    c->slot_pin_count.assign(n_slots, 0);
     c->host_to_slot.reserve(n_slots * 2);
     for (int phase = 0; phase < 2; ++phase) {
         c->phase_hits[phase].store(0, std::memory_order_relaxed);
@@ -1066,13 +1068,19 @@ int ggml_cuda_moe_cache_acquire(
     }
 
     // Miss: pick the LRU slot. Empty slots (last_used==0) win automatically.
-    int      lru_slot = 0;
+    int      lru_slot = -1;
     uint64_t lru_t    = std::numeric_limits<uint64_t>::max();
     for (int i = 0; i < cache->n_slots; ++i) {
+        if (cache->slot_pin_count[i] != 0) {
+            continue;
+        }
         if (cache->last_used[i] < lru_t) {
             lru_t    = cache->last_used[i];
             lru_slot = i;
         }
+    }
+    if (lru_slot < 0) {
+        return -1;
     }
 
     const void * evicted = cache->slot_to_host[lru_slot];
@@ -1231,6 +1239,106 @@ bool ggml_cuda_moe_cache_copy_to_staging(
 }
 
 extern "C"
+bool ggml_cuda_moe_cache_prepare_split_staging(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    int                  min_resident,
+    int *                slot_ids,
+    int *                out_n_resident,
+    void *               miss_dst,
+    cudaStream_t         compute_stream) {
+
+    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
+        !slot_ids || !out_n_resident || !miss_dst || !compute_stream) {
+        return false;
+    }
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (!host_srcs[i]) {
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    if (byte_count > cache->slot_size_bytes) {
+        return false;
+    }
+
+    int n_resident = 0;
+    for (int i = 0; i < n_host_srcs; ++i) {
+        const auto it = cache->host_to_slot.find(host_srcs[i]);
+        slot_ids[i] = it == cache->host_to_slot.end() ? -1 : it->second;
+        n_resident += slot_ids[i] >= 0;
+    }
+    if (n_resident < min_resident || n_resident == n_host_srcs) {
+        return false;
+    }
+
+    CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
+
+    int miss = 0;
+    for (int i = 0; i < n_host_srcs;) {
+        if (slot_ids[i] >= 0) {
+            cache->slot_pin_count[slot_ids[i]]++;
+            ++i;
+            continue;
+        }
+
+        const void * src = host_srcs[i];
+        int run = 1;
+        while (i + run < n_host_srcs && slot_ids[i + run] < 0 &&
+               (uintptr_t)host_srcs[i + run] == (uintptr_t)src + (size_t)run * byte_count) {
+            ++run;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            (char *)miss_dst + (size_t)miss * byte_count,
+            src,
+            (size_t)run * byte_count,
+            cudaMemcpyHostToDevice,
+            cache->copy_stream));
+        miss += run;
+        i += run;
+    }
+
+    CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
+    *out_n_resident = n_resident;
+    return true;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_release_split_slots(
+    struct ggml_cuda_moe_cache * cache,
+    const int *          slot_ids,
+    int                  n_slot_ids,
+    cudaStream_t         compute_stream) {
+
+    if (!cache || !slot_ids || n_slot_ids <= 0 || !compute_stream) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    cudaError_t err = cudaEventRecord(cache->compute_done, compute_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaEventRecord failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+
+    for (int i = 0; i < n_slot_ids; ++i) {
+        const int slot = slot_ids[i];
+        if (slot < 0) {
+            continue;
+        }
+        GGML_ASSERT(slot < cache->n_slots);
+        GGML_ASSERT(cache->slot_pin_count[slot] > 0);
+        cache->slot_pin_count[slot]--;
+    }
+    return true;
+}
+
+extern "C"
 bool ggml_cuda_moe_cache_grow_pool(
     struct ggml_cuda_moe_cache * cache,
     size_t min_slot_size_bytes) {
@@ -1240,6 +1348,12 @@ bool ggml_cuda_moe_cache_grow_pool(
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
+
+    for (uint32_t pin_count : cache->slot_pin_count) {
+        if (pin_count != 0) {
+            return false;
+        }
+    }
 
     if (min_slot_size_bytes <= cache->slot_size_bytes) {
         return true; // already big enough
@@ -1273,6 +1387,7 @@ bool ggml_cuda_moe_cache_grow_pool(
     std::fill(cache->last_used.begin(),    cache->last_used.end(),    0ull);
     std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
     std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0ull);
+    std::fill(cache->slot_pin_count.begin(), cache->slot_pin_count.end(), 0u);
     std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0ull);
     cache->host_to_slot.clear();
     cache->access_counter = 0;

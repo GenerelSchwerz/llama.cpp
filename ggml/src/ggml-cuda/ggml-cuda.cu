@@ -2239,18 +2239,34 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
     const char * src_base = (const char *)src0->data;
-    bool cache_staged = false;
+    std::vector<const void *> host_ptrs;
     if (overflow && cache) {
-        std::vector<const void *> host_ptrs;
         host_ptrs.reserve(n_unique);
         for (int32_t eid : unique_experts) {
             host_ptrs.push_back(src_base + (size_t)eid * expert_stride);
         }
+    }
+
+    std::vector<int> split_slot_ids(n_unique, -1);
+    int n_resident = 0;
+    bool split_staged = false;
+    if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        const int min_resident = ggml_cuda_moe_cache_n_slots(cache);
+        if (ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
+            split_staged = ggml_cuda_moe_cache_prepare_split_staging(
+                cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
+                split_slot_ids.data(), &n_resident, scratch_experts.get(), stream);
+        }
+    }
+
+    bool cache_staged = false;
+    if (overflow && cache && !split_staged) {
         cache_staged = ggml_cuda_moe_cache_copy_to_staging(
             cache, host_ptrs.data(), n_unique, expert_stride, scratch_experts.get(), stream);
     }
 
-    if (!cache_staged) {
+    if (!cache_staged && !split_staged) {
         char * dst_base = (char *)scratch_experts.get();
         for (int i = 0; i < n_unique; ++i) {
             const int32_t eid = unique_experts[i];
@@ -2263,6 +2279,89 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
+    if (split_staged) {
+        std::vector<int32_t> resident_expert_to_slot(n_experts_total, -1);
+        std::vector<int32_t> miss_expert_to_pos(n_experts_total, -1);
+        int n_misses = 0;
+        for (int i = 0; i < n_unique; ++i) {
+            const int32_t eid = unique_experts[i];
+            if (split_slot_ids[i] >= 0) {
+                resident_expert_to_slot[eid] = split_slot_ids[i];
+            } else {
+                miss_expert_to_pos[eid] = n_misses++;
+            }
+        }
+        GGML_ASSERT(n_resident > 0 && n_misses > 0 && n_resident + n_misses == n_unique);
+
+        const int32_t inactive = (int32_t)n_experts_total;
+        std::vector<int32_t> resident_ids_host;
+        std::vector<int32_t> miss_ids_host;
+        resident_ids_host.reserve(ids_total_elems);
+        miss_ids_host.reserve(ids_total_elems);
+        int64_t n_resident_rows = 0;
+        int64_t n_miss_rows = 0;
+        for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ids_ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < ids_ne0; ++i0) {
+                    const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
+                        + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
+                    const int32_t resident_slot = resident_expert_to_slot[eid];
+                    const int32_t miss_pos = miss_expert_to_pos[eid];
+                    resident_ids_host.push_back(resident_slot >= 0 ? resident_slot : inactive);
+                    miss_ids_host.push_back(miss_pos >= 0 ? miss_pos : inactive);
+                    n_resident_rows += resident_slot >= 0;
+                    n_miss_rows += miss_pos >= 0;
+                }
+            }
+        }
+        GGML_ASSERT(n_resident_rows > 0 && n_miss_rows > 0 &&
+                    n_resident_rows + n_miss_rows == (int64_t)ids_total_elems);
+
+        ggml_cuda_pool_alloc<int32_t> resident_ids(ctx.pool(), ids_total_elems);
+        ggml_cuda_pool_alloc<int32_t> miss_ids(ctx.pool(), ids_total_elems);
+        CUDA_CHECK(cudaMemcpyAsync(resident_ids.get(), resident_ids_host.data(),
+                                   ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(miss_ids.get(), miss_ids_host.data(),
+                                   ids_total_elems * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+
+        ggml_tensor resident_src0 = *src0;
+        resident_src0.ne[2] = ggml_cuda_moe_cache_n_slots(cache);
+        resident_src0.nb[3] = resident_src0.nb[2] * (size_t)resident_src0.ne[2];
+        resident_src0.data = ggml_cuda_moe_cache_slot_ptr(cache, 0);
+
+        ggml_tensor miss_src0 = *src0;
+        miss_src0.ne[2] = n_misses;
+        miss_src0.nb[3] = miss_src0.nb[2] * (size_t)n_misses;
+        miss_src0.data = scratch_experts.get();
+
+        ggml_tensor ids_synth = *ids;
+        ids_synth.nb[0] = sizeof(int32_t);
+        ids_synth.nb[1] = (size_t)ids_ne0 * sizeof(int32_t);
+        ids_synth.nb[2] = (size_t)ids_ne0 * ids_ne1 * sizeof(int32_t);
+        ids_synth.nb[3] = ids_synth.nb[2];
+
+        ggml_tensor * orig_src0 = dst->src[0];
+        ggml_tensor * orig_ids = dst->src[2];
+        dst->src[0] = &resident_src0;
+        ids_synth.data = resident_ids.get();
+        dst->src[2] = &ids_synth;
+        ggml_cuda_mul_mat_q_active(ctx, &resident_src0, dst->src[1], &ids_synth, dst, n_resident_rows);
+
+        dst->src[0] = &miss_src0;
+        ids_synth.data = miss_ids.get();
+        ggml_cuda_mul_mat_q_active(ctx, &miss_src0, dst->src[1], &ids_synth, dst, n_miss_rows);
+        dst->src[0] = orig_src0;
+        dst->src[2] = orig_ids;
+
+        const bool slots_released = ggml_cuda_moe_cache_release_split_slots(
+            cache, split_slot_ids.data(), n_unique, stream);
+        GGML_ASSERT(slots_released);
+        ggml_cuda_moe_record_op_stats(
+            is_decode, true, overflow, (uint64_t)n_unique, (uint64_t)ggml_nbytes(ids),
+            0, 0, 0, 0, 0, 0, (uint64_t)(ggml_time_us() - op_start_us), false);
+        return;
+    }
+
     std::vector<int32_t> remapped_ids_host;
     remapped_ids_host.reserve(ids_total_elems);
     for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {

@@ -82,8 +82,9 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
     }
 }
 
-void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_q_impl(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        int64_t n_active_rows) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -181,16 +182,22 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(nb2  % nb1  == 0);
 
     const int64_t n_expert_used = ids->ne[0];
-    const int64_t ne_get_rows = ne12 * n_expert_used;
+    const int64_t ne_get_rows_total = ne12 * n_expert_used;
+    if (n_active_rows < 0) {
+        n_active_rows = ne_get_rows_total;
+    }
+    GGML_ASSERT(n_active_rows > 0 && n_active_rows <= ne_get_rows_total);
     GGML_ASSERT(ne1 == n_expert_used);
-
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), dedup_bcast ? ne_get_rows_total : n_active_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_active_rows);
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    if (dedup_bcast && n_active_rows < ne_get_rows_total) {
+        CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows_total * sizeof(int32_t), stream));
+    }
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
@@ -202,15 +209,15 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+    const size_t nbytes_src1_q8_1 = n_active_rows*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-        src1_scale.alloc(ne12*n_expert_used);
+        src1_scale.alloc(n_active_rows);
     }
 
-    const int64_t ne11_flat = ne12*n_expert_used;
+    const int64_t ne11_flat = n_active_rows;
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
@@ -248,12 +255,25 @@ void ggml_cuda_mul_mat_q(
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne00, ne01, n_active_rows, s01, n_active_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
+}
+
+void ggml_cuda_mul_mat_q(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, -1);
+}
+
+void ggml_cuda_mul_mat_q_active(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        int64_t n_active_rows) {
+    GGML_ASSERT(ids);
+    GGML_ASSERT(src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4);
+    ggml_cuda_mul_mat_q_impl(ctx, src0, src1, ids, dst, n_active_rows);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
