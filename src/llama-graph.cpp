@@ -3503,39 +3503,13 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // store to KV cache
     {
-        const auto & k_idxs = inp->get_k_idxs();
-        const auto & v_idxs = inp->get_v_idxs();
-
-        if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
-            }
-        } else {
-            k_tail_written = mctx_cur->cpy_k_with_tail(ctx0, k_cur, k_idxs, inp->self_tail_idxs, il);
-            if (k_tail_written) {
-                ggml_build_forward_expand(gf, k_tail_written);
-            } else {
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-                if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->self_tail_idxs, il))) {
-                    ggml_build_forward_expand(gf, k_tail_written);
-                }
-            }
-        }
-        if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
-            }
-        } else {
-            v_tail_written = mctx_cur->cpy_v_with_tail(ctx0, v_cur, v_idxs, inp->self_tail_idxs, il);
-            if (v_tail_written) {
-                ggml_build_forward_expand(gf, v_tail_written);
-            } else {
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-                if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->self_tail_idxs, il))) {
-                    ggml_build_forward_expand(gf, v_tail_written);
-                }
-            }
-        }
+        const auto stored = mctx_cur->build_kv_store(
+                gf, ctx0,
+                k_cur, inp->get_k_idxs(),
+                v_cur, inp->get_v_idxs(),
+                il, inp->self_tail_idxs, compact_tail);
+        k_tail_written = stored.k_tail_written;
+        v_tail_written = stored.v_tail_written;
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
@@ -3940,46 +3914,14 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool compact_tail = mctx_cur->has_compact_tail();
 
     // optionally store to KV cache
-    if (k_cur) {
-        const auto & k_idxs = is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs();
-
-        if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
-            }
-        } else {
-            k_tail_written = mctx_cur->cpy_k_with_tail(
-                    ctx0, k_cur, k_idxs, inp->get_tail_idxs(is_swa), il);
-            if (k_tail_written) {
-                ggml_build_forward_expand(gf, k_tail_written);
-            } else {
-                ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-                if ((k_tail_written = mctx_cur->cpy_k_tail(ctx0, k_cur, inp->get_tail_idxs(is_swa), il))) {
-                    ggml_build_forward_expand(gf, k_tail_written);
-                }
-            }
-        }
-    }
-
-    if (v_cur) {
-        const auto & v_idxs = is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs();
-
-        if (compact_tail) {
-            if (ggml_tensor * written = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il)) {
-                ggml_build_forward_expand(gf, written);
-            }
-        } else {
-            v_tail_written = mctx_cur->cpy_v_with_tail(
-                    ctx0, v_cur, v_idxs, inp->get_tail_idxs(is_swa), il);
-            if (v_tail_written) {
-                ggml_build_forward_expand(gf, v_tail_written);
-            } else {
-                ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
-                if ((v_tail_written = mctx_cur->cpy_v_tail(ctx0, v_cur, inp->get_tail_idxs(is_swa), il))) {
-                    ggml_build_forward_expand(gf, v_tail_written);
-                }
-            }
-        }
+    if (k_cur || v_cur) {
+        const auto stored = mctx_cur->build_kv_store(
+                gf, ctx0,
+                k_cur, is_swa ? inp->get_k_idxs_swa() : inp->get_k_idxs(),
+                v_cur, is_swa ? inp->get_v_idxs_swa() : inp->get_v_idxs(),
+                il, inp->get_tail_idxs(is_swa), compact_tail);
+        k_tail_written = stored.k_tail_written;
+        v_tail_written = stored.v_tail_written;
     }
 
     const auto & kq_mask = is_swa ? inp->get_kq_mask_swa() : inp->get_kq_mask();

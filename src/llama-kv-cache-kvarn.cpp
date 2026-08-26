@@ -875,7 +875,11 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         ggml_context * ctx,
         ggml_tensor * k_cur,
         ggml_tensor * k_idxs,
-        int32_t il) const {
+        int32_t il,
+        ggml_tensor ** store_stage) const {
+    if (store_stage) {
+        *store_stage = nullptr;
+    }
     auto * result = cache->store(ctx, k_cur, k_idxs, il, current_sinfo(), false);
     stored_k[cache->mapped_layer_id(il)] = result;
     return result;
@@ -885,19 +889,31 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         ggml_context * ctx,
         ggml_tensor * v_cur,
         ggml_tensor * v_idxs,
-        int32_t il) const {
+        int32_t il,
+        ggml_tensor ** store_stage) const {
+    if (store_stage) {
+        *store_stage = nullptr;
+    }
     auto * result = cache->store(ctx, v_cur, v_idxs, il, current_sinfo(), true);
     stored_v[cache->mapped_layer_id(il)] = result;
     return result;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_with_tail(
-        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t) const {
+        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t,
+        ggml_tensor ** store_stage) const {
+    if (store_stage) {
+        *store_stage = nullptr;
+    }
     return nullptr;
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
-        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t) const {
+        ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t,
+        ggml_tensor ** store_stage) const {
+    if (store_stage) {
+        *store_stage = nullptr;
+    }
     return nullptr;
 }
 

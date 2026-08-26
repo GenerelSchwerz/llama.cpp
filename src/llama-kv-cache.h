@@ -282,14 +282,20 @@ public:
     const std::vector<std::pair<uint32_t, uint32_t>> & get_state_cell_remap() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
+            int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
+    ggml_tensor * cpy_v(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
+            int32_t il, const slot_info & sinfo, ggml_tensor ** store_stage = nullptr) const;
     ggml_tensor * cpy_k_with_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
-            ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const;
+            ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo,
+            ggml_tensor ** store_stage = nullptr) const;
     ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
-            ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo) const;
+            ggml_tensor * tail_idxs, int32_t il, const slot_info & sinfo,
+            ggml_tensor ** store_stage = nullptr) const;
     ggml_tensor * cpy_k_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;
@@ -369,10 +375,12 @@ private:
     bool seq_rm_unchecked(llama_seq_id seq_id, llama_pos p0, llama_pos p1);
     void reset_allocation_head(llama_seq_id seq_id);
     void rebuild_allocation_head(llama_seq_id seq_id);
-    ggml_tensor * build_store_source(
+    ggml_tensor * stage_store_rows(
             ggml_context * ctx,
             ggml_tensor  * source,
-            ggml_tensor  * stage) const;
+                 ggml_type type,
+                    int32_t il,
+                const char * side) const;
 
     const llama_model & model;
     const llama_hparams & hparams;
@@ -387,13 +395,10 @@ private:
         ggml_tensor * k_tail;
         ggml_tensor * v_tail;
 
-        // Construction owns the store route: a non-null stage means that an
-        // accelerator conversion was proved and allocated for a host body.
-        // Graph construction consumes this decision without probing placement.
-        // Owned layers keep K and V stages distinct because graph dependencies
-        // do not describe overlapping backing storage across separate views.
-        ggml_tensor * k_store_stage;
-        ggml_tensor * v_store_stage;
+        // Construction owns the numerical route; graph construction owns the
+        // scheduler-reusable staging tensors and their exact lifetimes.
+        bool k_store_quantize;
+        bool v_store_quantize;
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -581,6 +586,11 @@ public:
     using slot_info_vec_t  = llama_kv_cache::slot_info_vec_t;
     using stream_copy_info = llama_kv_cache::stream_copy_info;
 
+    struct kv_store_result {
+        ggml_tensor * k_tail_written = nullptr;
+        ggml_tensor * v_tail_written = nullptr;
+    };
+
     // used for errors
     llama_kv_cache_context(llama_memory_status status);
 
@@ -664,20 +674,35 @@ public:
     //   - k_idxs [n_tokens]
     //   - v_cur  [n_embd_head_v, n_head_v, n_tokens]
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
-    virtual ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
-    virtual ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+    virtual ggml_tensor * cpy_k(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
+            int32_t il, ggml_tensor ** store_stage = nullptr) const;
+    virtual ggml_tensor * cpy_v(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
+            int32_t il, ggml_tensor ** store_stage = nullptr) const;
     virtual ggml_tensor * cpy_k_with_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
-            ggml_tensor * tail_idxs, int32_t il) const;
+            ggml_tensor * tail_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
     virtual ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
-            ggml_tensor * tail_idxs, int32_t il) const;
+            ggml_tensor * tail_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const;
     virtual ggml_tensor * cpy_k_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;
     virtual ggml_tensor * cpy_v_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const;
+
+    kv_store_result build_kv_store(
+            ggml_cgraph  * gf,
+            ggml_context * ctx,
+            ggml_tensor  * k_cur,
+            ggml_tensor  * k_idxs,
+            ggml_tensor  * v_cur,
+            ggml_tensor  * v_idxs,
+            int32_t        il,
+            ggml_tensor  * tail_idxs = nullptr,
+            bool           compact_tail = false) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
