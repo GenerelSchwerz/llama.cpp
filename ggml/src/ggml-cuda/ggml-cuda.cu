@@ -1968,39 +1968,27 @@ static void ggml_cuda_mul_mat_id_impl(
 
         if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             if (mapped_experts) {
-                int32_t source_count = 0;
-                for (int64_t i02 = 0; i02 < ne02; ++i02) {
-                    source_count = std::max(source_count, host_route->expert_map[i02] + 1);
-                }
-                const int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : source_count;
-                GGML_ASSERT(source_count > 0 && source_split > 0 && source_split <= source_count);
-                GGML_ASSERT(!host_route->secondary_data || source_count == source_split + host_route->secondary_count);
-
-                std::vector<int32_t> source_wait_class_host;
-                if (host_route->source_wait_class != nullptr) {
-                    source_wait_class_host.resize(source_count);
+                int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : 0;
+                if (source_split == 0) {
                     for (int64_t i02 = 0; i02 < ne02; ++i02) {
-                        const int32_t source = host_route->expert_map[i02];
-                        if (source >= 0) {
-                            GGML_ASSERT(source < source_count);
-                            source_wait_class_host[source] = host_route->source_wait_class[i02];
-                        }
+                        source_split = std::max(source_split, host_route->expert_map[i02] + 1);
                     }
                 }
+                GGML_ASSERT(source_split > 0);
 
                 ggml_cuda_pool_alloc<int32_t> expert_map(ctx.pool(), ne02);
                 ggml_cuda_pool_alloc<int32_t> source_wait_class(ctx.pool());
                 CUDA_CHECK(cudaMemcpyAsync(expert_map.get(), host_route->expert_map,
                                            ne02 * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
                 if (host_route->source_wait_class != nullptr) {
-                    source_wait_class.alloc(source_count);
-                    CUDA_CHECK(cudaMemcpyAsync(source_wait_class.get(), source_wait_class_host.data(),
-                                               source_count * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
+                    source_wait_class.alloc(ne02);
+                    CUDA_CHECK(cudaMemcpyAsync(source_wait_class.get(), host_route->source_wait_class,
+                                               ne02 * sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
                 }
 
                 ggml_cuda_mul_mat_q_mapped(
                     ctx, src0, host_route->secondary_data ? host_route->secondary_data : src0->data,
-                    src1, ids, dst, expert_map.get(), source_count, source_split,
+                    src1, ids, dst, expert_map.get(), source_split,
                     source_wait_class.get(), host_route->stage_ready);
             } else {
                 ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
@@ -2093,10 +2081,10 @@ static void ggml_cuda_mul_mat_id_impl(
         const int sis1 = nb12 / nb11;
         ggml_cuda_launch_mm_ids_helper(
             (const int32_t *) ids->data, ids_buf_dev.ptr, ids_dst, expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, false, nullptr, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, false, stream);
         ggml_cuda_launch_mm_ids_helper(
             (const int32_t *) ids->data, ids_buf_dev.ptr + ne_get_rows, ids_dst, expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, true, nullptr, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, true, stream);
         CUDA_CHECK(cudaGetLastError());
     } else {
         GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));

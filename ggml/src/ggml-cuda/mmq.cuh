@@ -943,7 +943,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
-template <ggml_type type, int J, bool fallback, bool use_x_split>
+template <ggml_type type, int J, bool fallback, bool use_x_map>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
 static __global__ void mul_mat_q(
         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
@@ -952,8 +952,8 @@ static __global__ void mul_mat_q(
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const uint3 ntx, const char * __restrict__ x_secondary, const int32_t x_channel_split,
-        const int32_t * __restrict__ x_wait_class,
+        const uint3 ntx, const char * __restrict__ x_secondary, const int32_t * __restrict__ x_channel_map,
+        const int32_t x_channel_split, const int32_t * __restrict__ x_wait_class,
         const uint32_t * __restrict__ x_stage_ready) {
 
     // Skip unused template specializations for faster compilation:
@@ -1047,7 +1047,7 @@ static __global__ void mul_mat_q(
 
         int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
-        if constexpr (use_x_split) {
+        if constexpr (use_x_map) {
             if (x_stage_ready != nullptr) {
                 const int wait_class = x_wait_class[x_channel];
                 if (wait_class != 0) {
@@ -1059,6 +1059,7 @@ static __global__ void mul_mat_q(
                     __syncthreads();
                 }
             }
+            x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
                 x_channel -= x_channel_split;
@@ -1160,7 +1161,7 @@ static __global__ void mul_mat_q(
 
         int x_channel = fastdiv(zt, channel_ratio);
         const char * x_cur = x;
-        if constexpr (use_x_split) {
+        if constexpr (use_x_map) {
             if (x_stage_ready != nullptr) {
                 const int wait_class = x_wait_class[x_channel];
                 if (wait_class != 0) {
@@ -1172,6 +1173,7 @@ static __global__ void mul_mat_q(
                     __syncthreads();
                 }
             }
+            x_channel = x_channel_map[x_channel];
             if (x_channel >= x_channel_split) {
                 x_cur = x_secondary;
                 x_channel -= x_channel_split;
@@ -1263,7 +1265,7 @@ static __global__ void mul_mat_q(
 
     int x_channel = fastdiv(zt, channel_ratio);
     const char * x_cur = x;
-    if constexpr (use_x_split) {
+    if constexpr (use_x_map) {
         if (x_stage_ready != nullptr) {
             const int wait_class = x_wait_class[x_channel];
             if (wait_class != 0) {
@@ -1275,6 +1277,7 @@ static __global__ void mul_mat_q(
                 __syncthreads();
             }
         }
+        x_channel = x_channel_map[x_channel];
         if (x_channel >= x_channel_split) {
             x_cur = x_secondary;
             x_channel -= x_channel_split;
@@ -1435,6 +1438,7 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     const char * x_secondary = nullptr;
+    const int32_t * x_channel_map = nullptr;
     int32_t x_channel_split = 0;
     const int32_t * x_wait_class = nullptr;
     const uint32_t * x_stage_ready = nullptr;
@@ -1447,7 +1451,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
-template <ggml_type type, int J, bool fallback, bool use_x_split>
+template <ggml_type type, int J, bool fallback, bool use_x_map>
 static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int id = ggml_cuda_get_device();
     const int cc = ggml_cuda_info().devices[id].cc;
@@ -1461,8 +1465,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     const dim3 block_dims(warp_size, nwarps, 1);
 
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, use_x_split>), nbytes_shared);
-    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, use_x_split>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, use_x_map>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, use_x_map>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1482,12 +1486,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
-        mul_mat_q<type, J, fallback, use_x_split><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+        mul_mat_q<type, J, fallback, use_x_map><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-             ntx_fd, args.x_secondary, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
+             ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
         return;
     }
 
@@ -1511,12 +1515,12 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const dim3 block_nums_fixup(block_nums_stream_k.x, config.I/warp_size, 1);
     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
 
-    mul_mat_q<type, J, fallback, use_x_split><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+    mul_mat_q<type, J, fallback, use_x_map><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
-         ntx_fd, args.x_secondary, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
+         ntx_fd, args.x_secondary, args.x_channel_map, args.x_channel_split, args.x_wait_class, args.x_stage_ready);
 
     if (!fixup_needed) {
         return;
@@ -1529,7 +1533,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
          ntx_fd);
 }
 
-template <ggml_type type, bool fallback, bool use_x_split>
+template <ggml_type type, bool fallback, bool use_x_map>
 void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     const int    id    = ggml_cuda_get_device();
     const int    cc    = ggml_cuda_info().devices[id].cc;
@@ -1558,52 +1562,52 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
 
     switch (J_best) {
         case   8:
-            launch_mul_mat_q<type,   8, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,   8, fallback, use_x_map>(ctx, args, stream);
             break;
         case  16:
-            launch_mul_mat_q<type,  16, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  16, fallback, use_x_map>(ctx, args, stream);
             break;
         case  24:
-            launch_mul_mat_q<type,  24, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  24, fallback, use_x_map>(ctx, args, stream);
             break;
         case  32:
-            launch_mul_mat_q<type,  32, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  32, fallback, use_x_map>(ctx, args, stream);
             break;
         case  40:
-            launch_mul_mat_q<type,  40, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  40, fallback, use_x_map>(ctx, args, stream);
             break;
         case  48:
-            launch_mul_mat_q<type,  48, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  48, fallback, use_x_map>(ctx, args, stream);
             break;
         case  56:
-            launch_mul_mat_q<type,  56, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  56, fallback, use_x_map>(ctx, args, stream);
             break;
         case  64:
-            launch_mul_mat_q<type,  64, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  64, fallback, use_x_map>(ctx, args, stream);
             break;
         case  72:
-            launch_mul_mat_q<type,  72, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  72, fallback, use_x_map>(ctx, args, stream);
             break;
         case  80:
-            launch_mul_mat_q<type,  80, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  80, fallback, use_x_map>(ctx, args, stream);
             break;
         case  88:
-            launch_mul_mat_q<type,  88, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  88, fallback, use_x_map>(ctx, args, stream);
             break;
         case  96:
-            launch_mul_mat_q<type,  96, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type,  96, fallback, use_x_map>(ctx, args, stream);
             break;
         case 104:
-            launch_mul_mat_q<type, 104, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type, 104, fallback, use_x_map>(ctx, args, stream);
             break;
         case 112:
-            launch_mul_mat_q<type, 112, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type, 112, fallback, use_x_map>(ctx, args, stream);
             break;
         case 120:
-            launch_mul_mat_q<type, 120, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type, 120, fallback, use_x_map>(ctx, args, stream);
             break;
         case 128:
-            launch_mul_mat_q<type, 128, fallback, use_x_split>(ctx, args, stream);
+            launch_mul_mat_q<type, 128, fallback, use_x_map>(ctx, args, stream);
             break;
         default:
             fprintf(stderr, "J_best=%d\n", J_best);
@@ -1612,14 +1616,14 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     }
 }
 
-template <ggml_type type, bool use_x_split>
+template <ggml_type type, bool use_x_map>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     if (args.nrows_x % 128 == 0) {
         constexpr bool fallback = false;
-        mul_mat_q_switch_J<type, fallback, use_x_split>(ctx, args, stream);
+        mul_mat_q_switch_J<type, fallback, use_x_map>(ctx, args, stream);
     } else {
         constexpr bool fallback = true;
-        mul_mat_q_switch_J<type, fallback, use_x_split>(ctx, args, stream);
+        mul_mat_q_switch_J<type, fallback, use_x_map>(ctx, args, stream);
     }
 }
 
@@ -1660,7 +1664,7 @@ void ggml_cuda_mul_mat_q(
 void ggml_cuda_mul_mat_q_mapped(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const void * src0_secondary,
         const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const int32_t * expert_map, int32_t source_count, int32_t source_split,
+        const int32_t * source_map, int32_t source_split,
         const int32_t * source_wait_class = nullptr, const uint32_t * stage_ready = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
