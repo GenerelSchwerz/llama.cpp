@@ -358,11 +358,16 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-// The vector pair matrix and the quantized-native MMA pair matrix are the same
-// set, so both ask ggml_cuda_fattn_quant_pair_policy() rather than each carrying
-// its own copy of the band. Kept as a named wrapper because the vector selection
-// below reads better with it and because ggml/CMakeLists.txt names the same
-// policy on the build side.
+// The compiled vector FlashAttention pair matrix, and only that one: the
+// restricted bit-ladder band that ggml_cuda_get_fattn_vec_default_pairs() in
+// ggml/CMakeLists.txt names on the build side. Kept as a named wrapper because
+// the vector selection below reads better with it and because both sides should
+// ask one copy of the band.
+//
+// The quantized-native MMA route does NOT use this policy. It accepts every
+// ordered pair of compiled native types and asks ggml_cuda_fattn_mma_quant_pair()
+// instead, so the two matrices are deliberately different sets; see the pair
+// policy comment in fattn-mma-quant.cuh.
 static bool ggml_cuda_fattn_default_quant_pair(ggml_type type_K, ggml_type type_V) {
     return ggml_cuda_fattn_quant_pair_policy(type_K, type_V);
 }
