@@ -1278,6 +1278,11 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    std::vector<void *> batch_dsts;
+    std::vector<const void *> batch_srcs;
+    std::vector<size_t> batch_sizes;
+#endif
     int miss = 0;
     for (int i = 0; i < n_host_srcs;) {
         if (slot_ids[i] >= 0) {
@@ -1292,16 +1297,30 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
                (uintptr_t)host_srcs[i + run] == (uintptr_t)src + (size_t)run * byte_count) {
             ++run;
         }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        batch_dsts.push_back((char *)miss_dst + (size_t)miss * byte_count);
+        batch_srcs.push_back(src);
+        batch_sizes.push_back((size_t)run * byte_count);
+#else
         CUDA_CHECK(cudaMemcpyAsync(
             (char *)miss_dst + (size_t)miss * byte_count,
             src,
             (size_t)run * byte_count,
             cudaMemcpyHostToDevice,
             cache->copy_stream));
+#endif
         miss += run;
         i += run;
     }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    cudaMemcpyAttributes attributes = {};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    size_t attributes_index = 0;
+    CUDA_CHECK(cudaMemcpyBatchAsync(
+        batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
+        &attributes, &attributes_index, 1, cache->copy_stream));
+#endif
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
     CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     *out_n_resident = n_resident;
