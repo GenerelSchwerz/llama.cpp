@@ -1,14 +1,13 @@
 <script lang="ts">
-	import { Settings, Plus } from '@lucide/svelte';
-	import { Switch } from '$lib/components/ui/switch';
-	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
-	import { McpLogo, DropdownMenuSearchable, McpServerIdentity } from '$lib/components/app';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import { HealthCheckStatus } from '$lib/enums';
-	import type { MCPServerSettingsEntry } from '$lib/types';
+	import { Plus, Settings } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
-	import { ROUTES } from '$lib/constants/routes';
+	import { DropdownMenuSearchable, McpLogo, McpServerIdentity } from '$lib/components/app';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import { Switch } from '$lib/components/ui/switch';
+	import { ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
+	import { HealthCheckStatus } from '$lib/enums';
+	import { conversationsStore, mcpStore } from '$lib/stores';
+	import type { MCPServerSettingsEntry } from '$lib/types';
 
 	interface Props {
 		onMcpSettingsClick?: () => void;
@@ -23,10 +22,13 @@
 	let hasMcpServers = $derived(mcpServers.length > 0);
 	let filteredMcpServers = $derived.by(() => {
 		const query = mcpSearchQuery.toLowerCase().trim();
+
 		if (!query) return mcpServers;
+
 		return mcpServers.filter((s) => {
 			const name = getServerLabel(s).toLowerCase();
 			const url = s.url.toLowerCase();
+
 			return name.includes(query) || url.includes(query);
 		});
 	});
@@ -36,11 +38,11 @@
 	}
 
 	function isServerEnabledForChat(serverId: string): boolean {
-		return conversationsStore.isMcpServerEnabledForChat(serverId);
+		return conversationsStore.preferences.isMcpServerEnabledForChat(serverId);
 	}
 
 	async function toggleServerForChat(serverId: string) {
-		await conversationsStore.toggleMcpServerForChat(serverId);
+		await conversationsStore.preferences.toggleMcpServerForChat(serverId);
 	}
 
 	function handleMcpSubMenuOpen(open: boolean) {
@@ -60,7 +62,7 @@
 <DropdownMenu.Root>
 	<DropdownMenu.Sub onOpenChange={handleMcpSubMenuOpen}>
 		<DropdownMenu.SubTrigger class="flex cursor-pointer items-center gap-2">
-			<McpLogo class="h-4 w-4" />
+			<McpLogo class={ICON_CLASS_DEFAULT} />
 
 			<span>MCP Servers</span>
 		</DropdownMenu.SubTrigger>
@@ -68,10 +70,10 @@
 		<DropdownMenu.SubContent class="w-72 pt-0">
 			{#if hasMcpServers}
 				<DropdownMenuSearchable
-					placeholder="Search servers..."
 					bind:searchValue={mcpSearchQuery}
 					emptyMessage="No servers found"
 					isEmpty={filteredMcpServers.length === 0}
+					placeholder="Search servers..."
 				>
 					<div class="max-h-64 overflow-y-auto">
 						{#each filteredMcpServers as server (server.id)}
@@ -82,20 +84,20 @@
 							{@const faviconUrl = mcpStore.getServerFavicon(server.id)}
 
 							<button
-								type="button"
 								class="flex w-full items-center justify-between gap-2 rounded-sm px-2 py-2 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
-								onclick={() => !hasError && toggleServerForChat(server.id)}
 								disabled={hasError}
+								onclick={() => !hasError && toggleServerForChat(server.id)}
+								type="button"
 							>
 								<div class="flex min-w-0 flex-1 items-center gap-2">
 									<div class="min-w-0 flex-1">
 										<McpServerIdentity
 											{displayName}
 											{faviconUrl}
-											iconClass="h-4 w-4"
+											iconClass={ICON_CLASS_DEFAULT}
 											iconRounded="rounded-sm"
-											showVersion={false}
 											nameClass="text-sm"
+											showVersion={false}
 										/>
 									</div>
 
@@ -111,8 +113,8 @@
 								<Switch
 									checked={isEnabledForChat}
 									disabled={hasError}
-									onclick={(e) => e.stopPropagation()}
 									onCheckedChange={() => toggleServerForChat(server.id)}
+									onclick={(e) => e.stopPropagation()}
 								/>
 							</button>
 						{/each}
@@ -123,7 +125,7 @@
 							class="flex cursor-pointer items-center gap-2"
 							onclick={handleMcpSettingsClick}
 						>
-							<Settings class="h-4 w-4" />
+							<Settings class={ICON_CLASS_DEFAULT} />
 
 							<span>Manage MCP Servers</span>
 						</DropdownMenu.Item>
@@ -140,7 +142,7 @@
 					class="flex cursor-pointer items-center gap-2"
 					onclick={handleMcpSettingsClick}
 				>
-					<Plus class="h-4 w-4" />
+					<Plus class={ICON_CLASS_DEFAULT} />
 
 					<span>Add MCP Servers</span>
 				</DropdownMenu.Item>

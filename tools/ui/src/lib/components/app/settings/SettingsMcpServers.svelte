@@ -1,20 +1,18 @@
 <script lang="ts">
-	import { X, Plus } from '@lucide/svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { toolsStore } from '$lib/stores/tools.svelte';
-	import { Button } from '$lib/components/ui/button';
-	import * as Empty from '$lib/components/ui/empty';
+	import McpLogo from '../mcp/McpLogo.svelte';
+	import { Plus, X } from '@lucide/svelte';
+	import { browser } from '$app/environment';
+	import { goto, replaceState } from '$app/navigation';
+	import { page } from '$app/state';
 	import { ActionIcon, McpServerCard, McpServerCardSkeleton } from '$lib/components/app';
 	import { DialogMcpServerAddNew } from '$lib/components/app/dialogs';
-	import { HealthCheckStatus } from '$lib/enums';
+	import { Button } from '$lib/components/ui/button';
+	import * as Empty from '$lib/components/ui/empty';
 	import { ROUTES } from '$lib/constants';
-	import { fade } from 'svelte/transition';
+	import { HealthCheckStatus } from '$lib/enums';
+	import { conversationsStore, mcpStore, toolsStore } from '$lib/stores';
 	import { onMount } from 'svelte';
-	import McpLogo from '../mcp/McpLogo.svelte';
-	import { browser } from '$app/environment';
-	import { page } from '$app/state';
-	import { goto, replaceState } from '$app/navigation';
+	import { fade } from 'svelte/transition';
 
 	interface Props {
 		class?: string;
@@ -22,8 +20,6 @@
 
 	let { class: className }: Props = $props();
 
-	// Every configured server is listed; `enabled` is an on/off state,
-	// not a visibility filter, so a disabled server stays toggleable.
 	let servers = $derived(mcpStore.getServers());
 
 	let isAddingServer = $state(false);
@@ -32,6 +28,7 @@
 
 	$effect(() => {
 		const currentId = page.route.id;
+
 		return () => {
 			previousRouteId = currentId;
 		};
@@ -39,6 +36,7 @@
 
 	function handleClose() {
 		const prevIsMcpServers = previousRouteId === '/mcp-servers';
+
 		if (browser && window.history.length > 1 && !prevIsMcpServers) {
 			history.back();
 		} else {
@@ -51,6 +49,7 @@
 			isAddingServer = true;
 
 			const newUrl = new URL(page.url);
+
 			newUrl.searchParams.delete('add');
 
 			replaceState(newUrl, {});
@@ -65,6 +64,7 @@
 	// renders and keeps the enable toggle reachable.
 	function isServerPending(serverId: string, enabled: boolean): boolean {
 		const status = mcpStore.getHealthCheckState(serverId).status;
+
 		return (
 			status === HealthCheckStatus.CONNECTING || (status === HealthCheckStatus.IDLE && enabled)
 		);
@@ -73,7 +73,7 @@
 
 <div in:fade={{ duration: 150 }} class="flex min-h-[calc(100dvh-4rem)] flex-col">
 	<div class="fixed top-4.5 right-4 z-50 md:hidden">
-		<ActionIcon icon={X} tooltip="Close" onclick={handleClose} />
+		<ActionIcon icon={X} onclick={handleClose} tooltip="Close" />
 	</div>
 
 	<div
@@ -102,7 +102,7 @@
 				</Empty.Header>
 
 				<Empty.Content>
-					<Button size="sm" onclick={() => (isAddingServer = true)}>
+					<Button onclick={() => (isAddingServer = true)} size="sm">
 						<Plus />
 
 						Add New Server
@@ -120,17 +120,24 @@
 					<McpServerCardSkeleton />
 				{:else}
 					<McpServerCard
-						{server}
-						enabled={conversationsStore.isMcpServerEnabledForChat(server.id)}
+						enabled={conversationsStore.preferences.isMcpServerEnabledForChat(server.id)}
+						onDelete={() => mcpStore.removeServer(server.id)}
 						onToggle={async () => {
-							const wasEnabled = conversationsStore.isMcpServerEnabledForChat(server.id);
-							await conversationsStore.toggleMcpServerForChat(server.id);
+							const wasEnabled = conversationsStore.preferences.isMcpServerEnabledForChat(
+								server.id
+							);
+
+							await conversationsStore.preferences.toggleMcpServerForChat(server.id);
+
 							if (!wasEnabled) {
+								// Promote the connection so tools/prompts/resources become
+								// available right away instead of waiting for the next chat-init.
+								await mcpStore.runHealthCheck(server, true);
 								toolsStore.enableAllToolsForServer(server.id);
 							}
 						}}
 						onUpdate={(updates) => mcpStore.updateServer(server.id, updates)}
-						onDelete={() => mcpStore.removeServer(server.id)}
+						{server}
 					/>
 				{/if}
 			{/each}
@@ -148,7 +155,7 @@
 					</Empty.Header>
 
 					<Empty.Content>
-						<Button size="sm" onclick={() => (isAddingServer = true)}>
+						<Button onclick={() => (isAddingServer = true)} size="sm">
 							<Plus />
 
 							Add New Server
