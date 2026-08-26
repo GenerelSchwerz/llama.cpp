@@ -6952,11 +6952,26 @@ output is plausible.
 
 #### Revised disposition
 
-Retain the cleaned family as an explicit build and run-time opt-in. It removes
-a substantial long-context transient allocation, produces bit-exact output in
-the maintained same-MTP comparison, and shows useful medium/long prefill and
-MTP verification screens on the measured host. Keep both defaults off because
-the enabled build costs 7.12 MiB, short-depth performance is mixed, and only
-one recent NVIDIA architecture and one model have received integrated
-performance coverage. Future native cache pairs must be separately registered
-and evidenced; they must not be inferred from `GGML_CUDA_FA_ALL_QUANTS`.
+Retain the cleaned family. It removes a substantial long-context transient
+allocation, produces bit-exact output in the maintained same-MTP comparison, and
+shows useful medium/long prefill and MTP verification screens on the measured
+host.
+
+The build policy this paragraph originally recorded — an opt-in build switch
+with both defaults off, justified by a 7.12 MiB enabled-build cost — was
+superseded before merge and is corrected here. The default four types are
+compiled by every CUDA FlashAttention build, because a run-time option can only
+select kernels that are already in the binary and the earlier arrangement made
+`--flash-attn-native-quants` silently do nothing on a stock build. The measured
+cost of that decision is `+54.53 MiB` of `libggml-cuda.so` on `sm_120`; the
+7.12 MiB figure predates all-pair coverage, the shared attention body and the
+switch removal, and describes nothing that exists. `GGML_CUDA_FA_ALL_QUANTS`
+remains the one build flag that widens the type set, and the run-time default
+stays off. See
+[`quantized-native-flash-attention.md`](quantized-native-flash-attention.md)
+for the current build-cost record.
+
+Future native cache pairs must be separately registered and evidenced; they must
+not be inferred from `GGML_CUDA_FA_ALL_QUANTS`. What registration means is now
+one entry in `ggml/src/ggml-cuda/fattn-mma-quant-types.h` plus the evidence the
+scope policy requires; see Experiment 023.

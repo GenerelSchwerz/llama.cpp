@@ -423,6 +423,35 @@ test_cases.emplace_back(new test_flash_attn_ext(
 Fixing it is out of scope for the quantized-native work, which neither
 introduces nor worsens it.
 
+## Scope boundary
+
+The route predicate is deliberately narrow, and the narrowness is the contract,
+not an unfinished edge. `ggml_cuda_fattn_native_applies()` admits a node only
+when all of the following hold:
+
+- the device uses NVIDIA's Ampere MMA implementation (`ampere_mma_available`);
+- `DKQ == DV` and the head dimension is 64, 128 or 256;
+- both K and V are types this build compiled a native tile loader for;
+- `logit_softcap` is zero.
+
+Anything else keeps the established F16-materializing path. The option name is
+generic; its coverage is not, and a request outside the boundary is declined,
+not approximated.
+
+Expanding the boundary is a separate, measured change in each case:
+
+| Expansion | What it owes before it is taken |
+|---|---|
+| A new cache type | A `fattn_quant_type_traits` loader that is bit-identical to that type's cast kernel, its manifest entry, the ordered-pair sweep against every existing type, model-level byte identity against the materializing arm, and matched allocation and throughput evidence. |
+| A new head geometry (`D = 96`, `512`, or `DKQ != DV`) | Its own loader work and its own measurement. `D = 96` needs a loader that spans block boundaries; `D = 512` broke Turing-targeted compilation. Neither is implied by the head sizes already registered. |
+| A new device family or backend | Its own kernel-selection evidence. The MMA body this route reuses is the Ampere one; Volta/Turing, AMD, MUSA and the non-CUDA backends are untouched and must stay that way until measured. |
+| A non-zero `logit_softcap` | The pre-existing quantized-K/V softcap abort fixed first, on the standard path where it actually lives. The native route declines softcap so it does not compile kernels no dispatch can reach. |
+
+Widening the *pair* matrix within an already-compiled tier is not an expansion:
+every ordered pair of compiled types already has a kernel, and that costs two
+kernels per type rather than one per pair. What is an expansion is adding to the
+type set, the geometry set, or the device set.
+
 ## Adding a cache type
 
 Bit-identity is against the F16-casting route the option replaces, so the
