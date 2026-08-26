@@ -290,7 +290,7 @@ static void test_quantized_store_cross_residency(
         fail("cross-residency Q8 store graph allocation failed");
     }
     if (ggml_backend_sched_get_tensor_backend(sched.get(), converted) != accelerator) {
-        fail("cross-residency Q8 conversion was not pinned by its persistent device stage");
+        fail("cross-residency graph-owned Q8 conversion was not assigned to the accelerator");
     }
     if (ggml_backend_sched_graph_compute(sched.get(), staged_graph) != GGML_STATUS_SUCCESS) {
         fail("cross-residency Q8 store failed");

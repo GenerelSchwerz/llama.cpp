@@ -145,14 +145,18 @@ public:
     void set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_mat_idxs(ggml_tensor * idxs) const { mat_idxs = idxs; }
 
-    ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const override;
-    ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const override;
+    ggml_tensor * cpy_k(
+            ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
+            int32_t il, ggml_tensor ** store_stage = nullptr) const override;
+    ggml_tensor * cpy_v(
+            ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
+            int32_t il, ggml_tensor ** store_stage = nullptr) const override;
     ggml_tensor * cpy_k_with_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs,
-            ggml_tensor * tail_idxs, int32_t il) const override;
+            ggml_tensor * tail_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const override;
     ggml_tensor * cpy_v_with_tail(
             ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs,
-            ggml_tensor * tail_idxs, int32_t il) const override;
+            ggml_tensor * tail_idxs, int32_t il, ggml_tensor ** store_stage = nullptr) const override;
     ggml_tensor * cpy_k_tail(
             ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
             int32_t il, ggml_tensor * dependency = nullptr) const override;
