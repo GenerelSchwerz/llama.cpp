@@ -485,6 +485,27 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
+// The scheduler names a tensor it copies in from another backend "<backend>#<name>#<copy>", where
+// <name> is the graph name of the source plus the suffixes ggml appends for views. Undo both, so
+// that the copy can be recognised under the name the graph gave it.
+static std::string ggml_backend_meta_copy_source_name(const char * name) {
+    std::string decorated = name;
+    const size_t first = decorated.find('#');
+    const size_t last  = decorated.rfind('#');
+    if (first == std::string::npos || last <= first) {
+        return decorated;
+    }
+    std::string ret = decorated.substr(first + 1, last - first - 1);
+    while (!ret.empty() && ret.back() == ')') {
+        const size_t paren = ret.rfind(" (");
+        if (paren == std::string::npos) {
+            break;
+        }
+        ret.erase(paren);
+    }
+    return ret;
+}
+
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -831,10 +852,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        // A tensor the scheduler copied in from another backend is a leaf in the compute buffer,
+        // so it never reached the device callback and fell through to MIRRORED. A host-resident
+        // KV cache arrives this way, and mirroring it while the queries stay split by head makes
+        // each device attend the wrong heads. Ask the callback; it still answers MIRRORED for
+        // names it does not know.
+        const bool copied_in_leaf =
+            ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            tensor->op == GGML_OP_NONE && (tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0;
+
+        if ((ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || copied_in_leaf) &&
+                tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+            // the callback classifies by name, so offer a copy under the name it was copied from
+            const ggml_tensor * tensor_query = tensor;
+            ggml_tensor tensor_named;
+            if (copied_in_leaf) {
+                tensor_named = *tensor;
+                ggml_set_name(&tensor_named, ggml_backend_meta_copy_source_name(tensor->name).c_str());
+                tensor_query = &tensor_named;
+            }
+            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor_query, dev_ctx->get_split_state_ud);
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
@@ -1410,6 +1449,34 @@ static void ggml_backend_meta_buffer_memset_tensor(
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, 1].
+    // The heads are the split axis but they are interleaved inside each cell, so the chunk splice
+    // below cannot express the write. Each device's heads are one contiguous run per cell, which
+    // is a strided copy: ne[1] cells, from the full cell stride to the device's own.
+    const bool strided_head_split =
+        !ggml_is_contiguous(tensor) &&
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+        split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        tensor->ne[3] == 1 && tensor->nb[1] > tensor->nb[2] &&
+        offset == 0 && size == ggml_nbytes(tensor);
+
+    if (strided_head_split) {
+        size_t offset_data = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t nbytes = split_state.ne[j] * tensor->nb[2];
+            if (nbytes == 0) {
+                continue;
+            }
+            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data, 0, nbytes,
+                tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            offset_data += nbytes;
+        }
+        GGML_ASSERT(offset_data == (size_t) tensor->ne[2] * tensor->nb[2]);
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
