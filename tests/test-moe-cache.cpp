@@ -239,6 +239,75 @@ int main(int argc, char ** argv) {
     CUDA_OK(cudaStreamDestroy(compute_stream));
     ggml_cuda_moe_cache_free(staging_cache);
 
+    auto * split_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2, false, 0, 0);
+    CHECK(split_cache != nullptr);
+    cudaStream_t split_copy_stream = ggml_cuda_moe_cache_copy_stream(split_cache);
+    CHECK(split_copy_stream != nullptr);
+    CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    CUDA_OK(cudaMalloc(&staging_dst, 2 * SLOT_BYTES));
+    std::vector<float> split_readback(4 * N_FLOATS);
+
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        const int first = 2 * repeat;
+        const void * split_srcs[] = {
+            host_experts + (size_t)(first + 0) * N_FLOATS,
+            host_experts + (size_t)(first + 1) * N_FLOATS,
+            host_experts + (size_t)(first + 2) * N_FLOATS,
+            host_experts + (size_t)(first + 3) * N_FLOATS,
+        };
+        for (int e = first; e < first + 4; ++e) {
+            std::fill_n(host_experts + (size_t)e * N_FLOATS, N_FLOATS, (float)e);
+        }
+
+        host_barrier barrier;
+        CUDA_OK(cudaLaunchHostFunc(compute_stream, wait_on_host_barrier, &barrier));
+        while (!barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        int slot_ids[4] = {-1, -1, -1, -1};
+        int n_resident = 0;
+        CHECK(ggml_cuda_moe_cache_prepare_split_staging(
+            split_cache, split_srcs, 4, SLOT_BYTES, 1, slot_ids, &n_resident, staging_dst, compute_stream));
+        CHECK(n_resident == 2);
+        CHECK(slot_ids[0] >= 0 && slot_ids[1] >= 0);
+        CHECK(slot_ids[0] != slot_ids[1]);
+        CHECK(slot_ids[2] == -1 && slot_ids[3] == -1);
+        CHECK(cudaStreamQuery(split_copy_stream) == cudaErrorNotReady);
+
+        barrier.released.store(true, std::memory_order_release);
+        CUDA_OK(cudaStreamSynchronize(compute_stream));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data(), ggml_cuda_moe_cache_slot_ptr(split_cache, slot_ids[0]), SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data() + N_FLOATS, ggml_cuda_moe_cache_slot_ptr(split_cache, slot_ids[1]), SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data() + 2 * N_FLOATS, staging_dst, 2 * SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        for (int e = 0; e < 4; ++e) {
+            for (int j = 0; j < N_FLOATS; ++j) {
+                CHECK(split_readback[e * N_FLOATS + j] == (float)(first + e));
+            }
+        }
+        CHECK(ggml_cuda_moe_cache_release_split_slots(split_cache, slot_ids, 4, compute_stream));
+        CUDA_OK(cudaStreamSynchronize(compute_stream));
+    }
+
+    const void * non_overflow_srcs[] = {host_experts, host_experts + N_FLOATS};
+    int non_overflow_slots[2] = {-1, -1};
+    int non_overflow_resident = 0;
+    CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
+        split_cache, non_overflow_srcs, 2, SLOT_BYTES, 1, non_overflow_slots,
+        &non_overflow_resident, staging_dst, compute_stream));
+    CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
+    CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
+
+    CUDA_OK(cudaFree(staging_dst));
+    CUDA_OK(cudaStreamDestroy(compute_stream));
+    ggml_cuda_moe_cache_free(split_cache);
+
     auto * registry_cache_a = ggml_cuda_moe_cache_get_or_create_for_tensor(
         dev, host_experts, SLOT_BYTES, 1, 1, "duplicate.name");
     auto * registry_cache_b = ggml_cuda_moe_cache_get_or_create_for_tensor(
