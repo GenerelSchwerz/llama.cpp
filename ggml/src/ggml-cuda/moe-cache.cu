@@ -845,10 +845,16 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         cuStreamWriteValue32(
             c->copy_stream, (CUdeviceptr)c->slot_pool_d, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS) {
         err = cudaStreamSynchronize(c->copy_stream);
-        c->stream_mem_ops_supported = err == cudaSuccess;
         if (err != cudaSuccess) {
+            fprintf(stderr, "moe-cache: stream memory operation probe failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            (void)cudaStreamDestroy(c->copy_stream);
+            (void)cudaFree(c->slot_pool_d);
+            delete c;
+            (void)cudaSetDevice(prev_device);
+            return nullptr;
         }
+        c->stream_mem_ops_supported = true;
     }
 #endif
 
