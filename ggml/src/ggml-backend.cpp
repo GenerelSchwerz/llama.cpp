@@ -2632,6 +2632,14 @@ void ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
 
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
         if (dev == NULL || dev->iface.event_new == NULL) {
+            // Worth naming rather than folding into the generic message below: a backend that
+            // fans out over several devices -- the meta backend used for tensor parallelism --
+            // lands here because that layer implements no events, and ordering a transfer stream
+            // against the consumer is what this is built on. It keeps the ordered path.
+            if (tr->debug > 0) {
+                GGML_LOG_INFO("%s: %s cannot order streams with events, staying on the ordered path\n",
+                        __func__, ggml_backend_name(backend));
+            }
             continue;
         }
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {

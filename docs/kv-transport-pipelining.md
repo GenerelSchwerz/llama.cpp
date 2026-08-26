@@ -268,12 +268,82 @@ transport never enabled because the scheduler is given a depth of 0.
   staged split is both K and V of one attention layer over the whole context. That
   is linear in context length, and it is what bounds the feature at depth rather
   than anything about the transfer itself.
-- **One ring, on the first backend that qualifies. Additional accelerators keep
-  the ordered path, and nothing here has been measured on more than one GPU** --
-  every number in this document is `-sm none -mg 0` on a single RTX 4070. A
-  multi-GPU host-resident cache needs its own validation before any of this is
-  claimed for it.
+- **One ring per accelerator.** A layer-split model pipelines on every device
+  that qualifies; a device with no room within the budget falls back to the
+  ordered path on its own without disabling the others.
+- **Tensor parallelism keeps the ordered path.** See
+  [Tensor parallelism](#tensor-parallelism).
 - The scheduler must be configured with the device's own default buffer type. A
   scheduler built on a split or host buffer type keeps the ordered path.
 - `GGML_KV_PIPELINE_DEPTH` overrides the depth for tools that do not expose the
   command-line option, such as `llama-bench`.
+
+## Tensor parallelism
+
+`-sm tensor` is not pipelined. The scheduler sees a single *meta* backend there,
+and two separate things stand in the way:
+
+1. **No events in the meta layer.** `ggml_backend_meta_i.event_record` and
+   `.event_wait` are null, and so are `event_new` / `event_free` /
+   `event_synchronize` on the meta device. Pipelining is built on ordering a
+   transfer stream against the consumer with events, so the eligibility check
+   rejects the backend and the ordered path runs. Requesting a look-ahead under
+   `-sm tensor` costs nothing and changes nothing: measured 21.85 t/s at depth 1
+   against 21.87 at depth 0, with identical output.
+2. **The ring is a byte arena.** It is allocated once and the staged input copies
+   are pointed into it at fixed offsets. A meta buffer has no flat base --
+   `ggml_backend_meta_buffer_get_base` returns a placeholder -- and a tensor in
+   one is not placed at an offset but built as a set of per-device tensors by the
+   buffer's `init_tensor`, from a whole `ggml_context` allocated at once. The ring
+   would have to become slot *tensors* rather than offsets.
+
+Both sit behind a correctness problem that is not this feature's:
+**`-sm tensor` together with `--no-kv-offload` currently produces wrong output.**
+On one build and one prompt, `-sm layer --no-kv-offload` and `-sm tensor` with a
+device-resident cache agree exactly, while `-sm tensor --no-kv-offload` differs.
+It does not crash or warn; it generates fluent, different text.
+
+The cause is the GQA head mapping. Tensor parallelism splits attention by head,
+but a host-resident cache is one undivided tensor, so the scheduler's copy of it
+is classified `MIRRORED` and the whole window goes to every device. With 24 query
+heads split 12/12 and 4 KV heads mirrored, the kernel derives the GQA ratio from
+the tensors it is handed -- 12/4 = 3 rather than 6 -- and the second device's
+queries, renumbered from 0, read the first device's keys. With an uneven split the
+same fault surfaces as a crash instead:
+`GGML_ASSERT(Q->ne[2] % K->ne[2] == 0)`, because 24 heads split 13/11 is not
+divisible by 4.
+
+Head-splitting the copy rather than mirroring it fixes it. That was prototyped
+and reproduced the layer-split output byte for byte, and needs four coordinated
+changes: classify the scheduler's copy at all (it is a leaf in a compute buffer,
+so it never reaches the device's split-state callback), use the head axis for the
+permuted `[head_dim, n_kv, n_head_kv, 1]` shape rather than the cache tensor's own
+axis, express the granularity in heads aligned to the query split divided by the
+GQA ratio, and add a strided write because the heads are interleaved within each
+row rather than laid out end to end.
+
+## Future work
+
+- Fix `-sm tensor` with `--no-kv-offload` (above). Until then it should not be
+  used: it is wrong rather than slow.
+- Events on the meta backend and device, so a transfer stream can be ordered
+  against a tensor-parallel consumer at all.
+- A ring that can live in a meta buffer, as slot tensors rather than offsets, so
+  tensor parallelism can be pipelined once it is correct.
+- A transfer-only meta backend that does not stand up a second collective
+  communicator: `ggml_backend_dev_init` on a meta device runs the whole meta
+  context constructor, which calls `ggml_backend_comm_init` across every device.
+- Remove the transient device-memory peak. The budget is applied per graph, so a
+  context that grows past it still allocates a ring for the small windows of early
+  prefill and releases it once the window outgrows the budget: +112 MiB at 32,768
+  against +0 in steady state. Deciding against the context's final size needs KV
+  geometry the scheduler does not have.
+- Compare the ring against `--kv-gpu-layers` at depth. At 131,072 the ring's
+  818 MiB is about three attention layers' K and V; making three of sixteen
+  device-resident would remove about 19% of the host-to-device traffic against the
+  9.1% the ring buys there. Unmeasured, and it moves with layer count and card.
+- Give the exactness harness a per-task nonce. Two long-prompt tasks proved
+  non-deterministic in the baseline -- a second control run reproduced this
+  branch's hashes rather than its own -- because the server restores a similar
+  cached prefix. Until that is pinned down the harness is a weaker gate than it
+  looks.
