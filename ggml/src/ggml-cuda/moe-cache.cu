@@ -1259,6 +1259,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,
     const void * const * host_srcs,
     int                  n_host_srcs,
+    const int *          admission_order,
     size_t               byte_count,
     int                  min_resident,
     int *                slot_ids,
@@ -1266,14 +1267,17 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     void *               miss_dst,
     cudaStream_t         compute_stream) {
 
-    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
+    if (!cache || !host_srcs || n_host_srcs <= 0 || !admission_order || byte_count == 0 || min_resident <= 0 ||
         !slot_ids || !out_n_resident || !miss_dst || !compute_stream) {
         return false;
     }
+    std::vector<char> order_seen(n_host_srcs, 0);
     for (int i = 0; i < n_host_srcs; ++i) {
-        if (!host_srcs[i]) {
+        const int position = admission_order[i];
+        if (!host_srcs[i] || position < 0 || position >= n_host_srcs || order_seen[position]) {
             return false;
         }
+        order_seen[position] = 1;
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
@@ -1300,7 +1304,8 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         }
     }
 
-    for (int i = 0; i < n_host_srcs && n_resident < cache->n_slots; ++i) {
+    for (int order = 0; order < n_host_srcs && n_resident < cache->n_slots; ++order) {
+        const int i = admission_order[order];
         if (slot_ids[i] >= 0) {
             continue;
         }

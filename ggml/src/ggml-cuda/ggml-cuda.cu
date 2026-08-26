@@ -85,6 +85,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2216,6 +2217,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t ids_ne1 = ids->ne[1];
     const int64_t ids_ne2 = ids->ne[2];
     std::vector<int32_t> expert_to_pos(n_experts_total, -1);
+    std::vector<int32_t> expert_counts(n_experts_total, 0);
     std::vector<int32_t> unique_experts;
     unique_experts.reserve(std::min<int64_t>(n_experts_total, 64));
 
@@ -2225,6 +2227,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
                 const int32_t eid = *(const int32_t *)(ids_host_bytes.data()
                     + i2*ids_host_nb2 + i1*ids_host_nb1 + i0*ids_host_nb0);
                 GGML_ASSERT(eid >= 0 && eid < n_experts_total);
+                expert_counts[eid]++;
                 if (expert_to_pos[eid] < 0) {
                     expert_to_pos[eid] = (int32_t)unique_experts.size();
                     unique_experts.push_back(eid);
@@ -2235,6 +2238,11 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     const int n_unique = (int)unique_experts.size();
     GGML_ASSERT(n_unique > 0);
+    std::vector<int> admission_order(n_unique);
+    std::iota(admission_order.begin(), admission_order.end(), 0);
+    std::stable_sort(admission_order.begin(), admission_order.end(), [&](int a, int b) {
+        return expert_counts[unique_experts[a]] > expert_counts[unique_experts[b]];
+    });
 
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
@@ -2256,7 +2264,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         const int min_resident = (n_slots + 5) / 6;
         if (ggml_cuda_should_use_mmq(src0->type, cc, dst->src[1]->ne[2], n_unique)) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
-                cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
+                cache, host_ptrs.data(), n_unique, admission_order.data(), expert_stride, min_resident,
                 split_slot_ids.data(), &n_resident, scratch_experts.get(), stream);
         }
     }
