@@ -812,20 +812,6 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->l2_budget_bytes = l2_budget_bytes;
     c->l2_target_slots = l2_target_slots;
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
-    CUdevice cu_device;
-    int can_use_stream_mem_ops = 0;
-#if CUDA_VERSION >= 13000
-    const CUdevice_attribute stream_mem_ops_attribute = CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1;
-#else
-    const CUdevice_attribute stream_mem_ops_attribute = CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS;
-#endif
-    if (cuDeviceGet(&cu_device, device) == CUDA_SUCCESS &&
-        cuDeviceGetAttribute(&can_use_stream_mem_ops, stream_mem_ops_attribute, cu_device) == CUDA_SUCCESS) {
-        c->stream_mem_ops_supported = can_use_stream_mem_ops != 0;
-    }
-#endif
-
     err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
@@ -843,6 +829,28 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         cudaSetDevice(prev_device);
         return nullptr;
     }
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+    bool can_use_stream_mem_ops = true;
+#if CUDA_VERSION < 13000
+    CUdevice cu_device;
+    int stream_mem_ops_attribute = 0;
+    can_use_stream_mem_ops =
+        cuDeviceGet(&cu_device, device) == CUDA_SUCCESS &&
+        cuDeviceGetAttribute(
+            &stream_mem_ops_attribute, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS, cu_device) == CUDA_SUCCESS &&
+        stream_mem_ops_attribute != 0;
+#endif
+    if (can_use_stream_mem_ops &&
+        cuStreamWriteValue32(
+            c->copy_stream, (CUdeviceptr)c->slot_pool_d, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS) {
+        err = cudaStreamSynchronize(c->copy_stream);
+        c->stream_mem_ops_supported = err == cudaSuccess;
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+        }
+    }
+#endif
 
     err = cudaEventCreateWithFlags(&c->compute_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
