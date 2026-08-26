@@ -2181,7 +2181,8 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
 static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                         const std::vector<char> & ids_host_bytes,
                                         bool is_decode,
-                                        bool overflow) {
+                                        bool overflow,
+                                        ggml_cuda_moe_cache * cache) {
     const int64_t op_start_us = ggml_time_us();
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * ids  = dst->src[2];
@@ -2221,14 +2222,27 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
     const char * src_base = (const char *)src0->data;
-    char       * dst_base = (char *)scratch_experts.get();
-    for (int i = 0; i < n_unique; ++i) {
-        const int32_t eid = unique_experts[i];
-        CUDA_CHECK(cudaMemcpyAsync(
-            dst_base + (size_t)i * expert_stride,
-            src_base + (size_t)eid * expert_stride,
-            expert_stride,
-            cudaMemcpyHostToDevice, stream));
+    bool cache_staged = false;
+    if (overflow && cache) {
+        std::vector<const void *> host_ptrs;
+        host_ptrs.reserve(n_unique);
+        for (int32_t eid : unique_experts) {
+            host_ptrs.push_back(src_base + (size_t)eid * expert_stride);
+        }
+        cache_staged = ggml_cuda_moe_cache_copy_to_staging(
+            cache, host_ptrs.data(), n_unique, expert_stride, scratch_experts.get(), stream);
+    }
+
+    if (!cache_staged) {
+        char * dst_base = (char *)scratch_experts.get();
+        for (int i = 0; i < n_unique; ++i) {
+            const int32_t eid = unique_experts[i];
+            CUDA_CHECK(cudaMemcpyAsync(
+                dst_base + (size_t)i * expert_stride,
+                src_base + (size_t)eid * expert_stride,
+                expert_stride,
+                cudaMemcpyHostToDevice, stream));
+        }
     }
 
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
@@ -2384,7 +2398,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     if (cache == nullptr) {
-        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false, nullptr);
         return;
     }
 
@@ -2431,7 +2445,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (overflow) {
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, true);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, true, cache);
         return;
     }
 
@@ -2495,7 +2509,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     if (any_cache_failure) {
         // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
         // Fall back so we still produce correct output.
-        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false);
+        ggml_cuda_mul_mat_id_staged(ctx, dst, *ids_host_bytes, is_decode, false, nullptr);
         return;
     }
     const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);

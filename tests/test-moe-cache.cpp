@@ -9,6 +9,7 @@
 //   4. No expert is ever resident in two slots simultaneously.
 //   5. Hit rate for a Zipf-ish access pattern is non-trivial (>40%).
 //   6. Registry keys distinguish tensors that have the same name.
+//   7. Cache-assisted staging orders mixed D2D and H2D copies after prior compute.
 //
 // The workload is a synthetic stand-in for MoE routing: most tokens land on a
 // hot subset of experts. Real Gemma 4 / Mixtral / Qwen3 routing has stronger
@@ -19,13 +20,16 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <thread>
 #include <vector>
 
 #define CHECK(cond) do { \
@@ -59,6 +63,19 @@ static int sample_zipf(std::mt19937 & rng, int n, double s) {
     double r = u(rng);
     auto it = std::lower_bound(cdf.begin(), cdf.end(), r);
     return (int)(it - cdf.begin());
+}
+
+struct host_barrier {
+    std::atomic<bool> entered{false};
+    std::atomic<bool> released{false};
+};
+
+static void CUDART_CB wait_on_host_barrier(void * data) {
+    auto * barrier = static_cast<host_barrier *>(data);
+    barrier->entered.store(true, std::memory_order_release);
+    while (!barrier->released.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 }
 
 int main(int argc, char ** argv) {
@@ -154,6 +171,62 @@ int main(int argc, char ** argv) {
     CHECK(hits + misses == (uint64_t)(N_ACCESS + N_EXPERTS));
 
     ggml_cuda_moe_cache_free(cache);
+
+    auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 1, false, 0, 0);
+    CHECK(staging_cache != nullptr);
+    cudaStream_t staging_copy_stream = ggml_cuda_moe_cache_copy_stream(staging_cache);
+    CHECK(staging_copy_stream != nullptr);
+
+    const void * resident_src = host_experts;
+    const void * nonresident_src = host_experts + N_FLOATS;
+    CHECK(ggml_cuda_moe_cache_acquire(
+        staging_cache, resident_src, SLOT_BYTES, staging_copy_stream, false, false, false) == 0);
+    CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
+
+    cudaStream_t compute_stream = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    void * staging_dst = nullptr;
+    CUDA_OK(cudaMalloc(&staging_dst, 2 * SLOT_BYTES));
+    const void * staging_srcs[] = {resident_src, nonresident_src};
+    std::vector<float> staging_readback(2 * N_FLOATS);
+
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        float nonresident_value = 100.0f + repeat;
+        std::fill_n(host_experts + N_FLOATS, N_FLOATS, nonresident_value);
+
+        host_barrier barrier;
+        CUDA_OK(cudaLaunchHostFunc(compute_stream, wait_on_host_barrier, &barrier));
+        while (!barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        CHECK(ggml_cuda_moe_cache_copy_to_staging(
+            staging_cache, staging_srcs, 2, SLOT_BYTES, staging_dst, compute_stream));
+        cudaError_t staging_copy_status = cudaErrorNotReady;
+        for (int attempt = 0; attempt < 100 && staging_copy_status == cudaErrorNotReady; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            staging_copy_status = cudaStreamQuery(staging_copy_stream);
+        }
+        CHECK(staging_copy_status == cudaErrorNotReady);
+
+        barrier.released.store(true, std::memory_order_release);
+        CUDA_OK(cudaStreamSynchronize(compute_stream));
+        CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
+        CUDA_OK(cudaMemcpy(staging_readback.data(), staging_dst, 2 * SLOT_BYTES, cudaMemcpyDeviceToHost));
+        for (int j = 0; j < N_FLOATS; ++j) {
+            CHECK(staging_readback[j] == 0.0f);
+            CHECK(staging_readback[N_FLOATS + j] == nonresident_value);
+        }
+    }
+
+    CHECK(!ggml_cuda_moe_cache_copy_to_staging(
+        staging_cache, staging_srcs, 2, SLOT_BYTES + 1, staging_dst, compute_stream));
+    CHECK(cudaStreamQuery(staging_copy_stream) == cudaSuccess);
+    CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
+
+    CUDA_OK(cudaFree(staging_dst));
+    CUDA_OK(cudaStreamDestroy(compute_stream));
+    ggml_cuda_moe_cache_free(staging_cache);
 
     auto * registry_cache_a = ggml_cuda_moe_cache_get_or_create_for_tensor(
         dev, host_experts, SLOT_BYTES, 1, 1, "duplicate.name");

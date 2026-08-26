@@ -686,11 +686,10 @@ struct ggml_cuda_moe_cache {
 
     void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
 
-    // Dedicated copy stream so H2D acquires can pipeline with the compute
-    // stream's kernel work. The dispatch hook records `copy_done` after all
-    // acquires for an op finish, then makes the compute stream wait on it.
+    // Dedicated copy stream for cache fills, prefetches, and staging copies.
     cudaStream_t copy_stream;
     cudaEvent_t  compute_done;
+    cudaEvent_t  stage_done;
 
     // Per-slot state.
     std::vector<const void *> slot_to_host;  // [n_slots], nullptr if empty
@@ -804,6 +803,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->slot_pool_d     = nullptr;
     c->copy_stream     = nullptr;
     c->compute_done    = nullptr;
+    c->stage_done      = nullptr;
     c->access_counter  = 0;
     c->source_is_mmap  = source_is_mmap;
     c->l2_budget_bytes = l2_budget_bytes;
@@ -830,6 +830,17 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     err = cudaEventCreateWithFlags(&c->compute_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
+        cudaStreamDestroy(c->copy_stream);
+        cudaFree(c->slot_pool_d);
+        delete c;
+        cudaSetDevice(prev_device);
+        return nullptr;
+    }
+
+    err = cudaEventCreateWithFlags(&c->stage_done, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
+        cudaEventDestroy(c->compute_done);
         cudaStreamDestroy(c->copy_stream);
         cudaFree(c->slot_pool_d);
         delete c;
@@ -883,6 +894,9 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     }
     if (cache->compute_done) {
         cudaEventDestroy(cache->compute_done);
+    }
+    if (cache->stage_done) {
+        cudaEventDestroy(cache->stage_done);
     }
     if (cache->slot_pool_d) {
         cudaFree(cache->slot_pool_d);
@@ -1158,6 +1172,50 @@ int ggml_cuda_moe_cache_acquire(
     }
 
     return lru_slot;
+}
+
+extern "C"
+bool ggml_cuda_moe_cache_copy_to_staging(
+    struct ggml_cuda_moe_cache * cache,
+    const void * const * host_srcs,
+    int                  n_host_srcs,
+    size_t               byte_count,
+    void *               dst,
+    cudaStream_t         compute_stream) {
+
+    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || !dst || !compute_stream) {
+        return false;
+    }
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (!host_srcs[i]) {
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    if (byte_count > cache->slot_size_bytes) {
+        return false;
+    }
+
+    CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
+
+    for (int i = 0; i < n_host_srcs; ++i) {
+        const auto it = cache->host_to_slot.find(host_srcs[i]);
+        const bool resident = it != cache->host_to_slot.end();
+        const void * src = resident ?
+            (const char *)cache->slot_pool_d + (size_t)it->second * cache->slot_size_bytes : host_srcs[i];
+        CUDA_CHECK(cudaMemcpyAsync(
+            (char *)dst + (size_t)i * byte_count,
+            src,
+            byte_count,
+            resident ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
+            cache->copy_stream));
+    }
+
+    CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
+    return true;
 }
 
 extern "C"
