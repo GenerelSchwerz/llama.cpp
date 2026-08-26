@@ -1026,21 +1026,15 @@ static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache
     }
 }
 
-extern "C"
-int ggml_cuda_moe_cache_acquire(
+static int ggml_cuda_moe_cache_acquire_locked(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
     size_t       byte_count,
     cudaStream_t copy_stream,
     bool         use_l2,
     bool         is_decode,
-    bool         is_prefetch) {
-
-    if (!cache || host_src == nullptr || byte_count == 0) {
-        return -1;
-    }
-
-    std::lock_guard<std::mutex> lk(cache->mu);
+    bool         is_prefetch,
+    bool         wait_for_compute) {
 
     if (byte_count > cache->slot_size_bytes) {
         // Caller forgot to grow first. Bail rather than clobber the next slot.
@@ -1148,11 +1142,14 @@ int ggml_cuda_moe_cache_acquire(
     if (debug_mm) {
         enqueue_start_us = ggml_time_us();
     }
-    cudaError_t err = cudaStreamWaitEvent(copy_stream, cache->compute_done, 0);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "moe-cache: cudaStreamWaitEvent failed: %s\n", cudaGetErrorString(err));
-        rollback_miss();
-        return -1;
+    cudaError_t err = cudaSuccess;
+    if (wait_for_compute) {
+        err = cudaStreamWaitEvent(copy_stream, cache->compute_done, 0);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "moe-cache: cudaStreamWaitEvent failed: %s\n", cudaGetErrorString(err));
+            rollback_miss();
+            return -1;
+        }
     }
     err = cudaMemcpyAsync(
         dst, copy_src, byte_count,
@@ -1180,6 +1177,25 @@ int ggml_cuda_moe_cache_acquire(
     }
 
     return lru_slot;
+}
+
+extern "C"
+int ggml_cuda_moe_cache_acquire(
+    struct ggml_cuda_moe_cache * cache,
+    const void * host_src,
+    size_t       byte_count,
+    cudaStream_t copy_stream,
+    bool         use_l2,
+    bool         is_decode,
+    bool         is_prefetch) {
+
+    if (!cache || host_src == nullptr || byte_count == 0) {
+        return -1;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    return ggml_cuda_moe_cache_acquire_locked(
+        cache, host_src, byte_count, copy_stream, use_l2, is_decode, is_prefetch, true);
 }
 
 extern "C"
@@ -1261,7 +1277,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
-    if (byte_count > cache->slot_size_bytes) {
+    if (byte_count > cache->slot_size_bytes || n_host_srcs <= cache->n_slots) {
         return false;
     }
 
@@ -1271,12 +1287,42 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         slot_ids[i] = it == cache->host_to_slot.end() ? -1 : it->second;
         n_resident += slot_ids[i] >= 0;
     }
-    if (n_resident < min_resident || n_resident == n_host_srcs) {
+    if (n_resident == n_host_srcs) {
         return false;
     }
 
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
+
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (slot_ids[i] >= 0) {
+            cache->slot_pin_count[slot_ids[i]]++;
+        }
+    }
+
+    for (int i = 0; i < n_host_srcs && n_resident < cache->n_slots; ++i) {
+        if (slot_ids[i] >= 0) {
+            continue;
+        }
+
+        const int slot = ggml_cuda_moe_cache_acquire_locked(
+            cache, host_srcs[i], byte_count, cache->copy_stream, false, false, false, false);
+        if (slot < 0) {
+            break;
+        }
+        slot_ids[i] = slot;
+        cache->slot_pin_count[slot]++;
+        n_resident++;
+    }
+
+    if (n_resident < min_resident) {
+        for (int i = 0; i < n_host_srcs; ++i) {
+            if (slot_ids[i] >= 0) {
+                cache->slot_pin_count[slot_ids[i]]--;
+            }
+        }
+        return false;
+    }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
     std::vector<void *> batch_dsts;
@@ -1286,7 +1332,6 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     int miss = 0;
     for (int i = 0; i < n_host_srcs;) {
         if (slot_ids[i] >= 0) {
-            cache->slot_pin_count[slot_ids[i]]++;
             ++i;
             continue;
         }
