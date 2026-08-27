@@ -1217,15 +1217,38 @@ int ggml_cuda_moe_cache_acquire(
     cudaStream_t copy_stream,
     bool         use_l2,
     bool         is_decode,
-    bool         is_prefetch) {
+    bool         is_prefetch,
+    bool         pin) {
 
     if (!cache || host_src == nullptr || byte_count == 0) {
         return -1;
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
-    return ggml_cuda_moe_cache_acquire_locked(
+    const int slot = ggml_cuda_moe_cache_acquire_locked(
         cache, host_src, byte_count, copy_stream, use_l2, is_decode, is_prefetch, true);
+    if (slot >= 0 && pin) {
+        cache->slot_pin_count[slot]++;
+    }
+    return slot;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_release_slots(
+    struct ggml_cuda_moe_cache * cache,
+    const int * slot_ids,
+    int n_slot_ids) {
+    if (!cache || !slot_ids || n_slot_ids <= 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(cache->mu);
+    for (int i = 0; i < n_slot_ids; ++i) {
+        const int slot = slot_ids[i];
+        GGML_ASSERT(slot >= 0 && slot < cache->n_slots);
+        GGML_ASSERT(cache->slot_pin_count[slot] > 0);
+        cache->slot_pin_count[slot]--;
+    }
 }
 
 extern "C"
@@ -1540,8 +1563,21 @@ bool ggml_cuda_moe_cache_grow_pool(
     cudaGetDevice(&prev_device);
     cudaSetDevice(cache->device);
 
+    cudaError_t err = cudaEventSynchronize(cache->compute_done);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: grow_pool cudaEventSynchronize failed: %s\n", cudaGetErrorString(err));
+        cudaSetDevice(prev_device);
+        return false;
+    }
+    err = cudaStreamSynchronize(cache->copy_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: grow_pool cudaStreamSynchronize failed: %s\n", cudaGetErrorString(err));
+        cudaSetDevice(prev_device);
+        return false;
+    }
+
     void * new_pool = nullptr;
-    cudaError_t err = cudaMalloc(&new_pool, (size_t)cache->n_slots * min_slot_size_bytes);
+    err = cudaMalloc(&new_pool, (size_t)cache->n_slots * min_slot_size_bytes);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: grow_pool cudaMalloc(%zu) failed: %s\n",
                 (size_t)cache->n_slots * min_slot_size_bytes, cudaGetErrorString(err));
@@ -1549,9 +1585,6 @@ bool ggml_cuda_moe_cache_grow_pool(
         return false;
     }
 
-    if (cache->copy_stream) {
-        cudaStreamSynchronize(cache->copy_stream);
-    }
     if (cache->slot_pool_d) {
         cudaFree(cache->slot_pool_d);
     }
@@ -1603,18 +1636,20 @@ cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * 
 }
 
 extern "C"
-void ggml_cuda_moe_cache_mark_used(
+bool ggml_cuda_moe_cache_mark_used(
     struct ggml_cuda_moe_cache * cache,
     cudaStream_t compute_stream) {
     if (!cache || !compute_stream) {
-        return;
+        return false;
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
     cudaError_t err = cudaEventRecord(cache->compute_done, compute_stream);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventRecord failed: %s\n", cudaGetErrorString(err));
+        return false;
     }
+    return true;
 }
 
 extern "C"
@@ -2542,7 +2577,7 @@ void ggml_backend_cuda_moe_prefetch_experts(
         int32_t eid = eids[i];
         if (eid < 0) continue;
         const void * host_ptr = src_base + (size_t)eid * expert_stride;
-        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, true);
+        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, true, false);
     }
 }
 

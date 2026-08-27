@@ -87,7 +87,7 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
 
     It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
 */
-template <int n_experts, bool has_bias>
+template <int n_experts, bool has_bias, bool publish_ids>
 __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *         logits,
                                                                   float *               weights,
                                                                   int32_t *             ids,
@@ -96,7 +96,9 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
                                                                   const int             n_expert_used,
                                                                   const float           clamp_val,
                                                                   const float           scale_val,
-                                                                  const topk_moe_config config) {
+                                                                  const topk_moe_config config,
+                                                                  volatile int32_t *    published,
+                                                                  volatile uint32_t *   published_ready) {
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= n_rows) {
         return;
@@ -239,9 +241,20 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
             ids[k] = max_expert;
+            if constexpr (publish_ids) {
+                published[k] = max_expert;
+            }
             if (config.with_norm) {
                 wt_sum += max_val;
             }
+        }
+    }
+
+    if constexpr (publish_ids) {
+        __syncwarp();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            *published_ready = 1;
         }
     }
 
@@ -268,7 +281,7 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float * 
     }
 }
 
-template<bool has_bias>
+template<bool has_bias, bool publish_ids>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
                                  float *                     weights,
@@ -279,7 +292,9 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const int                   n_expert_used,
                                  const float                 clamp_val,
                                  const float                 scale_val,
-                                 const topk_moe_config       config) {
+                                 const topk_moe_config       config,
+                                 int32_t *                   published,
+                                 uint32_t *                  published_ready) {
     GGML_ASSERT(!(config.with_norm && config.delayed_softmax) &&
                 "delayed softmax is not supported with weight normalization");
     const int    rows_per_block = 4;
@@ -290,52 +305,52 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 
     switch (n_expert) {
         case 1:
-            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<1, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 2:
-            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<2, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 4:
-            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<4, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 8:
-            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<8, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 16:
-            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<16, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 32:
-            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<32, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 64:
-            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<64, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 128:
-            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<128, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 256:
-            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 288: // StepFun 3.7
-            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 512:
-            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<512, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         case 576:
-            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias>, launch_params,
-                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config);
+            ggml_cuda_kernel_launch(topk_moe_cuda<576, has_bias, publish_ids>, launch_params,
+                logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, published, published_ready);
             break;
         default:
             GGML_ASSERT(false && "fatal error");
@@ -350,7 +365,9 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
                            const ggml_tensor *             clamp,
                            const ggml_tensor *             scale,
                            const ggml_tensor *             bias,
-                           const ggml_cuda_topk_moe_args & args) {
+                           const ggml_cuda_topk_moe_args & args,
+                           int32_t *                       published_ids,
+                           uint32_t *                      published_ready) {
     GGML_ASSERT(logits->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
@@ -382,12 +399,19 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
     config.with_norm         = with_norm;
     config.delayed_softmax   = args.delayed_softmax;
 
-    if (bias) {
-        launch_topk_moe_cuda<true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+    const bool publish = published_ids && published_ready && n_rows == 1;
+    if (bias && publish) {
+        launch_topk_moe_cuda<true, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                             scale_val, config, published_ids, published_ready);
+    } else if (bias) {
+        launch_topk_moe_cuda<true, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                             scale_val, config, nullptr, nullptr);
+    } else if (publish) {
+        launch_topk_moe_cuda<false, true>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                             scale_val, config, published_ids, published_ready);
     } else {
-        launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
-                             scale_val, config);
+        launch_topk_moe_cuda<false, false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
+                             scale_val, config, nullptr, nullptr);
     }
 }
 

@@ -2864,6 +2864,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
 
     // a frequency map to count token occurrences
     std::unordered_map<llama_token, int> token_count;
+    std::vector<int32_t> token_count_dense;
 
     // backend graph inputs
     ggml_tensor * inp_token_ids = nullptr;
@@ -2880,6 +2881,7 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         // note: inp_token_ids/inp_counts belong to the current sampling graph
         prev        = src.prev;
         token_count = src.token_count;
+        token_count_dense = src.token_count_dense;
     }
 
     static bool is_disabled(
@@ -2907,7 +2909,8 @@ struct llama_sampler_penalties : public llama_sampler_backend {
         , penalty_repeat  (penalty_repeat)
         , penalty_freq    (penalty_freq)
         , penalty_present (penalty_present)
-        , prev            (penalty_last_n) {
+        , prev            (penalty_last_n)
+        , token_count_dense(std::max(n_vocab, 0), 0) {
     }
 };
 
@@ -2922,14 +2925,20 @@ static void llama_sampler_penalties_accept(struct llama_sampler * smpl, llama_to
         return;
     }
 
-    ctx->token_count[token]++;
+    const int count = ++ctx->token_count[token];
+    if (token >= 0 && token < ctx->n_vocab) {
+        ctx->token_count_dense[token] = count;
+    }
 
     // if the ring buffer is full, remove the oldest token
     if (ctx->prev.size() >= (size_t) ctx->penalty_last_n) {
         const auto old = ctx->prev.front();
 
-        ctx->token_count[old]--;
-        if (ctx->token_count[old] == 0) {
+        const int old_count = --ctx->token_count[old];
+        if (old >= 0 && old < ctx->n_vocab) {
+            ctx->token_count_dense[old] = old_count;
+        }
+        if (old_count == 0) {
             ctx->token_count.erase(old);
         }
     }
@@ -2956,12 +2965,17 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
 
     // Apply frequency and presence penalties to the cur_p
     for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
+        const llama_token token = cur_p->data[i].id;
+        int count = 0;
+        if (token >= 0 && token < ctx->n_vocab) {
+            count = ctx->token_count_dense[token];
+        } else {
+            const auto token_iter = ctx->token_count.find(token);
+            count = token_iter == ctx->token_count.end() ? 0 : token_iter->second;
+        }
+        if (count == 0) {
             continue;
         }
-
-        const int count = token_iter->second;
 
         assert(count > 0 && count <= ctx->penalty_last_n);
 
@@ -2983,6 +2997,7 @@ static void llama_sampler_penalties_reset(struct llama_sampler * smpl) {
     auto * ctx = (llama_sampler_penalties *) smpl->ctx;
     ctx->prev.clear();
     ctx->token_count.clear();
+    std::fill(ctx->token_count_dense.begin(), ctx->token_count_dense.end(), 0);
 }
 
 static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_sampler * smpl) {
@@ -3000,6 +3015,7 @@ static struct llama_sampler * llama_sampler_penalties_clone(const struct llama_s
 
         result_ctx->prev        = ctx->prev;
         result_ctx->token_count = ctx->token_count;
+        result_ctx->token_count_dense = ctx->token_count_dense;
     }
 
     return result;

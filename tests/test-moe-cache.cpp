@@ -118,7 +118,7 @@ int main(int argc, char ** argv) {
         int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
         const void * src = host_experts + (size_t)eid * N_FLOATS;
 
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         trace.push_back(eid);
     }
@@ -151,7 +151,7 @@ int main(int argc, char ** argv) {
     int verified = 0;
     for (int eid = 0; eid < N_EXPERTS; ++eid) {
         const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         CUDA_OK(cudaStreamSynchronize(copy_stream));
 
@@ -172,6 +172,31 @@ int main(int argc, char ** argv) {
 
     ggml_cuda_moe_cache_free(cache);
 
+    auto * batch_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 4, false, 0, 0);
+    CHECK(batch_cache != nullptr);
+    int batch_slots[4];
+    for (int eid = 0; eid < 4; ++eid) {
+        batch_slots[eid] = ggml_cuda_moe_cache_acquire(
+            batch_cache, host_experts + (size_t) eid * N_FLOATS,
+            SLOT_BYTES, copy_stream, false, true, false, true);
+        CHECK(batch_slots[eid] >= 0);
+    }
+    CHECK(ggml_cuda_moe_cache_acquire(
+        batch_cache, host_experts + 4 * N_FLOATS,
+        SLOT_BYTES, copy_stream, false, true, false, false) < 0);
+    CHECK(!ggml_cuda_moe_cache_grow_pool(batch_cache, 2 * SLOT_BYTES));
+    CUDA_OK(cudaStreamSynchronize(copy_stream));
+    for (int eid = 0; eid < 4; ++eid) {
+        void * d = ggml_cuda_moe_cache_slot_ptr(batch_cache, batch_slots[eid]);
+        CUDA_OK(cudaMemcpy(readback.data(), d, SLOT_BYTES, cudaMemcpyDeviceToHost));
+        for (int j = 0; j < N_FLOATS; ++j) {
+            CHECK(readback[j] == (float) eid);
+        }
+    }
+    ggml_cuda_moe_cache_release_slots(batch_cache, batch_slots, 4);
+    CHECK(ggml_cuda_moe_cache_grow_pool(batch_cache, 2 * SLOT_BYTES));
+    ggml_cuda_moe_cache_free(batch_cache);
+
     auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2, false, 0, 0);
     CHECK(staging_cache != nullptr);
     cudaStream_t staging_copy_stream = ggml_cuda_moe_cache_copy_stream(staging_cache);
@@ -180,9 +205,9 @@ int main(int argc, char ** argv) {
     const void * resident_src_0 = host_experts;
     const void * resident_src_1 = host_experts + N_FLOATS;
     CHECK(ggml_cuda_moe_cache_acquire(
-        staging_cache, resident_src_0, SLOT_BYTES, staging_copy_stream, false, false, false) == 0);
+        staging_cache, resident_src_0, SLOT_BYTES, staging_copy_stream, false, false, false, false) == 0);
     CHECK(ggml_cuda_moe_cache_acquire(
-        staging_cache, resident_src_1, SLOT_BYTES, staging_copy_stream, false, false, false) == 1);
+        staging_cache, resident_src_1, SLOT_BYTES, staging_copy_stream, false, false, false, false) == 1);
     CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
 
     cudaStream_t compute_stream = nullptr;

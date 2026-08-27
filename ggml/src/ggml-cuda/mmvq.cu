@@ -573,11 +573,13 @@ static __global__ void mul_mat_vec_q(
     const uint32_t channel_dst = blockIdx.y;
 
     uint32_t channel_x;
+    uint32_t gate_channel_x;
     uint32_t channel_y;
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+    gate_channel_x = ncols_dst == 1 && fusion.gate_ids ? fusion.gate_ids[channel_dst] : channel_x;
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
 
@@ -654,6 +656,7 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset_gate = sample_x*stride_sample_x + gate_channel_x*stride_channel_x + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -670,7 +673,7 @@ static __global__ void mul_mat_vec_q(
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                            vgate, &y[j*stride_col_y + kby], kbx_offset_gate + i*stride_row_x + kbx, kqs);
                     }
                 }
             }
@@ -1290,6 +1293,10 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
+        }
+        if (fusion->gate_ids) {
+            GGML_ASSERT(ids && fusion->gate_ids->type == GGML_TYPE_I32);
+            fusion_local.gate_ids = (const int32_t *) fusion->gate_ids->data;
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);

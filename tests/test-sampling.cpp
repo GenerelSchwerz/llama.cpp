@@ -187,6 +187,28 @@ static void test_penalties(
     tester.check();
 }
 
+static void test_penalties_candidates() {
+    std::vector<llama_token_data> cur = {
+        { 4,  2.0f, 0.0f },
+        { 1, -2.0f, 0.0f },
+        { 1,  4.0f, 0.0f },
+        { 7,  1.0f, 0.0f },
+    };
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, true };
+    auto * sampler = llama_sampler_init_penalties(5, 3, 2.0f, 0.25f, 0.5f);
+    llama_sampler_accept(sampler, 1);
+    llama_sampler_accept(sampler, 1);
+    llama_sampler_accept(sampler, 7);
+    llama_sampler_apply(sampler, &cur_p);
+    llama_sampler_free(sampler);
+
+    GGML_ASSERT(cur[0].logit ==  2.0f);
+    GGML_ASSERT(cur[1].logit == -5.0f);
+    GGML_ASSERT(cur[2].logit ==  1.0f);
+    GGML_ASSERT(cur[3].logit == -0.25f);
+    GGML_ASSERT(!cur_p.sorted);
+}
+
 static void test_dry(
     const std::vector<float> & probs, const std::vector<llama_token> & last_tokens,
     const std::vector<float> & expected_probs, float dry_multiplier, float dry_base,
@@ -383,6 +405,7 @@ int main(void) {
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0},             {0.000011f, 0.249997f, 0.249997f, 0.249997f, 0.249997f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2},       {0.000023f, 0.000023f, 0.000023f, 0.499966f, 0.499966f}, 1.0f, 5.0f, 5.0f);
     test_penalties({0.2f, 0.2f, 0.2f, 0.2f, 0.2f}, {0, 1, 2, 0, 0}, {0.000000f, 0.000023f, 0.000023f, 0.499977f, 0.499977f}, 1.0f, 5.0f, 5.0f);
+    test_penalties_candidates();
 
 
     test_dry({0.25f, 0.25f, 0.25f, 0.25f}, {0, 1}, {0.25f, 0.25f, 0.25f, 0.25f}, 1.0f, 1.1f, 2, 4, {});

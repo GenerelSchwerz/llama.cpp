@@ -56,7 +56,8 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache);
 //
 // `byte_count` MUST be <= ggml_cuda_moe_cache_slot_size_bytes(cache); the
 // caller is expected to ensure this via grow_pool() if the current slot_size
-// is too small. Returns -1 on bad args or a CUDA failure.
+// is too small. A pinned slot cannot be evicted until release_slots().
+// Returns -1 on bad args or a CUDA failure.
 int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
@@ -64,7 +65,13 @@ int ggml_cuda_moe_cache_acquire(
     cudaStream_t copy_stream,
     bool         use_l2,
     bool         is_decode,
-    bool         is_prefetch);
+    bool         is_prefetch,
+    bool         pin);
+
+void ggml_cuda_moe_cache_release_slots(
+    struct ggml_cuda_moe_cache * cache,
+    const int * slot_ids,
+    int n_slot_ids);
 
 // Copy host slabs into consecutive staging slots, using resident cache slots when available.
 // Returns false without enqueuing work if the arguments are invalid.
@@ -140,7 +147,7 @@ size_t       ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cach
 int          ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache);
 cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache);
 
-void ggml_cuda_moe_cache_mark_used(
+bool ggml_cuda_moe_cache_mark_used(
     struct ggml_cuda_moe_cache * cache,
     cudaStream_t compute_stream);
 
