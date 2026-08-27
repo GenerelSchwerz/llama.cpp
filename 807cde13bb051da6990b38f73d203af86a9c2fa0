@@ -1,0 +1,9 @@
+Compact causal mask port worklog
+
+Worktree: /home/gencoolpc/llama-compact-causal-mask-port
+
+Branch: codex/port-compact-causal-mask; base: 807cde13bb051da6990b38f73d203af86a9c2fa0
+
+2026-08-27: Qwen3.8 27B, ctx 131072, batch/ubatch 2048, q8_0 KV. Dense reservation 1616.30 MiB CUDA + 632.45 MiB host. Compact descriptor 1144.30 + 120.45 MiB. Live compact Q8-to-F16 staging 624.30 + 120.45 MiB. 31084-token A/B: embedded staging 1424.48 tok/s; live scratch 1430.65 tok/s. Gemma4 12B compact/live-staging reservation 510.04 + 73.36 MiB. CUDA exact descriptor equivalence 9/9.
+
+Open concern: compact mask handling adds runtime conditionals inside FA tile/MMA hot loops. Profile dense versus compact kernel behavior before accepting the implementation.
