@@ -865,6 +865,16 @@ struct ggml_backend_sched_transport {
     int64_t n_graphs;
     int64_t p_graph_us, p_sync_us, p_copy_us, p_issue_us, p_bytes_early, p_bytes_late;
 
+    // why the look-ahead stopped: the depth it was given, or a slot whose reader has not run yet.
+    // The two want opposite fixes, so they are counted apart.
+    int64_t n_stop_depth;
+    int64_t n_stop_recycle;
+    int64_t p_stop_depth, p_stop_recycle;
+
+    int64_t n_bytes_ordered; // what the ordered blocking copies still move
+    int64_t p_bytes_ordered;
+    bool    named_ordered;   // debug >= 3 names them once, they are the same every graph
+
     int debug;
 };
 
@@ -1922,20 +1932,29 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         }
     }
 
-    // per-ring slot size and delivery order
-    size_t slot_size[GGML_SCHED_MAX_BACKENDS] = { 0 };
+    // per-ring slot size and delivery order. The budget is applied to what this graph needs, so
+    // that a run whose window stays small keeps the ring whatever -n_ctx says. slot_size_max is
+    // what the same ring costs once the context is full, taken from the cache tensor the staged
+    // input is a view of; it is reported rather than enforced, because deciding on it would refuse
+    // the ring for every large -c even when the window never gets there.
+    size_t slot_size[GGML_SCHED_MAX_BACKENDS]     = { 0 };
+    size_t slot_size_max[GGML_SCHED_MAX_BACKENDS] = { 0 };
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         const int bid = split->backend_id;
 
         tr->split_order[i] = -1;
 
-        size_t need = 0;
+        size_t need     = 0;
+        size_t need_max = 0;
         for (int j = 0; j < split->n_inputs; j++) {
             if (!tr->input_staged[tr->split_input_ofs[i] + j]) {
                 continue;
             }
-            need += GGML_PAD(ggml_nbytes(split->inputs[j]), tr->rings[bid].alignment);
+            const struct ggml_tensor * input = split->inputs[j];
+            const struct ggml_tensor * base  = input->view_src ? input->view_src : input;
+            need     += GGML_PAD(ggml_nbytes(input), tr->rings[bid].alignment);
+            need_max += GGML_PAD(ggml_nbytes(base),  tr->rings[bid].alignment);
         }
 
         if (need == 0) {
@@ -1943,7 +1962,8 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         }
 
         tr->split_order[i] = tr->rings[bid].n_staged++;
-        slot_size[bid] = std::max(slot_size[bid], need);
+        slot_size[bid]     = std::max(slot_size[bid],     need);
+        slot_size_max[bid] = std::max(slot_size_max[bid], std::max(need, need_max));
     }
 
     for (int bid = 0; bid < sched->n_backends; bid++) {
@@ -1952,7 +1972,8 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             continue;
         }
 
-        const size_t ring_size = slot_size[bid] * tr->n_slots;
+        const size_t ring_size     = slot_size[bid]     * tr->n_slots;
+        const size_t ring_size_max = slot_size_max[bid] * tr->n_slots;
 
         // Checked before anything is allocated, and on every plan rather than only when the ring
         // has to grow. Latched, because a context only grows: the early prefill graphs have a
@@ -1965,10 +1986,11 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         if (tr->budget > 0 && (ring_size > tr->budget || r->over_budget)) {
             r->over_budget = true;
             if (!r->reported_no_room) {
-                GGML_LOG_WARN("%s: transport ring on %s would need %zu MiB against a %zu MiB budget, "
-                        "staying on the ordered path (raise --kv-pipeline-budget to spend more "
-                        "device memory on it)\n", __func__, ggml_backend_name(sched->backends[bid]),
-                        ring_size >> 20, tr->budget >> 20);
+                GGML_LOG_WARN("%s: transport ring on %s needs %zu MiB now and %zu MiB at the full "
+                        "context, against a %zu MiB budget, staying on the ordered path (raise "
+                        "--kv-pipeline-budget to spend more device memory on it)\n", __func__,
+                        ggml_backend_name(sched->backends[bid]), ring_size >> 20,
+                        ring_size_max >> 20, tr->budget >> 20);
                 r->reported_no_room = true;
             }
             ggml_backend_sched_transport_release_ring(sched, bid, true);
@@ -2133,6 +2155,7 @@ static void ggml_backend_sched_transport_prefetch(ggml_backend_sched_t sched, in
             continue;
         }
         if (tr->split_order[i] > r->consumed + tr->depth) {
+            tr->n_stop_depth++;
             return;
         }
 
@@ -2145,6 +2168,7 @@ static void ggml_backend_sched_transport_prefetch(ggml_backend_sched_t sched, in
         if (slot->release_armed) {
             ggml_backend_event_wait(r->transfer, slot->release);
             slot->release_armed = false;
+            tr->n_stop_recycle++;
         }
 
         for (int j = 0; j < split->n_inputs; j++) {
@@ -2279,6 +2303,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
     }
 
+    const int64_t t_graph_0 = tr->debug >= 2 ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
@@ -2287,10 +2313,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            const int64_t t0 = tr->debug >= 2 ? ggml_time_us() : 0;
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+            if (tr->debug >= 2) {
+                tr->t_sync_us += ggml_time_us() - t0;
             }
         }
 
@@ -2318,12 +2348,25 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+                const int64_t t0 = tr->debug >= 2 ? ggml_time_us() : 0;
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                 } else {
                     ggml_backend_synchronize(split_backend);
                 }
+                if (tr->debug >= 2) {
+                    tr->t_sync_us += ggml_time_us() - t0;
+                }
+                const int64_t t1 = tr->debug >= 2 ? ggml_time_us() : 0;
                 ggml_backend_tensor_copy(input, input_cpy);
+                if (tr->debug >= 2) {
+                    tr->t_copy_us     += ggml_time_us() - t1;
+                    tr->n_bytes_ordered += ggml_nbytes(input);
+                }
+                if (tr->debug >= 3 && !tr->named_ordered) {
+                    GGML_LOG_INFO("%s: ordered copy %s %zu KiB from %s\n", __func__, input->name,
+                            ggml_nbytes(input) >> 10, ggml_backend_buft_name(input->buffer->buft));
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2421,13 +2464,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                        const int64_t t0 = tr->debug >= 2 ? ggml_time_us() : 0;
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
+                        if (tr->debug >= 2) {
+                            tr->t_sync_us += ggml_time_us() - t0;
+                        }
+                        const int64_t t1 = tr->debug >= 2 ? ggml_time_us() : 0;
                         ggml_backend_tensor_copy(input, input_cpy);
+                        if (tr->debug >= 2) {
+                            tr->t_copy_us     += ggml_time_us() - t1;
+                            tr->n_bytes_ordered += ggml_nbytes(input);
+                        }
+                        if (tr->debug >= 3 && !tr->named_ordered) {
+                            GGML_LOG_INFO("%s: ordered copy %s %zu KiB from %s\n", __func__, input->name,
+                                    ggml_nbytes(input) >> 10, ggml_backend_buft_name(input->buffer->buft));
+                        }
                     }
                 }
             }
@@ -2498,6 +2554,41 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (tr->debug >= 2) {
+        tr->t_graph_us += ggml_time_us() - t_graph_0;
+        tr->n_graphs++;
+
+        // every 128 graphs, and as the mean over those 128, so that one graph's noise does not
+        // decide what the numbers look like
+        if (tr->n_graphs % 128 == 0) {
+            const double n = 128.0;
+            GGML_LOG_INFO("%s: per graph over %d: total %.2f ms, sync %.2f ms, ordered copy %.2f ms, "
+                    "issue %.2f ms, early %.1f MiB, late %.1f MiB, ordered %.1f MiB, "
+                    "stops depth/recycle %.1f/%.1f\n",
+                    __func__, (int) n,
+                    (tr->t_graph_us - tr->p_graph_us)/1e3/n,
+                    (tr->t_sync_us  - tr->p_sync_us )/1e3/n,
+                    (tr->t_copy_us  - tr->p_copy_us )/1e3/n,
+                    (tr->t_issue_us - tr->p_issue_us)/1e3/n,
+                    (tr->n_bytes_early - tr->p_bytes_early)/1048576.0/n,
+                    (tr->n_bytes_late  - tr->p_bytes_late )/1048576.0/n,
+                    (tr->n_bytes_ordered - tr->p_bytes_ordered)/1048576.0/n,
+                    (tr->n_stop_depth   - tr->p_stop_depth  )/n,
+                    (tr->n_stop_recycle - tr->p_stop_recycle)/n);
+
+            tr->p_graph_us     = tr->t_graph_us;
+            tr->p_sync_us      = tr->t_sync_us;
+            tr->p_copy_us      = tr->t_copy_us;
+            tr->p_issue_us     = tr->t_issue_us;
+            tr->p_bytes_early  = tr->n_bytes_early;
+            tr->p_bytes_late   = tr->n_bytes_late;
+            tr->p_bytes_ordered = tr->n_bytes_ordered;
+            tr->named_ordered   = true;
+            tr->p_stop_depth   = tr->n_stop_depth;
+            tr->p_stop_recycle = tr->n_stop_recycle;
+        }
     }
 
     return GGML_STATUS_SUCCESS;

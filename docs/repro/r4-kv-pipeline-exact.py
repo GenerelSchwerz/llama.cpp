@@ -41,7 +41,15 @@ def filler(name, target_tokens):
         return "".join(unit % i for i in range(reps))
     return unit * reps
 
-def ask(label, prompt, ntok):
+def nonce(name, length):
+    # The server restores a cached prefix from an earlier task, and a restored window is not
+    # numerically the same as a freshly prefilled one, so two tasks that share a long prefix stop
+    # measuring the code under test. This makes every task's prefix unique, and it is derived from
+    # the task rather than drawn at random so that a control run produces comparable hashes.
+    h = hashlib.sha256(f"{name}/{length}".encode()).hexdigest()[:32]
+    return f"Session {h}. Ignore this line.\n\n"
+
+def ask(label, prompt, ntok, want_prefill):
     body = json.dumps({"model": "m", "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": ntok, "temperature": 0, "top_k": 1, "seed": 1234}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", body,
@@ -56,15 +64,20 @@ def ask(label, prompt, ntok):
     # reasoning models put most of the generation in reasoning_content; hash both
     text = (m.get("reasoning_content") or "") + "\x00" + (m.get("content") or "")
     t = d.get("timings", {})
+    # a reused prefix shows up as a prompt_n far below the prompt actually sent; the hash it
+    # produces is not comparable to a fresh prefill, so say so rather than reporting it silently
+    prompt_n = t.get("prompt_n") or 0
+    reused = prompt_n < want_prefill // 2
     print(f"{label:<18} {hashlib.sha256(text.encode()).hexdigest()[:16]} "
-          f"prompt_n={t.get('prompt_n'):<7} n={t.get('predicted_n'):<4} "
-          f"pp={t.get('prompt_per_second'):8.2f} tg={t.get('predicted_per_second'):7.3f}", flush=True)
-    return True
+          f"prompt_n={prompt_n:<7} n={t.get('predicted_n'):<4} "
+          f"pp={t.get('prompt_per_second'):8.2f} tg={t.get('predicted_per_second'):7.3f}"
+          f"{'  CACHE_REUSE' if reused else ''}", flush=True)
+    return not reused
 
 ok = True
 for length in LENGTHS:
     ntok = 256 if length <= 4096 else 128
     for name in CORPORA:
-        prompt = filler(name, length) + "\n\n" + QUESTIONS[name]
-        ok &= ask(f"{name}@{length}", prompt, ntok)
+        prompt = nonce(name, length) + filler(name, length) + "\n\n" + QUESTIONS[name]
+        ok &= ask(f"{name}@{length}", prompt, ntok, length)
 sys.exit(0 if ok else 1)

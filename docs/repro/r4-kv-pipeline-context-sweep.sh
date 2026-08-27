@@ -11,10 +11,12 @@ PIN="${LLAMA_KV_TASKSET:-0,2,4}"
 NGEN="${LLAMA_KV_NGEN:-64}"
 LOCK=/tmp/beellama-single-gpu.lock
 
-# llama-bench does not expose every host-KV option that llama-server does; pass only what it takes
+# An unpinned host cache and a host-resident recurrent state both cost more than the transport
+# can win back, so a run without these does not measure the same thing. Older llama-bench builds
+# do not have them; skip rather than fail, and the numbers are then not comparable to the doc.
 BENCH_KV_OPTS=""
-for opt in --kv-cpu-pinned --recurrent-state-offload; do
-  "$BUILD/bin/llama-bench" --help 2>&1 | grep -q -- "$opt" && BENCH_KV_OPTS="$BENCH_KV_OPTS $opt"
+for opt in kvcp rso; do
+  "$BUILD/bin/llama-bench" --help 2>&1 | grep -q -- "-$opt," && BENCH_KV_OPTS="$BENCH_KV_OPTS -$opt 1"
 done
 
 arm () { # $1 pipeline depth, $2 context depth, $3 reps

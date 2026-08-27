@@ -123,22 +123,72 @@ RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F,
 --recurrent-state-offload`, everything under `taskset -c 0,2,4`.
 
 `llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order
-(`docs/repro/r4-kv-pipeline-ab.sh`):
+(`docs/repro/r4-kv-pipeline-ab.sh`, `docs/repro/r4-kv-pipeline-context-sweep.sh`),
+at `--kv-pipeline-budget 512` so the 32,768 ring is allowed:
 
-| Depth | reps | ordered | pipelined | gain | `max(copy, compute)` ceiling | share |
-|---|---:|---|---|---:|---:|---:|
-| 4,096 | 5 | 31.7324, 31.7363 | 37.0889, 37.0741 | **+16.9%** | 38.49 | 96.4% |
-| 16,384 | 3 | 19.6765, 19.6854 | 31.5352, 31.5807 | **+60.4%** | 34.88 | 90.4% |
-| 32,768 | 3 | 13.0264, 13.0254 | 15.5325, 15.5329 | **+19.3%** | 20.83 | 74.6% |
+| depth | ordered | pipelined | gain | peak device memory |
+|---:|---|---|---:|---:|
+| 4,096 | 31.3066, 31.2334 | 36.6107, 36.4701 | **+17.0%** | +28 MiB |
+| 16,384 | 19.4344, 19.4828 | 31.0981, 31.0931 | **+59.8%** | +86 to +104 MiB |
+| 32,768 | 12.9453, 12.9400 | 15.4571, 15.4516 | **+19.4%** | +206 MiB |
 
-These are the uncapped numbers, measured before `--kv-pipeline-budget` existed;
-they are what the ring can buy, and the 32,768 row needs
-`--kv-pipeline-budget 512` to reproduce, because 213 MiB is over the 128 MiB
-default. At the default the 4,096 and 16,384 rows stand and 32,768 declines to
-the ordered path. See [The budget](#the-budget).
+> These need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have them:
+> the repro scripts probed `--help`, found nothing, and quietly dropped both. The
+> same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the pipeline
+> buys +6.7% instead of +60%, because a host-resident recurrent state costs more
+> than the transport can win back. `llama-bench` takes them again.
 
-Server decode behind an 18,422-token prompt
-(`docs/repro/r4-kv-pipeline-exact.sh`): **18.468 -> 30.685 t/s, +66.2%**.
+`llama-server`, one request, `temperature 0, top_k 1, seed 1234`:
+
+| prompt | `-c` | ordered | pipelined | gain | copy ms | compute ms | ceiling | share |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 19,246 | 32,768 | 17.785 | 29.833 | **+67.7%** | 28.3 | 25.7 | 31.30 | 95.3% |
+| 48,042 | 65,536 | 9.790 | 11.313 | **+15.6%** | 76.4 | 25.4 | 11.86 | 95.4% |
+
+`copy` and `compute` are read off `GGML_SCHED_TRANSPORT_DEBUG=2` on each arm, not
+fitted: the ordered arm reports what it spends blocked in `ggml_backend_tensor_copy`
+and what it spends waiting for the consumer. The ceiling is `max(copy, compute)`
+plus the per-token work outside the split loop, which is on both arms.
+
+**The pipeline is within 5% of that ceiling at both depths.** What is left is not
+a scheduling problem, and the section on the residual below says what it is.
+
+Pinning is worth as much as the pipeline and is off by default. Behind a
+13,128-token prompt:
+
+| | ordered | pipelined |
+|---|---:|---:|
+| `--kv-cpu-pinned` | 21.582 | 32.252 |
+| unpinned | 14.945 | 22.709 |
+
+Look-ahead deeper than one split is worse at every depth measured. At 19,246:
+29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default
+for that reason.
+
+### The link is the ceiling, so the lever is bytes
+
+644 MiB in 28.3 ms is 22.0 GB/s, and `nvidia-smi` reports the card at gen4 x16.
+That is about 88% of what the link delivers in practice, so there is no room left
+in the transport itself. What is left is to send less. `-ctk q4_0 -ctv q4_0`
+halves the cache and therefore the traffic:
+
+| prompt | KV | ordered | pipelined | delivered |
+|---:|---|---:|---:|---:|
+| 19,246 | q8_0 | 17.785 | 29.833 | 644.0 MiB |
+| 19,246 | q4_0 | 22.904 | 31.502 | 343.2 MiB |
+| 48,042 | q8_0 | 9.790 | 11.313 | 1602.5 MiB |
+| 48,042 | q4_0 | 14.146 | 17.717 | 850.6 MiB |
+
+Halving the traffic is worth +5.6% on the pipelined path at 19,246 and +56.6% at
+48,042. The difference is the crossover: at 19,246 the pipeline has already
+brought the copy down to the compute floor, and the consumer wait is 27.31 ms at
+q8_0 against 27.26 ms at q4_0, the same number. Removing bytes there removes work
+nothing was waiting for. At 48,042 the copy still dominates and every byte
+removed is a byte off the token.
+
+**Whether to spend a quantisation step on the cache is a depth question, and the
+two compound.** At 48,042, q4_0 with the pipeline is 17.717 against 9.790 for
+q8_0 without it.
 
 ### Across context depth, with device memory
 
@@ -173,13 +223,21 @@ the ordered arm's own two passes, and 62 MiB of device memory for the transfer
 backend's context. Declining is the intended outcome, not a failure: the +62 MiB
 and the unchanged throughput are what "the guard did its job" looks like.
 
-**On a memory-constrained card, past roughly 64k the same device memory is
-probably better spent on `--kv-gpu-layers`.** At 131,072 a staged split is
-285 MiB, so the 818 MiB the ring takes is about three attention layers' worth of
-K and V; making three of sixteen layers device-resident removes about 19% of the
-host-to-device traffic against the 9.1% the ring buys. That comparison has not
-been measured here and it will move with the model's layer count and the card, so
-it is a pointer for whoever tunes a deployment, not a recommendation.
+**The ring beats `--kv-gpu-layers` per MiB, and the two barely add up.** Measured
+behind a 19,246-token prompt at `-c 32768`, where a device-resident layer costs
+about 68 MiB and the ring costs about 205 MiB:
+
+| | no `--kv-gpu-layers` | `--kv-gpu-layers 4` | `--kv-gpu-layers 8` |
+|---|---:|---:|---:|
+| ordered | 17.785 | 20.334 | |
+| pipelined | 29.843 | 30.263 | 30.640 |
+
+Four device-resident layers are worth +14.3% on the ordered path and +1.4% on the
+pipelined one. The reason they stop paying is the point of the section above: the
+pipeline has already moved the bottleneck down to the compute floor, so removing
+a quarter of the traffic removes something that was no longer being waited for.
+Whether this still holds where the copy dominates by a wide margin has not been
+measured.
 
 ### The budget
 
@@ -189,49 +247,57 @@ that speeds it up by spending hundreds of MiB of that memory is working against
 the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an
 absolute cap on the ring, not a fraction of what happens to be free:
 
-- Under the cap the ring is allocated and the deliveries pipeline: 4,096 and
-  16,384 in the table, at 28 MiB and 104 MiB.
+- Under the cap the ring is allocated and the deliveries pipeline.
 - Over it the scheduler declines and keeps the ordered path, and the decision is
   latched, because a context only grows and a ring allocated for the small
   windows of early prefill would only have to be given back later.
 - Declining costs nothing in steady state. Both the ring and the transfer
-  backend's device context are released: at 32,768 with the default budget,
-  device memory settles at 10,161 MiB, the same as the ordered path, and
-  throughput matches it (12.965 against 12.984 t/s).
+  backend's device context are released.
 
-Raising the budget trades that memory back for speed where it is worth it:
-`--kv-pipeline-budget 512` at 32,768 gives 15.487 t/s for 206 MiB.
+**The cap is applied to what the current graph needs, not to what the full
+context would need.** A run whose window stays small keeps the ring whatever
+`-n_ctx` says, which is the common case and the reason it is done this way: a
+staged input is a view of the cache tensor, so the full-context figure is there
+for the asking, but enforcing it would refuse the ring for every large `-c` even
+when the window never gets near it. The warning reports both numbers so that
+`--kv-pipeline-budget` can be sized against the one that matters.
 
-**Known limitation.** The cap is applied per graph, so a run whose context grows
-past it still allocates a ring for the early prefill graphs and releases it once
-the window outgrows the budget -- at 32,768 that shows up as a transient peak of
-+112 MiB even though the steady state is +0. Deciding against the context's final
-size rather than the current graph's would remove it, and needs the KV geometry
-the scheduler does not have.
+The cost of deciding per graph is that a context which grows past the budget
+allocates a ring for the small early windows and gives it back once it outgrows
+them. That transient is bounded by the budget itself, which is the memory the
+user already authorised, so it is a property of the cap rather than a defect in
+it.
 
-Where the split-loop host time goes, per decode graph at 18.5k
-(`GGML_SCHED_TRANSPORT_DEBUG=2`):
+At 32,768 the ring is 204 MiB at the full context, over the 128 MiB default.
+`--kv-pipeline-budget 512` buys 20.350 -> 31.463 t/s behind an 18,432-token
+prompt.
+
+### Where the rest of the token goes
+
+Per decode graph, `GGML_SCHED_TRANSPORT_DEBUG=2`, behind a 19,246-token prompt:
 
 | | ordered | pipelined |
 |---|---:|---:|
-| total | 52.11 ms | 30.37 ms |
-| blocked in the ordered `ggml_backend_tensor_copy` | 26.80 ms | 0.15 ms |
-| blocked waiting for the consumer backend | 25.14 ms | 26.69 ms |
+| total | 54.11 ms | 31.10 ms |
+| blocked in the ordered `ggml_backend_tensor_copy` | 28.30 ms | 3.57 ms |
+| blocked waiting for the consumer backend | 25.70 ms | 27.31 ms |
 | issuing early deliveries | 0.00 ms | 0.04 ms |
-| bytes delivered early / late | 0 / 0 MiB | 619.2 / 1.3 MiB |
+| bytes delivered early / late | 0 / 0 MiB | 644.0 / 2.3 MiB |
+| bytes left on the ordered path | 28.3 MiB | 0.4 MiB |
 
-The blocking host-to-device copy is gone and the consumer wait is unchanged,
-which is the shape a working overlap has: the transfer left the host's critical
-path without being added to the consumer's.
+The blocking host-to-device copy is all but gone and the consumer wait is
+unchanged, which is the shape a working overlap has: the transfer left the host's
+critical path without being added to the consumer's. 644 MiB in the 28.3 ms the
+ordered arm reports for the same bytes is 22.0 GB/s, which is what this link
+does; the transfer cannot be made faster, only hidden.
 
-**32,768 is the weak point and is reported as such.** The gain there is 74.6% of
-the probe ceiling, against 90-96% at shallower depths. At that depth the copy per
-staged split (about 2.9 ms) exceeds the compute between staged splits (about
-1.9 ms), so one split of look-ahead cannot cover it. Raising the look-ahead does
-not help: at 32,768 `N = 2` measured 15.5274 and `N = 3` measured 15.1114 against
-15.5273 for `N = 1`, and at 16,384 the same sweep gave 30.34 and 29.15 against
-31.56. `N = 1` is the best setting at every depth measured, which is why it is
-the default. Closing the 32,768 gap is a separate piece of work, not a knob.
+The 3.57 ms that remains moves 0.4 MiB. It is not bandwidth, it is 40 separate
+blocking copies at about 89 us each, and `GGML_SCHED_TRANSPORT_DEBUG=3` names
+them: 16 `cache_k_store_stage_l*`, 16 `cache_v_store_stage_l*`, and the graph
+inputs. The store staging tensors are the device-to-host write of this token's
+K and V, one per attention layer, and the ring carries deliveries in the other
+direction only. At 48,042 the same 40 copies cost 8.7 ms of an 85.6 ms graph, so
+this is worth about 10% of the token and it does not shrink with context.
 
 Do not compare these numbers against runs on other models, prompts, cache
 settings, hardware, or commits.
@@ -244,18 +310,31 @@ The gates, and what was run for them:
    at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token
    prompt, hashed and compared against a build of the parent commit. Identical at
    `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh`.
+   Every task now carries a nonce derived from its own name and length, so no two
+   share a prefix the server could restore, and the harness fails a task whose
+   reported `prompt_n` says a prefix was reused anyway.
+
+   **One task is still not a gate.** Re-run at `-c 32768` with the ring active,
+   seven of the eight tasks are byte-identical at `N = 0`, `N = 1` and `N = 4`.
+   `records@18432` is not, and it is not the pipeline: two separate `N = 0` runs
+   of it produced two different hashes, with `prompt_n = 29561` both times, so no
+   prefix was reused. Its prompt is about 29.6k tokens against a 32,768 context,
+   close enough to the limit that something in the slot handling varies. Until
+   that is understood the task should be read as unmeasured rather than passing.
 2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.**
    `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output.
 3. **Device allocation high-water reported.** Above.
 4. **Telemetry showing the deliveries actually converted.**
    `GGML_SCHED_TRANSPORT_DEBUG=1` reports the plan (staged splits, bytes per
-   graph, how much of it goes early, and the source buffer type);
-   `=2` adds the per-graph host-time breakdown above.
+   graph, how much of it goes early, and the source buffer type); `=2` adds the
+   per-graph host-time breakdown above, as the mean over each 128 graphs, with
+   how often the look-ahead stopped on the depth it was given against a slot
+   whose reader had not run; `=3` names the tensors still on the ordered path.
    `ggml_backend_sched_get_transport_pipeline_stats()` exposes the same counters
    to callers.
 
-A device-resident KV run is unaffected, and was measured to confirm it: 39.13 t/s
-on the parent commit against 39.10 t/s here at `tg128 @ d4096`, with the
+A device-resident KV run is unaffected, and was measured to confirm it: 38.5612
+t/s at depth 0 against 38.5240 at depth 1, `tg128 @ d4096`, with the
 transport never enabled because the scheduler is given a depth of 0.
 
 ## Scope and limits
@@ -326,24 +405,11 @@ row rather than laid out end to end.
 
 - Fix `-sm tensor` with `--no-kv-offload` (above). Until then it should not be
   used: it is wrong rather than slow.
-- Events on the meta backend and device, so a transfer stream can be ordered
-  against a tensor-parallel consumer at all.
-- A ring that can live in a meta buffer, as slot tensors rather than offsets, so
-  tensor parallelism can be pipelined once it is correct.
-- A transfer-only meta backend that does not stand up a second collective
-  communicator: `ggml_backend_dev_init` on a meta device runs the whole meta
-  context constructor, which calls `ggml_backend_comm_init` across every device.
-- Remove the transient device-memory peak. The budget is applied per graph, so a
-  context that grows past it still allocates a ring for the small windows of early
-  prefill and releases it once the window outgrows the budget: +112 MiB at 32,768
-  against +0 in steady state. Deciding against the context's final size needs KV
-  geometry the scheduler does not have.
-- Compare the ring against `--kv-gpu-layers` at depth. At 131,072 the ring's
-  818 MiB is about three attention layers' K and V; making three of sixteen
-  device-resident would remove about 19% of the host-to-device traffic against the
-  9.1% the ring buys there. Unmeasured, and it moves with layer count and card.
-- Give the exactness harness a per-task nonce. Two long-prompt tasks proved
-  non-deterministic in the baseline -- a second control run reproduced this
-  branch's hashes rather than its own -- because the server restores a similar
-  cached prefix. Until that is pinned down the harness is a weaker gate than it
-  looks.
+- Events on the meta backend and device, a ring that can live in a meta buffer,
+  and a transfer-only meta backend, so tensor parallelism can be pipelined once
+  it is correct. Written on a separate branch, and not reachable until it is.
+- Take the last small blocking copies off the host's critical path. On the
+  pipelined path 3.6 ms per graph at 19,246 and 8.7 ms at 48,042 is still spent
+  inside `ggml_backend_tensor_copy`, for 0.4 MiB. It is 40 separate copies, and
+  32 of them are the device-to-host KV store, which runs on the other copy engine
+  and could overlap the deliveries instead of blocking the host.
