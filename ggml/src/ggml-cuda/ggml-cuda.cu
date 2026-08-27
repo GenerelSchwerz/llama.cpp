@@ -1766,7 +1766,7 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     const bool up_cached = ggml_backend_buft_is_cuda_moe_cached(ffn_up->src[0]->buffer->buft);
     const bool gate_cached = ggml_backend_buft_is_cuda_moe_cached(ffn_gate->src[0]->buffer->buft);
     if (up_cached || gate_cached) {
-        return is_mul_mat_id && up_cached && gate_cached && !has_bias && !has_scale && ffn_up->src[2]->ne[1] * ffn_up->src[2]->ne[2] == 1;
+        return false;
     }
 
     return true;
