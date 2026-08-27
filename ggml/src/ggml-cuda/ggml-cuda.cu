@@ -2363,7 +2363,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     int stage_ready_capacity = 0;
     if (overflow && !is_decode && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-        constexpr int max_staging_waves = 4;
+        constexpr int max_staging_waves = 8;
         stage_ready_capacity = 1 + std::min(max_staging_waves, (n_unique + n_slots - 1) / n_slots);
         source_wait_class_host.resize(n_unique);
         stage_ready.alloc(stage_ready_capacity);
