@@ -49,7 +49,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     are put into the template specialization without GQA optimizations.
     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
+        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && t->type == GGML_TYPE_I64)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -377,7 +377,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type)) {
+        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && t->type == GGML_TYPE_I64)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -449,8 +449,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
-    if (mask && mask->ne[2] != 1) {
-        return BEST_FATTN_KERNEL_NONE;
+    if (mask) {
+        if (mask->type == GGML_TYPE_I64) {
+            if (mask->ne[0] != Q->ne[1] || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
+                    mask->nb[0] != ggml_type_size(mask->type) || max_bias != 0.0f) {
+                return BEST_FATTN_KERNEL_NONE;
+            }
+        } else if (mask->type != GGML_TYPE_F16 || mask->ne[2] != 1) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
@@ -585,5 +592,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
+#ifndef GGML_CUDA_COMPACT_CAUSAL_MASK
+    if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I64) {
+        return false;
+    }
+#endif
     return ggml_cuda_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
