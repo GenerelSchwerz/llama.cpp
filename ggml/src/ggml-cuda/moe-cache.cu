@@ -1296,11 +1296,14 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     int *                out_n_resident,
     void *               miss_dst,
     uint32_t *           stage_ready,
+    int                  stage_ready_capacity,
+    int *                out_n_wait_classes,
     cudaStream_t         compute_stream) {
 
     if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
-        !slot_ids || !out_n_resident || !miss_dst || !compute_stream ||
-        ((source_wait_class == nullptr) != (stage_ready == nullptr))) {
+        !slot_ids || !out_n_resident || !miss_dst || !out_n_wait_classes || !compute_stream ||
+        ((source_wait_class == nullptr) != (stage_ready == nullptr)) ||
+        (stage_ready == nullptr ? stage_ready_capacity != 0 : stage_ready_capacity < 2)) {
         return false;
     }
     for (int i = 0; i < n_host_srcs; ++i) {
@@ -1325,7 +1328,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         slot_ids[i] = it == cache->host_to_slot.end() ? -1 : it->second;
         n_resident += slot_ids[i] >= 0;
         if (source_wait_class != nullptr) {
-            source_wait_class[i] = slot_ids[i] >= 0 ? 0 : 2;
+            source_wait_class[i] = slot_ids[i] >= 0 ? 0 : -1;
         }
     }
     if (n_resident == n_host_srcs) {
@@ -1333,7 +1336,8 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     }
 
     if (overlap) {
-        CUDA_CHECK(cudaMemsetAsync(stage_ready, 0, 2 * sizeof(uint32_t), compute_stream));
+        CUDA_CHECK(cudaMemsetAsync(
+            stage_ready, 0, (size_t)stage_ready_capacity * sizeof(uint32_t), compute_stream));
     }
     CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
@@ -1382,8 +1386,21 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     std::vector<void *> batch_dsts;
     std::vector<const void *> batch_srcs;
     std::vector<size_t> batch_sizes;
+    cudaMemcpyAttributes attributes = {};
+    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+    attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
+    size_t attributes_index = 0;
 #endif
+    int n_misses = n_host_srcs - n_resident;
+    int wave_size = n_misses;
+    if (overlap) {
+        const int max_staging_waves = stage_ready_capacity - 1;
+        wave_size = std::max(cache->n_slots, (n_misses + max_staging_waves - 1) / max_staging_waves);
+    }
+
     int miss = 0;
+    int wave_count = 0;
+    int wait_class = 2;
     for (int i = 0; i < n_host_srcs;) {
         if (slot_ids[i] >= 0) {
             ++i;
@@ -1395,6 +1412,10 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         while (i + run < n_host_srcs && slot_ids[i + run] < 0 &&
                (uintptr_t)host_srcs[i + run] == (uintptr_t)src + (size_t)run * byte_count) {
             ++run;
+        }
+        run = std::min(run, wave_size - wave_count);
+        if (source_wait_class != nullptr) {
+            std::fill_n(source_wait_class + i, run, wait_class);
         }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
         batch_dsts.push_back((char *)miss_dst + (size_t)miss * byte_count);
@@ -1409,29 +1430,37 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
             cache->copy_stream));
 #endif
         miss += run;
+        wave_count += run;
         i += run;
-    }
+
+        if (wave_count < wave_size && miss < n_misses) {
+            continue;
+        }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-    cudaMemcpyAttributes attributes = {};
-    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
-    attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
-    size_t attributes_index = 0;
-    CUDA_CHECK(cudaMemcpyBatchAsync(
-        batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
-        &attributes, &attributes_index, 1, cache->copy_stream));
+        CUDA_CHECK(cudaMemcpyBatchAsync(
+            batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
+            &attributes, &attributes_index, 1, cache->copy_stream));
+        batch_dsts.clear();
+        batch_srcs.clear();
+        batch_sizes.clear();
 #endif
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
-    if (overlap) {
-        CU_CHECK(cuStreamWriteValue32(
-            cache->copy_stream, (CUdeviceptr)(stage_ready + 1), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
-    }
+        if (overlap) {
+            CU_CHECK(cuStreamWriteValue32(
+                cache->copy_stream, (CUdeviceptr)(stage_ready + wait_class - 1), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+        }
 #endif
+        wave_count = 0;
+        ++wait_class;
+    }
+
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
     if (!overlap) {
         CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     }
     *out_n_resident = n_resident;
+    *out_n_wait_classes = overlap ? wait_class : 1;
     return true;
 }
 

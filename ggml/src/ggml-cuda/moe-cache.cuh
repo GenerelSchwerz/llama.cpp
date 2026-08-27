@@ -87,6 +87,8 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     int *                out_n_resident,
     void *               miss_dst,
     uint32_t *           stage_ready,
+    int                  stage_ready_capacity,
+    int *                out_n_wait_classes,
     cudaStream_t         compute_stream);
 
 bool ggml_cuda_moe_cache_can_overlap_staging(

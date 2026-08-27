@@ -244,8 +244,8 @@ int main(int argc, char ** argv) {
     cudaStream_t split_copy_stream = ggml_cuda_moe_cache_copy_stream(split_cache);
     CHECK(split_copy_stream != nullptr);
     CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
-    CUDA_OK(cudaMalloc(&staging_dst, 2 * SLOT_BYTES));
-    std::vector<float> split_readback(4 * N_FLOATS);
+    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES));
+    std::vector<float> split_readback(6 * N_FLOATS);
 
     for (int repeat = 0; repeat < 2; ++repeat) {
         const int first = 2 * repeat;
@@ -267,10 +267,12 @@ int main(int argc, char ** argv) {
 
         int slot_ids[4] = {-1, -1, -1, -1};
         int n_resident = 0;
+        int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
             split_cache, split_srcs, 4, SLOT_BYTES, 1, slot_ids, nullptr,
-            &n_resident, staging_dst, nullptr, compute_stream));
+            &n_resident, staging_dst, nullptr, 0, &n_wait_classes, compute_stream));
         CHECK(n_resident == 2);
+        CHECK(n_wait_classes == 1);
         CHECK(slot_ids[0] >= 0 && slot_ids[1] >= 0);
         CHECK(slot_ids[0] != slot_ids[1]);
         CHECK(slot_ids[2] == -1 && slot_ids[3] == -1);
@@ -296,12 +298,80 @@ int main(int argc, char ** argv) {
         CUDA_OK(cudaStreamSynchronize(compute_stream));
     }
 
+    if (ggml_cuda_moe_cache_can_overlap_staging(split_cache)) {
+        constexpr int N_SPLIT_SRCS = 6;
+        const void * split_srcs[N_SPLIT_SRCS];
+        for (int e = 0; e < N_SPLIT_SRCS; ++e) {
+            split_srcs[e] = host_experts + (size_t)(8 + e) * N_FLOATS;
+        }
+
+        host_barrier barrier;
+        CUDA_OK(cudaLaunchHostFunc(compute_stream, wait_on_host_barrier, &barrier));
+        while (!barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        int slot_ids[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
+        int32_t wait_classes[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
+        uint32_t * stage_ready = nullptr;
+        CUDA_OK(cudaMalloc(&stage_ready, 3 * sizeof(uint32_t)));
+        int n_resident = 0;
+        int n_wait_classes = 0;
+        CHECK(ggml_cuda_moe_cache_prepare_split_staging(
+            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 1, slot_ids, wait_classes,
+            &n_resident, staging_dst, stage_ready, 3, &n_wait_classes, compute_stream));
+        CHECK(n_resident == 2);
+        CHECK(n_wait_classes == 4);
+        CHECK(wait_classes[0] == 1 && wait_classes[1] == 1);
+        CHECK(wait_classes[2] == 2 && wait_classes[3] == 2);
+        CHECK(wait_classes[4] == 3 && wait_classes[5] == 3);
+        CHECK(cudaStreamQuery(split_copy_stream) == cudaErrorNotReady);
+
+        barrier.released.store(true, std::memory_order_release);
+        CHECK(ggml_cuda_moe_cache_finish_split_staging(split_cache, compute_stream));
+        CUDA_OK(cudaStreamSynchronize(compute_stream));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data(), ggml_cuda_moe_cache_slot_ptr(split_cache, slot_ids[0]), SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data() + N_FLOATS, ggml_cuda_moe_cache_slot_ptr(split_cache, slot_ids[1]), SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(
+            split_readback.data() + 2 * N_FLOATS, staging_dst, 4 * SLOT_BYTES,
+            cudaMemcpyDeviceToHost));
+        for (int e = 0; e < N_SPLIT_SRCS; ++e) {
+            for (int j = 0; j < N_FLOATS; ++j) {
+                CHECK(split_readback[e * N_FLOATS + j] == (float)(8 + e));
+            }
+        }
+        uint32_t stage_ready_host[3] = {};
+        CUDA_OK(cudaMemcpy(stage_ready_host, stage_ready, sizeof(stage_ready_host), cudaMemcpyDeviceToHost));
+        CHECK(stage_ready_host[0] == 1 && stage_ready_host[1] == 1 && stage_ready_host[2] == 1);
+        CHECK(ggml_cuda_moe_cache_release_split_slots(
+            split_cache, slot_ids, N_SPLIT_SRCS, compute_stream));
+        CUDA_OK(cudaStreamSynchronize(compute_stream));
+        CUDA_OK(cudaFree(stage_ready));
+
+        int invalid_slots[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
+        int32_t invalid_wait_classes[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
+        int invalid_n_resident = 0;
+        int invalid_n_wait_classes = 0;
+        CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
+            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 1, invalid_slots, invalid_wait_classes,
+            &invalid_n_resident, staging_dst, (uint32_t *)staging_dst, 1,
+            &invalid_n_wait_classes, compute_stream));
+        CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
+        CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
+    }
+
     const void * non_overflow_srcs[] = {host_experts, host_experts + N_FLOATS};
     int non_overflow_slots[2] = {-1, -1};
     int non_overflow_resident = 0;
+    int non_overflow_wait_classes = 0;
     CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
         split_cache, non_overflow_srcs, 2, SLOT_BYTES, 1, non_overflow_slots,
-        nullptr, &non_overflow_resident, staging_dst, nullptr, compute_stream));
+        nullptr, &non_overflow_resident, staging_dst, nullptr, 0,
+        &non_overflow_wait_classes, compute_stream));
     CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
     CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
 

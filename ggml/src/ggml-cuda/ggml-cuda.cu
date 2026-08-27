@@ -2363,6 +2363,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         stage_ready.alloc(2);
     }
     int n_resident = 0;
+    int n_wait_classes = 1;
     bool split_staged = false;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
@@ -2371,7 +2372,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
-                &n_resident, scratch_experts.get(), stage_ready.get(), stream);
+                &n_resident, scratch_experts.get(), stage_ready.get(), 2, &n_wait_classes, stream);
         }
     }
 
