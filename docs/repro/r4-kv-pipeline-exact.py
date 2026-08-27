@@ -50,8 +50,12 @@ def nonce(name, length):
     return f"Session {h}. Ignore this line.\n\n"
 
 def ask(label, prompt, ntok, want_prefill):
+    # cache_prompt=False forces a full prefill. Without it a task inherits whatever the previous
+    # one left in the cache, and two tasks whose prompts do not both fit make placement depend on
+    # that: records@18432 then gives different answers across otherwise identical runs.
     body = json.dumps({"model": "m", "messages": [{"role": "user", "content": prompt}],
-                       "max_tokens": ntok, "temperature": 0, "top_k": 1, "seed": 1234}).encode()
+                       "max_tokens": ntok, "temperature": 0, "top_k": 1, "seed": 1234,
+                       "cache_prompt": False}).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions", body,
                                  {"Content-Type": "application/json"})
     try:

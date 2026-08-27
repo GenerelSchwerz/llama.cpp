@@ -321,17 +321,21 @@ The gates, and what was run for them:
    at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token
    prompt, hashed and compared against a build of the parent commit. Identical at
    `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh`.
-   Every task now carries a nonce derived from its own name and length, so no two
+   Two things keep the tasks independent of each other, and both were needed.
+   Every task carries a nonce derived from its own name and length, so no two
    share a prefix the server could restore, and the harness fails a task whose
-   reported `prompt_n` says a prefix was reused anyway.
+   `prompt_n` says one was reused anyway. Each request also sets
+   `cache_prompt: false`, so a task never inherits what the previous one left in
+   the cache.
 
-   **One task is still not a gate.** Re-run at `-c 32768` with the ring active,
-   seven of the eight tasks are byte-identical at `N = 0`, `N = 1` and `N = 4`.
-   `records@18432` is not, and it is not the pipeline: two separate `N = 0` runs
-   of it produced two different hashes, with `prompt_n = 29561` both times, so no
-   prefix was reused. Its prompt is about 29.6k tokens against a 32,768 context,
-   close enough to the limit that something in the slot handling varies. Until
-   that is understood the task should be read as unmeasured rather than passing.
+   The second is what made `records@18432` a gate rather than a coin flip. Its
+   prompt is about 29.6k tokens against a 32,768 context, and the task before it
+   is about the same size, so the two do not both fit and placement depended on
+   what was still resident. Two otherwise identical `N = 0` runs of it produced
+   different hashes. Asked on its own with the cache off it is perfectly stable:
+   the same hash three times running, at `-c 32768` and at `-c 65536`. With the
+   flag set, two independent `N = 0` passes agree on all eight tasks, and
+   `N = 0`, `N = 1` and `N = 4` agree on all eight.
 2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.**
    `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output.
 3. **Device allocation high-water reported.** Above.
