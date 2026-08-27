@@ -11,6 +11,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <optional>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -351,8 +352,9 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 dense mask, or I64 [n_batch] causal prefix descriptor
+    ggml_tensor * self_kq_mask_cnv = nullptr;
+    std::optional<uint32_t> self_kq_mask_causal_prefix_n_kv;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -394,8 +396,9 @@ public:
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 dense mask, or I64 [n_batch] causal prefix descriptor
+    ggml_tensor * self_kq_mask_cnv = nullptr;
+    std::optional<uint32_t> self_kq_mask_causal_prefix_n_kv;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -523,6 +526,8 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    std::optional<uint32_t> self_kq_mask_causal_prefix_n_kv;
 
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
@@ -787,6 +792,7 @@ struct llm_graph_params {
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
+    bool is_reserve = false;
 
     ggml_backend_sched_t sched;
     ggml_backend_t backend_cpu;
@@ -887,6 +893,7 @@ struct llm_graph_params {
             cparams.causal_attn             == other.cparams.causal_attn             &&
             arch  == other.arch  &&
             gtype == other.gtype &&
+            is_reserve == other.is_reserve &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -1027,6 +1034,7 @@ struct llm_graph_context {
     const enum llama_pooling_type pooling_type;
     const enum llama_rope_type    rope_type;
 
+    const bool is_reserve;
     ggml_backend_sched_t sched;
 
     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?

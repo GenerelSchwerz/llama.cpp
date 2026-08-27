@@ -1859,10 +1859,126 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+static bool llama_kv_causal_position_leq(
+        llama_pos p0, const llama_kv_cell_ext & ext0,
+        llama_pos p1, const llama_kv_cell_ext & ext1,
+        bool is_2d) {
+    if (p0 != p1) {
+        return p0 < p1;
+    }
+    return !is_2d || !ext0.is_2d_gt(ext1.x, ext1.y);
+}
+
+bool llama_kv_cache::can_use_compact_causal_mask(
+        const llama_ubatch & ubatch,
+                     bool   causal_attn,
+                 uint32_t   n_kv,
+                     bool   is_reserve,
+        const slot_info   * sinfo) const {
+    if (!causal_attn || hparams.use_alibi || n_swa != 0 || model.arch == LLM_ARCH_T5 ||
+            n_stream != 1 || ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+        return false;
+    }
+
+    if (is_reserve) {
+        return true;
+    }
+
+    if (!ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id) {
+        return false;
+    }
+
+    if (ubatch.n_seq_id[0] != 1 || !ubatch.seq_id[0]) {
+        return false;
+    }
+
+    const llama_seq_id seq_id = ubatch.seq_id[0][0];
+    if (seq_id < 0 || size_t(seq_id) >= seq_to_stream.size() || seq_to_stream[seq_id] != 0) {
+        return false;
+    }
+
+    const bool is_2d = ubatch.is_pos_2d();
+    bool have_query_prev = false;
+    llama_pos query_pos_prev = 0;
+    llama_kv_cell_ext query_ext_prev {};
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_kv_cell_ext query_ext {
+            /*.x =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens*2] : 0,
+            /*.y =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens]   : 0,
+        };
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id ||
+                (have_query_prev && !llama_kv_causal_position_leq(
+                    query_pos_prev, query_ext_prev, ubatch.pos[i], query_ext, is_2d))) {
+            return false;
+        }
+        query_pos_prev = ubatch.pos[i];
+        query_ext_prev = query_ext;
+        have_query_prev = true;
+    }
+
+    const auto & cells = v_cells[0];
+    if (n_kv > cells.size()) {
+        return false;
+    }
+
+    bool saw_empty = false;
+    bool saw_live = false;
+    bool have_cell_prev = false;
+    llama_pos cell_pos_prev = 0;
+    llama_kv_cell_ext cell_ext_prev {};
+    for (uint32_t i = 0; i < n_kv; ++i) {
+        if (cells.is_empty(i)) {
+            saw_empty = true;
+            continue;
+        }
+        if (saw_empty || !cells.seq_has(i, seq_id)) {
+            return false;
+        }
+
+        const llama_pos pos = cells.pos_get(i);
+        const llama_kv_cell_ext ext = is_2d ? cells.ext_get(i) : llama_kv_cell_ext {};
+        if (have_cell_prev && !llama_kv_causal_position_leq(cell_pos_prev, cell_ext_prev, pos, ext, is_2d)) {
+            return false;
+        }
+        cell_pos_prev = pos;
+        cell_ext_prev = ext;
+        have_cell_prev = true;
+        saw_live = true;
+    }
+
+    if (sinfo) {
+        if (sinfo->n_stream() != 1 || sinfo->strm[0] != 0 || sinfo->idxs[0].size() != ubatch.n_tokens) {
+            return false;
+        }
+
+        const uint32_t physical_base = sinfo->idxs[0][0];
+        uint32_t boundary = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const llama_kv_cell_ext query_ext {
+                /*.x =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens*2] : 0,
+                /*.y =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens]   : 0,
+            };
+            while (boundary < n_kv && !cells.is_empty(boundary) &&
+                    llama_kv_causal_position_leq(
+                        cells.pos_get(boundary), is_2d ? cells.ext_get(boundary) : llama_kv_cell_ext {},
+                        ubatch.pos[i], query_ext, is_2d)) {
+                ++boundary;
+            }
+            if (boundary == 0 || uint64_t(physical_base) + i >= n_kv ||
+                    sinfo->idxs[0][i] != physical_base + i || sinfo->idxs[0][i] + 1 != boundary) {
+                return false;
+            }
+        }
+    }
+
+    return saw_live;
+}
+
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
 
     const int64_t n_kv     = dst->ne[0];
     const int64_t n_stream = dst->ne[3]; // num streams in the current ubatch
@@ -2801,6 +2917,12 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+bool llama_kv_cache_context::can_use_compact_causal_mask(
+        const llama_ubatch & ubatch, bool causal_attn, bool is_reserve) const {
+    return kv->can_use_compact_causal_mask(
+            ubatch, causal_attn, n_kv, is_reserve, is_reserve ? nullptr : &sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
