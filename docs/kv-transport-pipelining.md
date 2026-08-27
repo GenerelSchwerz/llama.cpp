@@ -291,13 +291,24 @@ critical path without being added to the consumer's. 644 MiB in the 28.3 ms the
 ordered arm reports for the same bytes is 22.0 GB/s, which is what this link
 does; the transfer cannot be made faster, only hidden.
 
-The 3.57 ms that remains moves 0.4 MiB. It is not bandwidth, it is 40 separate
-blocking copies at about 89 us each, and `GGML_SCHED_TRANSPORT_DEBUG=3` names
-them: 16 `cache_k_store_stage_l*`, 16 `cache_v_store_stage_l*`, and the graph
-inputs. The store staging tensors are the device-to-host write of this token's
-K and V, one per attention layer, and the ring carries deliveries in the other
-direction only. At 48,042 the same 40 copies cost 8.7 ms of an 85.6 ms graph, so
-this is worth about 10% of the token and it does not shrink with context.
+The 3.57 ms that remains moves 0.4 MiB, and `GGML_SCHED_TRANSPORT_DEBUG=3` shows
+that almost all of it is one copy: `attn_inp_k_rot`, 256 KiB, 18 us on the
+ordered path and 3.4 ms behind one split of look-ahead. The 32 KV store copies
+cost 353 us between them.
+
+It looks like latency and is not. A blocking copy shares the device's copy engine
+with the deliveries and waits for what is already queued there: two staged splits
+at 22.0 GB/s is 3.6 ms, which is the number. Two things were tried and neither
+helped. Issuing the delivery in pieces so the blocking copy can interleave does
+nothing -- the engine is FIFO across streams, `attn_inp_k_rot` stays at 3.4 ms at
+every piece size, and small pieces cost throughput (29.80 t/s whole, 28.73 at
+4 MiB, 22.01 at 1 MiB). Putting the copy on the consumer's own stream so the host
+never blocks moves the time rather than removing it: the ordered copy falls from
+3.57 ms to 0.16 ms, the consumer wait rises from 27.31 ms to 31.05 ms, and
+throughput does not move (29.808 against 29.834).
+
+So this is not spare time. Those 256 KiB cross the same saturated link as the
+644 MiB of deliveries, and the link is the ceiling.
 
 Do not compare these numbers against runs on other models, prompts, cache
 settings, hardware, or commits.
