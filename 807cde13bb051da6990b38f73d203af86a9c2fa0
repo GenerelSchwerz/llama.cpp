@@ -9,3 +9,5 @@ Branch: codex/port-compact-causal-mask; base: 807cde13bb051da6990b38f73d203af86a
 Open concern: compact mask handling adds runtime conditionals inside FA tile/MMA hot loops. Profile dense versus compact kernel behavior before accepting the implementation.
 
 2026-08-27 preliminary profile: matched Nsight Systems runs on the Qwen 27B 3188-token prompt showed the main F16 MMA flash-attention kernel at 39.326 ms dense versus 41.569 ms compact across 48 launches (+5.71%). End-to-end prompt processing under nsys was 1384.7 versus 1417.7 tok/s (+2.38% compact) because compact avoided dense-mask overhead. Direct branch/instruction profiling is pending.
+
+2026-08-27 NCU confirmation on the same first full 2048-token Qwen F16 MMA launch: compact 530592 ns versus dense 497024 ns (+6.75%); branch instructions 453984 versus 263456 (+72.3%); divergent branch targets 688 versus 0; branch-resolution stalls 1736679 versus 1229096 (+41.3%); total instructions 44228672 versus 43977568 (+0.57%); registers/thread 250 versus 241. The runtime compact flag is not acceptable in this hot loop. Next: compile-time-specialize compact versus dense MMA and repeat the exact profile.
