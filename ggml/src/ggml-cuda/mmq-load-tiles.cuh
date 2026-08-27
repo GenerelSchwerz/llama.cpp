@@ -760,11 +760,32 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
             const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
 
-            const int * scales = (const int *) bxi->scales;
             const int ksc = threadIdx.x % 2;
 
+#if defined(TURING_MMA_AVAILABLE) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            const int * scales = (const int *) bxi->scales;
+            int scales0 = 0;
+            int scales1 = 0;
+            int scales2 = 0;
+            if (ksc == 0) {
+                scales0 = scales[0];
+                scales1 = scales[1];
+            } else {
+                scales2 = scales[2];
+            }
+            const int src_lane = threadIdx.x & ~1;
+            scales0 = __shfl_sync(0xFFFFFFFF, scales0, src_lane, warp_size);
+            scales1 = __shfl_sync(0xFFFFFFFF, scales1, src_lane, warp_size);
+
+            const int sc_low = ksc == 0 ? scales0 : scales2;
+            const int  m_low = ksc == 0 ? scales1 : scales2 >> 4;
+            const int sc32 = (sc_low & 0x0F0F0F0F) | ((scales0 >> (2*ksc)) & 0x30303030);
+            const int  m32 = ( m_low & 0x0F0F0F0F) | ((scales1 >> (2*ksc)) & 0x30303030);
+#else
+            const int * scales = (const int *) bxi->scales;
             const int sc32 = unpack_scales_q45_K(scales, ksc + 0);
             const int  m32 = unpack_scales_q45_K(scales, ksc + 2);
+#endif
 
             const uint8_t * sc8 = (const uint8_t *) &sc32;
             const uint8_t *  m8 = (const uint8_t *)  &m32;
