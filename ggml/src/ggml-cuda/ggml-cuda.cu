@@ -1929,6 +1929,7 @@ struct ggml_cuda_mul_mat_id_host_route {
     int32_t secondary_begin = 0;
     int32_t secondary_count = 0;
     const int32_t * source_wait_class = nullptr;
+    int n_wait_classes = 1;
     const uint32_t * stage_ready = nullptr;
 };
 
@@ -2107,7 +2108,8 @@ static void ggml_cuda_mul_mat_id_impl(
     }
     GGML_ASSERT(row_offset == (size_t) ne_get_rows);
 
-    const int n_wait_classes = host_route && host_route->source_wait_class ? 3 : 1;
+    const int n_wait_classes = host_route && host_route->source_wait_class ? host_route->n_wait_classes : 1;
+    GGML_ASSERT(n_wait_classes > 0);
     for (int wait_class = 0; wait_class < n_wait_classes; ++wait_class) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
         if (wait_class > 0) {
@@ -2358,9 +2360,12 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int> split_slot_ids(n_unique, -1);
     std::vector<int32_t> source_wait_class_host;
     ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
+    int stage_ready_capacity = 0;
     if (overflow && !is_decode && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+        const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
+        stage_ready_capacity = 1 + (n_unique + n_slots - 1) / n_slots;
         source_wait_class_host.resize(n_unique);
-        stage_ready.alloc(2);
+        stage_ready.alloc(stage_ready_capacity);
     }
     int n_resident = 0;
     int n_wait_classes = 1;
@@ -2372,7 +2377,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
-                &n_resident, scratch_experts.get(), stage_ready.get(), 2, &n_wait_classes, stream);
+                &n_resident, scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, stream);
         }
     }
 
@@ -2420,7 +2425,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         dst->src[0] = &src0_synth;
         const ggml_cuda_mul_mat_id_host_route host_route = {
             ids_host_bytes.data(), ids_host_nb0, ids_host_nb1, expert_source_host.data(),
-            scratch_experts.get(), n_slots, n_misses, expert_wait_class_host.data(), stage_ready.get(),
+            scratch_experts.get(), n_slots, n_misses, expert_wait_class_host.data(), n_wait_classes, stage_ready.get(),
         };
         ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route);
         dst->src[0] = orig_src0;
