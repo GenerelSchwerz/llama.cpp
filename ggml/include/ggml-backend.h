@@ -204,6 +204,80 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+#define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME "ggml_backend_moe_candidate_replace_v1"
+#define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u
+#define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION 1u
+
+    enum ggml_backend_moe_candidate_snapshot_flag {
+        GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_FLAG_NONE = 0,
+    };
+
+    enum ggml_backend_moe_candidate_layout {
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID       = 0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE      = 1,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP = 2,
+    };
+
+    enum ggml_backend_moe_candidate_bank_role {
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID             = 0,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT         = 1,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT           = 2,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT      = 3,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT         = 4,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE          = 5,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE            = 6,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE       = 7,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE          = 8,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BLOCK_SCALE    = 9,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BLOCK_SCALE      = 10,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BLOCK_SCALE = 11,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BLOCK_SCALE    = 12,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS           = 13,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS             = 14,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS        = 15,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS           = 16,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT,
+    };
+
+    enum ggml_backend_moe_candidate_replace_result {
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED         = 0,
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED         = 1,
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT = 2,
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI      = 3,
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR            = 4,
+    };
+
+    enum { GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS = 16 };
+
+    struct ggml_backend_moe_candidate_bank_v1 {
+        const struct ggml_tensor * tensor;
+        uint32_t role;
+        uint32_t reserved;
+    };
+
+    struct ggml_backend_moe_candidate_group_v1 {
+        const struct ggml_backend_moe_candidate_bank_v1 * banks;
+        uint32_t n_banks;
+        uint32_t layout;
+    };
+
+    struct ggml_backend_moe_candidate_snapshot_v1 {
+        uint32_t magic;
+        uint32_t abi_version;
+        uint32_t struct_size;
+        // Implementations reject unknown flags and nonzero reserved fields.
+        uint32_t flags;
+        // Physical configuration; not part of a logical group signature.
+        uint32_t n_slots;
+        uint32_t n_groups;
+        const struct ggml_backend_moe_candidate_group_v1 * groups;
+        uint64_t reserved[2];
+    };
+
+    // A well-formed call replaces the complete backend-local snapshot.
+    // Arrays are borrowed for the call. Tensor pointers must outlive the accepted snapshot.
+    typedef int32_t (*ggml_backend_moe_candidate_replace_v1_t)(ggml_backend_t backend, const struct ggml_backend_moe_candidate_snapshot_v1 * snapshot);
+
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
