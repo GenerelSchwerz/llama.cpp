@@ -7,3 +7,5 @@ Branch: codex/port-compact-causal-mask; base: 807cde13bb051da6990b38f73d203af86a
 2026-08-27: Qwen3.8 27B, ctx 131072, batch/ubatch 2048, q8_0 KV. Dense reservation 1616.30 MiB CUDA + 632.45 MiB host. Compact descriptor 1144.30 + 120.45 MiB. Live compact Q8-to-F16 staging 624.30 + 120.45 MiB. 31084-token A/B: embedded staging 1424.48 tok/s; live scratch 1430.65 tok/s. Gemma4 12B compact/live-staging reservation 510.04 + 73.36 MiB. CUDA exact descriptor equivalence 9/9.
 
 Open concern: compact mask handling adds runtime conditionals inside FA tile/MMA hot loops. Profile dense versus compact kernel behavior before accepting the implementation.
+
+2026-08-27 preliminary profile: matched Nsight Systems runs on the Qwen 27B 3188-token prompt showed the main F16 MMA flash-attention kernel at 39.326 ms dense versus 41.569 ms compact across 48 launches (+5.71%). End-to-end prompt processing under nsys was 1384.7 versus 1417.7 tok/s (+2.38% compact) because compact avoided dense-mask overhead. Direct branch/instruction profiling is pending.
