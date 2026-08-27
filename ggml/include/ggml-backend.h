@@ -212,6 +212,10 @@ extern "C" {
         GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_FLAG_NONE = 0,
     };
 
+    enum ggml_backend_moe_candidate_group_flag {
+        GGML_BACKEND_MOE_CANDIDATE_GROUP_FLAG_NONE = 0,
+    };
+
     enum ggml_backend_moe_candidate_layout {
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID       = 0,
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE      = 1,
@@ -247,7 +251,10 @@ extern "C" {
         GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR            = 4,
     };
 
-    enum { GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS = 16 };
+    enum {
+        GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS = 512,
+        GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS  = 16,
+    };
 
     struct ggml_backend_moe_candidate_bank_v1 {
         const struct ggml_tensor * tensor;
@@ -259,6 +266,8 @@ extern "C" {
         const struct ggml_backend_moe_candidate_bank_v1 * banks;
         uint32_t n_banks;
         uint32_t layout;
+        uint32_t flags;
+        uint32_t reserved;
     };
 
     struct ggml_backend_moe_candidate_snapshot_v1 {
