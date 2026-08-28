@@ -5556,8 +5556,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (cuda_ctx->moe_grouped_context != nullptr) {
-        (void) cuda_ctx->moe_grouped_context->prepare_graph_execution(
+        const auto prepare_result = cuda_ctx->moe_grouped_context->prepare_graph_execution(
             cgraph, cgraph->uid, node_properties_unchanged, &graph->moe_graph_plan, &moe_execution);
+        if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
+            return GGML_STATUS_FAILED;
+        }
     }
     const bool moe_dispatch = moe_execution.size() != 0;
     if (moe_dispatch) {

@@ -1795,6 +1795,11 @@ bool ggml_cuda_moe_graph_execution::resolve_streams(ggml_cuda_moe_graph_stream_r
             continue;
         }
         const auto & record = plan_->groups_[record_index];
+        dispatch.stream = resolver(data, record.ids_root.tensor);
+        if (dispatch.stream == nullptr) {
+            dispatch.classification = GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY;
+            continue;
+        }
         for (const ggml_tensor * node : record.nodes) {
             if (node == nullptr) {
                 continue;
@@ -4330,22 +4335,46 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
     if (execution == nullptr || execution->owner_ != this || !execution->dispatch_active_) {
         return false;
     }
+    std::array<std::unique_ptr<impl::grouped_resource>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> retired;
+    bool success = true;
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
         auto & group = execution->groups_[record_index];
         if (group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
             ggml_cuda_moe_grouped_decode_acquisition decode;
             decode.transaction = group.transaction;
             if (!finish_decode(decode, group.stream)) {
-                return false;
+                success = false;
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                auto * resource = impl_->find_resource(group.transaction);
+                if (resource != nullptr) {
+                    if (resource->device != nullptr && resource->active_decode_stream != nullptr) {
+                        GGML_ASSERT(resource->device->completion != nullptr);
+                        CUDA_CHECK(cudaEventRecord(resource->device->completion, resource->active_decode_stream));
+                        resource->device->has_completion = true;
+                    }
+                    resource->active_transaction_token = 0;
+                    resource->active_decode_stream = nullptr;
+                    const uint32_t group_index = group.transaction.acquisition.candidate.group_index;
+                    retired[record_index] = std::move(impl_->resources[group_index]);
+                    impl_->refreshing[group_index] = 0;
+                    impl_->resource_cv.notify_all();
+                }
             }
         }
+        group.transaction = {};
+        group.remapped_ids = nullptr;
+        std::fill_n(group.bank_data, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, nullptr);
+        group.n_slots = 0;
         group.state = GGML_CUDA_MOE_GRAPH_GROUP_FINISHED;
     }
     execution->dispatch_active_ = false;
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+        retired[record_index].reset();
+    }
+    for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
         execution->groups_[record_index].authority = {};
     }
-    return true;
+    return success;
 }
 
 void ggml_cuda_moe_grouped_context::end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept {

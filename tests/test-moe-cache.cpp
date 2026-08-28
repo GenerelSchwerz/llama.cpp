@@ -81,6 +81,17 @@ static cudaStream_t candidate_test_graph_stream(void * data, const ggml_tensor *
     return static_cast<cudaStream_t>(data);
 }
 
+struct candidate_test_graph_streams {
+    const ggml_tensor * producer = nullptr;
+    cudaStream_t producer_stream = nullptr;
+    cudaStream_t reader_stream = nullptr;
+};
+
+static cudaStream_t candidate_test_graph_mixed_stream(void * data, const ggml_tensor * node) {
+    auto * streams = static_cast<candidate_test_graph_streams *>(data);
+    return node == streams->producer ? streams->producer_stream : streams->reader_stream;
+}
+
 static int sample_zipf(std::mt19937 & rng, int n, double s) {
     // Rejection-sample a Zipf(s) over {0..n-1}. Cheap; fine for a test.
     static thread_local std::vector<double> cdf;
@@ -1229,6 +1240,27 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(execution.find(separate_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.key.n_banks == 3);
     CHECK(!execution.find(fused_bias, nullptr));
 
+    {
+        ggml_cuda_moe_graph_execution stream_execution;
+        registry.compile_graph_plan(complete_graph, 41, &plan, &stream_execution);
+        candidate_test_graph_streams streams = {
+            fused_route.root,
+            reinterpret_cast<cudaStream_t>(uintptr_t{2}),
+            reinterpret_cast<cudaStream_t>(uintptr_t{1}),
+        };
+        CHECK(stream_execution.resolve_streams(candidate_test_graph_mixed_stream, &streams));
+        CHECK(stream_execution.has_stream_grouped_candidate());
+        CHECK(registry.begin_graph_dispatch(&stream_execution, true));
+        const auto * fused_authority = stream_execution.find_authority(fused_gate_up_node);
+        const auto * separate_authority = stream_execution.find_authority(separate_gate_node);
+        const auto * fused_dispatch = stream_execution.find_group(fused_gate_up_node, nullptr);
+        CHECK(fused_authority != nullptr && fused_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY);
+        CHECK(fused_dispatch != nullptr && fused_dispatch->state == GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY &&
+            fused_dispatch->transaction.transaction_token == 0);
+        CHECK(separate_authority != nullptr && separate_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED);
+        CHECK(registry.finish_graph_dispatch(&stream_execution));
+    }
+
     CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
     CHECK(reused.size() == 2 && reused.find(separate_down_node, nullptr));
     CHECK(!registry.bind_graph_plan(complete_graph, 41, false, plan, &reused) && reused.size() == 0);
@@ -1597,6 +1629,40 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(legacy_after && legacy_after.acquisition().group_authority_epoch > legacy_before_state.group_authority_epoch);
     legacy_after = {};
     CHECK(registry.finish_graph_dispatch(&execution));
+
+    auto finalization_registry = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    CHECK(finalization_registry->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    ggml_cuda_moe_graph_plan finalization_plan;
+    ggml_cuda_moe_graph_execution finalization_execution;
+    finalization_registry->compile_graph_plan(complete_graph, 62, &finalization_plan, &finalization_execution);
+    CHECK(finalization_execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
+    CHECK(finalization_registry->begin_graph_dispatch(&finalization_execution, true));
+    ggml_cuda_moe_candidate_group_key failed_keys[2];
+    ggml_cuda_moe_grouped_acquisition failed_resources[2];
+    ggml_cuda_moe_grouped_transaction failed_transactions[2];
+    CHECK(finalization_registry->find_down_group_key(fused_down, &failed_keys[0]));
+    CHECK(finalization_registry->find_down_group_key(separate_down, &failed_keys[1]));
+    for (uint32_t i = 0; i < 2; ++i) {
+        CHECK(finalization_registry->acquire_group_resources(failed_keys[i], &failed_resources[i]));
+        CHECK(finalization_registry->begin_group_transaction(failed_resources[i], &failed_transactions[i]));
+    }
+    auto * failed_fused = finalization_execution.find_group(fused_gate_up_node, nullptr);
+    auto * failed_separate = finalization_execution.find_group(separate_gate_node, nullptr);
+    CHECK(failed_fused != nullptr && failed_separate != nullptr && failed_fused != failed_separate);
+    failed_fused->transaction = failed_transactions[0];
+    failed_fused->state = GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE;
+    failed_separate->transaction = failed_transactions[1];
+    failed_separate->state = GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE;
+    CHECK(!finalization_registry->finish_graph_dispatch(&finalization_execution));
+    for (uint32_t i = 0; i < 2; ++i) {
+        CHECK(!finalization_registry->get_group_resources(failed_resources[i], nullptr));
+        CHECK(!finalization_registry->end_group_transaction(failed_transactions[i]));
+    }
+    CHECK(finalization_execution.find_authority(fused_gate_up_node) == nullptr);
+    CHECK(finalization_execution.find_authority(separate_gate_node) == nullptr);
+    CHECK(finalization_registry->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    finalization_registry->shutdown();
+    finalization_registry.reset();
 
     registry.compile_graph_plan(complete_graph, 62, &plan, &execution);
     CHECK(registry.begin_graph_dispatch(&execution, true));
@@ -2034,6 +2100,75 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         squared_expected += static_cast<double>(expected[i]) * expected[i];
     }
     CHECK(squared_expected > 0.0 && squared_error == 0.0);
+
+    if (type == GGML_TYPE_Q4_0 && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && n_slots == 12) {
+        auto * context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
+        CHECK(context != nullptr);
+
+        std::shared_ptr<ggml_cuda_moe_graph_plan> failure_plan;
+        ggml_cuda_moe_graph_execution failure_execution;
+        CHECK(context->prepare_graph_execution(first.graph, 701, false, &failure_plan, &failure_execution) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        cudaStream_t stream = nullptr;
+        cudaStream_t wrong_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_OK(cudaStreamCreateWithFlags(&wrong_stream, cudaStreamNonBlocking));
+        CHECK(failure_execution.resolve_streams(candidate_test_graph_stream, stream));
+        CHECK(context->begin_graph_dispatch(&failure_execution, true));
+        ggml_cuda_moe_graph_binding binding;
+        auto * failure_group = failure_execution.find_group(first.output, &binding);
+        CHECK(failure_group != nullptr);
+        CHECK(context->prepare_graph_group(failure_group, binding, first.output, stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+        const auto failed_resource = failure_group->transaction.acquisition;
+        failure_group->stream = wrong_stream;
+        CHECK(!context->finish_graph_dispatch(&failure_execution));
+        CHECK(!context->get_group_resources(failed_resource, nullptr));
+        CUDA_OK(cudaStreamDestroy(wrong_stream));
+        CUDA_OK(cudaStreamDestroy(stream));
+        CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2) == first_output);
+
+        ggml_cuda_moe_candidate_group_key key;
+        ggml_cuda_moe_grouped_acquisition resource;
+        ggml_cuda_moe_grouped_transaction held;
+        CHECK(context->find_down_group_key(first.down, &key));
+        CHECK(context->acquire_group_resources(key, &resource));
+        CHECK(context->begin_group_transaction(resource, &held));
+        std::array<ggml_backend_moe_candidate_bank_v1, 3> replacement_banks = {};
+        for (size_t i = 0; i < first.banks.size(); ++i) {
+            replacement_banks[i] = {first.banks[i], first.roles[i], 0};
+        }
+        const ggml_backend_moe_candidate_group_v1 replacement_group = {
+            replacement_banks.data(), static_cast<uint32_t>(first.banks.size()), layout, 0, 0,
+        };
+        const auto replacement_snapshot = candidate_snapshot(n_slots, &replacement_group, 1);
+        std::atomic<bool> replacement_started{false};
+        std::atomic<int32_t> replacement_result{GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR};
+        std::thread replacement([&]() {
+            replacement_started.store(true, std::memory_order_release);
+            replacement_result.store(context->replace(&replacement_snapshot), std::memory_order_release);
+        });
+        while (!replacement_started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::shared_ptr<ggml_cuda_moe_graph_plan> unavailable_plan;
+        ggml_cuda_moe_graph_execution unavailable_execution;
+        while (context->prepare_graph_execution(first.graph, 702, false, &unavailable_plan, &unavailable_execution) !=
+                GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
+            std::this_thread::yield();
+        }
+        std::vector<float> zero_input(ggml_nelements(first.input));
+        ggml_backend_tensor_set(first.input, zero_input.data(), 0, ggml_nbytes(first.input));
+        CHECK(ggml_backend_graph_compute(first_backend.get(), first.graph) == GGML_STATUS_FAILED);
+        std::vector<float> preserved_output(ggml_nelements(first.output));
+        ggml_backend_tensor_get(first.output, preserved_output.data(), 0, ggml_nbytes(first.output));
+        CHECK(preserved_output == first_output);
+        const auto restored_input = cached_fusion_test_data(first.input, 131);
+        ggml_backend_tensor_set(first.input, restored_input.data(), 0, restored_input.size());
+        CHECK(context->end_group_transaction(held));
+        replacement.join();
+        CHECK(replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2) == first_output);
+    }
 }
 
 static void test_active_grouped_dispatch() {
