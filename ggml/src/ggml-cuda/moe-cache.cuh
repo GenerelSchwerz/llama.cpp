@@ -418,8 +418,10 @@ private:
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
     const void * graph_key_;
+    const void * coverage_nodes_;
     uint64_t registry_generation_;
     uint64_t graph_uid_;
+    uint64_t coverage_epoch_;
     int32_t graph_node_count_;
     uint32_t n_groups_;
     uint32_t n_nodes_;
@@ -540,19 +542,25 @@ public:
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
             ggml_cuda_moe_graph_plan * plan,
-            ggml_cuda_moe_graph_execution * execution) const;
+            ggml_cuda_moe_graph_execution * execution,
+            uint64_t coverage_epoch = 0,
+            const void * coverage_nodes = nullptr) const;
     bool bind_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
             ggml_cuda_moe_graph_property_hint property_hint,
             const ggml_cuda_moe_graph_plan & plan,
-            ggml_cuda_moe_graph_execution * execution) const;
+            ggml_cuda_moe_graph_execution * execution,
+            uint64_t coverage_epoch = 0,
+            const void * coverage_nodes = nullptr) const;
     ggml_cuda_moe_graph_prepare_result prepare_graph_execution(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
             ggml_cuda_moe_graph_property_hint property_hint,
             std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
-            ggml_cuda_moe_graph_execution * execution) const;
+            ggml_cuda_moe_graph_execution * execution,
+            uint64_t coverage_epoch = 0,
+            const void * coverage_nodes = nullptr) const;
     bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled);
     ggml_cuda_moe_grouped_decode_result prepare_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,

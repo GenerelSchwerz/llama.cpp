@@ -331,7 +331,6 @@ static ggml_cgraph * candidate_padded_graph(
 static void candidate_test_graph_views(
         candidate_test_fixture & fixture,
         ggml_cuda_moe_grouped_context & global_registry,
-        const ggml_backend_moe_candidate_group_v1 & local_group,
         const candidate_route & fused_route,
         const candidate_route & separate_route,
         ggml_tensor * fused_gate_up,
@@ -359,28 +358,73 @@ static void candidate_test_graph_views(
         CHECK(split_plan.get() != stable_split_plan && prepared->find(fused_down, nullptr));
     }
 
-    ggml_backend_moe_candidate_snapshot_v1 local_snapshot = {};
-    local_snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
-    local_snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
-    local_snapshot.struct_size = sizeof(local_snapshot);
-    local_snapshot.n_slots = 12;
-    local_snapshot.groups = &local_group;
-    local_snapshot.n_groups = 1;
-    ggml_cuda_moe_grouped_context local_registry(&fixture.owner);
-    CHECK(local_registry.replace(&local_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     split_plan.reset();
     {
         auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
-        CHECK(local_registry.prepare_graph_execution(&split_view, 33, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get()) ==
+        CHECK(global_registry.prepare_graph_execution(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get(), 1, split_view.nodes) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(prepared->size() == 1 && prepared->find(fused_down, nullptr));
     }
     stable_split_plan = split_plan.get();
     {
         auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
-        CHECK(local_registry.prepare_graph_execution(&split_view, 34, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+        CHECK(global_registry.prepare_graph_execution(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get(), 1, split_view.nodes) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
         CHECK(split_plan.get() == stable_split_plan && prepared->find(fused_down, nullptr));
+    }
+    {
+        ggml_cgraph exact_callback = ggml_graph_view(&split_view, 0, split_view.n_nodes);
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.bind_graph_plan(
+            &exact_callback, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *split_plan, prepared.get(), 1, split_view.nodes));
+        CHECK(prepared->find(fused_down, nullptr));
+    }
+    {
+        ggml_cgraph prefix_callback = ggml_graph_view(&split_view, 0, split_view.n_nodes - 1);
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(!global_registry.bind_graph_plan(
+            &prefix_callback, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *split_plan, prepared.get(), 1, split_view.nodes));
+        CHECK(!global_registry.bind_graph_plan(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *split_plan, prepared.get(), 2, split_view.nodes));
+    }
+
+    ggml_cgraph second_split_view = ggml_graph_view(split_parent, 4, split_parent->n_nodes);
+    std::shared_ptr<ggml_cuda_moe_graph_plan> second_split_plan;
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(
+            &second_split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &second_split_plan, prepared.get(), 2, second_split_view.nodes) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared->size() == 1 && prepared->find(separate_down, nullptr));
+    }
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(
+            &second_split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &second_split_plan, prepared.get(), 2, second_split_view.nodes) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(prepared->find(separate_down, nullptr));
+    }
+
+    const std::shared_ptr<ggml_cuda_moe_graph_plan> decode_split_plan = split_plan;
+    candidate_set_route_tokens(fused_route, {fused_gate_up, fused_down}, 4);
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get(), 3, split_view.nodes) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(split_plan.get() != decode_split_plan.get() && !prepared->find(fused_down, nullptr));
+        CHECK(!global_registry.bind_graph_plan(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *decode_split_plan, prepared.get(), 3, split_view.nodes));
+    }
+    candidate_set_route_tokens(fused_route, {fused_gate_up, fused_down}, 1);
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(
+            &split_view, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get(), 4, split_view.nodes) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared->find(fused_down, nullptr));
     }
 
     ggml_tensor * split_consumer = ggml_dup(fixture.ctx, fused_down);
@@ -394,14 +438,16 @@ static void candidate_test_graph_views(
     split_plan.reset();
     {
         auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
-        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 35, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get()) ==
+        CHECK(global_registry.prepare_graph_execution(
+            &split_consumer_view, 35, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get(), 5, split_consumer_view.nodes) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(prepared->size() == 1 && !prepared->find(fused_down, nullptr));
     }
     stable_split_plan = split_plan.get();
     {
         auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
-        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 36, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+        CHECK(global_registry.prepare_graph_execution(
+            &split_consumer_view, 36, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get(), 5, split_consumer_view.nodes) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
         CHECK(split_plan.get() == stable_split_plan && !prepared->find(fused_down, nullptr));
     }
@@ -409,7 +455,8 @@ static void candidate_test_graph_views(
     candidate_rebuild_graph_uses(split_consumer_parent);
     {
         auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
-        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 37, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+        CHECK(global_registry.prepare_graph_execution(
+            &split_consumer_view, 37, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get(), 5, split_consumer_view.nodes) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(split_plan.get() != stable_split_plan && prepared->find(fused_down, nullptr));
     }
@@ -1372,7 +1419,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
 
-    candidate_test_graph_views(fixture, registry, groups[0], fused_route, separate_route,
+    candidate_test_graph_views(fixture, registry, fused_route, separate_route,
         fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node);
 
     ggml_cuda_moe_graph_plan plan;

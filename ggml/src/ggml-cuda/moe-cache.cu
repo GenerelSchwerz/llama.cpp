@@ -1677,7 +1677,7 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 } // namespace
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), graph_key_(nullptr), registry_generation_(0), graph_uid_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false), unknown_reusable_(false) {
+    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false), unknown_reusable_(false) {
 }
 
 void ggml_cuda_moe_graph_plan::reset() {
@@ -1687,8 +1687,10 @@ void ggml_cuda_moe_graph_plan::reset() {
     }
     owner_ = nullptr;
     graph_key_ = nullptr;
+    coverage_nodes_ = nullptr;
     registry_generation_ = 0;
     graph_uid_ = 0;
+    coverage_epoch_ = 0;
     graph_node_count_ = 0;
     n_groups_ = 0;
     n_nodes_ = 0;
@@ -3675,7 +3677,9 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const ggml_cgraph * cgraph,
         uint64_t graph_uid,
         ggml_cuda_moe_graph_plan * plan,
-        ggml_cuda_moe_graph_execution * execution) const {
+        ggml_cuda_moe_graph_execution * execution,
+        uint64_t coverage_epoch,
+        const void * coverage_nodes) const {
     if (plan != nullptr) {
         plan->reset();
     }
@@ -3695,9 +3699,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->graph_uid_ = graph_uid;
     plan->graph_node_count_ = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
     plan->graph_key_ = plan->graph_node_count_ > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
+    const bool coverage_valid = coverage_epoch != 0 && coverage_nodes == cgraph->nodes;
+    plan->coverage_nodes_ = coverage_valid ? coverage_nodes : nullptr;
+    plan->coverage_epoch_ = coverage_valid ? coverage_epoch : 0;
     plan->initialized_ = true;
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
-        plan->unknown_reusable_ = impl_->table.groups.empty();
+        plan->unknown_reusable_ = coverage_valid || impl_->table.groups.empty();
         execution->plan_ = plan;
         return;
     }
@@ -3878,11 +3885,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     }
 
     uint32_t n_observed = 0;
-    plan->unknown_reusable_ = true;
+    bool all_observed = true;
     for (const auto & observation : observations) {
         n_observed += observation.observed;
-        plan->unknown_reusable_ = plan->unknown_reusable_ && observation.observed;
+        all_observed = all_observed && observation.observed;
     }
+    plan->unknown_reusable_ = coverage_valid || all_observed;
     try {
         plan->groups_.reserve(n_observed);
     } catch (const std::bad_alloc &) {
@@ -4163,20 +4171,24 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         uint64_t graph_uid,
         ggml_cuda_moe_graph_property_hint property_hint,
         const ggml_cuda_moe_graph_plan & plan,
-        ggml_cuda_moe_graph_execution * execution) const {
+        ggml_cuda_moe_graph_execution * execution,
+        uint64_t coverage_epoch,
+        const void * coverage_nodes) const {
     if (execution != nullptr) {
         execution->reset();
     }
-    if (cgraph == nullptr || execution == nullptr || property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED || graph_uid == 0) {
+    if (cgraph == nullptr || execution == nullptr || property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED) {
         return false;
     }
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
     const void * graph_key = n_nodes > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
+    const bool coverage_matches = plan.coverage_epoch_ == 0 ||
+        (plan.coverage_epoch_ == coverage_epoch && plan.coverage_nodes_ == coverage_nodes && coverage_nodes == cgraph->nodes);
     if (!plan.initialized_ || plan.owner_ != impl_.get() || plan.graph_key_ != graph_key || plan.graph_node_count_ != n_nodes ||
             impl_->draining || impl_->replacement_pending || plan.registry_generation_ != impl_->state.generation ||
-            plan.n_groups_ > impl_->table.groups.size() ||
+            plan.n_groups_ > impl_->table.groups.size() || !coverage_matches || (graph_uid == 0 && plan.coverage_epoch_ == 0) ||
             (property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN && !plan.unknown_reusable_)) {
         return false;
     }
@@ -4314,14 +4326,17 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
         uint64_t graph_uid,
         ggml_cuda_moe_graph_property_hint property_hint,
         std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
-        ggml_cuda_moe_graph_execution * execution) const {
+        ggml_cuda_moe_graph_execution * execution,
+        uint64_t coverage_epoch,
+        const void * coverage_nodes) const {
     if (execution != nullptr) {
         execution->reset();
     }
     if (cgraph == nullptr || plan == nullptr || execution == nullptr) {
         return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
     }
-    if (*plan != nullptr && bind_graph_plan(cgraph, graph_uid, property_hint, **plan, execution)) {
+    if (*plan != nullptr && bind_graph_plan(
+            cgraph, graph_uid, property_hint, **plan, execution, coverage_epoch, coverage_nodes)) {
         execution->retain(*plan);
         return GGML_CUDA_MOE_GRAPH_PREPARE_REUSED;
     }
@@ -4334,7 +4349,7 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
         execution->reset();
         return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
     }
-    compile_graph_plan(cgraph, graph_uid, replacement.get(), execution);
+    compile_graph_plan(cgraph, graph_uid, replacement.get(), execution, coverage_epoch, coverage_nodes);
     if (!replacement->initialized_) {
         plan->reset();
         execution->reset();

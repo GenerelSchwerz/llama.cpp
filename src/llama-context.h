@@ -22,10 +22,7 @@ class llama_io_read_i;
 class llama_io_write_i;
 
 struct llama_moe_candidate_snapshot {
-    llama_moe_candidate_snapshot(
-            const llama_model & model,
-            const llama_adapter_loras & loras,
-            ggml_backend_dev_t owner = nullptr);
+    llama_moe_candidate_snapshot(const llama_model & model, const llama_adapter_loras & loras);
 
     const ggml_backend_moe_candidate_snapshot_v1 & get() const;
 

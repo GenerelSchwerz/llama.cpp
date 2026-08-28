@@ -83,8 +83,7 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 
 llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
         const llama_model & model,
-        const llama_adapter_loras & loras,
-        ggml_backend_dev_t owner) {
+        const llama_adapter_loras & loras) {
     snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
     snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
     snapshot.struct_size = sizeof(snapshot);
@@ -104,8 +103,7 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
     };
 
     storage.reserve(std::min<size_t>(model.layers.size(), GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS));
-    for (uint32_t il = 0; il < model.layers.size(); ++il) {
-        const auto & layer = model.layers[il];
+    for (const auto & layer : model.layers) {
         if (layer.ffn_gate_inp == nullptr || layer.ffn_down_exps == nullptr) {
             continue;
         }
@@ -128,12 +126,6 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
                 (fused && has_lora(layer.ffn_gate_up_exps)) ||
                 (separate && (has_lora(layer.ffn_gate_exps) || has_lora(layer.ffn_up_exps)))) {
             continue;
-        }
-
-        if (owner != nullptr && model.dev_layer(il) != owner) {
-            // Partial placement cannot prove complete graph coverage.
-            storage.clear();
-            return;
         }
 
         if (storage.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
@@ -1044,24 +1036,13 @@ void llama_context::refresh_moe_candidates() {
     disabled.n_slots = std::max(model.moe_expert_cache_slots(), 0);
 
     try {
-        if (moe_candidate_replace_fns.size() != 1) {
-            for (const auto & endpoint : moe_candidate_replace_fns) {
+        const llama_moe_candidate_snapshot candidates(model, *loras);
+        for (const auto & endpoint : moe_candidate_replace_fns) {
+            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
+                    result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
                 endpoint.second(endpoint.first, &disabled);
             }
-            return;
-        }
-
-        const auto & endpoint = moe_candidate_replace_fns.front();
-        ggml_backend_dev_t owner = ggml_backend_get_device(endpoint.first);
-        if (owner == nullptr) {
-            endpoint.second(endpoint.first, &disabled);
-            return;
-        }
-        const llama_moe_candidate_snapshot candidates(model, *loras, owner);
-        const int32_t result = endpoint.second(endpoint.first, &candidates.get());
-        if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
-                result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
-            endpoint.second(endpoint.first, &disabled);
         }
     } catch (...) {
         for (const auto & endpoint : moe_candidate_replace_fns) {

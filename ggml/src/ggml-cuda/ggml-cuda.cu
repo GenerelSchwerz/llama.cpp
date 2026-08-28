@@ -3626,6 +3626,26 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
+static void ggml_cuda_moe_certify_graph(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    if (cuda_ctx->moe_grouped_context == nullptr || cgraph == nullptr || cgraph->n_nodes == 0) {
+        return;
+    }
+
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(ggml_cuda_graph_get_key(cgraph));
+    graph->moe_graph_plan.reset();
+    graph->moe_coverage_nodes = nullptr;
+    graph->moe_coverage_epoch = 0;
+    graph->moe_coverage_n_nodes = 0;
+    if (cuda_ctx->moe_coverage_epoch == UINT64_MAX) {
+        return;
+    }
+
+    const uint64_t coverage_epoch = ++cuda_ctx->moe_coverage_epoch;
+    graph->moe_coverage_nodes = cgraph->nodes;
+    graph->moe_coverage_epoch = coverage_epoch;
+    graph->moe_coverage_n_nodes = cgraph->n_nodes;
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -5558,8 +5578,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif // USE_CUDA_GRAPH
 
     if (cuda_ctx->moe_grouped_context != nullptr) {
+        std::shared_ptr<ggml_cuda_moe_graph_plan> local_plan;
+        std::shared_ptr<ggml_cuda_moe_graph_plan> * plan = &local_plan;
+        uint64_t coverage_epoch = 0;
+        const void * coverage_nodes = nullptr;
+        if (graph->moe_coverage_epoch != 0 && graph->moe_coverage_nodes == cgraph->nodes &&
+                graph->moe_coverage_n_nodes == cgraph->n_nodes) {
+            plan = &graph->moe_graph_plan;
+            coverage_epoch = graph->moe_coverage_epoch;
+            coverage_nodes = graph->moe_coverage_nodes;
+        }
         const auto prepare_result = cuda_ctx->moe_grouped_context->prepare_graph_execution(
-            cgraph, cgraph->uid, moe_property_hint, &graph->moe_graph_plan, &moe_execution);
+            cgraph, cgraph->uid, moe_property_hint, plan, &moe_execution, coverage_epoch, coverage_nodes);
         if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
             return GGML_STATUS_FAILED;
         }
@@ -5632,8 +5662,6 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
-    GGML_UNUSED(cuda_ctx);
-    GGML_UNUSED(cgraph);
 #endif
 
     static bool enable_graph_optimization = [] {
@@ -5642,6 +5670,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }();
 
     if (!enable_graph_optimization) {
+        ggml_cuda_moe_certify_graph(cuda_ctx, cgraph);
         return;
     }
 
@@ -5649,6 +5678,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     stream_context.reset();
 
     if (!use_cuda_graph || ggml_backend_cuda_get_device_count() != 1) {
+        ggml_cuda_moe_certify_graph(cuda_ctx, cgraph);
         return;
     }
 
@@ -5866,6 +5896,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
     }
+    ggml_cuda_moe_certify_graph(cuda_ctx, cgraph);
 }
 
 static const ggml_backend_i ggml_backend_cuda_interface = {
