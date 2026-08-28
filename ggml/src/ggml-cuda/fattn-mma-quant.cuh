@@ -33,6 +33,11 @@ struct fattn_quant_load_width {
     static constexpr int value = 16;
 };
 
+template <ggml_type type>
+struct fattn_quant_incremental_rows {
+    static constexpr bool value = false;
+};
+
 // Cache types with a compiled native tile loader. Both the host-side route
 // decision and the device-side kernel selection ask this same question. Which
 // type sits in which tier is declared once, in fattn-mma-quant-types.h.
@@ -107,6 +112,8 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
     const int i_tid = tid / threads_per_row;
     const int k_tid = tid % threads_per_row;
     const int e0    = 2*k0_h2 + k_tid*nelem_per_thread;
+    const int64_t stride_iter = int64_t(rows_per_iter)*stride_row;
+    const char * row = KV + int64_t(row0 + i_tid)*stride_row;
 
 #pragma unroll
     for (int i0 = 0; i0 < nbatch_fa; i0 += rows_per_iter) {
@@ -115,8 +122,12 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
         __align__(16) half2 vals[nh2_per_thread];
 
         if (!oob_check || i < i_sup) {
-            const char * const row = KV + int64_t(row0 + i)*stride_row;
-            traits::template dequant<nelem_per_thread>(row, vals, e0);
+            if constexpr (fattn_quant_incremental_rows<type>::value) {
+                traits::template dequant<nelem_per_thread>(row, vals, e0);
+            } else {
+                const char * const row_i = KV + int64_t(row0 + i)*stride_row;
+                traits::template dequant<nelem_per_thread>(row_i, vals, e0);
+            }
         } else {
 #pragma unroll
             for (int l = 0; l < nh2_per_thread; ++l) {
@@ -127,6 +138,9 @@ static __device__ __forceinline__ void flash_attn_ext_quant_load_tile(
 #pragma unroll
         for (int l0 = 0; l0 < nh2_per_thread; l0 += 16/sizeof(half2)) {
             ggml_cuda_memcpy_1<16>(dst + l0, vals + l0);
+        }
+        if constexpr (fattn_quant_incremental_rows<type>::value) {
+            row += stride_iter;
         }
     }
 #else
