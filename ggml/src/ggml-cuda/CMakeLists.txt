@@ -107,41 +107,36 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
-    file(GLOB   SRCS "template-instances/fattn-mma-f16*.cu")
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
-    file(GLOB   SRCS "template-instances/fattn-mma-quant*.cu")
-    if (NOT GGML_CUDA_FA_ALL_QUANTS)
-        # An extra-tier K type contributes no cases without
-        # GGML_CUDA_FA_ALL_QUANTS, so its files would each cost an nvcc
-        # invocation over the full MMA header for an empty translation unit.
-        #
-        # Which stems those are is not written here. It is read from
-        # fattn-mma-quant-types.h, the same manifest the route predicate, the
-        # extern declarations, the generator and the backend-ops coverage use,
-        # so this filter cannot name a type the generator stopped emitting or
-        # miss one it started emitting. A failed parse fails the configure
-        # rather than silently excluding nothing.
-        ggml_cuda_fattn_mma_quant_extra_stems(FATTN_MMA_QUANT_EXTRA_STEMS)
-        string(JOIN "|" FATTN_MMA_QUANT_EXTRA_RE ${FATTN_MMA_QUANT_EXTRA_STEMS})
-        list(FILTER SRCS EXCLUDE REGEX
-            "fattn-mma-quant-instance-(${FATTN_MMA_QUANT_EXTRA_RE})-.*[.]cu$")
+    if (GGML_CUDA_FA)
+        file(GLOB   SRCS "template-instances/fattn-mma-f16*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        file(GLOB   SRCS "template-instances/fattn-mma-quant*.cu")
+        if (NOT GGML_CUDA_FA_ALL_QUANTS)
+            ggml_cuda_fattn_mma_quant_extra_stems(FATTN_MMA_QUANT_EXTRA_STEMS)
+            string(JOIN "|" FATTN_MMA_QUANT_EXTRA_RE ${FATTN_MMA_QUANT_EXTRA_STEMS})
+            list(FILTER SRCS EXCLUDE REGEX
+                "fattn-mma-quant-instance-(${FATTN_MMA_QUANT_EXTRA_RE})-.*[.]cu$")
+        endif()
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+        if (GGML_CUDA_FA_ALL_QUANTS)
+            file(GLOB   SRCS "template-instances/fattn-vec*.cu")
+            list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        else()
+            list(APPEND GGML_SOURCES_CUDA
+                template-instances/fattn-vec-instance-f16-f16.cu
+                template-instances/fattn-vec-instance-q4_0-q4_0.cu
+                template-instances/fattn-vec-instance-q8_0-q8_0.cu
+                template-instances/fattn-vec-instance-bf16-bf16.cu)
+        endif()
     endif()
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
     if (GGML_CUDA_FA_ALL_QUANTS)
-        file(GLOB   SRCS "template-instances/fattn-vec*.cu")
-        list(APPEND GGML_SOURCES_CUDA ${SRCS})
         add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-    else()
-        list(APPEND GGML_SOURCES_CUDA
-            template-instances/fattn-vec-instance-f16-f16.cu
-            template-instances/fattn-vec-instance-q4_0-q4_0.cu
-            template-instances/fattn-vec-instance-q8_0-q8_0.cu
-            template-instances/fattn-vec-instance-bf16-bf16.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda

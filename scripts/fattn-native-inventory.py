@@ -46,7 +46,7 @@ GGML_TYPE_ENUM_RE = re.compile(r"^\s*GGML_TYPE_(\w+)\s*=\s*(\d+)\s*,")
 # inside the kernel. The sentinel's value is read from the source rather than
 # hard-coded, because it is defined relative to GGML_TYPE_COUNT.
 KERNEL_RE = re.compile(
-    r"flash_attn_ext_f16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*\w+,\s*\w+,"
+    r"flash_attn_ext_f16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*\w+,\s*\w+,\s*\w+,"
     r"\s*\(ggml_type\)(\d+),\s*\(ggml_type\)(\d+)\s*>")
 V_RUNTIME_SENTINEL_RE = re.compile(
     r"GGML_CUDA_FATTN_QUANT_V_RUNTIME\s*=\s*\(ggml_type\)\s*\(GGML_TYPE_COUNT\s*\+\s*(\d+)\)")

@@ -245,24 +245,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
-// Routing is otherwise only observable indirectly, through allocation size or
-// throughput, and both can be dominated by unrelated effects. Setting
-// GGML_CUDA_FATTN_NATIVE_VERBOSE logs every launch that actually takes this
-// path, so a measurement can state that it exercised the kernel rather than
-// inferring it.
-static void ggml_cuda_flash_attn_ext_mma_quant_log_route(const ggml_tensor * dst) {
-    static const bool verbose = getenv("GGML_CUDA_FATTN_NATIVE_VERBOSE") != nullptr;
-    if (!verbose) {
-        return;
-    }
-    const ggml_tensor * Q = dst->src[0];
-    const ggml_tensor * K = dst->src[1];
-    const ggml_tensor * V = dst->src[2];
-    GGML_LOG_INFO("fattn-native: K=%s V=%s D=%d n_q=%d n_kv=%d n_head=%d n_head_kv=%d\n",
-        ggml_type_name(K->type), ggml_type_name(V->type),
-        (int) Q->ne[0], (int) Q->ne[1], (int) K->ne[1], (int) Q->ne[2], (int) K->ne[2]);
-}
-
 template <ggml_type type_K, ggml_type type_V>
 static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     switch (dst->src[0]->ne[0]) {
@@ -293,19 +275,8 @@ static void ggml_cuda_flash_attn_ext_mma_quant(ggml_backend_cuda_context & ctx, 
     const ggml_tensor * V = dst->src[2];
 
     GGML_ASSERT(Q->ne[0] == K->ne[0] && Q->ne[0] == V->ne[0]);
-    // Same predicate the route decision used. It also guarantees K->type ==
-    // V->type where this build compiled no mixed-pair kernel, which is what
-    // makes the mixed arm below unreachable there rather than a silent no-op.
     GGML_ASSERT(ggml_cuda_fattn_mma_quant_pair(K->type, V->type));
 
-    ggml_cuda_flash_attn_ext_mma_quant_log_route(dst);
-
-    // Expanded from the same manifest that drives the route predicate and the
-    // extern declarations, so a type can never be routable without a kernel.
-    // The symmetric pair gets its V as a template argument; every mixed pair
-    // shares one runtime-V kernel per K type. So the common configuration keeps
-    // the code generation it had when V was always compile-time, and coverage of
-    // all ordered pairs costs 2n kernels rather than n^2.
 #define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                            \
         case t:                                                                     \
             if (V->type == (t)) {                                                   \
@@ -421,32 +392,12 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_MMA_NATIVE = 500, // MMA reading a quantized cache in place, no F16 copy
 };
 
-// The graph opts in per node. The kernels for the default cache types are
-// compiled by every CUDA FlashAttention build, so a default-tier request is
-// declined only by the route predicate below. An extra-tier request is still
-// declined by the build when GGML_CUDA_FA_ALL_QUANTS was not set, because
-// ggml_cuda_fattn_mma_quant_type() then does not name those types.
-static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
-    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
-}
-
-// The native route covers the compiled K/V type pairs at the supported equal
-// head sizes on NVIDIA architectures that use the Ampere MMA implementation.
-// K and V need not be the same type; ggml_cuda_fattn_mma_quant_pair() decides,
-// and it is the same predicate the kernel generator used.
-static bool ggml_cuda_fattn_native_applies(
+static bool ggml_cuda_fattn_native_supported(
         const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio) {
-    if (!ggml_cuda_fattn_native_enabled(dst)) {
-        return false;
-    }
-
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    // A non-zero logit softcap keeps the standard path. Excluding it lets the
-    // kernel drop the softcap specialization for every quantized case instead
-    // of compiling one that no dispatch can reach.
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
@@ -456,20 +407,58 @@ static bool ggml_cuda_fattn_native_applies(
     const bool supported_head_size = Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256 ||
         (Q->ne[0] == 512 && (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q4_1 || K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1 || K->type == GGML_TYPE_Q8_0) && V->type == K->type &&
          gqa_opt_applies && gqa_ratio > 4 && Q->ne[1] > 4);
-    const bool ok = ampere_mma_available(cc) && logit_softcap == 0.0f &&
+    return ampere_mma_available(cc) && logit_softcap == 0.0f &&
         ggml_cuda_fattn_mma_quant_pair(K->type, V->type) && supported_head_size &&
         K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0] && q5_1_aligned(K) && q5_1_aligned(V);
+}
 
-    static bool warned = false;
-    if (!ok && !warned && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
-        warned = true;
-        GGML_LOG_WARN("quantized-native CUDA FlashAttention has no kernel for K=%s V=%s DQ=%d DK=%d DV=%d "
-                      "softcap=%.1f; using the standard materializing path\n",
-            ggml_type_name(K->type), ggml_type_name(V->type),
-            (int) Q->ne[0], (int) K->ne[0], (int) V->ne[0], logit_softcap);
+static bool ggml_cuda_fattn_native_profitable(
+        const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!gqa_opt_applies || K->type != V->type) {
+        return false;
     }
 
-    return ok;
+    const bool k_host = K->buffer != nullptr && ggml_backend_buffer_is_host(K->buffer);
+    const bool v_host = V->buffer != nullptr && ggml_backend_buffer_is_host(V->buffer);
+    if (k_host != v_host) {
+        return false;
+    }
+
+    const bool device_type_profitable = K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0;
+    if (Q->ne[0] == 512) {
+        return gqa_ratio > 4 && Q->ne[1] > 4 && !k_host && device_type_profitable;
+    }
+    if (Q->ne[0] != 256) {
+        return false;
+    }
+
+    if (gqa_ratio == 2) {
+        return Q->ne[1] > 16 && ((k_host && K->type == GGML_TYPE_Q8_0) || (!k_host && device_type_profitable && K->ne[1] <= 1024));
+    }
+    if (gqa_ratio <= 4 || Q->ne[1] <= 4) {
+        return false;
+    }
+
+    if (k_host) {
+        return K->type == GGML_TYPE_Q8_0;
+    }
+    if (K->type == GGML_TYPE_Q4_0) {
+        return K->ne[1] <= 1024 || K->ne[1] >= 16384;
+    }
+    if (K->type == GGML_TYPE_Q5_0) {
+        return K->ne[1] >= 16384;
+    }
+    return K->ne[1] <= 512;
+}
+
+static bool ggml_cuda_fattn_native_applies(
+        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio) {
+    const bool supported = ggml_cuda_fattn_native_supported(cc, dst, gqa_opt_applies, gqa_ratio);
+    return supported && ggml_cuda_fattn_native_profitable(dst, gqa_opt_applies, gqa_ratio);
 }
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -706,7 +695,6 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
         case BEST_FATTN_KERNEL_MMA_NATIVE:
-            // The whole point: the kernel reads the quantized cache in place.
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
