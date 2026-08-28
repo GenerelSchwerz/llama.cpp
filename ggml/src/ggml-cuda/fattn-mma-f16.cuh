@@ -1954,8 +1954,8 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
     static_assert(!is_quant_kv || ggml_cuda_fattn_mma_quant_pair(type_K, type_V) ||
             (ggml_cuda_fattn_mma_quant_type(type_K) && ggml_cuda_fattn_mma_quant_v_runtime(type_V)),
             "quantized-native MMA requires two native cache types, or a native K with a runtime V");
-    static_assert(!is_quant_kv || (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256)),
-            "quantized-native MMA requires equal K/V head dimensions of 64, 128 or 256");
+    static_assert(!is_quant_kv || (DKQ == DV && (DKQ == 64 || DKQ == 128 || DKQ == 256 || DKQ == 512)),
+            "quantized-native MMA requires supported equal K/V head dimensions");
 
     const ggml_tensor * KQV = dst;
     const int id = ggml_cuda_get_device();

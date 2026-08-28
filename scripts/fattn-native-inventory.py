@@ -14,6 +14,7 @@ type manifest, ggml/src/ggml-cuda/fattn-mma-quant-types.h:
   * extra-tier types have them exactly when the build set GGML_CUDA_FA_ALL_QUANTS;
   * runtime-V kernels exist exactly when the build set GGML_CUDA_FA_ALL_QUANTS,
     because a build without it declines K != V before the route is asked;
+  * every runtime-V geometry also has its symmetric kernel;
   * no type outside the manifest has native kernels.
 
 Usage:
@@ -120,19 +121,23 @@ def main():
     v_runtime = read_v_runtime_sentinel(type_values)
     symbols, source = read_symbols(args.library)
 
-    symmetric = {}
-    runtime_v = {}
+    symmetric_geometries = {}
+    runtime_v_geometries = {}
     foreign = set()
     for m in KERNEL_RE.finditer(symbols):
+        geometry = tuple(int(m.group(i)) for i in range(1, 5))
         k, v = int(m.group(5)), int(m.group(6))
         if v == v_runtime:
             name = value_to_name.get(k)
             if name is None:
                 foreign.add(k)  # a runtime V loader for a type the manifest does not name
             else:
-                runtime_v[name] = runtime_v.get(name, 0) + 1
+                runtime_v_geometries.setdefault(name, set()).add(geometry)
         elif k == v and k in value_to_name:
-            symmetric[value_to_name[k]] = symmetric.get(value_to_name[k], 0) + 1
+            symmetric_geometries.setdefault(value_to_name[k], set()).add(geometry)
+
+    symmetric = {name: len(geometries) for name, geometries in symmetric_geometries.items()}
+    runtime_v = {name: len(geometries) for name, geometries in runtime_v_geometries.items()}
 
     want_symmetric = {n: (t == "DEFAULT" or args.all_quants) for n, t in tiers.items()}
     # Mixed pairs are only reachable with GGML_CUDA_FA_ALL_QUANTS, so that is
@@ -158,9 +163,10 @@ def main():
         if not want_symmetric[name] and sym:
             failures.append(f"{name} ({tier}) must not be compiled in this build, "
                             f"found {sym} symmetric kernels")
-        if want_runtime_v[name] and rt != sym:
-            failures.append(f"{name} has {sym} symmetric but {rt} runtime-V kernels; "
-                            "the two entries are generated together and must match")
+        if want_runtime_v[name] and rt == 0:
+            failures.append(f"{name} is expected in this build but has no runtime-V kernels")
+        if not runtime_v_geometries.get(name, set()) <= symmetric_geometries.get(name, set()):
+            failures.append(f"{name} has a runtime-V geometry without its symmetric kernel")
         if not want_runtime_v[name] and rt:
             failures.append(f"{name} must not have runtime-V kernels in this build, found {rt}")
 

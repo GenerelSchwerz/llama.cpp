@@ -10799,17 +10799,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(
                 72, 72, 4, {1, 1}, 128, 16, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                 GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 1, {16, 1}, 512, 65, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(
+                512, 512, 1, {16, 1}, 512, 65, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, true));
 
-    const auto add_q8_native_equivalence = [&](int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb) {
+    const auto add_q8_native_equivalence = [&](int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb) {
         test_cases.emplace_back(new test_flash_attn_ext(
-                    256, 256, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                    hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                     GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, true, true));
     };
-    add_q8_native_equivalence(4, {6, 1},  113,  65);
-    add_q8_native_equivalence(4, {6, 1},  512, 256);
-    add_q8_native_equivalence(4, {6, 1}, 1024,  65);
-    add_q8_native_equivalence(8, {2, 1},  512,  65);
-    add_q8_native_equivalence(8, {2, 1}, 1024,  65);
+    add_q8_native_equivalence(256, 4, { 6, 1},  113,  65);
+    add_q8_native_equivalence(256, 4, { 6, 1},  512, 256);
+    add_q8_native_equivalence(256, 4, { 6, 1}, 1024,  65);
+    add_q8_native_equivalence(256, 8, { 2, 1},  512,  65);
+    add_q8_native_equivalence(256, 8, { 2, 1}, 1024,  65);
+    add_q8_native_equivalence(512, 1, {16, 1},  512,  65);
+    add_q8_native_equivalence(512, 1, {16, 1}, 4096,  65);
+    add_q8_native_equivalence(512, 1, {16, 1},  512,   4);
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -11311,6 +11320,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    for (int kv : { 512, 4096 }) {
+        for (bool native_quants : { false, true }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, 65, true, false, 0, 0, GGML_PREC_F32,
+                        GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, native_quants));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {

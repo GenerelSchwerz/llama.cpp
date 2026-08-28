@@ -45,7 +45,7 @@ of:
 - the graph opted in for this node (the runtime option);
 - an NVIDIA device using the Ampere MMA implementation;
 - a compiled native K/V pair (see the tiers below);
-- equal head dimensions of 64, 128 or 256;
+- equal head dimensions of 64, 128 or 256, or Q8_0/Q8_0 D=512 with GQA enabled, a GQA ratio above 4, and a query batch above 4;
 - `logit_softcap == 0`.
 
 Anything else keeps the standard path. In particular the dispatcher checks the
@@ -75,6 +75,8 @@ default build compiles only the symmetric kernel per type. The all-quants build
 adds one runtime-V kernel per K type, which covers every mixed pair of that K.
 That is what keeps coverage linear: five types cover all 25 ordered pairs with
 ten kernels per tile shape, not 25.
+
+The D=512 Q8_0 specialization is symmetric-only. Mixed and other-type D=512 requests stay on the materializing path until those kernels have separate performance evidence.
 
 `fattn-mma-quant-types.h` is read by the route predicate, the extern
 declarations, the host K dispatch, the device runtime-V selection, the instance
@@ -117,8 +119,8 @@ Measured on this tree, `sm_86;sm_89`, CUDA 13.3, Release:
 | base, `GGML_CUDA_FA_ALL_QUANTS=ON` | 135,156,856 B | |
 | this branch, `GGML_CUDA_FA_ALL_QUANTS=ON` | 276,719,560 B | +141,562,704 B (+135.0 MiB, +104.74%) |
 
-The default tier is 2 types x 48 kernels (16 tile shapes x 3 head dimensions).
-The all-quants tier is 5 types x 48 symmetric + 48 runtime-V kernels. These
+The default tier has 48 Q4_0 kernels and 49 Q8_0 kernels (16 tile shapes x 3 base head dimensions, plus the Q8_0 D=512 8x8 kernel).
+The all-quants tier has the same Q8_0 specialization, plus 48 symmetric and 48 runtime-V kernels for each base type. These
 counts are read back out of the built library by
 `scripts/fattn-native-inventory.py`, which checks them against the manifest.
 
@@ -137,18 +139,16 @@ Correctness, `test-backend-ops`:
 
 | Build | Selection | CUDA0 | CUDA1 |
 |---|---|---|---|
-| default | `-o FLASH_ATTN_EXT` | 3145/3145 | 3145/3145 |
-| default | `-o FLASH_ATTN_EXT -p native_quants=1` | 209/209 | 209/209 |
-| all-quants | `-o FLASH_ATTN_EXT` | 4570/4570 | 4570/4570 |
-| all-quants | `-o FLASH_ATTN_EXT -p native_quants=1` | 621/621 | 621/621 |
+| default | `-o FLASH_ATTN_EXT` | 3146/3146 | not rerun |
+| default | `-o FLASH_ATTN_EXT -p native_quants=1` | 210/210 | not rerun |
+| all-quants | `-o FLASH_ATTN_EXT` | 4572/4572 | not rerun |
+| all-quants | `-o FLASH_ATTN_EXT -p native_quants=1` | 623/623 | not rerun |
 
 With `GGML_CUDA_FATTN_NATIVE_VERBOSE=1` the all-quants focused run takes the
 native route for all 25 ordered pairs of the five compiled types; the default
 run takes it for `q8_0/q8_0` and `q4_0/q4_0` and correctly declines the rest.
 
-Kernel inventory (`scripts/fattn-native-inventory.py`): the default library
-carries 48 symmetric and 0 runtime-V kernels for each of `q8_0` and `q4_0`, and
-none for the extra tier; the all-quants library carries 48 + 48 for all five.
+Kernel inventory (`scripts/fattn-native-inventory.py`): the default library carries 49 Q8_0 and 48 Q4_0 symmetric kernels, and none for the extra tier; the all-quants library adds 48 runtime-V Q8_0 kernels and carries 48 + 48 for each other type.
 Regenerating the instance files reproduces the committed ones byte for byte.
 
 Runtime, Qwen3.8-27B-UD-IQ2_M (D=256, 24 heads, 4 KV heads), `q8_0/q8_0` cache:
@@ -180,7 +180,7 @@ The route is deliberately narrow, and the conditions in
   F16 cast path, its manifest line, all ordered-pair coverage, and matched
   runtime allocation and performance evidence. Widening the pair matrix inside
   an already-compiled tier is not an expansion; adding to the type set is.
-- **A new head geometry** (unequal `DKQ`/`DV`, or a size outside 64/128/256) is
+- **A new head geometry** (unequal `DKQ`/`DV`, or a size outside 64/128/256/512) is
   a separate measured change. The tile loaders assert alignment against the
   quant block size, and those assertions are what currently confine the route.
 - **A new device family** is a separate measured change. The predicate names

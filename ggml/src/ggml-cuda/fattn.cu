@@ -275,6 +275,13 @@ static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cud
         case 256:
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, type_K, type_V>(ctx, dst);
             break;
+        case 512:
+            if constexpr (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 8, 8, type_K, type_V>(ctx, dst);
+            } else {
+                GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
+            }
+            break;
         default:
             GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
     }
@@ -427,7 +434,8 @@ static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
 // head sizes on NVIDIA architectures that use the Ampere MMA implementation.
 // K and V need not be the same type; ggml_cuda_fattn_mma_quant_pair() decides,
 // and it is the same predicate the kernel generator used.
-static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst) {
+static bool ggml_cuda_fattn_native_applies(
+        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio) {
     if (!ggml_cuda_fattn_native_enabled(dst)) {
         return false;
     }
@@ -442,9 +450,12 @@ static bool ggml_cuda_fattn_native_applies(const int cc, const ggml_tensor * dst
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
+    const bool supported_head_size = Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256 ||
+        (Q->ne[0] == 512 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0 &&
+         gqa_opt_applies && gqa_ratio > 4 && Q->ne[1] > 4);
     const bool ok = ampere_mma_available(cc) && logit_softcap == 0.0f &&
-        ggml_cuda_fattn_mma_quant_pair(K->type, V->type) &&
-        (Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256) && K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
+        ggml_cuda_fattn_mma_quant_pair(K->type, V->type) && supported_head_size &&
+        K->ne[0] == Q->ne[0] && V->ne[0] == Q->ne[0];
 
     static bool warned = false;
     if (!ok && !warned && (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
@@ -610,7 +621,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
-        if (ggml_cuda_fattn_native_applies(cc, dst)) {
+        if (ggml_cuda_fattn_native_applies(cc, dst, gqa_opt_applies, gqa_ratio)) {
             return BEST_FATTN_KERNEL_MMA_NATIVE;
         }
         return BEST_FATTN_KERNEL_MMA_F16;
