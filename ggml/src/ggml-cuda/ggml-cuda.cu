@@ -3043,14 +3043,14 @@ static bool ggml_cuda_moe_group_views(
     if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE || weight == nullptr ||
             binding.role < GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ||
             binding.role > GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
-            binding.bank_index >= GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || group.remapped_ids == nullptr) {
+            binding.slot_index >= GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || group.remapped_ids == nullptr) {
         return false;
     }
-    if (group.bank_data[binding.bank_index] == nullptr) {
+    if (group.bank_data[binding.slot_index] == nullptr) {
         return false;
     }
     bank_view = *weight;
-    bank_view.data = const_cast<void *>(group.bank_data[binding.bank_index]);
+    bank_view.data = const_cast<void *>(group.bank_data[binding.slot_index]);
     bank_view.ne[2] = group.n_slots;
     bank_view.nb[3] = bank_view.nb[2] * group.n_slots;
     ids_view = *group.key.ids.tensor;

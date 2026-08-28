@@ -309,6 +309,7 @@ struct ggml_cuda_moe_graph_binding {
     ggml_cuda_moe_complete_group_key key;
     uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     uint32_t bank_index = 0;
+    uint32_t slot_index = UINT32_MAX;
 };
 
 enum ggml_cuda_moe_graph_prepare_result : uint32_t {
@@ -457,6 +458,7 @@ private:
         uint32_t group_record;
         uint32_t role;
         uint32_t bank_index;
+        uint32_t slot_index;
     };
 
     friend class ggml_cuda_moe_grouped_context;
@@ -464,7 +466,7 @@ private:
     friend struct ggml_cuda_moe_grouped_context_test_access;
 
     void reset();
-    bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index);
+    bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index, uint32_t slot_index);
     const node_entry * find(const ggml_tensor * node) const;
     static_assert(sizeof(reader_witness) <= 640, "reader witness is too large");
     static_assert(sizeof(group_record) <= 4096, "group record is too large");

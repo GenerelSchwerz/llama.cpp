@@ -833,6 +833,47 @@ static void test_candidate_producer() {
     CHECK(disabled.get().n_slots == 48 && disabled.get().n_groups == 0 && disabled.get().groups == nullptr);
     CHECK(registry.replace(&disabled.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 48);
+
+    llama_model_params gemma_params = llama_model_default_params();
+    gemma_params.moe_expert_cache_slots = 12;
+    std::unique_ptr<llama_model> gemma(llama_model_create(LLM_ARCH_GEMMA4, gemma_params));
+    CHECK(gemma != nullptr);
+    gemma->layers.resize(30);
+    for (auto & layer : gemma->layers) {
+        layer.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
+        layer.ffn_gate_up_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, fused_ne);
+        layer.ffn_down_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
+        layer.ffn_down_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    }
+    llama_moe_candidate_snapshot gemma_produced(*gemma, loras);
+    const auto & gemma_snapshot = gemma_produced.get();
+    CHECK(gemma_snapshot.n_slots == 12 && gemma_snapshot.n_groups == 30);
+    for (uint32_t group_index = 0; group_index < gemma_snapshot.n_groups; ++group_index) {
+        const auto & group = gemma_snapshot.groups[group_index];
+        CHECK(group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && group.n_banks == 3);
+        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT)->tensor ==
+            gemma->layers[group_index].ffn_gate_up_exps);
+        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT)->tensor ==
+            gemma->layers[group_index].ffn_down_exps);
+        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE)->tensor ==
+            gemma->layers[group_index].ffn_down_exps_s);
+    }
+    CHECK(registry.replace(&gemma_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const auto gemma_state = registry.state();
+    CHECK(gemma_state.n_groups == 30 && gemma_state.n_weights == 60);
+    CHECK(gemma_state.slot_bound_bytes == 30 * 12 * (gemma->layers[0].ffn_gate_up_exps->nb[2] + gemma->layers[0].ffn_down_exps->nb[2]));
+    CHECK(gemma_state.permanent_candidate_bytes == 30 * ggml_nbytes(gemma->layers[0].ffn_down_exps_s));
+    for (uint32_t group_index = 0; group_index < gemma_snapshot.n_groups; ++group_index) {
+        ggml_cuda_moe_candidate_group_key key;
+        ggml_cuda_moe_candidate_group_info group_info;
+        ggml_cuda_moe_candidate_bank_info scale_info;
+        CHECK(registry.find_down_group_key(gemma->layers[group_index].ffn_down_exps, &key));
+        CHECK(key.group_index == group_index && registry.get_group(key, &group_info) && group_info.n_banks == 3);
+        CHECK(registry.get_bank(key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, &scale_info));
+        CHECK(scale_info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE);
+        CHECK(scale_info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT);
+    }
+    fprintf(stderr, "test-moe-cache: Gemma fused registry 30x(2 slot + 1 original-direct) OK\n");
 }
 
 static void test_candidate_registry(bool benchmark) {
@@ -1667,8 +1708,9 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(binding.key.candidate.generation == 1 && binding.key.candidate.group_index == 0);
     CHECK(binding.key.ids.tensor == fused_route.ids && binding.key.ids.data == fused_route.ids->data && binding.key.ids.buffer == fused_route.ids->buffer);
     CHECK(binding.key.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && binding.key.n_banks == 2);
-    CHECK(binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT && binding.bank_index == 0);
-    CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.bank_index == 1);
+    CHECK(binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT && binding.bank_index == 0 && binding.slot_index == 0);
+    CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
+        binding.bank_index == 1 && binding.slot_index == 1);
     CHECK(execution.find(separate_up_node, &binding) && binding.key.candidate.group_index == 1 && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
     CHECK(execution.find(separate_gate_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
     CHECK(execution.find(separate_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.key.n_banks == 3);
@@ -2245,6 +2287,50 @@ static void test_grouped_graph_preflight(bool benchmark) {
     registry.compile_graph_plan(auxiliary_registered_graph, 59, &plan, &execution);
     CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
 
+    {
+        candidate_test_fixture oversized_fixture;
+        constexpr int64_t n_experts = 1025;
+        const int64_t oversized_gate_up_ne[] = {32, 64, n_experts};
+        const int64_t oversized_down_ne[] = {32, 32, n_experts};
+        const int64_t oversized_scale_ne[] = {n_experts};
+        ggml_tensor * oversized_gate_up = oversized_fixture.tensor(GGML_TYPE_Q4_0, 3, oversized_gate_up_ne);
+        ggml_tensor * oversized_down = oversized_fixture.tensor(GGML_TYPE_Q4_0, 3, oversized_down_ne);
+        ggml_tensor * oversized_scale = oversized_fixture.tensor(GGML_TYPE_F32, 1, oversized_scale_ne);
+        const candidate_route oversized_route = candidate_top_k_route(oversized_fixture, n_experts, 2);
+        ggml_tensor * oversized_gate_up_node = candidate_mmid(oversized_fixture, oversized_gate_up, oversized_route.ids);
+        ggml_tensor * oversized_down_node = candidate_mmid(oversized_fixture, oversized_down, oversized_route.ids);
+        ggml_tensor * scale = ggml_reshape_3d(oversized_fixture.ctx, oversized_scale, 1, n_experts, 1);
+        oversized_fixture.materialize(scale);
+        scale->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        scale = ggml_repeat_4d(oversized_fixture.ctx, scale, 1, n_experts, 1, 1);
+        oversized_fixture.materialize(scale);
+        scale->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        scale = ggml_get_rows(oversized_fixture.ctx, scale, oversized_route.ids);
+        oversized_fixture.materialize(scale);
+        scale->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_tensor * oversized_output = ggml_mul(oversized_fixture.ctx, oversized_down_node, scale);
+        oversized_fixture.materialize(oversized_output);
+        oversized_output->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        ggml_cgraph * oversized_graph = candidate_graph(oversized_fixture, {
+            oversized_route.root, oversized_route.ids, oversized_gate_up_node, oversized_down_node,
+            scale->src[0]->src[0], scale->src[0], scale, oversized_output,
+        });
+        std::array<ggml_backend_moe_candidate_bank_v1, 3> oversized_banks = {{
+            {oversized_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+            {oversized_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+            {oversized_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0},
+        }};
+        const ggml_backend_moe_candidate_group_v1 oversized_group = {
+            oversized_banks.data(), oversized_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+        };
+        const auto oversized_snapshot = candidate_snapshot(12, &oversized_group, 1);
+        CHECK(registry.replace(&oversized_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        CHECK(registry.state().n_groups == 1 && registry.state().permanent_candidate_bytes == 4100);
+        registry.compile_graph_plan(oversized_graph, 591, &plan, &execution);
+        CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(oversized_gate_up_node, nullptr));
+        fprintf(stderr, "test-moe-cache: oversized original-direct auxiliary decline OK\n");
+    }
+
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     registry.compile_graph_plan(complete_graph, 60, &plan, &execution);
     CHECK(registry.begin_graph_dispatch(&execution, false));
@@ -2581,6 +2667,8 @@ struct active_grouped_dispatch_graph {
     ggml_tensor * ids = nullptr;
     ggml_tensor * gate_output = nullptr;
     ggml_tensor * up_output = nullptr;
+    ggml_tensor * down_output = nullptr;
+    ggml_tensor * down_scale = nullptr;
     ggml_tensor * output = nullptr;
     std::vector<ggml_tensor *> banks;
     std::vector<ggml_tensor *> readers;
@@ -2591,7 +2679,8 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         ggml_backend_t backend,
         ggml_backend_buffer_type_t weight_buft,
         ggml_type type,
-        uint32_t layout) {
+        uint32_t layout,
+        bool original_direct_down_scale = false) {
     constexpr int64_t N_EXPERTS = 8;
     constexpr int64_t N_USED = 2;
     constexpr int64_t N_DIM = 256;
@@ -2628,6 +2717,10 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         up = add_bank(N_DIM, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, "test.active.up");
     }
     result.down = add_bank(N_DIM, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, "test.active.down");
+    if (original_direct_down_scale) {
+        result.down_scale = ggml_new_tensor_1d(result.weights.get(), GGML_TYPE_F32, N_EXPERTS);
+        ggml_set_name(result.down_scale, "test.active.down_scale");
+    }
 
     result.input = ggml_new_tensor_2d(result.nodes.get(), GGML_TYPE_F32, N_DIM, 1);
     result.logits = ggml_new_tensor_2d(result.nodes.get(), GGML_TYPE_F32, N_EXPERTS, 1);
@@ -2648,8 +2741,15 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         result.readers.push_back(result.up_output);
         hidden = ggml_glu_split(result.nodes.get(), result.gate_output, result.up_output, GGML_GLU_OP_SWIGLU);
     }
-    result.output = ggml_mul_mat_id(result.nodes.get(), result.down, hidden, result.ids);
-    result.readers.push_back(result.output);
+    result.down_output = ggml_mul_mat_id(result.nodes.get(), result.down, hidden, result.ids);
+    result.readers.push_back(result.down_output);
+    result.output = result.down_output;
+    if (result.down_scale != nullptr) {
+        ggml_tensor * scale = ggml_reshape_3d(result.nodes.get(), result.down_scale, 1, N_EXPERTS, 1);
+        scale = ggml_repeat_4d(result.nodes.get(), scale, 1, N_EXPERTS, 1, 1);
+        scale = ggml_get_rows(result.nodes.get(), scale, result.ids);
+        result.output = ggml_mul(result.nodes.get(), result.down_output, scale);
+    }
     ggml_set_name(result.output, "test.active.output");
     result.graph = ggml_new_graph_custom(result.nodes.get(), 64, false);
     ggml_build_forward_expand(result.graph, result.output);
@@ -2679,10 +2779,21 @@ static void initialize_active_grouped_dispatch_graphs(const std::vector<active_g
             ggml_backend_tensor_set(graph->banks[bank], bytes.data(), 0, bytes.size());
         }
     }
+    if (graphs[0]->down_scale != nullptr) {
+        const auto bytes = cached_fusion_test_data(graphs[0]->down_scale, 151);
+        for (auto * graph : graphs) {
+            CHECK(graph->down_scale != nullptr && ggml_nbytes(graph->down_scale) == bytes.size());
+            ggml_backend_tensor_set(graph->down_scale, bytes.data(), 0, bytes.size());
+        }
+    } else {
+        for (auto * graph : graphs) {
+            CHECK(graph->down_scale == nullptr);
+        }
+    }
     const auto input = cached_fusion_test_data(graphs[0]->input, 131);
     for (auto * graph : graphs) {
         CHECK(graph->readers.size() == graph->banks.size());
-        CHECK(graph->readers.back() == graph->output && graph->output->src[0] == graph->down);
+        CHECK(graph->readers.back() == graph->down_output && graph->down_output->src[0] == graph->down);
         int32_t previous_reader = -1;
         for (ggml_tensor * reader : graph->readers) {
             int32_t reader_index = -1;
@@ -2708,13 +2819,21 @@ static void register_active_grouped_dispatch(
         ggml_backend_t backend,
         const active_grouped_dispatch_graph & graph,
         uint32_t layout,
-        uint32_t n_slots) {
-    std::array<ggml_backend_moe_candidate_bank_v1, 3> banks = {};
+        uint32_t n_slots,
+        bool auxiliary_first = false) {
+    std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
+    uint32_t n_banks = 0;
+    if (auxiliary_first && graph.down_scale != nullptr) {
+        banks[n_banks++] = {graph.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
+    }
     for (size_t i = 0; i < graph.banks.size(); ++i) {
-        banks[i] = {graph.banks[i], graph.roles[i], 0};
+        banks[n_banks++] = {graph.banks[i], graph.roles[i], 0};
+    }
+    if (!auxiliary_first && graph.down_scale != nullptr) {
+        banks[n_banks++] = {graph.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
     }
     const ggml_backend_moe_candidate_group_v1 group = {
-        banks.data(), static_cast<uint32_t>(graph.banks.size()), layout, 0, 0,
+        banks.data(), n_banks, layout, 0, 0,
     };
     const auto snapshot = candidate_snapshot(n_slots, &group, 1);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(backend, &snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -2804,7 +2923,8 @@ static void check_active_grouped_legacy_caches(
 static void check_active_grouped_contract(
         ggml_backend_t backend,
         active_grouped_dispatch_graph & graph,
-        uint32_t n_slots) {
+        uint32_t n_slots,
+        bool auxiliary_first = false) {
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
     CHECK(context != nullptr);
     const int32_t routes[] = {3, 5};
@@ -2834,7 +2954,7 @@ static void check_active_grouped_contract(
     for (size_t i = 0; i < graph.readers.size(); ++i) {
         ggml_cuda_moe_graph_binding binding;
         CHECK(execution.find_group(graph.readers[i], &binding) == group);
-        CHECK(binding.bank_index == i && binding.role == graph.roles[i]);
+        CHECK(binding.bank_index == i + (auxiliary_first ? 1 : 0) && binding.slot_index == i && binding.role == graph.roles[i]);
         CHECK(binding.key.ids.tensor == graph.ids && group->remapped_ids == remapped_ids);
         CHECK(!context->acquire_legacy_cache(graph.banks[i], nullptr, &group->authority));
     }
@@ -2842,6 +2962,11 @@ static void check_active_grouped_contract(
     ggml_cuda_moe_grouped_resource_info info;
     CHECK(context->get_group_resources(group->transaction.acquisition, &info));
     CHECK(info.transaction_active && info.n_banks == graph.banks.size() && info.n_slots == n_slots);
+    for (uint32_t slot_index = 0; slot_index < info.n_banks; ++slot_index) {
+        ggml_cuda_moe_grouped_bank_descriptor descriptor;
+        CHECK(context->get_group_resource_bank(group->transaction, slot_index, &descriptor));
+        CHECK(descriptor.tensor == graph.banks[slot_index] && descriptor.role == graph.roles[slot_index]);
+    }
     const auto acquisition = group->transaction.acquisition;
     CHECK(context->finish_graph_dispatch(&execution));
     CHECK(context->get_group_resources(acquisition, &info) && !info.transaction_active);
@@ -2883,22 +3008,51 @@ static std::vector<float> run_active_grouped_dispatch(
     return output;
 }
 
-static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, uint32_t n_slots) {
+static void test_active_grouped_dispatch_case(
+        ggml_type type,
+        uint32_t layout,
+        uint32_t n_slots,
+        bool original_direct_down_scale = false) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
     ggml_backend_ptr first_backend(ggml_backend_cuda_init(0));
     ggml_backend_ptr second_backend(ggml_backend_cuda_init(0));
     CHECK(reference_backend != nullptr && first_backend != nullptr && second_backend != nullptr);
-    auto reference = build_active_grouped_dispatch_graph(reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout);
-    auto first = build_active_grouped_dispatch_graph(first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout);
-    auto second = build_active_grouped_dispatch_graph(second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout);
+    auto reference = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout, original_direct_down_scale);
+    auto first = build_active_grouped_dispatch_graph(
+        first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout, original_direct_down_scale);
+    auto second = build_active_grouped_dispatch_graph(
+        second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout, original_direct_down_scale);
     initialize_active_grouped_dispatch_graphs({&reference, &first, &second});
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
+    register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots, original_direct_down_scale);
     register_active_grouped_dispatch(second_backend.get(), second, layout, n_slots);
-    check_active_grouped_contract(first_backend.get(), first, n_slots);
+    if (original_direct_down_scale) {
+        auto * first_context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
+        CHECK(first_context != nullptr);
+        const uint64_t reordered_signature = first_context->state().logical_signature;
+        register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
+        CHECK(first_context->state().logical_signature == reordered_signature);
+        register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots, true);
+        CHECK(first_context->state().logical_signature == reordered_signature);
+        for (auto * backend : {first_backend.get(), second_backend.get()}) {
+            auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+            ggml_cuda_moe_candidate_group_key key;
+            ggml_cuda_moe_candidate_group_info group_info;
+            ggml_cuda_moe_candidate_bank_info scale_info;
+            const auto & graph = backend == first_backend.get() ? first : second;
+            CHECK(context != nullptr && context->find_down_group_key(graph.down, &key));
+            CHECK(context->get_group(key, &group_info) && group_info.n_banks == 3);
+            CHECK(context->get_bank(key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, &scale_info));
+            CHECK(scale_info.tensor == graph.down_scale && scale_info.type == GGML_TYPE_F32);
+            CHECK(scale_info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE);
+            CHECK(scale_info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT);
+        }
+    }
+    check_active_grouped_contract(first_backend.get(), first, n_slots, original_direct_down_scale);
     check_active_grouped_contract(second_backend.get(), second, n_slots);
 
     std::vector<float> expected;
@@ -2947,7 +3101,8 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         CHECK(context != nullptr && !context->acquire_legacy_cache(bank));
     }
 
-    if (type == GGML_TYPE_Q4_0 && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && n_slots == 12) {
+    if (!original_direct_down_scale && type == GGML_TYPE_Q4_0 &&
+            layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && n_slots == 12) {
         auto * context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
         CHECK(context != nullptr);
         std::array<ggml_backend_moe_candidate_bank_v1, 3> replacement_banks = {};
@@ -3190,6 +3345,9 @@ static void test_active_grouped_dispatch() {
         GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 48);
+    test_active_grouped_dispatch_case(
+        GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12, true);
+    fprintf(stderr, "test-moe-cache: Gemma fused original-direct down scale exact OK\n");
     test_active_grouped_dispatch_decline();
     fprintf(stderr, "test-moe-cache: active grouped Q4 ordinary/F3 OK\n");
 }
