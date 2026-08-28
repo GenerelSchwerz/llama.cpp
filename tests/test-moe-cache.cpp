@@ -2514,6 +2514,45 @@ static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
     return result;
 }
 
+static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
+        ggml_backend_t backend,
+        ggml_tensor * gate_up,
+        ggml_tensor * down,
+        int64_t n_used,
+        int64_t n_tokens) {
+    CHECK(gate_up != nullptr && down != nullptr && gate_up->buffer != nullptr && down->buffer != nullptr &&
+        ggml_n_dims(gate_up) == 3 && ggml_n_dims(down) == 3 && gate_up->ne[0] == down->ne[0] &&
+        gate_up->ne[1] == 2 * down->ne[0] && gate_up->ne[2] == down->ne[2]);
+    const ggml_init_params node_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(32, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+
+    cached_mmid_path_test_graph result;
+    result.nodes.reset(ggml_init(node_params));
+    CHECK(result.nodes != nullptr);
+
+    const int64_t input_ne[] = {gate_up->ne[0], 1, n_tokens};
+    ggml_tensor * input = ggml_new_tensor(result.nodes.get(), GGML_TYPE_F32, 3, input_ne);
+    ggml_set_name(input, "test.paths.registered.input");
+    const int64_t ids_ne[] = {n_used, n_tokens};
+    result.ids = ggml_new_tensor(result.nodes.get(), GGML_TYPE_I32, 2, ids_ne);
+    ggml_set_name(result.ids, "test.paths.registered.ids");
+    ggml_tensor * hidden = ggml_mul_mat_id(result.nodes.get(), gate_up, input, result.ids);
+    hidden = ggml_dup(result.nodes.get(), hidden);
+    hidden = ggml_glu(result.nodes.get(), hidden, GGML_GLU_OP_SWIGLU, false);
+    result.output = ggml_mul_mat_id(result.nodes.get(), down, hidden, result.ids);
+    ggml_set_name(result.output, "test.paths.registered.output");
+    result.leaves = {gate_up, down, input, result.ids};
+
+    result.graph = ggml_new_graph_custom(result.nodes.get(), 32, false);
+    ggml_build_forward_expand(result.graph, result.output);
+    result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
+    CHECK(result.node_buffer != nullptr);
+    return result;
+}
+
 static void initialize_cached_mmid_path_test_graphs(
         cached_mmid_path_test_graph & cuda_graph,
         cached_mmid_path_test_graph & reference_graph) {
@@ -2605,6 +2644,66 @@ static void test_cached_mmid_prefill_and_overflow() {
     initialize_cached_mmid_path_test_graphs(cuda_q4_k_tiny, reference_q4_k_tiny);
     (void) run_cached_mmid_path_test(
         cuda_backend.get(), reference_backend.get(), cuda_q4_k_tiny, reference_q4_k_tiny, mapped_ids);
+
+    ggml_backend_ptr transition_backend(ggml_backend_cuda_init(0));
+    CHECK(transition_backend != nullptr);
+    auto grouped = build_active_grouped_dispatch_graph(
+        transition_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+    auto grouped_reference = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(0), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+    const auto grouped_input = cached_fusion_test_data(grouped.input, 181);
+    const float grouped_logits[] = {-1.0f, 3.0f, 0.5f, 9.0f, 2.0f, 8.0f, -2.0f, 1.0f};
+    ggml_backend_tensor_set(grouped.input, grouped_input.data(), 0, grouped_input.size());
+    ggml_backend_tensor_set(grouped.logits, grouped_logits, 0, sizeof(grouped_logits));
+    register_active_grouped_dispatch(
+        transition_backend.get(), grouped, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 4);
+
+    auto registered_prefill = build_cached_mmid_path_test_graph(
+        transition_backend.get(), grouped.banks[0], grouped.banks[1], 3, 2);
+    auto registered_reference = build_cached_mmid_path_test_graph(
+        reference_backend.get(), grouped_reference.banks[0], grouped_reference.banks[1], 3, 2);
+    initialize_cached_mmid_path_test_graphs(registered_prefill, registered_reference);
+    CHECK(!run_active_grouped_dispatch(transition_backend.get(), grouped, 2).empty());
+
+    auto * transition_context = ggml_cuda_moe_grouped_context_for_test(transition_backend.get());
+    ggml_cuda_moe_candidate_group_key transition_key;
+    ggml_cuda_moe_grouped_acquisition grouped_resource;
+    CHECK(transition_context != nullptr && transition_context->find_down_group_key(grouped.down, &transition_key));
+    CHECK(transition_context->acquire_group_resources(transition_key, &grouped_resource));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
+
+    std::shared_ptr<ggml_cuda_moe_graph_plan> transition_plan;
+    ggml_cuda_moe_graph_execution transition_execution;
+    CHECK(transition_context->prepare_graph_execution(
+        registered_prefill.graph, 801, false, &transition_plan, &transition_execution) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(transition_execution.size() == 1);
+    CHECK(transition_execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
+    CHECK(transition_context->begin_graph_dispatch(&transition_execution, true));
+    CHECK(!transition_context->get_group_resources(grouped_resource, nullptr));
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
+    auto first_legacy = transition_context->acquire_legacy_cache(grouped.banks[0]);
+    CHECK(first_legacy && first_legacy.get() != nullptr && first_legacy.acquisition().registered_source == 1 &&
+        first_legacy.acquisition().group_index == transition_key.group_index);
+    const uint64_t legacy_epoch = first_legacy.acquisition().group_authority_epoch;
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
+    first_legacy = {};
+    CHECK(transition_context->finish_graph_dispatch(&transition_execution));
+
+    const auto registered_mapped_first = run_cached_mmid_path_test(
+        transition_backend.get(), reference_backend.get(), registered_prefill, registered_reference, mapped_ids);
+    const auto registered_mapped_second = run_cached_mmid_path_test(
+        transition_backend.get(), reference_backend.get(), registered_prefill, registered_reference, mapped_ids);
+    CHECK(registered_mapped_first == registered_mapped_second);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
+    auto repeated_legacy = transition_context->acquire_legacy_cache(grouped.banks[0]);
+    CHECK(repeated_legacy && repeated_legacy.acquisition().group_authority_epoch == legacy_epoch);
+    repeated_legacy = {};
+    (void) run_cached_mmid_path_test(
+        transition_backend.get(), reference_backend.get(), registered_prefill, registered_reference, {0, 1, 2, 3, 4, 5});
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
+    fprintf(stderr, "test-moe-cache: registered grouped prefill rollback OK\n");
     fprintf(stderr, "test-moe-cache: cached mapped prefill and overflow OK\n");
 }
 
