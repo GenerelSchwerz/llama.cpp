@@ -268,6 +268,8 @@ struct ggml_cuda_moe_grouped_decode_acquisition {
     uint32_t n_slots = 0;
 };
 
+struct ggml_cuda_moe_grouped_context_test_access;
+
 class ggml_cuda_moe_grouped_context {
 public:
     explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device = -1);
@@ -314,6 +316,10 @@ public:
     void shutdown();
 
 private:
+    friend struct ggml_cuda_moe_grouped_context_test_access;
+
+    bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+
     struct impl;
     std::unique_ptr<impl> impl_;
 };

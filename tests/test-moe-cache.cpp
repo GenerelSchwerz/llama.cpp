@@ -55,6 +55,15 @@
     } \
 } while (0)
 
+struct ggml_cuda_moe_grouped_context_test_access {
+    static bool set_clock_bound(
+            ggml_cuda_moe_grouped_context & context,
+            const ggml_cuda_moe_grouped_acquisition & acquisition,
+            uint64_t clock_bound) {
+        return context.set_clock_bound_for_test(acquisition, clock_bound);
+    }
+};
+
 static int sample_zipf(std::mt19937 & rng, int n, double s) {
     // Rejection-sample a Zipf(s) over {0..n-1}. Cheap; fine for a test.
     static thread_local std::vector<double> cdf;
@@ -1666,6 +1675,62 @@ static ggml_cuda_moe_complete_group_key grouped_decode_key(
     return key;
 }
 
+struct grouped_clock_fixture {
+    explicit grouped_clock_fixture(int device, uint32_t n_slots) : fixture(device) {
+        weights[0] = fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+        weights[1] = fixture.weight(GGML_TYPE_Q4_0, 32, 32);
+        banks[0].tensor = weights[0];
+        banks[0].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT;
+        banks[1].tensor = weights[1];
+        banks[1].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT;
+        for (uint32_t bank = 0; bank < banks.size(); ++bank) {
+            memset(weights[bank]->data, 17 + bank, ggml_nbytes(weights[bank]));
+        }
+        group.banks = banks.data();
+        group.n_banks = banks.size();
+        group.layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP;
+        snapshot = candidate_snapshot(n_slots, &group, 1);
+        registry = std::make_unique<ggml_cuda_moe_grouped_context>(ggml_backend_get_device(fixture.backend), device);
+        CHECK(registry->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        ids = fixture.ids();
+        key = grouped_decode_key(*registry, weights[1], ids, group.layout, group.n_banks);
+        CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    }
+
+    ~grouped_clock_fixture() {
+        if (stream != nullptr) {
+            CUDA_OK(cudaStreamSynchronize(stream));
+            CUDA_OK(cudaStreamDestroy(stream));
+        }
+    }
+
+    ggml_cuda_moe_grouped_decode_result prepare(
+            const std::array<int32_t, 4> & routes,
+            ggml_cuda_moe_grouped_decode_acquisition & decode,
+            cudaStream_t target) {
+        CUDA_OK(cudaMemcpyAsync(ids->data, routes.data(), sizeof(routes), cudaMemcpyHostToDevice, target));
+        return registry->prepare_decode(key, target, &decode);
+    }
+
+    ggml_cuda_moe_grouped_decode_acquisition warm(const std::array<int32_t, 4> & routes) {
+        ggml_cuda_moe_grouped_decode_acquisition decode;
+        CHECK(prepare(routes, decode, stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+        CHECK(registry->finish_decode(decode, stream));
+        CUDA_OK(cudaStreamSynchronize(stream));
+        return decode;
+    }
+
+    grouped_decode_fixture fixture;
+    std::array<ggml_tensor *, 2> weights = {};
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {};
+    ggml_backend_moe_candidate_group_v1 group = {};
+    ggml_backend_moe_candidate_snapshot_v1 snapshot = {};
+    std::unique_ptr<ggml_cuda_moe_grouped_context> registry;
+    ggml_tensor * ids = nullptr;
+    ggml_cuda_moe_complete_group_key key;
+    cudaStream_t stream = nullptr;
+};
+
 static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout, bool pinned = true) {
     grouped_decode_fixture fixture(device, pinned);
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
@@ -1770,12 +1835,180 @@ static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout
     CUDA_OK(cudaStreamDestroy(stream));
 }
 
+static void test_grouped_clock_refresh_case(int device, uint32_t n_slots) {
+    grouped_clock_fixture fixture(device, n_slots);
+    const std::array<int32_t, 4> routes = {0, 1, 0, 2};
+    const auto initial = fixture.warm(routes);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_clock_bound(
+        *fixture.registry, initial.transaction.acquisition, UINT64_MAX - routes.size()));
+
+    ggml_cuda_moe_grouped_decode_acquisition boundary;
+    CHECK(fixture.prepare(routes, boundary, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+    CHECK(boundary.transaction.acquisition.resource_generation == initial.transaction.acquisition.resource_generation);
+    CHECK(fixture.registry->finish_decode(boundary, fixture.stream));
+    CUDA_OK(cudaStreamSynchronize(fixture.stream));
+
+    ggml_cuda_moe_grouped_decode_acquisition exhausted;
+    CHECK(fixture.prepare(routes, exhausted, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    CHECK(exhausted.transaction.transaction_token == 0);
+    CHECK(!fixture.registry->get_group_resources(initial.transaction.acquisition, nullptr));
+
+    ggml_cuda_moe_grouped_acquisition refreshed;
+    CHECK(fixture.registry->acquire_group_resources(fixture.key.candidate, &refreshed));
+    CHECK(refreshed.resource_generation > initial.transaction.acquisition.resource_generation);
+    ggml_cuda_moe_grouped_resource_info info;
+    CHECK(fixture.registry->get_group_resources(refreshed, &info) && info.n_slots == n_slots);
+    ggml_cuda_moe_grouped_decode_acquisition cold;
+    CHECK(fixture.prepare(routes, cold, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+    CHECK(fixture.registry->finish_decode(cold, fixture.stream));
+    CUDA_OK(cudaStreamSynchronize(fixture.stream));
+    std::array<int32_t, 4> remapped = {};
+    CUDA_OK(cudaMemcpy(remapped.data(), cold.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
+    CHECK((remapped == std::array<int32_t, 4>{0, 1, 0, 2}));
+    CHECK(cold.transaction.acquisition.resource_generation == refreshed.resource_generation);
+}
+
+static void test_grouped_clock_failed_rebuild(int device) {
+    grouped_clock_fixture fixture(device, 12);
+    const std::array<int32_t, 4> routes = {0, 1, 2, 3};
+    const auto initial = fixture.warm(routes);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_clock_bound(
+        *fixture.registry, initial.transaction.acquisition, UINT64_MAX));
+
+    ggml_backend_buffer_t saved_buffer = fixture.weights[0]->buffer;
+    fixture.weights[0]->buffer = nullptr;
+    ggml_cuda_moe_grouped_decode_acquisition failed;
+    CHECK(fixture.prepare(routes, failed, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    fixture.weights[0]->buffer = saved_buffer;
+    CHECK(!fixture.registry->get_group_resources(initial.transaction.acquisition, nullptr));
+
+    const auto recovered = fixture.warm(routes);
+    CHECK(recovered.transaction.acquisition.resource_generation > initial.transaction.acquisition.resource_generation);
+}
+
+static bool wait_for_grouped_detach(
+        ggml_cuda_moe_grouped_context & registry,
+        const ggml_cuda_moe_grouped_acquisition & acquisition) {
+    for (uint32_t attempt = 0; attempt < 1000; ++attempt) {
+        if (!registry.get_group_resources(acquisition, nullptr)) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+static void test_grouped_clock_replacement(int device) {
+    grouped_clock_fixture fixture(device, 12);
+    const std::array<int32_t, 4> routes = {0, 1, 2, 3};
+    fixture.warm(routes);
+
+    host_barrier barrier;
+    CUDA_OK(cudaLaunchHostFunc(fixture.stream, wait_on_host_barrier, &barrier));
+    ggml_cuda_moe_grouped_decode_acquisition pending;
+    CHECK(fixture.prepare(routes, pending, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+    CHECK(fixture.registry->finish_decode(pending, fixture.stream));
+    while (!barrier.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_clock_bound(
+        *fixture.registry, pending.transaction.acquisition, UINT64_MAX));
+
+    cudaStream_t maintenance_stream = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&maintenance_stream, cudaStreamNonBlocking));
+    std::atomic<uint32_t> maintenance_result{GGML_CUDA_MOE_GROUPED_DECODE_READY};
+    std::thread maintenance([&]() {
+        ggml_cuda_moe_grouped_decode_acquisition decode;
+        maintenance_result.store(fixture.registry->prepare_decode(fixture.key, maintenance_stream, &decode), std::memory_order_release);
+    });
+    const bool detached = wait_for_grouped_detach(*fixture.registry, pending.transaction.acquisition);
+
+    const auto replacement = candidate_snapshot(48, &fixture.group, 1);
+    std::atomic<bool> replacement_done{false};
+    std::atomic<int32_t> replacement_result{GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR};
+    std::thread replace_thread([&]() {
+        replacement_result.store(fixture.registry->replace(&replacement), std::memory_order_release);
+        replacement_done.store(true, std::memory_order_release);
+    });
+    for (uint32_t attempt = 0; attempt < 100 && !replacement_done.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool replacement_was_async = replacement_done.load(std::memory_order_acquire);
+    barrier.released.store(true, std::memory_order_release);
+    maintenance.join();
+    replace_thread.join();
+    CUDA_OK(cudaStreamSynchronize(fixture.stream));
+    CHECK(detached && replacement_was_async && replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(maintenance_result.load(std::memory_order_acquire) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    CHECK(fixture.registry->state().generation == 2 && fixture.registry->state().n_slots == 48);
+
+    fixture.key = grouped_decode_key(*fixture.registry, fixture.weights[1], fixture.ids, fixture.group.layout, fixture.group.n_banks);
+    const auto replaced = fixture.warm(routes);
+    CHECK(replaced.n_slots == 48 && replaced.transaction.acquisition.candidate.generation == 2);
+    CUDA_OK(cudaStreamDestroy(maintenance_stream));
+}
+
+static void test_grouped_clock_teardown(int device) {
+    grouped_clock_fixture fixture(device, 120);
+    const std::array<int32_t, 4> routes = {0, 1, 2, 3};
+    fixture.warm(routes);
+
+    host_barrier barrier;
+    CUDA_OK(cudaLaunchHostFunc(fixture.stream, wait_on_host_barrier, &barrier));
+    ggml_cuda_moe_grouped_decode_acquisition pending;
+    CHECK(fixture.prepare(routes, pending, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+    CHECK(fixture.registry->finish_decode(pending, fixture.stream));
+    while (!barrier.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_clock_bound(
+        *fixture.registry, pending.transaction.acquisition, UINT64_MAX));
+
+    cudaStream_t maintenance_stream = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&maintenance_stream, cudaStreamNonBlocking));
+    std::atomic<uint32_t> maintenance_result{GGML_CUDA_MOE_GROUPED_DECODE_READY};
+    std::thread maintenance([&]() {
+        ggml_cuda_moe_grouped_decode_acquisition decode;
+        maintenance_result.store(fixture.registry->prepare_decode(fixture.key, maintenance_stream, &decode), std::memory_order_release);
+    });
+    const bool detached = wait_for_grouped_detach(*fixture.registry, pending.transaction.acquisition);
+
+    std::atomic<bool> shutdown_done{false};
+    std::thread shutdown_thread([&]() {
+        fixture.registry->shutdown();
+        shutdown_done.store(true, std::memory_order_release);
+    });
+    for (uint32_t attempt = 0; attempt < 100 && !shutdown_done.load(std::memory_order_acquire); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const bool shutdown_was_async = shutdown_done.load(std::memory_order_acquire);
+    barrier.released.store(true, std::memory_order_release);
+    maintenance.join();
+    shutdown_thread.join();
+    CUDA_OK(cudaStreamSynchronize(fixture.stream));
+    CHECK(detached && shutdown_was_async);
+    CHECK(maintenance_result.load(std::memory_order_acquire) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    CHECK(fixture.registry->prepare_decode(fixture.key, maintenance_stream, &pending) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    CUDA_OK(cudaStreamDestroy(maintenance_stream));
+}
+
+static void test_grouped_clock_maintenance(int device) {
+    for (uint32_t n_slots : {12u, 48u, 120u}) {
+        test_grouped_clock_refresh_case(device, n_slots);
+    }
+    test_grouped_clock_failed_rebuild(device);
+    test_grouped_clock_replacement(device);
+    test_grouped_clock_teardown(device);
+    fprintf(stderr, "test-moe-cache: grouped clock maintenance OK\n");
+}
+
 static void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
+    test_grouped_clock_maintenance(device);
     fprintf(stderr, "test-moe-cache: grouped decode resources OK\n");
 }
 
