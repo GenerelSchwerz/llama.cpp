@@ -1,0 +1,7 @@
+2026-08-27 PR 40 post-rebase validation
+
+Rebased live-context workspace sizing onto origin/llama/dev af872667bbf6f01c60e87a0635eb7daa72f80cf9 after compact causal-mask cleanup PR 54. The three-commit series applied without conflicts. Final HEAD 830d219f75bbd504c82816b6fcf6bbec85fd0811; diff is 26 existing files, 624 insertions, 32 deletions. git diff --check and ASCII scan are clean.
+
+Release CPU and CUDA sm_120a builds passed for llama-cli, llama-server, llama-debug, test-arg-parser, test-llama-archs, and CUDA test-backend-ops with shared ccache and build locks. Focused CPU and CUDA CTest each passed 3/3: test-phase-aware-workspace, test-live-context-workspace, and test-arg-parser.
+
+Post-rebase live-mode final logits and token IDs match the pre-rebase known-good artifacts byte-for-byte. Qwen3.8 27B logits SHA-256: 44d6c43f83fbd6ced4480368cfa767de29e262b9b369b51af1f07bf604978342. Gemma 4 12B logits SHA-256: e67d9c54138e5c2fb80af48bb8e829c193952d9a63daa839a3428e6a6dcde822. GPU lock released. Prior Qwen/Gemma unified/non-unified parallel and lifecycle measurements remain recorded on old commit 77588478e23e42fd3c2c1a105efacf23a8830366; the live-context implementation content is unchanged by this conflict-free rebase.
