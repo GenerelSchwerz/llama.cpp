@@ -612,12 +612,20 @@ static void test_grouped_context_resources() {
     const int64_t down_ne[] = {32, 64, 4};
     ggml_tensor * gate_up = fixture.tensor(GGML_TYPE_BF16, 3, gate_up_ne);
     ggml_tensor * down = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
+    ggml_tensor * gate_up_peer = fixture.tensor(GGML_TYPE_BF16, 3, gate_up_ne);
+    ggml_tensor * down_peer = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
     std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
         {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
         {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
     }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> peer_banks = {{
+        {gate_up_peer, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down_peer, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
     ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
-    auto snapshot = candidate_snapshot(12, &group, 1);
+    ggml_backend_moe_candidate_group_v1 peer_group = {peer_banks.data(), peer_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {group, peer_group};
+    auto snapshot = candidate_snapshot(12, groups.data(), groups.size());
 
     auto first = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
     ggml_cuda_moe_grouped_context second(&fixture.owner);
@@ -626,32 +634,42 @@ static void test_grouped_context_resources() {
     CHECK(second.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
     ggml_cuda_moe_candidate_group_key first_key;
+    ggml_cuda_moe_candidate_group_key peer_key;
     ggml_cuda_moe_candidate_group_key second_key;
     CHECK(first->find_down_group_key(down, &first_key));
+    CHECK(first->find_down_group_key(down_peer, &peer_key));
     CHECK(second.find_down_group_key(down, &second_key));
     ggml_cuda_moe_grouped_acquisition first_acquisition;
+    ggml_cuda_moe_grouped_acquisition peer_acquisition;
     ggml_cuda_moe_grouped_acquisition repeated_acquisition;
     ggml_cuda_moe_grouped_acquisition second_acquisition;
     CHECK(first->acquire_group_resources(first_key, &first_acquisition));
     CHECK(first->acquire_group_resources(first_key, &repeated_acquisition));
+    CHECK(first->acquire_group_resources(peer_key, &peer_acquisition));
     CHECK(second.acquire_group_resources(second_key, &second_acquisition));
     CHECK(first_acquisition.resource_generation == 1);
     CHECK(repeated_acquisition.resource_generation == first_acquisition.resource_generation);
+    CHECK(peer_acquisition.resource_generation == 2);
     CHECK(second_acquisition.resource_generation == 1);
 
     ggml_cuda_moe_grouped_resource_info resource_info;
     CHECK(first->get_group_resources(first_acquisition, &resource_info));
     CHECK(resource_info.acquisition.candidate.generation == 1 && resource_info.n_slots == 12);
     CHECK(resource_info.down == down && resource_info.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && resource_info.n_banks == 2);
-    CHECK(!first->get_group_resource_bank(first_acquisition, 0, nullptr));
-    CHECK(first->begin_group_transaction(first_acquisition));
-    CHECK(!first->begin_group_transaction(first_acquisition));
+    ggml_cuda_moe_grouped_transaction inactive_transaction;
+    inactive_transaction.acquisition = first_acquisition;
+    CHECK(!first->get_group_resource_bank(inactive_transaction, 0, nullptr));
+    ggml_cuda_moe_grouped_transaction first_transaction;
+    ggml_cuda_moe_grouped_transaction repeated_transaction;
+    CHECK(first->begin_group_transaction(first_acquisition, &first_transaction));
+    CHECK(!first->begin_group_transaction(first_acquisition, &repeated_transaction));
+    CHECK(repeated_transaction.transaction_token == 0);
     CHECK(first->get_group_resources(first_acquisition, &resource_info) && resource_info.transaction_active == 1);
     bool found_gate_up = false;
     bool found_down = false;
     for (uint32_t i = 0; i < resource_info.n_banks; ++i) {
         ggml_cuda_moe_grouped_bank_descriptor descriptor;
-        CHECK(first->get_group_resource_bank(first_acquisition, i, &descriptor));
+        CHECK(first->get_group_resource_bank(first_transaction, i, &descriptor));
         CHECK(descriptor.buffer == descriptor.tensor->buffer && descriptor.buft == descriptor.tensor->buffer->buft);
         CHECK(descriptor.source_data == descriptor.tensor->data && descriptor.buffer_base == fixture.storage);
         CHECK(descriptor.buffer_size == candidate_test_fixture::BUFFER_SIZE && descriptor.byte_extent == ggml_nbytes(descriptor.tensor));
@@ -675,21 +693,58 @@ static void test_grouped_context_resources() {
     }
     CHECK(found_gate_up && found_down);
 
-    auto wrong_acquisition = first_acquisition;
-    ++wrong_acquisition.resource_generation;
-    CHECK(!first->end_group_transaction(wrong_acquisition));
+    auto wrong_transaction = first_transaction;
+    ++wrong_transaction.acquisition.resource_generation;
+    CHECK(!first->end_group_transaction(wrong_transaction));
     const uint64_t logical_signature = first->state().logical_signature;
-    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+    CHECK(first->end_group_transaction(first_transaction));
+    CHECK(first->begin_group_transaction(first_acquisition, &repeated_transaction));
+    CHECK(repeated_transaction.transaction_token > first_transaction.transaction_token);
+    CHECK(!first->end_group_transaction(first_transaction));
+    CHECK(!first->get_group_resource_bank(first_transaction, 0, nullptr));
+    CHECK(first->get_group_resource_bank(repeated_transaction, 0, nullptr));
+    CHECK(first->end_group_transaction(repeated_transaction));
+    CHECK(!first->end_group_transaction(repeated_transaction));
+
+    ggml_cuda_moe_grouped_transaction held_transaction;
+    CHECK(first->begin_group_transaction(first_acquisition, &held_transaction));
+    auto * first_context = first.get();
+    std::atomic<bool> replacement_started{false};
+    std::atomic<bool> replacement_done{false};
+    std::atomic<int32_t> replacement_result{-1};
+    std::thread replacement_thread([&]() {
+        replacement_started.store(true, std::memory_order_release);
+        replacement_result.store(first_context->replace(&snapshot), std::memory_order_release);
+        replacement_done.store(true, std::memory_order_release);
+    });
+    while (!replacement_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    for (;;) {
+        ggml_cuda_moe_grouped_transaction peer_transaction;
+        if (!first->begin_group_transaction(peer_acquisition, &peer_transaction)) {
+            break;
+        }
+        CHECK(first->end_group_transaction(peer_transaction));
+        std::this_thread::yield();
+    }
+    CHECK(!replacement_done.load(std::memory_order_acquire));
     CHECK(first->state().generation == 1 && first->state().n_slots == 12);
     CHECK(first->get_group_resources(first_acquisition, &resource_info) && resource_info.transaction_active == 1);
-    CHECK(first->end_group_transaction(first_acquisition));
-    CHECK(!first->end_group_transaction(first_acquisition));
+    CHECK(!first->acquire_group_resources(peer_key, &repeated_acquisition));
+    CHECK(repeated_acquisition.resource_generation == 0);
+    CHECK(first->get_group_resource_bank(held_transaction, 0, nullptr));
+    CHECK(first->end_group_transaction(held_transaction));
+    replacement_thread.join();
+    CHECK(replacement_done.load(std::memory_order_acquire));
+    CHECK(replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
-    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(first->state().generation == 2 && first->state().n_slots == 48);
     CHECK(first->state().logical_signature == logical_signature);
     CHECK(!first->get_group_resources(first_acquisition, nullptr));
-    CHECK(!first->end_group_transaction(first_acquisition));
+    CHECK(!first->get_group_resources(peer_acquisition, nullptr));
+    CHECK(!first->end_group_transaction(held_transaction));
+    CHECK(!first->get_group_resource_bank(held_transaction, 0, nullptr));
     CHECK(second.get_group_resources(second_acquisition, &resource_info));
     CHECK(resource_info.n_slots == 48 && resource_info.acquisition.candidate.generation == 1);
 
@@ -697,7 +752,7 @@ static void test_grouped_context_resources() {
     ggml_cuda_moe_grouped_acquisition replacement_acquisition;
     CHECK(first->find_down_group_key(down, &replacement_key));
     CHECK(first->acquire_group_resources(replacement_key, &replacement_acquisition));
-    CHECK(replacement_acquisition.resource_generation == 2);
+    CHECK(replacement_acquisition.resource_generation == 3);
     auto disabled = candidate_snapshot(12, nullptr, 0);
     CHECK(first->replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(first->state().generation == 3 && first->state().accepted == 1 && first->state().n_groups == 0);
@@ -709,9 +764,9 @@ static void test_grouped_context_resources() {
     CHECK(first->state().generation == 4 && first->state().logical_signature == logical_signature);
     CHECK(first->find_down_group_key(down, &replacement_key));
     CHECK(first->acquire_group_resources(replacement_key, &replacement_acquisition));
-    CHECK(replacement_acquisition.resource_generation == 3);
-    CHECK(first->begin_group_transaction(replacement_acquisition));
-    auto * first_context = first.get();
+    CHECK(replacement_acquisition.resource_generation == 4);
+    ggml_cuda_moe_grouped_transaction shutdown_transaction;
+    CHECK(first->begin_group_transaction(replacement_acquisition, &shutdown_transaction));
     std::atomic<bool> shutdown_started{false};
     std::atomic<bool> shutdown_done{false};
     std::thread shutdown_thread([&]() {
@@ -726,15 +781,16 @@ static void test_grouped_context_resources() {
         std::this_thread::yield();
     }
     CHECK(!shutdown_done.load(std::memory_order_acquire));
-    CHECK(first->get_group_resource_bank(replacement_acquisition, 0, nullptr));
-    CHECK(first->end_group_transaction(replacement_acquisition));
+    CHECK(first->get_group_resource_bank(shutdown_transaction, 0, nullptr));
+    CHECK(first->end_group_transaction(shutdown_transaction));
     shutdown_thread.join();
     CHECK(shutdown_done.load(std::memory_order_acquire));
     first.reset();
     CHECK(second.find_down_group_key(down, nullptr));
     CHECK(second.get_group_resources(second_acquisition, &resource_info));
-    CHECK(second.begin_group_transaction(second_acquisition));
-    CHECK(second.end_group_transaction(second_acquisition));
+    ggml_cuda_moe_grouped_transaction second_transaction;
+    CHECK(second.begin_group_transaction(second_acquisition, &second_transaction));
+    CHECK(second.end_group_transaction(second_transaction));
 
     fprintf(stderr, "test-moe-cache: grouped context resources OK\n");
 }

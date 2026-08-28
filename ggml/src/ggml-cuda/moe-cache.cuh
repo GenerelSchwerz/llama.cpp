@@ -111,6 +111,11 @@ struct ggml_cuda_moe_grouped_acquisition {
     uint64_t resource_generation = 0;
 };
 
+struct ggml_cuda_moe_grouped_transaction {
+    ggml_cuda_moe_grouped_acquisition acquisition;
+    uint64_t transaction_token = 0;
+};
+
 struct ggml_cuda_moe_grouped_resource_info {
     ggml_cuda_moe_grouped_acquisition acquisition;
     const ggml_tensor * down = nullptr;
@@ -157,10 +162,10 @@ public:
     bool get_bank(const ggml_cuda_moe_candidate_group_key & key, uint32_t role, ggml_cuda_moe_candidate_bank_info * info) const;
     bool probe(const ggml_cuda_moe_candidate_probe_input & input, ggml_cuda_moe_candidate_probe_result * result) const;
     bool acquire_group_resources(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_grouped_acquisition * acquisition);
-    bool begin_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition);
-    bool end_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition);
+    bool begin_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_transaction * transaction);
+    bool end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
-    bool get_group_resource_bank(const ggml_cuda_moe_grouped_acquisition & acquisition, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
     void shutdown();
 
 private:

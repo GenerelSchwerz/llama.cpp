@@ -1171,7 +1171,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         explicit grouped_resource(grouped_snapshot && snapshot) : snapshot(std::move(snapshot)) {}
 
         const grouped_snapshot snapshot;
-        bool transaction_active = false;
+        uint64_t active_transaction_token = 0;
     };
 
     struct resource_build_input {
@@ -1195,6 +1195,8 @@ struct ggml_cuda_moe_grouped_context::impl {
     moe_candidate_table table;
     resource_slots resources;
     uint64_t next_resource_generation = 0;
+    uint64_t next_transaction_token = 0;
+    bool replacement_pending = false;
     bool draining = false;
 
     grouped_resource * find_resource(const ggml_cuda_moe_grouped_acquisition & acquisition) {
@@ -1215,6 +1217,19 @@ struct ggml_cuda_moe_grouped_context::impl {
         return const_cast<impl *>(this)->find_resource(acquisition);
     }
 
+    grouped_resource * find_resource(const ggml_cuda_moe_grouped_transaction & transaction) {
+        auto * resource = find_resource(transaction.acquisition);
+        if (transaction.transaction_token == 0 || resource == nullptr ||
+                resource->active_transaction_token != transaction.transaction_token) {
+            return nullptr;
+        }
+        return resource;
+    }
+
+    const grouped_resource * find_resource(const ggml_cuda_moe_grouped_transaction & transaction) const {
+        return const_cast<impl *>(this)->find_resource(transaction);
+    }
+
     resource_slots detach_resources() {
         resource_slots result;
         result.swap(resources);
@@ -1227,7 +1242,7 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     bool has_active_transaction() const {
         for (const auto & resource : resources) {
-            if (resource != nullptr && resource->transaction_active) {
+            if (resource != nullptr && resource->active_transaction_token != 0) {
                 return true;
             }
         }
@@ -1249,10 +1264,12 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
         impl::resource_slots retired;
         int32_t published = result;
         {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (impl_->draining || impl_->has_active_transaction()) {
+            std::unique_lock<std::mutex> lock(impl_->mutex);
+            if (impl_->draining) {
                 return static_cast<int32_t>(GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
             }
+            impl_->replacement_pending = true;
+            impl_->resource_cv.wait(lock, [&]() { return !impl_->has_active_transaction(); });
             retired = impl_->detach_resources();
             impl_->table = {};
             if (impl_->state.generation == UINT64_MAX) {
@@ -1267,6 +1284,7 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
                 impl_->state.n_slots = n_slots;
                 impl_->state.rejection = rejection;
             }
+            impl_->replacement_pending = false;
         }
         impl::retire_resources(std::move(retired));
         return published;
@@ -1292,10 +1310,12 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
         impl::resource_slots retired;
         int32_t published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED;
         {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (impl_->draining || impl_->has_active_transaction()) {
+            std::unique_lock<std::mutex> lock(impl_->mutex);
+            if (impl_->draining) {
                 return static_cast<int32_t>(GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
             }
+            impl_->replacement_pending = true;
+            impl_->resource_cv.wait(lock, [&]() { return !impl_->has_active_transaction(); });
             retired = impl_->detach_resources();
             if (impl_->state.generation == UINT64_MAX) {
                 impl_->table = {};
@@ -1315,6 +1335,7 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
                 impl_->state.n_weights = impl_->table.reverse_map.size();
                 impl_->state.accepted = 1;
             }
+            impl_->replacement_pending = false;
         }
         impl::retire_resources(std::move(retired));
         return published;
@@ -1484,12 +1505,19 @@ bool ggml_cuda_moe_grouped_context::acquire_group_resources(
         return false;
     }
     *acquisition = {};
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->draining || impl_->replacement_pending) {
+            return false;
+        }
+    }
     std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
 
     impl::resource_build_input input;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->draining || !impl_->state.accepted || key.generation != impl_->state.generation || key.group_index >= impl_->table.groups.size()) {
+        if (impl_->draining || impl_->replacement_pending || !impl_->state.accepted ||
+                key.generation != impl_->state.generation || key.group_index >= impl_->table.groups.size()) {
             return false;
         }
         if (key.group_index < impl_->resources.size() && impl_->resources[key.group_index] != nullptr) {
@@ -1555,7 +1583,7 @@ bool ggml_cuda_moe_grouped_context::acquire_group_resources(
     bool installed = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->draining && impl_->state.accepted && input.candidate.generation == impl_->state.generation &&
+        if (!impl_->draining && !impl_->replacement_pending && impl_->state.accepted && input.candidate.generation == impl_->state.generation &&
                 input.candidate.group_index < impl_->table.groups.size() && input.n_slots == impl_->table.n_slots &&
                 input.n_groups == impl_->table.groups.size()) {
             const auto & group = impl_->table.groups[input.candidate.group_index];
@@ -1578,23 +1606,32 @@ bool ggml_cuda_moe_grouped_context::acquire_group_resources(
     return installed;
 }
 
-bool ggml_cuda_moe_grouped_context::begin_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition) {
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto * resource = impl_->find_resource(acquisition);
-    if (impl_->draining || resource == nullptr || resource->transaction_active) {
+bool ggml_cuda_moe_grouped_context::begin_group_transaction(
+        const ggml_cuda_moe_grouped_acquisition & acquisition,
+        ggml_cuda_moe_grouped_transaction * transaction) {
+    if (transaction == nullptr) {
         return false;
     }
-    resource->transaction_active = true;
+    *transaction = {};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto * resource = impl_->find_resource(acquisition);
+    if (impl_->draining || impl_->replacement_pending || resource == nullptr ||
+            resource->active_transaction_token != 0 || impl_->next_transaction_token == UINT64_MAX) {
+        return false;
+    }
+    resource->active_transaction_token = ++impl_->next_transaction_token;
+    transaction->acquisition = resource->snapshot.acquisition;
+    transaction->transaction_token = resource->active_transaction_token;
     return true;
 }
 
-bool ggml_cuda_moe_grouped_context::end_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition) {
+bool ggml_cuda_moe_grouped_context::end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    auto * resource = impl_->find_resource(acquisition);
-    if (resource == nullptr || !resource->transaction_active) {
+    auto * resource = impl_->find_resource(transaction);
+    if (resource == nullptr) {
         return false;
     }
-    resource->transaction_active = false;
+    resource->active_transaction_token = 0;
     impl_->resource_cv.notify_all();
     return true;
 }
@@ -1613,18 +1650,18 @@ bool ggml_cuda_moe_grouped_context::get_group_resources(
         info->layout = resource->snapshot.layout;
         info->n_slots = resource->snapshot.n_slots;
         info->n_banks = static_cast<uint32_t>(resource->snapshot.banks.size());
-        info->transaction_active = resource->transaction_active;
+        info->transaction_active = resource->active_transaction_token != 0;
     }
     return true;
 }
 
 bool ggml_cuda_moe_grouped_context::get_group_resource_bank(
-        const ggml_cuda_moe_grouped_acquisition & acquisition,
+        const ggml_cuda_moe_grouped_transaction & transaction,
         uint32_t bank_index,
         ggml_cuda_moe_grouped_bank_descriptor * descriptor) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto * resource = impl_->find_resource(acquisition);
-    if (resource == nullptr || !resource->transaction_active || bank_index >= resource->snapshot.banks.size()) {
+    const auto * resource = impl_->find_resource(transaction);
+    if (resource == nullptr || bank_index >= resource->snapshot.banks.size()) {
         return false;
     }
     if (descriptor != nullptr) {
