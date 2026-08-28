@@ -470,6 +470,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
             return max_bias == 0.0f;
         }
+        case GGML_OP_FLASH_ATTN_EXT: {
+            const ggml_tensor * mask = op->src[3];
+            if (mask == nullptr || mask->type == GGML_TYPE_F16) {
+                return true;
+            }
+
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+
+            return mask->type == GGML_TYPE_I64 && mask->ne[0] == src0->ne[1] &&
+                mask->ne[1] == 1 && mask->ne[2] == 1 && mask->ne[3] == 1 && max_bias == 0.0f;
+        }
         case GGML_OP_IM2COL_BACK:
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:

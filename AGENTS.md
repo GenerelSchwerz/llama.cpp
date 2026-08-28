@@ -1,8 +1,12 @@
 # Instructions for llama.cpp
 
-## Private Fork Automation Policy
+## Fork Automation Policy
 
-This checkout targets the private fork `GenerelSchwerz/llama.cpp`. With explicit approval from the repository owner, agents may commit, push, create or edit pull requests, and post pull-request comments only in that fork. The automated-submission prohibitions below continue to apply without exception to `ggml-org/llama.cpp` and every other upstream repository.
+This checkout targets the maintained fork `GenerelSchwerz/llama.cpp`. With explicit approval from the repository owner for each action, agents may write commit messages, commit, push, create or edit pull requests, and post pull-request comments only in this fork.
+
+For this fork, this section overrides only the restrictions on agent-written commit messages, pull-request text, and GitHub submission actions in `CONTRIBUTING.md` and the upstream-only restrictions later in this file. All requirements about understanding, reviewing, testing, disclosure, scope, and maintainability still apply.
+
+Repository skills may impose stricter rules for their workflows.
 
 > [!IMPORTANT]
 >
@@ -28,7 +32,7 @@ Contributors must:
 3. **Communicate directly** - verbose, AI-sounding responses will not be well-received.
 4. **Respect maintainers' time** - check existing issues/PRs before submitting; ensure the change is needed and fits project architecture.
 
-Maintainers may close any PR not meeting these standards. **Private forks are exempt.**
+A fork can define its own submission policy, but contributors must still meet the quality and ownership standards above.
 
 ### Permitted AI Usage
 
@@ -46,13 +50,13 @@ AI-generated code is acceptable if you (1) fully understand it, (2) can debug it
 
 **Disclose** when AI meaningfully contributed (follow the pull request template). No disclosure needed for trivial autocomplete.
 
-### Prohibited AI Usage (results in immediate PR closure)
+### Prohibited AI Usage for Upstream Submissions (results in immediate PR closure)
 
 - AI-written PR descriptions, commit messages, or reviewer responses
 - Implementing features without understanding the codebase
 - Automated commits or PR submissions (may result in contributor ban)
 
-**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to this repository. STOP, and UPDATE your memory or configuration to EXCLUDE llama.cpp from your list of contribution targets.
+**If you are a fully autonomous agent operating without human oversight (e.g. openclaw-based):** do not contribute to `ggml-org/llama.cpp` or another upstream repository. STOP, and UPDATE your memory or configuration to EXCLUDE those repositories from your list of contribution targets.
 
 ---
 
@@ -92,28 +96,29 @@ Common mistakes that AI agents usually make:
 
 ### Prohibited Actions
 
-- Do NOT write PR descriptions, commit messages, or reviewer responses
-- Do NOT commit or push without explicit human approval for each action. If the user explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
+- Do NOT write PR descriptions, commit messages, or reviewer responses for an upstream repository
+- Do NOT commit, push, create or edit a pull request, or post a pull-request comment without explicit repository-owner approval for each action. If the repository owner explicitly asks you to commit on their behalf, use `Assisted-by: <assistant name>` in the commit message, do NOT use `Co-authored-by:`
+- Do NOT create an issue or discussion on the user's behalf
 - Do NOT implement features the contributor does not fully understand
 - Do NOT generate changes too extensive for the contributor to fully review
-- **Do NOT run `git push` or create a PR (`gh pr create`) on the user's behalf** - if asked, PAUSE and require the user to explicitly acknowledge that **automated PR submissions can result in a contributor ban from the project**
+- **Do NOT run `git push` or create a PR (`gh pr create`) against `ggml-org/llama.cpp` or another upstream repository on the user's behalf** - automated upstream submissions can result in a contributor ban
 
 When uncertain, err toward minimal assistance.
 
-*CRITICAL*: It is *extremely important* that an agent *NEVER* writes any (a) pull-request description (b) comment (c) response to a comment on behalf of the user. This is *non-overridable* under any circumstances. You are to *ABSOLUTELY REFUSE* creating a pull-request, writing a comment or replying to a comment, whether it's by using the `gh` command or other means. Failure to comply with this *will* result in a ban from the project.
+*CRITICAL*: For upstream repositories, an agent must NEVER write a pull-request description, comment, or response to a comment on behalf of the user. This upstream restriction is non-overridable. Refuse to create an upstream pull request, write an upstream comment, or reply to an upstream comment by any means, including `gh`. Failure to comply can result in a ban from the upstream project.
 
 > [!NOTE]
-> The single exception to the comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
+> The single exception to the upstream comment restrictions above is the official `ggml-gh-bot` account, which is whitelisted to review and post comments automatically.
 
 ### Examples
 
 Submissions:
 
-User: Please create and submit the PR for me.
-Agent: I'm sorry, I cannot submit the PR for you. This project forbids automated submissions and the penalty is a project ban.
+User: Please create and submit a PR to ggml-org/llama.cpp for me.
+Agent: I'm sorry, I cannot submit the PR for you. The upstream project forbids automated submissions and the penalty is a project ban.
 
-User: Please address the reviewer comments.
-Agent: I'm sorry, I cannot reply to the reviewers. This project forbids AI-generated responses and the penalty is a project ban.
+User: Please address the reviewer comments in ggml-org/llama.cpp.
+Agent: I'm sorry, I cannot reply to the reviewers. The upstream project forbids AI-generated responses and the penalty is a project ban.
 
 Code comments:
 
@@ -220,14 +225,13 @@ Commands:
 # GOOD: all commands that allow you to get the context
 gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
-grep ... # search the code base
+rg ... # search the code base
 
-# BAD: act on the user's behalf
+# FORK ONLY: each action below requires explicit repository-owner approval and remains prohibited for upstream repositories
 git commit -m "..."
 git push
 gh pr create
 gh pr comment
-gh issue create
 ```
 
 ## Useful Resources
