@@ -583,6 +583,7 @@ struct common_params {
     bool recurrent_state_offload = false; // offload recurrent state independently of attention KV storage
     int32_t kv_gpu_layers  = 0;     // with no_kv_offload, keep this many attention KV layers device-resident
     bool phase_aware_workspace = false; // resize compute schedulers between prompt and generation phases
+    bool live_context_workspace = false; // size supported attention workspaces from the padded live KV extent
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

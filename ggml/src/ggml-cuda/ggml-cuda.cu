@@ -566,7 +566,9 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
             }
 #else
-            CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            if (pool_size > 0) {
+                CU_CHECK(cuMemUnmap(pool_addr, pool_size));
+            }
 #endif
             CU_CHECK(cuMemAddressFree(pool_addr, CUDA_POOL_VMM_MAX_SIZE));
         }
@@ -685,8 +687,61 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         // all deallocations must be in reverse order of the allocations
         GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used));
     }
+
+    size_t trim() override {
+        if (pool_addr == 0 || pool_size == 0) {
+            return 0;
+        }
+
+#if defined(GGML_USE_HIP)
+        if (pool_used != 0) {
+            return 0;
+        }
+        ggml_cuda_set_device(device);
+        for (std::pair<CUdeviceptr, size_t> & mapping : mappings) {
+            CU_CHECK(cuMemUnmap(mapping.first, mapping.second));
+        }
+        mappings.clear();
+        const size_t released = pool_size;
+        pool_size = 0;
+#else
+        const size_t keep_size = granularity * ((pool_used + granularity - 1) / granularity);
+        if (keep_size >= pool_size) {
+            return 0;
+        }
+        const size_t released = pool_size - keep_size;
+        ggml_cuda_set_device(device);
+        CU_CHECK(cuMemUnmap(pool_addr + keep_size, released));
+        pool_size = keep_size;
+#endif
+        return released;
+    }
 };
 #endif // defined(GGML_USE_VMM)
+
+static uint64_t ggml_backend_cuda_trim_transient_pools(ggml_backend_t backend) {
+    auto * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // Pool frees precede this call, but kernels and copies are asynchronous.
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->streams[device][stream] != nullptr) {
+                ggml_cuda_set_device(device);
+                CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->streams[device][stream]));
+            }
+        }
+    }
+
+    uint64_t released = 0;
+    for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
+            if (cuda_ctx->pools[device][stream] != nullptr) {
+                released += cuda_ctx->pools[device][stream]->trim();
+            }
+        }
+    }
+    return released;
+}
 
 std::unique_ptr<ggml_cuda_pool> ggml_backend_cuda_context::new_pool_for_device(int                  device,
                                                                                [[maybe_unused]] int stream_no) {
@@ -5608,6 +5663,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_flash_attn_causal_prefix_supported") == 0) {
         return (void *)ggml_backend_cuda_flash_attn_causal_prefix_supported;
+    }
+    if (strcmp(name, "ggml_backend_cuda_trim_transient_pools") == 0) {
+        return (void *)ggml_backend_cuda_trim_transient_pools;
     }
     return nullptr;
 }

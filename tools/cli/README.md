@@ -48,6 +48,7 @@
 | `--yarn-beta-slow N` | YaRN: high correction dim or alpha (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_SLOW) |
 | `--yarn-beta-fast N` | YaRN: low correction dim or beta (default: -1.00)<br/>(env: LLAMA_ARG_YARN_BETA_FAST) |
 | `-kvo, --kv-offload, -nkvo, --no-kv-offload` | whether to enable KV cache offloading (default: enabled)<br/>(env: LLAMA_ARG_KV_OFFLOAD) |
+| `--live-context-workspace, --no-live-context-workspace` | for supported attention caches, grow the compute workspace reservation with the padded live physical KV extent instead of reserving the full context up front (default: disabled)<br/>(env: LLAMA_ARG_LIVE_CONTEXT_WORKSPACE) |
 | `--repack, -nr, --no-repack` | whether to enable weight repacking (default: enabled)<br/>(env: LLAMA_ARG_REPACK) |
 | `--no-host` | bypass host buffer allowing extra buffers to be used<br/>(env: LLAMA_ARG_NO_HOST) |
 | `-ctk, --cache-type-k TYPE` | KV cache data type for K<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_K) |

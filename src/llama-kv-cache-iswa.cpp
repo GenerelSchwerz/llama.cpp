@@ -248,6 +248,14 @@ llama_memory_context_ptr llama_kv_cache_iswa::init_full() {
     return std::make_unique<llama_kv_cache_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_kv_cache_iswa::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_kv_cache_iswa_context>(this, n_kv);
+}
+
+uint32_t llama_kv_cache_iswa::get_attn_reserve_capacity() const {
+    return std::max(kv_base->get_attn_reserve_capacity(), kv_swa->get_attn_reserve_capacity());
+}
+
 llama_memory_context_ptr llama_kv_cache_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_kv_cache_iswa_context>(this, lctx, optimize);
 }
@@ -292,6 +300,14 @@ llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
         llama_kv_cache_iswa * kv) :
     ctx_base(kv->get_base()->init_full()),
     ctx_swa (kv->get_swa ()->init_full()),
+    status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
+}
+
+llama_kv_cache_iswa_context::llama_kv_cache_iswa_context(
+        llama_kv_cache_iswa * kv,
+        uint32_t n_kv) :
+    ctx_base(kv->get_base()->init_reserve(n_kv)),
+    ctx_swa (kv->get_swa ()->init_reserve(n_kv)),
     status(llama_memory_status_combine(ctx_base->get_status(), ctx_swa->get_status())) {
 }
 
@@ -350,6 +366,10 @@ const llama_ubatch & llama_kv_cache_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
 
     return ubatches[i_next];
+}
+
+uint32_t llama_kv_cache_iswa_context::get_attn_reserve_n_kv() const {
+    return std::max(ctx_base->get_attn_reserve_n_kv(), ctx_swa->get_attn_reserve_n_kv());
 }
 
 const llama_kv_cache_context * llama_kv_cache_iswa_context::get_base() const {
