@@ -3248,6 +3248,8 @@ static void ggml_cuda_moe_shadow_probe_registered(
 
 static inline void ggml_cuda_moe_shadow_probe(
         ggml_backend_cuda_context & ctx,
+        const ggml_cuda_moe_graph_execution * execution,
+        const ggml_tensor * mmid_node,
         const ggml_tensor * weight,
         const ggml_tensor * ids,
         const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
@@ -3256,16 +3258,22 @@ static inline void ggml_cuda_moe_shadow_probe(
     if (registry == nullptr || !is_mmid) {
         return;
     }
+    if (execution != nullptr) {
+        (void) execution->find(mmid_node, nullptr);
+    }
     ggml_cuda_moe_shadow_probe_registered(*registry, weight, ids, fusion);
 }
 
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
 // through the staging path; everything else goes straight to the regular
 // implementation, preserving existing behavior bit-for-bit.
-static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_id(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_cuda_moe_graph_execution * execution) {
     const ggml_tensor * src0 = dst->src[0];
 
-    ggml_cuda_moe_shadow_probe(ctx, src0, dst->src[2]);
+    ggml_cuda_moe_shadow_probe(ctx, execution, dst, src0, dst->src[2]);
 
     // One-time debug log: whenever the moe-cache flag is on, log the buffer
     // type of the FIRST mul_mat_id op we see, so we can confirm whether the
@@ -3293,7 +3301,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_mul_mat_id_impl(ctx, dst, true);
 }
 
-static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+static bool ggml_cuda_compute_forward(
+        ggml_backend_cuda_context & ctx,
+        struct ggml_tensor * dst,
+        const ggml_cuda_moe_graph_execution * execution) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3486,7 +3497,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst);
+            ggml_cuda_mul_mat_id(ctx, dst, execution);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4616,7 +4627,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
-static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+static int ggml_cuda_try_fuse(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph,
+        int i,
+        const ggml_cuda_moe_graph_execution * execution) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -5039,7 +5054,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                    ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data);
+                    ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up_n, src0, ids, &fusion_data);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -5095,7 +5110,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up_n, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -5109,7 +5124,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
-                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up_n, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -5136,7 +5151,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -5148,7 +5163,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
-                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 const bool is_cached = ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft);
                 if (is_cached) {
                     if (!ggml_cuda_mul_mat_vec_q_cached_fused(*cuda_ctx, src0, src1, ids, gate->src[0], glu, fusion_data)) {
@@ -5244,7 +5259,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, mm_node, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -5303,7 +5318,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
-            ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+            ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, mm_node, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -5311,7 +5326,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
-            ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+            ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, mm_node, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -5373,7 +5388,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph,
+        const bool use_cuda_graph,
+        const bool cuda_graph_update_required,
+        const void * graph_key,
+        const ggml_cuda_moe_graph_execution * moe_execution) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5513,7 +5534,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, moe_execution);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5543,7 +5564,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
-                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
+                bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, moe_execution);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
@@ -5617,6 +5638,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
+    ggml_cuda_moe_graph_plan moe_plan;
+    ggml_cuda_moe_graph_execution moe_execution;
+    if (cuda_ctx->moe_grouped_context != nullptr) {
+        cuda_ctx->moe_grouped_context->compile_graph_plan(cgraph, cgraph->uid, &moe_plan, &moe_execution);
+    }
 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
@@ -5663,7 +5689,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
 
     return GGML_STATUS_SUCCESS;
 }

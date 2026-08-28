@@ -87,7 +87,7 @@ static bool candidate_test_supports_buft(ggml_backend_dev_t dev, ggml_backend_bu
 }
 
 struct candidate_test_fixture {
-    static constexpr size_t BUFFER_SIZE = 1024 * 1024;
+    static constexpr size_t BUFFER_SIZE = 4 * 1024 * 1024;
 
     bool supports_buft = true;
     ggml_backend_device owner = {};
@@ -104,7 +104,7 @@ struct candidate_test_fixture {
         buffer = ggml_backend_cpu_buffer_from_ptr(storage, BUFFER_SIZE);
         CHECK(buffer != nullptr);
         ggml_init_params params = {};
-        params.mem_size = 64 * ggml_tensor_overhead();
+        params.mem_size = 512 * ggml_tensor_overhead();
         params.no_alloc = true;
         ctx = ggml_init(params);
         CHECK(ctx != nullptr);
@@ -127,6 +127,28 @@ struct candidate_test_fixture {
         return result;
     }
 };
+
+static ggml_tensor * candidate_mmid(candidate_test_fixture & fixture, ggml_tensor * weight, ggml_tensor * ids) {
+    const int64_t activation_ne[] = {weight->ne[0], 1, ids->ne[1]};
+    const int64_t output_ne[] = {weight->ne[1], ids->ne[0], ids->ne[1]};
+    ggml_tensor * activation = fixture.tensor(GGML_TYPE_F32, 3, activation_ne);
+    ggml_tensor * result = fixture.tensor(GGML_TYPE_F32, 3, output_ne);
+    result->op = GGML_OP_MUL_MAT_ID;
+    result->src[0] = weight;
+    result->src[1] = activation;
+    result->src[2] = ids;
+    result->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    return result;
+}
+
+static ggml_cgraph * candidate_graph(candidate_test_fixture & fixture, std::initializer_list<ggml_tensor *> nodes) {
+    ggml_cgraph * graph = ggml_new_graph_custom(fixture.ctx, 32, false);
+    CHECK(graph != nullptr);
+    for (ggml_tensor * node : nodes) {
+        ggml_graph_add_node(graph, node);
+    }
+    return graph;
+}
 
 static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
         uint32_t n_slots,
@@ -795,12 +817,202 @@ static void test_grouped_context_resources() {
     fprintf(stderr, "test-moe-cache: grouped context resources OK\n");
 }
 
+static void test_grouped_graph_preflight() {
+    candidate_test_fixture fixture;
+    const int64_t gate_ne[] = {256, 256, 4};
+    const int64_t fused_ne[] = {256, 512, 4};
+    const int64_t ids_ne[] = {2, 1};
+    const int64_t prefill_ids_ne[] = {2, 4};
+    const int64_t fused_bias_ne[] = {512, 4};
+
+    ggml_tensor * fused_gate_up = fixture.tensor(GGML_TYPE_Q4_0, 3, fused_ne);
+    ggml_tensor * fused_down = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    ggml_tensor * separate_gate = fixture.tensor(GGML_TYPE_Q4_K, 3, gate_ne);
+    ggml_tensor * separate_up = fixture.tensor(GGML_TYPE_Q4_K, 3, gate_ne);
+    ggml_tensor * separate_down = fixture.tensor(GGML_TYPE_Q4_K, 3, gate_ne);
+    ggml_tensor * fused_bias = fixture.tensor(GGML_TYPE_F32, 2, fused_bias_ne);
+    ggml_tensor * fused_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
+    ggml_tensor * fused_ids_other = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
+    ggml_tensor * separate_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
+    ggml_tensor * prefill_ids = fixture.tensor(GGML_TYPE_I32, 2, prefill_ids_ne);
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_banks = {{
+        {fused_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {fused_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> separate_banks = {{
+        {separate_gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {separate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {separate_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {{
+        {fused_banks.data(), fused_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
+        {separate_banks.data(), separate_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0},
+    }};
+    auto snapshot = candidate_snapshot(12, groups.data(), groups.size());
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    ggml_tensor * fused_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * fused_down_node = candidate_mmid(fixture, fused_down, fused_ids);
+    ggml_tensor * separate_up_node = candidate_mmid(fixture, separate_up, separate_ids);
+    ggml_tensor * separate_gate_node = candidate_mmid(fixture, separate_gate, separate_ids);
+    ggml_tensor * separate_down_node = candidate_mmid(fixture, separate_down, separate_ids);
+    ggml_cgraph * complete_graph = candidate_graph(fixture, {
+        fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
+    });
+
+    ggml_cuda_moe_graph_plan plan;
+    ggml_cuda_moe_graph_execution execution;
+    ggml_cuda_moe_graph_execution reused;
+    registry.compile_graph_plan(complete_graph, 41, &plan, &execution);
+    CHECK(plan.size() == 2 && execution.size() == 2);
+    CHECK(plan.registry_generation() == 1 && plan.graph_uid() == 41 && plan.graph_node_count() == 5);
+    ggml_cuda_moe_graph_binding binding;
+    CHECK(execution.find(fused_gate_up_node, &binding));
+    CHECK(binding.key.candidate.generation == 1 && binding.key.candidate.group_index == 0);
+    CHECK(binding.key.ids.tensor == fused_ids && binding.key.ids.data == fused_ids->data && binding.key.ids.buffer == fused_ids->buffer);
+    CHECK(binding.key.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && binding.key.n_banks == 2);
+    CHECK(binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT && binding.bank_index == 0);
+    CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.bank_index == 1);
+    CHECK(execution.find(separate_up_node, &binding) && binding.key.candidate.group_index == 1 && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
+    CHECK(execution.find(separate_gate_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+    CHECK(execution.find(separate_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.key.n_banks == 3);
+    CHECK(!execution.find(fused_bias, nullptr));
+
+    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    CHECK(reused.size() == 2 && reused.find(separate_down_node, nullptr));
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, false, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 42, true, plan, &reused) && reused.size() == 0);
+    ggml_cgraph * reordered_graph = candidate_graph(fixture, {
+        fused_down_node, fused_gate_up_node, separate_up_node, separate_gate_node, separate_down_node,
+    });
+    CHECK(execution.find(fused_gate_up_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
+    CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+    CHECK(!registry.bind_graph_plan(reordered_graph, 41, true, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    ggml_tensor * stale_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_cgraph * stale_graph = candidate_graph(fixture, {
+        stale_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
+    });
+    CHECK(!registry.bind_graph_plan(stale_graph, 41, true, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    ggml_cuda_moe_grouped_context other_registry(&fixture.owner);
+    CHECK(other_registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(!other_registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+
+    fused_gate_up_node->src[0] = separate_gate;
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+    fused_gate_up_node->src[0] = fused_gate_up;
+    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+    registry.compile_graph_plan(complete_graph, 43, &plan, &execution);
+    CHECK(plan.registry_generation() == 2 && execution.size() == 2);
+
+    ggml_cuda_moe_candidate_group_key held_key;
+    ggml_cuda_moe_grouped_acquisition held_acquisition;
+    ggml_cuda_moe_grouped_transaction held_transaction;
+    CHECK(registry.find_down_group_key(fused_down, &held_key));
+    CHECK(registry.acquire_group_resources(held_key, &held_acquisition));
+    CHECK(registry.begin_group_transaction(held_acquisition, &held_transaction));
+    std::atomic<bool> replacement_started{false};
+    std::atomic<bool> replacement_done{false};
+    std::thread replacement_thread([&]() {
+        replacement_started.store(true, std::memory_order_release);
+        CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        replacement_done.store(true, std::memory_order_release);
+    });
+    while (!replacement_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    do {
+        std::this_thread::yield();
+    } while (registry.bind_graph_plan(complete_graph, 43, true, plan, &reused));
+    CHECK(reused.size() == 0 && !replacement_done.load(std::memory_order_acquire));
+    registry.compile_graph_plan(complete_graph, 43, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0 && plan.registry_generation() == 0);
+    CHECK(registry.end_group_transaction(held_transaction));
+    replacement_thread.join();
+    CHECK(replacement_done.load(std::memory_order_acquire));
+    CHECK(!registry.bind_graph_plan(complete_graph, 43, true, plan, &reused) && reused.size() == 0);
+
+    registry.compile_graph_plan(complete_graph, 44, &plan, &execution);
+    CHECK(execution.size() == 2);
+    auto disabled = candidate_snapshot(12, nullptr, 0);
+    CHECK(registry.replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    registry.compile_graph_plan(complete_graph, 44, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0 && plan.registry_generation() == 0);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    ggml_tensor * mixed_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * mixed_down_node = candidate_mmid(fixture, fused_down, fused_ids_other);
+    ggml_cgraph * mixed_graph = candidate_graph(fixture, {mixed_gate_up_node, mixed_down_node});
+    registry.compile_graph_plan(mixed_graph, 45, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * missing_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_cgraph * missing_graph = candidate_graph(fixture, {missing_gate_up_node});
+    registry.compile_graph_plan(missing_graph, 46, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * duplicate_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * duplicate_gate_up_peer = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * duplicate_down_node = candidate_mmid(fixture, fused_down, fused_ids);
+    ggml_cgraph * duplicate_graph = candidate_graph(fixture, {duplicate_gate_up_node, duplicate_gate_up_peer, duplicate_down_node});
+    registry.compile_graph_plan(duplicate_graph, 47, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * prefill_gate_up_node = candidate_mmid(fixture, fused_gate_up, prefill_ids);
+    ggml_tensor * prefill_down_node = candidate_mmid(fixture, fused_down, prefill_ids);
+    ggml_cgraph * prefill_graph = candidate_graph(fixture, {prefill_gate_up_node, prefill_down_node});
+    registry.compile_graph_plan(prefill_graph, 48, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * wrong_source_node = candidate_mmid(fixture, separate_gate, fused_ids);
+    ggml_tensor * correct_down_node = candidate_mmid(fixture, fused_down, fused_ids);
+    ggml_cgraph * wrong_source_graph = candidate_graph(fixture, {wrong_source_node, correct_down_node});
+    registry.compile_graph_plan(wrong_source_graph, 49, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * auxiliary_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * auxiliary_down_node = candidate_mmid(fixture, fused_down, fused_ids);
+    const int64_t auxiliary_ne[] = {auxiliary_gate_up_node->ne[0], auxiliary_gate_up_node->ne[1], auxiliary_gate_up_node->ne[2]};
+    ggml_tensor * auxiliary_out = fixture.tensor(GGML_TYPE_F32, 3, auxiliary_ne);
+    auxiliary_out->op = GGML_OP_ADD_ID;
+    auxiliary_out->src[0] = auxiliary_gate_up_node;
+    auxiliary_out->src[1] = fused_bias;
+    auxiliary_out->src[2] = fused_ids;
+    auxiliary_out->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_cgraph * auxiliary_graph = candidate_graph(fixture, {auxiliary_gate_up_node, auxiliary_out, auxiliary_down_node});
+    registry.compile_graph_plan(auxiliary_graph, 50, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> auxiliary_banks = {{
+        {fused_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {fused_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        {fused_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 auxiliary_group = {
+        auxiliary_banks.data(), auxiliary_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+    };
+    auto auxiliary_snapshot = candidate_snapshot(12, &auxiliary_group, 1);
+    CHECK(registry.replace(&auxiliary_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    ggml_cgraph * auxiliary_registered_graph = candidate_graph(fixture, {auxiliary_gate_up_node, auxiliary_down_node});
+    registry.compile_graph_plan(auxiliary_registered_graph, 51, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    fprintf(stderr, "test-moe-cache: grouped graph preflight OK\n");
+}
+
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_grouped_context_resources();
+    test_grouped_graph_preflight();
     if (registry_only || registry_bench) {
         return 0;
     }

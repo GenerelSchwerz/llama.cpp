@@ -9,6 +9,7 @@
 
 #include "ggml-backend.h"
 
+#include <array>
 #include <memory>
 
 enum ggml_cuda_moe_candidate_rejection : uint32_t {
@@ -116,6 +117,92 @@ struct ggml_cuda_moe_grouped_transaction {
     uint64_t transaction_token = 0;
 };
 
+struct ggml_cuda_moe_ids_signature {
+    const ggml_tensor * tensor = nullptr;
+    const void * data = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    size_t nb[GGML_MAX_DIMS] = {};
+    uint32_t type = GGML_TYPE_COUNT;
+};
+
+struct ggml_cuda_moe_complete_group_key {
+    ggml_cuda_moe_candidate_group_key candidate;
+    ggml_cuda_moe_ids_signature ids;
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t n_banks = 0;
+};
+
+struct ggml_cuda_moe_graph_binding {
+    ggml_cuda_moe_complete_group_key key;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t bank_index = 0;
+};
+
+class ggml_cuda_moe_graph_plan {
+public:
+    ggml_cuda_moe_graph_plan();
+
+    uint32_t size() const;
+    uint64_t registry_generation() const;
+    uint64_t graph_uid() const;
+    int32_t graph_node_count() const;
+
+private:
+    static constexpr uint32_t MAX_NODE_BINDINGS = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * 3;
+    static constexpr uint32_t NODE_TABLE_SIZE = 4096;
+
+    struct group_record {
+        ggml_cuda_moe_candidate_group_key candidate;
+        uint32_t layout;
+        uint32_t n_banks;
+        const ggml_tensor * nodes[4];
+        uint32_t node_indices[4];
+        uint32_t bank_indices[4];
+    };
+
+    struct node_entry {
+        const ggml_tensor * node;
+        uint32_t group_record;
+        uint32_t role;
+        uint32_t bank_index;
+    };
+
+    friend class ggml_cuda_moe_grouped_context;
+    friend class ggml_cuda_moe_graph_execution;
+
+    void reset();
+    bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index);
+    const node_entry * find(const ggml_tensor * node) const;
+
+    std::array<group_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
+    std::array<node_entry, NODE_TABLE_SIZE> nodes_;
+    const void * owner_;
+    uint64_t registry_generation_;
+    uint64_t graph_uid_;
+    int32_t graph_node_count_;
+    uint32_t n_groups_;
+    uint32_t n_nodes_;
+    bool initialized_;
+};
+
+class ggml_cuda_moe_graph_execution {
+public:
+    ggml_cuda_moe_graph_execution();
+
+    bool find(const ggml_tensor * node, ggml_cuda_moe_graph_binding * binding) const;
+    uint32_t size() const;
+
+private:
+    friend class ggml_cuda_moe_grouped_context;
+
+    void reset();
+
+    const ggml_cuda_moe_graph_plan * plan_;
+    std::array<ggml_cuda_moe_complete_group_key, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
+    uint32_t n_groups_;
+};
+
 struct ggml_cuda_moe_grouped_resource_info {
     ggml_cuda_moe_grouped_acquisition acquisition;
     const ggml_tensor * down = nullptr;
@@ -166,6 +253,17 @@ public:
     bool end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    void compile_graph_plan(
+            const ggml_cgraph * cgraph,
+            uint64_t graph_uid,
+            ggml_cuda_moe_graph_plan * plan,
+            ggml_cuda_moe_graph_execution * execution) const;
+    bool bind_graph_plan(
+            const ggml_cgraph * cgraph,
+            uint64_t graph_uid,
+            bool node_properties_unchanged,
+            const ggml_cuda_moe_graph_plan & plan,
+            ggml_cuda_moe_graph_execution * execution) const;
     void shutdown();
 
 private:
