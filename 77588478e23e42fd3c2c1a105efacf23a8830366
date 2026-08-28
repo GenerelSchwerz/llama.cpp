@@ -5,3 +5,19 @@ Rebased PR 40 onto origin/llama/dev f5ad37ab2. Kept both compact causal-prefix a
 Release CPU and CUDA sm_120a builds passed for llama-server, llama-cli, llama-bench, test-llama-archs, test-arg-parser, and test-alloc with shared ccache and build locks.
 
 Focused tests initially found test-live-context-workspace assumed 256 -> 512 always grows the tiny synthetic backing. With compact masks both reservations are 7328 bytes, so this is a test interaction rather than under-reservation. Local uncommitted adjustment disables flash attention in that dense grow/shrink unit test. CPU focused suite passes; CUDA test rebuild is queued behind the shared CUDA build lock.
+
+2026-08-27 live-context parallel and Gemma checkpoint
+
+Qwen3.8 27B, ctx 131072, b/ub 4096/2048, q8_0 pinned host KV, two concurrent 15633-token prompts:
+- unified: live off startup/peak/idle 14750/14812/14812 MiB (startup inferred from first sample); live on 13758/13868/13828 MiB. Savings about 992/944/984 MiB. Live wall 23.19 s versus about 23.45 s off.
+- non-unified: off 14494/14554/14554 MiB; on 13662/13876/13836 MiB. Savings 832/678/718 MiB. Wall 22.05 versus 22.08 s (+0.14%).
+All eight parallel Qwen responses were byte-identical across live on/off and KV modes.
+
+Gemma 4 revealed llama_memory_hybrid_iswa was unsupported: the initial live-on run was exactly identical to off. Local uncommitted support now forwards bounded reserve through llama_kv_cache_iswa base/SWA children and the hybrid ISWA wrapper. Existing test-llama-archs now covers Gemma growth through 1024 and contraction to 256. CPU and CUDA focused live/phase/parser/alloc tests pass.
+
+Gemma 4 12B, same ctx/batch/KV placement, two concurrent 21174-token prompts after ISWA support:
+- unified: off 7786/7832/7832 MiB; on 7134/7514/7480 MiB. Savings 652/318/352 MiB. Wall +1.16% in one pair.
+- non-unified: off 7526/7564/7564 MiB; on 7146/7322/7288 MiB. Savings 380/242/276 MiB. Wall +1.24% in one pair.
+All eight Gemma responses were byte-identical across live on/off and KV modes.
+
+Qwen single 46950-token prefill: live off 1365.13 tok/s and 14334 MiB sampled peak; live on 1360.37 tok/s and 13942 MiB. Delta -0.35% and -392 MiB. Generated token output was identical; raw stdout differed only in its printed timing line.
