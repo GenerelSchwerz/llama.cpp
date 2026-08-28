@@ -317,6 +317,28 @@ enum ggml_cuda_moe_graph_prepare_result : uint32_t {
     GGML_CUDA_MOE_GRAPH_PREPARE_REUSED,
 };
 
+struct ggml_cuda_moe_grouped_debug_telemetry {
+    uint64_t registered = 0;
+    uint64_t covered = 0;
+    uint64_t plan_calls = 0;
+    uint64_t plan_compiles = 0;
+    uint64_t plan_reuses = 0;
+    uint64_t calls = 0;
+    uint64_t ready = 0;
+    uint64_t ready_min = 0;
+    uint64_t ready_max = 0;
+    uint64_t completed = 0;
+    uint64_t completed_min = 0;
+    uint64_t completed_max = 0;
+    uint64_t admitted_banks = 0;
+    uint64_t fallback = 0;
+    uint64_t rollback = 0;
+    uint64_t prepare_error = 0;
+    uint64_t finish_error = 0;
+    uint64_t h2d_banks = 0;
+    uint64_t h2d_bytes = 0;
+};
+
 enum ggml_cuda_moe_graph_property_hint : uint32_t {
     GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN = 0,
     GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED,
@@ -571,7 +593,7 @@ public:
             uint64_t copy_wait_event_time_us,
             uint64_t total_time_us,
             bool ids_cache_hit);
-    static void log_and_reset_legacy_stats();
+    static ggml_cuda_moe_grouped_debug_telemetry log_and_reset_legacy_stats();
     uint64_t certify_graph_coverage(const ggml_cgraph * cgraph);
     bool recover_graph_coverage(const ggml_cgraph * cgraph, uint64_t * coverage_epoch) const;
     void compile_graph_plan(
@@ -622,6 +644,7 @@ private:
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
     uint64_t legacy_op_count_for_test(bool is_decode) const;
+    ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
     bool rollback_group_to_legacy(ggml_cuda_moe_graph_group_dispatch & group);
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;

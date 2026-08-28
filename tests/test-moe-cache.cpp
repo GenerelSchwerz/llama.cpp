@@ -82,6 +82,11 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return context.legacy_op_count_for_test(is_decode);
     }
 
+    static ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry(
+            ggml_cuda_moe_grouped_context & context) {
+        return context.take_grouped_debug_telemetry_for_test();
+    }
+
     static size_t graph_reader_witness_size() {
         return sizeof(ggml_cuda_moe_graph_plan::reader_witness);
     }
@@ -2748,6 +2753,35 @@ static uint64_t active_grouped_legacy_op_count(ggml_backend_t backend) {
     return ggml_cuda_moe_grouped_context_test_access::legacy_op_count(*context, true);
 }
 
+static void check_active_grouped_debug_telemetry(
+        ggml_backend_t backend,
+        const active_grouped_dispatch_graph & graph) {
+    auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+    CHECK(context != nullptr);
+    const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(telemetry.registered == 1 && telemetry.covered == 1);
+    CHECK(telemetry.plan_calls == 6 && telemetry.plan_compiles == 5 && telemetry.plan_reuses == 1);
+    CHECK(telemetry.calls == 5 && telemetry.ready == 5 && telemetry.completed == 5);
+    CHECK(telemetry.ready_min == 5 && telemetry.ready_max == 5);
+    CHECK(telemetry.completed_min == 5 && telemetry.completed_max == 5);
+    CHECK(telemetry.admitted_banks == 5 * graph.banks.size());
+    CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
+    CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    CHECK(telemetry.h2d_banks == 2 * graph.banks.size());
+    uint64_t bytes_per_expert = 0;
+    for (const ggml_tensor * bank : graph.banks) {
+        bytes_per_expert += bank->nb[2];
+    }
+    CHECK(telemetry.h2d_bytes == 2 * bytes_per_expert);
+
+    const auto reset = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(reset.registered == 1 && reset.covered == 0 && reset.plan_calls == 0);
+    CHECK(reset.calls == 0 && reset.ready == 0 && reset.completed == 0);
+    CHECK(reset.ready_min == 0 && reset.ready_max == 0);
+    CHECK(reset.completed_min == 0 && reset.completed_max == 0);
+    CHECK(reset.admitted_banks == 0 && reset.h2d_banks == 0 && reset.h2d_bytes == 0);
+}
+
 static void check_active_grouped_legacy_caches(
         ggml_backend_t backend,
         const active_grouped_dispatch_graph & graph,
@@ -2780,6 +2814,9 @@ static void check_active_grouped_contract(
     ggml_cuda_moe_graph_execution execution;
     CHECK(context->prepare_graph_execution(graph.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution) ==
         GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(execution.size() == 1);
+    CHECK(context->prepare_graph_execution(graph.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &plan, &execution) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
     CHECK(execution.size() == 1);
     cudaStream_t stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -2898,6 +2935,8 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
     CHECK(active_grouped_legacy_op_count(reference_backend.get()) == 4 * reference.banks.size());
     CHECK(active_grouped_legacy_op_count(first_backend.get()) == 0);
     CHECK(active_grouped_legacy_op_count(second_backend.get()) == 0);
+    check_active_grouped_debug_telemetry(first_backend.get(), first);
+    check_active_grouped_debug_telemetry(second_backend.get(), second);
     check_active_grouped_legacy_caches(reference_backend.get(), reference, false);
     for (ggml_tensor * bank : first.banks) {
         auto * context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
@@ -2911,6 +2950,20 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
     if (type == GGML_TYPE_Q4_0 && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && n_slots == 12) {
         auto * context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
         CHECK(context != nullptr);
+        std::array<ggml_backend_moe_candidate_bank_v1, 3> replacement_banks = {};
+        for (size_t i = 0; i < first.banks.size(); ++i) {
+            replacement_banks[i] = {first.banks[i], first.roles[i], 0};
+        }
+        const ggml_backend_moe_candidate_group_v1 replacement_group = {
+            replacement_banks.data(), static_cast<uint32_t>(first.banks.size()), layout, 0, 0,
+        };
+        const auto replacement_snapshot = candidate_snapshot(n_slots, &replacement_group, 1);
+        CHECK(context->replace(&replacement_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        const auto zero_activity_replacement =
+            ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(zero_activity_replacement.registered == 1 && zero_activity_replacement.covered == 0);
+        CHECK(zero_activity_replacement.plan_calls == 0 && zero_activity_replacement.calls == 0);
+        CHECK(zero_activity_replacement.ready == 0 && zero_activity_replacement.completed == 0);
 
         std::shared_ptr<ggml_cuda_moe_graph_plan> failure_plan;
         ggml_cuda_moe_graph_execution failure_execution;
@@ -2930,6 +2983,11 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         failure_group->stream = wrong_stream;
         CHECK(!context->finish_graph_dispatch(&failure_execution));
         CHECK(!context->get_group_resources(failed_resource, nullptr));
+        const auto failure_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(failure_telemetry.registered == 1 && failure_telemetry.covered == 1);
+        CHECK(failure_telemetry.plan_calls == 1 && failure_telemetry.plan_compiles == 1);
+        CHECK(failure_telemetry.calls == 1 && failure_telemetry.ready == 1 && failure_telemetry.completed == 0);
+        CHECK(failure_telemetry.prepare_error == 0 && failure_telemetry.finish_error == 1);
         CUDA_OK(cudaStreamDestroy(wrong_stream));
         CUDA_OK(cudaStreamDestroy(stream));
         CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2, false) == first_output);
@@ -2940,14 +2998,6 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         CHECK(context->find_down_group_key(first.down, &key));
         CHECK(context->acquire_group_resources(key, &resource));
         CHECK(context->begin_group_transaction(resource, &held));
-        std::array<ggml_backend_moe_candidate_bank_v1, 3> replacement_banks = {};
-        for (size_t i = 0; i < first.banks.size(); ++i) {
-            replacement_banks[i] = {first.banks[i], first.roles[i], 0};
-        }
-        const ggml_backend_moe_candidate_group_v1 replacement_group = {
-            replacement_banks.data(), static_cast<uint32_t>(first.banks.size()), layout, 0, 0,
-        };
-        const auto replacement_snapshot = candidate_snapshot(n_slots, &replacement_group, 1);
         std::atomic<bool> replacement_started{false};
         std::atomic<int32_t> replacement_result{GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR};
         std::thread replacement([&]() {
@@ -2975,6 +3025,118 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         replacement.join();
         CHECK(replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2, false) == first_output);
+        const auto replacement_telemetry =
+            ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(replacement_telemetry.registered == 2 && replacement_telemetry.covered == 2);
+        CHECK(replacement_telemetry.plan_calls == 2 &&
+            replacement_telemetry.plan_compiles + replacement_telemetry.plan_reuses == replacement_telemetry.plan_calls);
+        CHECK(replacement_telemetry.calls == 2 && replacement_telemetry.ready == 2 && replacement_telemetry.completed == 2);
+        CHECK(replacement_telemetry.ready_min == 1 && replacement_telemetry.ready_max == 1);
+        CHECK(replacement_telemetry.completed_min == 1 && replacement_telemetry.completed_max == 1);
+        CHECK(replacement_telemetry.h2d_banks == 4 * first.banks.size());
+
+        CHECK(run_active_grouped_dispatch(first_backend.get(), first, 4, false) == first_output);
+        const auto disabled_snapshot = candidate_snapshot(n_slots, nullptr, 0);
+        CHECK(context->replace(&disabled_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        const auto disabled_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(disabled_telemetry.registered == 1 && disabled_telemetry.covered == 1);
+        CHECK(disabled_telemetry.plan_calls == 1 && disabled_telemetry.calls == 1);
+        CHECK(disabled_telemetry.ready == 1 && disabled_telemetry.completed == 1);
+        register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
+        CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2, false) == first_output);
+        const ggml_backend_moe_candidate_group_v1 rejected_group = {
+            replacement_banks.data(), static_cast<uint32_t>(first.banks.size()), layout, 1, 0,
+        };
+        const auto rejected_snapshot = candidate_snapshot(n_slots, &rejected_group, 1);
+        CHECK(context->replace(&rejected_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+        const auto rejected_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(rejected_telemetry.registered == 1 && rejected_telemetry.covered == 1);
+        CHECK(rejected_telemetry.plan_calls == 1 && rejected_telemetry.calls == 1);
+        CHECK(rejected_telemetry.ready == 1 && rejected_telemetry.completed == 1);
+        CHECK(rejected_telemetry.h2d_banks == 2 * first.banks.size());
+        register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
+        ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
+        const int32_t shutdown_routes[] = {3, 5};
+        ggml_backend_tensor_set(first.ids, shutdown_routes, 0, sizeof(shutdown_routes));
+        std::shared_ptr<ggml_cuda_moe_graph_plan> shutdown_plan;
+        ggml_cuda_moe_graph_execution shutdown_execution;
+        CHECK(context->prepare_graph_execution(first.graph, 703, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &shutdown_plan, &shutdown_execution) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        cudaStream_t shutdown_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&shutdown_stream, cudaStreamNonBlocking));
+        CHECK(shutdown_execution.resolve_streams(candidate_test_graph_stream, shutdown_stream));
+        CHECK(context->begin_graph_dispatch(&shutdown_execution, true));
+        ggml_cuda_moe_graph_binding shutdown_binding;
+        auto * shutdown_group = shutdown_execution.find_group(first.output, &shutdown_binding);
+        CHECK(shutdown_group != nullptr);
+        CHECK(context->prepare_graph_group(shutdown_group, shutdown_binding, first.output, shutdown_stream) ==
+            GGML_CUDA_MOE_GROUPED_DECODE_READY);
+        const auto shutdown_resource = shutdown_group->transaction.acquisition;
+        host_barrier barrier;
+        CUDA_OK(cudaLaunchHostFunc(shutdown_stream, wait_on_host_barrier, &barrier));
+        CHECK(context->finish_graph_dispatch(&shutdown_execution));
+        while (!barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        ggml_cuda_moe_grouped_resource_info shutdown_info;
+        CHECK(context->get_group_resources(shutdown_resource, &shutdown_info) && !shutdown_info.transaction_active);
+        CHECK(context->find_down_group_key(first.down, &key));
+        std::atomic<bool> shutdown_started{false};
+        std::atomic<bool> shutdown_done{false};
+        std::thread shutdown([&]() {
+            shutdown_started.store(true, std::memory_order_release);
+            context->shutdown();
+            shutdown_done.store(true, std::memory_order_release);
+        });
+        while (!shutdown_started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        ggml_cuda_moe_grouped_acquisition shutdown_probe;
+        while (context->acquire_group_resources(key, &shutdown_probe)) {
+            std::this_thread::yield();
+        }
+        CHECK(!shutdown_done.load(std::memory_order_acquire));
+        std::atomic<bool> logger_started{false};
+        std::atomic<bool> logger_done{false};
+        ggml_cuda_moe_grouped_debug_telemetry shutdown_telemetry;
+        std::thread logger([&]() {
+            logger_started.store(true, std::memory_order_release);
+            shutdown_telemetry = ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
+            logger_done.store(true, std::memory_order_release);
+        });
+        while (!logger_started.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        for (uint32_t attempt = 0; attempt < 100 && !logger_done.load(std::memory_order_acquire); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        CHECK(!logger_done.load(std::memory_order_acquire) && !shutdown_done.load(std::memory_order_acquire));
+        barrier.released.store(true, std::memory_order_release);
+        logger.join();
+        shutdown.join();
+        CHECK(logger_done.load(std::memory_order_acquire) && shutdown_done.load(std::memory_order_acquire));
+        CUDA_OK(cudaStreamDestroy(shutdown_stream));
+        CHECK(shutdown_telemetry.covered == 1 && shutdown_telemetry.plan_calls == 1);
+        CHECK(shutdown_telemetry.plan_compiles + shutdown_telemetry.plan_reuses == shutdown_telemetry.plan_calls);
+        CHECK(shutdown_telemetry.calls == 1 && shutdown_telemetry.ready == 1 && shutdown_telemetry.completed == 1);
+        CHECK(shutdown_telemetry.admitted_banks == first.banks.size());
+        CHECK(shutdown_telemetry.fallback == 0 && shutdown_telemetry.rollback == 0);
+        CHECK(shutdown_telemetry.prepare_error == 0 && shutdown_telemetry.finish_error == 0);
+        CHECK(shutdown_telemetry.h2d_banks == 2 * first.banks.size());
+        uint64_t shutdown_h2d_bytes = 0;
+        for (const ggml_tensor * bank : first.banks) {
+            shutdown_h2d_bytes += 2 * bank->nb[2];
+        }
+        CHECK(shutdown_telemetry.h2d_bytes == shutdown_h2d_bytes);
+        const auto shutdown_reset = ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
+        CHECK(shutdown_reset.covered == 0 && shutdown_reset.plan_calls == 0);
+        CHECK(shutdown_reset.plan_compiles == 0 && shutdown_reset.plan_reuses == 0 && shutdown_reset.calls == 0);
+        CHECK(shutdown_reset.ready == 0 && shutdown_reset.ready_min == 0 && shutdown_reset.ready_max == 0);
+        CHECK(shutdown_reset.completed == 0 && shutdown_reset.completed_min == 0 && shutdown_reset.completed_max == 0);
+        CHECK(shutdown_reset.admitted_banks == 0);
+        CHECK(shutdown_reset.fallback == 0 && shutdown_reset.rollback == 0);
+        CHECK(shutdown_reset.prepare_error == 0 && shutdown_reset.finish_error == 0);
+        CHECK(shutdown_reset.h2d_banks == 0 && shutdown_reset.h2d_bytes == 0);
     }
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
 }
