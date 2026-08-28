@@ -21,6 +21,22 @@ class llama_batch_allocr;
 class llama_io_read_i;
 class llama_io_write_i;
 
+struct llama_moe_candidate_snapshot {
+    llama_moe_candidate_snapshot(const llama_model & model, const llama_adapter_loras & loras);
+
+    const ggml_backend_moe_candidate_snapshot_v1 & get() const;
+
+private:
+    struct group_storage {
+        std::vector<ggml_backend_moe_candidate_bank_v1> banks;
+        uint32_t layout;
+    };
+
+    std::vector<group_storage> storage;
+    std::vector<ggml_backend_moe_candidate_group_v1> groups;
+    ggml_backend_moe_candidate_snapshot_v1 snapshot = {};
+};
+
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;

@@ -81,6 +81,102 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
+        const llama_model & model,
+        const llama_adapter_loras & loras) {
+    snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+    snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    snapshot.struct_size = sizeof(snapshot);
+    snapshot.n_slots = std::max(model.moe_expert_cache_slots(), 0);
+
+    if (model.has_tensor_overrides()) {
+        return;
+    }
+
+    auto has_lora = [&](ggml_tensor * tensor) {
+        for (const auto & lora : loras) {
+            if (lora.second != 0.0f && lora.first != nullptr && lora.first->get_weight(tensor) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    storage.reserve(std::min<size_t>(model.layers.size(), GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS));
+    for (const auto & layer : model.layers) {
+        if (layer.ffn_gate_inp == nullptr || layer.ffn_down_exps == nullptr) {
+            continue;
+        }
+
+        const bool fused = layer.ffn_gate_up_exps != nullptr;
+        const bool has_gate = layer.ffn_gate_exps != nullptr;
+        const bool has_up = layer.ffn_up_exps != nullptr;
+        const bool separate = !fused && has_gate && has_up;
+        if ((!fused && !separate) || (fused && (has_gate || has_up))) {
+            continue;
+        }
+
+        if ((fused && (layer.ffn_gate_exps_s != nullptr || layer.ffn_up_exps_s != nullptr ||
+                       layer.ffn_gate_exps_b != nullptr || layer.ffn_up_exps_b != nullptr)) ||
+                (separate && layer.ffn_gate_up_exps_b != nullptr)) {
+            continue;
+        }
+
+        if (has_lora(layer.ffn_down_exps) ||
+                (fused && has_lora(layer.ffn_gate_up_exps)) ||
+                (separate && (has_lora(layer.ffn_gate_exps) || has_lora(layer.ffn_up_exps)))) {
+            continue;
+        }
+
+        if (storage.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
+            storage.clear();
+            return;
+        }
+
+        group_storage group;
+        group.layout = fused ? GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP : GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE;
+        auto add = [&](ggml_tensor * tensor, uint32_t role) {
+            if (tensor != nullptr) {
+                group.banks.push_back({tensor, role, 0});
+            }
+        };
+
+        if (fused) {
+            add(layer.ffn_gate_up_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
+        } else {
+            add(layer.ffn_gate_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+            add(layer.ffn_up_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
+        }
+        add(layer.ffn_down_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+
+        if (!fused) {
+            add(layer.ffn_gate_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE);
+            add(layer.ffn_up_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE);
+        }
+        add(layer.ffn_down_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE);
+
+        if (fused) {
+            add(layer.ffn_gate_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS);
+        } else {
+            add(layer.ffn_gate_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS);
+            add(layer.ffn_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS);
+        }
+        add(layer.ffn_down_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS);
+        storage.push_back(std::move(group));
+    }
+
+    groups.reserve(storage.size());
+    for (const auto & group : storage) {
+        groups.push_back({group.banks.data(), static_cast<uint32_t>(group.banks.size()), group.layout, 0, 0});
+    }
+    snapshot.groups = groups.empty() ? nullptr : groups.data();
+    snapshot.n_groups = static_cast<uint32_t>(groups.size());
+}
+
+const ggml_backend_moe_candidate_snapshot_v1 & llama_moe_candidate_snapshot::get() const {
+    return snapshot;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
