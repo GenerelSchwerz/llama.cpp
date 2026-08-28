@@ -618,7 +618,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                 static_assert((DKQ/2) % nbatch_K2 == 0, "K batching leaves a partial quantized tile");
                 static_assert((2*nbatch_K2) % 32 == 0, "K batch start is not quant block aligned");
                 constexpr int nthreads_quant = nwarps * ggml_cuda_get_physical_warp_size();
-                flash_attn_ext_quant_load_tile<type_K, nbatch_K2, stride_tile_K, nthreads_quant, nbatch_fa, oob_check>
+                flash_attn_ext_quant_load_tile<type_K, nbatch_K2, stride_tile_K, nthreads_quant, nbatch_fa, ncols1, ncols2, oob_check>
                     ((const char *) K_h2, tile_K, k0_start, k_VKQ_0, stride_K, k_VKQ_sup);
             } else {
                 const int k0_diff = k0_stop - k0_start;
@@ -986,7 +986,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
 #define FATTN_MMA_QUANT_LOAD_V_CASE(t)                                                 \
                     case t:                                                            \
                         flash_attn_ext_quant_load_tile<t, nbatch_V2, stride_tile_V,    \
-                            nthreads_quant, nbatch_fa, oob_check>                      \
+                            nthreads_quant, nbatch_fa, ncols1, ncols2, oob_check>      \
                             ((const char *) V_h2, tile_V, i0_start/2, k_VKQ_0,         \
                              stride_V, k_VKQ_sup);                                     \
                         break;
@@ -997,7 +997,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     }
 #undef FATTN_MMA_QUANT_LOAD_V_CASE
                 } else {
-                    flash_attn_ext_quant_load_tile<type_V, nbatch_V2, stride_tile_V, nthreads_quant, nbatch_fa, oob_check>
+                    flash_attn_ext_quant_load_tile<type_V, nbatch_V2, stride_tile_V, nthreads_quant, nbatch_fa, ncols1, ncols2, oob_check>
                         ((const char *) V_h2, tile_V, i0_start/2, k_VKQ_0, stride_V, k_VKQ_sup);
                 }
                 __syncthreads();
