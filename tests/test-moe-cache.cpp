@@ -2018,6 +2018,17 @@ struct grouped_decode_fixture {
         return tensor;
     }
 
+    ggml_tensor * scale() {
+        ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_experts);
+        const size_t alignment = ggml_backend_buffer_get_alignment(source_buffer);
+        source_offset = (source_offset + alignment - 1) / alignment * alignment;
+        CHECK(source_offset + ggml_nbytes(tensor) <= ggml_backend_buffer_get_size(source_buffer));
+        tensor->buffer = source_buffer;
+        tensor->data = static_cast<char *>(ggml_backend_buffer_get_base(source_buffer)) + source_offset;
+        source_offset += ggml_nbytes(tensor);
+        return tensor;
+    }
+
     ggml_tensor * ids(int64_t n_routes = 4) {
         const int64_t ne[] = {n_routes, 1, 1, 1};
         ggml_tensor * tensor = ggml_new_tensor(ctx, GGML_TYPE_I32, 4, ne);
@@ -2181,11 +2192,17 @@ struct grouped_clock_fixture {
     cudaStream_t stream = nullptr;
 };
 
-static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout, bool pinned = true) {
+static void test_grouped_decode_type(
+        int device,
+        ggml_type type,
+        uint32_t layout,
+        bool pinned = true,
+        uint32_t n_slots = grouped_decode_fixture::N_SLOTS,
+        bool auxiliary_scale = false) {
     grouped_decode_fixture fixture(device, pinned);
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
-    std::array<ggml_backend_moe_candidate_bank_v1, 3> banks = {};
+    std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
     const uint32_t separate_roles[] = {
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
@@ -2196,26 +2213,35 @@ static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
     };
     for (uint32_t bank = 0; bank < n_banks; ++bank) {
-        const int64_t ne0 = type == GGML_TYPE_Q4_0 ? 32 : 256;
+        const int64_t ne0 = type == GGML_TYPE_Q4_K ? 256 : type == GGML_TYPE_Q4_0 ? 32 : 64;
         const int64_t ne1 = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && bank == 0 ? 2 * ne0 : ne0;
         weights[bank] = fixture.weight(type, ne0, ne1);
         banks[bank].tensor = weights[bank];
         banks[bank].role = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? separate_roles[bank] : fused_roles[bank];
+        CHECK(weights[bank]->nb[2] == ggml_row_size(type, ne0) * ne1);
         for (uint32_t expert = 0; expert < grouped_decode_fixture::N_EXPERTS; ++expert) {
-            memset(static_cast<char *>(weights[bank]->data) + expert * weights[bank]->nb[2],
-                17 * (bank + 1) + expert, weights[bank]->nb[2]);
+            auto * expert_data = static_cast<uint8_t *>(weights[bank]->data) + expert * weights[bank]->nb[2];
+            for (size_t byte = 0; byte < weights[bank]->nb[2]; ++byte) {
+                expert_data[byte] = static_cast<uint8_t>(17 * (bank + 1) + 13 * expert + byte);
+            }
         }
+    }
+    if (type == GGML_TYPE_NVFP4) {
+        CHECK(ggml_blck_size(type) == 64 && ggml_type_size(type) == 36);
+    }
+    if (auxiliary_scale) {
+        banks[n_banks] = {fixture.scale(), GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
     }
     ggml_backend_moe_candidate_group_v1 group = {};
     group.banks = banks.data();
-    group.n_banks = n_banks;
+    group.n_banks = n_banks + auxiliary_scale;
     group.layout = layout;
-    const auto snapshot = candidate_snapshot(grouped_decode_fixture::N_SLOTS, &group, 1);
+    const auto snapshot = candidate_snapshot(n_slots, &group, 1);
     ggml_cuda_moe_grouped_context registry(ggml_backend_get_device(fixture.backend), device);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
     ggml_tensor * ids = fixture.ids();
-    auto key = grouped_decode_key(registry, weights[n_banks - 1], ids, layout, n_banks);
+    auto key = grouped_decode_key(registry, weights[n_banks - 1], ids, layout, group.n_banks);
     cudaStream_t stream = nullptr;
     cudaStream_t wrong_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -2228,14 +2254,15 @@ static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout
 
     const int32_t first_ids[] = {3, 1, 3, 6};
     CUDA_OK(cudaMemcpyAsync(ids->data, first_ids, sizeof(first_ids), cudaMemcpyHostToDevice, stream));
-    if (!pinned) {
+    if (!pinned || auxiliary_scale) {
         CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+        CUDA_OK(cudaStreamSynchronize(stream));
         CUDA_OK(cudaStreamDestroy(wrong_stream));
         CUDA_OK(cudaStreamDestroy(stream));
         return;
     }
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
-    CHECK(decode.n_banks == n_banks && decode.n_slots == grouped_decode_fixture::N_SLOTS && decode.layout == layout);
+    CHECK(decode.n_banks == n_banks && decode.n_slots == n_slots && decode.layout == layout);
     CUDA_OK(cudaStreamSynchronize(stream));
     std::array<int32_t, 4> remapped = {};
     CUDA_OK(cudaMemcpy(remapped.data(), decode.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
@@ -2258,7 +2285,9 @@ static void test_grouped_decode_type(int device, ggml_type type, uint32_t layout
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CUDA_OK(cudaStreamSynchronize(stream));
     CUDA_OK(cudaMemcpy(remapped.data(), decode.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
-    CHECK((remapped == std::array<int32_t, 4>{2, 3, 0, 2}));
+    const std::array<int32_t, 4> expected_second = n_slots == grouped_decode_fixture::N_SLOTS ?
+        std::array<int32_t, 4>{2, 3, 0, 2} : std::array<int32_t, 4>{2, 3, 4, 2};
+    CHECK(remapped == expected_second);
     CHECK(registry.finish_decode(decode, stream));
 
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
@@ -2459,6 +2488,14 @@ static void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
+    for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
+        for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
+            for (uint32_t n_slots : {12u, 48u}) {
+                test_grouped_decode_type(device, type, layout, true, n_slots);
+            }
+        }
+    }
+    test_grouped_decode_type(device, GGML_TYPE_NVFP4, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true, 12, true);
     test_grouped_clock_maintenance(device);
     fprintf(stderr, "test-moe-cache: grouped decode resources OK\n");
 }

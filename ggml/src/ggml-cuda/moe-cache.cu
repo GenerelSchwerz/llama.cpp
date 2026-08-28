@@ -2235,13 +2235,16 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t experts = 0;
         uint32_t type = GGML_TYPE_COUNT;
         for (const auto & bank : snapshot.banks) {
+            const bool supported_encoding =
+                ((bank.type == GGML_TYPE_Q4_0 || bank.type == GGML_TYPE_Q4_K || bank.type == GGML_TYPE_BF16) &&
+                    bank.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN) ||
+                (bank.type == GGML_TYPE_NVFP4 && bank.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND);
             if (bank.role < GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ||
                     bank.role > GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
                     (roles & (1u << bank.role)) != 0 ||
-                    bank.encoding != GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN ||
+                    !supported_encoding ||
                     bank.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND ||
                     (bank.index_modes & GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT) == 0 ||
-                    (bank.type != GGML_TYPE_Q4_0 && bank.type != GGML_TYPE_Q4_K) ||
                     !ggml_backend_buft_is_cuda_moe_cached(bank.buft) || bank.ne[2] <= 0 || bank.expert_stride == 0 ||
                     (uint64_t) bank.ne[2] > UINT32_MAX || bank.expert_stride > SIZE_MAX / snapshot.n_slots ||
                     bank.byte_extent != bank.expert_stride * (uint64_t) bank.ne[2] || !descriptor_matches(bank)) {
