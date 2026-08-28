@@ -1944,6 +1944,18 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view>
+static fattn_kernel_t get_fattn_mma_f16_kernel(bool compact_causal_prefix) {
+#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
+    if (compact_causal_prefix) {
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>;
+    }
+#else
+    GGML_UNUSED(compact_causal_prefix);
+#endif
+    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
+}
+
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV = dst;
@@ -1992,31 +2004,12 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
 #else
     using fattn_kernel_ptr_t = fattn_kernel_t;
 #endif // defined(GGML_USE_HIP)
-    fattn_kernel_t fattn_kernel;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-        if (compact_causal_prefix) {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>;
-        } else
-#endif
-        {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
-        }
-    } else {
-        constexpr bool use_logit_softcap = true;
-#ifdef GGML_CUDA_COMPACT_CAUSAL_MASK
-        if (compact_causal_prefix) {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, true>;
-        } else
-#endif
-        {
-            fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false>;
-        }
-    }
+    fattn_kernel_t fattn_kernel = logit_softcap == 0.0f ?
+        get_fattn_mma_f16_kernel<DKQ, DV, ncols1, ncols2, false, V_is_K_view>(compact_causal_prefix) :
+        get_fattn_mma_f16_kernel<DKQ, DV, ncols1, ncols2, true,  V_is_K_view>(compact_causal_prefix);
 
 #if !defined(GGML_USE_MUSA)
-    const int kernel_variant = 2*(logit_softcap != 0.0f) + compact_causal_prefix;
+    const int kernel_variant = 2 * (logit_softcap != 0.0f) + compact_causal_prefix;
     static bool shared_memory_limit_raised[4][GGML_CUDA_MAX_DEVICES] = {{false}};
     if (!shared_memory_limit_raised[kernel_variant][id]) {
         CUDA_CHECK(cudaFuncSetAttribute(reinterpret_cast<fattn_kernel_ptr_t>(fattn_kernel), cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared_total));

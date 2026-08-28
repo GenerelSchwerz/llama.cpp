@@ -8519,6 +8519,11 @@ void ggml_compute_forward_top_k(
     }
 }
 
+static int64_t ggml_flash_attn_causal_prefix_bound(const ggml_tensor * mask, int64_t row) {
+    GGML_ASSERT(mask->type == GGML_TYPE_I64);
+    return *(const int64_t *) ((const char *) mask->data + row*mask->nb[0]) + 1;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8532,6 +8537,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8626,12 +8632,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const ggml_fp16_t * mp = mask && mask->type == GGML_TYPE_F16 ?
-            (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] +
-                (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
-        const char * prefix = mask && mask->type == GGML_TYPE_I64 ?
-            (const char *) mask->data + iq1*mask->nb[0] : NULL;
-        const int64_t prefix_bound = prefix ? *(const int64_t *) prefix + 1 : 0;
+        const ggml_fp16_t * mp = mask && !compact_causal_prefix ?
+            (const ggml_fp16_t *) ((const char *) mask->data + iq1*mask->nb[1] +
+                (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
+        const int64_t causal_prefix_bound = compact_causal_prefix ? ggml_flash_attn_causal_prefix_bound(mask, iq1) : 0;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8649,8 +8653,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = prefix ? (ic < prefix_bound ? 0.0f : -INFINITY) :
-                (mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f);
+            float mv = 0.0f;
+            if (compact_causal_prefix) {
+                mv = ic < causal_prefix_bound ? 0.0f : -INFINITY;
+            } else if (mp) {
+                mv = slope*GGML_CPU_FP16_TO_FP32(mp[ic]);
+            }
             if (mv == -INFINITY) {
                 continue;
             }
@@ -8772,6 +8780,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8913,17 +8922,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const ggml_fp16_t * mp_row = mask->type == GGML_TYPE_F16 ?
-                        (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] +
-                            (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : nullptr;
-                    const int64_t prefix = mask->type == GGML_TYPE_I64 ?
-                        *(const int64_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[0]) + 1 : 0;
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = mp_row ?
-                            slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]) :
-                            (ic + tk < prefix ? 0.0f : -INFINITY);
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
+                    if (compact_causal_prefix) {
+                        const int64_t causal_prefix_bound = ggml_flash_attn_causal_prefix_bound(mask, iq1 + tq);
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = ic + tk < causal_prefix_bound ? 0.0f : -INFINITY;
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
+                        }
+                    } else {
+                        const ggml_fp16_t * mp_row = (const ggml_fp16_t *) ((const char *) mask->data +
+                                (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
+                        for (int tk = 0; tk < kv_tile; tk++) {
+                            mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
+                            if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                                can_skip = false;
+                            }
                         }
                     }
                     // Pad remaining mask entries with -inf
