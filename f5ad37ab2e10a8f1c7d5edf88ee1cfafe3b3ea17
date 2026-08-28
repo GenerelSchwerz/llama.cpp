@@ -1,0 +1,5 @@
+Compact causal mask cleanup in /home/gencoolpc/llama-compact-causal-mask-cleanup on branch codex/cleanup-compact-causal-mask.
+
+Code-quality changes: resolve backend descriptor capability once per scheduler; split dense construction from compact selection; remove optional/default argument plumbing; harden compact eligibility pointer and slot checks; simplify CUDA KV_max and MMA/vector host dispatch; preserve compile-time CUDA hot-loop specialization; remove invalid/null dense-mask pointer arithmetic; make CPU descriptor access typed and explicit; simplify compact-equivalence test construction and exact op filtering.
+
+Current diff against merged PR #53: 11 files, 185 insertions, 190 deletions. git diff --check and ASCII scan clean. CPU and CUDA builds passed before final include/CMake/readability refinements; final CPU rebuild passed. Changed-lines clang-tidy clean for production files; remaining test harness mode warning predates this feature. Final CUDA rebuild and requested full matrix pending the shared CUDA build lock.
