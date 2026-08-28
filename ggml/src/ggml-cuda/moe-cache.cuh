@@ -139,6 +139,12 @@ struct ggml_cuda_moe_graph_binding {
     uint32_t bank_index = 0;
 };
 
+enum ggml_cuda_moe_graph_prepare_result : uint32_t {
+    GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE = 0,
+    GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED,
+    GGML_CUDA_MOE_GRAPH_PREPARE_REUSED,
+};
+
 class ggml_cuda_moe_graph_plan {
 public:
     ggml_cuda_moe_graph_plan();
@@ -178,6 +184,7 @@ private:
     std::array<group_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
+    const void * graph_key_;
     uint64_t registry_generation_;
     uint64_t graph_uid_;
     int32_t graph_node_count_;
@@ -197,8 +204,10 @@ private:
     friend class ggml_cuda_moe_grouped_context;
 
     void reset();
+    void retain(const std::shared_ptr<const ggml_cuda_moe_graph_plan> & plan);
 
     const ggml_cuda_moe_graph_plan * plan_;
+    std::shared_ptr<const ggml_cuda_moe_graph_plan> plan_lease_;
     std::array<ggml_cuda_moe_complete_group_key, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
     uint32_t n_groups_;
 };
@@ -263,6 +272,12 @@ public:
             uint64_t graph_uid,
             bool node_properties_unchanged,
             const ggml_cuda_moe_graph_plan & plan,
+            ggml_cuda_moe_graph_execution * execution) const;
+    ggml_cuda_moe_graph_prepare_result prepare_graph_execution(
+            const ggml_cgraph * cgraph,
+            uint64_t graph_uid,
+            bool node_properties_unchanged,
+            std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
             ggml_cuda_moe_graph_execution * execution) const;
     void shutdown();
 

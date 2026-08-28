@@ -1182,7 +1182,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build(
 } // namespace
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), registry_generation_(0), graph_uid_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false) {
+    owner_(nullptr), graph_key_(nullptr), registry_generation_(0), graph_uid_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false) {
 }
 
 void ggml_cuda_moe_graph_plan::reset() {
@@ -1190,6 +1190,7 @@ void ggml_cuda_moe_graph_plan::reset() {
         entry.node = nullptr;
     }
     owner_ = nullptr;
+    graph_key_ = nullptr;
     registry_generation_ = 0;
     graph_uid_ = 0;
     graph_node_count_ = 0;
@@ -1268,8 +1269,14 @@ ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() : plan_(nullptr),
 }
 
 void ggml_cuda_moe_graph_execution::reset() {
+    plan_lease_.reset();
     plan_ = nullptr;
     n_groups_ = 0;
+}
+
+void ggml_cuda_moe_graph_execution::retain(const std::shared_ptr<const ggml_cuda_moe_graph_plan> & plan) {
+    plan_lease_ = plan;
+    plan_ = plan.get();
 }
 
 bool ggml_cuda_moe_graph_execution::find(const ggml_tensor * node, ggml_cuda_moe_graph_binding * binding) const {
@@ -1835,14 +1842,19 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     };
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->draining || impl_->replacement_pending || !impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
+    if (impl_->draining || impl_->replacement_pending) {
         return;
     }
     plan->owner_ = impl_.get();
     plan->registry_generation_ = impl_->state.generation;
     plan->graph_uid_ = graph_uid;
     plan->graph_node_count_ = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
+    plan->graph_key_ = plan->graph_node_count_ > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
     plan->initialized_ = true;
+    if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
+        execution->plan_ = plan;
+        return;
+    }
 
     std::array<group_observation, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> observations = {};
     const uint32_t mapped_index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT |
@@ -2004,10 +2016,18 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
-    if (!plan.initialized_ || plan.owner_ != impl_.get() || plan.graph_uid_ != graph_uid || plan.graph_node_count_ != n_nodes ||
-            impl_->draining || impl_->replacement_pending || !impl_->state.accepted || impl_->state.n_slots == 0 ||
-            plan.registry_generation_ != impl_->state.generation || plan.n_groups_ > impl_->table.groups.size()) {
+    const void * graph_key = n_nodes > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
+    if (!plan.initialized_ || plan.owner_ != impl_.get() || plan.graph_key_ != graph_key || plan.graph_node_count_ != n_nodes ||
+            impl_->draining || impl_->replacement_pending || plan.registry_generation_ != impl_->state.generation ||
+            plan.n_groups_ > impl_->table.groups.size()) {
         return false;
+    }
+    if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
+        if (plan.n_groups_ != 0) {
+            return false;
+        }
+        execution->plan_ = &plan;
+        return true;
     }
 
     for (uint32_t record_index = 0; record_index < plan.n_groups_; ++record_index) {
@@ -2072,6 +2092,42 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
     execution->plan_ = &plan;
     execution->n_groups_ = plan.n_groups_;
     return true;
+}
+
+ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_execution(
+        const ggml_cgraph * cgraph,
+        uint64_t graph_uid,
+        bool node_properties_unchanged,
+        std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
+        ggml_cuda_moe_graph_execution * execution) const {
+    if (execution != nullptr) {
+        execution->reset();
+    }
+    if (cgraph == nullptr || plan == nullptr || execution == nullptr) {
+        return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
+    }
+    if (*plan != nullptr && bind_graph_plan(cgraph, graph_uid, node_properties_unchanged, **plan, execution)) {
+        execution->retain(*plan);
+        return GGML_CUDA_MOE_GRAPH_PREPARE_REUSED;
+    }
+
+    std::shared_ptr<ggml_cuda_moe_graph_plan> replacement;
+    try {
+        replacement = std::make_shared<ggml_cuda_moe_graph_plan>();
+    } catch (...) {
+        plan->reset();
+        execution->reset();
+        return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
+    }
+    compile_graph_plan(cgraph, graph_uid, replacement.get(), execution);
+    if (!replacement->initialized_) {
+        plan->reset();
+        execution->reset();
+        return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
+    }
+    *plan = replacement;
+    execution->retain(replacement);
+    return GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED;
 }
 
 void ggml_cuda_moe_grouped_context::shutdown() {

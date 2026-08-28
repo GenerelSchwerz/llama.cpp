@@ -713,9 +713,7 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-#ifdef USE_CUDA_GRAPH
     cuda_graphs.clear();
-#endif
     delete moe_grouped_context;
 
     if (copy_event != nullptr) {
@@ -3791,6 +3789,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    return cgraph->nodes[0];
+}
+
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
@@ -3829,10 +3831,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     }
 
     return use_cuda_graph;
-}
-
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -5637,23 +5635,26 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
-    const void * graph_key = nullptr;
-    ggml_cuda_moe_graph_plan moe_plan;
-    ggml_cuda_moe_graph_execution moe_execution;
+    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    ggml_cuda_graph * graph = nullptr;
+#ifdef USE_CUDA_GRAPH
+    graph = cuda_ctx->cuda_graph(graph_key);
+#else
     if (cuda_ctx->moe_grouped_context != nullptr) {
-        cuda_ctx->moe_grouped_context->compile_graph_plan(cgraph, cgraph->uid, &moe_plan, &moe_execution);
+        graph = cuda_ctx->cuda_graph(graph_key);
     }
+#endif
+    bool node_properties_unchanged = graph != nullptr && graph->moe_graph_plan != nullptr && cgraph->uid != 0;
+    ggml_cuda_moe_graph_execution moe_execution;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
-
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            node_properties_unchanged = !properties_changed;
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5678,6 +5679,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (cuda_ctx->moe_grouped_context != nullptr) {
+        (void) cuda_ctx->moe_grouped_context->prepare_graph_execution(
+            cgraph, cgraph->uid, node_properties_unchanged, &graph->moe_graph_plan, &moe_execution);
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
