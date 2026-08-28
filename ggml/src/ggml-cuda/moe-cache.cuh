@@ -241,9 +241,31 @@ struct ggml_cuda_moe_grouped_bank_descriptor {
     uint32_t index_modes = 0;
 };
 
+enum ggml_cuda_moe_grouped_decode_result : uint32_t {
+    GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK = 0,
+    GGML_CUDA_MOE_GROUPED_DECODE_READY,
+};
+
+struct ggml_cuda_moe_grouped_decode_bank {
+    const ggml_tensor * tensor = nullptr;
+    const void * data = nullptr;
+    uint32_t bank_index = 0;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t type = GGML_TYPE_COUNT;
+};
+
+struct ggml_cuda_moe_grouped_decode_acquisition {
+    ggml_cuda_moe_grouped_transaction transaction;
+    const int32_t * remapped_ids = nullptr;
+    ggml_cuda_moe_grouped_decode_bank banks[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t n_banks = 0;
+    uint32_t n_slots = 0;
+};
+
 class ggml_cuda_moe_grouped_context {
 public:
-    explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner);
+    explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device = -1);
     ~ggml_cuda_moe_grouped_context();
 
     ggml_cuda_moe_grouped_context(const ggml_cuda_moe_grouped_context &) = delete;
@@ -279,6 +301,11 @@ public:
             bool node_properties_unchanged,
             std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
             ggml_cuda_moe_graph_execution * execution) const;
+    ggml_cuda_moe_grouped_decode_result prepare_decode(
+            const ggml_cuda_moe_complete_group_key & key,
+            cudaStream_t compute_stream,
+            ggml_cuda_moe_grouped_decode_acquisition * acquisition);
+    bool finish_decode(const ggml_cuda_moe_grouped_decode_acquisition & acquisition, cudaStream_t compute_stream);
     void shutdown();
 
 private:

@@ -1181,6 +1181,352 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build(
 
 } // namespace
 
+namespace {
+
+static constexpr uint32_t MOE_GROUPED_MAX_DECODE_ROUTES = 32;
+static constexpr uint32_t MOE_GROUPED_MAX_SLOTS = 256;
+static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
+static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS = 128;
+static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
+
+enum moe_grouped_plan_status : uint32_t {
+    MOE_GROUPED_PLAN_BUILDING = 0,
+    MOE_GROUPED_PLAN_READY,
+    MOE_GROUPED_PLAN_INVALID_ROUTE,
+    MOE_GROUPED_PLAN_INVALID_STATE,
+    MOE_GROUPED_PLAN_CLOCK_EXHAUSTED,
+};
+
+struct moe_grouped_decode_plan {
+    uint32_t status;
+    uint32_t n_routes;
+    uint32_t n_unique;
+    uint32_t n_misses;
+    uint64_t next_clock;
+    int32_t unique_experts[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t unique_slots[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t unique_misses[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t miss_unique[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t miss_experts[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t miss_slots[MOE_GROUPED_MAX_DECODE_ROUTES];
+    int32_t remapped_ids[MOE_GROUPED_MAX_DECODE_ROUTES];
+};
+
+struct moe_grouped_device_bank {
+    const char * source;
+    char * data;
+    size_t expert_stride;
+};
+
+static __device__ void moe_grouped_warp_min(unsigned long long & age, uint32_t & slot) {
+#pragma unroll
+    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        const unsigned long long other_age = __shfl_xor_sync(0xffffffff, age, offset, WARP_SIZE);
+        const uint32_t other_slot = __shfl_xor_sync(0xffffffff, slot, offset, WARP_SIZE);
+        if (other_age < age || (other_age == age && other_slot < slot)) {
+            age = other_age;
+            slot = other_slot;
+        }
+    }
+}
+
+struct moe_grouped_device_scope {
+    explicit moe_grouped_device_scope(int device) : previous(ggml_cuda_get_device()) {
+        ggml_cuda_set_device(device);
+    }
+
+    ~moe_grouped_device_scope() {
+        (void) cudaSetDevice(previous);
+    }
+
+    int previous;
+};
+
+static __device__ void moe_grouped_plan_fail(moe_grouped_decode_plan * plan, moe_grouped_plan_status status) {
+    atomicCAS(&plan->status, MOE_GROUPED_PLAN_BUILDING, status);
+    __trap();
+}
+
+static __global__ void moe_grouped_plan_decode(
+        const int32_t * ids,
+        uint32_t n_routes,
+        uint32_t n_experts,
+        uint32_t n_slots,
+        const int32_t * slot_for_expert,
+        const int32_t * expert_for_slot,
+        const uint64_t * last_used,
+        const uint64_t * clock,
+        moe_grouped_decode_plan * plan) {
+    if (blockIdx.x != 0) {
+        return;
+    }
+
+    __shared__ int32_t route_experts[MOE_GROUPED_MAX_DECODE_ROUTES];
+    __shared__ int32_t route_unique[MOE_GROUPED_MAX_DECODE_ROUTES];
+    __shared__ uint32_t unique_scan[MOE_GROUPED_MAX_DECODE_ROUTES];
+    __shared__ uint32_t miss_scan[MOE_GROUPED_MAX_DECODE_ROUTES];
+    __shared__ unsigned long long warp_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t warp_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
+    __shared__ uint32_t selected_slot;
+    const uint32_t thread = threadIdx.x;
+    if (thread == 0) {
+        plan->status = MOE_GROUPED_PLAN_BUILDING;
+        plan->n_routes = n_routes;
+        plan->n_unique = 0;
+        plan->n_misses = 0;
+    }
+    if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
+        route_experts[thread] = -1;
+        route_unique[thread] = -1;
+        unique_scan[thread] = 0;
+        miss_scan[thread] = 0;
+        plan->unique_experts[thread] = -1;
+        plan->unique_slots[thread] = -1;
+        plan->unique_misses[thread] = 0;
+        plan->miss_unique[thread] = -1;
+        plan->miss_experts[thread] = -1;
+        plan->miss_slots[thread] = -1;
+        plan->remapped_ids[thread] = -1;
+    }
+    __syncthreads();
+
+    if (n_routes == 0 || n_routes > MOE_GROUPED_MAX_DECODE_ROUTES || n_slots == 0 ||
+            n_slots > MOE_GROUPED_MAX_SLOTS || n_routes > n_slots) {
+        moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+    }
+    if (thread < n_routes) {
+        const int32_t expert = ids[thread];
+        if (expert < 0 || (uint32_t) expert >= n_experts) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_ROUTE);
+        }
+        route_experts[thread] = expert;
+    }
+    __syncthreads();
+
+    if (thread < n_routes) {
+        bool first = true;
+        for (uint32_t previous = 0; previous < thread; ++previous) {
+            first = first && route_experts[previous] != route_experts[thread];
+        }
+        unique_scan[thread] = first ? 1 : 0;
+    }
+    __syncthreads();
+    for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
+        uint32_t add = 0;
+        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
+            add = unique_scan[thread - offset];
+        }
+        __syncthreads();
+        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
+            unique_scan[thread] += add;
+        }
+        __syncthreads();
+    }
+
+    if (thread == 0) {
+        plan->n_unique = unique_scan[n_routes - 1];
+    }
+    if (thread < n_routes) {
+        uint32_t first = thread;
+        for (uint32_t previous = 0; previous < thread; ++previous) {
+            if (route_experts[previous] == route_experts[thread]) {
+                first = previous;
+                break;
+            }
+        }
+        route_unique[thread] = unique_scan[first] - 1;
+        if (first == thread) {
+            plan->unique_experts[route_unique[thread]] = route_experts[thread];
+        }
+    }
+    __syncthreads();
+
+    if (thread < plan->n_unique) {
+        const int32_t expert = plan->unique_experts[thread];
+        const int32_t slot = slot_for_expert[expert];
+        if (slot < -1 || (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert))) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
+        plan->unique_slots[thread] = slot;
+        plan->unique_misses[thread] = slot < 0 ? 1 : 0;
+        miss_scan[thread] = plan->unique_misses[thread];
+    }
+    __syncthreads();
+    for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
+        uint32_t add = 0;
+        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
+            add = miss_scan[thread - offset];
+        }
+        __syncthreads();
+        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
+            miss_scan[thread] += add;
+        }
+        __syncthreads();
+    }
+    if (thread == 0) {
+        plan->n_misses = miss_scan[plan->n_unique - 1];
+    }
+    __syncthreads();
+
+    if (thread < plan->n_unique && plan->unique_misses[thread]) {
+        const uint32_t miss = miss_scan[thread] - 1;
+        plan->miss_unique[miss] = thread;
+        plan->miss_experts[miss] = plan->unique_experts[thread];
+    }
+    for (uint32_t slot = thread; slot < n_slots; slot += blockDim.x) {
+        const int32_t resident = expert_for_slot[slot];
+        if (resident < -1 || (resident >= 0 && ((uint32_t) resident >= n_experts || slot_for_expert[resident] != (int32_t) slot)) ||
+                (resident >= 0 && last_used[slot] == 0)) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
+    }
+    __syncthreads();
+
+    const uint32_t lane = thread % WARP_SIZE;
+    const uint32_t warp = thread / WARP_SIZE;
+    for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+        unsigned long long age = UINT64_MAX;
+        uint32_t slot = UINT32_MAX;
+        for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
+            bool reserved = false;
+            for (uint32_t unique = 0; unique < plan->n_unique; ++unique) {
+                reserved = reserved || plan->unique_slots[unique] == (int32_t) candidate;
+            }
+            if (!reserved) {
+                const int32_t resident = expert_for_slot[candidate];
+                const unsigned long long candidate_age = resident < 0 ? 0 : last_used[candidate];
+                if (candidate_age < age || (candidate_age == age && candidate < slot)) {
+                    age = candidate_age;
+                    slot = candidate;
+                }
+            }
+        }
+        moe_grouped_warp_min(age, slot);
+        if (lane == 0) {
+            warp_ages[warp] = age;
+            warp_slots[warp] = slot;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            age = lane < MOE_GROUPED_PLAN_THREADS / WARP_SIZE ? warp_ages[lane] : UINT64_MAX;
+            slot = lane < MOE_GROUPED_PLAN_THREADS / WARP_SIZE ? warp_slots[lane] : UINT32_MAX;
+            moe_grouped_warp_min(age, slot);
+            if (lane == 0) {
+                selected_slot = slot;
+            }
+        }
+        __syncthreads();
+        if (thread == 0) {
+            const int32_t unique = plan->miss_unique[miss];
+            if (selected_slot >= n_slots || unique < 0 || (uint32_t) unique >= plan->n_unique) {
+                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            }
+            plan->unique_slots[unique] = selected_slot;
+            plan->miss_slots[miss] = selected_slot;
+        }
+        __syncthreads();
+    }
+
+    if (thread < plan->n_unique && plan->unique_slots[thread] < 0) {
+        moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+    }
+    if (thread < n_routes) {
+        const int32_t unique = route_unique[thread];
+        if (unique < 0 || (uint32_t) unique >= plan->n_unique) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
+        plan->remapped_ids[thread] = plan->unique_slots[unique];
+    }
+    if (thread == 0) {
+        if (*clock > UINT64_MAX - plan->n_unique) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_CLOCK_EXHAUSTED);
+        }
+        plan->next_clock = *clock + plan->n_unique;
+    }
+    __syncthreads();
+    if (thread == 0) {
+        plan->status = MOE_GROUPED_PLAN_READY;
+    }
+}
+
+static __global__ void moe_grouped_gather_decode(
+        const moe_grouped_device_bank * banks,
+        uint32_t n_banks,
+        size_t words_per_miss,
+        const moe_grouped_decode_plan * plan) {
+    if (plan->status != MOE_GROUPED_PLAN_READY) {
+        return;
+    }
+    const size_t total_words = words_per_miss * plan->n_misses;
+    const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t) gridDim.x * blockDim.x;
+    for (size_t word = first; word < total_words; word += stride) {
+        const uint32_t miss = word / words_per_miss;
+        size_t bank_word = word % words_per_miss;
+        for (uint32_t bank = 0; bank < n_banks; ++bank) {
+            const auto descriptor = banks[bank];
+            const size_t bank_words = descriptor.expert_stride / sizeof(uint4);
+            if (bank_word >= bank_words) {
+                bank_word -= bank_words;
+                continue;
+            }
+            const int32_t expert = plan->miss_experts[miss];
+            const int32_t slot = plan->miss_slots[miss];
+            const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
+            uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
+            destination[bank_word] = source[bank_word];
+            break;
+        }
+    }
+}
+
+static __global__ void moe_grouped_commit_decode(
+        uint32_t n_experts,
+        uint32_t n_slots,
+        int32_t * slot_for_expert,
+        int32_t * expert_for_slot,
+        uint64_t * last_used,
+        uint64_t * clock,
+        moe_grouped_decode_plan * plan) {
+    if (blockIdx.x != 0 || plan->status != MOE_GROUPED_PLAN_READY) {
+        return;
+    }
+
+    const uint32_t thread = threadIdx.x;
+    if (thread < plan->n_misses) {
+        const int32_t expert = plan->miss_experts[thread];
+        const int32_t slot = plan->miss_slots[thread];
+        if (expert < 0 || (uint32_t) expert >= n_experts || slot < 0 || (uint32_t) slot >= n_slots) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
+        const int32_t old_expert = expert_for_slot[slot];
+        if (old_expert >= 0) {
+            slot_for_expert[old_expert] = -1;
+        }
+        expert_for_slot[slot] = expert;
+        slot_for_expert[expert] = slot;
+    }
+    __syncthreads();
+
+    if (thread < plan->n_unique) {
+        const int32_t slot = plan->unique_slots[thread];
+        last_used[slot] = plan->next_clock - plan->n_unique + thread + 1;
+    }
+    if (thread == 0) {
+        *clock = plan->next_clock;
+    }
+}
+
+static bool moe_grouped_cuda_success(cudaError_t error) {
+    if (error == cudaSuccess) {
+        return true;
+    }
+    (void) cudaGetLastError();
+    return false;
+}
+
+} // namespace
+
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
     owner_(nullptr), graph_key_(nullptr), registry_generation_(0), graph_uid_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false) {
 }
@@ -1300,7 +1646,7 @@ uint32_t ggml_cuda_moe_graph_execution::size() const {
 }
 
 struct ggml_cuda_moe_grouped_context::impl {
-    explicit impl(ggml_backend_dev_t owner) : owner(owner) {}
+    explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {}
 
     struct grouped_snapshot {
         ggml_cuda_moe_grouped_acquisition acquisition;
@@ -1310,11 +1656,63 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::vector<ggml_cuda_moe_grouped_bank_descriptor> banks;
     };
 
+    struct grouped_device_resource {
+        explicit grouped_device_resource(int device) : device(device) {}
+
+        ~grouped_device_resource() {
+            moe_grouped_device_scope device_scope(device);
+            if (completion != nullptr) {
+                if (has_completion) {
+                    (void) cudaEventSynchronize(completion);
+                }
+                (void) cudaEventDestroy(completion);
+            }
+            for (void * data : bank_data) {
+                if (data != nullptr) {
+                    (void) cudaFree(data);
+                }
+            }
+            if (slot_for_expert != nullptr) {
+                (void) cudaFree(slot_for_expert);
+            }
+            if (expert_for_slot != nullptr) {
+                (void) cudaFree(expert_for_slot);
+            }
+            if (last_used != nullptr) {
+                (void) cudaFree(last_used);
+            }
+            if (clock != nullptr) {
+                (void) cudaFree(clock);
+            }
+            if (plan != nullptr) {
+                (void) cudaFree(plan);
+            }
+            if (device_banks != nullptr) {
+                (void) cudaFree(device_banks);
+            }
+        }
+
+        int device;
+        uint32_t n_experts = 0;
+        size_t words_per_miss = 0;
+        std::vector<void *> bank_data;
+        int32_t * slot_for_expert = nullptr;
+        int32_t * expert_for_slot = nullptr;
+        uint64_t * last_used = nullptr;
+        uint64_t * clock = nullptr;
+        moe_grouped_decode_plan * plan = nullptr;
+        moe_grouped_device_bank * device_banks = nullptr;
+        cudaEvent_t completion = nullptr;
+        bool has_completion = false;
+    };
+
     struct grouped_resource {
         explicit grouped_resource(grouped_snapshot && snapshot) : snapshot(std::move(snapshot)) {}
 
         const grouped_snapshot snapshot;
+        std::unique_ptr<grouped_device_resource> device;
         uint64_t active_transaction_token = 0;
+        cudaStream_t active_decode_stream = nullptr;
     };
 
     struct resource_build_input {
@@ -1331,6 +1729,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     using resource_slots = std::vector<std::unique_ptr<grouped_resource>>;
 
     ggml_backend_dev_t owner;
+    int device;
     std::mutex resource_lifecycle_mutex;
     mutable std::mutex mutex;
     std::condition_variable resource_cv;
@@ -1373,6 +1772,34 @@ struct ggml_cuda_moe_grouped_context::impl {
         return const_cast<impl *>(this)->find_resource(transaction);
     }
 
+    grouped_resource * begin_decode(
+            const ggml_cuda_moe_complete_group_key & key,
+            cudaStream_t compute_stream,
+            ggml_cuda_moe_grouped_transaction & transaction,
+            bool & resource_missing) {
+        resource_missing = false;
+        if (draining || replacement_pending || !state.accepted || key.candidate.generation != state.generation ||
+                key.candidate.group_index >= table.groups.size()) {
+            return nullptr;
+        }
+        if (key.candidate.group_index >= resources.size() || resources[key.candidate.group_index] == nullptr) {
+            resource_missing = true;
+            return nullptr;
+        }
+        auto * resource = resources[key.candidate.group_index].get();
+        if (resource->snapshot.acquisition.candidate.generation != key.candidate.generation ||
+                resource->snapshot.acquisition.candidate.group_index != key.candidate.group_index ||
+                resource->snapshot.layout != key.layout || resource->snapshot.banks.size() != key.n_banks ||
+                resource->active_transaction_token != 0 || next_transaction_token == UINT64_MAX) {
+            return nullptr;
+        }
+        resource->active_transaction_token = ++next_transaction_token;
+        resource->active_decode_stream = compute_stream;
+        transaction.acquisition = resource->snapshot.acquisition;
+        transaction.transaction_token = resource->active_transaction_token;
+        return resource;
+    }
+
     resource_slots detach_resources() {
         resource_slots result;
         result.swap(resources);
@@ -1391,10 +1818,142 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         return false;
     }
+
+    static bool descriptor_matches(const ggml_cuda_moe_grouped_bank_descriptor & bank) {
+        if (bank.tensor == nullptr || bank.buffer == nullptr || bank.buft == nullptr ||
+                bank.tensor->buffer != bank.buffer || bank.tensor->data != bank.source_data ||
+                bank.tensor->view_src != nullptr || bank.tensor->op != GGML_OP_NONE || bank.tensor->type != bank.type || bank.buffer->buft != bank.buft ||
+                bank.buffer->size != bank.buffer_size || bank.buffer->iface.get_base == nullptr ||
+                bank.buft->iface.get_alignment == nullptr || bank.buffer->iface.get_base(bank.buffer) != bank.buffer_base ||
+                bank.buft->iface.get_alignment(bank.buft) != bank.alignment) {
+            return false;
+        }
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            if (bank.tensor->ne[dim] != bank.ne[dim] || bank.tensor->nb[dim] != bank.nb[dim]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static bool decode_eligible(const grouped_snapshot & snapshot, uint32_t * n_experts) {
+        const uint32_t expected_roles = snapshot.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ?
+            (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
+            snapshot.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT) |
+                    (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) : 0;
+        if (expected_roles == 0 || snapshot.n_slots == 0 || snapshot.n_slots > MOE_GROUPED_MAX_SLOTS ||
+                snapshot.banks.size() < 2 || snapshot.banks.size() > 3) {
+            return false;
+        }
+
+        uint32_t roles = 0;
+        uint32_t experts = 0;
+        uint32_t type = GGML_TYPE_COUNT;
+        for (const auto & bank : snapshot.banks) {
+            if (bank.role < GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ||
+                    bank.role > GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
+                    (roles & (1u << bank.role)) != 0 ||
+                    bank.encoding != GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN ||
+                    bank.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND ||
+                    (bank.index_modes & GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT) == 0 ||
+                    (bank.type != GGML_TYPE_Q4_0 && bank.type != GGML_TYPE_Q4_K) ||
+                    !ggml_backend_buft_is_cuda_moe_cached(bank.buft) || bank.ne[2] <= 0 || bank.expert_stride == 0 ||
+                    (uint64_t) bank.ne[2] > UINT32_MAX || bank.expert_stride > SIZE_MAX / snapshot.n_slots ||
+                    bank.byte_extent != bank.expert_stride * (uint64_t) bank.ne[2] || !descriptor_matches(bank)) {
+                return false;
+            }
+            if (experts == 0) {
+                experts = (uint32_t) bank.ne[2];
+                type = bank.type;
+            } else if (experts != (uint32_t) bank.ne[2] || type != bank.type) {
+                return false;
+            }
+            roles |= 1u << bank.role;
+        }
+        if (roles != expected_roles) {
+            return false;
+        }
+        *n_experts = experts;
+        return true;
+    }
+
+    std::unique_ptr<grouped_device_resource> make_device_resource(const grouped_snapshot & snapshot) const {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_UNUSED(snapshot);
+        return nullptr;
+#else
+        uint32_t n_experts = 0;
+        if (device < 0 || !decode_eligible(snapshot, &n_experts)) {
+            return nullptr;
+        }
+
+        moe_grouped_device_scope device_scope(device);
+        std::unique_ptr<grouped_device_resource> result;
+        try {
+            result = std::make_unique<grouped_device_resource>(device);
+            result->n_experts = n_experts;
+            result->bank_data.resize(snapshot.banks.size(), nullptr);
+        } catch (const std::bad_alloc &) {
+            return nullptr;
+        }
+
+        std::array<moe_grouped_device_bank, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> device_banks = {};
+        for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
+            const auto & bank = snapshot.banks[i];
+            cudaPointerAttributes attributes = {};
+            if (!moe_grouped_cuda_success(cudaPointerGetAttributes(&attributes, bank.buffer_base)) ||
+                    attributes.type != cudaMemoryTypeHost || bank.expert_stride % sizeof(uint4) != 0 ||
+                    (uintptr_t) bank.source_data % alignof(uint4) != 0) {
+                return nullptr;
+            }
+            void * alias_base = nullptr;
+            if (!moe_grouped_cuda_success(cudaHostGetDevicePointer(&alias_base, const_cast<void *>(bank.buffer_base), 0)) || alias_base == nullptr) {
+                return nullptr;
+            }
+            const size_t size = bank.expert_stride * snapshot.n_slots;
+            const size_t bank_words = bank.expert_stride / sizeof(uint4);
+            if (bank_words > SIZE_MAX - result->words_per_miss) {
+                return nullptr;
+            }
+            result->words_per_miss += bank_words;
+            if (!moe_grouped_cuda_success(cudaMalloc(&result->bank_data[i], size))) {
+                return nullptr;
+            }
+            device_banks[i].source = static_cast<const char *>(alias_base) + bank.data_offset;
+            device_banks[i].data = static_cast<char *>(result->bank_data[i]);
+            device_banks[i].expert_stride = bank.expert_stride;
+        }
+        if (result->words_per_miss > SIZE_MAX / MOE_GROUPED_MAX_DECODE_ROUTES) {
+            return nullptr;
+        }
+        if (!moe_grouped_cuda_success(cudaMalloc(&result->slot_for_expert, n_experts * sizeof(int32_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->expert_for_slot, snapshot.n_slots * sizeof(int32_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->last_used, snapshot.n_slots * sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->clock, sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->plan, sizeof(moe_grouped_decode_plan))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->device_banks, snapshot.banks.size() * sizeof(moe_grouped_device_bank))) ||
+                !moe_grouped_cuda_success(cudaEventCreateWithFlags(&result->completion, cudaEventDisableTiming))) {
+            return nullptr;
+        }
+        if (!moe_grouped_cuda_success(cudaMemset(result->slot_for_expert, 0xff, n_experts * sizeof(int32_t))) ||
+                !moe_grouped_cuda_success(cudaMemset(result->expert_for_slot, 0xff, snapshot.n_slots * sizeof(int32_t))) ||
+                !moe_grouped_cuda_success(cudaMemset(result->last_used, 0, snapshot.n_slots * sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMemset(result->clock, 0, sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMemset(result->plan, 0, sizeof(moe_grouped_decode_plan))) ||
+                !moe_grouped_cuda_success(cudaMemcpy(
+                    result->device_banks, device_banks.data(), snapshot.banks.size() * sizeof(moe_grouped_device_bank), cudaMemcpyHostToDevice))) {
+            return nullptr;
+        }
+        return result;
+#endif
+    }
 };
 
-ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner) :
-    impl_(std::make_unique<impl>(owner)) {
+ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device) :
+    impl_(std::make_unique<impl>(owner, device)) {
 }
 
 ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
@@ -1775,6 +2334,7 @@ bool ggml_cuda_moe_grouped_context::end_group_transaction(const ggml_cuda_moe_gr
         return false;
     }
     resource->active_transaction_token = 0;
+    resource->active_decode_stream = nullptr;
     impl_->resource_cv.notify_all();
     return true;
 }
@@ -1810,6 +2370,135 @@ bool ggml_cuda_moe_grouped_context::get_group_resource_bank(
     if (descriptor != nullptr) {
         *descriptor = resource->snapshot.banks[bank_index];
     }
+    return true;
+}
+
+ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decode(
+        const ggml_cuda_moe_complete_group_key & key,
+        cudaStream_t compute_stream,
+        ggml_cuda_moe_grouped_decode_acquisition * decode) {
+    if (decode == nullptr) {
+        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+    }
+    *decode = {};
+    if (compute_stream == nullptr || impl_->device < 0 || key.n_banks == 0 ||
+            key.n_banks > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
+        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+    }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+#else
+    const ggml_tensor * ids = key.ids.tensor;
+    if (ids == nullptr || ids->buffer == nullptr || ids->buffer->buft != ggml_backend_cuda_buffer_type(impl_->device) ||
+            ids->data != key.ids.data || ids->buffer != key.ids.buffer || ids->type != key.ids.type ||
+            ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[0] > MOE_GROUPED_MAX_DECODE_ROUTES ||
+            ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || !ggml_is_contiguous(ids)) {
+        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+    }
+    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+        if (ids->ne[dim] != key.ids.ne[dim] || ids->nb[dim] != key.ids.nb[dim]) {
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+    }
+
+    ggml_cuda_moe_grouped_transaction transaction = {};
+    impl::grouped_resource * resource = nullptr;
+    bool resource_missing = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
+    }
+    if (resource == nullptr && resource_missing) {
+        ggml_cuda_moe_grouped_acquisition resource_acquisition;
+        if (!acquire_group_resources(key.candidate, &resource_acquisition)) {
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
+    }
+    if (resource == nullptr || (uint32_t) ids->ne[0] > resource->snapshot.n_slots) {
+        if (resource != nullptr) {
+            (void) end_group_transaction(transaction);
+        }
+        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+    }
+
+    if (resource->device == nullptr) {
+        auto prospective = impl_->make_device_resource(resource->snapshot);
+        if (prospective == nullptr) {
+            (void) end_group_transaction(transaction);
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+        bool installed = false;
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            auto * current = impl_->find_resource(transaction);
+            if (current == resource) {
+                if (resource->device == nullptr) {
+                    resource->device = std::move(prospective);
+                }
+                installed = true;
+            }
+        }
+        if (!installed) {
+            (void) end_group_transaction(transaction);
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+    }
+
+    auto & device = *resource->device;
+    if (device.has_completion) {
+        if (!moe_grouped_cuda_success(cudaStreamWaitEvent(compute_stream, device.completion, 0))) {
+            (void) end_group_transaction(transaction);
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+    }
+
+    moe_grouped_plan_decode<<<1, MOE_GROUPED_PLAN_THREADS, 0, compute_stream>>>(
+        static_cast<const int32_t *>(ids->data), (uint32_t) ids->ne[0], device.n_experts, resource->snapshot.n_slots,
+        device.slot_for_expert, device.expert_for_slot, device.last_used, device.clock, device.plan);
+    CUDA_CHECK(cudaGetLastError());
+    moe_grouped_gather_decode<<<MOE_GROUPED_TRANSFER_BLOCKS, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+        device.device_banks, resource->snapshot.banks.size(), device.words_per_miss, device.plan);
+    CUDA_CHECK(cudaGetLastError());
+    moe_grouped_commit_decode<<<1, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+        device.n_experts, resource->snapshot.n_slots, device.slot_for_expert, device.expert_for_slot,
+        device.last_used, device.clock, device.plan);
+    CUDA_CHECK(cudaGetLastError());
+
+    decode->transaction = transaction;
+    decode->remapped_ids = device.plan->remapped_ids;
+    decode->layout = resource->snapshot.layout;
+    decode->n_banks = resource->snapshot.banks.size();
+    decode->n_slots = resource->snapshot.n_slots;
+    for (uint32_t bank = 0; bank < resource->snapshot.banks.size(); ++bank) {
+        decode->banks[bank].tensor = resource->snapshot.banks[bank].tensor;
+        decode->banks[bank].data = device.bank_data[bank];
+        decode->banks[bank].bank_index = bank;
+        decode->banks[bank].role = resource->snapshot.banks[bank].role;
+        decode->banks[bank].type = resource->snapshot.banks[bank].type;
+    }
+    return GGML_CUDA_MOE_GROUPED_DECODE_READY;
+#endif
+}
+
+bool ggml_cuda_moe_grouped_context::finish_decode(
+        const ggml_cuda_moe_grouped_decode_acquisition & decode,
+        cudaStream_t compute_stream) {
+    if (compute_stream == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto * resource = impl_->find_resource(decode.transaction);
+    if (resource == nullptr || resource->device == nullptr || resource->active_decode_stream != compute_stream) {
+        return false;
+    }
+    CUDA_CHECK(cudaEventRecord(resource->device->completion, compute_stream));
+    resource->device->has_completion = true;
+    resource->active_transaction_token = 0;
+    resource->active_decode_stream = nullptr;
+    impl_->resource_cv.notify_all();
     return true;
 }
 
@@ -2160,7 +2849,7 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v1(
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     try {
         std::call_once(ctx->moe_grouped_context_once, [&]() {
-            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device);
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device);
         });
     } catch (...) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
