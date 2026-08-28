@@ -1,0 +1,7 @@
+2026-08-27 live-context compact-mask rebase checkpoint
+
+Rebased PR 40 onto origin/llama/dev f5ad37ab2. Kept both compact causal-prefix and CUDA transient-pool registry procedures in ggml-cuda.cu. The redundant allocator fixture commit was skipped because llama/dev already contains it.
+
+Release CPU and CUDA sm_120a builds passed for llama-server, llama-cli, llama-bench, test-llama-archs, test-arg-parser, and test-alloc with shared ccache and build locks.
+
+Focused tests initially found test-live-context-workspace assumed 256 -> 512 always grows the tiny synthetic backing. With compact masks both reservations are 7328 bytes, so this is a test interaction rather than under-reservation. Local uncommitted adjustment disables flash attention in that dense grow/shrink unit test. CPU focused suite passes; CUDA test rebuild is queued behind the shared CUDA build lock.
