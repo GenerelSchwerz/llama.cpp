@@ -63,12 +63,27 @@ struct ggml_cuda_moe_candidate_bank_info {
     uint64_t generation = 0;
     uint64_t byte_extent = 0;
     uint64_t expert_stride = 0;
+    const ggml_tensor * tensor = nullptr;
+    const void * source_data = nullptr;
     uint32_t group_index = 0;
     uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     uint32_t type = GGML_TYPE_COUNT;
     uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
     uint32_t movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
     uint32_t index_modes = 0;
+};
+
+struct ggml_cuda_moe_candidate_group_key {
+    uint64_t generation = 0;
+    uint32_t group_index = 0;
+};
+
+struct ggml_cuda_moe_candidate_group_info {
+    ggml_cuda_moe_candidate_group_key key;
+    const ggml_tensor * down = nullptr;
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t n_banks = 0;
+    uint32_t n_slots = 0;
 };
 
 class ggml_cuda_moe_candidate_registry {
@@ -82,7 +97,10 @@ public:
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
     ggml_cuda_moe_candidate_registry_state state() const;
     bool find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const;
+    bool find_down_group_key(const ggml_tensor * tensor, ggml_cuda_moe_candidate_group_key * key) const;
     bool find_weight(const ggml_tensor * tensor, ggml_cuda_moe_candidate_bank_info * info) const;
+    bool get_group(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_candidate_group_info * info) const;
+    bool get_bank(const ggml_cuda_moe_candidate_group_key & key, uint32_t role, ggml_cuda_moe_candidate_bank_info * info) const;
 
 private:
     struct impl;

@@ -685,12 +685,10 @@ namespace {
 
 struct moe_candidate_bank_record {
     ggml_cuda_moe_candidate_bank_info info;
-    const ggml_tensor * tensor = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     ggml_backend_buffer_type_t buft = nullptr;
     const void * buffer_base = nullptr;
     uint64_t buffer_size = 0;
-    const void * data = nullptr;
     uint64_t data_offset = 0;
     uint64_t alignment = 0;
     int64_t ne[GGML_MAX_DIMS] = {};
@@ -817,11 +815,11 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_source(
     record.buft = buft;
     record.buffer_base = base_ptr;
     record.buffer_size = buffer->size;
-    record.tensor = tensor;
-    record.data = tensor->data;
     record.data_offset = offset;
     record.alignment = alignment;
     record.info.byte_extent = byte_extent;
+    record.info.tensor = tensor;
+    record.info.source_data = tensor->data;
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {
         record.ne[i] = tensor->ne[i];
         record.nb[i] = tensor->nb[i];
@@ -931,8 +929,8 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_aux(
 }
 
 static void moe_candidate_hash_bank(uint64_t & hash, const moe_candidate_bank_record & bank) {
-    const uintptr_t tensor = reinterpret_cast<uintptr_t>(bank.tensor);
-    const uintptr_t data = reinterpret_cast<uintptr_t>(bank.data);
+    const uintptr_t tensor = reinterpret_cast<uintptr_t>(bank.info.tensor);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(bank.info.source_data);
     const uintptr_t buffer = reinterpret_cast<uintptr_t>(bank.buffer);
     const uintptr_t buft = reinterpret_cast<uintptr_t>(bank.buft);
     const uintptr_t buffer_base = reinterpret_cast<uintptr_t>(bank.buffer_base);
@@ -1192,13 +1190,27 @@ ggml_cuda_moe_candidate_registry_state ggml_cuda_moe_candidate_registry::state()
 }
 
 bool ggml_cuda_moe_candidate_registry::find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const {
+    ggml_cuda_moe_candidate_group_key key;
+    if (!find_down_group_key(tensor, &key)) {
+        return false;
+    }
+    if (group_index != nullptr) {
+        *group_index = key.group_index;
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_candidate_registry::find_down_group_key(
+        const ggml_tensor * tensor,
+        ggml_cuda_moe_candidate_group_key * key) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto it = impl_->table.down_map.find(tensor);
     if (!impl_->state.accepted || it == impl_->table.down_map.end()) {
         return false;
     }
-    if (group_index != nullptr) {
-        *group_index = it->second;
+    if (key != nullptr) {
+        key->generation = impl_->state.generation;
+        key->group_index = it->second;
     }
     return true;
 }
@@ -1214,6 +1226,44 @@ bool ggml_cuda_moe_candidate_registry::find_weight(const ggml_tensor * tensor, g
         info->generation = impl_->state.generation;
     }
     return true;
+}
+
+bool ggml_cuda_moe_candidate_registry::get_group(
+        const ggml_cuda_moe_candidate_group_key & key,
+        ggml_cuda_moe_candidate_group_info * info) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->state.accepted || key.generation != impl_->state.generation || key.group_index >= impl_->table.groups.size()) {
+        return false;
+    }
+    if (info != nullptr) {
+        const auto & group = impl_->table.groups[key.group_index];
+        info->key = key;
+        info->down = group.down;
+        info->layout = group.layout;
+        info->n_banks = static_cast<uint32_t>(group.banks.size());
+        info->n_slots = impl_->table.n_slots;
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_candidate_registry::get_bank(
+        const ggml_cuda_moe_candidate_group_key & key,
+        uint32_t role,
+        ggml_cuda_moe_candidate_bank_info * info) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->state.accepted || key.generation != impl_->state.generation || key.group_index >= impl_->table.groups.size()) {
+        return false;
+    }
+    for (const auto & bank : impl_->table.groups[key.group_index].banks) {
+        if (bank.info.role == role) {
+            if (info != nullptr) {
+                *info = bank.info;
+                info->generation = key.generation;
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 extern "C"

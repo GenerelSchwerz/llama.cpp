@@ -175,23 +175,36 @@ static void test_candidate_registry() {
     uint32_t group_index = UINT32_MAX;
     CHECK(registry.find_down_group(down, &group_index) && group_index == 0);
     CHECK(!registry.find_down_group(gate, nullptr));
+    ggml_cuda_moe_candidate_group_key group_key;
+    CHECK(registry.find_down_group_key(down, &group_key));
+    CHECK(group_key.generation == 1 && group_key.group_index == 0);
+    ggml_cuda_moe_candidate_group_info group_info;
+    CHECK(registry.get_group(group_key, &group_info));
+    CHECK(group_info.down == down && group_info.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && group_info.n_banks == banks.size() && group_info.n_slots == 12);
     ggml_cuda_moe_candidate_bank_info info;
     CHECK(registry.find_weight(gate, &info));
-    CHECK(info.generation == 1 && info.group_index == 0 && info.type == GGML_TYPE_Q4_0);
+    CHECK(info.generation == 1 && info.group_index == 0 && info.tensor == gate && info.source_data == gate->data && info.type == GGML_TYPE_Q4_0);
     CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
     CHECK(info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND);
     CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
     CHECK(!registry.find_weight(down_scale, nullptr));
+    CHECK(registry.get_bank(group_key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, &info));
+    CHECK(info.tensor == down_bias && info.source_data == down_bias->data && info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE);
+    CHECK(!registry.get_bank(group_key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, nullptr));
 
     snapshot.n_slots = 48;
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     state = registry.state();
     CHECK(state.generation == 2 && state.n_slots == 48 && state.logical_signature == logical_signature);
     CHECK(state.slot_bound_bytes == 48 * (gate->nb[2] + up->nb[2] + down->nb[2]));
+    CHECK(!registry.get_group(group_key, nullptr) && !registry.get_bank(group_key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, nullptr));
+    CHECK(registry.find_down_group_key(down, &group_key) && group_key.generation == 2);
+    CHECK(registry.get_group(group_key, &group_info) && group_info.n_slots == 48);
     snapshot.n_slots = 12;
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     state = registry.state();
     CHECK(state.generation == 3 && state.n_slots == 12 && state.logical_signature == logical_signature);
+    CHECK(!registry.get_group(group_key, nullptr));
 
     auto expect_rejected = [&](ggml_cuda_moe_candidate_rejection rejection) {
         const uint64_t generation = registry.state().generation;
