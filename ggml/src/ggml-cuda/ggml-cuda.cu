@@ -1782,6 +1782,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
 
     const bool is_mul_mat_id = tensor->op == GGML_OP_MUL_MAT_ID;
 
+    if (is_mul_mat_id && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+        return false;
+    }
+
     bool use_mul_mat_vec_f =
         (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
@@ -1806,6 +1810,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
+
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+        return false;
+    }
 
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&

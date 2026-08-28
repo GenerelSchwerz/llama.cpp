@@ -20,6 +20,9 @@
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
 
+#include "ggml-alloc.h"
+#include "ggml-cuda.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -33,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1109,14 +1113,254 @@ static void test_grouped_graph_preflight(bool benchmark) {
     fprintf(stderr, "test-moe-cache: grouped graph preflight OK\n");
 }
 
+struct cached_fusion_test_graph {
+    ggml_context_ptr weights;
+    ggml_context_ptr auxiliaries;
+    ggml_context_ptr nodes;
+    ggml_backend_buffer_ptr weight_buffer;
+    ggml_backend_buffer_ptr auxiliary_buffer;
+    ggml_backend_buffer_ptr node_buffer;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<ggml_tensor *> leaves;
+    std::vector<ggml_tensor *> cached_weights;
+};
+
+static cached_fusion_test_graph build_cached_fusion_test_graph(
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t weight_buft) {
+    constexpr int64_t N_EXPERTS = 4;
+    constexpr int64_t N_USED = 2;
+    constexpr int64_t N_TOKENS = 1;
+    constexpr int64_t N_IN = 256;
+    constexpr int64_t N_OUT = 32;
+
+    ggml_init_params weight_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 64,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    ggml_init_params node_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(256, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+
+    cached_fusion_test_graph result;
+    result.weights.reset(ggml_init(weight_params));
+    result.auxiliaries.reset(ggml_init(weight_params));
+    result.nodes.reset(ggml_init(node_params));
+    CHECK(result.weights != nullptr && result.auxiliaries != nullptr && result.nodes != nullptr);
+
+    auto new_leaf = [&](ggml_context * ctx, ggml_type type, int n_dims, const int64_t * ne, const std::string & name) {
+        ggml_tensor * tensor = ggml_new_tensor(ctx, type, n_dims, ne);
+        ggml_set_name(tensor, name.c_str());
+        result.leaves.push_back(tensor);
+        return tensor;
+    };
+    auto new_weight = [&](ggml_type type, const std::string & name) {
+        const int64_t ne[] = {N_IN, N_OUT, N_EXPERTS};
+        ggml_tensor * tensor = new_leaf(result.weights.get(), type, 3, ne, name + ".weight");
+        result.cached_weights.push_back(tensor);
+        return tensor;
+    };
+    auto new_activation = [&](const std::string & name) {
+        const int64_t ne[] = {N_IN, N_USED, N_TOKENS};
+        return new_leaf(result.nodes.get(), GGML_TYPE_F32, 3, ne, name + ".input");
+    };
+    auto new_ids = [&](const std::string & name) {
+        const int64_t ne[] = {N_USED, N_TOKENS};
+        return new_leaf(result.nodes.get(), GGML_TYPE_I32, 2, ne, name + ".ids");
+    };
+    auto add_scale = [&](ggml_tensor * mmid, ggml_tensor * ids, const std::string & name) {
+        const int64_t ne[] = {N_EXPERTS};
+        ggml_tensor * scale = new_leaf(result.auxiliaries.get(), GGML_TYPE_F32, 1, ne, name + ".scale");
+        ggml_tensor * selected = ggml_reshape_3d(result.nodes.get(), scale, 1, N_EXPERTS, 1);
+        selected = ggml_repeat_4d(result.nodes.get(), selected, 1, N_EXPERTS, N_TOKENS, 1);
+        selected = ggml_get_rows(result.nodes.get(), selected, ids);
+        return ggml_mul(result.nodes.get(), mmid, selected);
+    };
+    auto add_bias = [&](ggml_tensor * mmid, ggml_tensor * ids, const std::string & name) {
+        const int64_t ne[] = {N_OUT, N_EXPERTS};
+        ggml_tensor * bias = new_leaf(result.nodes.get(), GGML_TYPE_F32, 2, ne, name + ".bias");
+        return ggml_add_id(result.nodes.get(), mmid, bias, ids);
+    };
+    auto build_single = [&](ggml_type type, const std::string & name, bool with_scale, bool with_bias) {
+        ggml_tensor * weight = new_weight(type, name);
+        ggml_tensor * input = new_activation(name);
+        ggml_tensor * ids = new_ids(name);
+        ggml_tensor * output = ggml_mul_mat_id(result.nodes.get(), weight, input, ids);
+        if (with_scale) {
+            output = add_scale(output, ids, name);
+        }
+        if (with_bias) {
+            output = add_bias(output, ids, name);
+        }
+        return output;
+    };
+    auto build_pair = [&](ggml_type type, const std::string & name, bool with_scale, bool with_bias) {
+        ggml_tensor * gate_weight = new_weight(type, name + ".gate");
+        ggml_tensor * up_weight = new_weight(type, name + ".up");
+        ggml_tensor * input = new_activation(name);
+        ggml_tensor * ids = new_ids(name);
+        ggml_tensor * gate = ggml_mul_mat_id(result.nodes.get(), gate_weight, input, ids);
+        ggml_tensor * up = ggml_mul_mat_id(result.nodes.get(), up_weight, input, ids);
+        if (with_scale) {
+            gate = add_scale(gate, ids, name + ".gate");
+            up = add_scale(up, ids, name + ".up");
+        }
+        if (with_bias) {
+            gate = add_bias(gate, ids, name + ".gate");
+            up = add_bias(up, ids, name + ".up");
+        }
+        return ggml_glu_split(result.nodes.get(), gate, up, GGML_GLU_OP_SWIGLU);
+    };
+
+    std::vector<ggml_tensor *> outputs;
+    outputs.push_back(build_single(GGML_TYPE_Q4_0, "test.ordinary.q4_0", false, false));
+    outputs.push_back(build_single(GGML_TYPE_Q4_K, "test.ordinary.q4_k", false, false));
+    outputs.push_back(build_pair(GGML_TYPE_NVFP4, "test.f1.no_bias", true, false));
+    outputs.push_back(build_pair(GGML_TYPE_NVFP4, "test.f1.bias", true, true));
+    outputs.push_back(build_pair(GGML_TYPE_Q4_0, "test.f2.q4_0", false, true));
+    outputs.push_back(build_pair(GGML_TYPE_Q4_K, "test.f2.q4_k", false, true));
+    outputs.push_back(build_pair(GGML_TYPE_Q4_0, "test.f3.q4_0", false, false));
+    outputs.push_back(build_pair(GGML_TYPE_Q4_K, "test.f3.q4_k", false, false));
+    outputs.push_back(build_single(GGML_TYPE_NVFP4, "test.f4.no_bias", true, false));
+    outputs.push_back(build_single(GGML_TYPE_NVFP4, "test.f4.bias", true, true));
+    outputs.push_back(build_single(GGML_TYPE_Q4_0, "test.f5.q4_0", false, true));
+    outputs.push_back(build_single(GGML_TYPE_Q4_K, "test.f5.q4_k", false, true));
+    outputs.push_back(build_single(GGML_TYPE_BF16, "test.f5.bf16", false, true));
+
+    result.output = outputs[0];
+    for (size_t i = 1; i < outputs.size(); ++i) {
+        result.output = ggml_add(result.nodes.get(), result.output, outputs[i]);
+    }
+    ggml_set_name(result.output, "test.cached_fusion.output");
+
+    result.graph = ggml_new_graph_custom(result.nodes.get(), 256, false);
+    ggml_build_forward_expand(result.graph, result.output);
+    result.weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result.weights.get(), weight_buft));
+    result.auxiliary_buffer.reset(ggml_backend_alloc_ctx_tensors(result.auxiliaries.get(), backend));
+    result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
+    CHECK(result.weight_buffer != nullptr && result.auxiliary_buffer != nullptr && result.node_buffer != nullptr);
+    ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_buffer_set_usage(result.auxiliary_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return result;
+}
+
+static std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t salt) {
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    if (tensor->type == GGML_TYPE_I32) {
+        std::vector<int32_t> values(ggml_nelements(tensor));
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = i % 2 == 0 ? 0 : 2;
+        }
+        memcpy(bytes.data(), values.data(), bytes.size());
+        return bytes;
+    }
+
+    std::vector<float> values(ggml_nelements(tensor));
+    const bool scale = strstr(tensor->name, ".scale") != nullptr;
+    const bool bias = strstr(tensor->name, ".bias") != nullptr;
+    for (size_t i = 0; i < values.size(); ++i) {
+        const int phase = static_cast<int>((i + 3 * salt) % 17) - 8;
+        values[i] = scale ? 0.75f + 0.025f * (phase + 8) : (bias ? 0.01f : 0.035f) * phase;
+    }
+
+    if (tensor->type == GGML_TYPE_F32) {
+        memcpy(bytes.data(), values.data(), bytes.size());
+    } else if (tensor->type == GGML_TYPE_BF16) {
+        ggml_fp32_to_bf16_row_ref(values.data(), reinterpret_cast<ggml_bf16_t *>(bytes.data()), values.size());
+    } else {
+        CHECK(ggml_is_quantized(tensor->type));
+        const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
+        CHECK(ggml_quantize_chunk(tensor->type, values.data(), bytes.data(), 0, nrows, tensor->ne[0], nullptr) == bytes.size());
+    }
+    return bytes;
+}
+
+static void test_cached_mmid_fusion_decline() {
+    ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(0));
+    ggml_backend_ptr cpu_backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    CHECK(cuda_backend != nullptr && cpu_backend != nullptr);
+
+    const int old_slots = ggml_backend_cuda_moe_get_cache_slots();
+    ggml_backend_cuda_moe_set_cache_slots(4);
+    ggml_cuda_moe_cache_free_all();
+
+    cached_fusion_test_graph cuda_graph = build_cached_fusion_test_graph(
+        cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type());
+    cached_fusion_test_graph cpu_graph = build_cached_fusion_test_graph(
+        cpu_backend.get(), ggml_backend_cpu_buffer_type());
+    CHECK(cuda_graph.leaves.size() == cpu_graph.leaves.size());
+    CHECK(cuda_graph.cached_weights.size() == 19);
+
+    for (size_t i = 0; i < cuda_graph.leaves.size(); ++i) {
+        CHECK(cuda_graph.leaves[i]->type == cpu_graph.leaves[i]->type);
+        CHECK(ggml_nbytes(cuda_graph.leaves[i]) == ggml_nbytes(cpu_graph.leaves[i]));
+        std::vector<uint8_t> data = cached_fusion_test_data(cuda_graph.leaves[i], i);
+        ggml_backend_tensor_set(cuda_graph.leaves[i], data.data(), 0, data.size());
+        ggml_backend_tensor_set(cpu_graph.leaves[i], data.data(), 0, data.size());
+    }
+    bool all_sources_dispatched = true;
+    for (ggml_tensor * weight : cuda_graph.cached_weights) {
+        CHECK(weight->buffer != nullptr && ggml_backend_buft_is_cuda_moe_cached(weight->buffer->buft));
+    }
+
+    CHECK(ggml_backend_graph_compute(cpu_backend.get(), cpu_graph.graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_backend_graph_compute(cuda_backend.get(), cuda_graph.graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(cpu_backend.get());
+    ggml_backend_synchronize(cuda_backend.get());
+
+    std::vector<float> expected(ggml_nelements(cpu_graph.output));
+    std::vector<float> actual(ggml_nelements(cuda_graph.output));
+    ggml_backend_tensor_get(cpu_graph.output, expected.data(), 0, ggml_nbytes(cpu_graph.output));
+    ggml_backend_tensor_get(cuda_graph.output, actual.data(), 0, ggml_nbytes(cuda_graph.output));
+    double squared_error = 0.0;
+    double squared_expected = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+        const double difference = actual[i] - expected[i];
+        squared_error += difference * difference;
+        squared_expected += static_cast<double>(expected[i]) * expected[i];
+    }
+    CHECK(squared_expected > 0.0 && squared_error / squared_expected < 2e-2);
+
+    for (ggml_tensor * weight : cuda_graph.cached_weights) {
+        ggml_cuda_moe_cache * cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
+            0, weight->data, weight->nb[2], 4, weight->ne[2], weight->name);
+        CHECK(cache != nullptr);
+        uint64_t hits = 0;
+        uint64_t misses = 0;
+        uint64_t evictions = 0;
+        ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
+        if (hits + misses != 2) {
+            fprintf(stderr, "FAIL cached fusion source %s: hits=%llu misses=%llu\n", weight->name,
+                static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses));
+            all_sources_dispatched = false;
+        }
+    }
+    CHECK(all_sources_dispatched);
+
+    ggml_cuda_moe_cache_free_all();
+    ggml_backend_cuda_moe_set_cache_slots(old_slots);
+    fprintf(stderr, "test-moe-cache: cached MMID F1-F5 decline OK\n");
+}
+
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
+    const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_grouped_context_resources();
     test_grouped_graph_preflight(registry_bench);
     if (registry_only || registry_bench) {
+        return 0;
+    }
+
+    test_cached_mmid_fusion_decline();
+    if (cached_fusion_only) {
         return 0;
     }
 
