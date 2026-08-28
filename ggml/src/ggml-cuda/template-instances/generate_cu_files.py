@@ -183,7 +183,7 @@ for ncols in [8, 16, 32, 64]:
                     f.write(SOURCE_FATTN_MMA_QUANT_CASE.format(
                         type_k=type_k, head_size=head_size,
                         ncols1=ncols1, ncols2=ncols2))
-                if type_k == "GGML_TYPE_Q8_0" and ncols1 == 8 and ncols2 == 8:
+                if type_k in ("GGML_TYPE_Q4_0", "GGML_TYPE_Q8_0") and ncols1 == 8 and ncols2 == 8:
                     f.write(SOURCE_FATTN_MMA_QUANT_CASE_SYMMETRIC.format(
                         type_k=type_k, head_size=512,
                         ncols1=ncols1, ncols2=ncols2))
