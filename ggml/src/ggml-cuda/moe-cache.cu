@@ -1715,13 +1715,22 @@ int32_t ggml_cuda_moe_graph_plan::graph_node_count() const {
     return initialized_ ? graph_node_count_ : 0;
 }
 
-ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() : plan_(nullptr), n_groups_(0) {
+ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() : plan_(nullptr), owner_(nullptr), n_groups_(0), dispatch_active_(false) {
+}
+
+ggml_cuda_moe_graph_execution::~ggml_cuda_moe_graph_execution() {
+    reset();
 }
 
 void ggml_cuda_moe_graph_execution::reset() {
+    if (dispatch_active_ && owner_ != nullptr) {
+        (void) owner_->finish_graph_dispatch(this);
+    }
     plan_lease_.reset();
     plan_ = nullptr;
+    owner_ = nullptr;
     n_groups_ = 0;
+    dispatch_active_ = false;
 }
 
 void ggml_cuda_moe_graph_execution::retain(const std::shared_ptr<const ggml_cuda_moe_graph_plan> & plan) {
@@ -1738,11 +1747,23 @@ bool ggml_cuda_moe_graph_execution::find(const ggml_tensor * node, ggml_cuda_moe
         return false;
     }
     if (binding != nullptr) {
-        binding->key = groups_[entry->group_record];
+        binding->key = groups_[entry->group_record].key;
         binding->role = entry->role;
         binding->bank_index = entry->bank_index;
     }
     return true;
+}
+
+const ggml_cuda_moe_group_call_lease * ggml_cuda_moe_graph_execution::find_authority(const ggml_tensor * node) const {
+    if (plan_ == nullptr || !dispatch_active_) {
+        return nullptr;
+    }
+    const auto * entry = plan_->find(node);
+    if (entry == nullptr || entry->group_record >= n_groups_) {
+        return nullptr;
+    }
+    const auto & authority = groups_[entry->group_record].authority;
+    return authority ? &authority : nullptr;
 }
 
 uint32_t ggml_cuda_moe_graph_execution::size() const {
@@ -1754,6 +1775,47 @@ static void ggml_cuda_moe_cache_set_metadata(
         const char * tensor_name,
         const void * tensor_data,
         int64_t n_experts);
+
+ggml_cuda_moe_group_call_lease::ggml_cuda_moe_group_call_lease() noexcept = default;
+
+ggml_cuda_moe_group_call_lease::~ggml_cuda_moe_group_call_lease() {
+    if (owner_ != nullptr) {
+        owner_->end_group_call(*this);
+    }
+}
+
+ggml_cuda_moe_group_call_lease::ggml_cuda_moe_group_call_lease(ggml_cuda_moe_group_call_lease && other) noexcept :
+        owner_(other.owner_),
+        candidate_generation_(other.candidate_generation_),
+        authority_epoch_(other.authority_epoch_),
+        group_index_(other.group_index_),
+        authority_(other.authority_) {
+    other.owner_ = nullptr;
+}
+
+ggml_cuda_moe_group_call_lease & ggml_cuda_moe_group_call_lease::operator=(ggml_cuda_moe_group_call_lease && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (owner_ != nullptr) {
+        owner_->end_group_call(*this);
+    }
+    owner_ = other.owner_;
+    candidate_generation_ = other.candidate_generation_;
+    authority_epoch_ = other.authority_epoch_;
+    group_index_ = other.group_index_;
+    authority_ = other.authority_;
+    other.owner_ = nullptr;
+    return *this;
+}
+
+ggml_cuda_moe_group_call_lease::operator bool() const noexcept {
+    return owner_ != nullptr;
+}
+
+ggml_cuda_moe_group_authority ggml_cuda_moe_group_call_lease::authority() const noexcept {
+    return authority_;
+}
 
 ggml_cuda_moe_legacy_operation_lease::ggml_cuda_moe_legacy_operation_lease() noexcept = default;
 
@@ -1926,7 +1988,15 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::array<moe_candidate_bank_record, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> banks;
     };
 
+    struct group_authority_record {
+        uint64_t epoch = 0;
+        uint32_t active_calls = 0;
+        ggml_cuda_moe_group_authority authority = GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
+        bool admission_closed = false;
+    };
+
     using legacy_record_map = std::unordered_map<const ggml_tensor *, std::unique_ptr<legacy_record>>;
+    using legacy_record_list = std::vector<std::unique_ptr<legacy_record>>;
     using resource_slots = std::vector<std::unique_ptr<grouped_resource>>;
 
     ggml_backend_dev_t owner;
@@ -1940,8 +2010,10 @@ struct ggml_cuda_moe_grouped_context::impl {
     legacy_record_map legacy_records;
     resource_slots resources;
     std::array<uint8_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> refreshing = {};
+    std::array<group_authority_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> group_authorities = {};
     uint64_t next_resource_generation = 0;
     uint64_t next_transaction_token = 0;
+    uint64_t next_group_authority_epoch = 0;
     uint32_t active_maintenance = 0;
     uint32_t active_legacy_operations = 0;
     uint64_t next_legacy_authority_epoch = 0;
@@ -1951,6 +2023,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     moe_cache_op_phase_stats legacy_op_stats[2];
     moe_cache_telemetry retired_telemetry;
     bool replacement_pending = false;
+    bool authority_transition_pending = false;
     bool draining = false;
     bool shutdown_complete = false;
 
@@ -2051,6 +2124,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     }
 
     void retire_legacy_records(legacy_record_map records);
+    void retire_legacy_records(legacy_record_list records);
 
     bool has_active_transaction() const {
         for (const auto & resource : resources) {
@@ -2059,6 +2133,41 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
         return false;
+    }
+
+    bool has_active_group_call() const {
+        for (const auto & authority : group_authorities) {
+            if (authority.active_calls != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool group_has_active_transaction(uint32_t group_index) const {
+        return group_index < resources.size() && resources[group_index] != nullptr &&
+            resources[group_index]->active_transaction_token != 0;
+    }
+
+    bool group_has_active_legacy_lease(uint32_t group_index) const {
+        for (const auto & entry : legacy_records) {
+            if (entry.second->acquisition.registered_source && entry.second->acquisition.group_index == group_index &&
+                    entry.second->active_leases != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool reset_group_authorities(uint32_t n_groups) {
+        if (n_groups > group_authorities.size() || n_groups > UINT64_MAX - next_group_authority_epoch) {
+            return false;
+        }
+        group_authorities = {};
+        for (uint32_t group_index = 0; group_index < n_groups; ++group_index) {
+            group_authorities[group_index].epoch = ++next_group_authority_epoch;
+        }
+        return true;
     }
 
     bool has_active_legacy_lease() const {
@@ -2482,11 +2591,13 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
             impl_->replacement_pending = true;
             impl_->resource_cv.wait(lock, [&]() {
                 return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
-                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
+                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
             });
             retired = impl_->detach_resources();
             retired_legacy = impl_->detach_legacy_records();
             impl_->refreshing.fill(0);
+            impl_->authority_transition_pending = false;
+            (void) impl_->reset_group_authorities(0);
             impl_->table = {};
             if (impl_->state.generation == UINT64_MAX) {
                 impl_->state = {};
@@ -2539,18 +2650,24 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
             impl_->replacement_pending = true;
             impl_->resource_cv.wait(lock, [&]() {
                 return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
-                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
+                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
             });
             retired = impl_->detach_resources();
             retired_legacy = impl_->detach_legacy_records();
             impl_->refreshing.fill(0);
-            if (impl_->state.generation == UINT64_MAX) {
+            impl_->authority_transition_pending = false;
+            if (impl_->state.generation == UINT64_MAX || table.groups.size() > UINT64_MAX - impl_->next_group_authority_epoch) {
+                const uint64_t generation = impl_->state.generation == UINT64_MAX ? UINT64_MAX : impl_->state.generation + 1;
+                impl_->group_authorities = {};
                 impl_->table = {};
-                impl_->state.accepted = 0;
+                impl_->state = {};
+                impl_->state.generation = generation;
                 impl_->state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
                 published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
             } else {
                 const uint64_t generation = impl_->state.generation + 1;
+                const bool reset = impl_->reset_group_authorities(static_cast<uint32_t>(table.groups.size()));
+                GGML_ASSERT(reset);
                 impl_->table = std::move(table);
                 impl_->state = {};
                 impl_->state.generation = generation;
@@ -2663,7 +2780,8 @@ bool ggml_cuda_moe_grouped_context::get_bank(
 ggml_cuda_moe_legacy_operation_lease ggml_cuda_moe_grouped_context::begin_legacy_operation() {
     ggml_cuda_moe_legacy_operation_lease result;
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->draining || impl_->replacement_pending || impl_->active_legacy_operations == UINT32_MAX) {
+    if (impl_->draining || impl_->replacement_pending || impl_->authority_transition_pending ||
+            impl_->active_legacy_operations == UINT32_MAX) {
         return result;
     }
     ++impl_->active_legacy_operations;
@@ -2681,15 +2799,36 @@ void ggml_cuda_moe_grouped_context::end_legacy_operation(ggml_cuda_moe_legacy_op
 
 ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_cache(
         const ggml_tensor * tensor,
-        const ggml_cuda_moe_legacy_acquisition * expected) {
+        const ggml_cuda_moe_legacy_acquisition * expected,
+        const ggml_cuda_moe_group_call_lease * authority) {
     ggml_cuda_moe_legacy_cache_lease result;
     if (tensor == nullptr) {
         return result;
     }
 
+    auto authority_matches = [&](const ggml_cuda_moe_legacy_acquisition & acquisition) {
+        if (!acquisition.registered_source) {
+            return authority == nullptr;
+        }
+        if (acquisition.candidate_generation != impl_->state.generation ||
+                acquisition.group_index >= impl_->table.groups.size()) {
+            return false;
+        }
+        const auto & current = impl_->group_authorities[acquisition.group_index];
+        if (current.admission_closed || current.authority != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY ||
+                acquisition.group_authority_epoch != current.epoch) {
+            return false;
+        }
+        return authority == nullptr ||
+            (authority->owner_ == this && authority->candidate_generation_ == impl_->state.generation &&
+                authority->authority_epoch_ == current.epoch && authority->group_index_ == acquisition.group_index &&
+                authority->authority_ == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY && current.active_calls != 0);
+    };
+
     auto acquire_record = [&](bool allow_missing_cache) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->draining || impl_->replacement_pending || impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+        if (impl_->draining || impl_->replacement_pending || impl_->authority_transition_pending ||
+                impl_->state.generation == 0 || impl_->state.n_slots == 0) {
             return false;
         }
         auto existing = impl_->legacy_records.find(tensor);
@@ -2697,7 +2836,8 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
             return false;
         }
         auto * record = existing->second.get();
-        if ((!allow_missing_cache && record->cache == nullptr) || record->active_leases == UINT32_MAX) {
+        if ((!allow_missing_cache && record->cache == nullptr) || record->active_leases == UINT32_MAX ||
+                !authority_matches(record->acquisition)) {
             return false;
         }
         if (expected != nullptr) {
@@ -2705,6 +2845,7 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
             if (expected->owner != this || expected->tensor != tensor ||
                     expected->candidate_generation != acquisition.candidate_generation ||
                     expected->authority_epoch != acquisition.authority_epoch ||
+                    expected->group_authority_epoch != acquisition.group_authority_epoch ||
                     expected->group_index != acquisition.group_index || expected->role != acquisition.role ||
                     expected->n_slots != acquisition.n_slots || expected->registered_source != acquisition.registered_source) {
                 return false;
@@ -2730,7 +2871,8 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
     bool installed = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->draining || impl_->replacement_pending || impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+        if (impl_->draining || impl_->replacement_pending || impl_->authority_transition_pending ||
+                impl_->state.generation == 0 || impl_->state.n_slots == 0) {
             return result;
         }
 
@@ -2780,10 +2922,19 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                             bank.info.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
                         return result;
                     }
+                    const auto & group_authority = impl_->group_authorities[reverse->second.group_index];
+                    if (group_authority.admission_closed ||
+                            group_authority.authority != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
+                        return result;
+                    }
                     prospective->acquisition.group_index = reverse->second.group_index;
                     prospective->acquisition.role = bank.info.role;
+                    prospective->acquisition.group_authority_epoch = group_authority.epoch;
                     prospective->acquisition.registered_source = 1;
                 }
+            }
+            if (!authority_matches(prospective->acquisition)) {
+                return result;
             }
             try {
                 existing = impl_->legacy_records.emplace(tensor, std::move(prospective)).first;
@@ -2798,10 +2949,14 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
             if (expected->owner != this || expected->tensor != tensor ||
                     expected->candidate_generation != acquisition.candidate_generation ||
                     expected->authority_epoch != acquisition.authority_epoch ||
+                    expected->group_authority_epoch != acquisition.group_authority_epoch ||
                     expected->group_index != acquisition.group_index || expected->role != acquisition.role ||
                     expected->n_slots != acquisition.n_slots || expected->registered_source != acquisition.registered_source) {
                 return result;
             }
+        }
+        if (!authority_matches(record->acquisition)) {
+            return result;
         }
         if (record->cache != nullptr) {
             if (record->active_leases == UINT32_MAX) {
@@ -2858,9 +3013,9 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         auto existing = impl_->legacy_records.find(tensor);
-        if (!impl_->draining && !impl_->replacement_pending && existing != impl_->legacy_records.end() &&
+        if (!impl_->draining && !impl_->replacement_pending && !impl_->authority_transition_pending && existing != impl_->legacy_records.end() &&
                 existing->second.get() == record && record->building_cache && impl::legacy_record_matches(*record, tensor) && record->cache == nullptr &&
-                record->active_leases != UINT32_MAX && prospective != nullptr) {
+                record->active_leases != UINT32_MAX && prospective != nullptr && authority_matches(record->acquisition)) {
             record->cache = prospective;
             prospective = nullptr;
             record->active_leases++;
@@ -2917,7 +3072,10 @@ void ggml_cuda_moe_grouped_context::prefetch_legacy_siblings(
         auto * record = static_cast<impl::legacy_record *>(source.record_);
         if (impl_->draining || impl_->replacement_pending || record->active_leases == 0 ||
                 source.acquisition_.candidate_generation != impl_->state.generation ||
-                source.acquisition_.group_index >= impl_->table.groups.size()) {
+                source.acquisition_.group_index >= impl_->table.groups.size() ||
+                source.acquisition_.group_authority_epoch != impl_->group_authorities[source.acquisition_.group_index].epoch ||
+                impl_->group_authorities[source.acquisition_.group_index].authority != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY ||
+                impl_->group_authorities[source.acquisition_.group_index].admission_closed) {
             return;
         }
         const auto & group = impl_->table.groups[source.acquisition_.group_index];
@@ -3382,6 +3540,9 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         uint32_t required_roles = 0;
         uint32_t seen_roles = 0;
         uint32_t n_banks = 0;
+        const ggml_tensor * authority_node = nullptr;
+        uint32_t authority_node_index = 0;
+        bool observed = false;
         bool eligible = false;
         bool invalid = false;
         bool has_ids = false;
@@ -3480,6 +3641,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const auto & group = impl_->table.groups[entry.group_index];
         const auto & bank = group.banks[entry.bank_index];
         auto & observation = observations[entry.group_index];
+        if (!observation.observed) {
+            observation.authority_node = node;
+            observation.authority_node_index = node_index;
+            observation.observed = true;
+        }
         const ggml_tensor * ids = node->src[2];
         if (!observation.eligible || !moe_candidate_record_matches(bank, node->src[0]) || !moe_candidate_ids_valid(ids) ||
                 ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || node->ne[2] != 1 || node->ne[3] != 1) {
@@ -3515,7 +3681,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     for (uint32_t group_index = 0; group_index < impl_->table.groups.size(); ++group_index) {
         const auto & group = impl_->table.groups[group_index];
         const auto & observation = observations[group_index];
-        if (!observation.eligible || observation.invalid || !observation.has_ids || observation.seen_roles != observation.required_roles) {
+        if (!observation.observed) {
             continue;
         }
         if (plan->n_groups_ == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
@@ -3528,18 +3694,27 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         record = {};
         record.candidate.generation = impl_->state.generation;
         record.candidate.group_index = group_index;
+        record.layout = group.layout;
+        record.n_banks = group.banks.size();
+        record.authority_node = observation.authority_node;
+        record.authority_node_index = observation.authority_node_index;
+        const bool grouped_eligible = observation.eligible && !observation.invalid && observation.has_ids &&
+            observation.seen_roles == observation.required_roles;
+        record.classification = grouped_eligible ? GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE : GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY;
+        auto & key = execution->groups_[record_index];
+        key.key.candidate = record.candidate;
+        key.key.layout = record.layout;
+        key.key.n_banks = record.n_banks;
+        key.classification = record.classification;
+        if (!grouped_eligible) {
+            continue;
+        }
         record.ids = observation.route.ids;
         record.ids_root = observation.route.root;
         record.ids_source = observation.route.source;
-        record.layout = group.layout;
-        record.n_banks = observation.n_banks;
         record.ids_root_node_index = observation.route.root_node_index;
         record.ids_node_index = observation.route.ids_node_index;
-        auto & key = execution->groups_[record_index];
-        key.candidate = record.candidate;
-        key.ids = record.ids;
-        key.layout = record.layout;
-        key.n_banks = record.n_banks;
+        key.key.ids = record.ids;
         for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
                 role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
             if ((observation.required_roles & (1u << role)) == 0) {
@@ -3557,6 +3732,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         }
     }
     execution->plan_ = plan;
+    execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
     execution->n_groups_ = plan->n_groups_;
 }
 
@@ -3596,6 +3772,31 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         }
         const auto & group = impl_->table.groups[record.candidate.group_index];
         if (group.layout != record.layout || group.banks.size() != record.n_banks) {
+            return false;
+        }
+        if (record.classification == GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY) {
+            if (record.authority_node_index >= static_cast<uint32_t>(n_nodes)) {
+                return false;
+            }
+            const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.authority_node_index);
+            if (node == nullptr || node != record.authority_node || node->op != GGML_OP_MUL_MAT_ID ||
+                    (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr) {
+                return false;
+            }
+            const auto reverse = impl_->table.reverse_map.find(node->src[0]);
+            if (reverse == impl_->table.reverse_map.end() || reverse->second.group_index != record.candidate.group_index ||
+                    reverse->second.bank_index >= group.banks.size() ||
+                    !moe_candidate_record_matches(group.banks[reverse->second.bank_index], node->src[0])) {
+                return false;
+            }
+            auto & dispatch = execution->groups_[record_index];
+            dispatch.key.candidate = record.candidate;
+            dispatch.key.layout = record.layout;
+            dispatch.key.n_banks = record.n_banks;
+            dispatch.classification = record.classification;
+            continue;
+        }
+        if (record.classification != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE) {
             return false;
         }
         uint32_t first_node_index = static_cast<uint32_t>(n_nodes);
@@ -3669,13 +3870,15 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         if (!moe_candidate_ids_equal(ids_signature, record.ids)) {
             return false;
         }
-        auto & key = execution->groups_[record_index];
-        key.candidate = record.candidate;
-        key.ids = ids_signature;
-        key.layout = record.layout;
-        key.n_banks = record.n_banks;
+        auto & dispatch = execution->groups_[record_index];
+        dispatch.key.candidate = record.candidate;
+        dispatch.key.ids = ids_signature;
+        dispatch.key.layout = record.layout;
+        dispatch.key.n_banks = record.n_banks;
+        dispatch.classification = record.classification;
     }
     execution->plan_ = &plan;
+    execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
     execution->n_groups_ = plan.n_groups_;
     return true;
 }
@@ -3716,6 +3919,187 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
     return GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED;
 }
 
+bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
+        ggml_cuda_moe_graph_execution * execution,
+        bool grouped_enabled) {
+    if (execution == nullptr) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    const uint32_t n_groups = execution->n_groups_;
+    const uint64_t generation = execution->plan_ != nullptr ? execution->plan_->registry_generation_ : 0;
+    std::array<ggml_cuda_moe_group_authority, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> desired = {};
+    std::array<uint8_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> barrier = {};
+    size_t legacy_capacity = 0;
+    size_t resource_capacity = 0;
+    bool has_barrier = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (execution->dispatch_active_ || execution->owner_ != this || execution->plan_ == nullptr ||
+                execution->plan_->owner_ != impl_.get() || impl_->draining || impl_->replacement_pending ||
+                !impl_->state.accepted || generation != impl_->state.generation || n_groups > impl_->table.groups.size()) {
+            return false;
+        }
+        uint64_t epoch_count = 0;
+        for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+            const auto & dispatch = execution->groups_[record_index];
+            const uint32_t group_index = dispatch.key.candidate.group_index;
+            if (dispatch.authority || dispatch.key.candidate.generation != generation ||
+                    group_index >= impl_->table.groups.size()) {
+                return false;
+            }
+            desired[record_index] = grouped_enabled &&
+                    dispatch.classification == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE ?
+                GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED : GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
+            const auto & current = impl_->group_authorities[group_index];
+            const bool has_wrong_resource = desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY &&
+                group_index < impl_->resources.size() && impl_->resources[group_index] != nullptr;
+            barrier[record_index] = current.authority != desired[record_index] || has_wrong_resource ||
+                (desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED && current.active_calls != 0);
+            has_barrier = has_barrier || barrier[record_index];
+            epoch_count += current.authority != desired[record_index];
+            if (current.active_calls == UINT32_MAX || epoch_count > UINT64_MAX - impl_->next_group_authority_epoch) {
+                return false;
+            }
+        }
+        legacy_capacity = impl_->table.reverse_map.size();
+        resource_capacity = impl_->resources.size();
+    }
+
+    if (!has_barrier) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->draining || impl_->replacement_pending || !impl_->state.accepted || generation != impl_->state.generation) {
+            return false;
+        }
+        for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+            const uint32_t group_index = execution->groups_[record_index].key.candidate.group_index;
+            auto & current = impl_->group_authorities[group_index];
+            if (current.admission_closed || current.authority != desired[record_index] || current.active_calls == UINT32_MAX) {
+                return false;
+            }
+            ++current.active_calls;
+            auto & lease = execution->groups_[record_index].authority;
+            lease.owner_ = this;
+            lease.candidate_generation_ = generation;
+            lease.authority_epoch_ = current.epoch;
+            lease.group_index_ = group_index;
+            lease.authority_ = current.authority;
+        }
+        execution->dispatch_active_ = true;
+        return true;
+    }
+
+    impl::legacy_record_list retired_legacy;
+    impl::resource_slots retired_resources;
+    try {
+        retired_legacy.reserve(legacy_capacity);
+        retired_resources.resize(resource_capacity);
+    } catch (const std::bad_alloc &) {
+        return false;
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(impl_->mutex);
+        if (impl_->draining || impl_->replacement_pending || !impl_->state.accepted || generation != impl_->state.generation) {
+            return false;
+        }
+        for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+            if (barrier[record_index]) {
+                impl_->group_authorities[execution->groups_[record_index].key.candidate.group_index].admission_closed = true;
+            }
+        }
+        impl_->authority_transition_pending = true;
+        impl_->resource_cv.wait(lock, [&]() {
+            if (impl_->active_maintenance != 0 || impl_->active_legacy_operations != 0) {
+                return false;
+            }
+            for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+                if (!barrier[record_index]) {
+                    continue;
+                }
+                const uint32_t group_index = execution->groups_[record_index].key.candidate.group_index;
+                if (impl_->group_authorities[group_index].active_calls != 0 || impl_->group_has_active_transaction(group_index) ||
+                        impl_->group_has_active_legacy_lease(group_index)) {
+                    return false;
+                }
+            }
+            return true;
+        });
+        for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+            if (!barrier[record_index]) {
+                continue;
+            }
+            const uint32_t group_index = execution->groups_[record_index].key.candidate.group_index;
+            if (desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
+                if (group_index < impl_->resources.size()) {
+                    retired_resources[group_index] = std::move(impl_->resources[group_index]);
+                }
+                impl_->refreshing[group_index] = 0;
+            } else {
+                for (auto it = impl_->legacy_records.begin(); it != impl_->legacy_records.end();) {
+                    if (it->second->acquisition.registered_source && it->second->acquisition.group_index == group_index) {
+                        retired_legacy.push_back(std::move(it->second));
+                        it = impl_->legacy_records.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+        }
+    }
+
+    impl::retire_resources(std::move(retired_resources));
+    impl_->retire_legacy_records(std::move(retired_legacy));
+
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        GGML_ASSERT(!impl_->draining && !impl_->replacement_pending && impl_->state.accepted && generation == impl_->state.generation);
+        for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+            const uint32_t group_index = execution->groups_[record_index].key.candidate.group_index;
+            auto & current = impl_->group_authorities[group_index];
+            if (current.authority != desired[record_index]) {
+                current.authority = desired[record_index];
+                current.epoch = ++impl_->next_group_authority_epoch;
+            }
+            current.admission_closed = false;
+            ++current.active_calls;
+            auto & lease = execution->groups_[record_index].authority;
+            lease.owner_ = this;
+            lease.candidate_generation_ = generation;
+            lease.authority_epoch_ = current.epoch;
+            lease.group_index_ = group_index;
+            lease.authority_ = current.authority;
+        }
+        impl_->authority_transition_pending = false;
+        execution->dispatch_active_ = true;
+    }
+    impl_->resource_cv.notify_all();
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution) {
+    if (execution == nullptr || execution->owner_ != this || !execution->dispatch_active_) {
+        return false;
+    }
+    execution->dispatch_active_ = false;
+    for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
+        execution->groups_[record_index].authority = {};
+    }
+    return true;
+}
+
+void ggml_cuda_moe_grouped_context::end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    GGML_ASSERT(lease.owner_ == this && lease.group_index_ < impl_->table.groups.size());
+    auto & current = impl_->group_authorities[lease.group_index_];
+    GGML_ASSERT(lease.candidate_generation_ == impl_->state.generation && lease.authority_epoch_ == current.epoch &&
+        lease.authority_ == current.authority && current.active_calls > 0);
+    --current.active_calls;
+    lease.owner_ = nullptr;
+    impl_->resource_cv.notify_all();
+}
+
 void ggml_cuda_moe_grouped_context::shutdown() {
     bool terminal_owner = false;
     {
@@ -3738,11 +4122,13 @@ void ggml_cuda_moe_grouped_context::shutdown() {
         std::unique_lock<std::mutex> lock(impl_->mutex);
         impl_->resource_cv.wait(lock, [&]() {
             return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
-                impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
+                impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
         });
         retired = impl_->detach_resources();
         retired_legacy = impl_->detach_legacy_records();
         impl_->refreshing.fill(0);
+        impl_->group_authorities = {};
+        impl_->authority_transition_pending = false;
         impl_->table = {};
         const uint64_t generation = impl_->state.generation;
         impl_->state = {};
@@ -4085,6 +4471,24 @@ void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(legacy_record_ma
         }
         ggml_cuda_moe_cache_free(entry.second->cache);
         entry.second->cache = nullptr;
+    }
+    records.clear();
+    try {
+        std::lock_guard<std::mutex> lock(telemetry_mutex);
+        moe_cache_add_telemetry(retired_telemetry, std::move(retired));
+    } catch (...) {
+    }
+}
+
+void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(legacy_record_list records) {
+    moe_cache_telemetry retired;
+    for (auto & record : records) {
+        try {
+            moe_cache_capture_telemetry(retired, record->cache, false);
+        } catch (...) {
+        }
+        ggml_cuda_moe_cache_free(record->cache);
+        record->cache = nullptr;
     }
     records.clear();
     try {

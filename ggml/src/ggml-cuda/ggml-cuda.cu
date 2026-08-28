@@ -2778,7 +2778,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 //
 // Cache misses cost one cudaMemcpyAsync per slab (slot_size bytes on PCIe).
 // Cache hits cost zero PCIe traffic; only the kernel reads the resident slot.
-static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat_id_cached(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        const ggml_cuda_moe_group_call_lease * authority) {
     const int64_t op_start_us = ggml_time_us();
     ggml_tensor * src0 = dst->src[0];   // experts in CPU pinned
     ggml_tensor * ids  = dst->src[2];   // routing decision
@@ -2789,7 +2792,7 @@ static void ggml_cuda_mul_mat_id_cached(ggml_backend_cuda_context & ctx, ggml_te
     auto * owner = ctx.moe_grouped_context;
     auto owner_lease = owner != nullptr ? owner->begin_legacy_operation() : ggml_cuda_moe_legacy_operation_lease{};
     auto * leased_owner = owner_lease ? owner : nullptr;
-    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0) : ggml_cuda_moe_legacy_cache_lease{};
+    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority) : ggml_cuda_moe_legacy_cache_lease{};
     ggml_cuda_moe_cache * cache = cache_lease.get();
 
     std::vector<char> ids_host_storage;
@@ -3061,7 +3064,7 @@ static void ggml_cuda_mul_mat_id(
     }
 
     if (src0 && src0->buffer && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
-        ggml_cuda_mul_mat_id_cached(ctx, dst);
+        ggml_cuda_mul_mat_id_cached(ctx, dst, execution != nullptr ? execution->find_authority(dst) : nullptr);
         return;
     }
     ggml_cuda_mul_mat_id_impl(ctx, dst, true);
@@ -5448,6 +5451,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         (void) cuda_ctx->moe_grouped_context->prepare_graph_execution(
             cgraph, cgraph->uid, node_properties_unchanged, &graph->moe_graph_plan, &moe_execution);
     }
+    const bool moe_dispatch = moe_execution.size() != 0;
+    if (moe_dispatch && !cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, false)) {
+        return GGML_STATUS_FAILED;
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
@@ -5460,6 +5467,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
+
+    if (moe_dispatch && !cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
+        return GGML_STATUS_FAILED;
+    }
 
     return GGML_STATUS_SUCCESS;
 }

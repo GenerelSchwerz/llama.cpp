@@ -1375,7 +1375,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_tensor * external_down_node = candidate_mmid(fixture, fused_down, external_ids);
     ggml_cgraph * external_graph = candidate_graph(fixture, {external_gate_up_node, external_down_node});
     registry.compile_graph_plan(external_graph, 46, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(external_gate_up_node, nullptr));
 
     ggml_tensor * copied_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
     copied_ids->op = GGML_OP_CPY;
@@ -1385,14 +1385,14 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_tensor * copied_down_node = candidate_mmid(fixture, fused_down, copied_ids);
     ggml_cgraph * copied_graph = candidate_graph(fixture, {copied_ids, copied_gate_up_node, copied_down_node});
     registry.compile_graph_plan(copied_graph, 47, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(copied_gate_up_node, nullptr));
 
     const candidate_route offset_route = candidate_top_k_route(fixture, 4, 2, 1, sizeof(int32_t));
     ggml_tensor * offset_gate_up_node = candidate_mmid(fixture, fused_gate_up, offset_route.ids);
     ggml_tensor * offset_down_node = candidate_mmid(fixture, fused_down, offset_route.ids);
     ggml_cgraph * offset_graph = candidate_graph(fixture, {offset_route.root, offset_route.ids, offset_gate_up_node, offset_down_node});
     registry.compile_graph_plan(offset_graph, 48, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(offset_gate_up_node, nullptr));
 
     ggml_tensor * transformed_ids = ggml_reshape_2d(fixture.ctx, fused_route_other.ids, 2, 1);
     fixture.materialize(transformed_ids);
@@ -1403,7 +1403,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route_other.root, fused_route_other.ids, transformed_ids, transformed_gate_up_node, transformed_down_node,
     });
     registry.compile_graph_plan(transformed_graph, 49, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(transformed_gate_up_node, nullptr));
 
     const candidate_route wrong_axis_route = candidate_top_k_route(fixture, 5, 2);
     ggml_tensor * wrong_axis_gate_up_node = candidate_mmid(fixture, fused_gate_up, wrong_axis_route.ids);
@@ -1412,7 +1412,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         wrong_axis_route.root, wrong_axis_route.ids, wrong_axis_gate_up_node, wrong_axis_down_node,
     });
     registry.compile_graph_plan(wrong_axis_graph, 50, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(wrong_axis_gate_up_node, nullptr));
 
     ggml_tensor * order_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route_other.ids);
     ggml_tensor * order_down_node = candidate_mmid(fixture, fused_down, fused_route_other.ids);
@@ -1420,7 +1420,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route_other.ids, fused_route_other.root, order_gate_up_node, order_down_node,
     });
     registry.compile_graph_plan(producer_order_graph, 51, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(order_gate_up_node, nullptr));
 
     const int64_t padding_ne[] = {1};
     ggml_tensor * padding_input = fixture.tensor(GGML_TYPE_F32, 1, padding_ne);
@@ -1486,12 +1486,12 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, fused_route_other.root, fused_route_other.ids, mixed_gate_up_node, mixed_down_node,
     });
     registry.compile_graph_plan(mixed_graph, 53, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(mixed_gate_up_node, nullptr));
 
     ggml_tensor * missing_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_cgraph * missing_graph = candidate_graph(fixture, {fused_route.root, fused_route.ids, missing_gate_up_node});
     registry.compile_graph_plan(missing_graph, 54, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(missing_gate_up_node, nullptr));
 
     ggml_tensor * duplicate_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_tensor * duplicate_gate_up_peer = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
@@ -1500,7 +1500,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, duplicate_gate_up_node, duplicate_gate_up_peer, duplicate_down_node,
     });
     registry.compile_graph_plan(duplicate_graph, 55, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(duplicate_gate_up_node, nullptr));
 
     ggml_tensor * prefill_gate_up_node = candidate_mmid(fixture, fused_gate_up, prefill_route.ids);
     ggml_tensor * prefill_down_node = candidate_mmid(fixture, fused_down, prefill_route.ids);
@@ -1508,7 +1508,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         prefill_route.root, prefill_route.ids, prefill_gate_up_node, prefill_down_node,
     });
     registry.compile_graph_plan(prefill_graph, 56, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(prefill_gate_up_node, nullptr));
 
     ggml_tensor * wrong_source_node = candidate_mmid(fixture, separate_gate, fused_route.ids);
     ggml_tensor * correct_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
@@ -1516,7 +1516,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, wrong_source_node, correct_down_node,
     });
     registry.compile_graph_plan(wrong_source_graph, 57, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 2 && execution.size() == 2 && !execution.find(wrong_source_node, nullptr));
 
     ggml_tensor * auxiliary_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_tensor * auxiliary_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
@@ -1531,7 +1531,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_out, auxiliary_down_node,
     });
     registry.compile_graph_plan(auxiliary_graph, 58, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
 
     std::array<ggml_backend_moe_candidate_bank_v1, 3> auxiliary_banks = {{
         {fused_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
@@ -1547,7 +1547,90 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_down_node,
     });
     registry.compile_graph_plan(auxiliary_registered_graph, 59, &plan, &execution);
-    CHECK(plan.size() == 0 && execution.size() == 0);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
+
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    registry.compile_graph_plan(complete_graph, 60, &plan, &execution);
+    CHECK(registry.begin_graph_dispatch(&execution, false));
+    const auto * legacy_authority = execution.find_authority(fused_gate_up_node);
+    CHECK(legacy_authority != nullptr && legacy_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY);
+    auto legacy_before = registry.acquire_legacy_cache(fused_gate_up, nullptr, legacy_authority);
+    CHECK(legacy_before);
+    const auto legacy_before_state = legacy_before.acquisition();
+    legacy_before = {};
+    CHECK(registry.finish_graph_dispatch(&execution));
+
+    CHECK(registry.begin_graph_dispatch(&execution, true));
+    const auto * grouped_authority = execution.find_authority(fused_gate_up_node);
+    CHECK(grouped_authority != nullptr && grouped_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED);
+    CHECK(!registry.acquire_legacy_cache(fused_gate_up, nullptr, grouped_authority));
+    ggml_cuda_moe_candidate_group_key authority_key;
+    ggml_cuda_moe_grouped_acquisition authority_resource;
+    CHECK(registry.find_down_group_key(fused_down, &authority_key));
+    CHECK(registry.acquire_group_resources(authority_key, &authority_resource));
+    CHECK(registry.finish_graph_dispatch(&execution));
+
+    registry.compile_graph_plan(missing_graph, 61, &plan, &execution);
+    CHECK(registry.begin_graph_dispatch(&execution, true));
+    CHECK(!registry.get_group_resources(authority_resource, nullptr));
+    auto legacy_after = registry.acquire_legacy_cache(fused_gate_up);
+    CHECK(legacy_after && legacy_after.acquisition().group_authority_epoch > legacy_before_state.group_authority_epoch);
+    legacy_after = {};
+    CHECK(registry.finish_graph_dispatch(&execution));
+
+    registry.compile_graph_plan(complete_graph, 62, &plan, &execution);
+    CHECK(registry.begin_graph_dispatch(&execution, true));
+    std::atomic<bool> authority_replacement_started{false};
+    std::atomic<bool> authority_replacement_done{false};
+    std::thread authority_replacement([&]() {
+        authority_replacement_started.store(true, std::memory_order_release);
+        CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        authority_replacement_done.store(true, std::memory_order_release);
+    });
+    while (!authority_replacement_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    do {
+        std::this_thread::yield();
+    } while (registry.bind_graph_plan(complete_graph, 62, true, plan, &reused));
+    CHECK(!authority_replacement_done.load(std::memory_order_acquire));
+    CHECK(registry.finish_graph_dispatch(&execution));
+    authority_replacement.join();
+    CHECK(authority_replacement_done.load(std::memory_order_acquire));
+
+    {
+        ggml_cuda_moe_graph_plan scoped_plan;
+        ggml_cuda_moe_graph_execution scoped_execution;
+        registry.compile_graph_plan(complete_graph, 63, &scoped_plan, &scoped_execution);
+        CHECK(registry.begin_graph_dispatch(&scoped_execution, true));
+    }
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto terminal = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    CHECK(terminal->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    ggml_cuda_moe_graph_plan terminal_plan;
+    ggml_cuda_moe_graph_execution terminal_execution;
+    ggml_cuda_moe_graph_execution terminal_probe;
+    terminal->compile_graph_plan(complete_graph, 64, &terminal_plan, &terminal_execution);
+    CHECK(terminal->begin_graph_dispatch(&terminal_execution, true));
+    std::atomic<bool> authority_shutdown_started{false};
+    std::atomic<bool> authority_shutdown_done{false};
+    std::thread authority_shutdown([&]() {
+        authority_shutdown_started.store(true, std::memory_order_release);
+        terminal->shutdown();
+        authority_shutdown_done.store(true, std::memory_order_release);
+    });
+    while (!authority_shutdown_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    do {
+        std::this_thread::yield();
+    } while (terminal->bind_graph_plan(complete_graph, 64, true, terminal_plan, &terminal_probe));
+    CHECK(!authority_shutdown_done.load(std::memory_order_acquire));
+    CHECK(terminal->finish_graph_dispatch(&terminal_execution));
+    authority_shutdown.join();
+    CHECK(authority_shutdown_done.load(std::memory_order_acquire));
+    terminal.reset();
 
     if (benchmark) {
         CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);

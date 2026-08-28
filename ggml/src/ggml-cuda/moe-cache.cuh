@@ -125,6 +125,7 @@ struct ggml_cuda_moe_legacy_acquisition {
     const ggml_tensor * tensor = nullptr;
     uint64_t candidate_generation = 0;
     uint64_t authority_epoch = 0;
+    uint64_t group_authority_epoch = 0;
     uint32_t group_index = UINT32_MAX;
     uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     uint32_t n_slots = 0;
@@ -190,6 +191,40 @@ struct ggml_cuda_moe_complete_group_key {
     uint32_t n_banks = 0;
 };
 
+enum ggml_cuda_moe_group_authority : uint32_t {
+    GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY = 0,
+    GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED,
+};
+
+enum ggml_cuda_moe_graph_group_class : uint32_t {
+    GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY = 0,
+    GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE,
+};
+
+class ggml_cuda_moe_group_call_lease {
+public:
+    ggml_cuda_moe_group_call_lease() noexcept;
+    ~ggml_cuda_moe_group_call_lease();
+
+    ggml_cuda_moe_group_call_lease(ggml_cuda_moe_group_call_lease && other) noexcept;
+    ggml_cuda_moe_group_call_lease & operator=(ggml_cuda_moe_group_call_lease && other) noexcept;
+
+    ggml_cuda_moe_group_call_lease(const ggml_cuda_moe_group_call_lease &) = delete;
+    ggml_cuda_moe_group_call_lease & operator=(const ggml_cuda_moe_group_call_lease &) = delete;
+
+    explicit operator bool() const noexcept;
+    ggml_cuda_moe_group_authority authority() const noexcept;
+
+private:
+    friend class ggml_cuda_moe_grouped_context;
+
+    ggml_cuda_moe_grouped_context * owner_ = nullptr;
+    uint64_t candidate_generation_ = 0;
+    uint64_t authority_epoch_ = 0;
+    uint32_t group_index_ = UINT32_MAX;
+    ggml_cuda_moe_group_authority authority_ = GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
+};
+
 struct ggml_cuda_moe_graph_binding {
     ggml_cuda_moe_complete_group_key key;
     uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
@@ -224,6 +259,9 @@ private:
         uint32_t n_banks;
         uint32_t ids_root_node_index;
         uint32_t ids_node_index;
+        uint32_t classification;
+        const ggml_tensor * authority_node;
+        uint32_t authority_node_index;
         const ggml_tensor * nodes[4];
         uint32_t node_indices[4];
         uint32_t bank_indices[4];
@@ -258,8 +296,13 @@ private:
 class ggml_cuda_moe_graph_execution {
 public:
     ggml_cuda_moe_graph_execution();
+    ~ggml_cuda_moe_graph_execution();
+
+    ggml_cuda_moe_graph_execution(const ggml_cuda_moe_graph_execution &) = delete;
+    ggml_cuda_moe_graph_execution & operator=(const ggml_cuda_moe_graph_execution &) = delete;
 
     bool find(const ggml_tensor * node, ggml_cuda_moe_graph_binding * binding) const;
+    const ggml_cuda_moe_group_call_lease * find_authority(const ggml_tensor * node) const;
     uint32_t size() const;
 
 private:
@@ -268,10 +311,18 @@ private:
     void reset();
     void retain(const std::shared_ptr<const ggml_cuda_moe_graph_plan> & plan);
 
+    struct group_dispatch {
+        ggml_cuda_moe_complete_group_key key;
+        ggml_cuda_moe_group_call_lease authority;
+        uint32_t classification = GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY;
+    };
+
     const ggml_cuda_moe_graph_plan * plan_;
     std::shared_ptr<const ggml_cuda_moe_graph_plan> plan_lease_;
-    std::array<ggml_cuda_moe_complete_group_key, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
+    std::array<group_dispatch, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
+    ggml_cuda_moe_grouped_context * owner_;
     uint32_t n_groups_;
+    bool dispatch_active_;
 };
 
 struct ggml_cuda_moe_grouped_resource_info {
@@ -351,7 +402,8 @@ public:
     ggml_cuda_moe_legacy_operation_lease begin_legacy_operation();
     ggml_cuda_moe_legacy_cache_lease acquire_legacy_cache(
             const ggml_tensor * tensor,
-            const ggml_cuda_moe_legacy_acquisition * expected = nullptr);
+            const ggml_cuda_moe_legacy_acquisition * expected = nullptr,
+            const ggml_cuda_moe_group_call_lease * authority = nullptr);
     void prefetch_legacy_siblings(
             const ggml_cuda_moe_legacy_cache_lease & source,
             const int32_t * expert_ids,
@@ -390,6 +442,8 @@ public:
             bool node_properties_unchanged,
             std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
             ggml_cuda_moe_graph_execution * execution) const;
+    bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled);
+    bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
     ggml_cuda_moe_grouped_decode_result prepare_decode(
             const ggml_cuda_moe_complete_group_key & key,
             cudaStream_t compute_stream,
@@ -399,10 +453,12 @@ public:
 
 private:
     friend struct ggml_cuda_moe_grouped_context_test_access;
+    friend class ggml_cuda_moe_group_call_lease;
     friend class ggml_cuda_moe_legacy_operation_lease;
     friend class ggml_cuda_moe_legacy_cache_lease;
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+    void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
 
