@@ -11,9 +11,11 @@
 
 #include <array>
 #include <memory>
+#include <vector>
 
 struct ggml_cuda_moe_cache;
 class ggml_cuda_moe_grouped_context;
+struct ggml_cuda_moe_grouped_context_test_access;
 
 enum ggml_cuda_moe_candidate_rejection : uint32_t {
     GGML_CUDA_MOE_CANDIDATE_REJECT_NONE = 0,
@@ -281,6 +283,12 @@ enum ggml_cuda_moe_graph_prepare_result : uint32_t {
     GGML_CUDA_MOE_GRAPH_PREPARE_REUSED,
 };
 
+enum ggml_cuda_moe_graph_property_hint : uint32_t {
+    GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN = 0,
+    GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED,
+    GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
+};
+
 class ggml_cuda_moe_graph_plan {
 public:
     ggml_cuda_moe_graph_plan();
@@ -293,6 +301,76 @@ public:
 private:
     static constexpr uint32_t MAX_NODE_BINDINGS = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * 3;
     static constexpr uint32_t NODE_TABLE_SIZE = 4096;
+    static constexpr uint32_t MAX_GROUP_READERS = 4;
+    static constexpr uint32_t MAX_READER_CONSUMERS = 4;
+
+    enum group_reason : uint32_t {
+        GROUP_REASON_ELIGIBLE = 0,
+        GROUP_REASON_DESCRIPTOR,
+        GROUP_REASON_SOURCE,
+        GROUP_REASON_GEOMETRY,
+        GROUP_REASON_ROUTE,
+        GROUP_REASON_DUPLICATE_ROLE,
+        GROUP_REASON_MIXED_IDS,
+        GROUP_REASON_AUXILIARY,
+        GROUP_REASON_MISSING_ROLE,
+        GROUP_REASON_UNPROVEN,
+    };
+
+    struct consumer_witness {
+        const ggml_tensor * node;
+        const ggml_tensor * src[3];
+        uint32_t node_index;
+        uint32_t src_index;
+        uint32_t op;
+    };
+
+    struct reader_witness {
+        ggml_cuda_moe_ids_signature output;
+        ggml_cuda_moe_ids_signature activation;
+        ggml_cuda_moe_ids_signature ids;
+        consumer_witness consumers[MAX_READER_CONSUMERS];
+        int32_t use_count;
+        uint32_t node_index;
+        uint32_t role;
+        uint32_t bank_index;
+        uint32_t n_consumers;
+    };
+
+    struct use_witness {
+        const ggml_tensor * tensor;
+        int32_t use_count;
+        uint32_t present;
+    };
+
+    struct group_observation {
+        ggml_cuda_moe_ids_signature ids;
+        ggml_cuda_moe_ids_signature route_root;
+        ggml_cuda_moe_ids_signature route_source;
+        reader_witness readers[MAX_GROUP_READERS];
+        uint32_t bank_readers[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+        const ggml_tensor * nodes[4];
+        uint32_t node_indices[4];
+        uint32_t bank_indices[4];
+        uint32_t route_root_node_index;
+        uint32_t route_ids_node_index;
+        uint32_t required_roles;
+        uint32_t seen_roles;
+        uint32_t n_banks;
+        uint32_t n_readers;
+        const ggml_tensor * authority_node;
+        uint32_t authority_node_index;
+        bool observed;
+        bool descriptor_supported;
+        bool source_invalid;
+        bool geometry_invalid;
+        bool route_invalid;
+        bool duplicate_role;
+        bool mixed_ids;
+        bool auxiliary;
+        bool unproven;
+        bool has_ids;
+    };
 
     struct group_record {
         ggml_cuda_moe_candidate_group_key candidate;
@@ -309,6 +387,11 @@ private:
         const ggml_tensor * nodes[4];
         uint32_t node_indices[4];
         uint32_t bank_indices[4];
+        reader_witness readers[MAX_GROUP_READERS];
+        use_witness bank_uses[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+        uint32_t reason;
+        uint32_t n_readers;
+        uint32_t witness_reusable;
     };
 
     struct node_entry {
@@ -320,12 +403,16 @@ private:
 
     friend class ggml_cuda_moe_grouped_context;
     friend class ggml_cuda_moe_graph_execution;
+    friend struct ggml_cuda_moe_grouped_context_test_access;
 
     void reset();
     bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index);
     const node_entry * find(const ggml_tensor * node) const;
+    static_assert(sizeof(reader_witness) <= 640, "reader witness is too large");
+    static_assert(sizeof(group_record) <= 4096, "group record is too large");
+    static_assert(sizeof(group_observation) <= 4096, "group observation is too large");
 
-    std::array<group_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
+    std::vector<group_record> groups_;
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
     const void * graph_key_;
@@ -335,7 +422,10 @@ private:
     uint32_t n_groups_;
     uint32_t n_nodes_;
     bool initialized_;
+    bool unknown_reusable_;
 };
+
+static_assert(sizeof(ggml_cuda_moe_graph_plan) <= 128 * 1024, "graph plan is too large");
 
 class ggml_cuda_moe_graph_execution {
 public:
@@ -452,13 +542,13 @@ public:
     bool bind_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
-            bool node_properties_unchanged,
+            ggml_cuda_moe_graph_property_hint property_hint,
             const ggml_cuda_moe_graph_plan & plan,
             ggml_cuda_moe_graph_execution * execution) const;
     ggml_cuda_moe_graph_prepare_result prepare_graph_execution(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
-            bool node_properties_unchanged,
+            ggml_cuda_moe_graph_property_hint property_hint,
             std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
             ggml_cuda_moe_graph_execution * execution) const;
     bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled);
@@ -486,6 +576,7 @@ private:
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
     uint64_t legacy_op_count_for_test(bool is_decode) const;
+    bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
     bool rollback_group_to_legacy(ggml_cuda_moe_graph_group_dispatch & group);
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;

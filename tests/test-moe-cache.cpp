@@ -17,6 +17,7 @@
 
 #include "../ggml/src/ggml-cuda/moe-cache.cuh"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-impl.h"
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
 
@@ -78,6 +79,18 @@ struct ggml_cuda_moe_grouped_context_test_access {
 
     static uint64_t legacy_op_count(const ggml_cuda_moe_grouped_context & context, bool is_decode) {
         return context.legacy_op_count_for_test(is_decode);
+    }
+
+    static size_t graph_reader_witness_size() {
+        return sizeof(ggml_cuda_moe_graph_plan::reader_witness);
+    }
+
+    static size_t graph_group_record_size() {
+        return sizeof(ggml_cuda_moe_graph_plan::group_record);
+    }
+
+    static size_t graph_group_observation_size() {
+        return sizeof(ggml_cuda_moe_graph_plan::group_observation);
     }
 };
 
@@ -251,12 +264,50 @@ static ggml_tensor * candidate_mmid(candidate_test_fixture & fixture, ggml_tenso
     return result;
 }
 
+static void candidate_set_route_tokens(
+        const candidate_route & route,
+        std::initializer_list<ggml_tensor *> readers,
+        int64_t n_tokens) {
+    route.source->ne[1] = n_tokens;
+    route.source->nb[2] = route.source->nb[1] * n_tokens;
+    route.source->nb[3] = route.source->nb[2];
+    route.root->ne[1] = n_tokens;
+    route.root->nb[2] = route.root->nb[1] * n_tokens;
+    route.root->nb[3] = route.root->nb[2];
+    route.ids->ne[1] = n_tokens;
+    memcpy(route.ids->nb, route.root->nb, sizeof(route.ids->nb));
+    for (ggml_tensor * reader : readers) {
+        reader->src[1]->ne[2] = n_tokens;
+        reader->src[1]->nb[3] = reader->src[1]->nb[2] * n_tokens;
+        reader->ne[2] = n_tokens;
+        reader->nb[3] = reader->nb[2] * n_tokens;
+    }
+}
+
+static void candidate_rebuild_graph_uses(ggml_cgraph * graph) {
+    ggml_hash_set_reset(&graph->visited_hash_set);
+    memset(graph->use_counts, 0, graph->visited_hash_set.size * sizeof(graph->use_counts[0]));
+    for (int node_index = 0; node_index < graph->n_nodes; ++node_index) {
+        ggml_tensor * node = graph->nodes[node_index];
+        CHECK(ggml_hash_find_or_insert(&graph->visited_hash_set, node) != GGML_HASHSET_FULL);
+        for (uint32_t src_index = 0; src_index < GGML_MAX_SRC; ++src_index) {
+            if (node->src[src_index] == nullptr) {
+                continue;
+            }
+            const size_t hash_pos = ggml_hash_find_or_insert(&graph->visited_hash_set, node->src[src_index]);
+            CHECK(hash_pos != GGML_HASHSET_FULL);
+            graph->use_counts[hash_pos]++;
+        }
+    }
+}
+
 static ggml_cgraph * candidate_graph(candidate_test_fixture & fixture, std::initializer_list<ggml_tensor *> nodes) {
     ggml_cgraph * graph = ggml_new_graph_custom(fixture.ctx, 32, false);
     CHECK(graph != nullptr);
     for (ggml_tensor * node : nodes) {
         ggml_graph_add_node(graph, node);
     }
+    candidate_rebuild_graph_uses(graph);
     return graph;
 }
 
@@ -273,6 +324,7 @@ static ggml_cgraph * candidate_padded_graph(
     for (ggml_tensor * node : nodes) {
         ggml_graph_add_node(graph, node);
     }
+    candidate_rebuild_graph_uses(graph);
     return graph;
 }
 
@@ -1178,6 +1230,16 @@ static void test_grouped_context_resources() {
 }
 
 static void test_grouped_graph_preflight(bool benchmark) {
+    CHECK(sizeof(ggml_cuda_moe_graph_plan) <= 128 * 1024);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_reader_witness_size() <= 640);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_record_size() <= 4096);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_observation_size() <= 4096);
+    fprintf(stderr, "test-moe-cache: graph witness sizes plan=%zu reader=%zu group=%zu observation=%zu\n",
+        sizeof(ggml_cuda_moe_graph_plan),
+        ggml_cuda_moe_grouped_context_test_access::graph_reader_witness_size(),
+        ggml_cuda_moe_grouped_context_test_access::graph_group_record_size(),
+        ggml_cuda_moe_grouped_context_test_access::graph_group_observation_size());
+
     candidate_test_fixture fixture;
     const int64_t gate_ne[] = {256, 256, 4};
     const int64_t fused_ne[] = {256, 512, 4};
@@ -1265,42 +1327,48 @@ static void test_grouped_graph_preflight(bool benchmark) {
         CHECK(registry.finish_graph_dispatch(&stream_execution));
     }
 
-    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
     CHECK(reused.size() == 2 && reused.find(separate_down_node, nullptr));
-    CHECK(!registry.bind_graph_plan(complete_graph, 41, false, plan, &reused) && reused.size() == 0);
-    CHECK(registry.bind_graph_plan(complete_graph, 42, true, plan, &reused) && reused.size() == 2);
-    CHECK(!registry.bind_graph_plan(complete_graph, 0, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 42, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 2);
+    CHECK(!registry.bind_graph_plan(complete_graph, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
     ggml_cgraph * reordered_graph = candidate_graph(fixture, {
         fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node,
     });
     CHECK(execution.find(fused_gate_up_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
     CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
-    CHECK(!registry.bind_graph_plan(reordered_graph, 41, true, plan, &reused) && reused.size() == 0);
-    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    CHECK(!registry.bind_graph_plan(reordered_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
     ggml_tensor * stale_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_cgraph * stale_graph = candidate_graph(fixture, {
         fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         stale_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
-    CHECK(!registry.bind_graph_plan(stale_graph, 41, true, plan, &reused) && reused.size() == 0);
-    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    CHECK(!registry.bind_graph_plan(stale_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
 
     std::shared_ptr<ggml_cuda_moe_graph_plan> cached_plan;
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 41, false, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan != nullptr && prepared.size() == 2);
     }
     const ggml_cuda_moe_graph_plan * first_cached_plan = cached_plan.get();
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
         CHECK(cached_plan.get() == first_cached_plan && prepared.find(separate_down_node, nullptr));
     }
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 42, false, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 42, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &cached_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(cached_plan.get() == first_cached_plan && prepared.find(fused_down_node, nullptr));
+    }
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(complete_graph, 42, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan.get() != first_cached_plan && prepared.size() == 2);
     }
     {
@@ -1308,7 +1376,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
         {
             std::shared_ptr<ggml_cuda_moe_graph_plan> lifetime_plan;
             ggml_cuda_moe_graph_execution prepared;
-            CHECK(registry.prepare_graph_execution(complete_graph, 41, false, &lifetime_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+            CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &lifetime_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
             lifetime = lifetime_plan;
             lifetime_plan.reset();
             CHECK(!lifetime.expired() && prepared.find(fused_down_node, nullptr));
@@ -1318,47 +1386,195 @@ static void test_grouped_graph_preflight(bool benchmark) {
     {
         const ggml_cuda_moe_graph_plan * current_plan = cached_plan.get();
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(reordered_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(reordered_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan.get() != current_plan && prepared.find(fused_gate_up_node, nullptr));
     }
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(prepared.size() == 2);
+    }
+
+    const candidate_route transition_fused_route = candidate_top_k_route(fixture, 4, 2, 4);
+    const candidate_route transition_separate_route = candidate_top_k_route(fixture, 4, 2, 4);
+    ggml_tensor * transition_fused_gate_up = candidate_mmid(fixture, fused_gate_up, transition_fused_route.ids);
+    ggml_tensor * transition_fused_down = candidate_mmid(fixture, fused_down, transition_fused_route.ids);
+    ggml_tensor * transition_separate_gate = candidate_mmid(fixture, separate_gate, transition_separate_route.ids);
+    ggml_tensor * transition_separate_up = candidate_mmid(fixture, separate_up, transition_separate_route.ids);
+    ggml_tensor * transition_separate_down = candidate_mmid(fixture, separate_down, transition_separate_route.ids);
+    ggml_cgraph * transition_graph = candidate_graph(fixture, {
+        transition_fused_route.root, transition_fused_route.ids, transition_separate_route.root, transition_separate_route.ids,
+        transition_fused_gate_up, transition_fused_down, transition_separate_gate, transition_separate_up, transition_separate_down,
+    });
+    std::shared_ptr<ggml_cuda_moe_graph_plan> transition_plan;
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 200, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.size() == 2 && !prepared.find(transition_fused_gate_up, nullptr) && !prepared.find(transition_separate_gate, nullptr));
+    }
+    const std::shared_ptr<ggml_cuda_moe_graph_plan> warmup_plan = transition_plan;
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 2001, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(transition_plan.get() == warmup_plan.get() && !prepared.find(transition_fused_gate_up, nullptr));
+    }
+    candidate_set_route_tokens(transition_fused_route, {transition_fused_gate_up, transition_fused_down}, 1);
+    candidate_set_route_tokens(transition_separate_route, {transition_separate_gate, transition_separate_up, transition_separate_down}, 1);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 201, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(transition_plan.get() != warmup_plan.get() && prepared.find(transition_fused_gate_up, nullptr) &&
+            prepared.find(transition_separate_down, nullptr));
+    }
+    const ggml_cuda_moe_graph_plan * decode_plan = transition_plan.get();
+    for (uint64_t uid = 202; uid < 234; ++uid) {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(transition_plan.get() == decode_plan && prepared.find(transition_fused_down, nullptr));
+    }
+    candidate_set_route_tokens(transition_fused_route, {transition_fused_gate_up, transition_fused_down}, 4);
+    candidate_set_route_tokens(transition_separate_route, {transition_separate_gate, transition_separate_up, transition_separate_down}, 4);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 234, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr) && !prepared.find(transition_separate_gate, nullptr));
+    }
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 2341, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr));
+    }
+    candidate_set_route_tokens(transition_fused_route, {transition_fused_gate_up, transition_fused_down}, 1);
+    candidate_set_route_tokens(transition_separate_route, {transition_separate_gate, transition_separate_up, transition_separate_down}, 1);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(transition_graph, 235, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &transition_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.find(transition_fused_gate_up, nullptr) && prepared.find(transition_separate_down, nullptr));
+    }
+
+    ggml_tensor * transition_consumer = ggml_dup(fixture.ctx, transition_fused_gate_up);
+    fixture.materialize(transition_consumer);
+    transition_consumer->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_cgraph * mutation_graph = candidate_graph(fixture, {
+        transition_fused_route.root, transition_fused_route.ids, transition_separate_route.root, transition_separate_route.ids,
+        transition_fused_gate_up, transition_consumer, transition_fused_down,
+        transition_separate_gate, transition_separate_up, transition_separate_down,
+    });
+    std::shared_ptr<ggml_cuda_moe_graph_plan> mutation_plan;
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 240, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.find(transition_fused_gate_up, nullptr) && prepared.find(transition_separate_down, nullptr));
+    }
+    const ggml_op saved_consumer_op = transition_consumer->op;
+    ggml_tensor * saved_consumer_src[3] = {transition_consumer->src[0], transition_consumer->src[1], transition_consumer->src[2]};
+    transition_consumer->op = GGML_OP_ADD_ID;
+    transition_consumer->src[0] = transition_fused_gate_up;
+    transition_consumer->src[1] = fused_bias;
+    transition_consumer->src[2] = transition_fused_route.ids;
+    candidate_rebuild_graph_uses(mutation_graph);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 241, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr) && prepared.find(transition_separate_down, nullptr));
+    }
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 2411, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr));
+    }
+    transition_consumer->op = saved_consumer_op;
+    memcpy(transition_consumer->src, saved_consumer_src, sizeof(saved_consumer_src));
+    candidate_rebuild_graph_uses(mutation_graph);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 242, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.find(transition_fused_gate_up, nullptr));
+    }
+    transition_consumer->op = GGML_OP_MUL_MAT_ID;
+    transition_consumer->src[0] = fused_gate_up;
+    transition_consumer->src[1] = transition_fused_gate_up->src[1];
+    transition_consumer->src[2] = transition_fused_route.ids;
+    candidate_rebuild_graph_uses(mutation_graph);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 243, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr) && prepared.find(transition_separate_down, nullptr));
+    }
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 2431, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr));
+    }
+    transition_consumer->op = saved_consumer_op;
+    memcpy(transition_consumer->src, saved_consumer_src, sizeof(saved_consumer_src));
+    candidate_rebuild_graph_uses(mutation_graph);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 244, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.find(transition_fused_gate_up, nullptr));
+    }
+    transition_fused_route.ids->view_offs = sizeof(int32_t);
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 245, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(!prepared.find(transition_fused_gate_up, nullptr));
+    }
+    transition_fused_route.ids->view_offs = 0;
+    {
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(mutation_graph, 246, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &mutation_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared.find(transition_fused_gate_up, nullptr));
     }
     {
         const ggml_cuda_moe_graph_plan * current_plan = cached_plan.get();
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(stale_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(stale_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan.get() != current_plan && prepared.find(stale_gate_up_node, nullptr));
     }
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(prepared.size() == 2);
     }
     ggml_cuda_moe_grouped_context other_registry(&fixture.owner);
     CHECK(other_registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(!other_registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+    CHECK(!other_registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
     {
         std::shared_ptr<ggml_cuda_moe_graph_plan> foreign_plan = cached_plan;
         const ggml_cuda_moe_graph_plan * original_owner_plan = foreign_plan.get();
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(other_registry.prepare_graph_execution(complete_graph, 41, true, &foreign_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(other_registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &foreign_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(foreign_plan.get() != original_owner_plan && prepared.size() == 2);
     }
 
     fused_gate_up_node->src[0] = separate_gate;
-    CHECK(!registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
     fused_gate_up_node->src[0] = fused_gate_up;
-    CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
 
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(!registry.bind_graph_plan(complete_graph, 41, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
     const ggml_cuda_moe_graph_plan * generation_one_plan = cached_plan.get();
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 41, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 41, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan.get() != generation_one_plan && cached_plan->registry_generation() == 2 && prepared.size() == 2);
     }
     registry.compile_graph_plan(complete_graph, 43, &plan, &execution);
@@ -1382,11 +1598,11 @@ static void test_grouped_graph_preflight(bool benchmark) {
     }
     do {
         std::this_thread::yield();
-    } while (registry.bind_graph_plan(complete_graph, 43, true, plan, &reused));
+    } while (registry.bind_graph_plan(complete_graph, 43, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
     CHECK(reused.size() == 0 && !replacement_done.load(std::memory_order_acquire));
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 43, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE);
+        CHECK(registry.prepare_graph_execution(complete_graph, 43, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE);
         CHECK(cached_plan == nullptr && prepared.size() == 0);
     }
     registry.compile_graph_plan(complete_graph, 43, &plan, &execution);
@@ -1394,13 +1610,13 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(registry.end_group_transaction(held_transaction));
     replacement_thread.join();
     CHECK(replacement_done.load(std::memory_order_acquire));
-    CHECK(!registry.bind_graph_plan(complete_graph, 43, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 43, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused) && reused.size() == 0);
 
     registry.compile_graph_plan(complete_graph, 44, &plan, &execution);
     CHECK(execution.size() == 2);
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 44, false, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 44, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan != nullptr && prepared.size() == 2);
     }
     auto disabled = candidate_snapshot(12, nullptr, 0);
@@ -1409,10 +1625,10 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(plan.size() == 0 && execution.size() == 0 && plan.registry_generation() != 0);
     {
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 44, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 44, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         CHECK(cached_plan != nullptr && prepared.size() == 0);
         const ggml_cuda_moe_graph_plan * disabled_plan = cached_plan.get();
-        CHECK(registry.prepare_graph_execution(complete_graph, 44, true, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 44, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &cached_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
         CHECK(cached_plan.get() == disabled_plan && prepared.size() == 0);
     }
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -1488,53 +1704,84 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_tensor * padded_down_node = candidate_mmid(fixture, fused_down, padded_route.ids);
     constexpr uint32_t n_padding_nodes = 32768;
     ggml_cgraph * padded_graph = candidate_padded_graph(fixture, padding_node, n_padding_nodes, {
-        padded_route.root, padded_route.ids, padded_gate_up_node, padded_down_node,
+        padded_route.root, padded_route.ids, separate_route.root, separate_route.ids,
+        padded_gate_up_node, padded_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
     ggml_cuda_moe_graph_plan padded_plan;
     ggml_cuda_moe_graph_execution padded_execution;
     registry.compile_graph_plan(padded_graph, 100, &padded_plan, &padded_execution);
-    CHECK(padded_plan.size() == 1 && padded_execution.size() == 1);
-    CHECK(padded_plan.graph_node_count() == static_cast<int32_t>(n_padding_nodes + 4));
-    CHECK(registry.bind_graph_plan(padded_graph, 101, true, padded_plan, &padded_execution) && padded_execution.size() == 1);
+    CHECK(padded_plan.size() == 2 && padded_execution.size() == 2);
+    CHECK(padded_plan.graph_node_count() == static_cast<int32_t>(n_padding_nodes + 9));
+    CHECK(registry.bind_graph_plan(padded_graph, 101, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, padded_plan, &padded_execution) && padded_execution.size() == 2);
 
     registry.compile_graph_plan(complete_graph, 52, &plan, &execution);
     CHECK(plan.size() == 2 && execution.size() == 2);
+    void * saved_ids_data = fused_route.ids->data;
+    fused_route.ids->data = fused_route_other.ids->data;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_route.ids->data = saved_ids_data;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
+    ggml_backend_buffer_t saved_ids_buffer = fused_route.ids->buffer;
+    fused_route.ids->buffer = nullptr;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_route.ids->buffer = saved_ids_buffer;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
+    const size_t saved_ids_stride = fused_route.ids->nb[0];
+    fused_route.ids->nb[0] += sizeof(int32_t);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_route.ids->nb[0] = saved_ids_stride;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
+    const int64_t saved_activation_tokens = fused_gate_up_node->src[1]->ne[2];
+    fused_gate_up_node->src[1]->ne[2] = 2;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_gate_up_node->src[1]->ne[2] = saved_activation_tokens;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
+    const int64_t saved_output_tokens = fused_gate_up_node->ne[2];
+    fused_gate_up_node->ne[2] = 2;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_gate_up_node->ne[2] = saved_output_tokens;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
+    ggml_tensor * saved_weight = fused_gate_up_node->src[0];
+    fused_gate_up_node->src[0] = separate_gate;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    fused_gate_up_node->src[0] = saved_weight;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     ggml_tensor * saved_view_src = fused_route.ids->view_src;
     fused_route.ids->view_src = fused_route_other.root;
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     fused_route.ids->view_src = saved_view_src;
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     ggml_tensor * saved_view_source = fused_route.ids->src[0];
     fused_route.ids->src[0] = fused_route_other.root;
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     fused_route.ids->src[0] = saved_view_source;
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     fused_route.ids->view_offs = sizeof(int32_t);
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     fused_route.ids->view_offs = 0;
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     const size_t saved_root_stride = fused_route.root->nb[1];
     fused_route.root->nb[1] += sizeof(int32_t);
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     fused_route.root->nb[1] = saved_root_stride;
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     ggml_tensor * saved_root_source = fused_route.root->src[0];
     fused_route.root->src[0] = fused_route_other.source;
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     fused_route.root->src[0] = saved_root_source;
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     const int32_t sort_asc = GGML_SORT_ORDER_ASC;
     memcpy(fused_route.root->op_params, &sort_asc, sizeof(sort_asc));
-    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
     const int32_t sort_desc = GGML_SORT_ORDER_DESC;
     memcpy(fused_route.root->op_params, &sort_desc, sizeof(sort_desc));
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
     ggml_cgraph * producer_reordered_graph = candidate_graph(fixture, {
         fused_route.root, fused_route.ids, separate_route.ids, separate_route.root,
         fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
-    CHECK(!registry.bind_graph_plan(producer_reordered_graph, 52, true, plan, &reused) && reused.size() == 0);
-    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    CHECK(!registry.bind_graph_plan(producer_reordered_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 52, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused));
 
     ggml_tensor * mixed_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_tensor * mixed_down_node = candidate_mmid(fixture, fused_down, fused_route_other.ids);
@@ -1548,6 +1795,31 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_cgraph * missing_graph = candidate_graph(fixture, {fused_route.root, fused_route.ids, missing_gate_up_node});
     registry.compile_graph_plan(missing_graph, 54, &plan, &execution);
     CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(missing_gate_up_node, nullptr));
+    {
+        std::shared_ptr<ggml_cuda_moe_graph_plan> missing_plan;
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(missing_graph, 540, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &missing_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        const std::shared_ptr<ggml_cuda_moe_graph_plan> first_missing_plan = missing_plan;
+        CHECK(registry.prepare_graph_execution(missing_graph, 541, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &missing_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(missing_plan.get() != first_missing_plan.get() && !prepared.find(missing_gate_up_node, nullptr));
+    }
+    ggml_cgraph * complete_missing_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
+        missing_gate_up_node, separate_up_node, separate_gate_node, separate_down_node,
+    });
+    {
+        std::shared_ptr<ggml_cuda_moe_graph_plan> missing_plan;
+        ggml_cuda_moe_graph_execution prepared;
+        CHECK(registry.prepare_graph_execution(complete_missing_graph, 542, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &missing_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        const ggml_cuda_moe_graph_plan * stable_missing_plan = missing_plan.get();
+        CHECK(!prepared.find(missing_gate_up_node, nullptr) && prepared.find(separate_down_node, nullptr));
+        CHECK(registry.prepare_graph_execution(complete_missing_graph, 543, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &missing_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(missing_plan.get() == stable_missing_plan && !prepared.find(missing_gate_up_node, nullptr));
+    }
 
     ggml_tensor * duplicate_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_tensor * duplicate_gate_up_peer = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
@@ -1682,7 +1954,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
     }
     do {
         std::this_thread::yield();
-    } while (registry.bind_graph_plan(complete_graph, 62, true, plan, &reused));
+    } while (registry.bind_graph_plan(complete_graph, 62, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, plan, &reused));
     CHECK(!authority_replacement_done.load(std::memory_order_acquire));
     CHECK(registry.finish_graph_dispatch(&execution));
     authority_replacement.join();
@@ -1715,7 +1987,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
     }
     do {
         std::this_thread::yield();
-    } while (terminal->bind_graph_plan(complete_graph, 64, true, terminal_plan, &terminal_probe));
+    } while (terminal->bind_graph_plan(complete_graph, 64, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, terminal_plan, &terminal_probe));
     CHECK(!authority_shutdown_done.load(std::memory_order_acquire));
     CHECK(terminal->finish_graph_dispatch(&terminal_execution));
     authority_shutdown.join();
@@ -1726,13 +1998,13 @@ static void test_grouped_graph_preflight(bool benchmark) {
         CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         std::shared_ptr<ggml_cuda_moe_graph_plan> benchmark_plan;
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 60, false, &benchmark_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 60, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &benchmark_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         const ggml_cuda_moe_graph_plan * stable_plan = benchmark_plan.get();
         constexpr uint32_t n_reuses = 200000;
         uint32_t reused_count = 0;
         const auto begin = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n_reuses; ++i) {
-            reused_count += registry.prepare_graph_execution(complete_graph, 61 + i, true, &benchmark_plan, &prepared) ==
+            reused_count += registry.prepare_graph_execution(complete_graph, 61 + i, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &benchmark_plan, &prepared) ==
                 GGML_CUDA_MOE_GRAPH_PREPARE_REUSED ? 1 : 0;
         }
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
@@ -1741,23 +2013,23 @@ static void test_grouped_graph_preflight(bool benchmark) {
             static_cast<double>(elapsed) / n_reuses, n_reuses);
 
         std::shared_ptr<ggml_cuda_moe_graph_plan> padded_benchmark_plan;
-        CHECK(registry.prepare_graph_execution(padded_graph, 100, false, &padded_benchmark_plan, &prepared) ==
+        CHECK(registry.prepare_graph_execution(padded_graph, 100, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &padded_benchmark_plan, &prepared) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         const ggml_cuda_moe_graph_plan * stable_padded_plan = padded_benchmark_plan.get();
         constexpr uint32_t n_padded_reuses = 100000;
         uint32_t padded_reused_count = 0;
         const auto padded_begin = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n_padded_reuses; ++i) {
-            padded_reused_count += registry.prepare_graph_execution(padded_graph, 101 + i, true, &padded_benchmark_plan, &prepared) ==
+            padded_reused_count += registry.prepare_graph_execution(padded_graph, 101 + i, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &padded_benchmark_plan, &prepared) ==
                 GGML_CUDA_MOE_GRAPH_PREPARE_REUSED ? 1 : 0;
         }
         const auto padded_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - padded_begin).count();
         const double padded_ns = static_cast<double>(padded_elapsed) / n_padded_reuses;
-        CHECK(padded_reused_count == n_padded_reuses && padded_benchmark_plan.get() == stable_padded_plan && prepared.size() == 1);
+        CHECK(padded_reused_count == n_padded_reuses && padded_benchmark_plan.get() == stable_padded_plan && prepared.size() == 2);
         CHECK(padded_ns < 10000.0);
         fprintf(stderr, "test-moe-cache: grouped padded graph plan %.1f ns/reuse with %u nodes, full scans=0/%u\n",
-            padded_ns, n_padding_nodes + 4, n_padded_reuses);
+            padded_ns, n_padding_nodes + 9, n_padded_reuses);
     }
 
     fprintf(stderr, "test-moe-cache: grouped graph preflight OK\n");
@@ -2143,7 +2415,7 @@ static void check_active_grouped_contract(
 
     std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
     ggml_cuda_moe_graph_execution execution;
-    CHECK(context->prepare_graph_execution(graph.graph, 801, false, &plan, &execution) ==
+    CHECK(context->prepare_graph_execution(graph.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution) ==
         GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
     CHECK(execution.size() == 1);
     cudaStream_t stream = nullptr;
@@ -2279,7 +2551,7 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
 
         std::shared_ptr<ggml_cuda_moe_graph_plan> failure_plan;
         ggml_cuda_moe_graph_execution failure_execution;
-        CHECK(context->prepare_graph_execution(first.graph, 701, false, &failure_plan, &failure_execution) ==
+        CHECK(context->prepare_graph_execution(first.graph, 701, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &failure_plan, &failure_execution) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         cudaStream_t stream = nullptr;
         cudaStream_t wrong_stream = nullptr;
@@ -2324,7 +2596,7 @@ static void test_active_grouped_dispatch_case(ggml_type type, uint32_t layout, u
         }
         std::shared_ptr<ggml_cuda_moe_graph_plan> unavailable_plan;
         ggml_cuda_moe_graph_execution unavailable_execution;
-        while (context->prepare_graph_execution(first.graph, 702, false, &unavailable_plan, &unavailable_execution) !=
+        while (context->prepare_graph_execution(first.graph, 702, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &unavailable_plan, &unavailable_execution) !=
                 GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
             std::this_thread::yield();
         }
@@ -2677,7 +2949,8 @@ static void test_cached_mmid_prefill_and_overflow() {
     std::shared_ptr<ggml_cuda_moe_graph_plan> transition_plan;
     ggml_cuda_moe_graph_execution transition_execution;
     CHECK(transition_context->prepare_graph_execution(
-        registered_prefill.graph, 801, false, &transition_plan, &transition_execution) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        registered_prefill.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &transition_plan, &transition_execution) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
     CHECK(transition_execution.size() == 1);
     CHECK(transition_execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
     CHECK(transition_context->begin_graph_dispatch(&transition_execution, true));

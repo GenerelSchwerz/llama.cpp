@@ -5521,7 +5521,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         graph = cuda_ctx->cuda_graph(graph_key);
     }
 #endif
-    bool node_properties_unchanged = graph != nullptr && graph->moe_graph_plan != nullptr && cgraph->uid != 0;
+    ggml_cuda_moe_graph_property_hint moe_property_hint = GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN;
     ggml_cuda_moe_graph_execution moe_execution;
 
 #ifdef USE_CUDA_GRAPH
@@ -5531,7 +5531,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
-            node_properties_unchanged = !properties_changed;
+            moe_property_hint = properties_changed ? GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED : GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED;
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -5559,7 +5559,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (cuda_ctx->moe_grouped_context != nullptr) {
         const auto prepare_result = cuda_ctx->moe_grouped_context->prepare_graph_execution(
-            cgraph, cgraph->uid, node_properties_unchanged, &graph->moe_graph_plan, &moe_execution);
+            cgraph, cgraph->uid, moe_property_hint, &graph->moe_graph_plan, &moe_execution);
         if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
             return GGML_STATUS_FAILED;
         }
