@@ -40,3 +40,15 @@ Final local validation on rebased compact-mask composition (2026-08-27)
 - Parallel two-request measurements, all at ctx 131072, b/ub 4096/2048, host q8_0 KV, FA on: Qwen unified saved about 992 MiB startup, 944 MiB peak, 984 MiB idle with +1.14% combined throughput; Qwen non-unified saved 832/678/718 MiB with -0.14%; Gemma unified saved 652/318/352 MiB with -1.15%; Gemma non-unified saved 380/242/276 MiB with -1.23%.
 - Qwen 46,950-token single prefill saved 392 MiB peak and changed throughput by -0.349%; generated token and normalized stdout matched.
 - PR 40 remains at remote head 4161c9a6a906901ab1f670bd3164d14059c7349b and is DIRTY/CONFLICTING until the rebased local branch plus ISWA delta are committed and pushed with force-with-lease.
+
+2026-08-27 final cleanup and exact-state verification
+
+- Uncommitted cleanup normalizes live-context capability once after memory construction, removes repeated unsupported-layout checks, consolidates memory_update reserve handling, and isolates standard KV, Gemma ISWA, and unsupported Mamba tests.
+- Current diff versus origin/llama/dev: 26 files, 624 insertions, 32 deletions. Cleanup/ISWA delta versus HEAD remains uncommitted. git diff --check is clean.
+- Exact current-source Release builds passed for CPU and CUDA sm_120a with CUDA FA and CUDA graphs. Shared ccache and repository locks were used.
+- Focused CPU ctest passed 4/4 and focused CUDA ctest passed 4/4: phase-aware workspace, live-context workspace, argument parser, and allocator.
+- clang-tidy-diff completed successfully. Remaining diagnostics are transitive-include warnings, test assert false positives, and existing logging-macro __func__ lambda warnings. The implementation-specific nested-ternary warning was fixed.
+- Exact current-binary final logits and token IDs are byte-identical for live off/on. Qwen3.8 27B logits SHA-256: 44d6c43f83fbd6ced4480368cfa767de29e262b9b369b51af1f07bf604978342. Gemma 4 12B logits SHA-256: e67d9c54138e5c2fb80af48bb8e829c193952d9a63daa839a3428e6a6dcde822. Artifacts: /tmp/live-context-port-20260827/final-cleanup-logits.
+- Balanced Gemma 4 12B two-request runs on the cleanup binary measured live mode 1.12% slower with unified KV and 1.00% slower with non-unified KV. Verbose reserve timings attribute nearly all of this to graph-reservation rebuilds at power-of-two live-KV growth boundaries. The mode remains opt-in.
+- CUDA is the tested transient-pool trim backend. HIP and other accelerator builds remain unverified locally.
+- No commit, push, PR update, or PR comment was performed.
