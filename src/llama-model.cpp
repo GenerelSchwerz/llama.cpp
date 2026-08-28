@@ -364,7 +364,27 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
-    const std::string tensor_name = tensor->name;
+    const std::string tensor_name = [&]() {
+        const std::string raw = tensor->name;
+        const size_t first = raw.find('#');
+        const size_t last  = raw.rfind('#');
+        if (first == std::string::npos || last <= first) {
+            return raw;
+        }
+
+        std::string name = raw.substr(first + 1, last - first - 1);
+        while (!name.empty() && name.back() == ')') {
+            const size_t paren = name.rfind(" (");
+            if (paren == std::string::npos) {
+                break;
+            }
+            name.erase(paren);
+        }
+
+        static const std::regex pattern_cache_copy("cache_(k|v)_l\\d+");
+        static const std::regex pattern_recurrent_copy("(conv_states_reshaped|state_predelta)-\\d+");
+        return std::regex_match(name, pattern_cache_copy) || std::regex_match(name, pattern_recurrent_copy) ? name : raw;
+    }();
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
@@ -392,6 +412,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
     static const std::regex pattern_r_cache         ("cache_r_l\\d*");
     static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    static const std::regex pattern_r_cache_view    ("conv_states_reshaped-\\d+");
+    static const std::regex pattern_s_cache_view    ("state_predelta-\\d+");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -448,6 +470,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
             rotation = get_il_eff(il) % ud->n_devices;
+        } else if (std::regex_match(tensor_name, pattern_r_cache_view) ||
+                std::regex_match(tensor_name, pattern_s_cache_view)) {
+            const size_t layer_index_start = tensor_name.rfind('-');
+            GGML_ASSERT(layer_index_start != std::string::npos);
+            il = std::stoull(tensor_name.substr(layer_index_start + 1));
+            prefix = "blk." + std::to_string(il) + ".";
+            rotation = get_il_eff(il) % ud->n_devices;
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -460,6 +489,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         GGML_ASSERT(tensor_axis_0 != nullptr);
         return {axis, tensor_axis_0, il, rotation};
     };
+
+    const bool kv_cache_head_axis = [&]() {
+        if (is_dsv4 || !std::regex_match(tensor_name, pattern_kv_cache)) {
+            return false;
+        }
+        const size_t layer_index_start = tensor_name.find("_l", 6);
+        if (layer_index_start == std::string::npos) {
+            return false;
+        }
+        const uint32_t il       = std::stoul(tensor_name.substr(layer_index_start + 2));
+        const int64_t  head_dim = tensor_name[6] == 'k' ? hparams.n_embd_head_k(il) : hparams.n_embd_head_v(il);
+        return hparams.n_head_kv(il) > 1 && tensor->ne[0] == head_dim && tensor->ne[2] == (int64_t) hparams.n_head_kv(il);
+    }();
 
     auto get_tensor_config = [&]() -> tensor_config {
         if (is_dsv4) {
@@ -505,7 +547,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(tensor->ne[1] == 1 ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_kv_cache) || std::regex_match(tensor_name, pattern_attn_sinks)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
+            return get_tensor_config_impl(
+                    kv_cache_head_axis ? GGML_BACKEND_SPLIT_AXIS_2 : GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
@@ -530,6 +573,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED, "");
             }
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ssm_out.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_r_cache_view)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
+        }
+        if (std::regex_match(tensor_name, pattern_s_cache_view)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2, "ssm_out.weight");
         }
         if (std::regex_match(tensor_name, pattern_ssm_conv1d)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ssm_out.weight");
@@ -570,7 +619,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(output_weight != nullptr);
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
-
         // everything else
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     };
@@ -592,8 +640,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2}, {value_dim, 1}};
                 }
-                if (std::regex_match(tensor_name, pattern_r_cache)) {
-                    return {{key_dim * (hparams.ssm_d_conv - 1), 2}, {value_dim * (hparams.ssm_d_conv - 1), 1}};
+                if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_r_cache_view)) {
+                    const int64_t conv = std::regex_match(tensor_name, pattern_r_cache_view) ? 1 : hparams.ssm_d_conv - 1;
+                    return {{key_dim * conv, 2}, {value_dim * conv, 1}};
                 }
             } else {
                 const int64_t head_ratio = n_v_heads / n_k_heads;
@@ -608,11 +657,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                         std::regex_match(tensor_name, pattern_ssm_alpha) || std::regex_match(tensor_name, pattern_ssm_beta)) {
                     return {{n_k_heads, head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_r_cache)) {
-                    return {{key_dim * (hparams.ssm_d_conv - 1), 2 + head_ratio}};
+                if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_r_cache_view)) {
+                    const int64_t conv = std::regex_match(tensor_name, pattern_r_cache_view) ? 1 : hparams.ssm_d_conv - 1;
+                    return {{key_dim * conv, 2 + head_ratio}};
                 }
-                if (std::regex_match(tensor_name, pattern_s_cache)) {
-                    return {{n_k_heads * head_v_dim * head_v_dim, head_ratio}};
+                if (std::regex_match(tensor_name, pattern_s_cache) || std::regex_match(tensor_name, pattern_s_cache_view)) {
+                    const int64_t state = std::regex_match(tensor_name, pattern_s_cache_view) ? 1 : head_v_dim * head_v_dim;
+                    return {{n_k_heads * state, head_ratio}};
                 }
             }
 
@@ -656,7 +707,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t blck_size_perf  = std::lcm(blck_size, 128);
             const int64_t granularity_qkv = std::lcm(blck_size_perf, head_dim);
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_attn_gate_weight) ||
-                    std::regex_match(tensor_name, pattern_ssm_conv1d) || std::regex_match(tensor_name, pattern_ssm_out_weight)) {
+                    std::regex_match(tensor_name, pattern_ssm_conv1d) ||
+                    std::regex_match(tensor_name, pattern_ssm_out_weight)) {
                 return std::vector<int64_t>(segments.size(), granularity_qkv);
             }
             if (std::regex_match(tensor_name, pattern_ssm_dt) || std::regex_match(tensor_name, pattern_ssm_a) ||
@@ -666,13 +718,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_ssm_beta_alpha)) {
                 return std::vector<int64_t>(segments.size(), 2 * (granularity_qkv / head_dim));
             }
-            if (std::regex_match(tensor_name, pattern_r_cache)) {
-                return std::vector<int64_t>(segments.size(), granularity_qkv * (hparams.ssm_d_conv - 1));
+            if (std::regex_match(tensor_name, pattern_r_cache) || std::regex_match(tensor_name, pattern_r_cache_view)) {
+                const int64_t conv = std::regex_match(tensor_name, pattern_r_cache_view) ? 1 : hparams.ssm_d_conv - 1;
+                return std::vector<int64_t>(segments.size(), granularity_qkv * conv);
             }
-            if (std::regex_match(tensor_name, pattern_s_cache)) {
-                return std::vector<int64_t>(segments.size(), granularity_qkv * head_dim);
+            if (std::regex_match(tensor_name, pattern_s_cache) || std::regex_match(tensor_name, pattern_s_cache_view)) {
+                const int64_t granularity = std::regex_match(tensor_name, pattern_s_cache_view) ? granularity_qkv / head_dim : granularity_qkv * head_dim;
+                return std::vector<int64_t>(segments.size(), granularity);
             }
-        } else {
+        } else if (std::regex_match(tensor_name, pattern_q_weight) ||
+                std::regex_match(tensor_name, pattern_kv_weight) ||
+                std::regex_match(tensor_name, pattern_q_bias) ||
+                std::regex_match(tensor_name, pattern_kv_bias) ||
+                std::regex_match(tensor_name, pattern_qkv_weight) ||
+                std::regex_match(tensor_name, pattern_qkv_bias) ||
+                std::regex_match(tensor_name, pattern_attn_sinks) ||
+                std::regex_match(tensor_name, pattern_attn_out_weight) ||
+                std::regex_match(tensor_name, pattern_attn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_kv_cache)) {
             // regular attention
             const uint32_t n_gqa    = hparams.n_gqa(il);
             const uint32_t n_embd_q = n_gqa * hparams.n_embd_head_k(il);
@@ -732,6 +795,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             const int64_t granularity_kv = granularity_q / n_gqa;
+            if (kv_cache_head_axis) {
+                GGML_ASSERT(segments.size() == 1);
+                return {granularity_kv / hparams.n_embd_head_k(il)};
+            }
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
