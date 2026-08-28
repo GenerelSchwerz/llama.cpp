@@ -828,7 +828,6 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 }
 
 void llama_context::sched_reserve(uint32_t n_tokens_req) {
-    refresh_moe_candidates();
     acquire_shared_workspace();
 
     const bool sched_resizable = cparams.phase_aware_workspace && !model.hparams.no_alloc;
@@ -858,6 +857,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req) {
     }
 
     synchronize();
+    refresh_moe_candidates();
 
     const int64_t t_start_us = ggml_time_us();
 
