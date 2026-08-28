@@ -1848,24 +1848,17 @@ static void test_grouped_clock_refresh_case(int device, uint32_t n_slots) {
     CHECK(fixture.registry->finish_decode(boundary, fixture.stream));
     CUDA_OK(cudaStreamSynchronize(fixture.stream));
 
-    ggml_cuda_moe_grouped_decode_acquisition exhausted;
-    CHECK(fixture.prepare(routes, exhausted, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
-    CHECK(exhausted.transaction.transaction_token == 0);
+    ggml_cuda_moe_grouped_decode_acquisition refreshed;
+    CHECK(fixture.prepare(routes, refreshed, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CHECK(!fixture.registry->get_group_resources(initial.transaction.acquisition, nullptr));
-
-    ggml_cuda_moe_grouped_acquisition refreshed;
-    CHECK(fixture.registry->acquire_group_resources(fixture.key.candidate, &refreshed));
-    CHECK(refreshed.resource_generation > initial.transaction.acquisition.resource_generation);
     ggml_cuda_moe_grouped_resource_info info;
-    CHECK(fixture.registry->get_group_resources(refreshed, &info) && info.n_slots == n_slots);
-    ggml_cuda_moe_grouped_decode_acquisition cold;
-    CHECK(fixture.prepare(routes, cold, fixture.stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
-    CHECK(fixture.registry->finish_decode(cold, fixture.stream));
+    CHECK(fixture.registry->get_group_resources(refreshed.transaction.acquisition, &info) && info.n_slots == n_slots);
+    CHECK(refreshed.transaction.acquisition.resource_generation > initial.transaction.acquisition.resource_generation);
+    CHECK(fixture.registry->finish_decode(refreshed, fixture.stream));
     CUDA_OK(cudaStreamSynchronize(fixture.stream));
     std::array<int32_t, 4> remapped = {};
-    CUDA_OK(cudaMemcpy(remapped.data(), cold.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
+    CUDA_OK(cudaMemcpy(remapped.data(), refreshed.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
     CHECK((remapped == std::array<int32_t, 4>{0, 1, 0, 2}));
-    CHECK(cold.transaction.acquisition.resource_generation == refreshed.resource_generation);
 }
 
 static void test_grouped_clock_failed_rebuild(int device) {
@@ -1973,22 +1966,30 @@ static void test_grouped_clock_teardown(int device) {
     });
     const bool detached = wait_for_grouped_detach(*fixture.registry, pending.transaction.acquisition);
 
-    std::atomic<bool> shutdown_done{false};
+    std::array<std::atomic<bool>, 2> shutdown_done = {};
     std::thread shutdown_thread([&]() {
         fixture.registry->shutdown();
-        shutdown_done.store(true, std::memory_order_release);
+        shutdown_done[0].store(true, std::memory_order_release);
     });
-    for (uint32_t attempt = 0; attempt < 100 && !shutdown_done.load(std::memory_order_acquire); ++attempt) {
+    std::thread second_shutdown_thread([&]() {
+        fixture.registry->shutdown();
+        shutdown_done[1].store(true, std::memory_order_release);
+    });
+    for (uint32_t attempt = 0; attempt < 100 &&
+            !shutdown_done[0].load(std::memory_order_acquire) && !shutdown_done[1].load(std::memory_order_acquire); ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    const bool shutdown_was_async = shutdown_done.load(std::memory_order_acquire);
+    const bool shutdown_waited = !shutdown_done[0].load(std::memory_order_acquire) && !shutdown_done[1].load(std::memory_order_acquire);
     barrier.released.store(true, std::memory_order_release);
-    maintenance.join();
     shutdown_thread.join();
-    CUDA_OK(cudaStreamSynchronize(fixture.stream));
-    CHECK(detached && shutdown_was_async);
-    CHECK(maintenance_result.load(std::memory_order_acquire) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    second_shutdown_thread.join();
+    CHECK(detached && shutdown_waited);
+    CHECK(shutdown_done[0].load(std::memory_order_acquire) && shutdown_done[1].load(std::memory_order_acquire));
     CHECK(fixture.registry->prepare_decode(fixture.key, maintenance_stream, &pending) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+    fixture.registry.reset();
+    maintenance.join();
+    CUDA_OK(cudaStreamSynchronize(fixture.stream));
+    CHECK(maintenance_result.load(std::memory_order_acquire) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
     CUDA_OK(cudaStreamDestroy(maintenance_stream));
 }
 

@@ -1807,8 +1807,31 @@ struct ggml_cuda_moe_grouped_context::impl {
     std::array<uint8_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> refreshing = {};
     uint64_t next_resource_generation = 0;
     uint64_t next_transaction_token = 0;
+    uint32_t active_maintenance = 0;
     bool replacement_pending = false;
     bool draining = false;
+    bool shutdown_complete = false;
+
+    void release_maintenance() {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(active_maintenance > 0);
+        --active_maintenance;
+        resource_cv.notify_all();
+    }
+
+    struct maintenance_lease {
+        maintenance_lease() = default;
+        maintenance_lease(const maintenance_lease &) = delete;
+        maintenance_lease & operator=(const maintenance_lease &) = delete;
+
+        ~maintenance_lease() {
+            if (owner != nullptr) {
+                owner->release_maintenance();
+            }
+        }
+
+        impl * owner = nullptr;
+    };
 
     grouped_resource * find_resource(const ggml_cuda_moe_grouped_acquisition & acquisition) {
         if (acquisition.resource_generation == 0 || acquisition.candidate.generation != state.generation ||
@@ -2136,8 +2159,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             const ggml_cuda_moe_grouped_transaction & transaction,
             uint32_t n_routes,
             uint64_t & clock_begin,
-            uint64_t & clock_end,
-            ggml_cuda_moe_grouped_acquisition & refresh) {
+            uint64_t & clock_end) {
         std::lock_guard<std::mutex> lock(mutex);
         auto * resource = find_resource(transaction);
         if (resource == nullptr || resource->device == nullptr || n_routes == 0) {
@@ -2146,16 +2168,28 @@ struct ggml_cuda_moe_grouped_context::impl {
         auto & clock_bound = resource->device->clock_bound;
         if (clock_bound > UINT64_MAX - n_routes) {
             refreshing[transaction.acquisition.candidate.group_index] = 1;
-            refresh = resource->snapshot.acquisition;
-            resource->active_transaction_token = 0;
-            resource->active_decode_stream = nullptr;
-            resource_cv.notify_all();
             return CLOCK_RESERVATION_REFRESH;
         }
         clock_begin = clock_bound;
         clock_end = clock_bound + n_routes;
         clock_bound = clock_end;
         return CLOCK_RESERVATION_READY;
+    }
+
+    bool begin_refresh(
+            const ggml_cuda_moe_grouped_transaction & transaction,
+            maintenance_lease & lease) {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto * resource = find_resource(transaction);
+        if (resource == nullptr || !refreshing[transaction.acquisition.candidate.group_index] || lease.owner != nullptr) {
+            return false;
+        }
+        ++active_maintenance;
+        lease.owner = this;
+        resource->active_transaction_token = 0;
+        resource->active_decode_stream = nullptr;
+        resource_cv.notify_all();
+        return !draining && !replacement_pending;
     }
 
     bool refresh_group_resource(const ggml_cuda_moe_grouped_acquisition & acquisition) {
@@ -2653,97 +2687,113 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         }
     }
 
-    ggml_cuda_moe_grouped_transaction transaction = {};
-    impl::grouped_resource * resource = nullptr;
-    bool resource_missing = false;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
-    }
-    if (resource == nullptr && resource_missing) {
-        ggml_cuda_moe_grouped_acquisition resource_acquisition;
-        if (!acquire_group_resources(key.candidate, &resource_acquisition)) {
-            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-        }
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
-    }
-    if (resource == nullptr || (uint32_t) ids->ne[0] > resource->snapshot.n_slots) {
-        if (resource != nullptr) {
-            (void) end_group_transaction(transaction);
-        }
-        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-    }
-
-    if (resource->device == nullptr) {
-        auto prospective = impl_->make_device_resource(resource->snapshot);
-        if (prospective == nullptr) {
-            (void) end_group_transaction(transaction);
-            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-        }
-        bool installed = false;
+    impl::maintenance_lease maintenance;
+    for (uint32_t attempt = 0; attempt < 2; ++attempt) {
+        ggml_cuda_moe_grouped_transaction transaction = {};
+        impl::grouped_resource * resource = nullptr;
+        bool resource_missing = false;
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
-            auto * current = impl_->find_resource(transaction);
-            if (current == resource && !impl_->refreshing[transaction.acquisition.candidate.group_index] &&
-                    impl_->resource_matches_table(*resource)) {
-                if (resource->device == nullptr) {
-                    resource->device = std::move(prospective);
+            resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
+        }
+        if (resource == nullptr && resource_missing) {
+            ggml_cuda_moe_grouped_acquisition resource_acquisition;
+            if (!acquire_group_resources(key.candidate, &resource_acquisition)) {
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
+        }
+        if (resource == nullptr || (uint32_t) ids->ne[0] > resource->snapshot.n_slots) {
+            if (resource != nullptr) {
+                (void) end_group_transaction(transaction);
+            }
+            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        }
+
+        if (resource->device == nullptr) {
+            auto prospective = impl_->make_device_resource(resource->snapshot);
+            if (prospective == nullptr) {
+                (void) end_group_transaction(transaction);
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
+            bool installed = false;
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                auto * current = impl_->find_resource(transaction);
+                if (current == resource && !impl_->refreshing[transaction.acquisition.candidate.group_index] &&
+                        impl_->resource_matches_table(*resource)) {
+                    if (resource->device == nullptr) {
+                        resource->device = std::move(prospective);
+                    }
+                    installed = true;
                 }
-                installed = true;
+            }
+            if (!installed) {
+                (void) end_group_transaction(transaction);
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
             }
         }
-        if (!installed) {
+
+        uint64_t clock_begin = 0;
+        uint64_t clock_end = 0;
+        const auto reservation = impl_->reserve_clock(transaction, static_cast<uint32_t>(ids->ne[0]), clock_begin, clock_end);
+        if (reservation == impl::CLOCK_RESERVATION_REFRESH) {
+            if (attempt != 0) {
+                (void) end_group_transaction(transaction);
+                impl_->clear_refresh(transaction.acquisition.candidate);
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
+            if (!impl_->begin_refresh(transaction, maintenance)) {
+                if (maintenance.owner == nullptr) {
+                    (void) end_group_transaction(transaction);
+                }
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
+            if (!impl_->refresh_group_resource(transaction.acquisition)) {
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
+            continue;
+        }
+        if (reservation != impl::CLOCK_RESERVATION_READY) {
             (void) end_group_transaction(transaction);
             return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
         }
-    }
-
-    uint64_t clock_begin = 0;
-    uint64_t clock_end = 0;
-    ggml_cuda_moe_grouped_acquisition refresh;
-    const auto reservation = impl_->reserve_clock(transaction, static_cast<uint32_t>(ids->ne[0]), clock_begin, clock_end, refresh);
-    if (reservation == impl::CLOCK_RESERVATION_REFRESH) {
-        (void) impl_->refresh_group_resource(refresh);
-        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-    }
-    if (reservation != impl::CLOCK_RESERVATION_READY) {
-        (void) end_group_transaction(transaction);
-        return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
-    }
-    auto & device = *resource->device;
-    if (device.has_completion) {
-        if (!moe_grouped_cuda_success(cudaStreamWaitEvent(compute_stream, device.completion, 0))) {
-            (void) end_group_transaction(transaction);
-            return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+        auto & device = *resource->device;
+        if (device.has_completion) {
+            if (!moe_grouped_cuda_success(cudaStreamWaitEvent(compute_stream, device.completion, 0))) {
+                (void) end_group_transaction(transaction);
+                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+            }
         }
-    }
 
-    moe_grouped_plan_decode<<<1, MOE_GROUPED_PLAN_THREADS, 0, compute_stream>>>(
-        static_cast<const int32_t *>(ids->data), (uint32_t) ids->ne[0], device.n_experts, resource->snapshot.n_slots,
-        device.slot_for_expert, device.expert_for_slot, device.last_used, clock_begin, clock_end, device.plan);
-    CUDA_CHECK(cudaGetLastError());
-    moe_grouped_gather_decode<<<MOE_GROUPED_TRANSFER_BLOCKS, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
-        device.device_banks, resource->snapshot.banks.size(), device.words_per_miss, device.plan);
-    CUDA_CHECK(cudaGetLastError());
-    moe_grouped_commit_decode<<<1, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
-        device.n_experts, resource->snapshot.n_slots, device.slot_for_expert, device.expert_for_slot,
-        device.last_used, device.plan);
-    CUDA_CHECK(cudaGetLastError());
+        moe_grouped_plan_decode<<<1, MOE_GROUPED_PLAN_THREADS, 0, compute_stream>>>(
+            static_cast<const int32_t *>(ids->data), (uint32_t) ids->ne[0], device.n_experts, resource->snapshot.n_slots,
+            device.slot_for_expert, device.expert_for_slot, device.last_used, clock_begin, clock_end, device.plan);
+        CUDA_CHECK(cudaGetLastError());
+        moe_grouped_gather_decode<<<MOE_GROUPED_TRANSFER_BLOCKS, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+            device.device_banks, resource->snapshot.banks.size(), device.words_per_miss, device.plan);
+        CUDA_CHECK(cudaGetLastError());
+        moe_grouped_commit_decode<<<1, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+            device.n_experts, resource->snapshot.n_slots, device.slot_for_expert, device.expert_for_slot,
+            device.last_used, device.plan);
+        CUDA_CHECK(cudaGetLastError());
 
-    decode->transaction = transaction;
-    decode->remapped_ids = device.plan->remapped_ids;
-    decode->layout = resource->snapshot.layout;
-    decode->n_banks = resource->snapshot.banks.size();
-    decode->n_slots = resource->snapshot.n_slots;
-    for (uint32_t bank = 0; bank < resource->snapshot.banks.size(); ++bank) {
-        decode->banks[bank].tensor = resource->snapshot.banks[bank].tensor;
-        decode->banks[bank].data = device.bank_data[bank];
-        decode->banks[bank].bank_index = bank;
-        decode->banks[bank].role = resource->snapshot.banks[bank].role;
-        decode->banks[bank].type = resource->snapshot.banks[bank].type;
+        decode->transaction = transaction;
+        decode->remapped_ids = device.plan->remapped_ids;
+        decode->layout = resource->snapshot.layout;
+        decode->n_banks = resource->snapshot.banks.size();
+        decode->n_slots = resource->snapshot.n_slots;
+        for (uint32_t bank = 0; bank < resource->snapshot.banks.size(); ++bank) {
+            decode->banks[bank].tensor = resource->snapshot.banks[bank].tensor;
+            decode->banks[bank].data = device.bank_data[bank];
+            decode->banks[bank].bank_index = bank;
+            decode->banks[bank].role = resource->snapshot.banks[bank].role;
+            decode->banks[bank].type = resource->snapshot.banks[bank].type;
+        }
+        return GGML_CUDA_MOE_GROUPED_DECODE_READY;
     }
-    return GGML_CUDA_MOE_GROUPED_DECODE_READY;
+    return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
 #endif
 }
 
@@ -3126,15 +3176,25 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
 }
 
 void ggml_cuda_moe_grouped_context::shutdown() {
-    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    bool terminal_owner = false;
+    {
+        std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->draining) {
+            impl_->draining = true;
+            terminal_owner = true;
+        }
+    }
+    if (!terminal_owner) {
+        std::unique_lock<std::mutex> lock(impl_->mutex);
+        impl_->resource_cv.wait(lock, [&]() { return impl_->shutdown_complete; });
+        return;
+    }
+
     impl::resource_slots retired;
     {
         std::unique_lock<std::mutex> lock(impl_->mutex);
-        if (impl_->draining) {
-            return;
-        }
-        impl_->draining = true;
-        impl_->resource_cv.wait(lock, [&]() { return !impl_->has_active_transaction(); });
+        impl_->resource_cv.wait(lock, [&]() { return !impl_->has_active_transaction() && impl_->active_maintenance == 0; });
         retired = impl_->detach_resources();
         impl_->refreshing.fill(0);
         impl_->table = {};
@@ -3143,6 +3203,11 @@ void ggml_cuda_moe_grouped_context::shutdown() {
         impl_->state.generation = generation;
     }
     impl::retire_resources(std::move(retired));
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->shutdown_complete = true;
+    }
+    impl_->resource_cv.notify_all();
 }
 
 extern "C"
