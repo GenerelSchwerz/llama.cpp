@@ -239,7 +239,7 @@ static void test_candidate_producer() {
     CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS)->tensor == fused.ffn_gate_up_exps_b);
     CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE) == nullptr);
 
-    ggml_cuda_moe_candidate_registry registry(&fixture.owner);
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().n_groups == 3 && registry.state().n_weights == 8);
 
@@ -274,7 +274,7 @@ static void test_candidate_producer() {
 
 static void test_candidate_registry(bool benchmark) {
     candidate_test_fixture fixture;
-    ggml_cuda_moe_candidate_registry registry(&fixture.owner);
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
 
     const int64_t gate_ne[] = {64, 32, 4};
     const int64_t down_ne[] = {32, 64, 4};
@@ -597,7 +597,7 @@ static void test_candidate_registry(bool benchmark) {
         benchmark_probe("pair-auxiliary");
     }
 
-    ggml_cuda_moe_candidate_registry other_registry(&fixture.owner);
+    ggml_cuda_moe_grouped_context other_registry(&fixture.owner);
     snapshot.n_slots = 48;
     CHECK(other_registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(other_registry.state().generation == 1 && other_registry.state().n_slots == 48);
@@ -606,11 +606,145 @@ static void test_candidate_registry(bool benchmark) {
     fprintf(stderr, "test-moe-cache: registry OK\n");
 }
 
+static void test_grouped_context_resources() {
+    candidate_test_fixture fixture;
+    const int64_t gate_up_ne[] = {64, 64, 4};
+    const int64_t down_ne[] = {32, 64, 4};
+    ggml_tensor * gate_up = fixture.tensor(GGML_TYPE_BF16, 3, gate_up_ne);
+    ggml_tensor * down = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    auto snapshot = candidate_snapshot(12, &group, 1);
+
+    auto first = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    ggml_cuda_moe_grouped_context second(&fixture.owner);
+    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    snapshot.n_slots = 48;
+    CHECK(second.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    ggml_cuda_moe_candidate_group_key first_key;
+    ggml_cuda_moe_candidate_group_key second_key;
+    CHECK(first->find_down_group_key(down, &first_key));
+    CHECK(second.find_down_group_key(down, &second_key));
+    ggml_cuda_moe_grouped_acquisition first_acquisition;
+    ggml_cuda_moe_grouped_acquisition repeated_acquisition;
+    ggml_cuda_moe_grouped_acquisition second_acquisition;
+    CHECK(first->acquire_group_resources(first_key, &first_acquisition));
+    CHECK(first->acquire_group_resources(first_key, &repeated_acquisition));
+    CHECK(second.acquire_group_resources(second_key, &second_acquisition));
+    CHECK(first_acquisition.resource_generation == 1);
+    CHECK(repeated_acquisition.resource_generation == first_acquisition.resource_generation);
+    CHECK(second_acquisition.resource_generation == 1);
+
+    ggml_cuda_moe_grouped_resource_info resource_info;
+    CHECK(first->get_group_resources(first_acquisition, &resource_info));
+    CHECK(resource_info.acquisition.candidate.generation == 1 && resource_info.n_slots == 12);
+    CHECK(resource_info.down == down && resource_info.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && resource_info.n_banks == 2);
+    CHECK(!first->get_group_resource_bank(first_acquisition, 0, nullptr));
+    CHECK(first->begin_group_transaction(first_acquisition));
+    CHECK(!first->begin_group_transaction(first_acquisition));
+    CHECK(first->get_group_resources(first_acquisition, &resource_info) && resource_info.transaction_active == 1);
+    bool found_gate_up = false;
+    bool found_down = false;
+    for (uint32_t i = 0; i < resource_info.n_banks; ++i) {
+        ggml_cuda_moe_grouped_bank_descriptor descriptor;
+        CHECK(first->get_group_resource_bank(first_acquisition, i, &descriptor));
+        CHECK(descriptor.buffer == descriptor.tensor->buffer && descriptor.buft == descriptor.tensor->buffer->buft);
+        CHECK(descriptor.source_data == descriptor.tensor->data && descriptor.buffer_base == fixture.storage);
+        CHECK(descriptor.buffer_size == candidate_test_fixture::BUFFER_SIZE && descriptor.byte_extent == ggml_nbytes(descriptor.tensor));
+        CHECK(descriptor.data_offset == static_cast<uint64_t>(static_cast<const uint8_t *>(descriptor.source_data) - static_cast<const uint8_t *>(descriptor.buffer_base)));
+        CHECK(descriptor.expert_stride == descriptor.tensor->nb[2] && descriptor.alignment == ggml_backend_buffer_get_alignment(descriptor.buffer));
+        CHECK(descriptor.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+        CHECK(descriptor.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND);
+        CHECK(descriptor.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            CHECK(descriptor.ne[dim] == descriptor.tensor->ne[dim] && descriptor.nb[dim] == descriptor.tensor->nb[dim]);
+        }
+        if (descriptor.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT) {
+            CHECK(descriptor.tensor == gate_up && descriptor.type == GGML_TYPE_BF16);
+            found_gate_up = true;
+        } else if (descriptor.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+            CHECK(descriptor.tensor == down && descriptor.type == GGML_TYPE_BF16);
+            found_down = true;
+        } else {
+            CHECK(false);
+        }
+    }
+    CHECK(found_gate_up && found_down);
+
+    auto wrong_acquisition = first_acquisition;
+    ++wrong_acquisition.resource_generation;
+    CHECK(!first->end_group_transaction(wrong_acquisition));
+    const uint64_t logical_signature = first->state().logical_signature;
+    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+    CHECK(first->state().generation == 1 && first->state().n_slots == 12);
+    CHECK(first->get_group_resources(first_acquisition, &resource_info) && resource_info.transaction_active == 1);
+    CHECK(first->end_group_transaction(first_acquisition));
+    CHECK(!first->end_group_transaction(first_acquisition));
+
+    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(first->state().generation == 2 && first->state().n_slots == 48);
+    CHECK(first->state().logical_signature == logical_signature);
+    CHECK(!first->get_group_resources(first_acquisition, nullptr));
+    CHECK(!first->end_group_transaction(first_acquisition));
+    CHECK(second.get_group_resources(second_acquisition, &resource_info));
+    CHECK(resource_info.n_slots == 48 && resource_info.acquisition.candidate.generation == 1);
+
+    ggml_cuda_moe_candidate_group_key replacement_key;
+    ggml_cuda_moe_grouped_acquisition replacement_acquisition;
+    CHECK(first->find_down_group_key(down, &replacement_key));
+    CHECK(first->acquire_group_resources(replacement_key, &replacement_acquisition));
+    CHECK(replacement_acquisition.resource_generation == 2);
+    auto disabled = candidate_snapshot(12, nullptr, 0);
+    CHECK(first->replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(first->state().generation == 3 && first->state().accepted == 1 && first->state().n_groups == 0);
+    CHECK(!first->get_group_resources(replacement_acquisition, nullptr));
+    CHECK(!first->acquire_group_resources(replacement_key, &repeated_acquisition));
+
+    snapshot.n_slots = 12;
+    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(first->state().generation == 4 && first->state().logical_signature == logical_signature);
+    CHECK(first->find_down_group_key(down, &replacement_key));
+    CHECK(first->acquire_group_resources(replacement_key, &replacement_acquisition));
+    CHECK(replacement_acquisition.resource_generation == 3);
+    CHECK(first->begin_group_transaction(replacement_acquisition));
+    auto * first_context = first.get();
+    std::atomic<bool> shutdown_started{false};
+    std::atomic<bool> shutdown_done{false};
+    std::thread shutdown_thread([&]() {
+        shutdown_started.store(true, std::memory_order_release);
+        first_context->shutdown();
+        shutdown_done.store(true, std::memory_order_release);
+    });
+    while (!shutdown_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    while (first->get_group_resources(replacement_acquisition, nullptr)) {
+        std::this_thread::yield();
+    }
+    CHECK(!shutdown_done.load(std::memory_order_acquire));
+    CHECK(first->get_group_resource_bank(replacement_acquisition, 0, nullptr));
+    CHECK(first->end_group_transaction(replacement_acquisition));
+    shutdown_thread.join();
+    CHECK(shutdown_done.load(std::memory_order_acquire));
+    first.reset();
+    CHECK(second.find_down_group_key(down, nullptr));
+    CHECK(second.get_group_resources(second_acquisition, &resource_info));
+    CHECK(second.begin_group_transaction(second_acquisition));
+    CHECK(second.end_group_transaction(second_acquisition));
+
+    fprintf(stderr, "test-moe-cache: grouped context resources OK\n");
+}
+
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     test_candidate_producer();
     test_candidate_registry(registry_bench);
+    test_grouped_context_resources();
     if (registry_only || registry_bench) {
         return 0;
     }

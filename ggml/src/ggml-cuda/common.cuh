@@ -1413,14 +1413,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
-class ggml_cuda_moe_candidate_registry;
+class ggml_cuda_moe_grouped_context;
 
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
-    std::once_flag moe_candidate_registry_once;
-    ggml_cuda_moe_candidate_registry * moe_candidate_registry = nullptr;
+    std::once_flag moe_grouped_context_once;
+    ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

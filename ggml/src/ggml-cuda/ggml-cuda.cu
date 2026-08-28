@@ -713,7 +713,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
-    delete moe_candidate_registry;
+#ifdef USE_CUDA_GRAPH
+    cuda_graphs.clear();
+#endif
+    delete moe_grouped_context;
 
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
@@ -3216,7 +3219,7 @@ static bool ggml_cuda_mul_mat_vec_q_cached_fused(
 }
 
 static void ggml_cuda_moe_shadow_probe_registered(
-        ggml_cuda_moe_candidate_registry & registry,
+        ggml_cuda_moe_grouped_context & registry,
         const ggml_tensor * weight,
         const ggml_tensor * ids,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -3249,7 +3252,7 @@ static inline void ggml_cuda_moe_shadow_probe(
         const ggml_tensor * ids,
         const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
         bool is_mmid = true) {
-    auto * registry = ctx.moe_candidate_registry;
+    auto * registry = ctx.moe_grouped_context;
     if (registry == nullptr || !is_mmid) {
         return;
     }

@@ -106,13 +106,47 @@ struct ggml_cuda_moe_candidate_probe_result {
     uint32_t roles[2] = {};
 };
 
-class ggml_cuda_moe_candidate_registry {
-public:
-    explicit ggml_cuda_moe_candidate_registry(ggml_backend_dev_t owner);
-    ~ggml_cuda_moe_candidate_registry();
+struct ggml_cuda_moe_grouped_acquisition {
+    ggml_cuda_moe_candidate_group_key candidate;
+    uint64_t resource_generation = 0;
+};
 
-    ggml_cuda_moe_candidate_registry(const ggml_cuda_moe_candidate_registry &) = delete;
-    ggml_cuda_moe_candidate_registry & operator=(const ggml_cuda_moe_candidate_registry &) = delete;
+struct ggml_cuda_moe_grouped_resource_info {
+    ggml_cuda_moe_grouped_acquisition acquisition;
+    const ggml_tensor * down = nullptr;
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t n_slots = 0;
+    uint32_t n_banks = 0;
+    uint32_t transaction_active = 0;
+};
+
+struct ggml_cuda_moe_grouped_bank_descriptor {
+    const ggml_tensor * tensor = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    const void * source_data = nullptr;
+    const void * buffer_base = nullptr;
+    uint64_t buffer_size = 0;
+    uint64_t data_offset = 0;
+    uint64_t byte_extent = 0;
+    uint64_t expert_stride = 0;
+    uint64_t alignment = 0;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    size_t nb[GGML_MAX_DIMS] = {};
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t type = GGML_TYPE_COUNT;
+    uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
+    uint32_t movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
+    uint32_t index_modes = 0;
+};
+
+class ggml_cuda_moe_grouped_context {
+public:
+    explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner);
+    ~ggml_cuda_moe_grouped_context();
+
+    ggml_cuda_moe_grouped_context(const ggml_cuda_moe_grouped_context &) = delete;
+    ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
     ggml_cuda_moe_candidate_registry_state state() const;
@@ -122,6 +156,12 @@ public:
     bool get_group(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_candidate_group_info * info) const;
     bool get_bank(const ggml_cuda_moe_candidate_group_key & key, uint32_t role, ggml_cuda_moe_candidate_bank_info * info) const;
     bool probe(const ggml_cuda_moe_candidate_probe_input & input, ggml_cuda_moe_candidate_probe_result * result) const;
+    bool acquire_group_resources(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_grouped_acquisition * acquisition);
+    bool begin_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition);
+    bool end_group_transaction(const ggml_cuda_moe_grouped_acquisition & acquisition);
+    bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
+    bool get_group_resource_bank(const ggml_cuda_moe_grouped_acquisition & acquisition, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    void shutdown();
 
 private:
     struct impl;
