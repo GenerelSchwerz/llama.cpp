@@ -1,7 +1,6 @@
 #!/bin/bash
 # R4 gate 1: greedy server output must be byte-identical to the ordered path, across several
-# prefill corpora and prefill lengths. Compare the hashes across pipeline depths, and against a
-# build of the parent commit.
+# prefill corpora and prefill lengths. The script compares every requested depth with the first.
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-exact.sh [pipeline-depth ...]
 #   LLAMA_KV_LENGTHS=2048,18432,65536 selects the prefill lengths (default 2048,18432).
@@ -16,6 +15,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DEPTHS=(0 1 4); [ $# -gt 0 ] && DEPTHS=("$@")
 rc=0
+BASE=""
 for D in "${DEPTHS[@]}"; do
   echo "== pipeline depth=$D  ctx=$CTX  prefill lengths=$LENGTHS"
   LOG=$(mktemp /tmp/r4-kv-pipeline.XXXX.log)
@@ -28,8 +28,20 @@ for D in "${DEPTHS[@]}"; do
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     sleep 1
   done
-  python3 "$HERE/r4-kv-pipeline-exact.py" "$PORT" "$LENGTHS" || rc=$?
-  kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
+  OUT=$(mktemp /tmp/r4-kv-pipeline.XXXX.hashes)
+  if python3 "$HERE/r4-kv-pipeline-exact.py" "$PORT" "$LENGTHS" "$OUT"; then
+    if [ -z "$BASE" ]; then
+      BASE="$OUT"
+    elif ! cmp -s "$BASE" "$OUT"; then
+      diff -u "$BASE" "$OUT"
+      rc=1
+    fi
+  else
+    rc=$?
+  fi
+  kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
   rm -f "$LOG"
+  [ "$OUT" = "$BASE" ] || rm -f "$OUT"
 done
+[ -z "$BASE" ] || rm -f "$BASE"
 exit $rc

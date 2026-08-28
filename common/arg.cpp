@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -2443,8 +2444,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       "ordered path, so a host-resident cache never quietly trades away the device memory it exists "
                       "to save. 0 removes the cap (default: %d)", params.kv_pipeline_budget_mib),
         [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("--kv-pipeline-budget must not be negative");
+            constexpr size_t mib = 1024u*1024u;
+            if (value < 0 || (size_t) value > std::numeric_limits<size_t>::max()/mib) {
+                throw std::invalid_argument("--kv-pipeline-budget is out of range for this platform");
             }
             params.kv_pipeline_budget_mib = value;
         }

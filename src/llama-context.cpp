@@ -867,15 +867,22 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     auto create_sched = [&](bool pipeline_parallel) {
+        constexpr size_t mib = 1024u*1024u;
+        if (cparams.kv_pipeline_depth > 14) {
+            throw std::invalid_argument("kv_pipeline_depth must be between 0 and 14");
+        }
+        if (cparams.kv_pipeline_budget_mib > std::numeric_limits<size_t>::max()/mib) {
+            throw std::invalid_argument("kv_pipeline_budget_mib is too large for this platform");
+        }
+
         sched.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, pipeline_parallel, cparams.op_offload));
         cparams.flash_attn_causal_prefix_supported = llama_sched_supports_flash_attn_causal_prefix(sched.get());
-        // only a host-resident KV cache produces the deliveries this pipelines
-        ggml_backend_sched_set_transport_pipeline_budget(sched.get(),
-                (size_t) cparams.kv_pipeline_budget_mib * 1024 * 1024);
-        ggml_backend_sched_set_transport_pipeline_depth(sched.get(),
-                cparams.kv_cpu_pinned || !cparams.offload_kqv ? (int) cparams.kv_pipeline_depth : 0);
+        if (!ggml_backend_sched_set_transport_pipeline_budget(sched.get(), (size_t) cparams.kv_pipeline_budget_mib*mib) ||
+            !ggml_backend_sched_set_transport_pipeline_depth(sched.get(), cparams.kv_cpu_pinned || !cparams.offload_kqv ? (int) cparams.kv_pipeline_depth : 0)) {
+            throw std::invalid_argument("invalid KV transport pipeline configuration");
+        }
         if (sched_resizable) {
             sched_buffers_shared = sched_buffer_owner != nullptr && sched_buffer_owner->get_sched() != nullptr &&
                     ggml_backend_sched_set_resizable(sched.get(), sched_buffer_owner->get_sched());

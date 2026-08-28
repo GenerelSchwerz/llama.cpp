@@ -20,6 +20,17 @@ struct dummy_backend_context {
     bool   fail_alloc             = false;
     bool   unique_alloc_addresses = false;
     int    graph_compute_count    = 0;
+    enum ggml_backend_dev_type device_type = GGML_BACKEND_DEVICE_TYPE_CPU;
+    const char * registry_name = "dummy";
+    bool buffer_is_host = true;
+    bool fail_backend_init = false;
+    bool fail_event_init = false;
+    int transfer_backend_count = 0;
+    int event_wait_count = 0;
+    int set_tensor_async_count = 0;
+    size_t set_tensor_async_bytes = 0;
+    ggml_backend_buffer_type_t buffer_type = nullptr;
+    ggml_backend_i backend_interface = {};
 
     ggml_backend_buffer_i              buffer_interface;
     std::vector<ggml_backend_buffer_t> buffers;
@@ -63,8 +74,8 @@ static size_t dummy_backend_buffer_type_get_max_size(ggml_backend_buffer_type_t 
     return ctx->max_buffer_size;
 }
 
-static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t) {
-    return true;
+static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
+    return ((dummy_backend_context *) buft->context)->buffer_is_host;
 }
 
 // ggml_backend_buffer interface
@@ -104,13 +115,34 @@ static void dummy_backend_buffer_clear(ggml_backend_buffer_t, uint8_t) {}
 
 struct dummy_backend {
     std::unique_ptr<dummy_backend_context> context;
+    std::unique_ptr<ggml_backend_reg>      registry;
     std::unique_ptr<ggml_backend_device>   device;
     std::unique_ptr<ggml_backend>          handle;
     ggml_backend_buffer_type               buffer_type;
 };
 
-static const char * dummy_backend_get_name(ggml_backend_t) {
-    return "dummy_backend";
+static const char * dummy_backend_get_name(ggml_backend_t backend) {
+    return ((dummy_backend_context *) backend->context)->registry_name;
+}
+
+static void dummy_backend_free(ggml_backend_t backend) {
+    dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
+    ctx->transfer_backend_count--;
+    delete backend;
+}
+
+static void dummy_backend_set_tensor_async(ggml_backend_t backend, ggml_tensor *, const void *, size_t, size_t size) {
+    dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
+    ctx->set_tensor_async_count++;
+    ctx->set_tensor_async_bytes += size;
+}
+
+static void dummy_backend_synchronize(ggml_backend_t) {}
+
+static void dummy_backend_event_record(ggml_backend_t, ggml_backend_event_t) {}
+
+static void dummy_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t) {
+    ((dummy_backend_context *) backend->context)->event_wait_count++;
 }
 
 static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *) {
@@ -119,24 +151,76 @@ static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml
     return GGML_STATUS_SUCCESS;
 }
 
-static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t) {
-    return GGML_BACKEND_DEVICE_TYPE_CPU;
+static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t dev) {
+    return ((dummy_backend_context *) dev->context)->device_type;
+}
+
+static void dummy_backend_device_get_memory(ggml_backend_dev_t, size_t * free, size_t * total) {
+    *free = SIZE_MAX;
+    *total = SIZE_MAX;
+}
+
+static ggml_backend_t dummy_backend_device_init(ggml_backend_dev_t dev, const char *) {
+    dummy_backend_context * ctx = (dummy_backend_context *) dev->context;
+    if (ctx->fail_backend_init) {
+        return nullptr;
+    }
+    ggml_backend_t backend = new ggml_backend{};
+    backend->iface = ctx->backend_interface;
+    backend->device = dev;
+    backend->context = ctx;
+    ctx->transfer_backend_count++;
+    return backend;
+}
+
+static ggml_backend_buffer_type_t dummy_backend_device_get_buffer_type(ggml_backend_dev_t dev) {
+    return ((dummy_backend_context *) dev->context)->buffer_type;
+}
+
+static ggml_backend_event_t dummy_backend_device_event_new(ggml_backend_dev_t dev) {
+    dummy_backend_context * ctx = (dummy_backend_context *) dev->context;
+    if (ctx->fail_event_init) {
+        return nullptr;
+    }
+    ggml_backend_event_t event = new ggml_backend_event;
+    event->device = dev;
+    event->context = nullptr;
+    return event;
+}
+
+static void dummy_backend_device_event_free(ggml_backend_dev_t, ggml_backend_event_t event) {
+    delete event;
+}
+
+static void dummy_backend_device_event_synchronize(ggml_backend_dev_t, ggml_backend_event_t) {}
+
+static const char * dummy_backend_registry_get_name(ggml_backend_reg_t reg) {
+    return ((dummy_backend_context *) reg->context)->registry_name;
 }
 
 static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tensor *) {
     return true;
 }
 
-static bool dummy_backend_device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t) {
-    return true;
+static bool dummy_backend_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    return buft == ((dummy_backend_context *) dev->context)->buffer_type;
 }
 
-static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false) {
+static dummy_backend dummy_backend_init(
+        size_t max_buffer_size,
+        size_t alignment = 8,
+        bool unique_alloc_addresses = false,
+        enum ggml_backend_dev_type device_type = GGML_BACKEND_DEVICE_TYPE_CPU,
+        const char * registry_name = "dummy",
+        bool buffer_is_host = true) {
     dummy_backend b{};
     b.context                         = std::make_unique<dummy_backend_context>();
     b.context->alignment              = alignment;
     b.context->max_buffer_size        = max_buffer_size;
     b.context->unique_alloc_addresses = unique_alloc_addresses;
+    b.context->device_type            = device_type;
+    b.context->registry_name          = registry_name;
+    b.context->buffer_is_host         = buffer_is_host;
 
     b.context->buffer_interface.free_buffer   = dummy_backend_buffer_free_buffer;
     b.context->buffer_interface.get_base      = dummy_backend_buffer_get_base;
@@ -152,17 +236,36 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.buffer_type.iface.get_alignment = dummy_backend_buffer_type_get_alignment;
     b.buffer_type.iface.get_max_size  = dummy_backend_buffer_type_get_max_size;
     b.buffer_type.iface.is_host       = dummy_backend_buffer_type_is_host;
+    b.context->buffer_type            = &b.buffer_type;
+
+    b.registry = std::make_unique<ggml_backend_reg>();
+    b.registry->iface.get_name = dummy_backend_registry_get_name;
+    b.registry->context = b.context.get();
 
     b.device = std::make_unique<ggml_backend_device>();
-    b.device->iface.get_type      = dummy_backend_device_get_type;
-    b.device->iface.supports_op   = dummy_backend_device_supports_op;
-    b.device->iface.supports_buft = dummy_backend_device_supports_buft;
+    b.device->iface.get_memory        = dummy_backend_device_get_memory;
+    b.device->iface.get_type          = dummy_backend_device_get_type;
+    b.device->iface.init_backend      = dummy_backend_device_init;
+    b.device->iface.get_buffer_type   = dummy_backend_device_get_buffer_type;
+    b.device->iface.supports_op       = dummy_backend_device_supports_op;
+    b.device->iface.supports_buft     = dummy_backend_device_supports_buft;
+    b.device->iface.event_new         = dummy_backend_device_event_new;
+    b.device->iface.event_free        = dummy_backend_device_event_free;
+    b.device->iface.event_synchronize = dummy_backend_device_event_synchronize;
+    b.device->reg                     = b.registry.get();
+    b.device->context                 = b.context.get();
 
     b.handle = std::make_unique<ggml_backend>();
-    b.handle->iface.get_name      = dummy_backend_get_name;
-    b.handle->iface.graph_compute = dummy_backend_graph_compute;
-    b.handle->device              = b.device.get();
-    b.handle->context             = b.context.get();
+    b.context->backend_interface.get_name         = dummy_backend_get_name;
+    b.context->backend_interface.free             = dummy_backend_free;
+    b.context->backend_interface.set_tensor_async = dummy_backend_set_tensor_async;
+    b.context->backend_interface.synchronize      = dummy_backend_synchronize;
+    b.context->backend_interface.graph_compute    = dummy_backend_graph_compute;
+    b.context->backend_interface.event_record     = dummy_backend_event_record;
+    b.context->backend_interface.event_wait       = dummy_backend_event_wait;
+    b.handle->iface                               = b.context->backend_interface;
+    b.handle->device                              = b.device.get();
+    b.handle->context                             = b.context.get();
     return b;
 }
 
@@ -184,6 +287,36 @@ static test_context_with_graph make_context() {
     ggml_context_ptr ctx_ptr = ggml_context_ptr(ctx);
     ggml_cgraph *    graph   = ggml_new_graph(ctx);
     return { ctx, graph, std::move(ctx_ptr) };
+}
+
+struct transport_graph {
+    test_context_with_graph ctx;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * source;
+    ggml_tensor * output;
+};
+
+static transport_graph make_transport_graph(dummy_backend & cpu, size_t size) {
+    GGML_ASSERT(size % sizeof(float) == 0);
+    auto result = make_context();
+    ggml_tensor * source = ggml_new_tensor_1d(result.ctx, GGML_TYPE_F32, size/sizeof(float));
+    ggml_tensor * output = ggml_scale(result.ctx, source, 2.0f);
+    source->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_build_forward_expand(result.graph, output);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, size));
+    source->buffer = buffer.get();
+    source->data = ggml_backend_buffer_get_base(buffer.get());
+
+    return { std::move(result), std::move(buffer), source, output };
+}
+
+static void transport_stats(
+        ggml_backend_sched_t sched,
+        int64_t * deliveries,
+        int64_t * early,
+        int64_t * late) {
+    ggml_backend_sched_get_transport_pipeline_stats(sched, deliveries, early, late);
 }
 
 static ggml_tensor * make_input_1d(ggml_context * ctx, int64_t n_elements) {
@@ -1124,6 +1257,202 @@ static void test_resizable_buffers_owner_borrower_teardown_order() {
     }
 }
 
+static void test_transport_prefix_and_configuration() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_transport_graph(cpu, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    {
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 1024));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+        ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+
+        ggml_set_stable_prefix(graph.source, 32);
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+        int64_t deliveries = 0;
+        int64_t early = 0;
+        int64_t late = 0;
+        transport_stats(sched.get(), &deliveries, &early, &late);
+        GGML_ASSERT(deliveries == 1 && early == 32 && late == 32);
+        GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
+        GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
+
+        ggml_set_stable_prefix(graph.source, 0);
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+        transport_stats(sched.get(), &deliveries, &early, &late);
+        GGML_ASSERT(deliveries == 2 && early == 32 && late == 96);
+
+        ggml_set_stable_prefix(graph.source, 64);
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+        transport_stats(sched.get(), &deliveries, &early, &late);
+        GGML_ASSERT(deliveries == 3 && early == 96 && late == 96);
+        GGML_ASSERT(cuda.context->event_wait_count > 0);
+    }
+    GGML_ASSERT(cuda.context->transfer_backend_count == 0);
+}
+
+static void test_transport_depth_zero() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_transport_graph(cpu, 64);
+    ggml_set_stable_prefix(graph.source, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = -1;
+    int64_t early = -1;
+    int64_t late = -1;
+    transport_stats(sched.get(), &deliveries, &early, &late);
+    GGML_ASSERT(deliveries == 0 && early == 0 && late == 0);
+    GGML_ASSERT(cuda.context->transfer_backend_count == 0);
+}
+
+static void test_transport_budget_recovers() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto large = make_transport_graph(cpu, 256);
+    auto small = make_transport_graph(cpu, 64);
+    ggml_set_stable_prefix(large.source, 256);
+    ggml_set_stable_prefix(small.source, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 384));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+
+    ggml_backend_sched_set_tensor_backend(sched.get(), large.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), large.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), large.ctx.graph) == GGML_STATUS_SUCCESS);
+    int64_t deliveries = 0;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 0);
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), small.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), small.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), small.ctx.graph) == GGML_STATUS_SUCCESS);
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 1);
+}
+
+static void test_transport_partial_backend_failure() {
+    dummy_backend cuda_fail = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cuda_ok   = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu       = dummy_backend_init(SIZE_MAX, 8, true);
+    cuda_fail.context->fail_event_init = true;
+
+    auto graph = make_context();
+    ggml_tensor * source_fail = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_F32, 16);
+    ggml_tensor * source_ok   = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_F32, 16);
+    ggml_tensor * output_fail = ggml_scale(graph.ctx, source_fail, 2.0f);
+    ggml_tensor * output_ok   = ggml_scale(graph.ctx, source_ok, 2.0f);
+    ggml_tensor * output      = ggml_add(graph.ctx, output_fail, output_ok);
+    source_fail->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    source_ok->flags   |= GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_set_stable_prefix(source_fail, 64);
+    ggml_set_stable_prefix(source_ok, 64);
+    ggml_build_forward_expand(graph.graph, output);
+
+    ggml_backend_buffer_ptr buffer_fail(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, 64));
+    ggml_backend_buffer_ptr buffer_ok(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, 64));
+    source_fail->buffer = buffer_fail.get();
+    source_fail->data   = ggml_backend_buffer_get_base(buffer_fail.get());
+    source_ok->buffer   = buffer_ok.get();
+    source_ok->data     = ggml_backend_buffer_get_base(buffer_ok.get());
+
+    ggml_backend_t backends[] = { cuda_fail.handle.get(), cuda_ok.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda_fail.buffer_type, &cuda_ok.buffer_type, &cpu.buffer_type };
+    {
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 3, 128, false, false));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+        ggml_backend_sched_set_tensor_backend(sched.get(), output_fail, cuda_fail.handle.get());
+        ggml_backend_sched_set_tensor_backend(sched.get(), output_ok, cuda_ok.handle.get());
+        ggml_backend_sched_set_tensor_backend(sched.get(), output, cpu.handle.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.graph));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.graph) == GGML_STATUS_SUCCESS);
+
+        int64_t deliveries = 0;
+        transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+        GGML_ASSERT(deliveries == 1);
+        GGML_ASSERT(cuda_fail.context->transfer_backend_count == 0);
+        GGML_ASSERT(cuda_ok.context->transfer_backend_count == 1);
+    }
+    GGML_ASSERT(cuda_ok.context->transfer_backend_count == 0);
+}
+
+static void test_transport_excludes_meta() {
+    dummy_backend meta = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_META, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_transport_graph(cpu, 64);
+    ggml_set_stable_prefix(graph.source, 64);
+
+    ggml_backend_t backends[] = { meta.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &meta.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, meta.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = -1;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 0);
+    GGML_ASSERT(meta.context->transfer_backend_count == 0);
+}
+
+static void test_transport_requires_annotation() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_transport_graph(cpu, 64);
+    graph.source->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_set_stable_prefix(graph.source, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = -1;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 0);
+    GGML_ASSERT(cuda.context->transfer_backend_count == 0);
+}
+
+static void test_transport_excludes_non_cuda() {
+    dummy_backend sycl = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "SYCL", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_transport_graph(cpu, 64);
+    ggml_set_stable_prefix(graph.source, 64);
+
+    ggml_backend_t backends[] = { sycl.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &sycl.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, sycl.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = -1;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 0);
+    GGML_ASSERT(sycl.context->transfer_backend_count == 0);
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1155,5 +1484,12 @@ int main() {
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
+    run("test_transport_prefix_and_configuration", test_transport_prefix_and_configuration);
+    run("test_transport_depth_zero", test_transport_depth_zero);
+    run("test_transport_budget_recovers", test_transport_budget_recovers);
+    run("test_transport_partial_backend_failure", test_transport_partial_backend_failure);
+    run("test_transport_excludes_meta", test_transport_excludes_meta);
+    run("test_transport_requires_annotation", test_transport_requires_annotation);
+    run("test_transport_excludes_non_cuda", test_transport_excludes_non_cuda);
     return 0;
 }

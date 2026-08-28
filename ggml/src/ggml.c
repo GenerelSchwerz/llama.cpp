@@ -1260,6 +1260,9 @@ static_assert(GGML_GLU_OP_COUNT == 6, "GGML_GLU_OP_COUNT != 6");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
+static_assert(sizeof(((struct ggml_tensor *) 0)->padding) == 8, "ggml_tensor trailing storage must be 8 bytes");
+static_assert(sizeof(((struct ggml_tensor *) 0)->stable_prefix) <= sizeof(((struct ggml_tensor *) 0)->padding), "stable_prefix must fit in trailing storage");
+static_assert(offsetof(struct ggml_tensor, stable_prefix) + sizeof(((struct ggml_tensor *) 0)->padding) == sizeof(struct ggml_tensor), "ggml_tensor trailing storage must remain last");
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1830,7 +1833,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.stable_prefix=*/ 0,
+        /*.padding      =*/ { 0 },
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads

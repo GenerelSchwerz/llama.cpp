@@ -648,11 +648,12 @@ extern "C" {
 
     // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT   =  1, // ...is an input for the GGML compute graph
-        GGML_TENSOR_FLAG_OUTPUT  =  2, // ...is an output for the GGML compute graph
-        GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
-        GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
-        GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_INPUT     =  1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT    =  2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM     =  4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS      =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_COMPUTE   = 16, // ...must be computed
+        GGML_TENSOR_FLAG_TRANSPORT = 32, // ...is persistent host storage that can use split-input transport
     };
 
     enum ggml_tri_type {
@@ -701,16 +702,11 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // number of leading bytes of this tensor's storage that are guaranteed not to be
-        // written during a single graph evaluation. 0 means "not known".
-        // set on the tensor that owns the storage, by whoever knows what the graph will write;
-        // a view inherits the part of it that its own byte window covers. read by the backend
-        // scheduler, which may use it to deliver a host-resident split input to an accelerator
-        // before the split that reads it runs, see
-        // ggml_backend_sched_set_transport_pipeline_depth().
-        // (kept last, in place of the former trailing padding, so that sizeof(struct ggml_tensor)
-        // does not change)
-        size_t stable_prefix;
+        // leading bytes that stay unchanged during the current graph evaluation
+        union {
+            size_t stable_prefix;
+            char padding[8];
+        };
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);

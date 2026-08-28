@@ -312,6 +312,15 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        if (ggml_backend_buft_is_host(buft)) {
+            if (k) {
+                k->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+            if (v && !v_trans) {
+                v->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+        }
+
         bool k_store_quantize = false;
         bool v_store_quantize = false;
         if (ggml_backend_buft_is_host(buft)) {

@@ -248,9 +248,8 @@ the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an
 absolute cap on the ring, not a fraction of what happens to be free:
 
 - Under the cap the ring is allocated and the deliveries pipeline.
-- Over it the scheduler declines and keeps the ordered path, and the decision is
-  latched, because a context only grows and a ring allocated for the small
-  windows of early prefill would only have to be given back later.
+- Over it the scheduler declines and keeps the ordered path for that graph.
+  Later graphs are evaluated again, so a smaller live window can use the ring.
 - Declining costs nothing in steady state. Both the ring and the transfer
   backend's device context are released.
 
@@ -320,7 +319,8 @@ The gates, and what was run for them:
 1. **Byte-identical greedy server output against the control.** Four fixed tasks
    at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token
    prompt, hashed and compared against a build of the parent commit. Identical at
-   `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh`.
+   `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh` compares
+   every requested depth with the first and fails on a hash difference.
    Two things keep the tasks independent of each other, and both were needed.
    Every task carries a nonce derived from its own name and length, so no two
    share a prefix the server could restore, and the harness fails a task whose
@@ -343,10 +343,9 @@ The gates, and what was run for them:
    `GGML_SCHED_TRANSPORT_DEBUG=1` reports the plan (staged splits, bytes per
    graph, how much of it goes early, and the source buffer type); `=2` adds the
    per-graph host-time breakdown above, as the mean over each 128 graphs, with
-   how often the look-ahead stopped on the depth it was given against a slot
-   whose reader had not run; `=3` names the tensors still on the ordered path.
-   `ggml_backend_sched_get_transport_pipeline_stats()` exposes the same counters
-   to callers.
+   depth stops and the number of recycle waits enqueued; `=3` names the tensors
+   still on the ordered path. `ggml_backend_sched_get_transport_pipeline_stats()`
+   exposes deliveries and early and late byte counts to callers.
 
 A device-resident KV run is unaffected, and was measured to confirm it: 38.5612
 t/s at depth 0 against 38.5240 at depth 1, `tg128 @ d4096`, with the
@@ -354,10 +353,11 @@ transport never enabled because the scheduler is given a depth of 0.
 
 ## Scope and limits
 
-- Only inputs carrying a stable prefix are eligible. Everything else -- weights,
-  user inputs, a transposed V cache, an input copy with a reader in a later
-  split, any backend that cannot transfer asynchronously or record events --
-  keeps the ordered path untouched.
+- Only persistent host inputs marked with `GGML_TENSOR_FLAG_TRANSPORT` are
+  candidates. The stable prefix remains a per-evaluation value. Unmarked inputs,
+  weights, user inputs, transposed V, and copies with later readers stay ordered.
+- CUDA is the only enabled backend. Meta, SYCL, WebGPU, and other backends stay
+  ordered until their event behavior and transport path are validated.
 - The ring costs `(depth + 2) x (largest staged split)` of device memory, and a
   staged split is both K and V of one attention layer over the whole context. That
   is linear in context length, and it is what bounds the feature at depth rather
@@ -374,22 +374,9 @@ transport never enabled because the scheduler is given a depth of 0.
 
 ## Tensor parallelism
 
-`-sm tensor` is not pipelined. The scheduler sees a single *meta* backend there,
-and two separate things stand in the way:
-
-1. **No events in the meta layer.** `ggml_backend_meta_i.event_record` and
-   `.event_wait` are null, and so are `event_new` / `event_free` /
-   `event_synchronize` on the meta device. Pipelining is built on ordering a
-   transfer stream against the consumer with events, so the eligibility check
-   rejects the backend and the ordered path runs. Requesting a look-ahead under
-   `-sm tensor` costs nothing and changes nothing: measured 21.85 t/s at depth 1
-   against 21.87 at depth 0, with identical output.
-2. **The ring is a byte arena.** It is allocated once and the staged input copies
-   are pointed into it at fixed offsets. A meta buffer has no flat base --
-   `ggml_backend_meta_buffer_get_base` returns a placeholder -- and a tensor in
-   one is not placed at an offset but built as a set of per-device tensors by the
-   buffer's `init_tensor`, from a whole `ggml_context` allocated at once. The ring
-   would have to become slot *tensors* rather than offsets.
+`-sm tensor` is not pipelined. The scheduler explicitly excludes meta devices.
+A host-resident cache needs a validated strided head-split write before this can
+be enabled.
 
 Both sit behind a correctness problem that is not this feature's:
 **`-sm tensor` together with `--no-kv-offload` currently produces wrong output.**
@@ -420,11 +407,4 @@ row rather than laid out end to end.
 
 - Fix `-sm tensor` with `--no-kv-offload` (above). Until then it should not be
   used: it is wrong rather than slow.
-- Events on the meta backend and device, a ring that can live in a meta buffer,
-  and a transfer-only meta backend, so tensor parallelism can be pipelined once
-  it is correct. Written on a separate branch, and not reachable until it is.
-- Take the last small blocking copies off the host's critical path. On the
-  pipelined path 3.6 ms per graph at 19,246 and 8.7 ms at 48,042 is still spent
-  inside `ggml_backend_tensor_copy`, for 0.4 MiB. It is 40 separate copies, and
-  32 of them are the device-to-host KV store, which runs on the other copy engine
-  and could overlap the deliveries instead of blocking the host.
+- Add the strided head-split delivery above, validate it, and then measure it.
