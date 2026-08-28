@@ -45,7 +45,7 @@ of:
 - the graph opted in for this node (the runtime option);
 - an NVIDIA device using the Ampere MMA implementation;
 - a compiled native K/V pair (see the tiers below);
-- equal head dimensions of 64, 128 or 256, or symmetric Q4_0, Q4_1, Q5_0 or Q8_0 D=512 with GQA enabled, a GQA ratio above 4, and a query batch above 4;
+- equal head dimensions of 64, 128 or 256, or symmetric Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 D=512 with GQA enabled, a GQA ratio above 4, and a query batch above 4;
 - `logit_softcap == 0`.
 
 Anything else keeps the standard path. In particular the dispatcher checks the
@@ -76,7 +76,7 @@ adds one runtime-V kernel per K type, which covers every mixed pair of that K.
 That is what keeps coverage linear: five types cover all 25 ordered pairs with
 ten kernels per tile shape, not 25.
 
-The D=512 Q4_0, Q4_1, Q5_0 and Q8_0 specializations are symmetric-only. Mixed and other-type D=512 requests stay on the materializing path until those kernels have separate performance evidence.
+The D=512 Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 specializations are symmetric-only. Mixed and other-type D=512 requests stay on the materializing path until those kernels have separate performance evidence.
 
 `fattn-mma-quant-types.h` is read by the route predicate, the extern
 declarations, the host K dispatch, the device runtime-V selection, the instance
@@ -120,7 +120,7 @@ Measured on this tree, `sm_86;sm_89`, CUDA 13.3, Release:
 | this branch, `GGML_CUDA_FA_ALL_QUANTS=ON` | 276,719,560 B | +141,562,704 B (+135.0 MiB, +104.74%) |
 
 The default tier has 49 Q4_0 kernels and 49 Q8_0 kernels (16 tile shapes x 3 base head dimensions, plus one D=512 8x8 kernel per type).
-The all-quants tier keeps the default D=512 specializations, adds Q4_1 and Q5_0 D=512 specializations and 48 runtime-V kernels per default type, and carries 48 symmetric plus 48 runtime-V kernels for Q5_1. These
+The all-quants tier keeps the default D=512 specializations, adds Q4_1, Q5_0 and Q5_1 D=512 specializations and 48 runtime-V kernels per default type. These
 counts are read back out of the built library by
 `scripts/fattn-native-inventory.py`, which checks them against the manifest.
 
@@ -148,7 +148,7 @@ With `GGML_CUDA_FATTN_NATIVE_VERBOSE=1` the all-quants focused run takes the
 native route for all 25 ordered pairs of the five compiled types; the default
 run takes it for `q8_0/q8_0` and `q4_0/q4_0` and correctly declines the rest.
 
-Kernel inventory (`scripts/fattn-native-inventory.py`): the default library carries 49 Q8_0 and 49 Q4_0 symmetric kernels, and none for the extra tier; the all-quants library adds 48 runtime-V kernels per default type, carries 49 symmetric plus 48 runtime-V kernels for Q4_1 and Q5_0, and carries 48 + 48 for Q5_1.
+Kernel inventory (`scripts/fattn-native-inventory.py`): the default library carries 49 Q8_0 and 49 Q4_0 symmetric kernels, and none for the extra tier; the all-quants library adds 48 runtime-V kernels per default type and carries 49 symmetric plus 48 runtime-V kernels for each extra type.
 Regenerating the instance files reproduces the committed ones byte for byte.
 
 Runtime, Qwen3.8-27B-UD-IQ2_M (D=256, 24 heads, 4 KV heads), `q8_0/q8_0` cache:
