@@ -286,6 +286,7 @@ private:
     void reset_sched_workspace();
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
+    void refresh_moe_candidates();
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -402,6 +403,8 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
+    std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v1_t>> moe_candidate_replace_fns;
+    bool moe_candidate_refresh_pending = true;
 
     // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;

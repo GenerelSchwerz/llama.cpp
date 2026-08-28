@@ -470,6 +470,12 @@ llama_context::llama_context(
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
                 }
+
+                auto moe_candidate_replace_fn = (ggml_backend_moe_candidate_replace_v1_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME);
+                if (moe_candidate_replace_fn) {
+                    moe_candidate_replace_fns.emplace_back(backend.get(), moe_candidate_replace_fn);
+                }
             }
         }
 
@@ -822,6 +828,7 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 }
 
 void llama_context::sched_reserve(uint32_t n_tokens_req) {
+    refresh_moe_candidates();
     acquire_shared_workspace();
 
     const bool sched_resizable = cparams.phase_aware_workspace && !model.hparams.no_alloc;
@@ -1009,6 +1016,38 @@ void llama_context::sched_reserve(uint32_t n_tokens_req) {
     } else {
         LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
                 __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+}
+
+void llama_context::refresh_moe_candidates() {
+    if (!moe_candidate_refresh_pending) {
+        return;
+    }
+
+    moe_candidate_refresh_pending = false;
+    if (moe_candidate_replace_fns.empty()) {
+        return;
+    }
+
+    ggml_backend_moe_candidate_snapshot_v1 disabled = {};
+    disabled.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+    disabled.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    disabled.struct_size = sizeof(disabled);
+    disabled.n_slots = std::max(model.moe_expert_cache_slots(), 0);
+
+    try {
+        const llama_moe_candidate_snapshot candidates(model, *loras);
+        for (const auto & endpoint : moe_candidate_replace_fns) {
+            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
+                    result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
+                endpoint.second(endpoint.first, &disabled);
+            }
+        }
+    } catch (...) {
+        for (const auto & endpoint : moe_candidate_replace_fns) {
+            endpoint.second(endpoint.first, &disabled);
+        }
     }
 }
 
@@ -1649,6 +1688,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
+    moe_candidate_refresh_pending = true;
     sched_need_reserve = true;
 }
 
