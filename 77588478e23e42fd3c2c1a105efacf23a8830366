@@ -21,3 +21,9 @@ Gemma 4 12B, same ctx/batch/KV placement, two concurrent 21174-token prompts aft
 All eight Gemma responses were byte-identical across live on/off and KV modes.
 
 Qwen single 46950-token prefill: live off 1365.13 tok/s and 14334 MiB sampled peak; live on 1360.37 tok/s and 13942 MiB. Delta -0.35% and -392 MiB. Generated token output was identical; raw stdout differed only in its printed timing line.
+
+2026-08-27 correctness and lifecycle checkpoint
+
+Exact final-logit files and token-ID files are byte-identical between live off/on on current llama/dev composition for both Qwen3.8 27B and Gemma 4 12B. Qwen logits SHA-256 44d6c43f83fbd6ced4480368cfa767de29e262b9b369b51af1f07bf604978342; Gemma e67d9c54138e5c2fb80af48bb8e829c193952d9a63daa839a3428e6a6dcde822.
+
+Gemma unified server lifecycle in one process: startup 7134 MiB, two 21174-token prompt peak 7514, long idle 7480, two replacement five-token prompt peak 7480, short idle 7146. Reserve contracted from kv 65536 (822.27 MiB CUDA + 333.36 MiB host compute) to kv 256 (488.35 + 63.36). Post-idle process recovery was 334 MiB without restart.
