@@ -10808,14 +10808,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                     type, type, {0, 1, 2, 3}, true, false, true, true));
     };
-    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
         add_native_equivalence(type, 256, 4, { 6, 1},  113,  65);
         add_native_equivalence(type, 256, 4, { 6, 1},  512, 256);
         add_native_equivalence(type, 256, 4, { 6, 1}, 1024,  65);
         add_native_equivalence(type, 256, 8, { 2, 1},  512,  65);
         add_native_equivalence(type, 256, 8, { 2, 1}, 1024,  65);
     }
-    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
         add_native_equivalence(type, 512, 1, {16, 1},  512, 65);
         add_native_equivalence(type, 512, 1, {16, 1}, 4096, 65);
         add_native_equivalence(type, 512, 1, {16, 1},  512,  4);
@@ -11329,9 +11329,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     };
     add_native_quant_perf(GGML_TYPE_Q4_0, 256, 4, {6, 1},  512, 65);
     add_native_quant_perf(GGML_TYPE_Q4_0, 256, 8, {2, 1}, 1024, 65);
+    add_native_quant_perf(GGML_TYPE_Q4_1, 256, 4, {6, 1},  512, 65);
+    add_native_quant_perf(GGML_TYPE_Q4_1, 256, 8, {2, 1}, 1024, 65);
     add_native_quant_perf(GGML_TYPE_Q5_0, 256, 4, {6, 1},  512, 65);
     add_native_quant_perf(GGML_TYPE_Q5_0, 256, 8, {2, 1}, 1024, 65);
-    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0 }) {
         for (int kv : { 512, 4096 }) {
             add_native_quant_perf(type, 512, 1, {16, 1}, kv, 65);
         }
