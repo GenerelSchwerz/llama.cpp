@@ -844,6 +844,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
         GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP;
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:
         case GGML_TYPE_BF16:
             break;
         case GGML_TYPE_NVFP4:

@@ -239,10 +239,10 @@ static void test_candidate_registry() {
     expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE);
     down->nb[2] = down_stride;
 
-    const int64_t q4k_ne[] = {256, 32, 4};
-    ggml_tensor * q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    const int64_t q5k_ne[] = {256, 32, 4};
+    ggml_tensor * q5k = fixture.tensor(GGML_TYPE_Q5_K, 3, q5k_ne);
     bad_banks = banks;
-    bad_banks[0].tensor = q4k;
+    bad_banks[0].tensor = q5k;
     group.banks = bad_banks.data();
     expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
 
@@ -287,6 +287,44 @@ static void test_candidate_registry() {
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.find_weight(gate_up_bf16, &info) && info.type == GGML_TYPE_BF16);
     CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+
+    const int64_t q4k_ne[] = {256, 256, 2};
+    ggml_tensor * gate_q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    ggml_tensor * up_q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    ggml_tensor * down_q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> q4k_banks = {{
+        {gate_q4k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up_q4k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down_q4k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 q4k_group = {q4k_banks.data(), q4k_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0};
+    snapshot = candidate_snapshot(12, &q4k_group, 1);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    for (const ggml_tensor * weight : {gate_q4k, up_q4k, down_q4k}) {
+        CHECK(registry.find_weight(weight, &info));
+        CHECK(info.type == GGML_TYPE_Q4_K && info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+        CHECK(info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND);
+        CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+        CHECK(info.byte_extent == ggml_nbytes(weight) && info.expert_stride == weight->nb[2]);
+    }
+    CHECK(registry.find_down_group(down_q4k, &group_index) && group_index == 0);
+
+    const int64_t fused_q4k_ne[] = {256, 512, 2};
+    ggml_tensor * gate_up_q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, fused_q4k_ne);
+    ggml_tensor * fused_down_q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_q4k_banks = {{
+        {gate_up_q4k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {fused_down_q4k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 fused_q4k_group = {fused_q4k_banks.data(), fused_q4k_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    snapshot = candidate_snapshot(12, &fused_q4k_group, 1);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    for (const ggml_tensor * weight : {gate_up_q4k, fused_down_q4k}) {
+        CHECK(registry.find_weight(weight, &info));
+        CHECK(info.type == GGML_TYPE_Q4_K && info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+        CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+    }
+    CHECK(registry.find_down_group(fused_down_q4k, &group_index) && group_index == 0);
 
     const int64_t nvfp4_ne[] = {64, 64, 4};
     ggml_tensor * gate_nvfp4 = fixture.tensor(GGML_TYPE_NVFP4, 3, nvfp4_ne);
