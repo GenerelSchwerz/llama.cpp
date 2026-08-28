@@ -313,6 +313,7 @@ private:
         GROUP_REASON_DUPLICATE_ROLE,
         GROUP_REASON_MIXED_IDS,
         GROUP_REASON_AUXILIARY,
+        GROUP_REASON_EXTERNAL_CONSUMER,
         GROUP_REASON_MISSING_ROLE,
         GROUP_REASON_UNPROVEN,
     };
@@ -368,6 +369,7 @@ private:
         bool duplicate_role;
         bool mixed_ids;
         bool auxiliary;
+        bool external_consumer;
         bool unproven;
         bool has_ids;
     };

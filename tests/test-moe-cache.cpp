@@ -328,6 +328,93 @@ static ggml_cgraph * candidate_padded_graph(
     return graph;
 }
 
+static void candidate_test_graph_views(
+        candidate_test_fixture & fixture,
+        ggml_cuda_moe_grouped_context & global_registry,
+        const ggml_backend_moe_candidate_group_v1 & local_group,
+        const candidate_route & fused_route,
+        const candidate_route & separate_route,
+        ggml_tensor * fused_gate_up,
+        ggml_tensor * fused_down,
+        ggml_tensor * separate_gate,
+        ggml_tensor * separate_up,
+        ggml_tensor * separate_down) {
+    ggml_cgraph * split_parent = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, fused_gate_up, fused_down,
+        separate_route.root, separate_route.ids, separate_gate, separate_up, separate_down,
+    });
+    ggml_cgraph split_view = ggml_graph_view(split_parent, 0, 4);
+    std::shared_ptr<ggml_cuda_moe_graph_plan> split_plan;
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(&split_view, 31, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared->size() == 1 && prepared->find(fused_down, nullptr));
+    }
+    const ggml_cuda_moe_graph_plan * stable_split_plan = split_plan.get();
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(global_registry.prepare_graph_execution(&split_view, 32, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(split_plan.get() != stable_split_plan && prepared->find(fused_down, nullptr));
+    }
+
+    ggml_backend_moe_candidate_snapshot_v1 local_snapshot = {};
+    local_snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+    local_snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    local_snapshot.struct_size = sizeof(local_snapshot);
+    local_snapshot.n_slots = 12;
+    local_snapshot.groups = &local_group;
+    local_snapshot.n_groups = 1;
+    ggml_cuda_moe_grouped_context local_registry(&fixture.owner);
+    CHECK(local_registry.replace(&local_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    split_plan.reset();
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(local_registry.prepare_graph_execution(&split_view, 33, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared->size() == 1 && prepared->find(fused_down, nullptr));
+    }
+    stable_split_plan = split_plan.get();
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(local_registry.prepare_graph_execution(&split_view, 34, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(split_plan.get() == stable_split_plan && prepared->find(fused_down, nullptr));
+    }
+
+    ggml_tensor * split_consumer = ggml_dup(fixture.ctx, fused_down);
+    fixture.materialize(split_consumer);
+    split_consumer->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_cgraph * split_consumer_parent = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, fused_gate_up, fused_down, split_consumer,
+        separate_route.root, separate_route.ids, separate_gate, separate_up, separate_down,
+    });
+    ggml_cgraph split_consumer_view = ggml_graph_view(split_consumer_parent, 0, 4);
+    split_plan.reset();
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 35, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prepared->size() == 1 && !prepared->find(fused_down, nullptr));
+    }
+    stable_split_plan = split_plan.get();
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 36, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(split_plan.get() == stable_split_plan && !prepared->find(fused_down, nullptr));
+    }
+    split_consumer->src[0] = nullptr;
+    candidate_rebuild_graph_uses(split_consumer_parent);
+    {
+        auto prepared = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(local_registry.prepare_graph_execution(&split_consumer_view, 37, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &split_plan, prepared.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(split_plan.get() != stable_split_plan && prepared->find(fused_down, nullptr));
+    }
+}
+
 static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
         uint32_t n_slots,
         const ggml_backend_moe_candidate_group_v1 * groups,
@@ -1284,6 +1371,9 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
+
+    candidate_test_graph_views(fixture, registry, groups[0], fused_route, separate_route,
+        fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node);
 
     ggml_cuda_moe_graph_plan plan;
     ggml_cuda_moe_graph_execution execution;

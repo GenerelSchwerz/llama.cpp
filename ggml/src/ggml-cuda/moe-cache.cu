@@ -3929,8 +3929,10 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             auto & reader = observation.readers[reader_index];
             bool present = false;
             if (!moe_candidate_graph_use(cgraph, reader.output.tensor, present, reader.use_count) || !present ||
-                    reader.use_count != static_cast<int32_t>(reader.n_consumers)) {
+                    reader.use_count < static_cast<int32_t>(reader.n_consumers)) {
                 observation.unproven = true;
+            } else if (reader.use_count > static_cast<int32_t>(reader.n_consumers)) {
+                observation.external_consumer = true;
             }
             for (uint32_t consumer_index = 0; consumer_index < reader.n_consumers; ++consumer_index) {
                 const auto & consumer = reader.consumers[consumer_index];
@@ -3955,6 +3957,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MIXED_IDS;
         } else if (observation.auxiliary) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_AUXILIARY;
+        } else if (observation.external_consumer) {
+            record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_EXTERNAL_CONSUMER;
         } else if (observation.seen_roles != observation.required_roles) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
         } else if (observation.unproven) {
@@ -4030,6 +4034,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
     bool duplicate_role = false;
     bool mixed_ids = false;
     bool auxiliary = false;
+    bool external_consumer = false;
     bool unproven = false;
     bool has_ids = false;
     uint32_t seen_roles = 0;
@@ -4099,8 +4104,10 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         bool reader_present = false;
         int32_t reader_use_count = 0;
         if (!moe_candidate_graph_use(cgraph, node, reader_present, reader_use_count) || !reader_present ||
-                reader_use_count != reader.use_count || reader_use_count != static_cast<int32_t>(reader.n_consumers)) {
+                reader_use_count != reader.use_count || reader_use_count < static_cast<int32_t>(reader.n_consumers)) {
             unproven = true;
+        } else if (reader_use_count > static_cast<int32_t>(reader.n_consumers)) {
+            external_consumer = true;
         }
         for (uint32_t consumer_index = 0; consumer_index < reader.n_consumers; ++consumer_index) {
             const auto & consumer = reader.consumers[consumer_index];
@@ -4141,6 +4148,8 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MIXED_IDS;
     } else if (auxiliary) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_AUXILIARY;
+    } else if (external_consumer) {
+        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_EXTERNAL_CONSUMER;
     } else if (seen_roles != required_roles) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
     } else if (unproven) {
