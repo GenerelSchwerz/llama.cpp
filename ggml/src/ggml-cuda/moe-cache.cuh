@@ -17,6 +17,40 @@ struct ggml_cuda_moe_cache;
 class ggml_cuda_moe_grouped_context;
 struct ggml_cuda_moe_grouped_context_test_access;
 
+struct ggml_cuda_moe_graph_span {
+    uintptr_t begin;
+    uintptr_t end;
+};
+
+static inline bool ggml_cuda_moe_graph_span_bounds(
+        const void * nodes,
+        int32_t n_nodes,
+        ggml_cuda_moe_graph_span * span) {
+    if (nodes == nullptr || n_nodes <= 0 || span == nullptr) {
+        return false;
+    }
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(nodes);
+    const uintptr_t count = static_cast<uintptr_t>(n_nodes);
+    if (count > UINTPTR_MAX / sizeof(ggml_tensor *) || begin > UINTPTR_MAX - count * sizeof(ggml_tensor *)) {
+        return false;
+    }
+    span->begin = begin;
+    span->end = begin + count * sizeof(ggml_tensor *);
+    return true;
+}
+
+static inline bool ggml_cuda_moe_graph_spans_overlap(
+        const void * first_nodes,
+        int32_t first_n_nodes,
+        const void * second_nodes,
+        int32_t second_n_nodes) {
+    ggml_cuda_moe_graph_span first;
+    ggml_cuda_moe_graph_span second;
+    return ggml_cuda_moe_graph_span_bounds(first_nodes, first_n_nodes, &first) &&
+        ggml_cuda_moe_graph_span_bounds(second_nodes, second_n_nodes, &second) &&
+        first.begin < second.end && second.begin < first.end;
+}
+
 enum ggml_cuda_moe_candidate_rejection : uint32_t {
     GGML_CUDA_MOE_CANDIDATE_REJECT_NONE = 0,
     GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI,
@@ -538,6 +572,8 @@ public:
             uint64_t total_time_us,
             bool ids_cache_hit);
     static void log_and_reset_legacy_stats();
+    uint64_t certify_graph_coverage(const ggml_cgraph * cgraph);
+    bool recover_graph_coverage(const ggml_cgraph * cgraph, uint64_t * coverage_epoch) const;
     void compile_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,

@@ -39,6 +39,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #define CHECK(cond) do { \
@@ -474,6 +475,229 @@ static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
     result.groups = groups;
     result.n_groups = n_groups;
     return result;
+}
+
+struct candidate_graph_holder {
+    void reset() {
+        plan.reset();
+        nodes = nullptr;
+        epoch = 0;
+        n_nodes = 0;
+    }
+
+    std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+    const void * nodes = nullptr;
+    uint64_t epoch = 0;
+    int32_t n_nodes = 0;
+};
+
+struct candidate_graph_holder_context {
+    explicit candidate_graph_holder_context(ggml_cuda_moe_grouped_context & registry) : registry(registry) {}
+
+    candidate_graph_holder & holder(const void * key) {
+        auto & result = holders[key];
+        if (result == nullptr) {
+            result = std::make_unique<candidate_graph_holder>();
+        }
+        return *result;
+    }
+
+    void certify(ggml_cgraph * graph) {
+        ggml_cuda_moe_graph_span span;
+        CHECK(graph != nullptr && ggml_cuda_moe_graph_span_bounds(graph->nodes, graph->n_nodes, &span));
+        const void * key = graph->nodes[0];
+        for (auto & entry : holders) {
+            if (entry.first == key || ggml_cuda_moe_graph_spans_overlap(
+                    entry.second->nodes, entry.second->n_nodes, graph->nodes, graph->n_nodes)) {
+                entry.second->reset();
+            }
+        }
+        const uint64_t epoch = registry.certify_graph_coverage(graph);
+        auto & current = holder(key);
+        current.reset();
+        CHECK(epoch != 0);
+        current.nodes = graph->nodes;
+        current.epoch = epoch;
+        current.n_nodes = graph->n_nodes;
+    }
+
+    bool recover(ggml_cgraph * graph, candidate_graph_holder & holder) {
+        holder.reset();
+        uint64_t epoch = 0;
+        if (!registry.recover_graph_coverage(graph, &epoch)) {
+            return false;
+        }
+        holder.nodes = graph->nodes;
+        holder.epoch = epoch;
+        holder.n_nodes = graph->n_nodes;
+        return true;
+    }
+
+    void evict(const void * key) {
+        holders.erase(key);
+    }
+
+    ggml_cuda_moe_grouped_context & registry;
+    std::unordered_map<const void *, std::unique_ptr<candidate_graph_holder>> holders;
+};
+
+static ggml_cuda_moe_graph_prepare_result candidate_prepare_graph_holder(
+        candidate_graph_holder_context & holder_context,
+        ggml_cgraph * graph,
+        uint64_t graph_uid,
+        ggml_cuda_moe_graph_property_hint property_hint,
+        ggml_cuda_moe_graph_execution * execution) {
+    auto & holder = holder_context.holder(graph->nodes[0]);
+    if (holder.epoch == 0 || holder.nodes != graph->nodes || holder.n_nodes != graph->n_nodes) {
+        holder_context.recover(graph, holder);
+    }
+    std::shared_ptr<ggml_cuda_moe_graph_plan> local_plan;
+    auto * plan = &local_plan;
+    uint64_t coverage_epoch = 0;
+    const void * coverage_nodes = nullptr;
+    if (holder.epoch != 0 && holder.nodes == graph->nodes && holder.n_nodes == graph->n_nodes) {
+        plan = &holder.plan;
+        coverage_epoch = holder.epoch;
+        coverage_nodes = holder.nodes;
+    }
+    return holder_context.registry.prepare_graph_execution(
+        graph, graph_uid, property_hint, plan, execution, coverage_epoch, coverage_nodes);
+}
+
+static void candidate_test_graph_holder_coverage(
+        candidate_test_fixture & fixture,
+        const ggml_backend_moe_candidate_snapshot_v1 & snapshot,
+        const candidate_route & fused_route,
+        const candidate_route & separate_route,
+        ggml_tensor * fused_gate_up,
+        ggml_tensor * fused_down,
+        ggml_tensor * separate_gate,
+        ggml_tensor * separate_up,
+        ggml_tensor * separate_down) {
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    candidate_graph_holder_context holder_context(registry);
+
+    ggml_cgraph * parent = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, fused_gate_up, fused_down,
+        separate_route.root, separate_route.ids, separate_gate, separate_up, separate_down,
+    });
+    ggml_cgraph first = ggml_graph_view(parent, 0, 4);
+    ggml_cgraph suffix = ggml_graph_view(parent, 4, parent->n_nodes);
+
+    holder_context.certify(&first);
+    auto & first_holder = holder_context.holder(first.nodes[0]);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &first, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution->find(fused_down, nullptr));
+    }
+    const uint64_t first_epoch = first_holder.epoch;
+    const auto first_plan = first_holder.plan;
+
+    holder_context.certify(&suffix);
+    CHECK(first_holder.epoch == first_epoch && first_holder.plan == first_plan);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution->find(separate_down, nullptr));
+    }
+
+    const void * suffix_key = suffix.nodes[0];
+    const uint64_t suffix_epoch = holder_context.holder(suffix_key).epoch;
+    holder_context.evict(suffix_key);
+    CHECK(holder_context.holders.find(suffix_key) == holder_context.holders.end());
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 100, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(holder_context.holder(suffix_key).epoch == suffix_epoch && execution->find(separate_down, nullptr));
+    }
+    const auto recovered_plan = holder_context.holder(suffix_key).plan;
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 101, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(holder_context.holder(suffix_key).plan == recovered_plan);
+    }
+
+    const auto old_suffix_plan = holder_context.holder(suffix_key).plan;
+    holder_context.certify(&suffix);
+    auto & suffix_holder = holder_context.holder(suffix_key);
+    CHECK(suffix_holder.epoch > suffix_epoch && suffix_holder.plan == nullptr);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(!registry.bind_graph_plan(
+            &suffix, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *old_suffix_plan, execution.get(),
+            suffix_holder.epoch, suffix.nodes));
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    }
+
+    const auto pre_replace_plan = suffix_holder.plan;
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 102, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(suffix_holder.plan != pre_replace_plan && execution->find(separate_down, nullptr));
+    }
+
+    candidate_set_route_tokens(separate_route, {separate_gate, separate_up, separate_down}, 4);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 103, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(!execution->find(separate_down, nullptr));
+    }
+    candidate_set_route_tokens(separate_route, {separate_gate, separate_up, separate_down}, 1);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, 104, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution->find(separate_down, nullptr));
+    }
+
+    const candidate_route disjoint_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * disjoint_gate_up = candidate_mmid(fixture, fused_gate_up->src[0], disjoint_route.ids);
+    ggml_tensor * disjoint_down = candidate_mmid(fixture, fused_down->src[0], disjoint_route.ids);
+    ggml_cgraph * disjoint = candidate_graph(fixture, {
+        disjoint_route.root, disjoint_route.ids, disjoint_gate_up, disjoint_down,
+    });
+    holder_context.certify(disjoint);
+    {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, disjoint, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    }
+    auto & disjoint_holder = holder_context.holder(disjoint->nodes[0]);
+    const uint64_t disjoint_epoch = disjoint_holder.epoch;
+    const auto disjoint_plan = disjoint_holder.plan;
+    const auto stale_suffix_plan = suffix_holder.plan;
+
+    holder_context.certify(parent);
+    CHECK(suffix_holder.epoch == 0 && suffix_holder.plan == nullptr);
+    CHECK(disjoint_holder.epoch == disjoint_epoch && disjoint_holder.plan == disjoint_plan);
+    CHECK(stale_suffix_plan != nullptr);
+    CHECK(!holder_context.recover(&suffix, suffix_holder));
+    for (uint64_t uid = 105; uid < 107; ++uid) {
+        auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+        CHECK(candidate_prepare_graph_holder(
+            holder_context, &suffix, uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution->find(separate_down, nullptr) && suffix_holder.plan == nullptr);
+    }
 }
 
 static const ggml_backend_moe_candidate_bank_v1 * candidate_bank(
@@ -1420,6 +1644,8 @@ static void test_grouped_graph_preflight(bool benchmark) {
     });
 
     candidate_test_graph_views(fixture, registry, fused_route, separate_route,
+        fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node);
+    candidate_test_graph_holder_coverage(fixture, snapshot, fused_route, separate_route,
         fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node);
 
     ggml_cuda_moe_graph_plan plan;

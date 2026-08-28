@@ -2110,9 +2110,16 @@ struct ggml_cuda_moe_grouped_context::impl {
         bool admission_closed = false;
     };
 
+    struct graph_coverage_record {
+        const void * nodes = nullptr;
+        uint64_t epoch = 0;
+        int32_t n_nodes = 0;
+    };
+
     using legacy_record_map = std::unordered_map<const ggml_tensor *, std::unique_ptr<legacy_record>>;
     using legacy_record_list = std::vector<std::unique_ptr<legacy_record>>;
     using resource_slots = std::vector<std::unique_ptr<grouped_resource>>;
+    using graph_coverage_map = std::unordered_map<const void *, graph_coverage_record>;
 
     ggml_backend_dev_t owner;
     int device;
@@ -2123,12 +2130,14 @@ struct ggml_cuda_moe_grouped_context::impl {
     ggml_cuda_moe_candidate_registry_state state;
     moe_candidate_table table;
     legacy_record_map legacy_records;
+    graph_coverage_map graph_coverages;
     resource_slots resources;
     std::array<uint8_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> refreshing = {};
     std::array<group_authority_record, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> group_authorities = {};
     uint64_t next_resource_generation = 0;
     uint64_t next_transaction_token = 0;
     uint64_t next_group_authority_epoch = 0;
+    uint64_t next_graph_coverage_epoch = 0;
     uint32_t active_maintenance = 0;
     uint32_t active_legacy_operations = 0;
     uint64_t next_legacy_authority_epoch = 0;
@@ -2677,6 +2686,71 @@ ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t 
 
 ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
     shutdown();
+}
+
+uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(const ggml_cgraph * cgraph) {
+    ggml_cuda_moe_graph_span span;
+    if (cgraph == nullptr || !ggml_cuda_moe_graph_span_bounds(cgraph->nodes, cgraph->n_nodes, &span)) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->draining) {
+        return 0;
+    }
+    const void * key = cgraph->nodes[0];
+    for (auto it = impl_->graph_coverages.begin(); it != impl_->graph_coverages.end();) {
+        const auto & record = it->second;
+        if (it->first == key || ggml_cuda_moe_graph_spans_overlap(
+                record.nodes, record.n_nodes, cgraph->nodes, cgraph->n_nodes)) {
+            it = impl_->graph_coverages.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (impl_->next_graph_coverage_epoch == UINT64_MAX) {
+        return 0;
+    }
+    if (impl_->graph_coverages.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
+        const auto oldest = std::min_element(
+            impl_->graph_coverages.begin(), impl_->graph_coverages.end(),
+            [](const auto & first, const auto & second) { return first.second.epoch < second.second.epoch; });
+        impl_->graph_coverages.erase(oldest);
+    }
+
+    const uint64_t epoch = impl_->next_graph_coverage_epoch + 1;
+    try {
+        impl_->graph_coverages.emplace(key, impl::graph_coverage_record{cgraph->nodes, epoch, cgraph->n_nodes});
+    } catch (...) {
+        return 0;
+    }
+    impl_->next_graph_coverage_epoch = epoch;
+    return epoch;
+}
+
+bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
+        const ggml_cgraph * cgraph,
+        uint64_t * coverage_epoch) const {
+    if (coverage_epoch != nullptr) {
+        *coverage_epoch = 0;
+    }
+    ggml_cuda_moe_graph_span span;
+    if (cgraph == nullptr || coverage_epoch == nullptr ||
+            !ggml_cuda_moe_graph_span_bounds(cgraph->nodes, cgraph->n_nodes, &span)) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->draining) {
+        return false;
+    }
+    const auto it = impl_->graph_coverages.find(cgraph->nodes[0]);
+    if (it == impl_->graph_coverages.end() || it->second.nodes != cgraph->nodes ||
+            it->second.n_nodes != cgraph->n_nodes || it->second.epoch == 0) {
+        return false;
+    }
+    *coverage_epoch = it->second.epoch;
+    return true;
 }
 
 bool ggml_cuda_moe_grouped_context::set_clock_bound_for_test(
@@ -4755,6 +4829,7 @@ void ggml_cuda_moe_grouped_context::shutdown() {
         impl_->group_authorities = {};
         impl_->authority_transition_pending = false;
         impl_->table = {};
+        impl_->graph_coverages.clear();
         const uint64_t generation = impl_->state.generation;
         impl_->state = {};
         impl_->state.generation = generation;

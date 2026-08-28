@@ -1438,7 +1438,6 @@ struct ggml_backend_cuda_context {
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
-    uint64_t moe_coverage_epoch = 0;
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1464,6 +1463,9 @@ struct ggml_backend_cuda_context {
         it->second->last_used_time = time_now;
         return it->second.get();
     }
+
+    void certify_moe_graph(ggml_cgraph * cgraph);
+    bool recover_moe_graph(ggml_cgraph * cgraph, ggml_cuda_graph * graph);
 
 #ifdef USE_CUDA_GRAPH
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
