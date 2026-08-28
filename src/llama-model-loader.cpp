@@ -1662,15 +1662,6 @@ bool llama_model_loader::load_all_data(
             }
         }
 
-#ifdef GGML_USE_CUDA
-        if (cur->buffer && ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(cur->buffer))) {
-            const int n_dims = ggml_n_dims(cur);
-            const size_t per_expert_bytes = (n_dims >= 3) ? cur->nb[n_dims - 1] : ggml_nbytes(cur);
-            const int64_t n_experts = (n_dims >= 3) ? cur->ne[n_dims - 1] : 1;
-            ggml_backend_cuda_moe_observe_expert_tensor(cur->data, cur->name, per_expert_bytes, n_experts);
-        }
-#endif
-
         size_done += n_size;
     }
 

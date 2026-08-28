@@ -40,6 +40,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <new>
@@ -681,7 +682,39 @@ struct moe_cache_tensor_decode_stats {
     moe_cache_reuse_hist reuse_hist = {};
 };
 
+struct moe_cache_telemetry {
+    size_t n_caches = 0;
+    uint64_t total_hits = 0;
+    uint64_t total_misses = 0;
+    uint64_t total_evictions = 0;
+    moe_cache_mm_stats mm = {};
+    moe_cache_l2_stats l2 = {};
+    moe_cache_expert_stats experts = {};
+    moe_cache_hot_tensor_stats hot_tensor = {};
+    std::vector<uint64_t> all_expert_access_counts;
+    moe_cache_tensor_decode_stats hot_decode_miss_tensor = {};
+    std::vector<moe_cache_tensor_decode_stats> decode_tensor_stats;
+    moe_cache_phase_stats phase_stats[2] = {};
+};
+
+struct moe_cache_owner_telemetry {
+    std::mutex mutex;
+    std::unordered_set<ggml_cuda_moe_grouped_context *> active;
+    moe_cache_telemetry retired;
+};
+
+static moe_cache_owner_telemetry & moe_cache_owner_telemetry_state() {
+    static moe_cache_owner_telemetry state;
+    return state;
+}
+
 } // namespace
+
+static void moe_cache_add_telemetry(moe_cache_telemetry & dst, moe_cache_telemetry && src);
+static void moe_cache_capture_telemetry(moe_cache_telemetry & dst, ggml_cuda_moe_cache * cache, bool reset);
+static moe_cache_phase_stats moe_cache_take_op_stats(moe_cache_op_phase_stats & stats, bool reset);
+static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe_cache_phase_stats & src);
+static void moe_cache_log_telemetry(moe_cache_telemetry telemetry);
 
 namespace {
 
@@ -1716,6 +1749,42 @@ uint32_t ggml_cuda_moe_graph_execution::size() const {
     return plan_ != nullptr ? n_groups_ : 0;
 }
 
+static void ggml_cuda_moe_cache_set_metadata(
+        ggml_cuda_moe_cache * cache,
+        const char * tensor_name,
+        const void * tensor_data,
+        int64_t n_experts);
+
+ggml_cuda_moe_legacy_operation_lease::ggml_cuda_moe_legacy_operation_lease() noexcept = default;
+
+ggml_cuda_moe_legacy_operation_lease::~ggml_cuda_moe_legacy_operation_lease() {
+    if (owner_ != nullptr) {
+        owner_->end_legacy_operation(*this);
+    }
+}
+
+ggml_cuda_moe_legacy_operation_lease::ggml_cuda_moe_legacy_operation_lease(
+        ggml_cuda_moe_legacy_operation_lease && other) noexcept : owner_(other.owner_) {
+    other.owner_ = nullptr;
+}
+
+ggml_cuda_moe_legacy_operation_lease & ggml_cuda_moe_legacy_operation_lease::operator=(
+        ggml_cuda_moe_legacy_operation_lease && other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    if (owner_ != nullptr) {
+        owner_->end_legacy_operation(*this);
+    }
+    owner_ = other.owner_;
+    other.owner_ = nullptr;
+    return *this;
+}
+
+ggml_cuda_moe_legacy_operation_lease::operator bool() const noexcept {
+    return owner_ != nullptr;
+}
+
 ggml_cuda_moe_legacy_cache_lease::ggml_cuda_moe_legacy_cache_lease() noexcept = default;
 
 ggml_cuda_moe_legacy_cache_lease::~ggml_cuda_moe_legacy_cache_lease() {
@@ -1779,6 +1848,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t type = GGML_TYPE_COUNT;
         uint32_t active_leases = 0;
         ggml_cuda_moe_cache * cache = nullptr;
+        bool building_cache = false;
     };
 
     struct grouped_snapshot {
@@ -1863,6 +1933,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     int device;
     std::mutex resource_lifecycle_mutex;
     mutable std::mutex mutex;
+    std::mutex telemetry_mutex;
     std::condition_variable resource_cv;
     ggml_cuda_moe_candidate_registry_state state;
     moe_candidate_table table;
@@ -1872,7 +1943,13 @@ struct ggml_cuda_moe_grouped_context::impl {
     uint64_t next_resource_generation = 0;
     uint64_t next_transaction_token = 0;
     uint32_t active_maintenance = 0;
+    uint32_t active_legacy_operations = 0;
     uint64_t next_legacy_authority_epoch = 0;
+    size_t legacy_l2_budget_bytes = 0;
+    std::atomic<bool> legacy_debug_mm{false};
+    bool legacy_policy_initialized = false;
+    moe_cache_op_phase_stats legacy_op_stats[2];
+    moe_cache_telemetry retired_telemetry;
     bool replacement_pending = false;
     bool draining = false;
     bool shutdown_complete = false;
@@ -1973,9 +2050,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         resources.clear();
     }
 
-    static void retire_legacy_records(legacy_record_map records) {
-        records.clear();
-    }
+    void retire_legacy_records(legacy_record_map records);
 
     bool has_active_transaction() const {
         for (const auto & resource : resources) {
@@ -2007,6 +2082,22 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
         return true;
+    }
+
+    size_t registered_mmap_bank_count() const {
+        size_t count = 0;
+        if (!state.accepted) {
+            return count;
+        }
+        for (const auto & group : table.groups) {
+            for (const auto & bank : group.banks) {
+                if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND &&
+                        moe_cache_is_mmap_range(bank.info.tensor->data, bank.info.expert_stride)) {
+                    ++count;
+                }
+            }
+        }
+        return count;
     }
 
     bool capture_resource_input(
@@ -2352,6 +2443,9 @@ struct ggml_cuda_moe_grouped_context::impl {
 
 ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device) :
     impl_(std::make_unique<impl>(owner, device)) {
+    auto & telemetry = moe_cache_owner_telemetry_state();
+    std::lock_guard<std::mutex> lock(telemetry.mutex);
+    telemetry.active.insert(this);
 }
 
 ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
@@ -2384,7 +2478,8 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
             }
             impl_->replacement_pending = true;
             impl_->resource_cv.wait(lock, [&]() {
-                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 && !impl_->has_active_legacy_lease();
+                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
+                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
             });
             retired = impl_->detach_resources();
             retired_legacy = impl_->detach_legacy_records();
@@ -2402,10 +2497,14 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
                 impl_->state.n_slots = n_slots;
                 impl_->state.rejection = rejection;
             }
-            impl_->replacement_pending = false;
         }
         impl::retire_resources(std::move(retired));
-        impl::retire_legacy_records(std::move(retired_legacy));
+        impl_->retire_legacy_records(std::move(retired_legacy));
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->replacement_pending = false;
+        }
+        impl_->resource_cv.notify_all();
         return published;
     };
 
@@ -2436,7 +2535,8 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
             }
             impl_->replacement_pending = true;
             impl_->resource_cv.wait(lock, [&]() {
-                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 && !impl_->has_active_legacy_lease();
+                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
+                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
             });
             retired = impl_->detach_resources();
             retired_legacy = impl_->detach_legacy_records();
@@ -2459,10 +2559,14 @@ int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_
                 impl_->state.n_weights = impl_->table.reverse_map.size();
                 impl_->state.accepted = 1;
             }
-            impl_->replacement_pending = false;
         }
         impl::retire_resources(std::move(retired));
-        impl::retire_legacy_records(std::move(retired_legacy));
+        impl_->retire_legacy_records(std::move(retired_legacy));
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            impl_->replacement_pending = false;
+        }
+        impl_->resource_cv.notify_all();
         return published;
     } catch (const std::bad_alloc &) {
         return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
@@ -2553,98 +2657,231 @@ bool ggml_cuda_moe_grouped_context::get_bank(
     return false;
 }
 
+ggml_cuda_moe_legacy_operation_lease ggml_cuda_moe_grouped_context::begin_legacy_operation() {
+    ggml_cuda_moe_legacy_operation_lease result;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->draining || impl_->replacement_pending || impl_->active_legacy_operations == UINT32_MAX) {
+        return result;
+    }
+    ++impl_->active_legacy_operations;
+    result.owner_ = this;
+    return result;
+}
+
+void ggml_cuda_moe_grouped_context::end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    GGML_ASSERT(lease.owner_ == this && impl_->active_legacy_operations > 0);
+    --impl_->active_legacy_operations;
+    lease.owner_ = nullptr;
+    impl_->resource_cv.notify_all();
+}
+
 ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_cache(
         const ggml_tensor * tensor,
         const ggml_cuda_moe_legacy_acquisition * expected) {
     ggml_cuda_moe_legacy_cache_lease result;
-    std::unique_ptr<impl::legacy_record> retired_record;
     if (tensor == nullptr) {
         return result;
     }
 
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->draining || impl_->replacement_pending || impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+    auto acquire_record = [&](bool allow_missing_cache) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->draining || impl_->replacement_pending || impl_->state.generation == 0 || impl_->state.n_slots == 0) {
+            return false;
+        }
+        auto existing = impl_->legacy_records.find(tensor);
+        if (existing == impl_->legacy_records.end() || !impl::legacy_record_matches(*existing->second, tensor)) {
+            return false;
+        }
+        auto * record = existing->second.get();
+        if ((!allow_missing_cache && record->cache == nullptr) || record->active_leases == UINT32_MAX) {
+            return false;
+        }
+        if (expected != nullptr) {
+            const auto & acquisition = record->acquisition;
+            if (expected->owner != this || expected->tensor != tensor ||
+                    expected->candidate_generation != acquisition.candidate_generation ||
+                    expected->authority_epoch != acquisition.authority_epoch ||
+                    expected->group_index != acquisition.group_index || expected->role != acquisition.role ||
+                    expected->n_slots != acquisition.n_slots || expected->registered_source != acquisition.registered_source) {
+                return false;
+            }
+        }
+        record->active_leases++;
+        result.owner_ = this;
+        result.record_ = record;
+        result.cache_ = record->cache;
+        result.acquisition_ = record->acquisition;
+        return true;
+    };
+
+    if (acquire_record(impl_->device < 0)) {
         return result;
     }
 
-    auto existing = impl_->legacy_records.find(tensor);
-    if (existing != impl_->legacy_records.end() && !impl::legacy_record_matches(*existing->second, tensor)) {
-        if (existing->second->active_leases != 0 || expected != nullptr) {
+    impl::legacy_record_map retired;
+    impl::legacy_record * record = nullptr;
+    size_t l2_budget_bytes = 0;
+    int l2_target_slots = 0;
+    bool source_is_mmap = false;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->draining || impl_->replacement_pending || impl_->state.generation == 0 || impl_->state.n_slots == 0) {
             return result;
         }
-        retired_record = std::move(existing->second);
-        impl_->legacy_records.erase(existing);
-        existing = impl_->legacy_records.end();
-    }
 
-    if (expected != nullptr) {
+        auto existing = impl_->legacy_records.find(tensor);
+        if (existing != impl_->legacy_records.end() && !impl::legacy_record_matches(*existing->second, tensor)) {
+            if (existing->second->active_leases != 0 || existing->second->building_cache || expected != nullptr) {
+                return result;
+            }
+            retired.emplace(existing->first, std::move(existing->second));
+            impl_->legacy_records.erase(existing);
+            existing = impl_->legacy_records.end();
+        }
+        if (expected != nullptr && existing == impl_->legacy_records.end()) {
+            return result;
+        }
         if (existing == impl_->legacy_records.end()) {
-            return result;
-        }
-        const auto & acquisition = existing->second->acquisition;
-        if (expected->owner != this || expected->tensor != tensor ||
-                expected->candidate_generation != acquisition.candidate_generation ||
-                expected->authority_epoch != acquisition.authority_epoch ||
-                expected->group_index != acquisition.group_index || expected->role != acquisition.role ||
-                expected->n_slots != acquisition.n_slots || expected->registered_source != acquisition.registered_source) {
-            return result;
-        }
-    } else if (existing == impl_->legacy_records.end()) {
-        if (tensor->data == nullptr || tensor->buffer == nullptr || tensor->view_src != nullptr || tensor->op != GGML_OP_NONE ||
-                ggml_n_dims(tensor) < 3 || tensor->ne[2] <= 0 || tensor->nb[2] == 0 || impl_->next_legacy_authority_epoch == UINT64_MAX) {
-            return result;
-        }
+            if (tensor->data == nullptr || tensor->buffer == nullptr || tensor->view_src != nullptr || tensor->op != GGML_OP_NONE ||
+                    ggml_n_dims(tensor) < 3 || tensor->ne[2] <= 0 || tensor->nb[2] == 0 || impl_->next_legacy_authority_epoch == UINT64_MAX) {
+                return result;
+            }
 
-        std::unique_ptr<impl::legacy_record> record;
-        try {
-            record = std::make_unique<impl::legacy_record>();
-        } catch (const std::bad_alloc &) {
-            return result;
-        }
-        record->acquisition.owner = this;
-        record->acquisition.tensor = tensor;
-        record->acquisition.candidate_generation = impl_->state.generation;
-        record->acquisition.authority_epoch = ++impl_->next_legacy_authority_epoch;
-        record->acquisition.n_slots = impl_->state.n_slots;
-        record->source_data = tensor->data;
-        record->buffer = tensor->buffer;
-        record->buft = tensor->buffer->buft;
-        record->byte_extent = ggml_nbytes(tensor);
-        record->type = tensor->type;
-        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
-            record->ne[dim] = tensor->ne[dim];
-            record->nb[dim] = tensor->nb[dim];
-        }
-
-        if (impl_->state.accepted) {
-            const auto reverse = impl_->table.reverse_map.find(tensor);
-            if (reverse != impl_->table.reverse_map.end()) {
-                const auto & bank = impl_->table.groups[reverse->second.group_index].banks[reverse->second.bank_index];
-                if (!moe_candidate_record_matches(bank, tensor)) {
-                    return result;
+            std::unique_ptr<impl::legacy_record> prospective;
+            try {
+                prospective = std::make_unique<impl::legacy_record>();
+            } catch (const std::bad_alloc &) {
+                return result;
+            }
+            prospective->acquisition.owner = this;
+            prospective->acquisition.tensor = tensor;
+            prospective->acquisition.candidate_generation = impl_->state.generation;
+            prospective->acquisition.authority_epoch = ++impl_->next_legacy_authority_epoch;
+            prospective->acquisition.n_slots = impl_->state.n_slots;
+            prospective->source_data = tensor->data;
+            prospective->buffer = tensor->buffer;
+            prospective->buft = tensor->buffer->buft;
+            prospective->byte_extent = ggml_nbytes(tensor);
+            prospective->type = tensor->type;
+            for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                prospective->ne[dim] = tensor->ne[dim];
+                prospective->nb[dim] = tensor->nb[dim];
+            }
+            if (impl_->state.accepted) {
+                const auto reverse = impl_->table.reverse_map.find(tensor);
+                if (reverse != impl_->table.reverse_map.end()) {
+                    const auto & bank = impl_->table.groups[reverse->second.group_index].banks[reverse->second.bank_index];
+                    if (!moe_candidate_record_matches(bank, tensor) ||
+                            bank.info.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
+                        return result;
+                    }
+                    prospective->acquisition.group_index = reverse->second.group_index;
+                    prospective->acquisition.role = bank.info.role;
+                    prospective->acquisition.registered_source = 1;
                 }
-                record->acquisition.group_index = reverse->second.group_index;
-                record->acquisition.role = bank.info.role;
-                record->acquisition.registered_source = 1;
+            }
+            try {
+                existing = impl_->legacy_records.emplace(tensor, std::move(prospective)).first;
+            } catch (const std::bad_alloc &) {
+                return result;
             }
         }
 
-        try {
-            existing = impl_->legacy_records.emplace(tensor, std::move(record)).first;
-        } catch (const std::bad_alloc &) {
+        record = existing->second.get();
+        if (expected != nullptr) {
+            const auto & acquisition = record->acquisition;
+            if (expected->owner != this || expected->tensor != tensor ||
+                    expected->candidate_generation != acquisition.candidate_generation ||
+                    expected->authority_epoch != acquisition.authority_epoch ||
+                    expected->group_index != acquisition.group_index || expected->role != acquisition.role ||
+                    expected->n_slots != acquisition.n_slots || expected->registered_source != acquisition.registered_source) {
+                return result;
+            }
+        }
+        if (record->cache != nullptr) {
+            if (record->active_leases == UINT32_MAX) {
+                return result;
+            }
+            record->active_leases++;
+            result.owner_ = this;
+            result.record_ = record;
+            result.cache_ = record->cache;
+            result.acquisition_ = record->acquisition;
             return result;
         }
+        if (impl_->device < 0) {
+            record->active_leases++;
+            result.owner_ = this;
+            result.record_ = record;
+            result.acquisition_ = record->acquisition;
+            return result;
+        }
+        if (record->building_cache || impl_->active_maintenance == UINT32_MAX) {
+            return result;
+        }
+        if (!impl_->legacy_policy_initialized) {
+            impl_->legacy_l2_budget_bytes = g_moe_cache_l2_pinned_size.load(std::memory_order_relaxed);
+            impl_->legacy_debug_mm.store(g_moe_cache_mm_debug.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            impl_->legacy_policy_initialized = true;
+        }
+        source_is_mmap = moe_cache_is_mmap_range(tensor->data, tensor->nb[2]);
+        if (record->acquisition.registered_source && source_is_mmap) {
+            const size_t n_mmap_banks = impl_->registered_mmap_bank_count();
+            if (n_mmap_banks > 0) {
+                l2_budget_bytes = impl_->legacy_l2_budget_bytes / n_mmap_banks;
+                const size_t budget_slots = l2_budget_bytes / tensor->nb[2];
+                l2_target_slots = (int) std::min<size_t>(budget_slots, tensor->ne[2]);
+            }
+        }
+        record->building_cache = true;
+        ++impl_->active_maintenance;
+    }
+    impl_->retire_legacy_records(std::move(retired));
+
+    ggml_cuda_moe_cache * prospective = nullptr;
+    try {
+        prospective = ggml_cuda_moe_cache_init(
+            impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
+        if (prospective != nullptr) {
+            ggml_cuda_moe_cache_set_metadata(prospective, tensor->name[0] ? tensor->name : "?", tensor->data, tensor->ne[2]);
+        }
+    } catch (...) {
+        ggml_cuda_moe_cache_free(prospective);
+        prospective = nullptr;
     }
 
-    auto * record = existing->second.get();
-    if (record->active_leases == UINT32_MAX) {
-        return result;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto existing = impl_->legacy_records.find(tensor);
+        if (!impl_->draining && !impl_->replacement_pending && existing != impl_->legacy_records.end() &&
+                existing->second.get() == record && record->building_cache && impl::legacy_record_matches(*record, tensor) && record->cache == nullptr &&
+                record->active_leases != UINT32_MAX && prospective != nullptr) {
+            record->cache = prospective;
+            prospective = nullptr;
+            record->active_leases++;
+            result.owner_ = this;
+            result.record_ = record;
+            result.cache_ = record->cache;
+            result.acquisition_ = record->acquisition;
+            installed = true;
+        }
+        if (existing != impl_->legacy_records.end() && existing->second.get() == record) {
+            record->building_cache = false;
+        }
+        GGML_ASSERT(impl_->active_maintenance > 0);
+        --impl_->active_maintenance;
+        impl_->resource_cv.notify_all();
     }
-    record->active_leases++;
-    result.owner_ = this;
-    result.record_ = record;
-    result.cache_ = record->cache;
-    result.acquisition_ = record->acquisition;
+    ggml_cuda_moe_cache_free(prospective);
+    if (installed) {
+        GGML_LOG_INFO("moe-cache: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%u slots x %.2f MiB)\n",
+            tensor->name[0] ? tensor->name : "?",
+            ((double) record->acquisition.n_slots * tensor->nb[2]) / 1024.0 / 1024.0,
+            record->acquisition.n_slots,
+            tensor->nb[2] / 1024.0 / 1024.0);
+    }
     return result;
 }
 
@@ -2658,6 +2895,93 @@ void ggml_cuda_moe_grouped_context::release_legacy_cache(ggml_cuda_moe_legacy_ca
     lease.cache_ = nullptr;
     lease.acquisition_ = {};
     impl_->resource_cv.notify_all();
+}
+
+void ggml_cuda_moe_grouped_context::prefetch_legacy_siblings(
+        const ggml_cuda_moe_legacy_cache_lease & source,
+        const int32_t * expert_ids,
+        int n_expert_ids,
+        bool use_l2,
+        bool is_decode) {
+    if (source.owner_ != this || source.record_ == nullptr || expert_ids == nullptr || n_expert_ids <= 0 ||
+            !source.acquisition_.registered_source || source.acquisition_.group_index == UINT32_MAX) {
+        return;
+    }
+
+    std::vector<const ggml_tensor *> siblings;
+    {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        auto * record = static_cast<impl::legacy_record *>(source.record_);
+        if (impl_->draining || impl_->replacement_pending || record->active_leases == 0 ||
+                source.acquisition_.candidate_generation != impl_->state.generation ||
+                source.acquisition_.group_index >= impl_->table.groups.size()) {
+            return;
+        }
+        const auto & group = impl_->table.groups[source.acquisition_.group_index];
+        for (const auto & bank : group.banks) {
+            const uint32_t role = bank.info.role;
+            const bool base_role = role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT ||
+                role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ||
+                role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT;
+            if (base_role && bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND &&
+                    bank.info.tensor != source.acquisition_.tensor) {
+                siblings.push_back(bank.info.tensor);
+            }
+        }
+    }
+
+    for (const ggml_tensor * tensor : siblings) {
+        auto lease = acquire_legacy_cache(tensor);
+        ggml_cuda_moe_cache * cache = lease.get();
+        if (cache == nullptr) {
+            continue;
+        }
+        cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache);
+        const char * source_data = static_cast<const char *>(tensor->data);
+        for (int i = 0; i < n_expert_ids; ++i) {
+            const int32_t expert = expert_ids[i];
+            if (expert < 0 || expert >= tensor->ne[2]) {
+                continue;
+            }
+            const void * expert_data = source_data + (size_t) expert * tensor->nb[2];
+            (void) ggml_cuda_moe_cache_acquire(
+                cache, expert_data, tensor->nb[2], copy_stream, use_l2, is_decode, true, false);
+        }
+    }
+}
+
+void ggml_cuda_moe_grouped_context::record_legacy_op(
+        bool is_decode,
+        bool staged,
+        bool overflow,
+        uint64_t unique_experts,
+        uint64_t ids_bytes,
+        uint64_t ids_d2h_time_us,
+        uint64_t ids_d2h_sync_count,
+        uint64_t acquire_time_us,
+        uint64_t remap_time_us,
+        uint64_t copy_wait_event_count,
+        uint64_t copy_wait_event_time_us,
+        uint64_t total_time_us,
+        bool ids_cache_hit) {
+    if (!impl_->legacy_debug_mm.load(std::memory_order_relaxed)) {
+        return;
+    }
+    moe_cache_op_phase_stats & stats = impl_->legacy_op_stats[moe_cache_phase_index(is_decode)];
+    stats.ops.fetch_add(1, std::memory_order_relaxed);
+    stats.staged_ops.fetch_add(staged ? 1 : 0, std::memory_order_relaxed);
+    stats.overflow_ops.fetch_add(overflow ? 1 : 0, std::memory_order_relaxed);
+    stats.unique_experts.fetch_add(unique_experts, std::memory_order_relaxed);
+    moe_cache_atomic_max(stats.unique_experts_max, unique_experts);
+    stats.ids_bytes.fetch_add(ids_bytes, std::memory_order_relaxed);
+    stats.ids_d2h_time_us.fetch_add(ids_d2h_time_us, std::memory_order_relaxed);
+    stats.ids_d2h_sync_count.fetch_add(ids_d2h_sync_count, std::memory_order_relaxed);
+    stats.ids_cache_hits.fetch_add(ids_cache_hit ? 1 : 0, std::memory_order_relaxed);
+    stats.acquire_time_us.fetch_add(acquire_time_us, std::memory_order_relaxed);
+    stats.remap_time_us.fetch_add(remap_time_us, std::memory_order_relaxed);
+    stats.copy_wait_event_count.fetch_add(copy_wait_event_count, std::memory_order_relaxed);
+    stats.copy_wait_event_time_us.fetch_add(copy_wait_event_time_us, std::memory_order_relaxed);
+    stats.total_time_us.fetch_add(total_time_us, std::memory_order_relaxed);
 }
 
 bool ggml_cuda_moe_grouped_context::probe(
@@ -3410,7 +3734,8 @@ void ggml_cuda_moe_grouped_context::shutdown() {
     {
         std::unique_lock<std::mutex> lock(impl_->mutex);
         impl_->resource_cv.wait(lock, [&]() {
-            return !impl_->has_active_transaction() && impl_->active_maintenance == 0 && !impl_->has_active_legacy_lease();
+            return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
+                impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease();
         });
         retired = impl_->detach_resources();
         retired_legacy = impl_->detach_legacy_records();
@@ -3421,7 +3746,25 @@ void ggml_cuda_moe_grouped_context::shutdown() {
         impl_->state.generation = generation;
     }
     impl::retire_resources(std::move(retired));
-    impl::retire_legacy_records(std::move(retired_legacy));
+    impl_->retire_legacy_records(std::move(retired_legacy));
+    moe_cache_telemetry final_telemetry;
+    try {
+        std::lock_guard<std::mutex> lock(impl_->telemetry_mutex);
+        moe_cache_add_telemetry(final_telemetry, std::move(impl_->retired_telemetry));
+        for (int phase = 0; phase < 2; ++phase) {
+            ggml_cuda_moe_add_phase_stats(final_telemetry.phase_stats[phase], moe_cache_take_op_stats(impl_->legacy_op_stats[phase], true));
+        }
+    } catch (...) {
+    }
+    {
+        auto & telemetry = moe_cache_owner_telemetry_state();
+        std::lock_guard<std::mutex> lock(telemetry.mutex);
+        telemetry.active.erase(this);
+        try {
+            moe_cache_add_telemetry(telemetry.retired, std::move(final_telemetry));
+        } catch (...) {
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->shutdown_complete = true;
@@ -3508,6 +3851,7 @@ struct ggml_cuda_moe_cache {
     std::atomic<uint64_t> mincore_failures{0};
 
     bool source_is_mmap = false;
+    bool debug_mm = false;
     bool l2_alloc_failed = false;
     int  l2_target_slots = 0;
     size_t l2_budget_bytes = 0;
@@ -3531,6 +3875,16 @@ struct ggml_cuda_moe_cache {
     uint64_t phase_expert_reuse_gt_l1[2] = {};
     moe_cache_reuse_hist phase_expert_reuse_hist[2];
 };
+
+static void ggml_cuda_moe_cache_set_metadata(
+        ggml_cuda_moe_cache * cache,
+        const char * tensor_name,
+        const void * tensor_data,
+        int64_t n_experts) {
+    cache->tensor_name = tensor_name;
+    cache->tensor_data = tensor_data;
+    cache->n_experts = n_experts;
+}
 
 static void ggml_cuda_moe_cache_append_expert_counts(
         const struct ggml_cuda_moe_cache * cache,
@@ -3578,6 +3932,7 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->stream_mem_ops_supported = false;
     c->access_counter  = 0;
     c->source_is_mmap  = source_is_mmap;
+    c->debug_mm        = moe_cache_mm_debug_enabled();
     c->l2_budget_bytes = l2_budget_bytes;
     c->l2_target_slots = l2_target_slots;
 
@@ -3685,10 +4040,20 @@ extern "C"
 void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     if (!cache) return;
 
+    {
+        std::lock_guard<std::mutex> lock(cache->mu);
+        for (uint32_t pins : cache->slot_pin_count) {
+            GGML_ASSERT(pins == 0);
+        }
+    }
+
     int prev_device = 0;
     cudaGetDevice(&prev_device);
     cudaSetDevice(cache->device);
 
+    if (cache->compute_done) {
+        cudaEventSynchronize(cache->compute_done);
+    }
     if (cache->copy_stream) {
         cudaStreamSynchronize(cache->copy_stream);
         cudaStreamDestroy(cache->copy_stream);
@@ -3706,6 +4071,24 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     cudaSetDevice(prev_device);
 
     delete cache;
+}
+
+void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(legacy_record_map records) {
+    moe_cache_telemetry retired;
+    for (auto & entry : records) {
+        try {
+            moe_cache_capture_telemetry(retired, entry.second->cache, false);
+        } catch (...) {
+        }
+        ggml_cuda_moe_cache_free(entry.second->cache);
+        entry.second->cache = nullptr;
+    }
+    records.clear();
+    try {
+        std::lock_guard<std::mutex> lock(telemetry_mutex);
+        moe_cache_add_telemetry(retired_telemetry, std::move(retired));
+    } catch (...) {
+    }
 }
 
 static const void * ggml_cuda_moe_cache_l2_source(
@@ -3750,7 +4133,7 @@ static int64_t ggml_cuda_moe_cache_expert_id(const ggml_cuda_moe_cache * cache, 
 }
 
 static void ggml_cuda_moe_cache_record_expert_access(ggml_cuda_moe_cache * cache, const void * host_src, int phase) {
-    if (!moe_cache_mm_debug_enabled()) {
+    if (!cache->debug_mm) {
         return;
     }
 
@@ -3921,7 +4304,7 @@ static int ggml_cuda_moe_cache_acquire_locked(
         cache->slot_prefetched[lru_slot] = 0;
     };
 
-    const bool debug_mm = moe_cache_mm_debug_enabled();
+    const bool debug_mm = cache->debug_mm;
     int64_t enqueue_start_us = 0;
     void * dst = (char *)cache->slot_pool_d + (size_t)lru_slot * cache->slot_size_bytes;
     const void * copy_src = use_l2 ? ggml_cuda_moe_cache_l2_source(cache, host_src, byte_count, is_decode, copy_stream) : host_src;
@@ -4529,48 +4912,26 @@ static moe_cache_phase_stats ggml_cuda_moe_cache_phase_stats(const struct ggml_c
     return s;
 }
 
-static moe_cache_phase_stats ggml_cuda_moe_op_phase_stats(int phase) {
+static moe_cache_phase_stats moe_cache_take_op_stats(moe_cache_op_phase_stats & op, bool reset) {
     moe_cache_phase_stats s = {};
-    if (phase < 0 || phase >= 2) {
-        return s;
-    }
-
-    const moe_cache_op_phase_stats & op = g_moe_cache_op_stats[phase];
-    s.ops = op.ops.load(std::memory_order_relaxed);
-    s.staged_ops = op.staged_ops.load(std::memory_order_relaxed);
-    s.overflow_ops = op.overflow_ops.load(std::memory_order_relaxed);
-    s.unique_experts = op.unique_experts.load(std::memory_order_relaxed);
-    s.unique_experts_max = op.unique_experts_max.load(std::memory_order_relaxed);
-    s.ids_bytes = op.ids_bytes.load(std::memory_order_relaxed);
-    s.ids_d2h_time_us = op.ids_d2h_time_us.load(std::memory_order_relaxed);
-    s.ids_d2h_sync_count = op.ids_d2h_sync_count.load(std::memory_order_relaxed);
-    s.ids_cache_hits = op.ids_cache_hits.load(std::memory_order_relaxed);
-    s.acquire_time_us = op.acquire_time_us.load(std::memory_order_relaxed);
-    s.remap_time_us = op.remap_time_us.load(std::memory_order_relaxed);
-    s.copy_wait_event_count = op.copy_wait_event_count.load(std::memory_order_relaxed);
-    s.copy_wait_event_time_us = op.copy_wait_event_time_us.load(std::memory_order_relaxed);
-    s.total_time_us = op.total_time_us.load(std::memory_order_relaxed);
+    auto take = [reset](std::atomic<uint64_t> & value) {
+        return reset ? value.exchange(0, std::memory_order_relaxed) : value.load(std::memory_order_relaxed);
+    };
+    s.ops = take(op.ops);
+    s.staged_ops = take(op.staged_ops);
+    s.overflow_ops = take(op.overflow_ops);
+    s.unique_experts = take(op.unique_experts);
+    s.unique_experts_max = take(op.unique_experts_max);
+    s.ids_bytes = take(op.ids_bytes);
+    s.ids_d2h_time_us = take(op.ids_d2h_time_us);
+    s.ids_d2h_sync_count = take(op.ids_d2h_sync_count);
+    s.ids_cache_hits = take(op.ids_cache_hits);
+    s.acquire_time_us = take(op.acquire_time_us);
+    s.remap_time_us = take(op.remap_time_us);
+    s.copy_wait_event_count = take(op.copy_wait_event_count);
+    s.copy_wait_event_time_us = take(op.copy_wait_event_time_us);
+    s.total_time_us = take(op.total_time_us);
     return s;
-}
-
-static void ggml_cuda_moe_reset_op_phase_stats(void) {
-    for (int phase = 0; phase < 2; ++phase) {
-        moe_cache_op_phase_stats & s = g_moe_cache_op_stats[phase];
-        s.ops.store(0, std::memory_order_relaxed);
-        s.staged_ops.store(0, std::memory_order_relaxed);
-        s.overflow_ops.store(0, std::memory_order_relaxed);
-        s.unique_experts.store(0, std::memory_order_relaxed);
-        s.unique_experts_max.store(0, std::memory_order_relaxed);
-        s.ids_bytes.store(0, std::memory_order_relaxed);
-        s.ids_d2h_time_us.store(0, std::memory_order_relaxed);
-        s.ids_d2h_sync_count.store(0, std::memory_order_relaxed);
-        s.ids_cache_hits.store(0, std::memory_order_relaxed);
-        s.acquire_time_us.store(0, std::memory_order_relaxed);
-        s.remap_time_us.store(0, std::memory_order_relaxed);
-        s.copy_wait_event_count.store(0, std::memory_order_relaxed);
-        s.copy_wait_event_time_us.store(0, std::memory_order_relaxed);
-        s.total_time_us.store(0, std::memory_order_relaxed);
-    }
 }
 
 static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe_cache_phase_stats & src) {
@@ -4932,6 +5293,96 @@ void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache) {
     }
 }
 
+static void moe_cache_add_telemetry(moe_cache_telemetry & dst, moe_cache_telemetry && src) {
+    dst.n_caches += src.n_caches;
+    dst.total_hits += src.total_hits;
+    dst.total_misses += src.total_misses;
+    dst.total_evictions += src.total_evictions;
+    dst.mm.h2d_copy_count += src.mm.h2d_copy_count;
+    dst.mm.h2d_copy_bytes += src.mm.h2d_copy_bytes;
+    dst.mm.h2d_enqueue_time_us += src.mm.h2d_enqueue_time_us;
+    dst.mm.sampled_mincore_checks += src.mm.sampled_mincore_checks;
+    dst.mm.sampled_pages_total += src.mm.sampled_pages_total;
+    dst.mm.sampled_pages_resident += src.mm.sampled_pages_resident;
+    dst.mm.sampled_nonresident_expert_count += src.mm.sampled_nonresident_expert_count;
+    dst.mm.mincore_failures += src.mm.mincore_failures;
+    dst.l2.budget_bytes += src.l2.budget_bytes;
+    dst.l2.slots += src.l2.slots;
+    dst.l2.used_bytes += src.l2.used_bytes;
+    dst.l2.hits += src.l2.hits;
+    dst.l2.misses += src.l2.misses;
+    dst.l2.fills += src.l2.fills;
+    dst.l2.evictions += src.l2.evictions;
+    dst.l2.fill_bytes += src.l2.fill_bytes;
+    dst.l2.fill_time_us += src.l2.fill_time_us;
+    dst.experts.tensors += src.experts.tensors;
+    dst.experts.experts += src.experts.experts;
+    dst.experts.unique_experts += src.experts.unique_experts;
+    dst.experts.accesses += src.experts.accesses;
+    dst.experts.first_touches += src.experts.first_touches;
+    dst.experts.reuse_le_l1 += src.experts.reuse_le_l1;
+    dst.experts.reuse_le_l2 += src.experts.reuse_le_l2;
+    dst.experts.reuse_gt_l2 += src.experts.reuse_gt_l2;
+    dst.experts.touched_once += src.experts.touched_once;
+    dst.experts.touched_ge2 += src.experts.touched_ge2;
+    if (src.hot_tensor.accesses > dst.hot_tensor.accesses) {
+        dst.hot_tensor = std::move(src.hot_tensor);
+    }
+    dst.all_expert_access_counts.insert(
+        dst.all_expert_access_counts.end(), src.all_expert_access_counts.begin(), src.all_expert_access_counts.end());
+    if (src.hot_decode_miss_tensor.h2d_copy_bytes > dst.hot_decode_miss_tensor.h2d_copy_bytes) {
+        dst.hot_decode_miss_tensor = std::move(src.hot_decode_miss_tensor);
+    }
+    dst.decode_tensor_stats.insert(
+        dst.decode_tensor_stats.end(),
+        std::make_move_iterator(src.decode_tensor_stats.begin()),
+        std::make_move_iterator(src.decode_tensor_stats.end()));
+    for (int phase = 0; phase < 2; ++phase) {
+        ggml_cuda_moe_add_phase_stats(dst.phase_stats[phase], src.phase_stats[phase]);
+    }
+}
+
+static void moe_cache_capture_telemetry(moe_cache_telemetry & dst, ggml_cuda_moe_cache * cache, bool reset) {
+    if (cache == nullptr) {
+        return;
+    }
+    moe_cache_telemetry sample;
+    std::lock_guard<std::mutex> lock(cache->mu);
+    sample.n_caches = 1;
+    ggml_cuda_moe_cache_stats(cache, &sample.total_hits, &sample.total_misses, &sample.total_evictions);
+    if (cache->debug_mm) {
+        sample.mm = ggml_cuda_moe_cache_mm_stats(cache);
+        sample.l2 = ggml_cuda_moe_cache_l2_stats(cache);
+        for (int phase = 0; phase < 2; ++phase) {
+            ggml_cuda_moe_add_phase_stats(sample.phase_stats[phase], ggml_cuda_moe_cache_phase_stats(cache, phase));
+        }
+        const moe_cache_hot_tensor_stats expert = ggml_cuda_moe_cache_expert_stats(cache);
+        if (expert.experts > 0) {
+            sample.experts.tensors = 1;
+            sample.experts.experts = expert.experts;
+            sample.experts.unique_experts = expert.unique_experts;
+            sample.experts.accesses = expert.accesses;
+            sample.experts.first_touches = expert.first_touches;
+            sample.experts.reuse_le_l1 = expert.reuse_le_l1;
+            sample.experts.reuse_le_l2 = expert.reuse_le_l2;
+            sample.experts.reuse_gt_l2 = expert.reuse_gt_l2;
+            sample.experts.touched_once = expert.touched_once;
+            sample.experts.touched_ge2 = expert.touched_ge2;
+            sample.hot_tensor = expert;
+            ggml_cuda_moe_cache_append_expert_counts(cache, sample.all_expert_access_counts);
+        }
+        moe_cache_tensor_decode_stats decode = ggml_cuda_moe_cache_decode_tensor_stats(cache);
+        if (decode.l1_hits + decode.l1_misses + decode.h2d_copy_count > 0) {
+            sample.decode_tensor_stats.push_back(decode);
+        }
+        sample.hot_decode_miss_tensor = std::move(decode);
+    }
+    if (reset) {
+        ggml_cuda_moe_cache_reset_stats(cache);
+    }
+    moe_cache_add_telemetry(dst, std::move(sample));
+}
+
 extern "C"
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
@@ -5073,106 +5524,6 @@ ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * p
     return buffer;
 }
 
-// ---------------------------------------------------------------------------
-// Per-device cache singleton
-//
-// The dispatch hook calls get_or_create on first cached op; subsequent ops
-// reuse the same cache. Slot size is set on first creation. If a later op
-// needs a different slot size, the caller is expected to detect the mismatch
-// via ggml_cuda_moe_cache_slot_size_bytes() and fall back to per-op staging.
-// ---------------------------------------------------------------------------
-
-// Per-tensor cache registry: one cache per (device, tensor_data).
-// "Tensor" here means a model expert weight tensor like blk.0.ffn_up_exps.weight.
-// Each name is unique and identifies a (layer, matrix_kind) pair. The N slots
-// in that tensor's cache are dedicated to that tensor's experts only -- no
-// cross-layer competition.
-//
-// User-facing N is slots-per-tensor, not slots-total. For Qwen3.6 35B-A3B
-// with 40 layers x 3 matrices = 120 expert tensors and N=32:
-//   total memory = 120 x 32 x ~0.82 MiB ~= 3.1 GiB per device
-//
-// Slot size per cache equals that tensor's expert_stride, so slots are tightly
-// packed; the synthetic src0 stays contiguous and kernels run unchanged.
-namespace {
-
-struct moe_cache_key {
-    int          device;
-    const void * tensor_data;
-    bool operator<(const moe_cache_key & o) const {
-        if (device != o.device) return device < o.device;
-        return std::less<const void *>{}(tensor_data, o.tensor_data);
-    }
-};
-
-struct moe_cache_registry {
-    std::mutex mu;
-    std::map<moe_cache_key, ggml_cuda_moe_cache *> by_key;
-};
-
-static moe_cache_registry & get_registry() {
-    static moe_cache_registry inst;
-    return inst;
-}
-
-static std::atomic<int> g_moe_cache_l2_mmap_tensor_count{0};
-
-} // namespace
-
-extern "C"
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
-    int          device,
-    const void * tensor_data,
-    size_t       slot_size_bytes,
-    int          n_slots,
-    int64_t      n_experts,
-    const char * tensor_name_for_log) {
-
-    if (tensor_data == nullptr || tensor_name_for_log == nullptr || tensor_name_for_log[0] == '\0') {
-        return nullptr;
-    }
-
-    auto & reg = get_registry();
-    std::lock_guard<std::mutex> lk(reg.mu);
-
-    moe_cache_key k{device, tensor_data};
-    auto it = reg.by_key.find(k);
-    if (it != reg.by_key.end()) {
-        return it->second;
-    }
-
-    const bool source_is_mmap = moe_cache_is_mmap_range(tensor_data, slot_size_bytes);
-    size_t l2_budget_bytes = 0;
-    int l2_target_slots = 0;
-    if (source_is_mmap) {
-        const size_t total_l2_budget = g_moe_cache_l2_pinned_size.load(std::memory_order_relaxed);
-        const int n_mmap_tensors = g_moe_cache_l2_mmap_tensor_count.load(std::memory_order_relaxed);
-        if (total_l2_budget > 0 && n_mmap_tensors > 0) {
-            l2_budget_bytes = total_l2_budget / (size_t) n_mmap_tensors;
-            const size_t budget_slots = l2_budget_bytes / slot_size_bytes;
-            const size_t expert_slots = n_experts > 0 ? (size_t) n_experts : budget_slots;
-            l2_target_slots = (int) std::min(budget_slots, expert_slots);
-        }
-    }
-
-    ggml_cuda_moe_cache * c = ggml_cuda_moe_cache_init(
-        device, slot_size_bytes, n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
-    if (!c) {
-        return nullptr;
-    }
-
-    c->tensor_name = tensor_name_for_log;
-    c->tensor_data = tensor_data;
-    c->n_experts = n_experts;
-    reg.by_key.emplace(k, c);
-    GGML_LOG_INFO("load_tensors: CUDA_MoE_Cache_Pool[%-32s] = %7.2f MiB  (%d slots x %.2f MiB)\n",
-                  tensor_name_for_log,
-                  ((double)n_slots * slot_size_bytes) / 1024.0 / 1024.0,
-                  n_slots,
-                  slot_size_bytes / 1024.0 / 1024.0);
-    return c;
-}
-
 // Backward-compat wrapper: keys solely by slot_size. Kept so existing callers
 // don't break, but prefer the per-tensor variant.
 extern "C"
@@ -5188,12 +5539,6 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
 
 extern "C"
 void ggml_cuda_moe_cache_free_all(void) {
-    auto & reg = get_registry();
-    std::lock_guard<std::mutex> lk(reg.mu);
-    for (auto & kv : reg.by_key) {
-        ggml_cuda_moe_cache_free(kv.second);
-    }
-    reg.by_key.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -5233,67 +5578,25 @@ bool ggml_backend_cuda_moe_get_debug_mm(void) {
     return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
 }
 
-// Per-tensor observation list: (tensor_data, name, expert_stride) populated
-// by the model loader, drained by preallocate_pools to create one cache per
-// observed tensor. Reset between models.
-namespace {
-struct observed_tensor {
-    const void * tensor_data;
-    std::string  tensor_name;
-    size_t       per_expert_bytes;
-    int64_t      n_experts;
-};
-struct observation_state {
-    std::mutex mu;
-    std::vector<observed_tensor> tensors;
-};
-static observation_state & get_observation_state() {
-    static observation_state inst;
-    return inst;
-}
-} // namespace
-
 extern "C"
 void ggml_backend_cuda_moe_observe_expert_tensor(
     const void * tensor_data,
     const char * tensor_name,
     size_t       per_expert_bytes,
     int64_t      n_experts) {
-    if (tensor_data == nullptr || per_expert_bytes == 0) return;
-    auto & st = get_observation_state();
-    std::lock_guard<std::mutex> lk(st.mu);
-    st.tensors.push_back({tensor_data,
-                          tensor_name ? std::string(tensor_name) : std::string(),
-                          per_expert_bytes,
-                          n_experts});
+    GGML_UNUSED(tensor_data);
+    GGML_UNUSED(tensor_name);
+    GGML_UNUSED(per_expert_bytes);
+    GGML_UNUSED(n_experts);
 }
 
 extern "C"
 void ggml_backend_cuda_moe_reset_expert_size_observation(void) {
-    auto & st = get_observation_state();
-    std::lock_guard<std::mutex> lk(st.mu);
-    st.tensors.clear();
 }
 
 extern "C"
 void ggml_backend_cuda_moe_preallocate_pools(int device) {
-    const int n_slots = ggml_backend_cuda_moe_get_cache_slots();
-    if (n_slots <= 0) return;
-    auto & st = get_observation_state();
-    std::lock_guard<std::mutex> lk(st.mu);
-    int n_mmap_tensors = 0;
-    for (const auto & t : st.tensors) {
-        if (moe_cache_is_mmap_range(t.tensor_data, t.per_expert_bytes)) {
-            ++n_mmap_tensors;
-        }
-    }
-    g_moe_cache_l2_mmap_tensor_count.store(n_mmap_tensors, std::memory_order_relaxed);
-    for (const auto & t : st.tensors) {
-        ggml_cuda_moe_cache_get_or_create_for_tensor(
-            device, t.tensor_data, t.per_expert_bytes, n_slots,
-            t.n_experts,
-            t.tensor_name.empty() ? "?" : t.tensor_name.c_str());
-    }
+    GGML_UNUSED(device);
 }
 
 extern "C"
@@ -5304,140 +5607,33 @@ void ggml_backend_cuda_moe_prefetch_experts(
     int             n_eids,
     bool            use_l2,
     bool            is_decode) {
-    if (!tensor_name || !eids || n_eids <= 0) return;
-
-    // 1. Look up the observed tensor (data ptr + stride) by name.
-    observed_tensor found;
-    bool has_found = false;
-    {
-        auto & st = get_observation_state();
-        std::lock_guard<std::mutex> lk(st.mu);
-        for (const auto & t : st.tensors) {
-            if (t.tensor_name == tensor_name) {
-                found = t;
-                has_found = true;
-                break;
-            }
-        }
-        if (!has_found) return;
-    }
-
-    const void * tensor_data    = found.tensor_data;
-    const size_t expert_stride  = found.per_expert_bytes;
-
-    // 2. Find the cache for this tensor.
-    auto & reg = get_registry();
-    ggml_cuda_moe_cache * cache = nullptr;
-    {
-        std::lock_guard<std::mutex> lk(reg.mu);
-        moe_cache_key k{device, tensor_data};
-        auto it = reg.by_key.find(k);
-        if (it == reg.by_key.end()) return; // cache not created yet
-        cache = it->second;
-    }
-
-    if (!cache) return;
-    cudaStream_t copy_stream = cache->copy_stream;
-    const char * src_base = (const char *)tensor_data;
-
-    // 3. Issue acquires for each expert id. Failures are silent -- this is
-    //    speculative; the real op will re-acquire if needed.
-    for (int i = 0; i < n_eids; ++i) {
-        int32_t eid = eids[i];
-        if (eid < 0) continue;
-        const void * host_ptr = src_base + (size_t)eid * expert_stride;
-        (void)ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, true, false);
-    }
+    GGML_UNUSED(device);
+    GGML_UNUSED(tensor_name);
+    GGML_UNUSED(eids);
+    GGML_UNUSED(n_eids);
+    GGML_UNUSED(use_l2);
+    GGML_UNUSED(is_decode);
 }
 
 // Deprecated singular-pool entry point; superseded by preallocate_pools (plural).
 extern "C"
 void ggml_backend_cuda_moe_preallocate_pool(int device) {
-    ggml_backend_cuda_moe_preallocate_pools(device);
+    GGML_UNUSED(device);
 }
 
-extern "C"
-void ggml_backend_cuda_moe_log_and_reset_stats(void) {
-    auto & reg = get_registry();
-    std::lock_guard<std::mutex> lk(reg.mu);
-
-    // Aggregate across all per-tensor caches into one line per request.
-    // 120+ per-tensor lines would drown the timing output.
-    uint64_t total_hits = 0, total_misses = 0, total_evictions = 0;
-    moe_cache_mm_stats mm = {};
-    moe_cache_l2_stats l2 = {};
-    moe_cache_expert_stats experts = {};
-    moe_cache_hot_tensor_stats hot_tensor = {};
-    std::vector<uint64_t> all_expert_access_counts;
-    moe_cache_tensor_decode_stats hot_decode_miss_tensor = {};
-    std::vector<moe_cache_tensor_decode_stats> decode_tensor_stats;
-    moe_cache_phase_stats phase_stats[2] = {};
-    if (moe_cache_mm_debug_enabled()) {
-        for (int phase = 0; phase < 2; ++phase) {
-            ggml_cuda_moe_add_phase_stats(phase_stats[phase], ggml_cuda_moe_op_phase_stats(phase));
-        }
-    }
-    size_t   n_caches = reg.by_key.size();
-    for (auto & kv : reg.by_key) {
-        uint64_t h = 0, m = 0, e = 0;
-        ggml_cuda_moe_cache_stats(kv.second, &h, &m, &e);
-        total_hits      += h;
-        total_misses    += m;
-        total_evictions += e;
-        if (moe_cache_mm_debug_enabled()) {
-            moe_cache_mm_stats s = ggml_cuda_moe_cache_mm_stats(kv.second);
-            mm.h2d_copy_count                   += s.h2d_copy_count;
-            mm.h2d_copy_bytes                   += s.h2d_copy_bytes;
-            mm.h2d_enqueue_time_us              += s.h2d_enqueue_time_us;
-            mm.sampled_mincore_checks           += s.sampled_mincore_checks;
-            mm.sampled_pages_total              += s.sampled_pages_total;
-            mm.sampled_pages_resident           += s.sampled_pages_resident;
-            mm.sampled_nonresident_expert_count += s.sampled_nonresident_expert_count;
-            mm.mincore_failures                 += s.mincore_failures;
-
-            moe_cache_l2_stats ls = ggml_cuda_moe_cache_l2_stats(kv.second);
-            l2.budget_bytes += ls.budget_bytes;
-            l2.slots        += ls.slots;
-            l2.used_bytes   += ls.used_bytes;
-            l2.hits         += ls.hits;
-            l2.misses       += ls.misses;
-            l2.fills        += ls.fills;
-            l2.evictions    += ls.evictions;
-            l2.fill_bytes   += ls.fill_bytes;
-            l2.fill_time_us += ls.fill_time_us;
-
-            for (int phase = 0; phase < 2; ++phase) {
-                ggml_cuda_moe_add_phase_stats(phase_stats[phase], ggml_cuda_moe_cache_phase_stats(kv.second, phase));
-            }
-
-            moe_cache_hot_tensor_stats es = ggml_cuda_moe_cache_expert_stats(kv.second);
-            if (es.experts > 0) {
-                experts.tensors++;
-                experts.experts        += es.experts;
-                experts.unique_experts += es.unique_experts;
-                experts.accesses       += es.accesses;
-                experts.first_touches  += es.first_touches;
-                experts.reuse_le_l1    += es.reuse_le_l1;
-                experts.reuse_le_l2    += es.reuse_le_l2;
-                experts.reuse_gt_l2    += es.reuse_gt_l2;
-                experts.touched_once   += es.touched_once;
-                experts.touched_ge2    += es.touched_ge2;
-                ggml_cuda_moe_cache_append_expert_counts(kv.second, all_expert_access_counts);
-                if (es.accesses > hot_tensor.accesses) {
-                    hot_tensor = es;
-                }
-            }
-
-            moe_cache_tensor_decode_stats ds = ggml_cuda_moe_cache_decode_tensor_stats(kv.second);
-            if (ds.l1_hits + ds.l1_misses + ds.h2d_copy_count > 0) {
-                decode_tensor_stats.push_back(ds);
-            }
-            if (ds.h2d_copy_bytes > hot_decode_miss_tensor.h2d_copy_bytes) {
-                hot_decode_miss_tensor = ds;
-            }
-        }
-        ggml_cuda_moe_cache_reset_stats(kv.second);
-    }
+static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
+    const size_t n_caches = telemetry.n_caches;
+    const uint64_t total_hits = telemetry.total_hits;
+    const uint64_t total_misses = telemetry.total_misses;
+    const uint64_t total_evictions = telemetry.total_evictions;
+    const moe_cache_mm_stats & mm = telemetry.mm;
+    const moe_cache_l2_stats & l2 = telemetry.l2;
+    moe_cache_expert_stats & experts = telemetry.experts;
+    const moe_cache_hot_tensor_stats & hot_tensor = telemetry.hot_tensor;
+    std::vector<uint64_t> & all_expert_access_counts = telemetry.all_expert_access_counts;
+    const moe_cache_tensor_decode_stats & hot_decode_miss_tensor = telemetry.hot_decode_miss_tensor;
+    std::vector<moe_cache_tensor_decode_stats> & decode_tensor_stats = telemetry.decode_tensor_stats;
+    moe_cache_phase_stats * phase_stats = telemetry.phase_stats;
     const uint64_t total = total_hits + total_misses;
     const double rate = total > 0 ? 100.0 * (double)total_hits / (double)total : 0.0;
     GGML_LOG_INFO("moe-cache: %zu caches  hits=%llu  misses=%llu  evictions=%llu  hit-rate=%.2f%%\n",
@@ -5596,5 +5792,34 @@ void ggml_backend_cuda_moe_log_and_reset_stats(void) {
             (unsigned long long) proc.vm_workingset_refault_file,
             (unsigned long long) proc.vm_workingset_refault_anon);
     }
-    ggml_cuda_moe_reset_op_phase_stats();
+}
+
+void ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats() {
+    moe_cache_telemetry aggregate;
+    auto & owners = moe_cache_owner_telemetry_state();
+    {
+        std::lock_guard<std::mutex> owner_registry_lock(owners.mutex);
+        moe_cache_add_telemetry(aggregate, std::move(owners.retired));
+        for (ggml_cuda_moe_grouped_context * owner : owners.active) {
+            std::lock_guard<std::mutex> owner_lock(owner->impl_->mutex);
+            for (auto & entry : owner->impl_->legacy_records) {
+                moe_cache_capture_telemetry(aggregate, entry.second->cache, true);
+            }
+            std::lock_guard<std::mutex> telemetry_lock(owner->impl_->telemetry_mutex);
+            moe_cache_add_telemetry(aggregate, std::move(owner->impl_->retired_telemetry));
+            for (int phase = 0; phase < 2; ++phase) {
+                ggml_cuda_moe_add_phase_stats(
+                    aggregate.phase_stats[phase], moe_cache_take_op_stats(owner->impl_->legacy_op_stats[phase], true));
+            }
+        }
+    }
+    for (int phase = 0; phase < 2; ++phase) {
+        ggml_cuda_moe_add_phase_stats(aggregate.phase_stats[phase], moe_cache_take_op_stats(g_moe_cache_op_stats[phase], true));
+    }
+    moe_cache_log_telemetry(std::move(aggregate));
+}
+
+extern "C"
+void ggml_backend_cuda_moe_log_and_reset_stats(void) {
+    ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
 }

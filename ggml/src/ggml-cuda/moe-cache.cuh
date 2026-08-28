@@ -131,6 +131,25 @@ struct ggml_cuda_moe_legacy_acquisition {
     uint32_t registered_source = 0;
 };
 
+class ggml_cuda_moe_legacy_operation_lease {
+public:
+    ggml_cuda_moe_legacy_operation_lease() noexcept;
+    ~ggml_cuda_moe_legacy_operation_lease();
+
+    ggml_cuda_moe_legacy_operation_lease(ggml_cuda_moe_legacy_operation_lease && other) noexcept;
+    ggml_cuda_moe_legacy_operation_lease & operator=(ggml_cuda_moe_legacy_operation_lease && other) noexcept;
+
+    ggml_cuda_moe_legacy_operation_lease(const ggml_cuda_moe_legacy_operation_lease &) = delete;
+    ggml_cuda_moe_legacy_operation_lease & operator=(const ggml_cuda_moe_legacy_operation_lease &) = delete;
+
+    explicit operator bool() const noexcept;
+
+private:
+    friend class ggml_cuda_moe_grouped_context;
+
+    ggml_cuda_moe_grouped_context * owner_ = nullptr;
+};
+
 class ggml_cuda_moe_legacy_cache_lease {
 public:
     ggml_cuda_moe_legacy_cache_lease() noexcept;
@@ -329,9 +348,31 @@ public:
     bool end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    ggml_cuda_moe_legacy_operation_lease begin_legacy_operation();
     ggml_cuda_moe_legacy_cache_lease acquire_legacy_cache(
             const ggml_tensor * tensor,
             const ggml_cuda_moe_legacy_acquisition * expected = nullptr);
+    void prefetch_legacy_siblings(
+            const ggml_cuda_moe_legacy_cache_lease & source,
+            const int32_t * expert_ids,
+            int n_expert_ids,
+            bool use_l2,
+            bool is_decode);
+    void record_legacy_op(
+            bool is_decode,
+            bool staged,
+            bool overflow,
+            uint64_t unique_experts,
+            uint64_t ids_bytes,
+            uint64_t ids_d2h_time_us,
+            uint64_t ids_d2h_sync_count,
+            uint64_t acquire_time_us,
+            uint64_t remap_time_us,
+            uint64_t copy_wait_event_count,
+            uint64_t copy_wait_event_time_us,
+            uint64_t total_time_us,
+            bool ids_cache_hit);
+    static void log_and_reset_legacy_stats();
     void compile_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
@@ -358,9 +399,11 @@ public:
 
 private:
     friend struct ggml_cuda_moe_grouped_context_test_access;
+    friend class ggml_cuda_moe_legacy_operation_lease;
     friend class ggml_cuda_moe_legacy_cache_lease;
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+    void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
 
     struct impl;
@@ -524,19 +567,6 @@ void ggml_cuda_moe_cache_stats(
     uint64_t * out_evictions);
 
 void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
-
-// Per-tensor cache: returns the existing cache for this (device, tensor_data)
-// pair, or creates a fresh one on first call. Each MoE expert tensor has its
-// own pool of N slots dedicated to its experts only -- no cross-tensor or
-// cross-layer slot contention. tensor_name_for_log is used for the
-// "load_tensors:" log line on first creation; pass src0->name.
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create_for_tensor(
-    int          device,
-    const void * tensor_data,
-    size_t       slot_size_bytes,
-    int          n_slots,
-    int64_t      n_experts,
-    const char * tensor_name_for_log);
 
 // Deprecated: keys solely by slot_size_bytes. Kept for compat; returns nullptr.
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(

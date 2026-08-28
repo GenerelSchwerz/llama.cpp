@@ -8,7 +8,7 @@
 //   3. hits + misses == total acquires.
 //   4. No expert is ever resident in two slots simultaneously.
 //   5. Hit rate for a Zipf-ish access pattern is non-trivial (>40%).
-//   6. Registry keys distinguish tensors that have the same name.
+//   6. Backend-context owners distinguish identical tensor sources.
 //   7. Cache-assisted staging orders coalesced D2D and H2D copies after prior compute.
 //
 // The workload is a synthetic stand-in for MoE routing: most tokens land on a
@@ -665,6 +665,8 @@ static void test_candidate_registry(bool benchmark) {
     ggml_backend_moe_candidate_group_v1 pair_aux_group = {pair_aux_banks.data(), pair_aux_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0};
     snapshot = candidate_snapshot(12, &pair_aux_group, 1);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(!registry.acquire_legacy_cache(gate_bias));
+    CHECK(!registry.acquire_legacy_cache(up_bias));
     probe = {};
     probe.n_banks = 2;
     probe.exact_auxiliaries = 1;
@@ -867,6 +869,61 @@ static void test_legacy_owner_leases() {
     CHECK(unsupported_lease.acquisition().registered_source == 0 && unsupported_lease.acquisition().n_slots == 9);
     unsupported_lease = {};
     second_lease = {};
+
+    auto null_cache_owner = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    auto null_cache_snapshot = candidate_snapshot(0, nullptr, 0);
+    CHECK(null_cache_owner->replace(&null_cache_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto null_cache_operation = null_cache_owner->begin_legacy_operation();
+    CHECK(null_cache_operation && !null_cache_owner->acquire_legacy_cache(down));
+    auto replacement_snapshot = candidate_snapshot(9, nullptr, 0);
+    std::atomic<bool> null_replacement_started{false};
+    std::atomic<bool> null_replacement_done{false};
+    std::thread null_replacement_thread([&]() {
+        null_replacement_started.store(true, std::memory_order_release);
+        CHECK(null_cache_owner->replace(&replacement_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        null_replacement_done.store(true, std::memory_order_release);
+    });
+    while (!null_replacement_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    for (;;) {
+        auto rejected = null_cache_owner->begin_legacy_operation();
+        if (!rejected) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    CHECK(!null_replacement_done.load(std::memory_order_acquire));
+    null_cache_operation = {};
+    null_replacement_thread.join();
+    CHECK(null_replacement_done.load(std::memory_order_acquire));
+
+    CHECK(null_cache_owner->replace(&null_cache_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    null_cache_operation = null_cache_owner->begin_legacy_operation();
+    CHECK(null_cache_operation && !null_cache_owner->acquire_legacy_cache(down));
+    auto * null_cache_context = null_cache_owner.get();
+    std::atomic<bool> null_shutdown_started{false};
+    std::atomic<bool> null_shutdown_done{false};
+    std::thread null_shutdown_thread([&]() {
+        null_shutdown_started.store(true, std::memory_order_release);
+        null_cache_context->shutdown();
+        null_shutdown_done.store(true, std::memory_order_release);
+    });
+    while (!null_shutdown_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    for (;;) {
+        auto rejected = null_cache_context->begin_legacy_operation();
+        if (!rejected) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    CHECK(!null_shutdown_done.load(std::memory_order_acquire));
+    null_cache_operation = {};
+    null_shutdown_thread.join();
+    CHECK(null_shutdown_done.load(std::memory_order_acquire));
+    null_cache_owner.reset();
 
     auto terminal = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
     CHECK(terminal->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -1722,15 +1779,18 @@ static void test_cached_mmid_fusion_decline() {
         ggml_backend_tensor_set(cuda_graph.leaves[i], data.data(), 0, data.size());
         ggml_backend_tensor_set(cpu_graph.leaves[i], data.data(), 0, data.size());
     }
-    bool all_sources_dispatched = true;
     for (ggml_tensor * weight : cuda_graph.cached_weights) {
         CHECK(weight->buffer != nullptr && ggml_backend_buft_is_cuda_moe_cached(weight->buffer->buft));
     }
+    const auto disabled = candidate_snapshot(4, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(cuda_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
-    CHECK(ggml_backend_graph_compute(cpu_backend.get(), cpu_graph.graph) == GGML_STATUS_SUCCESS);
-    CHECK(ggml_backend_graph_compute(cuda_backend.get(), cuda_graph.graph) == GGML_STATUS_SUCCESS);
-    ggml_backend_synchronize(cpu_backend.get());
-    ggml_backend_synchronize(cuda_backend.get());
+    for (int pass = 0; pass < 2; ++pass) {
+        CHECK(ggml_backend_graph_compute(cpu_backend.get(), cpu_graph.graph) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_graph_compute(cuda_backend.get(), cuda_graph.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(cpu_backend.get());
+        ggml_backend_synchronize(cuda_backend.get());
+    }
 
     std::vector<float> expected(ggml_nelements(cpu_graph.output));
     std::vector<float> actual(ggml_nelements(cuda_graph.output));
@@ -1746,25 +1806,161 @@ static void test_cached_mmid_fusion_decline() {
     }
     CHECK(squared_expected > 0.0 && squared_error / squared_expected < 2e-2);
 
-    for (ggml_tensor * weight : cuda_graph.cached_weights) {
-        ggml_cuda_moe_cache * cache = ggml_cuda_moe_cache_get_or_create_for_tensor(
-            0, weight->data, weight->nb[2], 4, weight->ne[2], weight->name);
-        CHECK(cache != nullptr);
-        uint64_t hits = 0;
-        uint64_t misses = 0;
-        uint64_t evictions = 0;
-        ggml_cuda_moe_cache_stats(cache, &hits, &misses, &evictions);
-        if (hits + misses != 2) {
-            fprintf(stderr, "FAIL cached fusion source %s: hits=%llu misses=%llu\n", weight->name,
-                static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses));
-            all_sources_dispatched = false;
-        }
-    }
-    CHECK(all_sources_dispatched);
-
     ggml_cuda_moe_cache_free_all();
     ggml_backend_cuda_moe_set_cache_slots(old_slots);
     fprintf(stderr, "test-moe-cache: cached MMID F1-F5 decline OK\n");
+}
+
+struct cached_mmid_path_test_graph {
+    ggml_context_ptr weights;
+    ggml_context_ptr nodes;
+    ggml_backend_buffer_ptr weight_buffer;
+    ggml_backend_buffer_ptr node_buffer;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * output = nullptr;
+    std::vector<ggml_tensor *> leaves;
+};
+
+static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t weight_buft,
+        ggml_type weight_type,
+        int64_t n_out,
+        int64_t n_used,
+        int64_t n_tokens) {
+    constexpr int64_t N_EXPERTS = 8;
+    constexpr int64_t N_IN = 256;
+    const ggml_init_params weight_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 8,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    const ggml_init_params node_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(32, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+
+    cached_mmid_path_test_graph result;
+    result.weights.reset(ggml_init(weight_params));
+    result.nodes.reset(ggml_init(node_params));
+    CHECK(result.weights != nullptr && result.nodes != nullptr);
+
+    const int64_t weight_ne[] = {N_IN, n_out, N_EXPERTS};
+    ggml_tensor * weight = ggml_new_tensor(result.weights.get(), weight_type, 3, weight_ne);
+    ggml_set_name(weight, "test.paths.ffn_up_exps.weight");
+    const int64_t input_ne[] = {N_IN, 1, n_tokens};
+    ggml_tensor * input = ggml_new_tensor(result.nodes.get(), GGML_TYPE_F32, 3, input_ne);
+    ggml_set_name(input, "test.paths.input");
+    const int64_t ids_ne[] = {n_used, n_tokens};
+    result.ids = ggml_new_tensor(result.nodes.get(), GGML_TYPE_I32, 2, ids_ne);
+    ggml_set_name(result.ids, "test.paths.ids");
+    result.output = ggml_mul_mat_id(result.nodes.get(), weight, input, result.ids);
+    ggml_set_name(result.output, "test.paths.output");
+    result.leaves = {weight, input, result.ids};
+
+    result.graph = ggml_new_graph_custom(result.nodes.get(), 32, false);
+    ggml_build_forward_expand(result.graph, result.output);
+    result.weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result.weights.get(), weight_buft));
+    result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
+    CHECK(result.weight_buffer != nullptr && result.node_buffer != nullptr);
+    ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return result;
+}
+
+static void initialize_cached_mmid_path_test_graphs(
+        cached_mmid_path_test_graph & cuda_graph,
+        cached_mmid_path_test_graph & reference_graph) {
+    CHECK(cuda_graph.leaves.size() == reference_graph.leaves.size());
+    for (size_t i = 0; i < cuda_graph.leaves.size(); ++i) {
+        CHECK(cuda_graph.leaves[i]->type == reference_graph.leaves[i]->type);
+        CHECK(ggml_nbytes(cuda_graph.leaves[i]) == ggml_nbytes(reference_graph.leaves[i]));
+        std::vector<uint8_t> data = cached_fusion_test_data(cuda_graph.leaves[i], i + 31);
+        ggml_backend_tensor_set(cuda_graph.leaves[i], data.data(), 0, data.size());
+        ggml_backend_tensor_set(reference_graph.leaves[i], data.data(), 0, data.size());
+    }
+}
+
+static std::vector<float> run_cached_mmid_path_test(
+        ggml_backend_t cached_backend,
+        ggml_backend_t reference_backend,
+        cached_mmid_path_test_graph & cuda_graph,
+        cached_mmid_path_test_graph & reference_graph,
+        const std::vector<int32_t> & ids) {
+    CHECK(ids.size() == (size_t) ggml_nelements(cuda_graph.ids));
+    ggml_backend_tensor_set(cuda_graph.ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
+    ggml_backend_tensor_set(reference_graph.ids, ids.data(), 0, ids.size() * sizeof(ids[0]));
+    std::vector<uint8_t> output_zero(ggml_nbytes(cuda_graph.output), 0);
+    ggml_backend_tensor_set(cuda_graph.output, output_zero.data(), 0, output_zero.size());
+    ggml_backend_tensor_set(reference_graph.output, output_zero.data(), 0, output_zero.size());
+    CHECK(ggml_backend_graph_compute(reference_backend, reference_graph.graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_backend_graph_compute(cached_backend, cuda_graph.graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(reference_backend);
+    ggml_backend_synchronize(cached_backend);
+
+    std::vector<float> expected(ggml_nelements(reference_graph.output));
+    std::vector<float> actual(ggml_nelements(cuda_graph.output));
+    ggml_backend_tensor_get(reference_graph.output, expected.data(), 0, ggml_nbytes(reference_graph.output));
+    ggml_backend_tensor_get(cuda_graph.output, actual.data(), 0, ggml_nbytes(cuda_graph.output));
+    double squared_error = 0.0;
+    double squared_expected = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+        const double difference = actual[i] - expected[i];
+        squared_error += difference * difference;
+        squared_expected += static_cast<double>(expected[i]) * expected[i];
+    }
+    const double relative_squared_error = squared_error / squared_expected;
+    CHECK(squared_expected > 0.0 && relative_squared_error < 2e-5);
+    return actual;
+}
+
+static void test_cached_mmid_prefill_and_overflow() {
+    ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(0));
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+    CHECK(cuda_backend != nullptr && reference_backend != nullptr);
+    const auto disabled = candidate_snapshot(4, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(cuda_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto cuda_prefill = build_cached_mmid_path_test_graph(
+        cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0, 128, 3, 2);
+    auto reference_prefill = build_cached_mmid_path_test_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(0), GGML_TYPE_Q4_0, 128, 3, 2);
+    initialize_cached_mmid_path_test_graphs(cuda_prefill, reference_prefill);
+    const std::vector<int32_t> mapped_ids = {0, 1, 2, 1, 2, 3};
+    const auto mapped_first = run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_prefill, reference_prefill, mapped_ids);
+    const auto mapped_second = run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_prefill, reference_prefill, mapped_ids);
+    CHECK(mapped_first == mapped_second);
+    (void) run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_prefill, reference_prefill, {0, 1, 2, 3, 4, 5});
+
+    auto cuda_decode = build_cached_mmid_path_test_graph(
+        cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0, 128, 6, 1);
+    auto reference_decode = build_cached_mmid_path_test_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(0), GGML_TYPE_Q4_0, 128, 6, 1);
+    initialize_cached_mmid_path_test_graphs(cuda_decode, reference_decode);
+    (void) run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_decode, reference_decode, {0, 1, 2, 3, 4, 5});
+
+    auto cuda_q4_k = build_cached_mmid_path_test_graph(
+        cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_K, 256, 3, 2);
+    auto reference_q4_k = build_cached_mmid_path_test_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(0), GGML_TYPE_Q4_K, 256, 3, 2);
+    initialize_cached_mmid_path_test_graphs(cuda_q4_k, reference_q4_k);
+    (void) run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_q4_k, reference_q4_k, mapped_ids);
+
+    auto cuda_q4_k_tiny = build_cached_mmid_path_test_graph(
+        cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_K, 64, 3, 2);
+    auto reference_q4_k_tiny = build_cached_mmid_path_test_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(0), GGML_TYPE_Q4_K, 64, 3, 2);
+    initialize_cached_mmid_path_test_graphs(cuda_q4_k_tiny, reference_q4_k_tiny);
+    (void) run_cached_mmid_path_test(
+        cuda_backend.get(), reference_backend.get(), cuda_q4_k_tiny, reference_q4_k_tiny, mapped_ids);
+    fprintf(stderr, "test-moe-cache: cached mapped prefill and overflow OK\n");
 }
 
 struct grouped_decode_fixture {
@@ -1830,6 +2026,83 @@ struct grouped_decode_fixture {
         return tensor;
     }
 };
+
+static void test_owner_legacy_cache(int device) {
+    grouped_decode_fixture fixture(device);
+    ggml_tensor * gate_up = fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+    ggml_tensor * down = fixture.weight(GGML_TYPE_Q4_0, 32, 32);
+    ggml_tensor * gate = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
+    ggml_tensor * up = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
+    ggml_tensor * separate_down = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
+    ggml_set_name(gate_up, "test.owner.ffn_gate_up_exps.weight");
+    ggml_set_name(down, "test.owner.ffn_down_exps.weight");
+    ggml_set_name(gate, "test.owner.ffn_gate_exps.weight");
+    ggml_set_name(up, "test.owner.ffn_up_exps.weight");
+    ggml_set_name(separate_down, "test.owner.separate.ffn_down_exps.weight");
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> separate_banks = {{
+        {gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {separate_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {{
+        {fused_banks.data(), fused_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
+        {separate_banks.data(), separate_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0},
+    }};
+    const auto snapshot = candidate_snapshot(grouped_decode_fixture::N_SLOTS, groups.data(), groups.size());
+
+    ggml_cuda_moe_grouped_context first(ggml_backend_get_device(fixture.backend), device);
+    ggml_cuda_moe_grouped_context second(ggml_backend_get_device(fixture.backend), device);
+    CHECK(first.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(second.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto first_gate = first.acquire_legacy_cache(gate_up);
+    auto second_gate = second.acquire_legacy_cache(gate_up);
+    CHECK(first_gate && second_gate && first_gate.get() != nullptr && second_gate.get() != nullptr);
+    CHECK(first_gate.get() != second_gate.get());
+    CHECK(ggml_cuda_moe_cache_n_slots(first_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
+    const int32_t experts[] = {1, 3};
+    first.prefetch_legacy_siblings(first_gate, experts, 2, true, true);
+    auto first_down = first.acquire_legacy_cache(down);
+    CHECK(first_down && first_down.get() != nullptr && first_down.acquisition().registered_source == 1);
+    uint64_t hits = 0;
+    uint64_t misses = 0;
+    uint64_t evictions = 0;
+    ggml_cuda_moe_cache_stats(first_down.get(), &hits, &misses, &evictions);
+    CHECK(hits == 0 && misses == 2 && evictions == 0);
+
+    auto second_up = second.acquire_legacy_cache(up);
+    CHECK(second_up && second_up.get() != nullptr && second_up.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
+    second.prefetch_legacy_siblings(second_up, experts, 2, true, true);
+    auto second_separate_gate = second.acquire_legacy_cache(gate);
+    auto second_separate_down = second.acquire_legacy_cache(separate_down);
+    CHECK(second_separate_gate && second_separate_down);
+    CHECK(second_separate_gate.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+    CHECK(second_separate_down.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+    ggml_cuda_moe_cache_stats(second_separate_gate.get(), &hits, &misses, &evictions);
+    CHECK(hits == 0 && misses == 2 && evictions == 0);
+    ggml_cuda_moe_cache_stats(second_separate_down.get(), &hits, &misses, &evictions);
+    CHECK(hits == 0 && misses == 2 && evictions == 0);
+
+    ggml_backend_cuda_moe_observe_expert_tensor(gate_up->data, gate_up->name, gate_up->nb[2], gate_up->ne[2]);
+    ggml_backend_cuda_moe_preallocate_pools(device);
+    ggml_cuda_moe_cache_free_all();
+    CHECK(ggml_cuda_moe_cache_n_slots(first_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
+
+    ggml_backend_cuda_moe_log_and_reset_stats();
+    ggml_cuda_moe_cache_stats(first_down.get(), &hits, &misses, &evictions);
+    CHECK(hits == 0 && misses == 0 && evictions == 0);
+    first_down = {};
+    first_gate = {};
+    const auto disabled = candidate_snapshot(grouped_decode_fixture::N_SLOTS, nullptr, 0);
+    CHECK(first.replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(ggml_cuda_moe_cache_n_slots(second_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
+    ggml_backend_cuda_moe_log_and_reset_stats();
+    fprintf(stderr, "test-moe-cache: owner-local legacy cache OK\n");
+}
 
 static ggml_cuda_moe_complete_group_key grouped_decode_key(
         ggml_cuda_moe_grouped_context & registry,
@@ -2419,6 +2692,8 @@ int main(int argc, char ** argv) {
     }
 
     test_cached_mmid_fusion_decline();
+    test_cached_mmid_prefill_and_overflow();
+    test_owner_legacy_cache(dev);
     if (cached_fusion_only) {
         return 0;
     }
@@ -2745,13 +3020,8 @@ int main(int argc, char ** argv) {
     CUDA_OK(cudaStreamDestroy(compute_stream));
     ggml_cuda_moe_cache_free(split_cache);
 
-    auto * registry_cache_a = ggml_cuda_moe_cache_get_or_create_for_tensor(
-        dev, host_experts, SLOT_BYTES, 1, 1, "duplicate.name");
-    auto * registry_cache_b = ggml_cuda_moe_cache_get_or_create_for_tensor(
-        dev, host_experts + N_FLOATS, SLOT_BYTES, 1, 1, "duplicate.name");
-    CHECK(registry_cache_a != nullptr);
-    CHECK(registry_cache_b != nullptr);
-    CHECK(registry_cache_a != registry_cache_b);
+    ggml_backend_cuda_moe_observe_expert_tensor(host_experts, "duplicate.name", SLOT_BYTES, 1);
+    ggml_backend_cuda_moe_preallocate_pools(dev);
     ggml_cuda_moe_cache_free_all();
 
     CUDA_OK(cudaStreamDestroy(copy_stream));

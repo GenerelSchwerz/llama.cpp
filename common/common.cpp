@@ -1415,9 +1415,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 #ifdef GGML_USE_CUDA
     ggml_backend_cuda_moe_set_l2_pinned_cache_size(params.moe_expert_cache_l2_pinned_size);
     ggml_backend_cuda_moe_set_debug_mm(params.experimental_logs);
-    if (params.n_moe_expert_cache_slots > 0) {
-        ggml_backend_cuda_moe_preallocate_pools(/*device=*/0);
-    }
 #endif
 
     set_process_priority(params.cpuparams.priority);
