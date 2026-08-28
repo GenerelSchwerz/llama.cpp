@@ -276,7 +276,7 @@ static void ggml_cuda_flash_attn_ext_mma_quant_switch_head_size(ggml_backend_cud
             ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, type_K, type_V>(ctx, dst);
             break;
         case 512:
-            if constexpr ((type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0) && type_V == type_K) {
+            if constexpr ((type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q5_0 || type_K == GGML_TYPE_Q8_0) && type_V == type_K) {
                 ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 8, 8, type_K, type_V>(ctx, dst);
             } else {
                 GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_applies
@@ -451,7 +451,7 @@ static bool ggml_cuda_fattn_native_applies(
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     const bool supported_head_size = Q->ne[0] == 64 || Q->ne[0] == 128 || Q->ne[0] == 256 ||
-        (Q->ne[0] == 512 && (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0) && V->type == K->type &&
+        (Q->ne[0] == 512 && (K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q8_0) && V->type == K->type &&
          gqa_opt_applies && gqa_ratio > 4 && Q->ne[1] > 4);
     const bool ok = ampere_mma_available(cc) && logit_softcap == 0.0f &&
         ggml_cuda_fattn_mma_quant_pair(K->type, V->type) && supported_head_size &&
