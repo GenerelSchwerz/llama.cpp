@@ -1806,12 +1806,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool allow_cached = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+    if (!allow_cached && tensor->op == GGML_OP_MUL_MAT_ID && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
         return false;
     }
 
@@ -3033,16 +3033,72 @@ static inline void ggml_cuda_moe_shadow_probe(
     ggml_cuda_moe_shadow_probe_registered(*registry, weight, ids, fusion);
 }
 
+static bool ggml_cuda_moe_group_views(
+        const ggml_cuda_moe_graph_group_dispatch & group,
+        const ggml_cuda_moe_graph_binding & binding,
+        const ggml_tensor * weight,
+        ggml_tensor & bank_view,
+        ggml_tensor & ids_view) {
+    if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE || weight == nullptr ||
+            binding.role < GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ||
+            binding.role > GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT ||
+            binding.bank_index >= GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || group.remapped_ids == nullptr) {
+        return false;
+    }
+    if (group.bank_data[binding.bank_index] == nullptr) {
+        return false;
+    }
+    bank_view = *weight;
+    bank_view.data = const_cast<void *>(group.bank_data[binding.bank_index]);
+    bank_view.ne[2] = group.n_slots;
+    bank_view.nb[3] = bank_view.nb[2] * group.n_slots;
+    ids_view = *group.key.ids.tensor;
+    ids_view.data = const_cast<int32_t *>(group.remapped_ids);
+    ids_view.nb[0] = sizeof(int32_t);
+    ids_view.nb[1] = ids_view.ne[0] * sizeof(int32_t);
+    ids_view.nb[2] = ids_view.nb[1] * ids_view.ne[1];
+    ids_view.nb[3] = ids_view.nb[2] * ids_view.ne[2];
+    return true;
+}
+
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
 // through the staging path; everything else goes straight to the regular
 // implementation, preserving existing behavior bit-for-bit.
-static void ggml_cuda_mul_mat_id(
+static bool ggml_cuda_mul_mat_id(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
-        const ggml_cuda_moe_graph_execution * execution) {
+        ggml_cuda_moe_graph_execution * execution) {
     const ggml_tensor * src0 = dst->src[0];
+    ggml_cuda_moe_graph_binding binding;
+    auto * group = execution != nullptr ? execution->find_group(dst, &binding) : nullptr;
 
     ggml_cuda_moe_shadow_probe(ctx, execution, dst, src0, dst->src[2]);
+
+    if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
+        const auto result = ctx.moe_grouped_context->prepare_graph_group(group, binding, dst, ctx.stream());
+        if (result == GGML_CUDA_MOE_GROUPED_DECODE_ERROR) {
+            return false;
+        }
+    }
+    if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+        ggml_tensor bank_view;
+        ggml_tensor ids_view;
+        if (group->stream != ctx.stream() || dst->src[2] != group->key.ids.tensor ||
+                !ggml_cuda_moe_group_views(*group, binding, src0, bank_view, ids_view)) {
+            return false;
+        }
+        ggml_tensor * original_weight = dst->src[0];
+        ggml_tensor * original_ids = dst->src[2];
+        dst->src[0] = &bank_view;
+        dst->src[2] = &ids_view;
+        ggml_cuda_mul_mat_id_impl(ctx, dst, ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]));
+        dst->src[0] = original_weight;
+        dst->src[2] = original_ids;
+        return true;
+    }
+    if (group != nullptr && group->state != GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY) {
+        return false;
+    }
 
     // One-time debug log: whenever the moe-cache flag is on, log the buffer
     // type of the FIRST mul_mat_id op we see, so we can confirm whether the
@@ -3064,16 +3120,19 @@ static void ggml_cuda_mul_mat_id(
     }
 
     if (src0 && src0->buffer && ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
-        ggml_cuda_mul_mat_id_cached(ctx, dst, execution != nullptr ? execution->find_authority(dst) : nullptr);
-        return;
+        const auto * authority = group != nullptr && group->authority ? &group->authority :
+            (execution != nullptr ? execution->find_authority(dst) : nullptr);
+        ggml_cuda_mul_mat_id_cached(ctx, dst, authority);
+        return true;
     }
     ggml_cuda_mul_mat_id_impl(ctx, dst, true);
+    return true;
 }
 
 static bool ggml_cuda_compute_forward(
         ggml_backend_cuda_context & ctx,
         struct ggml_tensor * dst,
-        const ggml_cuda_moe_graph_execution * execution) {
+        ggml_cuda_moe_graph_execution * execution) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3266,7 +3325,9 @@ static bool ggml_cuda_compute_forward(
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
         case GGML_OP_MUL_MAT_ID:
-            ggml_cuda_mul_mat_id(ctx, dst, execution);
+            if (!ggml_cuda_mul_mat_id(ctx, dst, execution)) {
+                return false;
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -4078,6 +4139,12 @@ static int ggml_cuda_get_graph_stream(const ggml_cuda_stream_context & stream_ct
     return stream;
 }
 
+static cudaStream_t ggml_cuda_moe_graph_stream(void * data, const ggml_tensor * node) {
+    auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(data);
+    const int stream = ggml_cuda_get_graph_stream(cuda_ctx->stream_context(), node);
+    return stream >= 0 ? cuda_ctx->stream(cuda_ctx->device, stream) : nullptr;
+}
+
 static bool ggml_cuda_can_fuse_f32_q8_0_cpy_pair(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int node_idx) {
     if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_CPY, GGML_OP_CPY }, { node_idx, node_idx + 1 })) {
         return false;
@@ -4400,7 +4467,7 @@ static int ggml_cuda_try_fuse(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_cgraph * cgraph,
         int i,
-        const ggml_cuda_moe_graph_execution * execution) {
+        ggml_cuda_moe_graph_execution * execution) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -4927,12 +4994,44 @@ static int ggml_cuda_try_fuse(
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            ggml_cuda_moe_graph_binding up_binding;
+            ggml_cuda_moe_graph_binding gate_binding;
+            auto * up_group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(up, &up_binding) : nullptr;
+            auto * gate_group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(gate, &gate_binding) : nullptr;
+            const bool grouped_pair = up_group != nullptr && gate_group == up_group &&
+                (up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED ||
+                    up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, grouped_pair)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
                 ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                if (up_group != nullptr && gate_group == up_group && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
+                    const auto result = cuda_ctx->moe_grouped_context->prepare_graph_group(up_group, up_binding, up, cuda_ctx->stream());
+                    if (result == GGML_CUDA_MOE_GROUPED_DECODE_ERROR) {
+                        return -1;
+                    }
+                }
+                if (up_group != nullptr && gate_group == up_group && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                    ggml_tensor up_view;
+                    ggml_tensor gate_view;
+                    ggml_tensor ids_view;
+                    ggml_tensor gate_ids_view;
+                    if (up->src[2] != up_group->key.ids.tensor || gate->src[2] != up_group->key.ids.tensor ||
+                            up_group->stream != cuda_ctx->stream() ||
+                            !ggml_cuda_moe_group_views(*up_group, up_binding, src0, up_view, ids_view) ||
+                            !ggml_cuda_moe_group_views(*up_group, gate_binding, gate->src[0], gate_view, gate_ids_view) ||
+                            ids_view.data != gate_ids_view.data) {
+                        return -1;
+                    }
+                    fusion_data.gate = &gate_view;
+                    fusion_data.gate_ids = &ids_view;
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &up_view, src1, &ids_view, glu, &fusion_data);
+                    fused_mul_mat_vec = true;
+                    fused_node_count = 3;
+                    break;
+                }
                 if (ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
                     continue;
                 }
@@ -5153,13 +5252,13 @@ static int ggml_cuda_try_fuse(
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(
+static bool ggml_cuda_graph_evaluate_and_capture(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_cgraph * cgraph,
         const bool use_cuda_graph,
         const bool cuda_graph_update_required,
         const void * graph_key,
-        const ggml_cuda_moe_graph_execution * moe_execution) {
+        ggml_cuda_moe_graph_execution * moe_execution) {
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -5301,7 +5400,11 @@ static void ggml_cuda_graph_evaluate_and_capture(
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, moe_execution);
 
-                if (nodes_to_skip != 0) {
+                if (nodes_to_skip < 0) {
+                    GGML_ASSERT(!use_cuda_graph && !cuda_graph_update_required);
+                    return false;
+                }
+                if (nodes_to_skip > 0) {
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -5332,6 +5435,10 @@ static void ggml_cuda_graph_evaluate_and_capture(
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node, moe_execution);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                    if (moe_execution != nullptr && moe_execution->find_group(node, nullptr) != nullptr) {
+                        GGML_ASSERT(!use_cuda_graph && !cuda_graph_update_required);
+                        return false;
+                    }
                 }
                 GGML_ASSERT(ok);
 
@@ -5376,6 +5483,7 @@ static void ggml_cuda_graph_evaluate_and_capture(
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
     }
+    return true;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -5452,8 +5560,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cgraph, cgraph->uid, node_properties_unchanged, &graph->moe_graph_plan, &moe_execution);
     }
     const bool moe_dispatch = moe_execution.size() != 0;
-    if (moe_dispatch && !cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, false)) {
-        return GGML_STATUS_FAILED;
+    if (moe_dispatch) {
+        if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
+            return GGML_STATUS_FAILED;
+        }
+        if (use_cuda_graph && moe_execution.has_stream_grouped_candidate()) {
+            use_cuda_graph = false;
+            cuda_graph_update_required = false;
+        }
+        if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, !use_cuda_graph)) {
+            return GGML_STATUS_FAILED;
+        }
     }
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -5466,9 +5583,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
-    ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
+    const bool graph_evaluated = ggml_cuda_graph_evaluate_and_capture(
+        cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
 
-    if (moe_dispatch && !cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
+    const bool dispatch_finished = !moe_dispatch || cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution);
+    if (!graph_evaluated || !dispatch_finished) {
         return GGML_STATUS_FAILED;
     }
 
