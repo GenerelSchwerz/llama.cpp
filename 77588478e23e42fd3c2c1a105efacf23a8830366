@@ -27,3 +27,16 @@ Qwen single 46950-token prefill: live off 1365.13 tok/s and 14334 MiB sampled pe
 Exact final-logit files and token-ID files are byte-identical between live off/on on current llama/dev composition for both Qwen3.8 27B and Gemma 4 12B. Qwen logits SHA-256 44d6c43f83fbd6ced4480368cfa767de29e262b9b369b51af1f07bf604978342; Gemma e67d9c54138e5c2fb80af48bb8e829c193952d9a63daa839a3428e6a6dcde822.
 
 Gemma unified server lifecycle in one process: startup 7134 MiB, two 21174-token prompt peak 7514, long idle 7480, two replacement five-token prompt peak 7480, short idle 7146. Reserve contracted from kv 65536 (822.27 MiB CUDA + 333.36 MiB host compute) to kv 256 (488.35 + 63.36). Post-idle process recovery was 334 MiB without restart.
+
+Final local validation on rebased compact-mask composition (2026-08-27)
+
+- Current local HEAD before the final ISWA commit: 77588478e23e42fd3c2c1a105efacf23a8830366, based on llama/dev f5ad37ab2e10a8f1c7d5edf88ee1cfafe3b3ea17.
+- The remaining five-file Gemma 4 ISWA/test delta is intentionally uncommitted pending explicit commit approval: 120 insertions, git diff --check clean.
+- Exact current-source release rebuilds succeeded for CPU and CUDA sm_120a. Focused CPU and CUDA ctest selections each passed 4/4: test-phase-aware-workspace, test-live-context-workspace, test-arg-parser, and test-alloc.
+- Qwen 27B live-off/live-on final logits and token IDs compare byte-for-byte. Gemma 4 12B live-off/live-on final logits and token IDs compare byte-for-byte.
+- Correction to earlier wording: generated response content fields were byte-identical across parallel A/B arms; complete JSON responses were not byte-identical because timing metadata differs.
+- Idle cache-retention check, Gemma 4 12B, ctx 131072, b/ub 4096/2048, one non-unified slot, host q8_0 KV, FA on, live-context workspace on: first 21,174-token request processed all 21,174 tokens in 6473.988 ms. After the server became fully idle, an identical request selected the same slot at LCP similarity 1.000, reported cache_n 21,173 and prompt_n 1, and evaluated the one required token in 104.910 ms. Both responses generated the same content. Idle trimming released only transient backend pool mappings; it did not clear KV state.
+- Retained idle KV contributes to the live reserve extent. Workspace can contract to the small bin only after the corresponding long KV state is truncated, replaced, cleared, or evicted. The earlier lifecycle contraction used unrelated short prompts in both slots, which replaced the long contexts; idle trimming itself did not discard them.
+- Parallel two-request measurements, all at ctx 131072, b/ub 4096/2048, host q8_0 KV, FA on: Qwen unified saved about 992 MiB startup, 944 MiB peak, 984 MiB idle with +1.14% combined throughput; Qwen non-unified saved 832/678/718 MiB with -0.14%; Gemma unified saved 652/318/352 MiB with -1.15%; Gemma non-unified saved 380/242/276 MiB with -1.23%.
+- Qwen 46,950-token single prefill saved 392 MiB peak and changed throughput by -0.349%; generated token and normalized stdout matched.
+- PR 40 remains at remote head 4161c9a6a906901ab1f670bd3164d14059c7349b and is DIRTY/CONFLICTING until the rebased local branch plus ISWA delta are committed and pushed with force-with-lease.
