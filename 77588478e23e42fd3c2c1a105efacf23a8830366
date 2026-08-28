@@ -52,3 +52,13 @@ Final local validation on rebased compact-mask composition (2026-08-27)
 - Balanced Gemma 4 12B two-request runs on the cleanup binary measured live mode 1.12% slower with unified KV and 1.00% slower with non-unified KV. Verbose reserve timings attribute nearly all of this to graph-reservation rebuilds at power-of-two live-KV growth boundaries. The mode remains opt-in.
 - CUDA is the tested transient-pool trim backend. HIP and other accelerator builds remain unverified locally.
 - No commit, push, PR update, or PR comment was performed.
+
+2026-08-27 exact cleanup Qwen parallel confirmation
+
+Current cleanup binary, Qwen3.8 27B, ctx 131072, b/ub 4096/2048, two concurrent 15,633-token requests, q8_0 pinned host KV, CUDA FA, cache RAM disabled, no warmup:
+- Unified KV off: startup/peak/idle 14750/14812/14812 MiB, wall 22983 ms.
+- Unified KV live: 13758/13868/13828 MiB, wall 23244 ms. Savings 992/944/984 MiB. This pair is 1.14% slower, opposite the similar-sized improvement in the earlier pair, so the timing effect is noise-sized.
+- Non-unified KV off: 14494/14554/14554 MiB, wall 22027 ms.
+- Non-unified KV live: 13662/13876/13836 MiB, wall 22015 ms. Savings 832/678/718 MiB and 0.05% lower wall time.
+- All eight current responses had identical content SHA-256 359fb84430398915ea7200f019f02bdef620e92697238b0839923051729e9f11.
+- Artifacts: /tmp/live-context-port-20260827/final-cleanup-qwen-parallel.
