@@ -12,6 +12,9 @@
 #include <array>
 #include <memory>
 
+struct ggml_cuda_moe_cache;
+class ggml_cuda_moe_grouped_context;
+
 enum ggml_cuda_moe_candidate_rejection : uint32_t {
     GGML_CUDA_MOE_CANDIDATE_REJECT_NONE = 0,
     GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI,
@@ -115,6 +118,41 @@ struct ggml_cuda_moe_grouped_acquisition {
 struct ggml_cuda_moe_grouped_transaction {
     ggml_cuda_moe_grouped_acquisition acquisition;
     uint64_t transaction_token = 0;
+};
+
+struct ggml_cuda_moe_legacy_acquisition {
+    const void * owner = nullptr;
+    const ggml_tensor * tensor = nullptr;
+    uint64_t candidate_generation = 0;
+    uint64_t authority_epoch = 0;
+    uint32_t group_index = UINT32_MAX;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t n_slots = 0;
+    uint32_t registered_source = 0;
+};
+
+class ggml_cuda_moe_legacy_cache_lease {
+public:
+    ggml_cuda_moe_legacy_cache_lease() noexcept;
+    ~ggml_cuda_moe_legacy_cache_lease();
+
+    ggml_cuda_moe_legacy_cache_lease(ggml_cuda_moe_legacy_cache_lease && other) noexcept;
+    ggml_cuda_moe_legacy_cache_lease & operator=(ggml_cuda_moe_legacy_cache_lease && other) noexcept;
+
+    ggml_cuda_moe_legacy_cache_lease(const ggml_cuda_moe_legacy_cache_lease &) = delete;
+    ggml_cuda_moe_legacy_cache_lease & operator=(const ggml_cuda_moe_legacy_cache_lease &) = delete;
+
+    explicit operator bool() const noexcept;
+    const ggml_cuda_moe_legacy_acquisition & acquisition() const noexcept;
+    ggml_cuda_moe_cache * get() const noexcept;
+
+private:
+    friend class ggml_cuda_moe_grouped_context;
+
+    ggml_cuda_moe_grouped_context * owner_ = nullptr;
+    void * record_ = nullptr;
+    ggml_cuda_moe_cache * cache_ = nullptr;
+    ggml_cuda_moe_legacy_acquisition acquisition_;
 };
 
 struct ggml_cuda_moe_ids_signature {
@@ -291,6 +329,9 @@ public:
     bool end_group_transaction(const ggml_cuda_moe_grouped_transaction & transaction);
     bool get_group_resources(const ggml_cuda_moe_grouped_acquisition & acquisition, ggml_cuda_moe_grouped_resource_info * info) const;
     bool get_group_resource_bank(const ggml_cuda_moe_grouped_transaction & transaction, uint32_t bank_index, ggml_cuda_moe_grouped_bank_descriptor * descriptor) const;
+    ggml_cuda_moe_legacy_cache_lease acquire_legacy_cache(
+            const ggml_tensor * tensor,
+            const ggml_cuda_moe_legacy_acquisition * expected = nullptr);
     void compile_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
@@ -317,8 +358,10 @@ public:
 
 private:
     friend struct ggml_cuda_moe_grouped_context_test_access;
+    friend class ggml_cuda_moe_legacy_cache_lease;
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+    void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
 
     struct impl;
     std::unique_ptr<impl> impl_;

@@ -722,6 +722,183 @@ static void test_candidate_registry(bool benchmark) {
     fprintf(stderr, "test-moe-cache: registry OK\n");
 }
 
+static void test_legacy_owner_leases() {
+    candidate_test_fixture fixture;
+    const int64_t gate_ne[] = {64, 32, 4};
+    const int64_t gate_up_ne[] = {64, 64, 4};
+    const int64_t down_ne[] = {32, 64, 4};
+    ggml_tensor * gate = fixture.tensor(GGML_TYPE_BF16, 3, gate_ne);
+    ggml_tensor * up = fixture.tensor(GGML_TYPE_BF16, 3, gate_ne);
+    ggml_tensor * gate_up = fixture.tensor(GGML_TYPE_BF16, 3, gate_up_ne);
+    ggml_tensor * down = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
+    ggml_tensor * unsupported = fixture.tensor(GGML_TYPE_BF16, 3, gate_up_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    auto snapshot = candidate_snapshot(12, &group, 1);
+
+    auto first = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    ggml_cuda_moe_grouped_context second(&fixture.owner);
+    CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(second.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto first_lease = first->acquire_legacy_cache(gate_up);
+    auto second_lease = second.acquire_legacy_cache(gate_up);
+    CHECK(first_lease && second_lease);
+    CHECK(first_lease.get() == nullptr && second_lease.get() == nullptr);
+    CHECK(first_lease.acquisition().owner != second_lease.acquisition().owner);
+    CHECK(first_lease.acquisition().tensor == gate_up && first_lease.acquisition().candidate_generation == 1);
+    CHECK(first_lease.acquisition().authority_epoch != 0 && first_lease.acquisition().group_index == 0);
+    CHECK(first_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
+    CHECK(first_lease.acquisition().n_slots == 12 && first_lease.acquisition().registered_source == 1);
+    CHECK(!second.acquire_legacy_cache(gate_up, &first_lease.acquisition()));
+
+    auto moved_lease = std::move(first_lease);
+    CHECK(!first_lease && moved_lease && moved_lease.get() == nullptr);
+    const auto stale = moved_lease.acquisition();
+
+    std::atomic<bool> replacement_started{false};
+    std::atomic<bool> replacement_done{false};
+    std::thread replacement_thread([&]() {
+        replacement_started.store(true, std::memory_order_release);
+        CHECK(first->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        replacement_done.store(true, std::memory_order_release);
+    });
+    while (!replacement_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    for (;;) {
+        auto rejected = first->acquire_legacy_cache(gate_up);
+        if (!rejected) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    CHECK(!replacement_done.load(std::memory_order_acquire));
+    moved_lease = {};
+    replacement_thread.join();
+    CHECK(replacement_done.load(std::memory_order_acquire));
+    CHECK(first->state().generation == 2 && second.state().generation == 1);
+    CHECK(!first->acquire_legacy_cache(gate_up, &stale));
+
+    auto current = first->acquire_legacy_cache(gate_up);
+    CHECK(current && current.get() == nullptr);
+    CHECK(current.acquisition().candidate_generation == 2 && current.acquisition().authority_epoch > stale.authority_epoch);
+    auto wrong_generation = current.acquisition();
+    wrong_generation.candidate_generation--;
+    CHECK(!first->acquire_legacy_cache(gate_up, &wrong_generation));
+    auto wrong_epoch = current.acquisition();
+    wrong_epoch.authority_epoch--;
+    CHECK(!first->acquire_legacy_cache(gate_up, &wrong_epoch));
+    current = {};
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> separate_banks = {{
+        {gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 separate_group = {
+        separate_banks.data(), separate_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    auto separate_snapshot = candidate_snapshot(12, &separate_group, 1);
+    CHECK(first->replace(&separate_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto gate_lease = first->acquire_legacy_cache(gate);
+    auto up_lease = first->acquire_legacy_cache(up);
+    auto down_lease = first->acquire_legacy_cache(down);
+    CHECK(gate_lease && up_lease && down_lease);
+    CHECK(gate_lease.get() == nullptr && up_lease.get() == nullptr && down_lease.get() == nullptr);
+    CHECK(gate_lease.acquisition().group_index == 0 && gate_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+    CHECK(up_lease.acquisition().group_index == 0 && up_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
+    CHECK(down_lease.acquisition().group_index == 0 && down_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+    CHECK(gate_lease.acquisition().registered_source == 1 && up_lease.acquisition().registered_source == 1 && down_lease.acquisition().registered_source == 1);
+
+    const auto stale_data = gate_lease.acquisition();
+    gate_lease = {};
+    void * gate_data = gate->data;
+    gate->data = static_cast<uint8_t *>(gate_data) + 1;
+    CHECK(!first->acquire_legacy_cache(gate, &stale_data));
+    CHECK(!first->acquire_legacy_cache(gate));
+    gate->data = gate_data;
+    gate_lease = first->acquire_legacy_cache(gate);
+    CHECK(gate_lease && gate_lease.get() == nullptr);
+    CHECK(gate_lease.acquisition().authority_epoch > stale_data.authority_epoch);
+    gate_lease = {};
+
+    const auto stale_stride = up_lease.acquisition();
+    up_lease = {};
+    const size_t up_stride = up->nb[1];
+    up->nb[1]++;
+    CHECK(!first->acquire_legacy_cache(up, &stale_stride));
+    CHECK(!first->acquire_legacy_cache(up));
+    up->nb[1] = up_stride;
+    up_lease = first->acquire_legacy_cache(up);
+    CHECK(up_lease && up_lease.get() == nullptr);
+    CHECK(up_lease.acquisition().authority_epoch > stale_stride.authority_epoch);
+    up_lease = {};
+    down_lease = {};
+
+    separate_group.flags = 1;
+    separate_snapshot.n_slots = 7;
+    CHECK(first->replace(&separate_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+    separate_group.flags = 0;
+    auto rejected_lease = first->acquire_legacy_cache(gate);
+    CHECK(rejected_lease && rejected_lease.get() == nullptr);
+    CHECK(rejected_lease.acquisition().n_slots == 7 && rejected_lease.acquisition().registered_source == 0);
+    CHECK(rejected_lease.acquisition().group_index == UINT32_MAX);
+    CHECK(rejected_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID);
+    rejected_lease = {};
+
+    auto disabled_snapshot = candidate_snapshot(9, nullptr, 0);
+    CHECK(first->replace(&disabled_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto disabled_lease = first->acquire_legacy_cache(gate);
+    CHECK(disabled_lease && disabled_lease.get() == nullptr);
+    CHECK(disabled_lease.acquisition().n_slots == 9 && disabled_lease.acquisition().registered_source == 0);
+    CHECK(disabled_lease.acquisition().group_index == UINT32_MAX);
+    CHECK(disabled_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID);
+    disabled_lease = {};
+
+    auto unsupported_lease = first->acquire_legacy_cache(unsupported);
+    CHECK(unsupported_lease && unsupported_lease.get() == nullptr);
+    CHECK(unsupported_lease.acquisition().group_index == UINT32_MAX);
+    CHECK(unsupported_lease.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID);
+    CHECK(unsupported_lease.acquisition().registered_source == 0 && unsupported_lease.acquisition().n_slots == 9);
+    unsupported_lease = {};
+    second_lease = {};
+
+    auto terminal = std::make_unique<ggml_cuda_moe_grouped_context>(&fixture.owner);
+    CHECK(terminal->replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto terminal_lease = terminal->acquire_legacy_cache(down);
+    CHECK(terminal_lease && terminal_lease.get() == nullptr);
+    auto * terminal_context = terminal.get();
+    std::atomic<bool> shutdown_started{false};
+    std::atomic<bool> shutdown_done{false};
+    std::thread shutdown_thread([&]() {
+        shutdown_started.store(true, std::memory_order_release);
+        terminal_context->shutdown();
+        shutdown_done.store(true, std::memory_order_release);
+        terminal.reset();
+    });
+    while (!shutdown_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    for (;;) {
+        auto rejected = terminal_context->acquire_legacy_cache(down);
+        if (!rejected) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    CHECK(!shutdown_done.load(std::memory_order_acquire));
+    terminal_lease = {};
+    shutdown_thread.join();
+    CHECK(shutdown_done.load(std::memory_order_acquire));
+
+    fprintf(stderr, "test-moe-cache: legacy owner leases OK\n");
+}
+
 static void test_grouped_context_resources() {
     candidate_test_fixture fixture;
     const int64_t gate_up_ne[] = {64, 64, 4};
@@ -1926,12 +2103,12 @@ static void test_grouped_clock_replacement(int device) {
     for (uint32_t attempt = 0; attempt < 100 && !replacement_done.load(std::memory_order_acquire); ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    const bool replacement_was_async = replacement_done.load(std::memory_order_acquire);
+    const bool replacement_waited = !replacement_done.load(std::memory_order_acquire);
     barrier.released.store(true, std::memory_order_release);
     maintenance.join();
     replace_thread.join();
     CUDA_OK(cudaStreamSynchronize(fixture.stream));
-    CHECK(detached && replacement_was_async && replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(detached && replacement_waited && replacement_result.load(std::memory_order_acquire) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(maintenance_result.load(std::memory_order_acquire) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
     CHECK(fixture.registry->state().generation == 2 && fixture.registry->state().n_slots == 48);
 
@@ -2226,6 +2403,7 @@ int main(int argc, char ** argv) {
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
     test_candidate_producer();
     test_candidate_registry(registry_bench);
+    test_legacy_owner_leases();
     test_grouped_context_resources();
     test_grouped_graph_preflight(registry_bench);
     if (registry_only || registry_bench) {
