@@ -7840,36 +7840,67 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
+    const int expected_native;
+    const bool native_equivalence;
     const bool compact_equivalence;
+    ggml_tensor * route_out = nullptr;
+    ggml_tensor * native_k = nullptr;
+    ggml_tensor * native_v = nullptr;
+    ggml_tensor * native_k_ref = nullptr;
+    ggml_tensor * native_v_ref = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) +
-            " compact_equivalence=" + std::to_string(int(compact_equivalence));
+        std::string result = VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k);
+        if (native_equivalence) {
+            result += " expected_native=" + std::to_string(expected_native);
+        }
+        return result;
     }
 
     std::string op_desc(ggml_tensor * t) override {
+        if (native_equivalence) {
+            return "NATIVE_QUANT_EQUIVALENCE";
+        }
         return compact_equivalence ? "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE" : test_case::op_desc(t);
     }
 
     bool run_whole_graph() override {
-        return compact_equivalence;
+        return native_equivalence || compact_equivalence;
     }
 
     double err(const float * a, const float * b, size_t n) override {
-        if (!compact_equivalence) {
+        if (!native_equivalence && !compact_equivalence) {
             return test_case::err(a, b, n);
         }
 
         GGML_ASSERT(n % 2 == 0);
         const size_t half = n/2;
-        return std::max({
-                nmse(a, b, n),
-                memcmp(a, a + half, half*sizeof(float)) == 0 ? 0.0 : 1.0,
-                memcmp(b, b + half, half*sizeof(float)) == 0 ? 0.0 : 1.0 });
+        const double backend_err = nmse(a, b, n);
+        const bool reference_exact = memcmp(a, a + half, half*sizeof(float)) == 0;
+        if (native_equivalence) {
+            return std::max({backend_err, reference_exact ? 0.0 : 1.0, nmse(b, b + half, half)});
+        }
+        return std::max({backend_err, reference_exact ? 0.0 : 1.0,
+                memcmp(b, b + half, half*sizeof(float)) == 0 ? 0.0 : 1.0});
     }
 
     double max_nmse_err() override {
         return 5e-4;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (!native_equivalence || expected_native < 0 ||
+                strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
+            return test_case::max_err(backend);
+        }
+        GGML_ASSERT(route_out && route_out->buffer);
+        const bool native = ggml_backend_buffer_get_alloc_size(route_out->buffer, route_out) == ggml_nbytes(route_out);
+        if (native != bool(expected_native)) {
+            fprintf(stderr, "unexpected CUDA FlashAttention route: expected native=%d, got native=%d\n", expected_native, int(native));
+            return -1.0;
+        }
+        return test_case::max_err(backend);
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -7882,10 +7913,15 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, bool compact_equivalence = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, int expected_native = -1, bool native_equivalence = false,
+                        bool compact_equivalence = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k),
-          compact_equivalence(compact_equivalence) {}
+          expected_native(expected_native), native_equivalence(native_equivalence), compact_equivalence(compact_equivalence) {
+        GGML_ASSERT(expected_native >= -1 && expected_native <= 1);
+        GGML_ASSERT(!native_equivalence || expected_native >= 0);
+        GGML_ASSERT(!native_equivalence || !compact_equivalence);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7955,7 +7991,20 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
-        if (compact_equivalence) {
+        if (native_equivalence) {
+            route_out = out;
+            native_k = k;
+            native_v = v;
+            native_k_ref = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, k->ne);
+            native_v_ref = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, v->ne);
+            ggml_set_name(native_k_ref, "k_ref");
+            ggml_set_name(native_v_ref, "v_ref");
+
+            ggml_tensor * exact = ggml_flash_attn_ext(ctx, q, native_k_ref, native_v_ref, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+            ggml_flash_attn_ext_add_sinks(exact, s);
+            ggml_flash_attn_ext_set_prec (exact, prec);
+            out = ggml_concat(ctx, out, exact, 3);
+        } else if (compact_equivalence) {
             ggml_tensor * exact = ggml_flash_attn_ext(ctx, q, k, v, m_explicit, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
             ggml_flash_attn_ext_add_sinks(exact, s);
             ggml_flash_attn_ext_set_prec (exact, prec);
@@ -7968,7 +8017,9 @@ struct test_flash_attn_ext : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "s") == 0) {
+            if (t == native_k_ref || t == native_v_ref) {
+                continue;
+            } else if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
             } else if (strcmp(t->name, "m_explicit") == 0) {
@@ -7994,6 +8045,17 @@ struct test_flash_attn_ext : public test_case {
             } else {
                 init_tensor_uniform(t);
             }
+        }
+
+        const auto init_native_ref = [](ggml_tensor * src, ggml_tensor * dst) {
+            std::vector<float> data = tensor_to_float(src);
+            std::vector<ggml_fp16_t> data_f16(data.size());
+            ggml_fp32_to_fp16_row(data.data(), data_f16.data(), data.size());
+            ggml_backend_tensor_set(dst, data_f16.data(), 0, data_f16.size()*sizeof(data_f16[0]));
+        };
+        if (native_equivalence) {
+            init_native_ref(native_k, native_k_ref);
+            init_native_ref(native_v, native_v_ref);
         }
     }
 
@@ -10696,7 +10758,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     const auto add_compact_causal_test = [&](int64_t hs, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, ggml_type type_K, ggml_type type_V) {
         test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, nr23, kv, nb, true, false, 0, 0, GGML_PREC_F32,
-                type_K, type_V, {0, 1, 2, 3}, true, false, true));
+                type_K, type_V, {0, 1, 2, 3}, true, false, -1, false, true));
     };
 
     add_compact_causal_test( 64, {4, 1},   512,   1, GGML_TYPE_F16,  GGML_TYPE_F16);
@@ -10709,6 +10771,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_compact_causal_test(256, {6, 1},   512,  65, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
     add_compact_causal_test(256, {6, 1}, 16384,   1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
     add_compact_causal_test( 64, {4, 1},   512,   2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
+
+    const auto add_native_equivalence = [&](ggml_type type, int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, int expected_native) {
+        test_cases.emplace_back(new test_flash_attn_ext(
+                    hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                    type, type, {0, 1, 2, 3}, true, false, expected_native, true));
+    };
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }) {
+        add_native_equivalence(type, 256, 4, {6, 1}, type == GGML_TYPE_Q5_0 ? 16384 : 512, 65, 1);
+    }
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q8_0 }) {
+        add_native_equivalence(type, 256, 8, { 2, 1}, 1024, 65, 1);
+        add_native_equivalence(type, 512, 1, {16, 1}, 4096, 65, 1);
+    }
+    add_native_equivalence(GGML_TYPE_Q4_0, 256, 4, { 6, 1}, 4096, 65, 0);
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 6, 1}, 1024, 65, 0);
+    add_native_equivalence(GGML_TYPE_Q5_0, 256, 8, { 2, 1}, 1024, 65, 0);
+    add_native_equivalence(GGML_TYPE_Q4_1, 512, 1, {16, 1},  512, 65, 0);
+    add_native_equivalence(GGML_TYPE_Q5_1, 512, 1, {16, 1},  512, 65, 0);
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -11210,7 +11290,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {
