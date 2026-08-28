@@ -1145,7 +1145,9 @@ static bool moe_candidate_original_direct_down_scale_consumer(
         const ggml_tensor * producer,
         const ggml_tensor * ids,
         const moe_candidate_group_record & group,
-        uint32_t * bank_index) {
+        uint32_t * bank_index,
+        const ggml_tensor ** auxiliary_nodes,
+        uint32_t * auxiliary_node_indices) {
     if (consumer == nullptr || producer == nullptr || ids == nullptr || consumer->op != GGML_OP_MUL ||
             consumer->src[0] != producer || group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
         return false;
@@ -1178,10 +1180,56 @@ static bool moe_candidate_original_direct_down_scale_consumer(
                 bank.info.type == GGML_TYPE_F32 && bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN &&
                 reshape->ne[1] == bank.ne[0] && moe_candidate_record_matches(bank, reshape->src[0])) {
             *bank_index = i;
+            auxiliary_nodes[0] = reshape;
+            auxiliary_nodes[1] = repeat;
+            auxiliary_nodes[2] = rows;
+            auxiliary_node_indices[0] = reshape_node_index;
+            auxiliary_node_indices[1] = repeat_node_index;
+            auxiliary_node_indices[2] = rows_node_index;
             return true;
         }
     }
     return false;
+}
+
+static bool moe_candidate_original_direct_down_scale_witness_matches(
+        const ggml_cgraph * cgraph,
+        uint32_t consumer_node_index,
+        const ggml_tensor * consumer,
+        const ggml_tensor * producer,
+        const ggml_tensor * ids,
+        const moe_candidate_group_record & group,
+        uint32_t bank_index,
+        const ggml_tensor * const * auxiliary_nodes,
+        const uint32_t * auxiliary_node_indices) {
+    if (cgraph == nullptr || consumer == nullptr || producer == nullptr || ids == nullptr ||
+            consumer->op != GGML_OP_MUL || consumer->src[0] != producer || group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ||
+            bank_index >= group.banks.size() || auxiliary_node_indices[0] >= auxiliary_node_indices[1] ||
+            auxiliary_node_indices[1] >= auxiliary_node_indices[2] || auxiliary_node_indices[2] >= consumer_node_index ||
+            consumer_node_index >= static_cast<uint32_t>(cgraph->n_nodes)) {
+        return false;
+    }
+    for (uint32_t i = 0; i < 3; ++i) {
+        if (auxiliary_node_indices[i] >= static_cast<uint32_t>(cgraph->n_nodes) ||
+                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), auxiliary_node_indices[i]) != auxiliary_nodes[i]) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * reshape = auxiliary_nodes[0];
+    const ggml_tensor * repeat = auxiliary_nodes[1];
+    const ggml_tensor * rows = auxiliary_nodes[2];
+    const auto & bank = group.banks[bank_index];
+    return reshape != nullptr && reshape->op == GGML_OP_RESHAPE && reshape->src[0] != nullptr &&
+        repeat != nullptr && repeat->op == GGML_OP_REPEAT && repeat->src[0] == reshape &&
+        rows != nullptr && rows->op == GGML_OP_GET_ROWS && rows->src[0] == repeat && rows->src[1] == ids && consumer->src[1] == rows &&
+        rows->type == GGML_TYPE_F32 && reshape->ne[0] == 1 && reshape->ne[1] > 0 && reshape->ne[2] == 1 && reshape->ne[3] == 1 &&
+        repeat->ne[0] == 1 && repeat->ne[1] == reshape->ne[1] && repeat->ne[2] == producer->ne[2] && repeat->ne[3] == 1 &&
+        bank.info.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE &&
+        bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE &&
+        bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT && bank.info.type == GGML_TYPE_F32 &&
+        bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN && reshape->ne[1] == bank.ne[0] &&
+        moe_candidate_record_matches(bank, reshape->src[0]);
 }
 
 static bool moe_candidate_validate_route(
@@ -4406,8 +4454,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 const auto & consumer = reader.consumers[consumer_index];
                 if (moe_candidate_auxiliary_consumer(consumer.node, reader.output.tensor, reader.ids.tensor)) {
                     uint32_t bank_index = 0;
-                    if (moe_candidate_original_direct_down_scale_consumer(
-                            cgraph, consumer.node_index, consumer.node, reader.output.tensor, reader.ids.tensor, group, &bank_index)) {
+                    if (reader.n_auxiliary_nodes == 0 && moe_candidate_original_direct_down_scale_consumer(
+                            cgraph, consumer.node_index, consumer.node, reader.output.tensor, reader.ids.tensor, group, &bank_index,
+                            reader.auxiliary_nodes, reader.auxiliary_node_indices)) {
+                        reader.auxiliary_bank_index = bank_index;
+                        reader.auxiliary_consumer_index = consumer_index;
+                        reader.n_auxiliary_nodes = 3;
                         observation.bank_readers[bank_index]++;
                     } else {
                         observation.auxiliary = true;
@@ -4609,10 +4661,11 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                 return false;
             }
             if (moe_candidate_auxiliary_consumer(current, node, ids)) {
-                uint32_t bank_index = 0;
-                if (moe_candidate_original_direct_down_scale_consumer(
-                        cgraph, consumer.node_index, current, node, ids, group, &bank_index)) {
-                    bank_readers[bank_index]++;
+                if (reader.n_auxiliary_nodes == 3 && reader.auxiliary_consumer_index == consumer_index &&
+                        moe_candidate_original_direct_down_scale_witness_matches(
+                            cgraph, consumer.node_index, current, node, ids, group, reader.auxiliary_bank_index,
+                            reader.auxiliary_nodes, reader.auxiliary_node_indices)) {
+                    bank_readers[reader.auxiliary_bank_index]++;
                 } else {
                     auxiliary = true;
                 }

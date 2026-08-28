@@ -388,11 +388,16 @@ private:
         ggml_cuda_moe_ids_signature activation;
         ggml_cuda_moe_ids_signature ids;
         consumer_witness consumers[MAX_READER_CONSUMERS];
+        const ggml_tensor * auxiliary_nodes[3];
         int32_t use_count;
         uint32_t node_index;
         uint32_t role;
         uint32_t bank_index;
         uint32_t n_consumers;
+        uint32_t auxiliary_node_indices[3];
+        uint32_t auxiliary_bank_index;
+        uint32_t auxiliary_consumer_index;
+        uint32_t n_auxiliary_nodes;
     };
 
     struct use_witness {

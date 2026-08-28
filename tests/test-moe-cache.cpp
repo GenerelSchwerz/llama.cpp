@@ -2669,6 +2669,9 @@ struct active_grouped_dispatch_graph {
     ggml_tensor * up_output = nullptr;
     ggml_tensor * down_output = nullptr;
     ggml_tensor * down_scale = nullptr;
+    ggml_tensor * down_scale_reshape = nullptr;
+    ggml_tensor * down_scale_repeat = nullptr;
+    ggml_tensor * down_scale_rows = nullptr;
     ggml_tensor * output = nullptr;
     std::vector<ggml_tensor *> banks;
     std::vector<ggml_tensor *> readers;
@@ -2745,10 +2748,10 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
     result.readers.push_back(result.down_output);
     result.output = result.down_output;
     if (result.down_scale != nullptr) {
-        ggml_tensor * scale = ggml_reshape_3d(result.nodes.get(), result.down_scale, 1, N_EXPERTS, 1);
-        scale = ggml_repeat_4d(result.nodes.get(), scale, 1, N_EXPERTS, 1, 1);
-        scale = ggml_get_rows(result.nodes.get(), scale, result.ids);
-        result.output = ggml_mul(result.nodes.get(), result.down_output, scale);
+        result.down_scale_reshape = ggml_reshape_3d(result.nodes.get(), result.down_scale, 1, N_EXPERTS, 1);
+        result.down_scale_repeat = ggml_repeat_4d(result.nodes.get(), result.down_scale_reshape, 1, N_EXPERTS, 1, 1);
+        result.down_scale_rows = ggml_get_rows(result.nodes.get(), result.down_scale_repeat, result.ids);
+        result.output = ggml_mul(result.nodes.get(), result.down_output, result.down_scale_rows);
     }
     ggml_set_name(result.output, "test.active.output");
     result.graph = ggml_new_graph_custom(result.nodes.get(), 64, false);
@@ -2938,6 +2941,33 @@ static void check_active_grouped_contract(
     CHECK(context->prepare_graph_execution(graph.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, &plan, &execution) ==
         GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
     CHECK(execution.size() == 1);
+    if (graph.down_scale != nullptr) {
+        ggml_cuda_moe_graph_execution unknown;
+        CHECK(context->bind_graph_plan(graph.graph, 802, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *plan, &unknown));
+        CHECK(unknown.find_group(graph.down_output, nullptr) != nullptr);
+
+        ggml_tensor * saved_scale = graph.down_scale_reshape->src[0];
+        graph.down_scale_reshape->src[0] = graph.input;
+        CHECK(!context->bind_graph_plan(graph.graph, 803, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *plan, &unknown));
+        graph.down_scale_reshape->src[0] = saved_scale;
+
+        for (ggml_tensor * auxiliary : {graph.down_scale_reshape, graph.down_scale_repeat, graph.down_scale_rows}) {
+            int32_t node_index = -1;
+            for (int32_t i = 0; i < ggml_graph_n_nodes(graph.graph); ++i) {
+                if (ggml_graph_node(graph.graph, i) == auxiliary) {
+                    node_index = i;
+                    break;
+                }
+            }
+            CHECK(node_index >= 0);
+            ggml_tensor * saved_node = graph.graph->nodes[node_index];
+            graph.graph->nodes[node_index] = graph.output;
+            CHECK(!context->bind_graph_plan(graph.graph, 804, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *plan, &unknown));
+            graph.graph->nodes[node_index] = saved_node;
+        }
+        CHECK(context->bind_graph_plan(graph.graph, 805, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, *plan, &unknown));
+        CHECK(unknown.find_group(graph.down_output, nullptr) != nullptr);
+    }
     cudaStream_t stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     CHECK(execution.resolve_streams(candidate_test_graph_stream, stream));
