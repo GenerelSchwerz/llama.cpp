@@ -428,6 +428,13 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
 
+        if (cparams.live_context_workspace && hparams.no_alloc) {
+            cparams.live_context_workspace = false;
+        } else if (cparams.live_context_workspace && (!memory || memory->get_attn_reserve_capacity() == 0)) {
+            LLAMA_LOG_WARN("%s: live-context workspace sizing unsupported; using full-context reserve\n", __func__);
+            cparams.live_context_workspace = false;
+        }
+
         if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
             if (memory && memory->get_supports_partial_kv()) {
                 cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
@@ -531,9 +538,7 @@ llama_context::~llama_context() {
 
             const size_t size_exp = backend_buf_exp_size[i];
             const size_t size_act = ggml_backend_sched_get_buffer_size(sched.get(), backend);
-            const bool live_context_workspace = cparams.live_context_workspace && memory &&
-                    memory->get_attn_reserve_capacity() > 0;
-            if (cparams.phase_aware_workspace || live_context_workspace) {
+            if (cparams.phase_aware_workspace || cparams.live_context_workspace) {
                 LLAMA_LOG_DEBUG("%s: %10s resizable compute backing size is %8.4f MiB (last observed %8.4f MiB)\n",
                         __func__, ggml_backend_buft_name(buft),
                         size_act / (1024.0*1024.0), size_exp / (1024.0*1024.0));
@@ -686,7 +691,7 @@ static uint32_t llama_workspace_kv_growth_bound(uint32_t required, uint32_t capa
 
     uint32_t result = std::min(256u, capacity);
     while (result < required) {
-        result = uint32_t(std::min<uint64_t>(capacity, uint64_t(result)*2));
+        result = uint32_t(std::min<uint64_t>(capacity, uint64_t(result) * 2));
     }
     return result;
 }
@@ -700,17 +705,24 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
             std::max(cparams.n_seq_max, sched_decode_outputs));
     plan.n_tokens = plan.n_tokens_max;
 
-    if (cparams.live_context_workspace && !model.hparams.no_alloc && memory) {
+    if (cparams.live_context_workspace) {
+        GGML_ASSERT(memory);
         plan.n_kv_capacity = memory->get_attn_reserve_capacity();
-        plan.live_kv = plan.n_kv_capacity > 0;
+        GGML_ASSERT(plan.n_kv_capacity > 0);
+        plan.live_kv = true;
     }
 
     if (plan.live_kv) {
-        const uint32_t required = n_kv_req > 0 ? n_kv_req :
-                sched_reserved_kv > 0 ? sched_reserved_kv : std::min(256u, plan.n_kv_capacity);
+        uint32_t required = n_kv_req;
+        if (required == 0) {
+            required = sched_reserved_kv;
+        }
+        if (required == 0) {
+            required = std::min(256u, plan.n_kv_capacity);
+        }
         plan.n_kv = llama_workspace_kv_growth_bound(required, plan.n_kv_capacity);
 
-        if (sched_reserved_kv > plan.n_kv && plan.n_kv >= sched_reserved_kv/2) {
+        if (sched_reserved_kv > plan.n_kv && plan.n_kv >= sched_reserved_kv / 2) {
             plan.n_kv = sched_reserved_kv;
         }
     }
@@ -1039,9 +1051,7 @@ void llama_context::synchronize() {
 }
 
 uint64_t llama_context::trim_transient_memory() {
-    const bool live_context_workspace = cparams.live_context_workspace && memory &&
-            memory->get_attn_reserve_capacity() > 0 && !model.hparams.no_alloc;
-    if (!live_context_workspace) {
+    if (!cparams.live_context_workspace) {
         return 0;
     }
 
@@ -1163,10 +1173,6 @@ bool llama_context::recurrent_sparse_snapshots_supported() const {
     return memory && memory->recurrent_sparse_snapshots_supported() && recurrent_sparse_snapshot_ops_supported;
 }
 
-bool llama_context::memory_update(bool optimize) {
-    return memory_update(optimize, 0);
-}
-
 bool llama_context::memory_update(bool optimize, uint32_t n_tokens_req) {
     if (!memory) {
         return false;
@@ -1208,9 +1214,7 @@ bool llama_context::memory_update(bool optimize, uint32_t n_tokens_req) {
 
     // if the memory module did any computation, we have to reserve a new worst-case graph
     {
-        const uint32_t n_kv_capacity = memory->get_attn_reserve_capacity();
-        const bool live_kv = cparams.live_context_workspace && !model.hparams.no_alloc &&
-                n_kv_capacity > 0 && sched_reserved_kv > 0;
+        const bool live_kv = cparams.live_context_workspace && sched_reserved_kv > 0;
         const auto mctx = live_kv ? memory->init_reserve(sched_reserved_kv) : memory->init_full();
         if (!mctx) {
             throw std::runtime_error("failed to initialize memory context");
@@ -2121,8 +2125,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     output_swaps.clear();
 
-    const bool live_exact_batch_plan = cparams.live_context_workspace && memory &&
-            memory->get_attn_reserve_capacity() > 0 && !model.hparams.no_alloc;
+    const bool live_exact_batch_plan = cparams.live_context_workspace;
 
     if (!live_exact_batch_plan) {
         try {
@@ -2141,11 +2144,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // handle any pending shifts/copies
     try {
-        if (live_exact_batch_plan) {
-            memory_update(false, n_tokens_all);
-        } else {
-            memory_update(false);
-        }
+        memory_update(false, live_exact_batch_plan ? n_tokens_all : 0);
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to update memory: %s\n", __func__, err.what());
         return -2;
@@ -2176,8 +2175,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
                         bool optimized;
                         try {
-                            optimized = live_exact_batch_plan ?
-                                    memory_update(true, n_tokens_all) : memory_update(true);
+                            optimized = memory_update(true, live_exact_batch_plan ? n_tokens_all : 0);
                         } catch (const std::exception & err) {
                             LLAMA_LOG_ERROR("%s: failed to optimize memory: %s\n", __func__, err.what());
                             return -2;

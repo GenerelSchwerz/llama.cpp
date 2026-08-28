@@ -1277,8 +1277,8 @@ private:
                     const uint64_t draft_released = llama_trim_transient_memory(ctx_dft);
                     if (target_released + draft_released > 0) {
                         SRV_TRC("trimmed transient backend pools: target %.2f MiB, draft %.2f MiB\n",
-                                target_released/1024.0/1024.0,
-                                draft_released/1024.0/1024.0);
+                                target_released / 1024.0 / 1024.0,
+                                draft_released / 1024.0 / 1024.0);
                     }
                 }
             };

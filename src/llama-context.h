@@ -91,8 +91,7 @@ struct llama_context {
     bool recurrent_sparse_snapshots_supported() const;
 
     // return true if the memory was updated
-    bool memory_update(bool optimize);
-    bool memory_update(bool optimize, uint32_t n_tokens_req);
+    bool memory_update(bool optimize, uint32_t n_tokens_req = 0);
 
     enum llama_pooling_type pooling_type() const;
 

@@ -133,6 +133,14 @@ llama_memory_context_ptr llama_memory_hybrid_iswa::init_full() {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_iswa::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_iswa_context>(this, mem_attn->init_reserve(n_kv));
+}
+
+uint32_t llama_memory_hybrid_iswa::get_attn_reserve_capacity() const {
+    return mem_attn->get_attn_reserve_capacity();
+}
+
 llama_memory_context_ptr llama_memory_hybrid_iswa::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_iswa_context>(this, lctx, optimize);
 }
@@ -225,6 +233,14 @@ llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(llama_memory_
 }
 
 llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
+              llama_memory_hybrid_iswa * mem,
+        llama_memory_context_ptr          ctx_attn) :
+    ctx_attn(std::move(ctx_attn)),
+    ctx_recr(mem->get_mem_recr()->init_full()),
+    status(llama_memory_status_combine(this->ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_iswa_context::llama_memory_hybrid_iswa_context(
         llama_memory_hybrid_iswa * mem,
                    llama_context * lctx,
                             bool   optimize) :
@@ -276,6 +292,10 @@ llama_memory_status llama_memory_hybrid_iswa_context::get_status() const {
 const llama_ubatch & llama_memory_hybrid_iswa_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];
+}
+
+uint32_t llama_memory_hybrid_iswa_context::get_attn_reserve_n_kv() const {
+    return ctx_attn->get_attn_reserve_n_kv();
 }
 
 const llama_kv_cache_iswa_context * llama_memory_hybrid_iswa_context::get_attn() const {

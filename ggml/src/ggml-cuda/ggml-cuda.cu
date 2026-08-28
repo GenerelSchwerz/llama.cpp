@@ -705,7 +705,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
         const size_t released = pool_size;
         pool_size = 0;
 #else
-        const size_t keep_size = granularity*((pool_used + granularity - 1)/granularity);
+        const size_t keep_size = granularity * ((pool_used + granularity - 1) / granularity);
         if (keep_size >= pool_size) {
             return 0;
         }
