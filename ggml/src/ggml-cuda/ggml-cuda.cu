@@ -713,6 +713,8 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
+    delete moe_candidate_registry;
+
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
@@ -6804,6 +6806,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME) == 0) {
+        return (void *)ggml_backend_cuda_moe_candidate_replace_v1;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;

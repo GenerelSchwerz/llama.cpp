@@ -1,12 +1,95 @@
 #pragma once
 
-// Pure host-side API: only depends on the CUDA runtime headers for
-// cudaStream_t. Do NOT include common.cuh here -- it is full of device-side
-// code (__device__, __shfl_*, threadIdx, ...) that only nvcc can compile,
-// which would prevent .cpp consumers (e.g. tests) from including this header.
+// Keep this header usable by host C++ consumers.
 #include <cuda_runtime.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#ifdef __cplusplus
+
+#include "ggml-backend.h"
+
+#include <memory>
+
+enum ggml_cuda_moe_candidate_rejection : uint32_t {
+    GGML_CUDA_MOE_CANDIDATE_REJECT_NONE = 0,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_ROLE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_ROLE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INACCESSIBLE_SOURCE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION,
+    GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED,
+};
+
+enum ggml_cuda_moe_candidate_encoding : uint32_t {
+    GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN = 0,
+    GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND,
+};
+
+enum ggml_cuda_moe_candidate_movement : uint32_t {
+    GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND = 0,
+    GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE,
+};
+
+enum ggml_cuda_moe_candidate_index_mode : uint32_t {
+    GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT     = 1u << 0,
+    GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT   = 1u << 1,
+    GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP = 1u << 2,
+};
+
+struct ggml_cuda_moe_candidate_registry_state {
+    uint64_t generation = 0;
+    uint64_t logical_signature = 0;
+    uint64_t slot_bound_bytes = 0;
+    uint64_t permanent_candidate_bytes = 0;
+    uint32_t n_slots = 0;
+    uint32_t n_groups = 0;
+    uint32_t n_weights = 0;
+    uint32_t accepted = 0;
+    ggml_cuda_moe_candidate_rejection rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+};
+
+struct ggml_cuda_moe_candidate_bank_info {
+    uint64_t generation = 0;
+    uint64_t byte_extent = 0;
+    uint64_t expert_stride = 0;
+    uint32_t group_index = 0;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t type = GGML_TYPE_COUNT;
+    uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
+    uint32_t movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
+    uint32_t index_modes = 0;
+};
+
+class ggml_cuda_moe_candidate_registry {
+public:
+    explicit ggml_cuda_moe_candidate_registry(ggml_backend_dev_t owner);
+    ~ggml_cuda_moe_candidate_registry();
+
+    ggml_cuda_moe_candidate_registry(const ggml_cuda_moe_candidate_registry &) = delete;
+    ggml_cuda_moe_candidate_registry & operator=(const ggml_cuda_moe_candidate_registry &) = delete;
+
+    int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
+    ggml_cuda_moe_candidate_registry_state state() const;
+    bool find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const;
+    bool find_weight(const ggml_tensor * tensor, ggml_cuda_moe_candidate_bank_info * info) const;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> impl_;
+};
+
+#endif
 
 // MoE expert cache: keeps a fixed-size GPU slot pool of expert weight slabs
 // while cold experts live in CPU pinned memory. On routing miss the slab is
@@ -34,6 +117,10 @@ extern "C" {
 #endif
 
 struct ggml_cuda_moe_cache;
+
+int32_t ggml_backend_cuda_moe_candidate_replace_v1(
+    ggml_backend_t backend,
+    const struct ggml_backend_moe_candidate_snapshot_v1 * snapshot);
 
 // Create a cache for one device.
 //   slot_size_bytes : size of one expert weight slab (uniform across slots)

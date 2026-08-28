@@ -16,10 +16,12 @@
 // locality than this, so a passing test here is a lower bound.
 
 #include "../ggml/src/ggml-cuda/moe-cache.cuh"
+#include "../ggml/src/ggml-backend-impl.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -78,8 +80,244 @@ static void CUDART_CB wait_on_host_barrier(void * data) {
     }
 }
 
+static bool candidate_test_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t) {
+    return *static_cast<const bool *>(dev->context);
+}
+
+struct candidate_test_fixture {
+    static constexpr size_t BUFFER_SIZE = 1024 * 1024;
+
+    bool supports_buft = true;
+    ggml_backend_device owner = {};
+    ggml_context * ctx = nullptr;
+    void * storage = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    size_t next_offset = 0;
+
+    candidate_test_fixture() {
+        owner.context = &supports_buft;
+        owner.iface.supports_buft = candidate_test_supports_buft;
+        CHECK(posix_memalign(&storage, 64, BUFFER_SIZE) == 0);
+        memset(storage, 0, BUFFER_SIZE);
+        buffer = ggml_backend_cpu_buffer_from_ptr(storage, BUFFER_SIZE);
+        CHECK(buffer != nullptr);
+        ggml_init_params params = {};
+        params.mem_size = 64 * ggml_tensor_overhead();
+        params.no_alloc = true;
+        ctx = ggml_init(params);
+        CHECK(ctx != nullptr);
+    }
+
+    ~candidate_test_fixture() {
+        ggml_free(ctx);
+        ggml_backend_buffer_free(buffer);
+        free(storage);
+    }
+
+    ggml_tensor * tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
+        ggml_tensor * result = ggml_new_tensor(ctx, type, n_dims, ne);
+        const size_t alignment = ggml_backend_buffer_get_alignment(buffer);
+        next_offset = (next_offset + alignment - 1) / alignment * alignment;
+        CHECK(next_offset + ggml_nbytes(result) <= BUFFER_SIZE);
+        result->buffer = buffer;
+        result->data = static_cast<uint8_t *>(storage) + next_offset;
+        next_offset += ggml_nbytes(result);
+        return result;
+    }
+};
+
+static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
+        uint32_t n_slots,
+        const ggml_backend_moe_candidate_group_v1 * groups,
+        uint32_t n_groups) {
+    ggml_backend_moe_candidate_snapshot_v1 result = {};
+    result.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+    result.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    result.struct_size = sizeof(result);
+    result.n_slots = n_slots;
+    result.groups = groups;
+    result.n_groups = n_groups;
+    return result;
+}
+
+static void test_candidate_registry() {
+    candidate_test_fixture fixture;
+    ggml_cuda_moe_candidate_registry registry(&fixture.owner);
+
+    const int64_t gate_ne[] = {64, 32, 4};
+    const int64_t down_ne[] = {32, 64, 4};
+    const int64_t scale_ne[] = {4};
+    const int64_t bias_ne[] = {64, 4};
+    ggml_tensor * gate = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    ggml_tensor * up = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    ggml_tensor * down = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * down_scale = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    ggml_tensor * down_bias = fixture.tensor(GGML_TYPE_F32, 2, bias_ne);
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 5> banks = {{
+        {gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        {down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0},
+        {down_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0};
+    auto snapshot = candidate_snapshot(12, &group, 1);
+
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto state = registry.state();
+    CHECK(state.accepted == 1 && state.generation == 1 && state.n_slots == 12);
+    CHECK(state.n_groups == 1 && state.n_weights == 3 && state.rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE);
+    CHECK(state.slot_bound_bytes == 12 * (gate->nb[2] + up->nb[2] + down->nb[2]));
+    CHECK(state.permanent_candidate_bytes == ggml_nbytes(down_scale) + ggml_nbytes(down_bias));
+    const uint64_t logical_signature = state.logical_signature;
+
+    uint32_t group_index = UINT32_MAX;
+    CHECK(registry.find_down_group(down, &group_index) && group_index == 0);
+    CHECK(!registry.find_down_group(gate, nullptr));
+    ggml_cuda_moe_candidate_bank_info info;
+    CHECK(registry.find_weight(gate, &info));
+    CHECK(info.generation == 1 && info.group_index == 0 && info.type == GGML_TYPE_Q4_0);
+    CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+    CHECK(info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND);
+    CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+    CHECK(!registry.find_weight(down_scale, nullptr));
+
+    snapshot.n_slots = 48;
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    state = registry.state();
+    CHECK(state.generation == 2 && state.n_slots == 48 && state.logical_signature == logical_signature);
+    CHECK(state.slot_bound_bytes == 48 * (gate->nb[2] + up->nb[2] + down->nb[2]));
+    snapshot.n_slots = 12;
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    state = registry.state();
+    CHECK(state.generation == 3 && state.n_slots == 12 && state.logical_signature == logical_signature);
+
+    auto expect_rejected = [&](ggml_cuda_moe_candidate_rejection rejection) {
+        const uint64_t generation = registry.state().generation;
+        CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+        const auto rejected = registry.state();
+        CHECK(rejected.generation == generation + 1 && rejected.accepted == 0 && rejected.n_groups == 0);
+        CHECK(rejected.rejection == rejection && !registry.find_weight(gate, nullptr));
+    };
+
+    group.flags = 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS);
+    group.flags = 0;
+    group.reserved = 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS);
+    group.reserved = 0;
+    banks[0].reserved = 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS);
+    banks[0].reserved = 0;
+    snapshot.flags = 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS);
+    snapshot.flags = 0;
+    snapshot.reserved[0] = 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS);
+    snapshot.reserved[0] = 0;
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    auto bad_banks = banks;
+    bad_banks[1].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+    group.banks = bad_banks.data();
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_ROLE);
+    bad_banks = banks;
+    bad_banks[1].tensor = gate;
+    group.banks = bad_banks.data();
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR);
+    group.banks = banks.data();
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    void * down_data = down->data;
+    down->data = static_cast<uint8_t *>(fixture.storage) + candidate_test_fixture::BUFFER_SIZE - 64;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS);
+    down->data = down_data;
+
+    const size_t down_stride = down->nb[2];
+    down->nb[2] += 64;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE);
+    down->nb[2] = down_stride;
+
+    const int64_t q4k_ne[] = {256, 32, 4};
+    ggml_tensor * q4k = fixture.tensor(GGML_TYPE_Q4_K, 3, q4k_ne);
+    bad_banks = banks;
+    bad_banks[0].tensor = q4k;
+    group.banks = bad_banks.data();
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
+
+    group.banks = banks.data();
+    group.n_banks = 2;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT);
+    group.n_banks = banks.size();
+
+    ggml_tensor * block_scale = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 6> block_banks;
+    std::copy(banks.begin(), banks.end(), block_banks.begin());
+    block_banks[5] = {block_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BLOCK_SCALE, 0};
+    group.banks = block_banks.data();
+    group.n_banks = block_banks.size();
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_ROLE);
+    group.banks = banks.data();
+    group.n_banks = banks.size();
+
+    snapshot.n_groups = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS + 1;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT);
+    snapshot.n_groups = 1;
+    fixture.supports_buft = false;
+    expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INACCESSIBLE_SOURCE);
+    fixture.supports_buft = true;
+
+    snapshot.magic = 0;
+    const uint64_t generation = registry.state().generation;
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
+    state = registry.state();
+    CHECK(state.generation == generation + 1 && state.accepted == 0 && state.rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI);
+    snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+
+    const int64_t fused_ne[] = {64, 64, 4};
+    ggml_tensor * gate_up_bf16 = fixture.tensor(GGML_TYPE_BF16, 3, fused_ne);
+    ggml_tensor * down_bf16 = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_banks = {{
+        {gate_up_bf16, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down_bf16, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 fused_group = {fused_banks.data(), fused_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0};
+    snapshot = candidate_snapshot(12, &fused_group, 1);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.find_weight(gate_up_bf16, &info) && info.type == GGML_TYPE_BF16);
+    CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT | GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+
+    const int64_t nvfp4_ne[] = {64, 64, 4};
+    ggml_tensor * gate_nvfp4 = fixture.tensor(GGML_TYPE_NVFP4, 3, nvfp4_ne);
+    ggml_tensor * up_nvfp4 = fixture.tensor(GGML_TYPE_NVFP4, 3, nvfp4_ne);
+    ggml_tensor * down_nvfp4 = fixture.tensor(GGML_TYPE_NVFP4, 3, nvfp4_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> nvfp4_banks = {{
+        {gate_nvfp4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up_nvfp4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down_nvfp4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 nvfp4_group = {nvfp4_banks.data(), nvfp4_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0};
+    snapshot = candidate_snapshot(12, &nvfp4_group, 1);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.find_weight(gate_nvfp4, &info));
+    CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND);
+    CHECK(info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT);
+
+    ggml_cuda_moe_candidate_registry other_registry(&fixture.owner);
+    snapshot.n_slots = 48;
+    CHECK(other_registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(other_registry.state().generation == 1 && other_registry.state().n_slots == 48);
+    CHECK(registry.state().n_slots == 12 && registry.state().generation > 1);
+
+    fprintf(stderr, "test-moe-cache: registry OK\n");
+}
+
 int main(int argc, char ** argv) {
-    (void)argc; (void)argv;
+    test_candidate_registry();
+    if (argc == 2 && strcmp(argv[1], "--registry-only") == 0) {
+        return 0;
+    }
 
     // Toy parameters. Small enough to run in a few ms on any CUDA device,
     // large enough that LRU has work to do.

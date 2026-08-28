@@ -40,10 +40,12 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <new>
 #include <sstream>
 #include <string>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -678,6 +680,560 @@ struct moe_cache_tensor_decode_stats {
 };
 
 } // namespace
+
+namespace {
+
+struct moe_candidate_bank_record {
+    ggml_cuda_moe_candidate_bank_info info;
+    const ggml_tensor * tensor = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_buffer_type_t buft = nullptr;
+    const void * buffer_base = nullptr;
+    uint64_t buffer_size = 0;
+    const void * data = nullptr;
+    uint64_t data_offset = 0;
+    uint64_t alignment = 0;
+    int64_t ne[GGML_MAX_DIMS] = {};
+    size_t nb[GGML_MAX_DIMS] = {};
+};
+
+struct moe_candidate_group_record {
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    const ggml_tensor * down = nullptr;
+    std::vector<moe_candidate_bank_record> banks;
+};
+
+struct moe_candidate_reverse_entry {
+    uint32_t group_index;
+    uint32_t bank_index;
+};
+
+struct moe_candidate_table {
+    uint32_t n_slots = 0;
+    uint64_t logical_signature = 0;
+    uint64_t slot_bound_bytes = 0;
+    uint64_t permanent_candidate_bytes = 0;
+    std::vector<moe_candidate_group_record> groups;
+    std::unordered_map<const ggml_tensor *, uint32_t> down_map;
+    std::unordered_map<const ggml_tensor *, moe_candidate_reverse_entry> reverse_map;
+};
+
+static bool moe_candidate_add(uint64_t a, uint64_t b, uint64_t & result) {
+    if (a > UINT64_MAX - b) {
+        return false;
+    }
+    result = a + b;
+    return true;
+}
+
+static bool moe_candidate_mul(uint64_t a, uint64_t b, uint64_t & result) {
+    if (a != 0 && b > UINT64_MAX / a) {
+        return false;
+    }
+    result = a * b;
+    return true;
+}
+
+static void moe_candidate_hash_bytes(uint64_t & hash, const void * data, size_t size) {
+    const uint8_t * bytes = static_cast<const uint8_t *>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+}
+
+template<typename T>
+static void moe_candidate_hash_value(uint64_t & hash, const T & value) {
+    moe_candidate_hash_bytes(hash, &value, sizeof(value));
+}
+
+static bool moe_candidate_is_scale(uint32_t role) {
+    return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE &&
+        role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE;
+}
+
+static bool moe_candidate_is_block_scale(uint32_t role) {
+    return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BLOCK_SCALE &&
+        role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BLOCK_SCALE;
+}
+
+static bool moe_candidate_is_bias(uint32_t role) {
+    return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS &&
+        role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS;
+}
+
+static uint32_t moe_candidate_base_role(uint32_t role) {
+    if (moe_candidate_is_scale(role)) {
+        return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT +
+            role - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE;
+    }
+    if (moe_candidate_is_block_scale(role)) {
+        return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT +
+            role - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BLOCK_SCALE;
+    }
+    if (moe_candidate_is_bias(role)) {
+        return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT +
+            role - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
+    }
+    return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_source(
+        ggml_backend_dev_t owner,
+        const ggml_tensor * tensor,
+        uint64_t byte_extent,
+        moe_candidate_bank_record & record) {
+    if (tensor == nullptr || tensor->buffer == nullptr || tensor->data == nullptr || tensor->view_src != nullptr || tensor->op != GGML_OP_NONE) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR;
+    }
+
+    ggml_backend_buffer_t buffer = tensor->buffer;
+    ggml_backend_buffer_type_t buft = buffer->buft;
+    if (owner == nullptr || buft == nullptr || owner->iface.supports_buft == nullptr || !ggml_backend_dev_supports_buft(owner, buft)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INACCESSIBLE_SOURCE;
+    }
+    if (buffer->size == 0 || buffer->iface.get_base == nullptr || buft->iface.get_alignment == nullptr) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS;
+    }
+
+    const void * base_ptr = buffer->iface.get_base(buffer);
+    const size_t alignment = buft->iface.get_alignment(buft);
+    if (base_ptr == nullptr || alignment == 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS;
+    }
+
+    const uintptr_t base = reinterpret_cast<uintptr_t>(base_ptr);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(tensor->data);
+    if (data < base || data % alignment != 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS;
+    }
+
+    const uint64_t offset = data - base;
+    if (offset > buffer->size || byte_extent > buffer->size - offset) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_BOUNDS;
+    }
+
+    record.buffer = buffer;
+    record.buft = buft;
+    record.buffer_base = base_ptr;
+    record.buffer_size = buffer->size;
+    record.tensor = tensor;
+    record.data = tensor->data;
+    record.data_offset = offset;
+    record.alignment = alignment;
+    record.info.byte_extent = byte_extent;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        record.ne[i] = tensor->ne[i];
+        record.nb[i] = tensor->nb[i];
+    }
+    return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
+        ggml_backend_dev_t owner,
+        const ggml_tensor * tensor,
+        uint32_t role,
+        uint32_t group_index,
+        moe_candidate_bank_record & record) {
+    if (tensor == nullptr || ggml_n_dims(tensor) != 3 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] != 1) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR;
+    }
+
+    uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
+    uint32_t index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT |
+        GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP;
+    switch (tensor->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_BF16:
+            break;
+        case GGML_TYPE_NVFP4:
+            encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND;
+            index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT;
+            break;
+        default:
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE;
+    }
+
+    const int64_t block_size = ggml_blck_size(tensor->type);
+    if (block_size <= 0 || tensor->ne[0] % block_size != 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+    }
+    uint64_t row_bytes = 0;
+    uint64_t expert_bytes = 0;
+    uint64_t byte_extent = 0;
+    if (!moe_candidate_mul(ggml_type_size(tensor->type), tensor->ne[0] / block_size, row_bytes) ||
+            !moe_candidate_mul(row_bytes, tensor->ne[1], expert_bytes) ||
+            !moe_candidate_mul(expert_bytes, tensor->ne[2], byte_extent)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
+    }
+    if (tensor->nb[0] != ggml_type_size(tensor->type) || tensor->nb[1] != row_bytes ||
+            tensor->nb[2] != expert_bytes || tensor->nb[3] != byte_extent) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+    }
+
+    record.info.group_index = group_index;
+    record.info.role = role;
+    record.info.type = tensor->type;
+    record.info.encoding = encoding;
+    record.info.movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
+    record.info.index_modes = index_modes;
+    record.info.expert_stride = tensor->nb[2];
+    return moe_candidate_source(owner, tensor, byte_extent, record);
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_aux(
+        ggml_backend_dev_t owner,
+        const ggml_tensor * tensor,
+        const ggml_tensor * weight,
+        uint32_t role,
+        uint32_t group_index,
+        moe_candidate_bank_record & record) {
+    if (tensor == nullptr || weight == nullptr || tensor->type != GGML_TYPE_F32 || tensor->ne[0] <= 0 || tensor->ne[1] <= 0 || tensor->ne[2] <= 0 || tensor->ne[3] <= 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE;
+    }
+    if (moe_candidate_is_block_scale(role)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_ROLE;
+    }
+
+    uint64_t row_bytes = 0;
+    if (!moe_candidate_mul(ggml_type_size(tensor->type), tensor->ne[0], row_bytes)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
+    }
+    if (tensor->nb[0] != ggml_type_size(tensor->type) || tensor->nb[1] != row_bytes) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+    }
+    uint64_t byte_extent = 0;
+    if (moe_candidate_is_scale(role)) {
+        if (ggml_n_dims(tensor) != 1 || tensor->ne[0] != weight->ne[2] || tensor->ne[1] != 1 || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+                tensor->nb[2] != row_bytes || tensor->nb[3] != row_bytes) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+        }
+        byte_extent = row_bytes;
+    } else if (moe_candidate_is_bias(role)) {
+        if (!moe_candidate_mul(row_bytes, tensor->ne[1], byte_extent)) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
+        }
+        if (ggml_n_dims(tensor) != 2 || tensor->ne[0] != weight->ne[1] || tensor->ne[1] != weight->ne[2] || tensor->ne[2] != 1 || tensor->ne[3] != 1 ||
+                tensor->nb[2] != byte_extent || tensor->nb[3] != byte_extent) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+        }
+    } else {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
+    }
+
+    record.info.group_index = group_index;
+    record.info.role = role;
+    record.info.type = tensor->type;
+    record.info.encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
+    record.info.movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE;
+    record.info.index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT;
+    return moe_candidate_source(owner, tensor, byte_extent, record);
+}
+
+static void moe_candidate_hash_bank(uint64_t & hash, const moe_candidate_bank_record & bank) {
+    const uintptr_t tensor = reinterpret_cast<uintptr_t>(bank.tensor);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(bank.data);
+    const uintptr_t buffer = reinterpret_cast<uintptr_t>(bank.buffer);
+    const uintptr_t buft = reinterpret_cast<uintptr_t>(bank.buft);
+    const uintptr_t buffer_base = reinterpret_cast<uintptr_t>(bank.buffer_base);
+    moe_candidate_hash_value(hash, tensor);
+    moe_candidate_hash_value(hash, data);
+    moe_candidate_hash_value(hash, buffer);
+    moe_candidate_hash_value(hash, buft);
+    moe_candidate_hash_value(hash, buffer_base);
+    moe_candidate_hash_value(hash, bank.buffer_size);
+    moe_candidate_hash_value(hash, bank.info.role);
+    moe_candidate_hash_value(hash, bank.info.type);
+    moe_candidate_hash_value(hash, bank.info.encoding);
+    moe_candidate_hash_value(hash, bank.info.movement);
+    moe_candidate_hash_value(hash, bank.info.index_modes);
+    moe_candidate_hash_value(hash, bank.data_offset);
+    moe_candidate_hash_value(hash, bank.info.byte_extent);
+    moe_candidate_hash_value(hash, bank.info.expert_stride);
+    moe_candidate_hash_value(hash, bank.alignment);
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        moe_candidate_hash_value(hash, bank.ne[i]);
+        moe_candidate_hash_value(hash, bank.nb[i]);
+    }
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_group(
+        ggml_backend_dev_t owner,
+        const ggml_backend_moe_candidate_group_v1 & input,
+        uint32_t group_index,
+        uint32_t n_slots,
+        std::unordered_set<const ggml_tensor *> & tensors,
+        moe_candidate_table & table) {
+    if (input.flags != GGML_BACKEND_MOE_CANDIDATE_GROUP_FLAG_NONE || input.reserved != 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS;
+    }
+    if (input.n_banks == 0 || input.n_banks > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || input.banks == nullptr) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT;
+    }
+
+    const ggml_backend_moe_candidate_bank_v1 * by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT] = {};
+    for (uint32_t i = 0; i < input.n_banks; ++i) {
+        const auto & bank = input.banks[i];
+        if (bank.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID || bank.role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
+        }
+        if (bank.reserved != 0) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS;
+        }
+        if (by_role[bank.role] != nullptr) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_ROLE;
+        }
+        if (bank.tensor == nullptr || !tensors.insert(bank.tensor).second) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR;
+        }
+        by_role[bank.role] = &bank;
+    }
+
+    const bool has_gate = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT] != nullptr;
+    const bool has_up = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT] != nullptr;
+    const bool has_gate_up = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT] != nullptr;
+    const bool has_down = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT] != nullptr;
+    if ((input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && (!has_gate || !has_up || has_gate_up || !has_down)) ||
+            (input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && (has_gate || has_up || !has_gate_up || !has_down)) ||
+            (input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT;
+    }
+
+    moe_candidate_group_record group;
+    group.layout = input.layout;
+    group.banks.reserve(input.n_banks);
+    const ggml_tensor * weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT] = {};
+
+    for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT; role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
+        if (by_role[role] == nullptr) {
+            continue;
+        }
+        moe_candidate_bank_record record;
+        const auto rejection = moe_candidate_weight(owner, by_role[role]->tensor, role, group_index, record);
+        if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            return rejection;
+        }
+        weights[role] = by_role[role]->tensor;
+        group.banks.push_back(record);
+    }
+
+    const ggml_tensor * down = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT];
+    if (input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE) {
+        const ggml_tensor * gate = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT];
+        const ggml_tensor * up = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT];
+        if (gate->ne[0] != up->ne[0] || gate->ne[1] != up->ne[1] || gate->ne[2] != up->ne[2] ||
+                down->ne[0] != gate->ne[1] || down->ne[1] != gate->ne[0] || down->ne[2] != gate->ne[2]) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+        }
+    } else {
+        const ggml_tensor * gate_up = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT];
+        uint64_t doubled_down = 0;
+        if (!moe_candidate_mul(down->ne[0], 2, doubled_down) || gate_up->ne[0] != down->ne[1] ||
+                static_cast<uint64_t>(gate_up->ne[1]) != doubled_down || gate_up->ne[2] != down->ne[2]) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+        }
+    }
+
+    for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE; role < GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT; ++role) {
+        if (by_role[role] == nullptr) {
+            continue;
+        }
+        const uint32_t base_role = moe_candidate_base_role(role);
+        if (base_role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID || weights[base_role] == nullptr) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
+        }
+        moe_candidate_bank_record record;
+        const auto rejection = moe_candidate_aux(owner, by_role[role]->tensor, weights[base_role], role, group_index, record);
+        if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            return rejection;
+        }
+        group.banks.push_back(record);
+    }
+
+    uint64_t group_hash = UINT64_C(1469598103934665603);
+    moe_candidate_hash_value(group_hash, group.layout);
+    const uint32_t n_banks = group.banks.size();
+    moe_candidate_hash_value(group_hash, n_banks);
+    for (uint32_t bank_index = 0; bank_index < group.banks.size(); ++bank_index) {
+        auto & bank = group.banks[bank_index];
+        moe_candidate_hash_bank(group_hash, bank);
+        if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
+            uint64_t bytes = 0;
+            if (!moe_candidate_mul(bank.info.expert_stride, n_slots, bytes) ||
+                    !moe_candidate_add(table.slot_bound_bytes, bytes, table.slot_bound_bytes)) {
+                return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
+            }
+            const auto inserted = table.reverse_map.emplace(by_role[bank.info.role]->tensor, moe_candidate_reverse_entry{group_index, bank_index});
+            if (!inserted.second) {
+                return GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR;
+            }
+        } else if (!moe_candidate_add(table.permanent_candidate_bytes, bank.info.byte_extent, table.permanent_candidate_bytes)) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
+        }
+    }
+
+    group.down = down;
+    if (!table.down_map.emplace(down, group_index).second) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR;
+    }
+    moe_candidate_hash_value(table.logical_signature, group_hash);
+    table.groups.push_back(std::move(group));
+    return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_build(
+        ggml_backend_dev_t owner,
+        const ggml_backend_moe_candidate_snapshot_v1 & snapshot,
+        moe_candidate_table & table) {
+    if (snapshot.flags != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_FLAG_NONE || snapshot.reserved[0] != 0 || snapshot.reserved[1] != 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS;
+    }
+    if (snapshot.n_groups > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || (snapshot.n_groups > 0 && snapshot.groups == nullptr)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT;
+    }
+
+    table.n_slots = snapshot.n_slots;
+    table.logical_signature = UINT64_C(1469598103934665603);
+    moe_candidate_hash_value(table.logical_signature, snapshot.n_groups);
+    table.groups.reserve(snapshot.n_groups);
+    table.down_map.reserve(snapshot.n_groups);
+    table.reverse_map.reserve(snapshot.n_groups * 3);
+    std::unordered_set<const ggml_tensor *> tensors;
+    tensors.reserve(snapshot.n_groups * 4);
+    for (uint32_t i = 0; i < snapshot.n_groups; ++i) {
+        const auto rejection = moe_candidate_group(owner, snapshot.groups[i], i, snapshot.n_slots, tensors, table);
+        if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            return rejection;
+        }
+    }
+    return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+}
+
+} // namespace
+
+struct ggml_cuda_moe_candidate_registry::impl {
+    explicit impl(ggml_backend_dev_t owner) : owner(owner) {}
+
+    ggml_backend_dev_t owner;
+    mutable std::mutex mutex;
+    ggml_cuda_moe_candidate_registry_state state;
+    moe_candidate_table table;
+};
+
+ggml_cuda_moe_candidate_registry::ggml_cuda_moe_candidate_registry(ggml_backend_dev_t owner) :
+    impl_(std::make_unique<impl>(owner)) {
+}
+
+ggml_cuda_moe_candidate_registry::~ggml_cuda_moe_candidate_registry() = default;
+
+int32_t ggml_cuda_moe_candidate_registry::replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot) {
+    auto publish_failure = [&](ggml_cuda_moe_candidate_rejection rejection, uint32_t n_slots, int32_t result) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->table = {};
+        if (impl_->state.generation == UINT64_MAX) {
+            impl_->state = {};
+            impl_->state.generation = UINT64_MAX;
+            impl_->state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
+            return static_cast<int32_t>(GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+        }
+        const uint64_t generation = impl_->state.generation + 1;
+        impl_->state = {};
+        impl_->state.generation = generation;
+        impl_->state.n_slots = n_slots;
+        impl_->state.rejection = rejection;
+        return result;
+    };
+
+    if (snapshot == nullptr) {
+        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT);
+    }
+    if (snapshot->magic != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC ||
+            snapshot->abi_version != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION ||
+            snapshot->struct_size != sizeof(*snapshot)) {
+        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
+    }
+
+    try {
+        moe_candidate_table table;
+        const auto rejection = moe_candidate_build(impl_->owner, *snapshot, table);
+        if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            return publish_failure(rejection, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+        }
+
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->state.generation == UINT64_MAX) {
+            impl_->table = {};
+            impl_->state.accepted = 0;
+            impl_->state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
+            return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+        }
+        const uint64_t generation = impl_->state.generation + 1;
+        impl_->table = std::move(table);
+        impl_->state = {};
+        impl_->state.generation = generation;
+        impl_->state.logical_signature = impl_->table.logical_signature;
+        impl_->state.slot_bound_bytes = impl_->table.slot_bound_bytes;
+        impl_->state.permanent_candidate_bytes = impl_->table.permanent_candidate_bytes;
+        impl_->state.n_slots = impl_->table.n_slots;
+        impl_->state.n_groups = impl_->table.groups.size();
+        impl_->state.n_weights = impl_->table.reverse_map.size();
+        impl_->state.accepted = 1;
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED;
+    } catch (const std::bad_alloc &) {
+        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+    } catch (...) {
+        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+    }
+}
+
+ggml_cuda_moe_candidate_registry_state ggml_cuda_moe_candidate_registry::state() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->state;
+}
+
+bool ggml_cuda_moe_candidate_registry::find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->table.down_map.find(tensor);
+    if (!impl_->state.accepted || it == impl_->table.down_map.end()) {
+        return false;
+    }
+    if (group_index != nullptr) {
+        *group_index = it->second;
+    }
+    return true;
+}
+
+bool ggml_cuda_moe_candidate_registry::find_weight(const ggml_tensor * tensor, ggml_cuda_moe_candidate_bank_info * info) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto it = impl_->table.reverse_map.find(tensor);
+    if (!impl_->state.accepted || it == impl_->table.reverse_map.end()) {
+        return false;
+    }
+    if (info != nullptr) {
+        *info = impl_->table.groups[it->second.group_index].banks[it->second.bank_index].info;
+        info->generation = impl_->state.generation;
+    }
+    return true;
+}
+
+extern "C"
+int32_t ggml_backend_cuda_moe_candidate_replace_v1(
+        ggml_backend_t backend,
+        const ggml_backend_moe_candidate_snapshot_v1 * snapshot) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || backend->device == nullptr) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT;
+    }
+
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    try {
+        std::call_once(ctx->moe_candidate_registry_once, [&]() {
+            ctx->moe_candidate_registry = new ggml_cuda_moe_candidate_registry(backend->device);
+        });
+    } catch (...) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+    }
+    return ctx->moe_candidate_registry->replace(snapshot);
+}
 
 struct ggml_cuda_moe_cache {
     int      device;
