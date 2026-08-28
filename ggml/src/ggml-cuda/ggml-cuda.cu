@@ -3215,11 +3215,54 @@ static bool ggml_cuda_mul_mat_vec_q_cached_fused(
     return true;
 }
 
+static void ggml_cuda_moe_shadow_probe_registered(
+        ggml_cuda_moe_candidate_registry & registry,
+        const ggml_tensor * weight,
+        const ggml_tensor * ids,
+        const ggml_cuda_mm_fusion_args_host * fusion) {
+    ggml_cuda_moe_candidate_probe_input input = {};
+    input.n_banks = fusion != nullptr && fusion->gate != nullptr ? 2 : 1;
+    input.exact_auxiliaries = fusion != nullptr &&
+        (fusion->x_scale != nullptr || fusion->gate_scale != nullptr || fusion->x_bias != nullptr || fusion->gate_bias != nullptr);
+    input.banks[0] = {
+        weight,
+        ids,
+        fusion != nullptr ? fusion->x_scale : nullptr,
+        fusion != nullptr ? fusion->x_bias : nullptr,
+        static_cast<uint32_t>(input.n_banks == 2 ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID),
+    };
+    if (input.n_banks == 2) {
+        input.banks[1] = {
+            fusion->gate,
+            fusion->gate_ids != nullptr ? fusion->gate_ids : ids,
+            fusion->gate_scale,
+            fusion->gate_bias,
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
+        };
+    }
+    (void) registry.probe(input, nullptr);
+}
+
+static inline void ggml_cuda_moe_shadow_probe(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * weight,
+        const ggml_tensor * ids,
+        const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+        bool is_mmid = true) {
+    auto * registry = ctx.moe_candidate_registry;
+    if (registry == nullptr || !is_mmid) {
+        return;
+    }
+    ggml_cuda_moe_shadow_probe_registered(*registry, weight, ids, fusion);
+}
+
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
 // through the staging path; everything else goes straight to the regular
 // implementation, preserving existing behavior bit-for-bit.
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
+
+    ggml_cuda_moe_shadow_probe(ctx, src0, dst->src[2]);
 
     // One-time debug log: whenever the moe-cache flag is on, log the buffer
     // type of the FIRST mul_mat_id op we see, so we can confirm whether the
@@ -4993,6 +5036,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
                 if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                    ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data);
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -5048,6 +5092,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -5061,6 +5106,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate_bias = gate_bias_tensor;
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -5087,6 +5133,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
@@ -5098,6 +5145,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
 
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 const bool is_cached = ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft);
                 if (is_cached) {
                     if (!ggml_cuda_mul_mat_vec_q_cached_fused(*cuda_ctx, src0, src1, ids, gate->src[0], glu, fusion_data)) {
@@ -5193,6 +5241,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             fusion_data.x_scale = scale;
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+                ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
@@ -5251,6 +5300,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {
+            ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
@@ -5258,6 +5308,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            ggml_cuda_moe_shadow_probe(*cuda_ctx, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
