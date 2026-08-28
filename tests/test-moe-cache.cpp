@@ -140,7 +140,7 @@ static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
     return result;
 }
 
-static void test_candidate_registry() {
+static void test_candidate_registry(bool benchmark) {
     candidate_test_fixture fixture;
     ggml_cuda_moe_candidate_registry registry(&fixture.owner);
 
@@ -148,11 +148,14 @@ static void test_candidate_registry() {
     const int64_t down_ne[] = {32, 64, 4};
     const int64_t scale_ne[] = {4};
     const int64_t bias_ne[] = {64, 4};
+    const int64_t ids_ne[] = {2, 1, 1};
     ggml_tensor * gate = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
     ggml_tensor * up = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
     ggml_tensor * down = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
     ggml_tensor * down_scale = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
     ggml_tensor * down_bias = fixture.tensor(GGML_TYPE_F32, 2, bias_ne);
+    ggml_tensor * ids = fixture.tensor(GGML_TYPE_I32, 3, ids_ne);
+    ggml_tensor * other_ids = fixture.tensor(GGML_TYPE_I32, 3, ids_ne);
 
     std::array<ggml_backend_moe_candidate_bank_v1, 5> banks = {{
         {gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
@@ -192,6 +195,37 @@ static void test_candidate_registry() {
     CHECK(info.tensor == down_bias && info.source_data == down_bias->data && info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE);
     CHECK(!registry.get_bank(group_key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, nullptr));
 
+    ggml_cuda_moe_candidate_probe_input probe = {};
+    ggml_cuda_moe_candidate_probe_result probe_result;
+    probe.n_banks = 1;
+    probe.banks[0].weight = gate;
+    probe.banks[0].ids = ids;
+    CHECK(registry.probe(probe, &probe_result));
+    CHECK(probe_result.key.generation == 1 && probe_result.key.group_index == 0 && probe_result.roles[0] == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+
+    probe = {};
+    probe.n_banks = 2;
+    probe.exact_auxiliaries = 1;
+    probe.banks[0] = {up, ids, nullptr, nullptr, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT};
+    probe.banks[1] = {gate, ids, nullptr, nullptr, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT};
+    CHECK(registry.probe(probe, &probe_result));
+    probe.banks[1].ids = other_ids;
+    CHECK(!registry.probe(probe, nullptr));
+    probe.banks[1].ids = ids;
+    ggml_tensor copied_gate = *gate;
+    probe.banks[1].weight = &copied_gate;
+    CHECK(!registry.probe(probe, nullptr));
+
+    probe = {};
+    probe.n_banks = 1;
+    probe.exact_auxiliaries = 1;
+    probe.banks[0] = {down, ids, down_scale, down_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT};
+    CHECK(registry.probe(probe, &probe_result));
+    probe.banks[0].bias = nullptr;
+    CHECK(!registry.probe(probe, nullptr));
+    probe.banks[0].bias = down_bias;
+    probe.expected_generation = probe_result.key.generation;
+
     snapshot.n_slots = 48;
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     state = registry.state();
@@ -200,6 +234,9 @@ static void test_candidate_registry() {
     CHECK(!registry.get_group(group_key, nullptr) && !registry.get_bank(group_key, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, nullptr));
     CHECK(registry.find_down_group_key(down, &group_key) && group_key.generation == 2);
     CHECK(registry.get_group(group_key, &group_info) && group_info.n_slots == 48);
+    CHECK(!registry.probe(probe, nullptr));
+    probe.expected_generation = 0;
+    CHECK(registry.probe(probe, &probe_result) && probe_result.key.generation == 2);
     snapshot.n_slots = 12;
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     state = registry.state();
@@ -317,6 +354,32 @@ static void test_candidate_registry() {
     CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND);
     CHECK(info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT);
 
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {group, nvfp4_group};
+    snapshot = candidate_snapshot(12, groups.data(), groups.size());
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    probe = {};
+    probe.n_banks = 2;
+    probe.exact_auxiliaries = 1;
+    probe.banks[0] = {up, ids, nullptr, nullptr, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT};
+    probe.banks[1] = {gate_nvfp4, ids, nullptr, nullptr, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT};
+    CHECK(!registry.probe(probe, nullptr));
+
+    probe = {};
+    probe.n_banks = 1;
+    probe.banks[0].weight = gate_nvfp4;
+    probe.banks[0].ids = ids;
+    if (benchmark) {
+        constexpr uint32_t n_probes = 200000;
+        uint32_t n_matches = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < n_probes; ++i) {
+            n_matches += registry.probe(probe, nullptr) ? 1 : 0;
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();
+        CHECK(n_matches == n_probes);
+        fprintf(stderr, "test-moe-cache: registered shadow %.1f ns/probe\n", static_cast<double>(elapsed) / n_probes);
+    }
+
     ggml_cuda_moe_candidate_registry other_registry(&fixture.owner);
     snapshot.n_slots = 48;
     CHECK(other_registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -327,8 +390,10 @@ static void test_candidate_registry() {
 }
 
 int main(int argc, char ** argv) {
-    test_candidate_registry();
-    if (argc == 2 && strcmp(argv[1], "--registry-only") == 0) {
+    const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
+    const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
+    test_candidate_registry(registry_bench);
+    if (registry_only || registry_bench) {
         return 0;
     }
 

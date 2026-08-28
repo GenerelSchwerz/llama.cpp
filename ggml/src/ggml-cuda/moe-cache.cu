@@ -827,6 +827,50 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_source(
     return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
 }
 
+static bool moe_candidate_record_matches(const moe_candidate_bank_record & record, const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor != record.info.tensor || tensor->buffer != record.buffer || tensor->data != record.info.source_data ||
+            tensor->view_src != nullptr || tensor->op != GGML_OP_NONE || tensor->type != record.info.type) {
+        return false;
+    }
+    if (record.buffer->buft != record.buft || record.buffer->size != record.buffer_size || record.buffer->iface.get_base == nullptr ||
+            record.buft->iface.get_alignment == nullptr || record.buffer->iface.get_base(record.buffer) != record.buffer_base ||
+            record.buft->iface.get_alignment(record.buft) != record.alignment) {
+        return false;
+    }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(record.buffer_base);
+    const uintptr_t data = reinterpret_cast<uintptr_t>(tensor->data);
+    if (data < base || data - base != record.data_offset || record.info.byte_extent > record.buffer_size - record.data_offset) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (tensor->ne[i] != record.ne[i] || tensor->nb[i] != record.nb[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const moe_candidate_bank_record * moe_candidate_find_role(const moe_candidate_group_record & group, uint32_t role) {
+    for (const auto & bank : group.banks) {
+        if (bank.info.role == role) {
+            return &bank;
+        }
+    }
+    return nullptr;
+}
+
+static bool moe_candidate_ids_valid(const ggml_tensor * ids) {
+    if (ids == nullptr || ids->type != GGML_TYPE_I32 || ids->buffer == nullptr || ids->data == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (ids->ne[i] <= 0 || ids->nb[i] == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
         ggml_backend_dev_t owner,
         const ggml_tensor * tensor,
@@ -1264,6 +1308,76 @@ bool ggml_cuda_moe_candidate_registry::get_bank(
         }
     }
     return false;
+}
+
+bool ggml_cuda_moe_candidate_registry::probe(
+        const ggml_cuda_moe_candidate_probe_input & input,
+        ggml_cuda_moe_candidate_probe_result * result) const {
+    if (result != nullptr) {
+        *result = {};
+    }
+    if (input.n_banks == 0 || input.n_banks > 2 || input.exact_auxiliaries > 1) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (!impl_->state.accepted || (input.expected_generation != 0 && input.expected_generation != impl_->state.generation)) {
+        return false;
+    }
+
+    uint32_t group_index = UINT32_MAX;
+    uint32_t roles[2] = {};
+    for (uint32_t i = 0; i < input.n_banks; ++i) {
+        const auto & observed = input.banks[i];
+        if (!moe_candidate_ids_valid(observed.ids) || (i > 0 && observed.ids != input.banks[0].ids) ||
+                (i > 0 && observed.weight == input.banks[0].weight)) {
+            return false;
+        }
+        const auto reverse = impl_->table.reverse_map.find(observed.weight);
+        if (reverse == impl_->table.reverse_map.end()) {
+            return false;
+        }
+        const auto & entry = reverse->second;
+        const auto & record = impl_->table.groups[entry.group_index].banks[entry.bank_index];
+        if (!moe_candidate_record_matches(record, observed.weight) ||
+                (observed.expected_role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID && observed.expected_role != record.info.role) ||
+                (i > 0 && entry.group_index != group_index)) {
+            return false;
+        }
+        group_index = entry.group_index;
+        roles[i] = record.info.role;
+    }
+    if (input.n_banks == 2 && roles[0] == roles[1]) {
+        return false;
+    }
+
+    const auto & group = impl_->table.groups[group_index];
+    for (uint32_t i = 0; i < input.n_banks; ++i) {
+        const auto & observed = input.banks[i];
+        if (!input.exact_auxiliaries) {
+            if (observed.scale != nullptr || observed.bias != nullptr) {
+                return false;
+            }
+            continue;
+        }
+        const uint32_t scale_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE + roles[i] - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+        const uint32_t bias_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS + roles[i] - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+        const auto * scale = moe_candidate_find_role(group, scale_role);
+        const auto * bias = moe_candidate_find_role(group, bias_role);
+        if ((scale == nullptr) != (observed.scale == nullptr) || (bias == nullptr) != (observed.bias == nullptr) ||
+                (scale != nullptr && !moe_candidate_record_matches(*scale, observed.scale)) ||
+                (bias != nullptr && !moe_candidate_record_matches(*bias, observed.bias))) {
+            return false;
+        }
+    }
+
+    if (result != nullptr) {
+        result->key.generation = impl_->state.generation;
+        result->key.group_index = group_index;
+        result->roles[0] = roles[0];
+        result->roles[1] = roles[1];
+    }
+    return true;
 }
 
 extern "C"

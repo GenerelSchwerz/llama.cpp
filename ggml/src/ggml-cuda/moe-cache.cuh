@@ -86,6 +86,26 @@ struct ggml_cuda_moe_candidate_group_info {
     uint32_t n_slots = 0;
 };
 
+struct ggml_cuda_moe_candidate_probe_bank {
+    const ggml_tensor * weight = nullptr;
+    const ggml_tensor * ids = nullptr;
+    const ggml_tensor * scale = nullptr;
+    const ggml_tensor * bias = nullptr;
+    uint32_t expected_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+};
+
+struct ggml_cuda_moe_candidate_probe_input {
+    ggml_cuda_moe_candidate_probe_bank banks[2];
+    uint64_t expected_generation = 0;
+    uint32_t n_banks = 0;
+    uint32_t exact_auxiliaries = 0;
+};
+
+struct ggml_cuda_moe_candidate_probe_result {
+    ggml_cuda_moe_candidate_group_key key;
+    uint32_t roles[2] = {};
+};
+
 class ggml_cuda_moe_candidate_registry {
 public:
     explicit ggml_cuda_moe_candidate_registry(ggml_backend_dev_t owner);
@@ -101,6 +121,7 @@ public:
     bool find_weight(const ggml_tensor * tensor, ggml_cuda_moe_candidate_bank_info * info) const;
     bool get_group(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_candidate_group_info * info) const;
     bool get_bank(const ggml_cuda_moe_candidate_group_key & key, uint32_t role, ggml_cuda_moe_candidate_bank_info * info) const;
+    bool probe(const ggml_cuda_moe_candidate_probe_input & input, ggml_cuda_moe_candidate_probe_result * result) const;
 
 private:
     struct impl;
