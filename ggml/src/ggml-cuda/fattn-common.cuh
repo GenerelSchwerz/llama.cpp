@@ -727,14 +727,10 @@ template <int ncols1>
 __launch_bounds__(1, 1)
 static __global__ void flash_attn_causal_prefix_to_KV_max(
         const int64_t * write_indices_ptr, int * KV_max_ptr,
-        const int ne11, const int64_t s31, const int64_t s33) {
-    if (threadIdx.x != 0) {
-        return;
-    }
-
+        const int ne11, const int64_t s31) {
     const int sequence = blockIdx.y;
     const int jt = blockIdx.x;
-    const int64_t * write_indices = write_indices_ptr + sequence*s33 + jt*ncols1*s31;
+    const int64_t * write_indices = write_indices_ptr + jt*ncols1*s31;
     const int32_t bound = flash_attn_causal_prefix_bound(write_indices, 0) + ncols1 - 1;
     const int rounded = ((bound + FATTN_KQ_STRIDE - 1) / FATTN_KQ_STRIDE) * FATTN_KQ_STRIDE;
     KV_max_ptr[sequence*gridDim.x + jt] = min(ne11, rounded);
@@ -1127,7 +1123,7 @@ void launch_fattn(
             blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_causal_prefix_to_KV_max<ncols1>, launch_params,
             (const int64_t *) mask->data, KV_max.ptr, int(K->ne[1]),
-            mask->nb[0] / sizeof(int64_t), 0);
+            mask->nb[0] / sizeof(int64_t));
         CUDA_CHECK(cudaGetLastError());
     } else if (mask && use_KV_max) {
         const int64_t s31 = mask->nb[1] / sizeof(half2);

@@ -1884,11 +1884,8 @@ bool llama_kv_cache::can_use_compact_causal_mask(
         return true;
     }
 
-    if (!ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id) {
-        return false;
-    }
-
-    if (ubatch.n_seq_id[0] != 1 || !ubatch.seq_id[0]) {
+    if (!ubatch.pos || !ubatch.n_seq_id || !ubatch.seq_id ||
+            ubatch.n_seq_id[0] != 1 || !ubatch.seq_id[0]) {
         return false;
     }
 
@@ -1898,7 +1895,6 @@ bool llama_kv_cache::can_use_compact_causal_mask(
     }
 
     const bool is_2d = ubatch.is_pos_2d();
-    bool have_query_prev = false;
     llama_pos query_pos_prev = 0;
     llama_kv_cell_ext query_ext_prev {};
     for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
@@ -1906,14 +1902,13 @@ bool llama_kv_cache::can_use_compact_causal_mask(
             /*.x =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens*2] : 0,
             /*.y =*/ is_2d ? ubatch.pos[i + ubatch.n_tokens]   : 0,
         };
-        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != seq_id ||
-                (have_query_prev && !llama_kv_causal_position_leq(
+        if (ubatch.n_seq_id[i] != 1 || !ubatch.seq_id[i] || ubatch.seq_id[i][0] != seq_id ||
+                (i > 0 && !llama_kv_causal_position_leq(
                     query_pos_prev, query_ext_prev, ubatch.pos[i], query_ext, is_2d))) {
             return false;
         }
         query_pos_prev = ubatch.pos[i];
         query_ext_prev = query_ext;
-        have_query_prev = true;
     }
 
     const auto & cells = v_cells[0];
@@ -1923,7 +1918,6 @@ bool llama_kv_cache::can_use_compact_causal_mask(
 
     bool saw_empty = false;
     bool saw_live = false;
-    bool have_cell_prev = false;
     llama_pos cell_pos_prev = 0;
     llama_kv_cell_ext cell_ext_prev {};
     for (uint32_t i = 0; i < n_kv; ++i) {
@@ -1937,17 +1931,17 @@ bool llama_kv_cache::can_use_compact_causal_mask(
 
         const llama_pos pos = cells.pos_get(i);
         const llama_kv_cell_ext ext = is_2d ? cells.ext_get(i) : llama_kv_cell_ext {};
-        if (have_cell_prev && !llama_kv_causal_position_leq(cell_pos_prev, cell_ext_prev, pos, ext, is_2d)) {
+        if (saw_live && !llama_kv_causal_position_leq(cell_pos_prev, cell_ext_prev, pos, ext, is_2d)) {
             return false;
         }
         cell_pos_prev = pos;
         cell_ext_prev = ext;
-        have_cell_prev = true;
         saw_live = true;
     }
 
     if (sinfo) {
-        if (sinfo->n_stream() != 1 || sinfo->strm[0] != 0 || sinfo->idxs[0].size() != ubatch.n_tokens) {
+        if (sinfo->n_stream() != 1 || sinfo->idxs.size() != 1 ||
+                sinfo->strm[0] != 0 || sinfo->idxs[0].size() != ubatch.n_tokens) {
             return false;
         }
 
