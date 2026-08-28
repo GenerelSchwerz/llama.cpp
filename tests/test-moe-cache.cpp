@@ -108,7 +108,7 @@ struct candidate_test_fixture {
         buffer = ggml_backend_cpu_buffer_from_ptr(storage, BUFFER_SIZE);
         CHECK(buffer != nullptr);
         ggml_init_params params = {};
-        params.mem_size = 512 * ggml_tensor_overhead();
+        params.mem_size = 8192 * ggml_tensor_overhead();
         params.no_alloc = true;
         ctx = ggml_init(params);
         CHECK(ctx != nullptr);
@@ -213,6 +213,22 @@ static ggml_tensor * candidate_mmid(candidate_test_fixture & fixture, ggml_tenso
 static ggml_cgraph * candidate_graph(candidate_test_fixture & fixture, std::initializer_list<ggml_tensor *> nodes) {
     ggml_cgraph * graph = ggml_new_graph_custom(fixture.ctx, 32, false);
     CHECK(graph != nullptr);
+    for (ggml_tensor * node : nodes) {
+        ggml_graph_add_node(graph, node);
+    }
+    return graph;
+}
+
+static ggml_cgraph * candidate_padded_graph(
+        candidate_test_fixture & fixture,
+        ggml_tensor * padding,
+        uint32_t n_padding,
+        std::initializer_list<ggml_tensor *> nodes) {
+    ggml_cgraph * graph = ggml_new_graph_custom(fixture.ctx, n_padding + nodes.size(), false);
+    CHECK(graph != nullptr);
+    for (uint32_t i = 0; i < n_padding; ++i) {
+        ggml_graph_add_node(graph, padding);
+    }
     for (ggml_tensor * node : nodes) {
         ggml_graph_add_node(graph, node);
     }
@@ -1163,6 +1179,25 @@ static void test_grouped_graph_preflight(bool benchmark) {
     registry.compile_graph_plan(producer_order_graph, 51, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
+    const int64_t padding_ne[] = {1};
+    ggml_tensor * padding_input = fixture.tensor(GGML_TYPE_F32, 1, padding_ne);
+    ggml_tensor * padding_node = ggml_dup(fixture.ctx, padding_input);
+    fixture.materialize(padding_node);
+    padding_node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    const candidate_route padded_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * padded_gate_up_node = candidate_mmid(fixture, fused_gate_up, padded_route.ids);
+    ggml_tensor * padded_down_node = candidate_mmid(fixture, fused_down, padded_route.ids);
+    constexpr uint32_t n_padding_nodes = 32768;
+    ggml_cgraph * padded_graph = candidate_padded_graph(fixture, padding_node, n_padding_nodes, {
+        padded_route.root, padded_route.ids, padded_gate_up_node, padded_down_node,
+    });
+    ggml_cuda_moe_graph_plan padded_plan;
+    ggml_cuda_moe_graph_execution padded_execution;
+    registry.compile_graph_plan(padded_graph, 100, &padded_plan, &padded_execution);
+    CHECK(padded_plan.size() == 1 && padded_execution.size() == 1);
+    CHECK(padded_plan.graph_node_count() == static_cast<int32_t>(n_padding_nodes + 4));
+    CHECK(registry.bind_graph_plan(padded_graph, 101, true, padded_plan, &padded_execution) && padded_execution.size() == 1);
+
     registry.compile_graph_plan(complete_graph, 52, &plan, &execution);
     CHECK(plan.size() == 2 && execution.size() == 2);
     ggml_tensor * saved_view_src = fused_route.ids->view_src;
@@ -1288,6 +1323,25 @@ static void test_grouped_graph_preflight(bool benchmark) {
         CHECK(reused_count == n_reuses && benchmark_plan.get() == stable_plan && prepared.size() == 2);
         fprintf(stderr, "test-moe-cache: grouped graph plan %.1f ns/reuse with fresh UIDs, full scans=0/%u\n",
             static_cast<double>(elapsed) / n_reuses, n_reuses);
+
+        std::shared_ptr<ggml_cuda_moe_graph_plan> padded_benchmark_plan;
+        CHECK(registry.prepare_graph_execution(padded_graph, 100, false, &padded_benchmark_plan, &prepared) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        const ggml_cuda_moe_graph_plan * stable_padded_plan = padded_benchmark_plan.get();
+        constexpr uint32_t n_padded_reuses = 100000;
+        uint32_t padded_reused_count = 0;
+        const auto padded_begin = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < n_padded_reuses; ++i) {
+            padded_reused_count += registry.prepare_graph_execution(padded_graph, 101 + i, true, &padded_benchmark_plan, &prepared) ==
+                GGML_CUDA_MOE_GRAPH_PREPARE_REUSED ? 1 : 0;
+        }
+        const auto padded_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - padded_begin).count();
+        const double padded_ns = static_cast<double>(padded_elapsed) / n_padded_reuses;
+        CHECK(padded_reused_count == n_padded_reuses && padded_benchmark_plan.get() == stable_padded_plan && prepared.size() == 1);
+        CHECK(padded_ns < 10000.0);
+        fprintf(stderr, "test-moe-cache: grouped padded graph plan %.1f ns/reuse with %u nodes, full scans=0/%u\n",
+            padded_ns, n_padding_nodes + 4, n_padded_reuses);
     }
 
     fprintf(stderr, "test-moe-cache: grouped graph preflight OK\n");

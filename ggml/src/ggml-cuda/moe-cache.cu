@@ -920,9 +920,7 @@ static bool moe_candidate_graph_node_before(
     return false;
 }
 
-static bool moe_candidate_prove_route(
-        const ggml_cgraph * cgraph,
-        uint32_t consumer_node_index,
+static bool moe_candidate_validate_route(
         const ggml_tensor * ids,
         int64_t n_experts,
         moe_candidate_route_proof & proof) {
@@ -957,18 +955,21 @@ static bool moe_candidate_prove_route(
         }
     }
 
-    uint32_t root_node_index = 0;
-    uint32_t ids_node_index = 0;
-    if (!moe_candidate_graph_node_before(cgraph, root, consumer_node_index, &root_node_index) ||
-            !moe_candidate_graph_node_before(cgraph, ids, consumer_node_index, &ids_node_index) || root_node_index >= ids_node_index) {
-        return false;
-    }
-
     proof.ids = moe_candidate_ids_signature(ids);
     proof.root = moe_candidate_ids_signature(root);
     proof.source = moe_candidate_ids_signature(source);
-    proof.root_node_index = root_node_index;
-    proof.ids_node_index = ids_node_index;
+    return true;
+}
+
+static bool moe_candidate_discover_route(
+        const ggml_cgraph * cgraph,
+        uint32_t consumer_node_index,
+        moe_candidate_route_proof & proof) {
+    if (!moe_candidate_graph_node_before(cgraph, proof.root.tensor, consumer_node_index, &proof.root_node_index) ||
+            !moe_candidate_graph_node_before(cgraph, proof.ids.tensor, consumer_node_index, &proof.ids_node_index) ||
+            proof.root_node_index >= proof.ids_node_index) {
+        return false;
+    }
     return true;
 }
 
@@ -2714,7 +2715,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             continue;
         }
         if (!observation.has_ids) {
-            if (!moe_candidate_prove_route(cgraph, node_index, ids, bank.ne[2], observation.route)) {
+            if (!moe_candidate_validate_route(ids, bank.ne[2], observation.route) ||
+                    !moe_candidate_discover_route(cgraph, node_index, observation.route)) {
                 observation.invalid = true;
                 continue;
             }
@@ -2828,8 +2830,12 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             }
         }
         moe_candidate_route_proof current_route;
-        if (group.banks.empty() || !moe_candidate_prove_route(cgraph, first_node_index, record.ids.tensor, group.banks[0].ne[2], current_route) ||
-                current_route.root_node_index != record.ids_root_node_index || current_route.ids_node_index != record.ids_node_index ||
+        if (group.banks.empty() || record.ids_root_node_index >= static_cast<uint32_t>(n_nodes) ||
+                record.ids_node_index >= static_cast<uint32_t>(n_nodes) || record.ids_root_node_index >= record.ids_node_index ||
+                record.ids_node_index >= first_node_index ||
+                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
+                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
+                !moe_candidate_validate_route(record.ids.tensor, group.banks[0].ne[2], current_route) ||
                 !moe_candidate_ids_equal(current_route.ids, record.ids) || !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
                 !moe_candidate_ids_equal(current_route.source, record.ids_source)) {
             return false;
