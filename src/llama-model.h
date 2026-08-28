@@ -710,6 +710,7 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    int32_t moe_expert_cache_slots() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 

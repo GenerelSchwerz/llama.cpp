@@ -17,6 +17,8 @@
 
 #include "../ggml/src/ggml-cuda/moe-cache.cuh"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../src/llama-context.h"
+#include "../src/llama-model.h"
 
 #include <cuda_runtime.h>
 
@@ -138,6 +140,136 @@ static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
     result.groups = groups;
     result.n_groups = n_groups;
     return result;
+}
+
+static const ggml_backend_moe_candidate_bank_v1 * candidate_bank(
+        const ggml_backend_moe_candidate_group_v1 & group,
+        uint32_t role) {
+    for (uint32_t i = 0; i < group.n_banks; ++i) {
+        if (group.banks[i].role == role) {
+            return &group.banks[i];
+        }
+    }
+    return nullptr;
+}
+
+static void test_candidate_producer() {
+    candidate_test_fixture fixture;
+    llama_model_params params = llama_model_default_params();
+    params.moe_expert_cache_slots = 12;
+    std::unique_ptr<llama_model> model(llama_model_create(LLM_ARCH_LLAMA, params));
+    CHECK(model != nullptr && model->moe_expert_cache_slots() == 12);
+    model->layers.resize(4);
+
+    const int64_t router_ne[] = {64, 4};
+    const int64_t gate_ne[] = {64, 32, 4};
+    const int64_t down_ne[] = {32, 64, 4};
+    const int64_t fused_ne[] = {64, 64, 4};
+    const int64_t scale_ne[] = {4};
+    const int64_t gate_bias_ne[] = {32, 4};
+    const int64_t fused_bias_ne[] = {64, 4};
+    const int64_t down_bias_ne[] = {64, 4};
+    const int64_t scalar_ne[] = {1};
+
+    auto & separate = model->layers[0];
+    separate.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
+    separate.ffn_gate_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    separate.ffn_up_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    separate.ffn_down_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    separate.ffn_gate_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_up_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_down_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_gate_exps_b = fixture.tensor(GGML_TYPE_F32, 2, gate_bias_ne);
+    separate.ffn_up_exps_b = fixture.tensor(GGML_TYPE_F32, 2, gate_bias_ne);
+    separate.ffn_down_exps_b = fixture.tensor(GGML_TYPE_F32, 2, down_bias_ne);
+    separate.ffn_gate = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
+    separate.ffn_up_shexp = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
+    separate.ffn_gate_exps_in_s = fixture.tensor(GGML_TYPE_F32, 1, scalar_ne);
+
+    auto & fused = model->layers[1];
+    fused.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
+    fused.ffn_gate_up_exps = fixture.tensor(GGML_TYPE_BF16, 3, fused_ne);
+    fused.ffn_down_exps = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
+    fused.ffn_gate_up_exps_b = fixture.tensor(GGML_TYPE_F32, 2, fused_bias_ne);
+    fused.ffn_down_exps_b = fixture.tensor(GGML_TYPE_F32, 2, down_bias_ne);
+
+    auto & nvfp4 = model->layers[2];
+    nvfp4.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
+    nvfp4.ffn_gate_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_up_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_down_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_gate_exps_in_s = fixture.tensor(GGML_TYPE_F32, 1, scalar_ne);
+    nvfp4.ffn_down_shexp = fixture.tensor(GGML_TYPE_BF16, 2, down_ne);
+
+    auto & excluded = model->layers[3];
+    excluded.ffn_gate = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
+    excluded.ffn_up_shexp = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
+    excluded.ffn_down_shexp = fixture.tensor(GGML_TYPE_BF16, 2, down_ne);
+
+    ggml_set_name(separate.ffn_gate_exps, "blk.0.ffn_gate_exps.weight");
+    ggml_set_name(separate.ffn_up_exps, "blk.0.ffn_up_exps.weight");
+    ggml_set_name(separate.ffn_down_exps, "blk.0.ffn_down_exps.weight");
+
+    llama_adapter_loras loras;
+    llama_moe_candidate_snapshot produced(*model, loras);
+    const auto & snapshot = produced.get();
+    CHECK(snapshot.magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC);
+    CHECK(snapshot.abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION);
+    CHECK(snapshot.struct_size == sizeof(snapshot));
+    CHECK(snapshot.n_slots == 12 && snapshot.n_groups == 3);
+
+    const auto & separate_group = snapshot.groups[0];
+    CHECK(separate_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
+    CHECK(separate_group.n_banks == 9);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT)->tensor == separate.ffn_gate_exps);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT)->tensor == separate.ffn_up_exps);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT)->tensor == separate.ffn_down_exps);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE)->tensor == separate.ffn_gate_exps_s);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS)->tensor == separate.ffn_down_exps_b);
+    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BLOCK_SCALE) == nullptr);
+    for (uint32_t i = 0; i < separate_group.n_banks; ++i) {
+        CHECK(separate_group.banks[i].tensor != separate.ffn_gate);
+        CHECK(separate_group.banks[i].tensor != separate.ffn_up_shexp);
+        CHECK(separate_group.banks[i].tensor != separate.ffn_gate_exps_in_s);
+    }
+
+    const auto & fused_group = snapshot.groups[1];
+    CHECK(fused_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT)->tensor == fused.ffn_gate_up_exps);
+    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS)->tensor == fused.ffn_gate_up_exps_b);
+    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE) == nullptr);
+
+    ggml_cuda_moe_candidate_registry registry(&fixture.owner);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 3 && registry.state().n_weights == 8);
+
+    llama_adapter_lora adapter(model.get());
+    adapter.ab_map.emplace(separate.ffn_gate_exps->name, llama_adapter_lora_weight());
+    loras.emplace(&adapter, 1.0f);
+    llama_moe_candidate_snapshot lora_on(*model, loras);
+    CHECK(lora_on.get().n_groups == 2);
+    CHECK(registry.replace(&lora_on.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(!registry.find_weight(separate.ffn_gate_exps, nullptr));
+    loras.clear();
+    llama_moe_candidate_snapshot lora_off(*model, loras);
+    CHECK(lora_off.get().n_groups == 3);
+    CHECK(registry.replace(&lora_off.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.find_weight(separate.ffn_gate_exps, nullptr));
+
+    fused.ffn_up_exps_s = separate.ffn_up_exps_s;
+    llama_moe_candidate_snapshot untyped_fused_scale(*model, loras);
+    CHECK(untyped_fused_scale.get().n_groups == 2);
+    fused.ffn_up_exps_s = nullptr;
+
+    llama_model_tensor_buft_override overrides[] = {{".*", ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}};
+    params.tensor_buft_overrides = overrides;
+    params.moe_expert_cache_slots = 48;
+    std::unique_ptr<llama_model> overridden(llama_model_create(LLM_ARCH_LLAMA, params));
+    overridden->layers = model->layers;
+    llama_moe_candidate_snapshot disabled(*overridden, loras);
+    CHECK(disabled.get().n_slots == 48 && disabled.get().n_groups == 0 && disabled.get().groups == nullptr);
+    CHECK(registry.replace(&disabled.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 48);
 }
 
 static void test_candidate_registry(bool benchmark) {
@@ -439,6 +571,7 @@ static void test_candidate_registry(bool benchmark) {
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
+    test_candidate_producer();
     test_candidate_registry(registry_bench);
     if (registry_only || registry_bench) {
         return 0;
