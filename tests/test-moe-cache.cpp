@@ -120,17 +120,82 @@ struct candidate_test_fixture {
         free(storage);
     }
 
-    ggml_tensor * tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
-        ggml_tensor * result = ggml_new_tensor(ctx, type, n_dims, ne);
+    void materialize(ggml_tensor * tensor) {
+        if (tensor->view_src != nullptr) {
+            CHECK(tensor->view_src->buffer != nullptr && tensor->data != nullptr);
+            tensor->buffer = tensor->view_src->buffer;
+            return;
+        }
         const size_t alignment = ggml_backend_buffer_get_alignment(buffer);
         next_offset = (next_offset + alignment - 1) / alignment * alignment;
-        CHECK(next_offset + ggml_nbytes(result) <= BUFFER_SIZE);
-        result->buffer = buffer;
-        result->data = static_cast<uint8_t *>(storage) + next_offset;
-        next_offset += ggml_nbytes(result);
+        CHECK(next_offset + ggml_nbytes(tensor) <= BUFFER_SIZE);
+        tensor->buffer = buffer;
+        tensor->data = static_cast<uint8_t *>(storage) + next_offset;
+        next_offset += ggml_nbytes(tensor);
+    }
+
+    ggml_tensor * tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
+        ggml_tensor * result = ggml_new_tensor(ctx, type, n_dims, ne);
+        materialize(result);
         return result;
     }
 };
+
+struct candidate_route {
+    ggml_tensor * source = nullptr;
+    ggml_tensor * root = nullptr;
+    ggml_tensor * ids = nullptr;
+};
+
+static candidate_route candidate_top_k_route(
+        candidate_test_fixture & fixture,
+        int64_t n_experts,
+        int64_t n_routes,
+        int64_t n_tokens = 1,
+        size_t view_offs = 0) {
+    candidate_route result;
+    const int64_t source_ne[] = {n_experts, n_tokens};
+    result.source = fixture.tensor(GGML_TYPE_F32, 2, source_ne);
+    result.root = ggml_argsort(fixture.ctx, result.source, GGML_SORT_ORDER_DESC);
+    fixture.materialize(result.root);
+    result.root->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    result.ids = ggml_view_4d(fixture.ctx, result.root, n_routes, n_tokens, 1, 1,
+        result.root->nb[1], result.root->nb[2], result.root->nb[3], view_offs);
+    fixture.materialize(result.ids);
+    result.ids->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    return result;
+}
+
+struct candidate_fused_top_k_route {
+    candidate_route route;
+    ggml_tensor * softmax = nullptr;
+    ggml_tensor * reshaped = nullptr;
+    ggml_tensor * weights = nullptr;
+};
+
+static candidate_fused_top_k_route candidate_fused_top_k(candidate_test_fixture & fixture, int64_t n_experts, int64_t n_routes) {
+    candidate_fused_top_k_route result;
+    const int64_t logits_ne[] = {n_experts, 1};
+    ggml_tensor * logits = fixture.tensor(GGML_TYPE_F32, 2, logits_ne);
+    result.softmax = ggml_soft_max(fixture.ctx, logits);
+    fixture.materialize(result.softmax);
+    result.softmax->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    result.reshaped = ggml_reshape_2d(fixture.ctx, result.softmax, n_experts, 1);
+    fixture.materialize(result.reshaped);
+    result.reshaped->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    result.route.source = result.softmax;
+    result.route.root = ggml_argsort(fixture.ctx, result.softmax, GGML_SORT_ORDER_DESC);
+    fixture.materialize(result.route.root);
+    result.route.root->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    result.route.ids = ggml_view_4d(fixture.ctx, result.route.root, n_routes, 1, 1, 1,
+        result.route.root->nb[1], result.route.root->nb[2], result.route.root->nb[3], 0);
+    fixture.materialize(result.route.ids);
+    result.route.ids->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    result.weights = ggml_get_rows(fixture.ctx, result.reshaped, result.route.ids);
+    fixture.materialize(result.weights);
+    result.weights->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    return result;
+}
 
 static ggml_tensor * candidate_mmid(candidate_test_fixture & fixture, ggml_tensor * weight, ggml_tensor * ids) {
     const int64_t activation_ne[] = {weight->ne[0], 1, ids->ne[1]};
@@ -826,7 +891,6 @@ static void test_grouped_graph_preflight(bool benchmark) {
     const int64_t gate_ne[] = {256, 256, 4};
     const int64_t fused_ne[] = {256, 512, 4};
     const int64_t ids_ne[] = {2, 1};
-    const int64_t prefill_ids_ne[] = {2, 4};
     const int64_t fused_bias_ne[] = {512, 4};
 
     ggml_tensor * fused_gate_up = fixture.tensor(GGML_TYPE_Q4_0, 3, fused_ne);
@@ -835,10 +899,11 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_tensor * separate_up = fixture.tensor(GGML_TYPE_Q4_K, 3, gate_ne);
     ggml_tensor * separate_down = fixture.tensor(GGML_TYPE_Q4_K, 3, gate_ne);
     ggml_tensor * fused_bias = fixture.tensor(GGML_TYPE_F32, 2, fused_bias_ne);
-    ggml_tensor * fused_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
-    ggml_tensor * fused_ids_other = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
-    ggml_tensor * separate_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
-    ggml_tensor * prefill_ids = fixture.tensor(GGML_TYPE_I32, 2, prefill_ids_ne);
+    ggml_tensor * external_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
+    const candidate_route fused_route = candidate_top_k_route(fixture, 4, 2);
+    const candidate_route fused_route_other = candidate_top_k_route(fixture, 4, 2);
+    const candidate_route separate_route = candidate_top_k_route(fixture, 4, 2);
+    const candidate_route prefill_route = candidate_top_k_route(fixture, 4, 2, 4);
 
     std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_banks = {{
         {fused_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
@@ -857,12 +922,13 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_cuda_moe_grouped_context registry(&fixture.owner);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
-    ggml_tensor * fused_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_tensor * fused_down_node = candidate_mmid(fixture, fused_down, fused_ids);
-    ggml_tensor * separate_up_node = candidate_mmid(fixture, separate_up, separate_ids);
-    ggml_tensor * separate_gate_node = candidate_mmid(fixture, separate_gate, separate_ids);
-    ggml_tensor * separate_down_node = candidate_mmid(fixture, separate_down, separate_ids);
+    ggml_tensor * fused_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * fused_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
+    ggml_tensor * separate_up_node = candidate_mmid(fixture, separate_up, separate_route.ids);
+    ggml_tensor * separate_gate_node = candidate_mmid(fixture, separate_gate, separate_route.ids);
+    ggml_tensor * separate_down_node = candidate_mmid(fixture, separate_down, separate_route.ids);
     ggml_cgraph * complete_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
 
@@ -871,11 +937,11 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_cuda_moe_graph_execution reused;
     registry.compile_graph_plan(complete_graph, 41, &plan, &execution);
     CHECK(plan.size() == 2 && execution.size() == 2);
-    CHECK(plan.registry_generation() == 1 && plan.graph_uid() == 41 && plan.graph_node_count() == 5);
+    CHECK(plan.registry_generation() == 1 && plan.graph_uid() == 41 && plan.graph_node_count() == 9);
     ggml_cuda_moe_graph_binding binding;
     CHECK(execution.find(fused_gate_up_node, &binding));
     CHECK(binding.key.candidate.generation == 1 && binding.key.candidate.group_index == 0);
-    CHECK(binding.key.ids.tensor == fused_ids && binding.key.ids.data == fused_ids->data && binding.key.ids.buffer == fused_ids->buffer);
+    CHECK(binding.key.ids.tensor == fused_route.ids && binding.key.ids.data == fused_route.ids->data && binding.key.ids.buffer == fused_route.ids->buffer);
     CHECK(binding.key.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && binding.key.n_banks == 2);
     CHECK(binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT && binding.bank_index == 0);
     CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.bank_index == 1);
@@ -890,14 +956,16 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(registry.bind_graph_plan(complete_graph, 42, true, plan, &reused) && reused.size() == 2);
     CHECK(!registry.bind_graph_plan(complete_graph, 0, true, plan, &reused) && reused.size() == 0);
     ggml_cgraph * reordered_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         fused_gate_up_node, fused_down_node, separate_gate_node, separate_up_node, separate_down_node,
     });
     CHECK(execution.find(fused_gate_up_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
     CHECK(execution.find(fused_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
     CHECK(!registry.bind_graph_plan(reordered_graph, 41, true, plan, &reused) && reused.size() == 0);
     CHECK(registry.bind_graph_plan(complete_graph, 41, true, plan, &reused));
-    ggml_tensor * stale_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
+    ggml_tensor * stale_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
     ggml_cgraph * stale_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, separate_route.root, separate_route.ids,
         stale_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
     });
     CHECK(!registry.bind_graph_plan(stale_graph, 41, true, plan, &reused) && reused.size() == 0);
@@ -1034,47 +1102,157 @@ static void test_grouped_graph_preflight(bool benchmark) {
     }
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
-    ggml_tensor * mixed_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_tensor * mixed_down_node = candidate_mmid(fixture, fused_down, fused_ids_other);
-    ggml_cgraph * mixed_graph = candidate_graph(fixture, {mixed_gate_up_node, mixed_down_node});
-    registry.compile_graph_plan(mixed_graph, 45, &plan, &execution);
+    const candidate_fused_top_k_route evaluator_route = candidate_fused_top_k(fixture, 4, 2);
+    ggml_tensor * evaluator_gate_up_node = candidate_mmid(fixture, fused_gate_up, evaluator_route.route.ids);
+    ggml_tensor * evaluator_down_node = candidate_mmid(fixture, fused_down, evaluator_route.route.ids);
+    ggml_cgraph * evaluator_graph = candidate_graph(fixture, {
+        evaluator_route.softmax, evaluator_route.reshaped, evaluator_route.route.root, evaluator_route.route.ids,
+        evaluator_route.weights, evaluator_gate_up_node, evaluator_down_node,
+    });
+    registry.compile_graph_plan(evaluator_graph, 45, &plan, &execution);
+    CHECK(plan.size() == 1 && execution.size() == 1);
+
+    ggml_tensor * external_gate_up_node = candidate_mmid(fixture, fused_gate_up, external_ids);
+    ggml_tensor * external_down_node = candidate_mmid(fixture, fused_down, external_ids);
+    ggml_cgraph * external_graph = candidate_graph(fixture, {external_gate_up_node, external_down_node});
+    registry.compile_graph_plan(external_graph, 46, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
-    ggml_tensor * missing_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_cgraph * missing_graph = candidate_graph(fixture, {missing_gate_up_node});
-    registry.compile_graph_plan(missing_graph, 46, &plan, &execution);
+    ggml_tensor * copied_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
+    copied_ids->op = GGML_OP_CPY;
+    copied_ids->src[0] = external_ids;
+    copied_ids->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_tensor * copied_gate_up_node = candidate_mmid(fixture, fused_gate_up, copied_ids);
+    ggml_tensor * copied_down_node = candidate_mmid(fixture, fused_down, copied_ids);
+    ggml_cgraph * copied_graph = candidate_graph(fixture, {copied_ids, copied_gate_up_node, copied_down_node});
+    registry.compile_graph_plan(copied_graph, 47, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
-    ggml_tensor * duplicate_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_tensor * duplicate_gate_up_peer = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_tensor * duplicate_down_node = candidate_mmid(fixture, fused_down, fused_ids);
-    ggml_cgraph * duplicate_graph = candidate_graph(fixture, {duplicate_gate_up_node, duplicate_gate_up_peer, duplicate_down_node});
-    registry.compile_graph_plan(duplicate_graph, 47, &plan, &execution);
+    const candidate_route offset_route = candidate_top_k_route(fixture, 4, 2, 1, sizeof(int32_t));
+    ggml_tensor * offset_gate_up_node = candidate_mmid(fixture, fused_gate_up, offset_route.ids);
+    ggml_tensor * offset_down_node = candidate_mmid(fixture, fused_down, offset_route.ids);
+    ggml_cgraph * offset_graph = candidate_graph(fixture, {offset_route.root, offset_route.ids, offset_gate_up_node, offset_down_node});
+    registry.compile_graph_plan(offset_graph, 48, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
-    ggml_tensor * prefill_gate_up_node = candidate_mmid(fixture, fused_gate_up, prefill_ids);
-    ggml_tensor * prefill_down_node = candidate_mmid(fixture, fused_down, prefill_ids);
-    ggml_cgraph * prefill_graph = candidate_graph(fixture, {prefill_gate_up_node, prefill_down_node});
-    registry.compile_graph_plan(prefill_graph, 48, &plan, &execution);
+    ggml_tensor * transformed_ids = ggml_reshape_2d(fixture.ctx, fused_route_other.ids, 2, 1);
+    fixture.materialize(transformed_ids);
+    transformed_ids->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_tensor * transformed_gate_up_node = candidate_mmid(fixture, fused_gate_up, transformed_ids);
+    ggml_tensor * transformed_down_node = candidate_mmid(fixture, fused_down, transformed_ids);
+    ggml_cgraph * transformed_graph = candidate_graph(fixture, {
+        fused_route_other.root, fused_route_other.ids, transformed_ids, transformed_gate_up_node, transformed_down_node,
+    });
+    registry.compile_graph_plan(transformed_graph, 49, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
-    ggml_tensor * wrong_source_node = candidate_mmid(fixture, separate_gate, fused_ids);
-    ggml_tensor * correct_down_node = candidate_mmid(fixture, fused_down, fused_ids);
-    ggml_cgraph * wrong_source_graph = candidate_graph(fixture, {wrong_source_node, correct_down_node});
-    registry.compile_graph_plan(wrong_source_graph, 49, &plan, &execution);
+    const candidate_route wrong_axis_route = candidate_top_k_route(fixture, 5, 2);
+    ggml_tensor * wrong_axis_gate_up_node = candidate_mmid(fixture, fused_gate_up, wrong_axis_route.ids);
+    ggml_tensor * wrong_axis_down_node = candidate_mmid(fixture, fused_down, wrong_axis_route.ids);
+    ggml_cgraph * wrong_axis_graph = candidate_graph(fixture, {
+        wrong_axis_route.root, wrong_axis_route.ids, wrong_axis_gate_up_node, wrong_axis_down_node,
+    });
+    registry.compile_graph_plan(wrong_axis_graph, 50, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
-    ggml_tensor * auxiliary_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_ids);
-    ggml_tensor * auxiliary_down_node = candidate_mmid(fixture, fused_down, fused_ids);
+    ggml_tensor * order_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route_other.ids);
+    ggml_tensor * order_down_node = candidate_mmid(fixture, fused_down, fused_route_other.ids);
+    ggml_cgraph * producer_order_graph = candidate_graph(fixture, {
+        fused_route_other.ids, fused_route_other.root, order_gate_up_node, order_down_node,
+    });
+    registry.compile_graph_plan(producer_order_graph, 51, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    registry.compile_graph_plan(complete_graph, 52, &plan, &execution);
+    CHECK(plan.size() == 2 && execution.size() == 2);
+    ggml_tensor * saved_view_src = fused_route.ids->view_src;
+    fused_route.ids->view_src = fused_route_other.root;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    fused_route.ids->view_src = saved_view_src;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    ggml_tensor * saved_view_source = fused_route.ids->src[0];
+    fused_route.ids->src[0] = fused_route_other.root;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    fused_route.ids->src[0] = saved_view_source;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    fused_route.ids->view_offs = sizeof(int32_t);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    fused_route.ids->view_offs = 0;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    const size_t saved_root_stride = fused_route.root->nb[1];
+    fused_route.root->nb[1] += sizeof(int32_t);
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    fused_route.root->nb[1] = saved_root_stride;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    ggml_tensor * saved_root_source = fused_route.root->src[0];
+    fused_route.root->src[0] = fused_route_other.source;
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    fused_route.root->src[0] = saved_root_source;
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    const int32_t sort_asc = GGML_SORT_ORDER_ASC;
+    memcpy(fused_route.root->op_params, &sort_asc, sizeof(sort_asc));
+    CHECK(!registry.bind_graph_plan(complete_graph, 52, true, plan, &reused) && reused.size() == 0);
+    const int32_t sort_desc = GGML_SORT_ORDER_DESC;
+    memcpy(fused_route.root->op_params, &sort_desc, sizeof(sort_desc));
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+    ggml_cgraph * producer_reordered_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, separate_route.ids, separate_route.root,
+        fused_gate_up_node, fused_down_node, separate_up_node, separate_gate_node, separate_down_node,
+    });
+    CHECK(!registry.bind_graph_plan(producer_reordered_graph, 52, true, plan, &reused) && reused.size() == 0);
+    CHECK(registry.bind_graph_plan(complete_graph, 52, true, plan, &reused));
+
+    ggml_tensor * mixed_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * mixed_down_node = candidate_mmid(fixture, fused_down, fused_route_other.ids);
+    ggml_cgraph * mixed_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, fused_route_other.root, fused_route_other.ids, mixed_gate_up_node, mixed_down_node,
+    });
+    registry.compile_graph_plan(mixed_graph, 53, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * missing_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_cgraph * missing_graph = candidate_graph(fixture, {fused_route.root, fused_route.ids, missing_gate_up_node});
+    registry.compile_graph_plan(missing_graph, 54, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * duplicate_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * duplicate_gate_up_peer = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * duplicate_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
+    ggml_cgraph * duplicate_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, duplicate_gate_up_node, duplicate_gate_up_peer, duplicate_down_node,
+    });
+    registry.compile_graph_plan(duplicate_graph, 55, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * prefill_gate_up_node = candidate_mmid(fixture, fused_gate_up, prefill_route.ids);
+    ggml_tensor * prefill_down_node = candidate_mmid(fixture, fused_down, prefill_route.ids);
+    ggml_cgraph * prefill_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, prefill_gate_up_node, prefill_down_node,
+    });
+    registry.compile_graph_plan(prefill_graph, 56, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * wrong_source_node = candidate_mmid(fixture, separate_gate, fused_route.ids);
+    ggml_tensor * correct_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
+    ggml_cgraph * wrong_source_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, wrong_source_node, correct_down_node,
+    });
+    registry.compile_graph_plan(wrong_source_graph, 57, &plan, &execution);
+    CHECK(plan.size() == 0 && execution.size() == 0);
+
+    ggml_tensor * auxiliary_gate_up_node = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * auxiliary_down_node = candidate_mmid(fixture, fused_down, fused_route.ids);
     const int64_t auxiliary_ne[] = {auxiliary_gate_up_node->ne[0], auxiliary_gate_up_node->ne[1], auxiliary_gate_up_node->ne[2]};
     ggml_tensor * auxiliary_out = fixture.tensor(GGML_TYPE_F32, 3, auxiliary_ne);
     auxiliary_out->op = GGML_OP_ADD_ID;
     auxiliary_out->src[0] = auxiliary_gate_up_node;
     auxiliary_out->src[1] = fused_bias;
-    auxiliary_out->src[2] = fused_ids;
+    auxiliary_out->src[2] = fused_route.ids;
     auxiliary_out->flags |= GGML_TENSOR_FLAG_COMPUTE;
-    ggml_cgraph * auxiliary_graph = candidate_graph(fixture, {auxiliary_gate_up_node, auxiliary_out, auxiliary_down_node});
-    registry.compile_graph_plan(auxiliary_graph, 50, &plan, &execution);
+    ggml_cgraph * auxiliary_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_out, auxiliary_down_node,
+    });
+    registry.compile_graph_plan(auxiliary_graph, 58, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
     std::array<ggml_backend_moe_candidate_bank_v1, 3> auxiliary_banks = {{
@@ -1087,21 +1265,23 @@ static void test_grouped_graph_preflight(bool benchmark) {
     };
     auto auxiliary_snapshot = candidate_snapshot(12, &auxiliary_group, 1);
     CHECK(registry.replace(&auxiliary_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    ggml_cgraph * auxiliary_registered_graph = candidate_graph(fixture, {auxiliary_gate_up_node, auxiliary_down_node});
-    registry.compile_graph_plan(auxiliary_registered_graph, 51, &plan, &execution);
+    ggml_cgraph * auxiliary_registered_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_down_node,
+    });
+    registry.compile_graph_plan(auxiliary_registered_graph, 59, &plan, &execution);
     CHECK(plan.size() == 0 && execution.size() == 0);
 
     if (benchmark) {
         CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         std::shared_ptr<ggml_cuda_moe_graph_plan> benchmark_plan;
         ggml_cuda_moe_graph_execution prepared;
-        CHECK(registry.prepare_graph_execution(complete_graph, 52, false, &benchmark_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(registry.prepare_graph_execution(complete_graph, 60, false, &benchmark_plan, &prepared) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
         const ggml_cuda_moe_graph_plan * stable_plan = benchmark_plan.get();
         constexpr uint32_t n_reuses = 200000;
         uint32_t reused_count = 0;
         const auto begin = std::chrono::steady_clock::now();
         for (uint32_t i = 0; i < n_reuses; ++i) {
-            reused_count += registry.prepare_graph_execution(complete_graph, 53 + i, true, &benchmark_plan, &prepared) ==
+            reused_count += registry.prepare_graph_execution(complete_graph, 61 + i, true, &benchmark_plan, &prepared) ==
                 GGML_CUDA_MOE_GRAPH_PREPARE_REUSED ? 1 : 0;
         }
         const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count();

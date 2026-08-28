@@ -898,6 +898,80 @@ static bool moe_candidate_ids_equal(const ggml_cuda_moe_ids_signature & a, const
     return true;
 }
 
+struct moe_candidate_route_proof {
+    ggml_cuda_moe_ids_signature ids;
+    ggml_cuda_moe_ids_signature root;
+    ggml_cuda_moe_ids_signature source;
+    uint32_t root_node_index = 0;
+    uint32_t ids_node_index = 0;
+};
+
+static bool moe_candidate_graph_node_before(
+        const ggml_cgraph * cgraph,
+        const ggml_tensor * tensor,
+        uint32_t before,
+        uint32_t * node_index) {
+    for (uint32_t i = 0; i < before; ++i) {
+        if (ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), i) == tensor) {
+            *node_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool moe_candidate_prove_route(
+        const ggml_cgraph * cgraph,
+        uint32_t consumer_node_index,
+        const ggml_tensor * ids,
+        int64_t n_experts,
+        moe_candidate_route_proof & proof) {
+    if (!moe_candidate_ids_valid(ids) || ids->op != GGML_OP_VIEW || (ids->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            ids->ne[0] <= 0 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->nb[0] != sizeof(int32_t) ||
+            !ggml_is_contiguous(ids) || ids->src[0] == nullptr || ids->view_src != ids->src[0] || ids->view_offs != 0) {
+        return false;
+    }
+    size_t op_view_offs = 0;
+    memcpy(&op_view_offs, ids->op_params, sizeof(op_view_offs));
+    if (op_view_offs != 0) {
+        return false;
+    }
+
+    const ggml_tensor * root = ids->src[0];
+    const ggml_tensor * source = root->src[0];
+    if (n_experts <= 0 || root->op != GGML_OP_ARGSORT || (root->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
+            root->type != GGML_TYPE_I32 || root->buffer == nullptr || root->data == nullptr || root->view_src != nullptr || root->view_offs != 0 ||
+            source == nullptr || source->type != GGML_TYPE_F32 || source->buffer == nullptr || source->data == nullptr ||
+            ggml_get_op_params_i32(root, 0) != GGML_SORT_ORDER_DESC || root->ne[0] != n_experts || ids->ne[0] > root->ne[0] ||
+            root->nb[0] != sizeof(int32_t) || !ggml_is_contiguous(root) || ids->buffer != root->buffer || ids->data != root->data) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_SRC; ++i) {
+        if (ids->src[i] != nullptr || root->src[i] != nullptr) {
+            return false;
+        }
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (ids->nb[i] != root->nb[i] || root->ne[i] != source->ne[i] || (i > 0 && ids->ne[i] != root->ne[i])) {
+            return false;
+        }
+    }
+
+    uint32_t root_node_index = 0;
+    uint32_t ids_node_index = 0;
+    if (!moe_candidate_graph_node_before(cgraph, root, consumer_node_index, &root_node_index) ||
+            !moe_candidate_graph_node_before(cgraph, ids, consumer_node_index, &ids_node_index) || root_node_index >= ids_node_index) {
+        return false;
+    }
+
+    proof.ids = moe_candidate_ids_signature(ids);
+    proof.root = moe_candidate_ids_signature(root);
+    proof.source = moe_candidate_ids_signature(source);
+    proof.root_node_index = root_node_index;
+    proof.ids_node_index = ids_node_index;
+    return true;
+}
+
 static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
         ggml_backend_dev_t owner,
         const ggml_tensor * tensor,
@@ -2519,6 +2593,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
 
     struct group_observation {
         ggml_cuda_moe_ids_signature ids;
+        moe_candidate_route_proof route;
         const ggml_tensor * nodes[4] = {};
         uint32_t node_indices[4] = {};
         uint32_t bank_indices[4] = {};
@@ -2639,8 +2714,15 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             continue;
         }
         if (!observation.has_ids) {
+            if (!moe_candidate_prove_route(cgraph, node_index, ids, bank.ne[2], observation.route)) {
+                observation.invalid = true;
+                continue;
+            }
             observation.ids = ids_signature;
             observation.has_ids = true;
+        } else if (static_cast<uint32_t>(node_index) <= observation.route.ids_node_index) {
+            observation.invalid = true;
+            continue;
         }
         observation.seen_roles |= role_bit;
         observation.nodes[role_slot] = node;
@@ -2663,11 +2745,16 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         record = {};
         record.candidate.generation = impl_->state.generation;
         record.candidate.group_index = group_index;
+        record.ids = observation.route.ids;
+        record.ids_root = observation.route.root;
+        record.ids_source = observation.route.source;
         record.layout = group.layout;
         record.n_banks = observation.n_banks;
+        record.ids_root_node_index = observation.route.root_node_index;
+        record.ids_node_index = observation.route.ids_node_index;
         auto & key = execution->groups_[record_index];
         key.candidate = record.candidate;
-        key.ids = observation.ids;
+        key.ids = record.ids;
         key.layout = record.layout;
         key.n_banks = record.n_banks;
         for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
@@ -2728,6 +2815,25 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         if (group.layout != record.layout || group.banks.size() != record.n_banks) {
             return false;
         }
+        uint32_t first_node_index = static_cast<uint32_t>(n_nodes);
+        for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+                role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
+            const bool required = record.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
+                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
+                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ||
+                    role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+            if (required) {
+                const uint32_t role_slot = role - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+                first_node_index = std::min(first_node_index, record.node_indices[role_slot]);
+            }
+        }
+        moe_candidate_route_proof current_route;
+        if (group.banks.empty() || !moe_candidate_prove_route(cgraph, first_node_index, record.ids.tensor, group.banks[0].ne[2], current_route) ||
+                current_route.root_node_index != record.ids_root_node_index || current_route.ids_node_index != record.ids_node_index ||
+                !moe_candidate_ids_equal(current_route.ids, record.ids) || !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
+                !moe_candidate_ids_equal(current_route.source, record.ids_source)) {
+            return false;
+        }
         ggml_cuda_moe_ids_signature ids_signature;
         bool has_ids = false;
         uint32_t seen_roles = 0;
@@ -2752,7 +2858,8 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             if (node == nullptr || node != record.nodes[role_slot] || node->op != GGML_OP_MUL_MAT_ID ||
                     (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
                     bank.info.role != role || !moe_candidate_record_matches(bank, node->src[0]) || !moe_candidate_ids_valid(ids) ||
-                    ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || node->ne[2] != 1 || node->ne[3] != 1) {
+                    node_index <= record.ids_node_index || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+                    node->ne[2] != 1 || node->ne[3] != 1) {
                 return false;
             }
             const auto current_ids = moe_candidate_ids_signature(ids);
@@ -2770,6 +2877,9 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) | (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
                 (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
         if (!has_ids || seen_roles != expected_roles) {
+            return false;
+        }
+        if (!moe_candidate_ids_equal(ids_signature, record.ids)) {
             return false;
         }
         auto & key = execution->groups_[record_index];

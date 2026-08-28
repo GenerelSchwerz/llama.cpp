@@ -160,8 +160,13 @@ private:
 
     struct group_record {
         ggml_cuda_moe_candidate_group_key candidate;
+        ggml_cuda_moe_ids_signature ids;
+        ggml_cuda_moe_ids_signature ids_root;
+        ggml_cuda_moe_ids_signature ids_source;
         uint32_t layout;
         uint32_t n_banks;
+        uint32_t ids_root_node_index;
+        uint32_t ids_node_index;
         const ggml_tensor * nodes[4];
         uint32_t node_indices[4];
         uint32_t bank_indices[4];
