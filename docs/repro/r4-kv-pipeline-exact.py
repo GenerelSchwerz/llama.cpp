@@ -1,10 +1,11 @@
 # Greedy server output, hashed, over several prefill corpora and prefill lengths.
-# Run through r4-kv-pipeline-exact.sh. Compare the hashes across pipeline depths and against a
-# build of the parent commit: the pipelined path must reproduce the ordered path exactly.
+# Run through r4-kv-pipeline-exact.sh. The pipelined path must reproduce depth 0 exactly.
 import hashlib, json, sys, urllib.request
 
 PORT = sys.argv[1]
 LENGTHS = [int(x) for x in sys.argv[2].split(",")]   # approximate prefill tokens
+RESULTS_PATH = sys.argv[3]
+RESULTS = []
 
 # Four corpora with different token statistics, so that the deliveries being pipelined are not
 # always the same shape of content: prose, source code, structured records, and dialogue.
@@ -72,7 +73,9 @@ def ask(label, prompt, ntok, want_prefill):
     # produces is not comparable to a fresh prefill, so say so rather than reporting it silently
     prompt_n = t.get("prompt_n") or 0
     reused = prompt_n < want_prefill // 2
-    print(f"{label:<18} {hashlib.sha256(text.encode()).hexdigest()[:16]} "
+    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+    RESULTS.append(f"{label} {digest}\n")
+    print(f"{label:<18} {digest} "
           f"prompt_n={prompt_n:<7} n={t.get('predicted_n'):<4} "
           f"pp={t.get('prompt_per_second'):8.2f} tg={t.get('predicted_per_second'):7.3f}"
           f"{'  CACHE_REUSE' if reused else ''}", flush=True)
@@ -84,4 +87,6 @@ for length in LENGTHS:
     for name in CORPORA:
         prompt = nonce(name, length) + filler(name, length) + "\n\n" + QUESTIONS[name]
         ok &= ask(f"{name}@{length}", prompt, ntok, length)
+with open(RESULTS_PATH, "w", encoding="utf-8") as f:
+    f.writelines(RESULTS)
 sys.exit(0 if ok else 1)
