@@ -2667,6 +2667,10 @@ bool ggml_cuda_moe_grouped_context::get_clock_bound_for_test(
     return true;
 }
 
+uint64_t ggml_cuda_moe_grouped_context::legacy_op_count_for_test(bool is_decode) const {
+    return impl_->legacy_op_stats[moe_cache_phase_index(is_decode)].ops.load(std::memory_order_relaxed);
+}
+
 int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot) {
     auto publish_failure = [&](ggml_cuda_moe_candidate_rejection rejection, uint32_t n_slots, int32_t result) {
         std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
