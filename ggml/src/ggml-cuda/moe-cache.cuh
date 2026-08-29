@@ -482,12 +482,6 @@ private:
         int32_t flags;
     };
 
-    struct source_use_witness {
-        const ggml_tensor * tensor;
-        int32_t use_count;
-        uint32_t present;
-    };
-
     struct group_observation {
         ggml_cuda_moe_ids_signature ids;
         ggml_cuda_moe_ids_signature route_root;
@@ -566,7 +560,6 @@ private:
 
     std::vector<group_record> groups_;
     std::vector<mmid_witness> mmid_inventory_;
-    std::vector<source_use_witness> source_uses_;
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
     const void * graph_key_;
