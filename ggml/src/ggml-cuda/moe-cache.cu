@@ -781,12 +781,25 @@ struct moe_candidate_group_record {
 };
 
 struct moe_candidate_reverse_entry {
-    uint32_t group_index;
-    uint32_t bank_index;
+    uint32_t group_index = UINT32_MAX;
+    uint32_t bank_index = UINT32_MAX;
+    uint32_t semantic_group_index = UINT32_MAX;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t status = GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INVALID;
+    uint32_t flags = 0;
+    uint32_t group_flags = 0;
+    uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_INVALID;
+    uint32_t rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+    moe_candidate_bank_record descriptor;
+    bool active = false;
+    bool descriptor_valid = false;
 };
 
 struct moe_candidate_table {
     uint32_t n_slots = 0;
+    uint32_t manifest_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    uint32_t active_weights = 0;
     uint64_t logical_signature = 0;
     uint64_t slot_bound_bytes = 0;
     uint64_t permanent_candidate_bytes = 0;
@@ -927,6 +940,55 @@ static bool moe_candidate_record_matches(const moe_candidate_bank_record & recor
         }
     }
     return true;
+}
+
+static const moe_candidate_reverse_entry * moe_candidate_active_reverse(
+        const moe_candidate_table & table,
+        const ggml_tensor * tensor) {
+    const auto it = table.reverse_map.find(tensor);
+    if (it == table.reverse_map.end() || !it->second.active || it->second.group_index >= table.groups.size() ||
+            it->second.bank_index >= table.groups[it->second.group_index].banks.size()) {
+        return nullptr;
+    }
+    return &it->second;
+}
+
+static bool moe_candidate_reverse_matches(const moe_candidate_table & table, const moe_candidate_reverse_entry & entry, const ggml_tensor * tensor) {
+    if (entry.active && entry.group_index < table.groups.size() && entry.bank_index < table.groups[entry.group_index].banks.size()) {
+        return moe_candidate_record_matches(table.groups[entry.group_index].banks[entry.bank_index], tensor);
+    }
+    return entry.descriptor_valid && moe_candidate_record_matches(entry.descriptor, tensor);
+}
+
+static uint32_t moe_candidate_coverage_reason(const moe_candidate_reverse_entry & entry) {
+    if (entry.active) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED;
+    }
+    if ((entry.flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES) != 0 ||
+            (entry.group_flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) != 0) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_TENSOR_OVERRIDE;
+    }
+    if ((entry.flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA) != 0 ||
+            (entry.group_flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA) != 0) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_ACTIVE_LORA;
+    }
+    if ((entry.group_flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE) != 0) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE;
+    }
+    if (entry.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_UNCLASSIFIED;
+    }
+    if (entry.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+        if (entry.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED ||
+                entry.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE) {
+            return GGML_CUDA_MOE_GRAPH_COVERAGE_EXCLUDED;
+        }
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_NON_ROUTED_BASE;
+    }
+    if (entry.rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+        return GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR;
+    }
+    return GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT;
 }
 
 static const moe_candidate_bank_record * moe_candidate_find_role(const moe_candidate_group_record & group, uint32_t role) {
@@ -1531,10 +1593,22 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
                     !moe_candidate_add(table.slot_bound_bytes, bytes, table.slot_bound_bytes)) {
                 return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
             }
-            const auto inserted = table.reverse_map.emplace(bank.info.tensor, moe_candidate_reverse_entry{group_index, bank_index});
+            moe_candidate_reverse_entry entry;
+            entry.group_index = group_index;
+            entry.bank_index = bank_index;
+            entry.semantic_group_index = group_index;
+            entry.role = bank.info.role;
+            entry.status = GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE;
+            entry.layout = group.layout;
+            entry.domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
+            entry.descriptor = bank;
+            entry.active = true;
+            entry.descriptor_valid = true;
+            const auto inserted = table.reverse_map.emplace(bank.info.tensor, std::move(entry));
             if (!inserted.second) {
                 return GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_TENSOR;
             }
+            ++table.active_weights;
         } else if (!moe_candidate_add(table.permanent_candidate_bytes, bank.info.byte_extent, table.permanent_candidate_bytes)) {
             return GGML_CUDA_MOE_CANDIDATE_REJECT_OVERFLOW;
         }
@@ -1572,6 +1646,207 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build(
         const auto rejection = moe_candidate_group(owner, snapshot.groups[i], i, snapshot.n_slots, tensors, table);
         if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
             return rejection;
+        }
+    }
+    return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+}
+
+static bool moe_candidate_v2_role_status(uint32_t role, uint32_t status) {
+    if (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+        return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT && role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT;
+    }
+    if (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE) {
+        return moe_candidate_is_scale(role);
+    }
+    if (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS) {
+        return moe_candidate_is_bias(role);
+    }
+    if (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE) {
+        return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_INPUT_SCALE &&
+            role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_INPUT_SCALE;
+    }
+    return (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED ||
+            status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED ||
+            status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE) &&
+        role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+}
+
+static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
+        ggml_backend_dev_t owner,
+        const ggml_backend_moe_candidate_snapshot_v2 & snapshot,
+        moe_candidate_table & table) {
+    const uint32_t snapshot_flags = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_TENSOR_OVERRIDES |
+        GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+    const uint32_t group_flags = GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA |
+        GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES |
+        GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+    const uint32_t tensor_flags = GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER |
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA |
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES;
+    if ((snapshot.flags & ~snapshot_flags) != 0 || snapshot.reserved32 != 0 || snapshot.reserved[0] != 0 || snapshot.reserved[1] != 0 ||
+            snapshot.n_groups > GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS || snapshot.n_tensors > GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2 ||
+            (snapshot.n_groups > 0 && snapshot.groups == nullptr) || (snapshot.n_tensors > 0 && snapshot.tensors == nullptr)) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_COUNT;
+    }
+
+    std::vector<std::vector<const ggml_backend_moe_candidate_tensor_v2 *>> records(snapshot.n_groups);
+    std::unordered_set<const ggml_tensor *> tensors;
+    tensors.reserve(snapshot.n_tensors);
+    for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+        const auto & group = snapshot.groups[group_index];
+        if (group.reserved != 0 || (group.flags & ~group_flags) != 0 ||
+                (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID && group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+                 group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED) ||
+                (group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY && group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK)) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_FLAGS;
+        }
+    }
+    for (uint32_t tensor_index = 0; tensor_index < snapshot.n_tensors; ++tensor_index) {
+        const auto & record = snapshot.tensors[tensor_index];
+        if (record.tensor == nullptr || record.reserved != 0 || (record.flags & ~tensor_flags) != 0 ||
+                !moe_candidate_v2_role_status(record.role, record.status) || !tensors.insert(record.tensor).second) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR;
+        }
+        const bool ungrouped = record.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED ||
+            record.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED ||
+            record.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE;
+        if ((ungrouped && record.group_index != UINT32_MAX) || (!ungrouped && record.group_index >= snapshot.n_groups)) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
+        }
+        const bool cached = record.tensor->buffer != nullptr &&
+            ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(record.tensor->buffer));
+        if (cached != ((record.flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) != 0)) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR;
+        }
+        if (!ungrouped) {
+            records[record.group_index].push_back(&record);
+        }
+    }
+
+    struct active_group_storage {
+        uint32_t semantic_group_index;
+        std::vector<ggml_backend_moe_candidate_bank_v1> banks;
+    };
+    std::vector<active_group_storage> active_storage;
+    std::vector<uint32_t> group_rejections(snapshot.n_groups, GGML_CUDA_MOE_CANDIDATE_REJECT_NONE);
+    std::vector<uint32_t> active_group_indices(snapshot.n_groups, UINT32_MAX);
+    active_storage.reserve(snapshot.n_groups);
+    const bool snapshot_dormant = snapshot.flags != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE;
+    for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+        const auto & group = snapshot.groups[group_index];
+        if (snapshot_dormant || group.flags != GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_NONE ||
+                group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY ||
+                (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+                 group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP)) {
+            continue;
+        }
+
+        active_group_storage prospective;
+        prospective.semantic_group_index = group_index;
+        bool bases_cached = true;
+        bool association_valid = true;
+        for (const auto * record : records[group_index]) {
+            if (record->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE) {
+                continue;
+            }
+            if (record->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                bases_cached = bases_cached &&
+                    (record->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) != 0;
+            } else {
+                const uint32_t base_role = moe_candidate_base_role(record->role);
+                const bool has_base = std::any_of(records[group_index].begin(), records[group_index].end(), [&](const auto * base) {
+                    return base->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && base->role == base_role;
+                });
+                association_valid = association_valid && has_base;
+            }
+            prospective.banks.push_back({record->tensor, record->role, 0});
+        }
+        if (!bases_cached || !association_valid) {
+            group_rejections[group_index] = GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
+            continue;
+        }
+
+        ggml_backend_moe_candidate_group_v1 input = {
+            prospective.banks.data(), static_cast<uint32_t>(prospective.banks.size()), group.layout, 0, 0,
+        };
+        ggml_backend_moe_candidate_snapshot_v1 trial_snapshot = {};
+        trial_snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+        trial_snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+        trial_snapshot.struct_size = sizeof(trial_snapshot);
+        trial_snapshot.n_slots = snapshot.n_slots;
+        trial_snapshot.n_groups = 1;
+        trial_snapshot.groups = &input;
+        moe_candidate_table trial;
+        const auto rejection = moe_candidate_build(owner, trial_snapshot, trial);
+        group_rejections[group_index] = rejection;
+        if (rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            active_group_indices[group_index] = active_storage.size();
+            active_storage.push_back(std::move(prospective));
+        }
+    }
+
+    std::vector<ggml_backend_moe_candidate_group_v1> active_groups;
+    active_groups.reserve(active_storage.size());
+    for (const auto & group : active_storage) {
+        const auto & semantic = snapshot.groups[group.semantic_group_index];
+        active_groups.push_back({group.banks.data(), static_cast<uint32_t>(group.banks.size()), semantic.layout, 0, 0});
+    }
+    ggml_backend_moe_candidate_snapshot_v1 active_snapshot = {};
+    active_snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC;
+    active_snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    active_snapshot.struct_size = sizeof(active_snapshot);
+    active_snapshot.n_slots = snapshot.n_slots;
+    active_snapshot.n_groups = active_groups.size();
+    active_snapshot.groups = active_groups.empty() ? nullptr : active_groups.data();
+    const auto active_rejection = moe_candidate_build(owner, active_snapshot, table);
+    if (active_rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+        return active_rejection;
+    }
+    table.manifest_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+
+    for (uint32_t tensor_index = 0; tensor_index < snapshot.n_tensors; ++tensor_index) {
+        const auto & record = snapshot.tensors[tensor_index];
+        if ((record.flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) == 0) {
+            continue;
+        }
+        const uint32_t active_group = record.group_index < active_group_indices.size() ? active_group_indices[record.group_index] : UINT32_MAX;
+        auto reverse = table.reverse_map.find(record.tensor);
+        if (reverse == table.reverse_map.end()) {
+            moe_candidate_reverse_entry entry;
+            entry.group_index = active_group;
+            entry.semantic_group_index = record.group_index;
+            entry.role = record.role;
+            entry.status = record.status;
+            entry.flags = record.flags;
+            if (record.group_index < snapshot.n_groups) {
+                entry.layout = snapshot.groups[record.group_index].layout;
+                entry.domain = snapshot.groups[record.group_index].domain;
+                entry.group_flags = snapshot.groups[record.group_index].flags;
+                entry.rejection = group_rejections[record.group_index];
+            }
+            if (active_group < table.groups.size()) {
+                for (uint32_t bank_index = 0; bank_index < table.groups[active_group].banks.size(); ++bank_index) {
+                    if (table.groups[active_group].banks[bank_index].info.tensor == record.tensor) {
+                        entry.bank_index = bank_index;
+                        break;
+                    }
+                }
+            }
+            entry.descriptor.info.type = record.tensor->type;
+            entry.descriptor.info.role = record.role;
+            entry.descriptor.info.group_index = active_group;
+            entry.descriptor_valid = moe_candidate_source(owner, record.tensor, ggml_nbytes(record.tensor), entry.descriptor) ==
+                GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+            reverse = table.reverse_map.emplace(record.tensor, std::move(entry)).first;
+        } else {
+            reverse->second.semantic_group_index = record.group_index;
+            reverse->second.role = record.role;
+            reverse->second.status = record.status;
+            reverse->second.flags = record.flags;
+            reverse->second.layout = snapshot.groups[record.group_index].layout;
+            reverse->second.domain = snapshot.groups[record.group_index].domain;
+            reverse->second.group_flags = snapshot.groups[record.group_index].flags;
+            reverse->second.rejection = group_rejections[record.group_index];
         }
     }
     return GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
@@ -3132,6 +3407,109 @@ struct ggml_cuda_moe_grouped_context::impl {
         refreshing[group_index] = 0;
         return true;
     }
+
+    int32_t publish_failure(ggml_cuda_moe_candidate_rejection rejection, uint32_t n_slots, int32_t result) {
+        std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
+        legacy_record_map retired_legacy;
+        resource_slots retired;
+        uint32_t old_registered_groups = 0;
+        int32_t published = result;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (draining) {
+                return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+            }
+            replacement_pending = true;
+            resource_cv.wait(lock, [&]() {
+                return !has_active_transaction() && active_maintenance == 0 && active_legacy_operations == 0 &&
+                    !has_active_legacy_lease() && !has_active_group_call();
+            });
+            retired = detach_resources();
+            retired_legacy = detach_legacy_records();
+            old_registered_groups = state.accepted ? static_cast<uint32_t>(table.groups.size()) : 0;
+            refreshing.fill(0);
+            authority_transition_pending = false;
+        }
+        retire_resources(std::move(retired));
+        retire_legacy_records(std::move(retired_legacy));
+        fold_grouped_debug_telemetry(old_registered_groups);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            (void) reset_group_authorities(0);
+            table = {};
+            if (state.generation == UINT64_MAX) {
+                state = {};
+                state.generation = UINT64_MAX;
+                state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
+                published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+            } else {
+                const uint64_t generation = state.generation + 1;
+                state = {};
+                state.generation = generation;
+                state.n_slots = n_slots;
+                state.rejection = rejection;
+            }
+            replacement_pending = false;
+        }
+        resource_cv.notify_all();
+        return published;
+    }
+
+    int32_t publish(moe_candidate_table && replacement) {
+        std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
+        legacy_record_map retired_legacy;
+        resource_slots retired;
+        uint32_t old_registered_groups = 0;
+        int32_t published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED;
+        {
+            std::unique_lock<std::mutex> lock(mutex);
+            if (draining) {
+                return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+            }
+            replacement_pending = true;
+            resource_cv.wait(lock, [&]() {
+                return !has_active_transaction() && active_maintenance == 0 && active_legacy_operations == 0 &&
+                    !has_active_legacy_lease() && !has_active_group_call();
+            });
+            retired = detach_resources();
+            retired_legacy = detach_legacy_records();
+            old_registered_groups = state.accepted ? static_cast<uint32_t>(table.groups.size()) : 0;
+            refreshing.fill(0);
+            authority_transition_pending = false;
+        }
+        retire_resources(std::move(retired));
+        retire_legacy_records(std::move(retired_legacy));
+        fold_grouped_debug_telemetry(old_registered_groups);
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (state.generation == UINT64_MAX || replacement.groups.size() > UINT64_MAX - next_group_authority_epoch) {
+                const uint64_t generation = state.generation == UINT64_MAX ? UINT64_MAX : state.generation + 1;
+                group_authorities = {};
+                table = {};
+                state = {};
+                state.generation = generation;
+                state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
+                published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+            } else {
+                const uint64_t generation = state.generation + 1;
+                const bool reset = reset_group_authorities(static_cast<uint32_t>(replacement.groups.size()));
+                GGML_ASSERT(reset);
+                table = std::move(replacement);
+                state = {};
+                state.generation = generation;
+                state.logical_signature = table.logical_signature;
+                state.slot_bound_bytes = table.slot_bound_bytes;
+                state.permanent_candidate_bytes = table.permanent_candidate_bytes;
+                state.n_slots = table.n_slots;
+                state.n_groups = table.groups.size();
+                state.n_weights = table.active_weights;
+                state.accepted = 1;
+            }
+            replacement_pending = false;
+        }
+        resource_cv.notify_all();
+        return published;
+    }
 };
 
 ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device) :
@@ -3262,126 +3640,46 @@ ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::take_groupe
 }
 
 int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot) {
-    auto publish_failure = [&](ggml_cuda_moe_candidate_rejection rejection, uint32_t n_slots, int32_t result) {
-        std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
-        impl::legacy_record_map retired_legacy;
-        impl::resource_slots retired;
-        uint32_t old_registered_groups = 0;
-        int32_t published = result;
-        {
-            std::unique_lock<std::mutex> lock(impl_->mutex);
-            if (impl_->draining) {
-                return static_cast<int32_t>(GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
-            }
-            impl_->replacement_pending = true;
-            impl_->resource_cv.wait(lock, [&]() {
-                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
-                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
-            });
-            retired = impl_->detach_resources();
-            retired_legacy = impl_->detach_legacy_records();
-            old_registered_groups = impl_->state.accepted ? static_cast<uint32_t>(impl_->table.groups.size()) : 0;
-            impl_->refreshing.fill(0);
-            impl_->authority_transition_pending = false;
-        }
-        impl::retire_resources(std::move(retired));
-        impl_->retire_legacy_records(std::move(retired_legacy));
-        impl_->fold_grouped_debug_telemetry(old_registered_groups);
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            (void) impl_->reset_group_authorities(0);
-            impl_->table = {};
-            if (impl_->state.generation == UINT64_MAX) {
-                impl_->state = {};
-                impl_->state.generation = UINT64_MAX;
-                impl_->state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
-                published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
-            } else {
-                const uint64_t generation = impl_->state.generation + 1;
-                impl_->state = {};
-                impl_->state.generation = generation;
-                impl_->state.n_slots = n_slots;
-                impl_->state.rejection = rejection;
-            }
-            impl_->replacement_pending = false;
-        }
-        impl_->resource_cv.notify_all();
-        return published;
-    };
-
     if (snapshot == nullptr) {
-        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT);
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT);
     }
     if (snapshot->magic != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC ||
             snapshot->abi_version != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION ||
             snapshot->struct_size != sizeof(*snapshot)) {
-        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
     }
 
     try {
         moe_candidate_table table;
         const auto rejection = moe_candidate_build(impl_->owner, *snapshot, table);
         if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
-            return publish_failure(rejection, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+            return impl_->publish_failure(rejection, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
         }
-
-        std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
-        impl::legacy_record_map retired_legacy;
-        impl::resource_slots retired;
-        uint32_t old_registered_groups = 0;
-        int32_t published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED;
-        {
-            std::unique_lock<std::mutex> lock(impl_->mutex);
-            if (impl_->draining) {
-                return static_cast<int32_t>(GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
-            }
-            impl_->replacement_pending = true;
-            impl_->resource_cv.wait(lock, [&]() {
-                return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
-                    impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
-            });
-            retired = impl_->detach_resources();
-            retired_legacy = impl_->detach_legacy_records();
-            old_registered_groups = impl_->state.accepted ? static_cast<uint32_t>(impl_->table.groups.size()) : 0;
-            impl_->refreshing.fill(0);
-            impl_->authority_transition_pending = false;
-        }
-        impl::retire_resources(std::move(retired));
-        impl_->retire_legacy_records(std::move(retired_legacy));
-        impl_->fold_grouped_debug_telemetry(old_registered_groups);
-        {
-            std::lock_guard<std::mutex> lock(impl_->mutex);
-            if (impl_->state.generation == UINT64_MAX || table.groups.size() > UINT64_MAX - impl_->next_group_authority_epoch) {
-                const uint64_t generation = impl_->state.generation == UINT64_MAX ? UINT64_MAX : impl_->state.generation + 1;
-                impl_->group_authorities = {};
-                impl_->table = {};
-                impl_->state = {};
-                impl_->state.generation = generation;
-                impl_->state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
-                published = GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
-            } else {
-                const uint64_t generation = impl_->state.generation + 1;
-                const bool reset = impl_->reset_group_authorities(static_cast<uint32_t>(table.groups.size()));
-                GGML_ASSERT(reset);
-                impl_->table = std::move(table);
-                impl_->state = {};
-                impl_->state.generation = generation;
-                impl_->state.logical_signature = impl_->table.logical_signature;
-                impl_->state.slot_bound_bytes = impl_->table.slot_bound_bytes;
-                impl_->state.permanent_candidate_bytes = impl_->table.permanent_candidate_bytes;
-                impl_->state.n_slots = impl_->table.n_slots;
-                impl_->state.n_groups = impl_->table.groups.size();
-                impl_->state.n_weights = impl_->table.reverse_map.size();
-                impl_->state.accepted = 1;
-            }
-            impl_->replacement_pending = false;
-        }
-        impl_->resource_cv.notify_all();
-        return published;
+        return impl_->publish(std::move(table));
     } catch (const std::bad_alloc &) {
-        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
     } catch (...) {
-        return publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
+    }
+}
+
+int32_t ggml_cuda_moe_grouped_context::replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot) {
+    if (snapshot == nullptr) {
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT);
+    }
+    if (snapshot->magic != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC ||
+            snapshot->abi_version != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION || snapshot->struct_size != sizeof(*snapshot)) {
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ABI, 0, GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ABI);
+    }
+    try {
+        moe_candidate_table table;
+        const auto rejection = moe_candidate_build_v2(impl_->owner, *snapshot, table);
+        if (rejection != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE) {
+            return impl_->publish_failure(rejection, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED);
+        }
+        return impl_->publish(std::move(table));
+    } catch (...) {
+        return impl_->publish_failure(GGML_CUDA_MOE_CANDIDATE_REJECT_ALLOCATION, snapshot->n_slots, GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR);
     }
 }
 
@@ -3418,12 +3716,12 @@ bool ggml_cuda_moe_grouped_context::find_down_group_key(
 
 bool ggml_cuda_moe_grouped_context::find_weight(const ggml_tensor * tensor, ggml_cuda_moe_candidate_bank_info * info) const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto it = impl_->table.reverse_map.find(tensor);
-    if (!impl_->state.accepted || it == impl_->table.reverse_map.end()) {
+    const auto * entry = moe_candidate_active_reverse(impl_->table, tensor);
+    if (!impl_->state.accepted || entry == nullptr) {
         return false;
     }
     if (info != nullptr) {
-        *info = impl_->table.groups[it->second.group_index].banks[it->second.bank_index].info;
+        *info = impl_->table.groups[entry->group_index].banks[entry->bank_index].info;
         info->generation = impl_->state.generation;
     }
     return true;
@@ -3605,19 +3903,19 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                 prospective->nb[dim] = tensor->nb[dim];
             }
             if (impl_->state.accepted) {
-                const auto reverse = impl_->table.reverse_map.find(tensor);
-                if (reverse != impl_->table.reverse_map.end()) {
-                    const auto & bank = impl_->table.groups[reverse->second.group_index].banks[reverse->second.bank_index];
+                const auto * reverse = moe_candidate_active_reverse(impl_->table, tensor);
+                if (reverse != nullptr) {
+                    const auto & bank = impl_->table.groups[reverse->group_index].banks[reverse->bank_index];
                     if (!moe_candidate_record_matches(bank, tensor) ||
                             bank.info.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
                         return result;
                     }
-                    const auto & group_authority = impl_->group_authorities[reverse->second.group_index];
+                    const auto & group_authority = impl_->group_authorities[reverse->group_index];
                     if (group_authority.admission_closed ||
                             group_authority.authority != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
                         return result;
                     }
-                    prospective->acquisition.group_index = reverse->second.group_index;
+                    prospective->acquisition.group_index = reverse->group_index;
                     prospective->acquisition.role = bank.info.role;
                     prospective->acquisition.group_authority_epoch = group_authority.epoch;
                     prospective->acquisition.registered_source = 1;
@@ -3858,18 +4156,17 @@ bool ggml_cuda_moe_grouped_context::probe(
                 (i > 0 && observed.weight == input.banks[0].weight)) {
             return false;
         }
-        const auto reverse = impl_->table.reverse_map.find(observed.weight);
-        if (reverse == impl_->table.reverse_map.end()) {
+        const auto * entry = moe_candidate_active_reverse(impl_->table, observed.weight);
+        if (entry == nullptr) {
             return false;
         }
-        const auto & entry = reverse->second;
-        const auto & record = impl_->table.groups[entry.group_index].banks[entry.bank_index];
+        const auto & record = impl_->table.groups[entry->group_index].banks[entry->bank_index];
         if (!moe_candidate_record_matches(record, observed.weight) ||
                 (observed.expected_role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID && observed.expected_role != record.info.role) ||
-                (i > 0 && entry.group_index != group_index)) {
+                (i > 0 && entry->group_index != group_index)) {
             return false;
         }
-        group_index = entry.group_index;
+        group_index = entry->group_index;
         roles[i] = record.info.role;
     }
     if (input.n_banks == 2 && roles[0] == roles[1]) {
@@ -4258,6 +4555,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->coverage_epoch_ = coverage_valid ? coverage_epoch : 0;
     plan->initialized_ = true;
     auto & diagnostics = plan->coverage_diagnostics_;
+    diagnostics.manifest_version = impl_->table.manifest_version;
     for (int node_index = 0; node_index < plan->graph_node_count_; ++node_index) {
         const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
@@ -4274,12 +4572,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         if (reverse != impl_->table.reverse_map.end()) {
             group_index = reverse->second.group_index;
             bank_index = reverse->second.bank_index;
-            if (group_index >= impl_->table.groups.size() || bank_index >= impl_->table.groups[group_index].banks.size()) {
+            if (!reverse->second.descriptor_valid) {
                 reason = GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP;
-            } else if (!moe_candidate_record_matches(impl_->table.groups[group_index].banks[bank_index], source)) {
+            } else if (!moe_candidate_reverse_matches(impl_->table, reverse->second, source)) {
                 reason = GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED;
             } else {
-                reason = GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED;
+                reason = moe_candidate_coverage_reason(reverse->second);
             }
         }
         ++diagnostics.counts[reason];
@@ -4288,6 +4586,16 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             diagnostics.first_node_index[reason] = node_index;
             diagnostics.first_group_index[reason] = group_index;
             diagnostics.first_bank_index[reason] = bank_index;
+            if (reverse != impl_->table.reverse_map.end()) {
+                diagnostics.first_group_index[reason] = reverse->second.semantic_group_index;
+                diagnostics.first_role[reason] = reverse->second.role;
+                diagnostics.first_status[reason] = reverse->second.status;
+                diagnostics.first_layout[reason] = reverse->second.layout;
+                diagnostics.first_domain[reason] = reverse->second.domain;
+                diagnostics.first_flags[reason] = reverse->second.flags;
+                diagnostics.first_group_flags[reason] = reverse->second.group_flags;
+                diagnostics.first_rejection[reason] = reverse->second.rejection;
+            }
         }
     }
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
@@ -4344,11 +4652,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             if (reader == nullptr || reader->op != GGML_OP_MUL_MAT_ID || reader->src[0] == nullptr) {
                 continue;
             }
-            const auto reverse = impl_->table.reverse_map.find(reader->src[0]);
-            if (reverse == impl_->table.reverse_map.end() || reverse->second.group_index >= impl_->table.groups.size()) {
+            const auto * reverse = moe_candidate_active_reverse(impl_->table, reader->src[0]);
+            if (reverse == nullptr) {
                 continue;
             }
-            auto & observation = observations[reverse->second.group_index];
+            auto & observation = observations[reverse->group_index];
             auto found = observation.n_readers;
             for (uint32_t i = 0; i < observation.n_readers; ++i) {
                 if (observation.readers[i].output.tensor == reader) {
@@ -4376,11 +4684,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         if (node->op != GGML_OP_MUL_MAT_ID || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr) {
             continue;
         }
-        const auto reverse = impl_->table.reverse_map.find(node->src[0]);
-        if (reverse == impl_->table.reverse_map.end() || reverse->second.group_index >= impl_->table.groups.size()) {
+        const auto * reverse = moe_candidate_active_reverse(impl_->table, node->src[0]);
+        if (reverse == nullptr) {
             continue;
         }
-        const auto & entry = reverse->second;
+        const auto & entry = *reverse;
         const auto & group = impl_->table.groups[entry.group_index];
         const auto & bank = group.banks[entry.bank_index];
         auto & observation = observations[entry.group_index];
@@ -4818,10 +5126,9 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
                     (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->src[0] == nullptr) {
                 return false;
             }
-            const auto reverse = impl_->table.reverse_map.find(node->src[0]);
-            if (reverse == impl_->table.reverse_map.end() || reverse->second.group_index != record.candidate.group_index ||
-                    reverse->second.bank_index >= group.banks.size() ||
-                    !moe_candidate_record_matches(group.banks[reverse->second.bank_index], node->src[0])) {
+            const auto * reverse = moe_candidate_active_reverse(impl_->table, node->src[0]);
+            if (reverse == nullptr || reverse->group_index != record.candidate.group_index ||
+                    !moe_candidate_record_matches(group.banks[reverse->bank_index], node->src[0])) {
                 return false;
             }
             auto & dispatch = execution->groups_[record_index];
@@ -5036,7 +5343,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 return false;
             }
         }
-        legacy_capacity = impl_->table.reverse_map.size();
+        legacy_capacity = impl_->table.active_weights;
         resource_capacity = impl_->resources.size();
     }
 
@@ -5465,6 +5772,25 @@ extern "C"
 int32_t ggml_backend_cuda_moe_candidate_replace_v1(
         ggml_backend_t backend,
         const ggml_backend_moe_candidate_snapshot_v1 * snapshot) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || backend->device == nullptr) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT;
+    }
+
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    try {
+        std::call_once(ctx->moe_grouped_context_once, [&]() {
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device);
+        });
+    } catch (...) {
+        return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
+    }
+    return ctx->moe_grouped_context->replace(snapshot);
+}
+
+extern "C"
+int32_t ggml_backend_cuda_moe_candidate_replace_v2(
+        ggml_backend_t backend,
+        const ggml_backend_moe_candidate_snapshot_v2 * snapshot) {
     if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || backend->device == nullptr) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_INVALID_ARGUMENT;
     }

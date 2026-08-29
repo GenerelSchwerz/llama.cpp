@@ -496,6 +496,24 @@ static ggml_backend_moe_candidate_snapshot_v1 candidate_snapshot(
     return result;
 }
 
+static ggml_backend_moe_candidate_snapshot_v2 candidate_snapshot_v2(
+        uint32_t n_slots,
+        const ggml_backend_moe_candidate_group_v2 * groups,
+        uint32_t n_groups,
+        const ggml_backend_moe_candidate_tensor_v2 * tensors,
+        uint32_t n_tensors) {
+    ggml_backend_moe_candidate_snapshot_v2 result = {};
+    result.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
+    result.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+    result.struct_size = sizeof(result);
+    result.n_slots = n_slots;
+    result.groups = groups;
+    result.n_groups = n_groups;
+    result.tensors = tensors;
+    result.n_tensors = n_tensors;
+    return result;
+}
+
 struct candidate_graph_holder {
     void reset() {
         plan.reset();
@@ -730,6 +748,17 @@ static const ggml_backend_moe_candidate_bank_v1 * candidate_bank(
     return nullptr;
 }
 
+static const ggml_backend_moe_candidate_tensor_v2 * candidate_tensor(
+        const ggml_backend_moe_candidate_snapshot_v2 & snapshot,
+        const ggml_tensor * tensor) {
+    for (uint32_t i = 0; i < snapshot.n_tensors; ++i) {
+        if (snapshot.tensors[i].tensor == tensor) {
+            return &snapshot.tensors[i];
+        }
+    }
+    return nullptr;
+}
+
 static void test_candidate_graph_coverage_ledger() {
     candidate_test_fixture fixture;
     const int64_t gate_up_ne[] = {64, 64, 4};
@@ -798,6 +827,99 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 3);
     CHECK(execution.size() == 0);
     CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, {0, 0}));
+
+    ggml_tensor * ungated_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * ungated_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * chunk_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * chunk_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * lora_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * lora_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * override_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * override_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * incomplete_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * incomplete_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * unsupported_gate_up = fixture.cached_tensor(GGML_TYPE_F16, 3, gate_up_ne);
+    ggml_tensor * unsupported_down = fixture.cached_tensor(GGML_TYPE_F16, 3, down_ne);
+    ggml_tensor * excluded_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * opaque_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * missing_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    std::array<ggml_backend_moe_candidate_group_v2, 7> v2_groups = {{
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, 0, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY,
+            GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY,
+            GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY,
+            GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+    }};
+    constexpr uint32_t cached = GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
+    std::array<ggml_backend_moe_candidate_tensor_v2, 16> v2_tensors = {{
+        {gate_up, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {down, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {ungated_up, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {ungated_down, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_gate_up, 2, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_down, 2, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {lora_gate_up, 3, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE,
+            cached | GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA, 0},
+        {lora_down, 3, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {override_gate_up, 4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE,
+            cached | GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES, 0},
+        {override_down, 4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {incomplete_gate_up, 5, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {incomplete_down, 5, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {unsupported_gate_up, 6, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {unsupported_down, 6, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {excluded_cached, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID,
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED, cached, 0},
+        {opaque_cached, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID,
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED, cached, 0},
+    }};
+    const auto v2_snapshot = candidate_snapshot_v2(12, v2_groups.data(), v2_groups.size(), v2_tensors.data(), v2_tensors.size());
+    CHECK(registry.replace(&v2_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 1 && registry.state().n_weights == 2);
+
+    const candidate_route v2_route = candidate_top_k_route(fixture, 4, 2);
+    std::array<ggml_tensor *, 11> v2_readers = {{
+        candidate_mmid(fixture, gate_up, v2_route.ids),
+        candidate_mmid(fixture, down, v2_route.ids),
+        candidate_mmid(fixture, ungated_up, v2_route.ids),
+        candidate_mmid(fixture, chunk_gate_up, v2_route.ids),
+        candidate_mmid(fixture, lora_gate_up, v2_route.ids),
+        candidate_mmid(fixture, override_gate_up, v2_route.ids),
+        candidate_mmid(fixture, incomplete_gate_up, v2_route.ids),
+        candidate_mmid(fixture, unsupported_gate_up, v2_route.ids),
+        candidate_mmid(fixture, excluded_cached, v2_route.ids),
+        candidate_mmid(fixture, opaque_cached, v2_route.ids),
+        candidate_mmid(fixture, missing_cached, v2_route.ids),
+    }};
+    ggml_cgraph * v2_graph = ggml_new_graph_custom(fixture.ctx, 32, false);
+    ggml_graph_add_node(v2_graph, v2_route.root);
+    ggml_graph_add_node(v2_graph, v2_route.ids);
+    for (ggml_tensor * reader : v2_readers) {
+        ggml_graph_add_node(v2_graph, reader);
+    }
+    candidate_rebuild_graph_uses(v2_graph);
+    registry.compile_graph_plan(v2_graph, 905, &plan, &execution);
+    const auto & v2_diagnostics = plan.coverage_diagnostics();
+    CHECK(v2_diagnostics.manifest_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION);
+    CHECK(v2_diagnostics.cached_mmid == v2_readers.size());
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 2);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == 2);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_ACTIVE_LORA] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_TENSOR_OVERRIDE] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_EXCLUDED] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_UNCLASSIFIED] == 1);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
+    CHECK(v2_diagnostics.first_domain[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+    CHECK(v2_diagnostics.first_rejection[GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR] ==
+        GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
+    CHECK(execution.size() == 1 && execution.find(v2_readers[1], nullptr));
     fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
 }
 
@@ -821,38 +943,44 @@ static void test_candidate_producer() {
 
     auto & separate = model->layers[0];
     separate.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
-    separate.ffn_gate_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
-    separate.ffn_up_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_ne);
-    separate.ffn_down_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
-    separate.ffn_gate_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
-    separate.ffn_up_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
-    separate.ffn_down_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
-    separate.ffn_gate_exps_b = fixture.tensor(GGML_TYPE_F32, 2, gate_bias_ne);
-    separate.ffn_up_exps_b = fixture.tensor(GGML_TYPE_F32, 2, gate_bias_ne);
-    separate.ffn_down_exps_b = fixture.tensor(GGML_TYPE_F32, 2, down_bias_ne);
+    separate.ffn_gate_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    separate.ffn_up_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    separate.ffn_down_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    separate.ffn_gate_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_up_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_down_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
+    separate.ffn_gate_exps_b = fixture.cached_tensor(GGML_TYPE_F32, 2, gate_bias_ne);
+    separate.ffn_up_exps_b = fixture.cached_tensor(GGML_TYPE_F32, 2, gate_bias_ne);
+    separate.ffn_down_exps_b = fixture.cached_tensor(GGML_TYPE_F32, 2, down_bias_ne);
     separate.ffn_gate = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
     separate.ffn_up_shexp = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
-    separate.ffn_gate_exps_in_s = fixture.tensor(GGML_TYPE_F32, 1, scalar_ne);
+    separate.ffn_gate_exps_in_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scalar_ne);
 
     auto & fused = model->layers[1];
     fused.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
-    fused.ffn_gate_up_exps = fixture.tensor(GGML_TYPE_BF16, 3, fused_ne);
-    fused.ffn_down_exps = fixture.tensor(GGML_TYPE_BF16, 3, down_ne);
-    fused.ffn_gate_up_exps_b = fixture.tensor(GGML_TYPE_F32, 2, fused_bias_ne);
-    fused.ffn_down_exps_b = fixture.tensor(GGML_TYPE_F32, 2, down_bias_ne);
+    fused.ffn_gate_up_exps = fixture.cached_tensor(GGML_TYPE_BF16, 3, fused_ne);
+    fused.ffn_down_exps = fixture.cached_tensor(GGML_TYPE_BF16, 3, down_ne);
+    fused.ffn_gate_up_exps_b = fixture.cached_tensor(GGML_TYPE_F32, 2, fused_bias_ne);
+    fused.ffn_down_exps_b = fixture.cached_tensor(GGML_TYPE_F32, 2, down_bias_ne);
 
     auto & nvfp4 = model->layers[2];
     nvfp4.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
-    nvfp4.ffn_gate_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
-    nvfp4.ffn_up_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
-    nvfp4.ffn_down_exps = fixture.tensor(GGML_TYPE_NVFP4, 3, fused_ne);
-    nvfp4.ffn_gate_exps_in_s = fixture.tensor(GGML_TYPE_F32, 1, scalar_ne);
+    nvfp4.ffn_gate_exps = fixture.cached_tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_up_exps = fixture.cached_tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_down_exps = fixture.cached_tensor(GGML_TYPE_NVFP4, 3, fused_ne);
+    nvfp4.ffn_gate_exps_in_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scalar_ne);
     nvfp4.ffn_down_shexp = fixture.tensor(GGML_TYPE_BF16, 2, down_ne);
 
     auto & excluded = model->layers[3];
     excluded.ffn_gate = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
     excluded.ffn_up_shexp = fixture.tensor(GGML_TYPE_BF16, 2, gate_ne);
     excluded.ffn_down_shexp = fixture.tensor(GGML_TYPE_BF16, 2, down_ne);
+    excluded.ffn_up_chexps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_ne);
+    excluded.ffn_down_chexps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+
+    ggml_tensor * opaque_cached = fixture.cached_tensor(GGML_TYPE_Q8_K, 3, gate_ne);
+    model->tensors_by_name.push_back({"opaque.cached", opaque_cached});
+    model->tensors_by_name.push_back({"opaque.alias", opaque_cached});
 
     ggml_set_name(separate.ffn_gate_exps, "blk.0.ffn_gate_exps.weight");
     ggml_set_name(separate.ffn_up_exps, "blk.0.ffn_up_exps.weight");
@@ -861,52 +989,103 @@ static void test_candidate_producer() {
     llama_adapter_loras loras;
     llama_moe_candidate_snapshot produced(*model, loras);
     const auto & snapshot = produced.get();
-    CHECK(snapshot.magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC);
-    CHECK(snapshot.abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION);
+    CHECK(snapshot.magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC);
+    CHECK(snapshot.abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION);
     CHECK(snapshot.struct_size == sizeof(snapshot));
-    CHECK(snapshot.n_slots == 12 && snapshot.n_groups == 3);
+    CHECK(snapshot.n_slots == 12 && snapshot.n_groups == 4);
 
     const auto & separate_group = snapshot.groups[0];
     CHECK(separate_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
-    CHECK(separate_group.n_banks == 9);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT)->tensor == separate.ffn_gate_exps);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT)->tensor == separate.ffn_up_exps);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT)->tensor == separate.ffn_down_exps);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE)->tensor == separate.ffn_gate_exps_s);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS)->tensor == separate.ffn_down_exps_b);
-    CHECK(candidate_bank(separate_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BLOCK_SCALE) == nullptr);
-    for (uint32_t i = 0; i < separate_group.n_banks; ++i) {
-        CHECK(separate_group.banks[i].tensor != separate.ffn_gate);
-        CHECK(separate_group.banks[i].tensor != separate.ffn_up_shexp);
-        CHECK(separate_group.banks[i].tensor != separate.ffn_gate_exps_in_s);
-    }
+    CHECK(separate_group.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps)->group_index == 0);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps)->role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps)->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER);
+    CHECK(candidate_tensor(snapshot, separate.ffn_down_exps_s)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+    CHECK(candidate_tensor(snapshot, separate.ffn_down_exps_b)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps_in_s)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate_exps_in_s)->role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_INPUT_SCALE);
 
     const auto & fused_group = snapshot.groups[1];
     CHECK(fused_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
-    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT)->tensor == fused.ffn_gate_up_exps);
-    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS)->tensor == fused.ffn_gate_up_exps_b);
-    CHECK(candidate_bank(fused_group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE) == nullptr);
+    CHECK(candidate_tensor(snapshot, fused.ffn_gate_up_exps)->role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT);
+    CHECK(candidate_tensor(snapshot, fused.ffn_gate_up_exps_b)->role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS);
+
+    const auto & chunk_group = snapshot.groups[3];
+    CHECK(chunk_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED);
+    CHECK(chunk_group.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK);
+    CHECK(candidate_tensor(snapshot, excluded.ffn_up_chexps)->group_index == 3);
+    CHECK(candidate_tensor(snapshot, excluded.ffn_up_chexps)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+    CHECK(candidate_tensor(snapshot, separate.ffn_up_shexp)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED);
+    CHECK(candidate_tensor(snapshot, separate.ffn_gate)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE);
+    CHECK(candidate_tensor(snapshot, opaque_cached)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED);
+    CHECK(candidate_tensor(snapshot, opaque_cached)->group_index == UINT32_MAX);
 
     ggml_cuda_moe_grouped_context registry(&fixture.owner);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().n_groups == 3 && registry.state().n_weights == 8);
+    CHECK(!registry.find_weight(excluded.ffn_up_chexps, nullptr));
+    CHECK(!registry.find_weight(separate.ffn_gate_exps_in_s, nullptr));
+    CHECK(!registry.find_weight(opaque_cached, nullptr));
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 9> separate_v1 = {{
+        {separate.ffn_gate_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {separate.ffn_up_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {separate.ffn_down_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        {separate.ffn_gate_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE, 0},
+        {separate.ffn_up_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE, 0},
+        {separate.ffn_down_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0},
+        {separate.ffn_gate_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, 0},
+        {separate.ffn_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, 0},
+        {separate.ffn_down_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 4> fused_v1 = {{
+        {fused.ffn_gate_up_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {fused.ffn_down_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        {fused.ffn_gate_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS, 0},
+        {fused.ffn_down_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> nvfp4_v1 = {{
+        {nvfp4.ffn_gate_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {nvfp4.ffn_up_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {nvfp4.ffn_down_exps, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_group_v1, 3> groups_v1 = {{
+        {separate_v1.data(), separate_v1.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0},
+        {fused_v1.data(), fused_v1.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
+        {nvfp4_v1.data(), nvfp4_v1.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0},
+    }};
+    ggml_cuda_moe_grouped_context v1_registry(&fixture.owner);
+    const auto v1_snapshot = candidate_snapshot(12, groups_v1.data(), groups_v1.size());
+    CHECK(v1_registry.replace(&v1_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const auto v1_state = v1_registry.state();
+    const auto v2_state = registry.state();
+    CHECK(v1_state.n_groups == v2_state.n_groups && v1_state.n_weights == v2_state.n_weights);
+    CHECK(v1_state.logical_signature == v2_state.logical_signature);
+    CHECK(v1_state.slot_bound_bytes == v2_state.slot_bound_bytes);
+    CHECK(v1_state.permanent_candidate_bytes == v2_state.permanent_candidate_bytes);
 
     llama_adapter_lora adapter(model.get());
     adapter.ab_map.emplace(separate.ffn_gate_exps->name, llama_adapter_lora_weight());
     loras.emplace(&adapter, 1.0f);
     llama_moe_candidate_snapshot lora_on(*model, loras);
-    CHECK(lora_on.get().n_groups == 2);
+    CHECK(lora_on.get().n_groups == 4);
+    CHECK(lora_on.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA);
+    CHECK(candidate_tensor(lora_on.get(), separate.ffn_gate_exps)->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA);
     CHECK(registry.replace(&lora_on.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 2);
     CHECK(!registry.find_weight(separate.ffn_gate_exps, nullptr));
     loras.clear();
     llama_moe_candidate_snapshot lora_off(*model, loras);
-    CHECK(lora_off.get().n_groups == 3);
+    CHECK(lora_off.get().n_groups == 4);
     CHECK(registry.replace(&lora_off.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.find_weight(separate.ffn_gate_exps, nullptr));
 
-    fused.ffn_up_exps_s = separate.ffn_up_exps_s;
+    fused.ffn_up_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
     llama_moe_candidate_snapshot untyped_fused_scale(*model, loras);
-    CHECK(untyped_fused_scale.get().n_groups == 2);
+    CHECK(untyped_fused_scale.get().n_groups == 4);
+    CHECK(registry.replace(&untyped_fused_scale.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 2);
     fused.ffn_up_exps_s = nullptr;
 
     llama_model_tensor_buft_override overrides[] = {{".*", ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}};
@@ -915,7 +1094,9 @@ static void test_candidate_producer() {
     std::unique_ptr<llama_model> overridden(llama_model_create(LLM_ARCH_LLAMA, params));
     overridden->layers = model->layers;
     llama_moe_candidate_snapshot disabled(*overridden, loras);
-    CHECK(disabled.get().n_slots == 48 && disabled.get().n_groups == 0 && disabled.get().groups == nullptr);
+    CHECK(disabled.get().n_slots == 48 && disabled.get().n_groups == 4);
+    CHECK(disabled.get().flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_TENSOR_OVERRIDES);
+    CHECK(candidate_tensor(disabled.get(), separate.ffn_gate_exps)->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES);
     CHECK(registry.replace(&disabled.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 48);
 
@@ -926,22 +1107,21 @@ static void test_candidate_producer() {
     gemma->layers.resize(30);
     for (auto & layer : gemma->layers) {
         layer.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
-        layer.ffn_gate_up_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, fused_ne);
-        layer.ffn_down_exps = fixture.tensor(GGML_TYPE_Q4_0, 3, down_ne);
-        layer.ffn_down_exps_s = fixture.tensor(GGML_TYPE_F32, 1, scale_ne);
+        layer.ffn_gate_up_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, fused_ne);
+        layer.ffn_down_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+        layer.ffn_down_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
     }
     llama_moe_candidate_snapshot gemma_produced(*gemma, loras);
     const auto & gemma_snapshot = gemma_produced.get();
     CHECK(gemma_snapshot.n_slots == 12 && gemma_snapshot.n_groups == 30);
     for (uint32_t group_index = 0; group_index < gemma_snapshot.n_groups; ++group_index) {
         const auto & group = gemma_snapshot.groups[group_index];
-        CHECK(group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && group.n_banks == 3);
-        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT)->tensor ==
-            gemma->layers[group_index].ffn_gate_up_exps);
-        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT)->tensor ==
-            gemma->layers[group_index].ffn_down_exps);
-        CHECK(candidate_bank(group, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE)->tensor ==
-            gemma->layers[group_index].ffn_down_exps_s);
+        CHECK(group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+        CHECK(group.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+        CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_gate_up_exps)->group_index == group_index);
+        CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_down_exps)->group_index == group_index);
+        CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_down_exps_s)->status ==
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
     }
     CHECK(registry.replace(&gemma_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     const auto gemma_state = registry.state();

@@ -351,16 +351,32 @@ enum ggml_cuda_moe_graph_coverage_reason : uint32_t {
     GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS,
     GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED,
     GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_ACTIVE_LORA,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_TENSOR_OVERRIDE,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_NON_ROUTED_BASE,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_EXCLUDED,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_UNCLASSIFIED,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE,
     GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT,
 };
 
 struct ggml_cuda_moe_graph_coverage_diagnostics {
     uint32_t cached_mmid = 0;
+    uint32_t manifest_version = 0;
     uint32_t counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
     const ggml_tensor * first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
     uint32_t first_node_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
     uint32_t first_group_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
     uint32_t first_bank_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_role[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_status[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_layout[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_domain[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_flags[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_group_flags[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_rejection[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
 };
 
 class ggml_cuda_moe_graph_plan {
@@ -582,6 +598,7 @@ public:
     ggml_cuda_moe_grouped_context & operator=(const ggml_cuda_moe_grouped_context &) = delete;
 
     int32_t replace(const ggml_backend_moe_candidate_snapshot_v1 * snapshot);
+    int32_t replace(const ggml_backend_moe_candidate_snapshot_v2 * snapshot);
     ggml_cuda_moe_candidate_registry_state state() const;
     bool find_down_group(const ggml_tensor * tensor, uint32_t * group_index) const;
     bool find_down_group_key(const ggml_tensor * tensor, ggml_cuda_moe_candidate_group_key * key) const;
@@ -715,6 +732,10 @@ struct ggml_cuda_moe_cache;
 int32_t ggml_backend_cuda_moe_candidate_replace_v1(
     ggml_backend_t backend,
     const struct ggml_backend_moe_candidate_snapshot_v1 * snapshot);
+
+int32_t ggml_backend_cuda_moe_candidate_replace_v2(
+    ggml_backend_t backend,
+    const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 
 // Create a cache for one device.
 //   slot_size_bytes : size of one expert weight slab (uniform across slots)

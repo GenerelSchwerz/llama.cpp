@@ -24,17 +24,12 @@ class llama_io_write_i;
 struct llama_moe_candidate_snapshot {
     llama_moe_candidate_snapshot(const llama_model & model, const llama_adapter_loras & loras);
 
-    const ggml_backend_moe_candidate_snapshot_v1 & get() const;
+    const ggml_backend_moe_candidate_snapshot_v2 & get() const;
 
 private:
-    struct group_storage {
-        std::vector<ggml_backend_moe_candidate_bank_v1> banks;
-        uint32_t layout;
-    };
-
-    std::vector<group_storage> storage;
-    std::vector<ggml_backend_moe_candidate_group_v1> groups;
-    ggml_backend_moe_candidate_snapshot_v1 snapshot = {};
+    std::vector<ggml_backend_moe_candidate_group_v2> groups;
+    std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
+    ggml_backend_moe_candidate_snapshot_v2 snapshot = {};
 };
 
 // "memory" as in abstract memory for the context
@@ -403,7 +398,7 @@ private:
     void *              abort_callback_data = nullptr;
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
-    std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v1_t>> moe_candidate_replace_fns;
+    std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v2_t>> moe_candidate_replace_fns;
     bool moe_candidate_refresh_pending = true;
 
     // pointers and buffer types used for the compute buffer of each backend
