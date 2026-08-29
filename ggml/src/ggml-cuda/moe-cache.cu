@@ -803,6 +803,7 @@ struct moe_candidate_reverse_entry {
 struct moe_candidate_table {
     uint32_t n_slots = 0;
     uint32_t manifest_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION;
+    uint32_t submitted_flags = 0;
     uint32_t submitted_groups = 0;
     uint32_t submitted_tensors = 0;
     uint32_t active_weights = 0;
@@ -2002,6 +2003,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
         return active_rejection;
     }
     table.manifest_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+    table.submitted_flags = snapshot.flags;
     table.submitted_groups = snapshot.n_groups;
     table.submitted_tensors = snapshot.n_tensors;
     for (uint32_t active_group = 0; active_group < active_storage.size(); ++active_group) {
@@ -2423,7 +2425,7 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 } // namespace
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), graph_node_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
+    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), coverage_mmid_fingerprint_(0), graph_node_count_(0), coverage_mmid_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
     for (auto & index : coverage_diagnostics_.first_node_index) {
         index = UINT32_MAX;
     }
@@ -2447,7 +2449,9 @@ void ggml_cuda_moe_graph_plan::reset() {
     registry_generation_ = 0;
     graph_uid_ = 0;
     coverage_epoch_ = 0;
+    coverage_mmid_fingerprint_ = 0;
     graph_node_count_ = 0;
+    coverage_mmid_count_ = 0;
     outcome_ = GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     n_groups_ = 0;
     n_nodes_ = 0;
@@ -2579,6 +2583,14 @@ bool ggml_cuda_moe_graph_execution::find(const ggml_tensor * node, ggml_cuda_moe
         binding->slot_index = entry->slot_index;
     }
     return true;
+}
+
+bool ggml_cuda_moe_graph_execution::rejects_cached_mmid(const ggml_tensor * node) const {
+    const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+    const bool cached = source != nullptr && source->buffer != nullptr &&
+        ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer));
+    return cached && plan_ != nullptr && plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY &&
+        plan_->find(node) == nullptr;
 }
 
 ggml_cuda_moe_graph_group_dispatch * ggml_cuda_moe_graph_execution::find_group(
@@ -2905,7 +2917,9 @@ struct ggml_cuda_moe_grouped_context::impl {
     struct graph_coverage_record {
         const void * nodes = nullptr;
         uint64_t epoch = 0;
+        uint64_t mmid_fingerprint = 0;
         int32_t n_nodes = 0;
+        uint32_t mmid_count = 0;
     };
 
     using legacy_record_map = std::unordered_map<const ggml_tensor *, std::unique_ptr<legacy_record>>;
@@ -3754,9 +3768,67 @@ ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
     shutdown();
 }
 
-uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(const ggml_cgraph * cgraph) {
+static void moe_candidate_graph_mmid_fingerprint_add(
+        uint64_t & fingerprint,
+        int32_t node_index,
+        const ggml_tensor * node,
+        const ggml_tensor * source) {
+    const uintptr_t node_address = reinterpret_cast<uintptr_t>(node);
+    const uintptr_t source_address = reinterpret_cast<uintptr_t>(source);
+    moe_candidate_hash_value(fingerprint, node_index);
+    moe_candidate_hash_value(fingerprint, node_address);
+    moe_candidate_hash_value(fingerprint, source_address);
+}
+
+static uint64_t moe_candidate_graph_mmid_fingerprint_finish(uint64_t fingerprint, uint32_t count) {
+    moe_candidate_hash_value(fingerprint, count);
+    return fingerprint != 0 ? fingerprint : UINT64_C(1);
+}
+
+static bool moe_candidate_graph_mmid_inventory(
+        const ggml_cgraph * cgraph,
+        uint32_t * mmid_count,
+        uint64_t * mmid_fingerprint) {
+    if (cgraph == nullptr || mmid_count == nullptr || mmid_fingerprint == nullptr || cgraph->n_nodes < 0) {
+        return false;
+    }
+    uint32_t count = 0;
+    uint64_t fingerprint = UINT64_C(1469598103934665603);
+    for (int32_t node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        const ggml_tensor * node = cgraph->nodes[node_index];
+        const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+        if (source == nullptr || source->buffer == nullptr ||
+                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+            continue;
+        }
+        if (count == UINT32_MAX) {
+            return false;
+        }
+        moe_candidate_graph_mmid_fingerprint_add(fingerprint, node_index, node, source);
+        ++count;
+    }
+    *mmid_count = count;
+    *mmid_fingerprint = moe_candidate_graph_mmid_fingerprint_finish(fingerprint, count);
+    return true;
+}
+
+uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(
+        const ggml_cgraph * cgraph,
+        uint32_t * coverage_mmid_count,
+        uint64_t * coverage_mmid_fingerprint) {
+    if (coverage_mmid_count != nullptr) {
+        *coverage_mmid_count = 0;
+    }
+    if (coverage_mmid_fingerprint != nullptr) {
+        *coverage_mmid_fingerprint = 0;
+    }
     ggml_cuda_moe_graph_span span;
     if (cgraph == nullptr || !ggml_cuda_moe_graph_span_bounds(cgraph->nodes, cgraph->n_nodes, &span)) {
+        return 0;
+    }
+    uint32_t mmid_count = 0;
+    uint64_t mmid_fingerprint = 0;
+    if (!moe_candidate_graph_mmid_inventory(cgraph, &mmid_count, &mmid_fingerprint)) {
         return 0;
     }
 
@@ -3786,19 +3858,34 @@ uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(const ggml_cgraph
 
     const uint64_t epoch = impl_->next_graph_coverage_epoch + 1;
     try {
-        impl_->graph_coverages.emplace(key, impl::graph_coverage_record{cgraph->nodes, epoch, cgraph->n_nodes});
+        impl_->graph_coverages.emplace(
+            key, impl::graph_coverage_record{cgraph->nodes, epoch, mmid_fingerprint, cgraph->n_nodes, mmid_count});
     } catch (...) {
         return 0;
     }
     impl_->next_graph_coverage_epoch = epoch;
+    if (coverage_mmid_count != nullptr) {
+        *coverage_mmid_count = mmid_count;
+    }
+    if (coverage_mmid_fingerprint != nullptr) {
+        *coverage_mmid_fingerprint = mmid_fingerprint;
+    }
     return epoch;
 }
 
 bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
         const ggml_cgraph * cgraph,
-        uint64_t * coverage_epoch) const {
+        uint64_t * coverage_epoch,
+        uint32_t * coverage_mmid_count,
+        uint64_t * coverage_mmid_fingerprint) const {
     if (coverage_epoch != nullptr) {
         *coverage_epoch = 0;
+    }
+    if (coverage_mmid_count != nullptr) {
+        *coverage_mmid_count = 0;
+    }
+    if (coverage_mmid_fingerprint != nullptr) {
+        *coverage_mmid_fingerprint = 0;
     }
     ggml_cuda_moe_graph_span span;
     if (cgraph == nullptr || coverage_epoch == nullptr ||
@@ -3816,6 +3903,12 @@ bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
         return false;
     }
     *coverage_epoch = it->second.epoch;
+    if (coverage_mmid_count != nullptr) {
+        *coverage_mmid_count = it->second.mmid_count;
+    }
+    if (coverage_mmid_fingerprint != nullptr) {
+        *coverage_mmid_fingerprint = it->second.mmid_fingerprint;
+    }
     return true;
 }
 
@@ -4769,7 +4862,9 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         ggml_cuda_moe_graph_plan * plan,
         ggml_cuda_moe_graph_execution * execution,
         uint64_t coverage_epoch,
-        const void * coverage_nodes) const {
+        const void * coverage_nodes,
+        uint32_t coverage_mmid_count,
+        uint64_t coverage_mmid_fingerprint) const {
     if (plan != nullptr) {
         plan->reset();
     }
@@ -4789,9 +4884,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->graph_uid_ = graph_uid;
     plan->graph_node_count_ = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
     plan->graph_key_ = plan->graph_node_count_ > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
-    const bool coverage_valid = coverage_epoch != 0 && coverage_nodes == cgraph->nodes;
+    const bool coverage_valid = coverage_epoch != 0 && coverage_nodes == cgraph->nodes && coverage_mmid_fingerprint != 0;
     plan->coverage_nodes_ = coverage_valid ? coverage_nodes : nullptr;
     plan->coverage_epoch_ = coverage_valid ? coverage_epoch : 0;
+    plan->coverage_mmid_count_ = coverage_valid ? coverage_mmid_count : 0;
+    plan->coverage_mmid_fingerprint_ = coverage_valid ? coverage_mmid_fingerprint : 0;
     plan->initialized_ = true;
     auto & diagnostics = plan->coverage_diagnostics_;
     diagnostics.manifest_version = impl_->table.manifest_version;
@@ -4800,6 +4897,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     std::array<uint32_t, ggml_cuda_moe_graph_plan::MAX_MMID_INVENTORY> mmid_indices;
     prefill_authority_indices.fill(UINT32_MAX);
     uint32_t n_mmid_indices = 0;
+    uint64_t compiled_mmid_fingerprint = UINT64_C(1469598103934665603);
     bool inventory_complete = true;
     bool cached_prefill = false;
     bool cached_decode = false;
@@ -4812,6 +4910,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         }
 
         ++diagnostics.cached_mmid;
+        moe_candidate_graph_mmid_fingerprint_add(compiled_mmid_fingerprint, node_index, node, source);
         if (n_mmid_indices == mmid_indices.size()) {
             inventory_complete = false;
         } else {
@@ -4859,6 +4958,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             }
         }
     }
+    compiled_mmid_fingerprint = moe_candidate_graph_mmid_fingerprint_finish(
+        compiled_mmid_fingerprint, diagnostics.cached_mmid);
     try {
         plan->mmid_inventory_.reserve(n_mmid_indices);
     } catch (const std::bad_alloc &) {
@@ -4879,11 +4980,13 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         witness.flags = node->flags;
         plan->mmid_inventory_.push_back(witness);
     }
+    const bool certified_inventory = coverage_valid && plan->coverage_mmid_count_ == diagnostics.cached_mmid &&
+        plan->coverage_mmid_fingerprint_ == compiled_mmid_fingerprint &&
+        plan->mmid_inventory_.size() == diagnostics.cached_mmid && plan->inventory_complete_;
     const bool pure_prefill = cached_prefill && !cached_decode;
     if (pure_prefill) {
         plan->outcome_ = GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
-        plan->unknown_reusable_ = coverage_valid && plan->inventory_complete_ &&
-            plan->mmid_inventory_.size() == diagnostics.cached_mmid;
+        plan->unknown_reusable_ = certified_inventory;
         if (impl_->state.accepted && impl_->state.n_slots != 0 && !impl_->table.groups.empty()) {
             uint32_t n_prefill_groups = 0;
             for (uint32_t group_index = 0; group_index < impl_->table.groups.size(); ++group_index) {
@@ -4927,14 +5030,14 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     }
     const bool empty_manifest = impl_->table.manifest_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION ?
         impl_->table.submitted_groups == 0 :
-        impl_->table.submitted_groups == 0 && impl_->table.submitted_tensors == 0;
+        impl_->table.submitted_flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE &&
+            impl_->table.submitted_groups == 0 && impl_->table.submitted_tensors == 0;
     const bool explicitly_disabled = impl_->state.accepted &&
         (impl_->state.n_slots == 0 || empty_manifest);
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
         plan->outcome_ = cached_decode && !explicitly_disabled ?
             GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR : GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
-        plan->unknown_reusable_ = explicitly_disabled && plan->inventory_complete_ &&
-            plan->mmid_inventory_.size() == diagnostics.cached_mmid;
+        plan->unknown_reusable_ = explicitly_disabled && certified_inventory;
         execution->plan_ = plan;
         execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
         return;
@@ -5124,13 +5227,10 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     }
 
     uint32_t n_observed = 0;
-    bool all_observed = true;
     for (const auto & observation : observations) {
         n_observed += observation.observed;
-        all_observed = all_observed && observation.observed;
     }
-    plan->unknown_reusable_ = plan->inventory_complete_ &&
-        plan->mmid_inventory_.size() == diagnostics.cached_mmid && (coverage_valid || all_observed) &&
+    plan->unknown_reusable_ = certified_inventory &&
         diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid;
     try {
         plan->groups_.reserve(n_observed);
@@ -5318,33 +5418,19 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
 bool ggml_cuda_moe_grouped_context::graph_mmid_inventory_matches(
         const ggml_cgraph * cgraph,
         const ggml_cuda_moe_graph_plan & plan) const {
-    if (!plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid) {
+    if (!plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid ||
+            plan.coverage_mmid_count_ != plan.mmid_inventory_.size()) {
         return false;
     }
-    uint32_t current_mmid = 0;
-    const ggml_tensor * previous_node = nullptr;
-    const ggml_tensor * previous_source = nullptr;
-    bool previous_cached = false;
-    for (int32_t node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
-        const ggml_tensor * node = cgraph->nodes[node_index];
-        const ggml_tensor * source = previous_source;
-        bool cached = previous_cached;
-        if (node != previous_node) {
-            source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
-            cached = source != nullptr && source->buffer != nullptr &&
-                ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer));
-            previous_node = node;
-            previous_source = source;
-            previous_cached = cached;
-        }
-        if (!cached) {
-            continue;
-        }
-        if (current_mmid == plan.mmid_inventory_.size()) {
+    for (const auto & witness : plan.mmid_inventory_) {
+        if (witness.node_index >= static_cast<uint32_t>(cgraph->n_nodes)) {
             return false;
         }
-        const auto & witness = plan.mmid_inventory_[current_mmid++];
-        if (witness.node_index != static_cast<uint32_t>(node_index) || node->flags != witness.flags ||
+        const ggml_tensor * node = cgraph->nodes[witness.node_index];
+        const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+        if (source == nullptr || source->buffer == nullptr ||
+                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer)) ||
+                node->flags != witness.flags ||
                 !moe_candidate_signature_matches(witness.output, node) ||
                 !moe_candidate_signature_matches(witness.source, source) ||
                 !moe_candidate_signature_matches(witness.activation, node->src[1]) ||
@@ -5352,7 +5438,7 @@ bool ggml_cuda_moe_grouped_context::graph_mmid_inventory_matches(
             return false;
         }
     }
-    return current_mmid == plan.mmid_inventory_.size();
+    return true;
 }
 
 bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
@@ -5537,7 +5623,9 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         const ggml_cuda_moe_graph_plan & plan,
         ggml_cuda_moe_graph_execution * execution,
         uint64_t coverage_epoch,
-        const void * coverage_nodes) const {
+        const void * coverage_nodes,
+        uint32_t coverage_mmid_count,
+        uint64_t coverage_mmid_fingerprint) const {
     if (execution != nullptr) {
         execution->reset();
     }
@@ -5549,7 +5637,9 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
     const int n_nodes = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
     const void * graph_key = n_nodes > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
     const bool coverage_matches = plan.coverage_epoch_ == 0 ||
-        (plan.coverage_epoch_ == coverage_epoch && plan.coverage_nodes_ == coverage_nodes && coverage_nodes == cgraph->nodes);
+        (plan.coverage_epoch_ == coverage_epoch && plan.coverage_nodes_ == coverage_nodes && coverage_nodes == cgraph->nodes &&
+            plan.coverage_mmid_count_ == coverage_mmid_count &&
+            plan.coverage_mmid_fingerprint_ == coverage_mmid_fingerprint);
     if (!plan.initialized_ || plan.owner_ != impl_.get() || plan.graph_key_ != graph_key || plan.graph_node_count_ != n_nodes ||
             impl_->draining || impl_->replacement_pending || plan.registry_generation_ != impl_->state.generation ||
             plan.n_groups_ > impl_->table.groups.size() || !coverage_matches || (graph_uid == 0 && plan.coverage_epoch_ == 0) ||
@@ -5700,7 +5790,9 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
         std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
         ggml_cuda_moe_graph_execution * execution,
         uint64_t coverage_epoch,
-        const void * coverage_nodes) const {
+        const void * coverage_nodes,
+        uint32_t coverage_mmid_count,
+        uint64_t coverage_mmid_fingerprint) const {
     if (execution != nullptr) {
         execution->reset();
     }
@@ -5742,7 +5834,8 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
         return result;
     };
     if (*plan != nullptr && bind_graph_plan(
-            cgraph, graph_uid, property_hint, **plan, execution, coverage_epoch, coverage_nodes)) {
+            cgraph, graph_uid, property_hint, **plan, execution, coverage_epoch, coverage_nodes,
+            coverage_mmid_count, coverage_mmid_fingerprint)) {
         execution->retain(*plan);
         return record_result(GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
     }
@@ -5755,7 +5848,8 @@ ggml_cuda_moe_graph_prepare_result ggml_cuda_moe_grouped_context::prepare_graph_
         execution->reset();
         return GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE;
     }
-    compile_graph_plan(cgraph, graph_uid, replacement.get(), execution, coverage_epoch, coverage_nodes);
+    compile_graph_plan(cgraph, graph_uid, replacement.get(), execution, coverage_epoch, coverage_nodes,
+        coverage_mmid_count, coverage_mmid_fingerprint);
     if (!replacement->initialized_) {
         plan->reset();
         execution->reset();

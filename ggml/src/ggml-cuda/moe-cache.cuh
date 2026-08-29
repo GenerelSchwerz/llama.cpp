@@ -567,7 +567,9 @@ private:
     uint64_t registry_generation_;
     uint64_t graph_uid_;
     uint64_t coverage_epoch_;
+    uint64_t coverage_mmid_fingerprint_;
     int32_t graph_node_count_;
+    uint32_t coverage_mmid_count_;
     ggml_cuda_moe_graph_outcome outcome_;
     uint32_t n_groups_;
     uint32_t n_nodes_;
@@ -588,6 +590,7 @@ public:
     ggml_cuda_moe_graph_execution & operator=(const ggml_cuda_moe_graph_execution &) = delete;
 
     bool find(const ggml_tensor * node, ggml_cuda_moe_graph_binding * binding) const;
+    bool rejects_cached_mmid(const ggml_tensor * node) const;
     ggml_cuda_moe_graph_group_dispatch * find_group(const ggml_tensor * node, ggml_cuda_moe_graph_binding * binding);
     const ggml_cuda_moe_group_call_lease * find_authority(const ggml_tensor * node) const;
     bool resolve_streams(ggml_cuda_moe_graph_stream_resolver resolver, void * data);
@@ -689,15 +692,24 @@ public:
             uint64_t total_time_us,
             bool ids_cache_hit);
     static ggml_cuda_moe_grouped_debug_telemetry log_and_reset_legacy_stats();
-    uint64_t certify_graph_coverage(const ggml_cgraph * cgraph);
-    bool recover_graph_coverage(const ggml_cgraph * cgraph, uint64_t * coverage_epoch) const;
+    uint64_t certify_graph_coverage(
+            const ggml_cgraph * cgraph,
+            uint32_t * coverage_mmid_count = nullptr,
+            uint64_t * coverage_mmid_fingerprint = nullptr);
+    bool recover_graph_coverage(
+            const ggml_cgraph * cgraph,
+            uint64_t * coverage_epoch,
+            uint32_t * coverage_mmid_count = nullptr,
+            uint64_t * coverage_mmid_fingerprint = nullptr) const;
     void compile_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
             ggml_cuda_moe_graph_plan * plan,
             ggml_cuda_moe_graph_execution * execution,
             uint64_t coverage_epoch = 0,
-            const void * coverage_nodes = nullptr) const;
+            const void * coverage_nodes = nullptr,
+            uint32_t coverage_mmid_count = 0,
+            uint64_t coverage_mmid_fingerprint = 0) const;
     bool bind_graph_plan(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
@@ -705,7 +717,9 @@ public:
             const ggml_cuda_moe_graph_plan & plan,
             ggml_cuda_moe_graph_execution * execution,
             uint64_t coverage_epoch = 0,
-            const void * coverage_nodes = nullptr) const;
+            const void * coverage_nodes = nullptr,
+            uint32_t coverage_mmid_count = 0,
+            uint64_t coverage_mmid_fingerprint = 0) const;
     ggml_cuda_moe_graph_prepare_result prepare_graph_execution(
             const ggml_cgraph * cgraph,
             uint64_t graph_uid,
@@ -713,7 +727,9 @@ public:
             std::shared_ptr<ggml_cuda_moe_graph_plan> * plan,
             ggml_cuda_moe_graph_execution * execution,
             uint64_t coverage_epoch = 0,
-            const void * coverage_nodes = nullptr) const;
+            const void * coverage_nodes = nullptr,
+            uint32_t coverage_mmid_count = 0,
+            uint64_t coverage_mmid_fingerprint = 0) const;
     bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled);
     ggml_cuda_moe_grouped_decode_result prepare_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,

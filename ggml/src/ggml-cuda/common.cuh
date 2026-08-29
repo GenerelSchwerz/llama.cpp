@@ -1235,7 +1235,9 @@ struct ggml_cuda_graph {
     std::shared_ptr<ggml_cuda_moe_graph_plan> moe_graph_plan;
     const void * moe_coverage_nodes = nullptr;
     uint64_t moe_coverage_epoch = 0;
+    uint64_t moe_coverage_mmid_fingerprint = 0;
     int32_t moe_coverage_n_nodes = 0;
+    uint32_t moe_coverage_mmid_count = 0;
     int64_t last_used_time = 0;
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
