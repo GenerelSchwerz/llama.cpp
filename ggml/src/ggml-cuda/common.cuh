@@ -1236,6 +1236,8 @@ struct ggml_cuda_graph {
     const void * moe_coverage_nodes = nullptr;
     uint64_t moe_coverage_epoch = 0;
     uint64_t moe_coverage_mmid_fingerprint = 0;
+    uint64_t moe_resource_fingerprint = 0;
+    std::vector<std::weak_ptr<void>> moe_resource_witnesses;
     int32_t moe_coverage_n_nodes = 0;
     uint32_t moe_coverage_mmid_count = 0;
     int64_t last_used_time = 0;

@@ -3700,9 +3700,10 @@ bool ggml_backend_cuda_context::recover_moe_graph(ggml_cgraph * cgraph, ggml_cud
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * has_cached_mmid) {
 
     bool use_cuda_graph = true;
+    *has_cached_mmid = false;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -3716,8 +3717,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         if (node->op == GGML_OP_MUL_MAT_ID) {
             if (node->src[0] && node->src[0]->buffer &&
                     ggml_backend_buft_is_cuda_moe_cached(node->src[0]->buffer->buft)) {
-                use_cuda_graph = false;
-                break;
+                *has_cached_mmid = true;
             }
 
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -4573,6 +4573,9 @@ static int ggml_cuda_try_fuse(
     //topk-moe
     if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
             cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+        const bool grouped_device_ids = execution != nullptr &&
+            execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+            execution->dispatch_mode() != GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
         ggml_cuda_topk_moe_args args;
         const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
         std::vector<ggml_op>    ops;
@@ -4624,7 +4627,8 @@ static int ggml_cuda_try_fuse(
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    const ggml_cuda_moe_ids_publish publish = ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                    const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
@@ -4640,7 +4644,8 @@ static int ggml_cuda_try_fuse(
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    const ggml_cuda_moe_ids_publish publish = ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                    const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
@@ -5589,6 +5594,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
+    bool graph_has_cached_mmid      = false;
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = nullptr;
 #ifdef USE_CUDA_GRAPH
@@ -5605,7 +5611,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &graph_has_cached_mmid);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
             moe_property_hint = properties_changed ? GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED : GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED;
@@ -5660,17 +5666,95 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
     const bool moe_dispatch = moe_execution.requires_dispatch();
+    ggml_cuda_moe_graph_dispatch_mode moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
+    uint64_t moe_resource_fingerprint = 0;
+    std::vector<std::shared_ptr<void>> moe_resource_leases;
+    std::vector<std::weak_ptr<void>> moe_resource_witnesses;
+    const auto force_moe_direct = [&]() {
+        moe_resource_leases.clear();
+        moe_resource_witnesses.clear();
+        use_cuda_graph = false;
+        cuda_graph_update_required = false;
+        if (graph != nullptr) {
+#ifdef USE_CUDA_GRAPH
+            graph->warmup_complete = false;
+            if (graph->moe_resource_fingerprint != 0) {
+                if (graph->instance != nullptr) {
+                    CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+                    graph->instance = nullptr;
+                }
+                if (graph->graph != nullptr) {
+                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                    graph->graph = nullptr;
+                }
+                graph->moe_resource_witnesses.clear();
+            }
+#endif
+            graph->moe_resource_fingerprint = 0;
+        }
+    };
+    if (graph_has_cached_mmid && moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        force_moe_direct();
+    }
     if (moe_dispatch) {
         if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
             return GGML_STATUS_FAILED;
         }
-        if (use_cuda_graph && moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY) {
-            use_cuda_graph = false;
-            cuda_graph_update_required = false;
+        const auto outcome = moe_execution.outcome();
+        if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+            if (use_cuda_graph && !cuda_graph_update_required) {
+                if (graph == nullptr || graph->moe_resource_fingerprint == 0) {
+                    force_moe_direct();
+                } else {
+                    moe_resource_fingerprint = graph->moe_resource_fingerprint;
+                }
+            } else {
+                const bool validate_resources = use_cuda_graph || (graph != nullptr && graph->moe_resource_fingerprint != 0);
+                if (validate_resources && !cuda_ctx->moe_grouped_context->graph_resource_fingerprint(
+                        moe_execution, cuda_ctx->stream(), &moe_resource_fingerprint,
+                        use_cuda_graph ? &moe_resource_leases : nullptr)) {
+                    force_moe_direct();
+                } else if (graph != nullptr && graph->moe_resource_fingerprint != 0 &&
+                        graph->moe_resource_fingerprint != moe_resource_fingerprint) {
+                    force_moe_direct();
+                } else if (use_cuda_graph) {
+                    try {
+                        moe_resource_witnesses.reserve(moe_resource_leases.size());
+                        for (const auto & lease : moe_resource_leases) {
+                            moe_resource_witnesses.emplace_back(lease);
+                        }
+                    } catch (const std::bad_alloc &) {
+                        force_moe_direct();
+                    }
+                }
+            }
+            moe_dispatch_mode = !use_cuda_graph ? GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT :
+                cuda_graph_update_required ? GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE : GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY;
+        } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR) {
+            force_moe_direct();
+            moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
+        } else if (graph != nullptr && graph->moe_resource_fingerprint != 0) {
+            force_moe_direct();
         }
-        if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, !use_cuda_graph)) {
+        if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
             return GGML_STATUS_FAILED;
         }
+        if ((moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE ||
+                moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY) &&
+                !cuda_ctx->moe_grouped_context->activate_graph_resources(
+                    &moe_execution, moe_dispatch_mode, moe_resource_fingerprint,
+                    moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY ? &graph->moe_resource_witnesses : nullptr)) {
+            if (!cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
+                return GGML_STATUS_FAILED;
+            }
+            force_moe_direct();
+            moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
+            if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
+                return GGML_STATUS_FAILED;
+            }
+        }
+    } else if (graph != nullptr && graph->moe_resource_fingerprint != 0) {
+        force_moe_direct();
     }
 
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -5685,6 +5769,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const bool graph_evaluated = ggml_cuda_graph_evaluate_and_capture(
         cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key, &moe_execution);
+
+    if (graph_evaluated && moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {
+        graph->moe_resource_fingerprint = moe_resource_fingerprint;
+        graph->moe_resource_witnesses = std::move(moe_resource_witnesses);
+    }
 
     const bool dispatch_finished = !moe_dispatch || cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution);
     if (!graph_evaluated || !dispatch_finished) {

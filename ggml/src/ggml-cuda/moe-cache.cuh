@@ -262,6 +262,7 @@ enum ggml_cuda_moe_group_authority : uint32_t {
 enum ggml_cuda_moe_graph_outcome : uint32_t {
     GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY = 0,
     GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY,
     GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR,
 };
 
@@ -293,7 +294,15 @@ enum ggml_cuda_moe_graph_group_state : uint32_t {
     GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY = 0,
     GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED,
     GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE,
+    GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_REPLAY,
     GGML_CUDA_MOE_GRAPH_GROUP_FINISHED,
+};
+
+enum ggml_cuda_moe_graph_dispatch_mode : uint32_t {
+    GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY = 0,
+    GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT,
+    GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE,
+    GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY,
 };
 
 struct ggml_cuda_moe_graph_capability_witness {
@@ -330,6 +339,7 @@ struct ggml_cuda_moe_graph_group_dispatch {
     cudaStream_t stream = nullptr;
     uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY;
     uint32_t n_slots = 0;
+    bool defer_completion = false;
 };
 
 using ggml_cuda_moe_graph_stream_resolver = cudaStream_t (*)(void * data, const ggml_tensor * node);
@@ -440,6 +450,7 @@ private:
         GROUP_REASON_EXTERNAL_CONSUMER,
         GROUP_REASON_MISSING_ROLE,
         GROUP_REASON_UNPROVEN,
+        GROUP_REASON_MATERIALIZATION,
     };
 
     struct consumer_witness {
@@ -597,6 +608,7 @@ public:
     bool has_stream_grouped_candidate() const;
     bool requires_dispatch() const;
     ggml_cuda_moe_graph_outcome outcome() const;
+    ggml_cuda_moe_graph_dispatch_mode dispatch_mode() const;
     uint32_t size() const;
 
 private:
@@ -610,6 +622,7 @@ private:
     std::array<ggml_cuda_moe_graph_group_dispatch, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> groups_;
     ggml_cuda_moe_grouped_context * owner_;
     uint32_t n_groups_;
+    ggml_cuda_moe_graph_dispatch_mode dispatch_mode_;
     bool dispatch_active_;
 };
 
@@ -730,7 +743,23 @@ public:
             const void * coverage_nodes = nullptr,
             uint32_t coverage_mmid_count = 0,
             uint64_t coverage_mmid_fingerprint = 0) const;
-    bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled);
+    bool graph_resource_fingerprint(
+            const ggml_cuda_moe_graph_execution & execution,
+            cudaStream_t stream,
+            uint64_t * fingerprint,
+            std::vector<std::shared_ptr<void>> * leases = nullptr) const;
+    bool activate_graph_resources(
+            ggml_cuda_moe_graph_execution * execution,
+            ggml_cuda_moe_graph_dispatch_mode mode,
+            uint64_t expected_fingerprint,
+            const std::vector<std::weak_ptr<void>> * resource_witnesses = nullptr);
+    bool begin_graph_dispatch(
+            ggml_cuda_moe_graph_execution * execution,
+            ggml_cuda_moe_graph_dispatch_mode mode);
+    bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled) {
+        return begin_graph_dispatch(execution, grouped_enabled ?
+            GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT : GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY);
+    }
     ggml_cuda_moe_grouped_decode_result prepare_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
@@ -764,6 +793,11 @@ private:
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_mmid_inventory_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan & plan) const;
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
+    bool graph_resource_fingerprint_locked(
+            const ggml_cuda_moe_graph_execution & execution,
+            cudaStream_t stream,
+            uint64_t * fingerprint,
+            std::vector<std::shared_ptr<void>> * leases) const;
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
