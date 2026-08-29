@@ -5234,6 +5234,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     }
 
     const int n_nodes = plan->graph_node_count_;
+    uint32_t observed_cached_readers = 0;
     for (int node_index = 0; node_index < n_nodes; ++node_index) {
         const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
         if (node == nullptr) {
@@ -5285,6 +5286,10 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const auto & group = impl_->table.groups[entry.group_index];
         const auto & bank = group.banks[entry.bank_index];
         auto & observation = observations[entry.group_index];
+        if (node->src[0]->buffer != nullptr &&
+                ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(node->src[0]->buffer))) {
+            ++observed_cached_readers;
+        }
         if (!observation.observed) {
             observation.authority_node = node;
             observation.authority_node_index = node_index;
@@ -5507,9 +5512,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             }
         }
 
-        if (record.prefill) {
-            record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
-        } else if (!observation.descriptor_supported) {
+        if (!observation.descriptor_supported) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_DESCRIPTOR;
         } else if (observation.source_invalid) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_SOURCE;
@@ -5517,7 +5520,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
         } else if (observation.capability_invalid) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CAPABILITY;
-        } else if (observation.route_invalid || !observation.has_ids) {
+        } else if (observation.decode && (observation.route_invalid || !observation.has_ids)) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE;
         } else if (observation.duplicate_role) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_DUPLICATE_ROLE;
@@ -5531,6 +5534,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
         } else if (observation.unproven) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_UNPROVEN;
+        } else if (record.prefill) {
+            record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
         } else {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
         }
@@ -5564,25 +5569,34 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             }
         }
     }
-    uint32_t observed_readers = 0;
     bool observed_prefill = false;
     bool observed_decode = false;
     for (const auto & record : plan->groups_) {
-        observed_readers += record.n_readers;
-        observed_prefill = observed_prefill || record.prefill;
-        observed_decode = observed_decode || !record.prefill;
+        const auto & observation = observations[record.candidate.group_index];
+        observed_prefill = observed_prefill || observation.prefill;
+        observed_decode = observed_decode || observation.decode;
     }
     const bool call_prefill = cached_prefill || observed_prefill;
     const bool call_decode = cached_decode || observed_decode;
     const bool complete_coverage = diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid;
-    bool complete_certificate = call_decode && !call_prefill && complete_coverage &&
-        observed_readers >= diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] && plan->n_groups_ != 0;
+    const bool complete_slice = complete_coverage &&
+        observed_cached_readers == diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] && plan->n_groups_ != 0;
+    bool mixed_certificate = call_prefill && call_decode && complete_slice;
+    bool decode_certificate = call_decode && !call_prefill && complete_slice;
     for (const auto & record : plan->groups_) {
-        complete_certificate = complete_certificate && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
+        const auto & observation = observations[record.candidate.group_index];
+        const bool prefill_group = observation.prefill && !observation.decode;
+        const bool decode_group = observation.decode && !observation.prefill;
+        mixed_certificate = mixed_certificate &&
+            ((prefill_group && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL) ||
+                (decode_group && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE));
+        decode_certificate = decode_certificate && decode_group &&
+            record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
     }
     plan->outcome_ = call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
-        complete_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
-    if (plan->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        mixed_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
+        decode_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
+    if (mixed_certificate || decode_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
             const auto & record = plan->groups_[record_index];
             const auto & group = impl_->table.groups[record.candidate.group_index];
@@ -5834,15 +5848,13 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
     }
 
     uint32_t reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
-    if (prefill && !decode) {
-        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
-    } else if (source_invalid) {
+    if (source_invalid) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_SOURCE;
     } else if (geometry_invalid) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
     } else if (capability_invalid) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CAPABILITY;
-    } else if (route_invalid || !has_ids) {
+    } else if (decode && (route_invalid || !has_ids)) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE;
     } else if (duplicate_role) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_DUPLICATE_ROLE;
@@ -5856,6 +5868,8 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
     } else if (unproven) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_UNPROVEN;
+    } else if (prefill && !decode) {
+        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
     }
     return reason == record.reason && record.prefill == (prefill && !decode) && !unproven;
 }

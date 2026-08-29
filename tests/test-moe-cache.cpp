@@ -147,6 +147,21 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
     }
 
+    static bool graph_group_has_eligible_reason(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
+        CHECK(group_index < plan.groups_.size());
+        return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
+    }
+
+    static bool graph_group_has_prefill_reason(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
+        CHECK(group_index < plan.groups_.size());
+        return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
+    }
+
+    static bool graph_group_has_missing_role_reason(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
+        CHECK(group_index < plan.groups_.size());
+        return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
+    }
+
     static uint32_t graph_group_auxiliary_node_count(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
         CHECK(group_index < plan.groups_.size());
         uint32_t result = 0;
@@ -3406,6 +3421,136 @@ static void test_grouped_graph_preflight(bool benchmark) {
     fprintf(stderr, "test-moe-cache: grouped graph preflight OK\n");
 }
 
+static void test_grouped_graph_mixed_phase() {
+    candidate_test_fixture fixture;
+    const int64_t gate_up_ne[] = {256, 512, 4};
+    const int64_t down_ne[] = {256, 256, 4};
+    ggml_tensor * prefill_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * prefill_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * decode_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * decode_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * uncovered = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> prefill_banks = {{
+        {prefill_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {prefill_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> decode_banks = {{
+        {decode_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {decode_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {{
+        {prefill_banks.data(), prefill_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
+        {decode_banks.data(), decode_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
+    }};
+    const auto snapshot = candidate_snapshot(12, groups.data(), groups.size());
+    ggml_cuda_moe_grouped_context registry(&fixture.owner, 0);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    const candidate_route prefill_route = candidate_top_k_route(fixture, 4, 2, 4);
+    const candidate_route decode_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * prefill_gate_up_reader = candidate_mmid(fixture, prefill_gate_up, prefill_route.ids);
+    ggml_tensor * prefill_down_reader = candidate_mmid(fixture, prefill_down, prefill_route.ids);
+    ggml_tensor * decode_gate_up_reader = candidate_mmid(fixture, decode_gate_up, decode_route.ids);
+    ggml_tensor * decode_down_reader = candidate_mmid(fixture, decode_down, decode_route.ids);
+    ggml_tensor * cross_phase_down_reader = candidate_mmid(fixture, prefill_down, decode_route.ids);
+    ggml_tensor * uncovered_reader = candidate_mmid(fixture, uncovered, prefill_route.ids);
+    ggml_cgraph * mixed_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, decode_route.root, decode_route.ids,
+        prefill_gate_up_reader, prefill_down_reader, decode_gate_up_reader, decode_down_reader,
+    });
+    const auto mixed_coverage = candidate_certify_graph(registry, mixed_graph);
+    ggml_cuda_moe_graph_plan plan;
+    ggml_cuda_moe_graph_execution execution;
+    registry.compile_graph_plan(
+        mixed_graph, 701, &plan, &execution, mixed_coverage.epoch, mixed_coverage.nodes,
+        mixed_coverage.mmid_count, mixed_coverage.mmid_fingerprint);
+    CHECK(plan.size() == 2 && execution.size() == 2);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY && execution.requires_dispatch());
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_prefill_reason(plan, 0));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 1));
+    CHECK(execution.find(prefill_gate_up_reader, nullptr) && execution.find(prefill_down_reader, nullptr));
+    CHECK(execution.find(decode_gate_up_reader, nullptr) && execution.find(decode_down_reader, nullptr));
+    CHECK(registry.begin_graph_dispatch(&execution, true));
+    const auto * prefill_authority = execution.find_authority(prefill_gate_up_reader);
+    const auto * decode_authority = execution.find_authority(decode_gate_up_reader);
+    CHECK(prefill_authority != nullptr && prefill_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY);
+    CHECK(decode_authority != nullptr && decode_authority->authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY);
+    CHECK(registry.finish_graph_dispatch(&execution));
+    ggml_cuda_moe_graph_execution reused;
+    CHECK(registry.bind_graph_plan(
+        mixed_graph, 702, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &reused,
+        mixed_coverage.epoch, mixed_coverage.nodes, mixed_coverage.mmid_count, mixed_coverage.mmid_fingerprint));
+    CHECK(reused.find(prefill_down_reader, nullptr) && reused.find(decode_down_reader, nullptr));
+
+    ggml_cgraph * incomplete_prefill_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, decode_route.root, decode_route.ids,
+        prefill_gate_up_reader, decode_gate_up_reader, decode_down_reader,
+    });
+    const auto incomplete_prefill_coverage = candidate_certify_graph(registry, incomplete_prefill_graph);
+    registry.compile_graph_plan(
+        incomplete_prefill_graph, 703, &plan, &execution,
+        incomplete_prefill_coverage.epoch, incomplete_prefill_coverage.nodes,
+        incomplete_prefill_coverage.mmid_count, incomplete_prefill_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && execution.requires_dispatch());
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_missing_role_reason(plan, 0));
+    CHECK(execution.rejects_cached_mmid(prefill_gate_up_reader) && execution.rejects_cached_mmid(decode_down_reader));
+
+    ggml_cgraph * cross_phase_group_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, decode_route.root, decode_route.ids,
+        prefill_gate_up_reader, cross_phase_down_reader,
+    });
+    const auto cross_phase_group_coverage = candidate_certify_graph(registry, cross_phase_group_graph);
+    registry.compile_graph_plan(
+        cross_phase_group_graph, 704, &plan, &execution,
+        cross_phase_group_coverage.epoch, cross_phase_group_coverage.nodes,
+        cross_phase_group_coverage.mmid_count, cross_phase_group_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && execution.requires_dispatch());
+
+    ggml_cgraph * uncovered_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, decode_route.root, decode_route.ids,
+        prefill_gate_up_reader, prefill_down_reader, decode_gate_up_reader, decode_down_reader, uncovered_reader,
+    });
+    const auto uncovered_coverage = candidate_certify_graph(registry, uncovered_graph);
+    registry.compile_graph_plan(
+        uncovered_graph, 705, &plan, &execution, uncovered_coverage.epoch, uncovered_coverage.nodes,
+        uncovered_coverage.mmid_count, uncovered_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && execution.rejects_cached_mmid(uncovered_reader));
+
+    ggml_cgraph * pure_prefill_graph = candidate_graph(fixture, {
+        prefill_route.root, prefill_route.ids, prefill_gate_up_reader, prefill_down_reader,
+    });
+    const auto pure_prefill_coverage = candidate_certify_graph(registry, pure_prefill_graph);
+    registry.compile_graph_plan(
+        pure_prefill_graph, 706, &plan, &execution, pure_prefill_coverage.epoch, pure_prefill_coverage.nodes,
+        pure_prefill_coverage.mmid_count, pure_prefill_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY && execution.size() == 1);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_prefill_reason(plan, 0));
+
+    ggml_cgraph * pure_decode_graph = candidate_graph(fixture, {
+        decode_route.root, decode_route.ids, decode_gate_up_reader, decode_down_reader,
+    });
+    const auto pure_decode_coverage = candidate_certify_graph(registry, pure_decode_graph);
+    registry.compile_graph_plan(
+        pure_decode_graph, 707, &plan, &execution, pure_decode_coverage.epoch, pure_decode_coverage.nodes,
+        pure_decode_coverage.mmid_count, pure_decode_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 0));
+    CHECK(execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
+    CHECK(execution.has_stream_grouped_candidate());
+
+    ggml_cgraph * incomplete_decode_graph = candidate_graph(fixture, {
+        decode_route.root, decode_route.ids, decode_gate_up_reader,
+    });
+    const auto incomplete_decode_coverage = candidate_certify_graph(registry, incomplete_decode_graph);
+    registry.compile_graph_plan(
+        incomplete_decode_graph, 708, &plan, &execution,
+        incomplete_decode_coverage.epoch, incomplete_decode_coverage.nodes,
+        incomplete_decode_coverage.mmid_count, incomplete_decode_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && execution.rejects_cached_mmid(decode_gate_up_reader));
+
+    fprintf(stderr, "test-moe-cache: mixed phase graph repair OK\n");
+}
+
 struct cached_fusion_test_graph {
     ggml_context_ptr weights;
     ggml_context_ptr auxiliaries;
@@ -6300,6 +6445,7 @@ int main(int argc, char ** argv) {
     test_legacy_owner_leases();
     test_grouped_context_resources();
     test_grouped_graph_preflight(registry_bench);
+    test_grouped_graph_mixed_phase();
     if (registry_only || registry_bench) {
         return 0;
     }
