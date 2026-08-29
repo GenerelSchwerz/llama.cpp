@@ -290,12 +290,10 @@ void ggml_cuda_mul_mat_q_mapped(
         source_map, source_split, source_wait_class, stage_ready);
 }
 
-static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo) {
+static bool ggml_cuda_mmq_type_supported(enum ggml_type type) {
 #ifdef GGML_CUDA_FORCE_CUBLAS
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
-
-    bool mmq_supported;
 
     switch (type) {
         case GGML_TYPE_Q1_0:
@@ -323,17 +321,13 @@ static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t n
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-            mmq_supported = true;
-            break;
+            return true;
         default:
-            mmq_supported = false;
-            break;
+            return false;
     }
+}
 
-    if (!mmq_supported) {
-        return false;
-    }
-
+static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo) {
     // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
     if (smpbo < 48 * 1024) {
         return false;
@@ -414,10 +408,16 @@ static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t n
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+    if (!ggml_cuda_mmq_type_supported(type)) {
+        return false;
+    }
     const int id = ggml_cuda_get_device();
     return ggml_cuda_should_use_mmq_impl(type, cc, ne11, n_experts, ggml_cuda_info().devices[id].smpbo);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo) {
+    if (!ggml_cuda_mmq_type_supported(type)) {
+        return false;
+    }
     return ggml_cuda_should_use_mmq_impl(type, cc, ne11, n_experts, smpbo);
 }
