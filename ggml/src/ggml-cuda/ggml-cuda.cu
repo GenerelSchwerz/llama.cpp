@@ -6308,6 +6308,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     }
                 }
 #endif // GGML_USE_MUSA
+                if (op->op == GGML_OP_MUL_MAT_ID) {
+                    return (ggml_cuda_mmid_source_capability_for(a->type).flags & GGML_CUDA_MMID_SOURCE_ADVERTISED) != 0;
+                }
                 switch (a->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:

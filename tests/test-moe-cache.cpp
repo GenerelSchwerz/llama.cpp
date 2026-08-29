@@ -16,6 +16,7 @@
 // locality than this, so a passing test here is a lower bound.
 
 #include "../ggml/src/ggml-cuda/moe-cache.cuh"
+#include "../ggml/src/ggml-cuda/mmid.cuh"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
 #include "../src/llama-context.h"
@@ -937,6 +938,120 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(incomplete_diagnostics.first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE] == gate_up);
     CHECK(execution.size() == 0);
     fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
+}
+
+static ggml_cuda_mmid_capability_query candidate_mmid_query(
+        ggml_type type,
+        int64_t n_tokens = 1,
+        ggml_cuda_mmid_mapping mapping = GGML_CUDA_MMID_MAPPING_DIRECT,
+        bool use_mmq = false,
+        size_t smpbo = 64 * 1024) {
+    ggml_cuda_mmid_capability_query query;
+    query.source_type = type;
+    query.input_type = GGML_TYPE_F32;
+    query.output_type = GGML_TYPE_F32;
+    query.source_ne[0] = 256;
+    query.source_ne[1] = 128;
+    query.source_ne[2] = 64;
+    query.source_ne[3] = 1;
+    query.source_nb[0] = ggml_type_size(type);
+    query.source_nb[1] = query.source_nb[0] * query.source_ne[0] / ggml_blck_size(type);
+    query.source_nb[2] = query.source_nb[1] * query.source_ne[1];
+    query.source_nb[3] = query.source_nb[2] * query.source_ne[2];
+    query.n_tokens = n_tokens;
+    query.n_experts = query.source_ne[2];
+    query.cc = 800;
+    query.warp_size = 32;
+    query.smpbo = smpbo;
+    query.phase = n_tokens == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
+    query.mapping = mapping;
+    query.use_mmq = use_mmq;
+    return query;
+}
+
+static void test_mmid_capabilities() {
+    constexpr std::array<ggml_type, 27> advertised = {
+        GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
+        GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_K,
+        GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS,
+        GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
+        GGML_TYPE_MXFP4, GGML_TYPE_NVFP4,
+    };
+    uint32_t n_advertised = 0;
+    uint32_t n_mmvq = 0;
+    uint32_t n_mmq = 0;
+    uint32_t n_mapped_mmq = 0;
+    uint32_t n_scalar = 0;
+    uint32_t n_generic = 0;
+    for (int value = 0; value < GGML_TYPE_COUNT; ++value) {
+        const auto type = static_cast<ggml_type>(value);
+        const bool expected = std::find(advertised.begin(), advertised.end(), type) != advertised.end();
+        CHECK(((ggml_cuda_mmid_source_capability_for(type).flags & GGML_CUDA_MMID_SOURCE_ADVERTISED) != 0) == expected);
+    }
+    for (ggml_type type : advertised) {
+        const auto source = ggml_cuda_mmid_source_capability_for(type);
+        CHECK(source.type == type);
+        n_advertised += (source.flags & GGML_CUDA_MMID_SOURCE_ADVERTISED) != 0;
+        n_mmvq += (source.flags & GGML_CUDA_MMID_SOURCE_MMVQ) != 0;
+        n_mmq += (source.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0;
+        n_mapped_mmq += (source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0;
+        n_scalar += (source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0;
+        n_generic += (source.flags & GGML_CUDA_MMID_SOURCE_GENERIC) != 0;
+
+        const auto capability = ggml_cuda_mmid_get_capability(candidate_mmid_query(type));
+        if (type == GGML_TYPE_Q8_K) {
+            CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
+            CHECK(capability.reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER);
+        } else if ((source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0) {
+            CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_MMF || capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC);
+            CHECK(capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+        } else {
+            CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ);
+            CHECK(capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+        }
+    }
+    CHECK(n_advertised == 27 && n_mmvq == 23 && n_mmq == 22 && n_mapped_mmq == 20 && n_scalar == 3 && n_generic == 26);
+    CHECK(ggml_cuda_mmid_source_capability_for(GGML_TYPE_Q8_1).flags == 0);
+    CHECK(ggml_cuda_mmid_source_capability_for(GGML_TYPE_COUNT).flags == 0);
+
+    auto query = candidate_mmid_query(GGML_TYPE_Q4_K, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true);
+    const auto direct = ggml_cuda_mmid_get_capability(query);
+    CHECK((direct.selection == GGML_CUDA_MMID_CONSUMER_MMQ || direct.selection == GGML_CUDA_MMID_CONSUMER_GENERIC) &&
+        direct.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+    query.mapping = GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+    auto capability = ggml_cuda_mmid_get_capability(query);
+    CHECK(capability.selection == direct.selection && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+    query = candidate_mmid_query(GGML_TYPE_NVFP4, 16, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
+    capability = ggml_cuda_mmid_get_capability(query);
+    CHECK((capability.selection == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED &&
+            capability.reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_MAPPING) ||
+        (capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK));
+    query.use_mmq = false;
+    capability = ggml_cuda_mmid_get_capability(query);
+    CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+    query = candidate_mmid_query(GGML_TYPE_IQ1_M, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true);
+    CHECK(ggml_cuda_mmid_get_capability(query).selection == GGML_CUDA_MMID_CONSUMER_GENERIC);
+    query = candidate_mmid_query(GGML_TYPE_Q4_K, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true, 32 * 1024);
+    CHECK(ggml_cuda_mmid_get_capability(query).selection == GGML_CUDA_MMID_CONSUMER_GENERIC);
+
+    query = candidate_mmid_query(GGML_TYPE_Q4_K, 2);
+    query.phase = GGML_CUDA_MMID_PHASE_DECODE;
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE);
+    query = candidate_mmid_query(GGML_TYPE_Q4_K);
+    query.source_nb[0]++;
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_GEOMETRY);
+    query = candidate_mmid_query(GGML_TYPE_Q4_K);
+    query.mapping = static_cast<ggml_cuda_mmid_mapping>(2);
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_MAPPING);
+    query = candidate_mmid_query(GGML_TYPE_Q4_K);
+    query.smpbo = 0;
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_DEVICE);
+    query = candidate_mmid_query(GGML_TYPE_Q4_K);
+    query.input_type = GGML_TYPE_F16;
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_IO);
+    query = candidate_mmid_query(GGML_TYPE_Q8_K, 16, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
+    CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER);
 }
 
 static void test_candidate_producer() {
@@ -4741,6 +4856,7 @@ int main(int argc, char ** argv) {
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
     test_candidate_graph_coverage_ledger();
+    test_mmid_capabilities();
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_legacy_owner_leases();

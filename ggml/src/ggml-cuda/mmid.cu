@@ -1,5 +1,120 @@
 #include "common.cuh"
 #include "mmid.cuh"
+#include "mmf.cuh"
+#include "mmvf.cuh"
+#include "mmq.cuh"
+#include "mmvq.cuh"
+
+ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type) {
+    constexpr uint32_t scalar = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_SCALAR | GGML_CUDA_MMID_SOURCE_GENERIC;
+    constexpr uint32_t quant = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_MMVQ | GGML_CUDA_MMID_SOURCE_MMQ |
+        GGML_CUDA_MMID_SOURCE_MAPPED_MMQ | GGML_CUDA_MMID_SOURCE_GENERIC;
+    constexpr uint32_t fp4 = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_MMVQ | GGML_CUDA_MMID_SOURCE_MMQ |
+        GGML_CUDA_MMID_SOURCE_GENERIC;
+    constexpr uint32_t mmvq = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_MMVQ | GGML_CUDA_MMID_SOURCE_GENERIC;
+
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+            return {type, scalar};
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+            return {type, quant};
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+            return {type, fp4};
+        case GGML_TYPE_IQ1_M:
+            return {type, mmvq};
+        case GGML_TYPE_Q8_K:
+            return {type, GGML_CUDA_MMID_SOURCE_ADVERTISED};
+        default:
+            return {type, 0};
+    }
+}
+
+ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query) {
+    ggml_cuda_mmid_capability result;
+    result.source = ggml_cuda_mmid_source_capability_for(query.source_type);
+    if ((result.source.flags & GGML_CUDA_MMID_SOURCE_ADVERTISED) == 0) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_UNADVERTISED_SOURCE;
+        return result;
+    }
+    if ((result.source.flags & GGML_CUDA_MMID_SOURCE_GENERIC) == 0) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER;
+        return result;
+    }
+    if (query.input_type != GGML_TYPE_F32 || query.output_type != GGML_TYPE_F32) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_IO;
+        return result;
+    }
+    if (query.phase != GGML_CUDA_MMID_PHASE_DECODE && query.phase != GGML_CUDA_MMID_PHASE_PREFILL) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
+        return result;
+    }
+    if ((query.phase == GGML_CUDA_MMID_PHASE_DECODE && query.n_tokens != 1) ||
+            (query.phase == GGML_CUDA_MMID_PHASE_PREFILL && query.n_tokens <= 1)) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
+        return result;
+    }
+    if (query.mapping != GGML_CUDA_MMID_MAPPING_DIRECT && query.mapping != GGML_CUDA_MMID_MAPPING_SOURCE_MAP) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_MAPPING;
+        return result;
+    }
+    const int64_t block_size = ggml_blck_size(query.source_type);
+    if (query.n_tokens <= 0 || query.n_experts <= 0 || query.source_ne[0] <= 0 || query.source_ne[1] <= 0 ||
+            query.source_ne[2] != query.n_experts || block_size <= 0 || query.source_ne[0] % block_size != 0 ||
+            query.source_nb[0] != ggml_type_size(query.source_type)) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_GEOMETRY;
+        return result;
+    }
+    if (query.cc <= 0 || query.warp_size <= 0 || query.smpbo == 0) {
+        result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_DEVICE;
+        return result;
+    }
+
+    const bool mapped = query.mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+    if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMVQ) != 0 && query.n_tokens <= MMVQ_MAX_BATCH_SIZE &&
+            query.n_tokens <= get_mmvq_mmid_max_batch(query.source_type, query.cc)) {
+        result.selection = GGML_CUDA_MMID_CONSUMER_MMVQ;
+    } else if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
+            query.n_tokens <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(query.cc)) {
+        result.selection = GGML_CUDA_MMID_CONSUMER_MMVF;
+    } else if (query.use_mmq && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
+            ggml_cuda_should_use_mmq(query.source_type, query.cc, query.n_tokens, query.n_experts, query.smpbo)) {
+        if (mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) == 0) {
+            result.reason = GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_MAPPING;
+            return result;
+        }
+        result.selection = GGML_CUDA_MMID_CONSUMER_MMQ;
+    } else if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
+            ggml_cuda_should_use_mmf(query.source_type, query.cc, query.warp_size, query.source_ne, query.source_nb,
+                query.n_tokens, true)) {
+        result.selection = GGML_CUDA_MMID_CONSUMER_MMF;
+    } else {
+        result.selection = GGML_CUDA_MMID_CONSUMER_GENERIC;
+    }
+    result.reason = GGML_CUDA_MMID_CAPABILITY_OK;
+    return result;
+}
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {

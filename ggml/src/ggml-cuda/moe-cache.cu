@@ -24,6 +24,7 @@
 
 #include "moe-cache.cuh"
 #include "common.cuh"
+#include "mmid.cuh"
 
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
@@ -3198,7 +3199,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         return true;
     }
 
-    static bool decode_eligible(const grouped_snapshot & snapshot, uint32_t * n_experts) {
+    static bool decode_eligible(const grouped_snapshot & snapshot, int device, uint32_t * n_experts) {
         const uint32_t expected_roles = snapshot.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ?
             (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) |
                 (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
@@ -3214,6 +3215,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t roles = 0;
         uint32_t experts = 0;
         uint32_t type = GGML_TYPE_COUNT;
+        const auto & device_info = ggml_cuda_info().devices[device];
         for (const auto & bank : snapshot.banks) {
             const bool supported_encoding =
                 ((bank.type == GGML_TYPE_Q4_0 || bank.type == GGML_TYPE_Q4_K || bank.type == GGML_TYPE_BF16) &&
@@ -3228,6 +3230,22 @@ struct ggml_cuda_moe_grouped_context::impl {
                     !ggml_backend_buft_is_cuda_moe_cached(bank.buft) || bank.ne[2] <= 0 || bank.expert_stride == 0 ||
                     (uint64_t) bank.ne[2] > UINT32_MAX || bank.expert_stride > SIZE_MAX / snapshot.n_slots ||
                     bank.byte_extent != bank.expert_stride * (uint64_t) bank.ne[2] || !descriptor_matches(bank)) {
+                return false;
+            }
+            ggml_cuda_mmid_capability_query query;
+            query.source_type = static_cast<ggml_type>(bank.type);
+            query.input_type = GGML_TYPE_F32;
+            query.output_type = GGML_TYPE_F32;
+            memcpy(query.source_ne, bank.ne, sizeof(query.source_ne));
+            memcpy(query.source_nb, bank.nb, sizeof(query.source_nb));
+            query.n_tokens = 1;
+            query.n_experts = bank.ne[2];
+            query.cc = device_info.cc;
+            query.warp_size = device_info.warp_size;
+            query.smpbo = device_info.smpbo;
+            query.phase = GGML_CUDA_MMID_PHASE_DECODE;
+            query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+            if (ggml_cuda_mmid_get_capability(query).reason != GGML_CUDA_MMID_CAPABILITY_OK) {
                 return false;
             }
             if (experts == 0) {
@@ -3251,7 +3269,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         return nullptr;
 #else
         uint32_t n_experts = 0;
-        if (device < 0 || !decode_eligible(snapshot, &n_experts)) {
+        if (device < 0 || !decode_eligible(snapshot, device, &n_experts)) {
             return nullptr;
         }
 

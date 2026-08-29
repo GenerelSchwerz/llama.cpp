@@ -1668,3 +1668,4 @@ void ggml_cuda_mul_mat_q_mapped(
         const int32_t * source_wait_class = nullptr, const uint32_t * stage_ready = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo);
