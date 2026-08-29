@@ -140,6 +140,15 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
     groups.reserve(std::min<size_t>(model.layers.size() * 2, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS));
     tensors.reserve(std::min<size_t>(model.layers.size() * 12, GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2));
 
+    auto mark_typed_alias = [&](const ggml_tensor * tensor) {
+        snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+        for (const auto & record : tensors) {
+            if (record.tensor == tensor && record.group_index < groups.size()) {
+                groups[record.group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+            }
+        }
+    };
+
     auto append_group = [&](const group_source & source) {
         if (source.gate == nullptr && source.up == nullptr && source.gate_up == nullptr && source.down == nullptr) {
             return;
@@ -169,9 +178,14 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
             if (tensor == nullptr) {
                 return;
             }
-            if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2 || !seen.insert(tensor).second) {
+            if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {
                 groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
                 snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+                return;
+            }
+            if (!seen.insert(tensor).second) {
+                groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+                mark_typed_alias(tensor);
                 return;
             }
             uint32_t flags = tensor_overrides ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
@@ -192,7 +206,9 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
         append_tensor(source.gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
         append_tensor(source.down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
         append_tensor(source.gate_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
-        append_tensor(source.up_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+        append_tensor(source.up_scale,
+            source.gate_up != nullptr ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE,
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
         append_tensor(source.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
         append_tensor(source.gate_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
         append_tensor(source.up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
@@ -221,7 +237,11 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
     }
 
     auto append_excluded = [&](ggml_tensor * tensor, uint32_t status) {
-        if (tensor == nullptr || !seen.insert(tensor).second) {
+        if (tensor == nullptr) {
+            return;
+        }
+        if (!seen.insert(tensor).second) {
+            mark_typed_alias(tensor);
             return;
         }
         if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {

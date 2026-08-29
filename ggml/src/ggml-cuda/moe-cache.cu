@@ -1731,6 +1731,13 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
     std::vector<uint32_t> group_rejections(snapshot.n_groups, GGML_CUDA_MOE_CANDIDATE_REJECT_NONE);
     std::vector<uint32_t> active_group_indices(snapshot.n_groups, UINT32_MAX);
     active_storage.reserve(snapshot.n_groups);
+    uint32_t inherited_group_flags = 0;
+    if ((snapshot.flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_TENSOR_OVERRIDES) != 0) {
+        inherited_group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES;
+    }
+    if ((snapshot.flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE) != 0) {
+        inherited_group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+    }
     const bool snapshot_dormant = snapshot.flags != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE;
     for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
         const auto & group = snapshot.groups[group_index];
@@ -1745,6 +1752,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
         prospective.semantic_group_index = group_index;
         bool bases_cached = true;
         bool association_valid = true;
+        bool current_policy_supported = true;
         for (const auto * record : records[group_index]) {
             if (record->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE) {
                 continue;
@@ -1759,7 +1767,13 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
                 });
                 association_valid = association_valid && has_base;
             }
+            current_policy_supported = current_policy_supported &&
+                record->role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE;
             prospective.banks.push_back({record->tensor, record->role, 0});
+        }
+        if (!current_policy_supported) {
+            group_rejections[group_index] = GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_ROLE;
+            continue;
         }
         if (!bases_cached || !association_valid) {
             group_rejections[group_index] = GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_ROLE;
@@ -1818,10 +1832,11 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
             entry.role = record.role;
             entry.status = record.status;
             entry.flags = record.flags;
+            entry.group_flags = inherited_group_flags;
             if (record.group_index < snapshot.n_groups) {
                 entry.layout = snapshot.groups[record.group_index].layout;
                 entry.domain = snapshot.groups[record.group_index].domain;
-                entry.group_flags = snapshot.groups[record.group_index].flags;
+                entry.group_flags |= snapshot.groups[record.group_index].flags;
                 entry.rejection = group_rejections[record.group_index];
             }
             if (active_group < table.groups.size()) {
@@ -1845,7 +1860,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
             reverse->second.flags = record.flags;
             reverse->second.layout = snapshot.groups[record.group_index].layout;
             reverse->second.domain = snapshot.groups[record.group_index].domain;
-            reverse->second.group_flags = snapshot.groups[record.group_index].flags;
+            reverse->second.group_flags = inherited_group_flags | snapshot.groups[record.group_index].flags;
             reverse->second.rejection = group_rejections[record.group_index];
         }
     }

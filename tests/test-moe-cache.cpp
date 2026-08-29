@@ -920,6 +920,22 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(v2_diagnostics.first_rejection[GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR] ==
         GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
     CHECK(execution.size() == 1 && execution.find(v2_readers[1], nullptr));
+
+    auto incomplete_snapshot = v2_snapshot;
+    incomplete_snapshot.flags = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+    CHECK(registry.replace(&incomplete_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 0);
+    registry.compile_graph_plan(v2_graph, 906, &plan, &execution);
+    const auto & incomplete_diagnostics = plan.coverage_diagnostics();
+    CHECK(incomplete_diagnostics.cached_mmid == v2_readers.size());
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 0);
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE] == v2_readers.size() - 3);
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_ACTIVE_LORA] == 1);
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_TENSOR_OVERRIDE] == 1);
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == 0);
+    CHECK(incomplete_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
+    CHECK(incomplete_diagnostics.first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE] == gate_up);
+    CHECK(execution.size() == 0);
     fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
 }
 
@@ -993,6 +1009,7 @@ static void test_candidate_producer() {
     CHECK(snapshot.abi_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION);
     CHECK(snapshot.struct_size == sizeof(snapshot));
     CHECK(snapshot.n_slots == 12 && snapshot.n_groups == 4);
+    CHECK(snapshot.flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
 
     const auto & separate_group = snapshot.groups[0];
     CHECK(separate_group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
@@ -1082,11 +1099,28 @@ static void test_candidate_producer() {
     CHECK(registry.find_weight(separate.ffn_gate_exps, nullptr));
 
     fused.ffn_up_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
-    llama_moe_candidate_snapshot untyped_fused_scale(*model, loras);
-    CHECK(untyped_fused_scale.get().n_groups == 4);
-    CHECK(registry.replace(&untyped_fused_scale.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(registry.state().n_groups == 2);
+    llama_moe_candidate_snapshot fused_scale(*model, loras);
+    CHECK(fused_scale.get().n_groups == 4);
+    const auto * fused_scale_record = candidate_tensor(fused_scale.get(), fused.ffn_up_exps_s);
+    CHECK(fused_scale_record != nullptr);
+    CHECK(fused_scale_record->role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE);
+    CHECK(fused_scale_record->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+    CHECK(registry.replace(&fused_scale.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 2 && registry.state().n_weights == 6);
+    CHECK(!registry.find_down_group_key(fused.ffn_down_exps, nullptr));
+    CHECK(!registry.find_weight(fused.ffn_gate_up_exps, nullptr));
     fused.ffn_up_exps_s = nullptr;
+
+    ggml_tensor * saved_shared = separate.ffn_up_shexp;
+    separate.ffn_up_shexp = separate.ffn_gate_exps;
+    llama_moe_candidate_snapshot typed_alias(*model, loras);
+    CHECK(typed_alias.get().flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE);
+    CHECK(typed_alias.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE);
+    CHECK(candidate_tensor(typed_alias.get(), separate.ffn_gate_exps)->status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+    CHECK(registry.replace(&typed_alias.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 0);
+    separate.ffn_up_shexp = saved_shared;
+    CHECK(registry.replace(&lora_off.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
     llama_model_tensor_buft_override overrides[] = {{".*", ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}};
     params.tensor_buft_overrides = overrides;
