@@ -295,10 +295,33 @@ enum ggml_cuda_moe_graph_group_state : uint32_t {
     GGML_CUDA_MOE_GRAPH_GROUP_FINISHED,
 };
 
+struct ggml_cuda_moe_graph_capability_witness {
+    const ggml_tensor * tensor = nullptr;
+    const void * source_data = nullptr;
+    uint64_t byte_extent = 0;
+    uint64_t expert_stride = 0;
+    int64_t n_tokens = 0;
+    int64_t n_experts = 0;
+    size_t smpbo = 0;
+    int32_t device = -1;
+    int32_t cc = 0;
+    int32_t warp_size = 0;
+    uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    uint32_t source_type = GGML_TYPE_COUNT;
+    uint32_t source_flags = 0;
+    uint32_t input_type = GGML_TYPE_COUNT;
+    uint32_t output_type = GGML_TYPE_COUNT;
+    uint32_t phase = 0;
+    uint32_t mapping = 0;
+    uint32_t consumer = 0;
+    uint32_t reason = 0;
+};
+
 struct ggml_cuda_moe_graph_group_dispatch {
     ggml_cuda_moe_complete_group_key key;
     ggml_cuda_moe_group_call_lease authority;
     ggml_cuda_moe_grouped_transaction transaction;
+    const ggml_cuda_moe_graph_capability_witness * capabilities = nullptr;
     const int32_t * remapped_ids = nullptr;
     const void * bank_data[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
     cudaStream_t stream = nullptr;
@@ -404,6 +427,7 @@ private:
         GROUP_REASON_DESCRIPTOR,
         GROUP_REASON_SOURCE,
         GROUP_REASON_GEOMETRY,
+        GROUP_REASON_CAPABILITY,
         GROUP_REASON_ROUTE,
         GROUP_REASON_DUPLICATE_ROLE,
         GROUP_REASON_MIXED_IDS,
@@ -453,6 +477,7 @@ private:
         const ggml_tensor * nodes[4];
         uint32_t node_indices[4];
         uint32_t bank_indices[4];
+        ggml_cuda_moe_graph_capability_witness capabilities[4];
         uint32_t route_root_node_index;
         uint32_t route_ids_node_index;
         uint32_t required_roles;
@@ -465,6 +490,7 @@ private:
         bool descriptor_supported;
         bool source_invalid;
         bool geometry_invalid;
+        bool capability_invalid;
         bool route_invalid;
         bool duplicate_role;
         bool mixed_ids;
@@ -489,6 +515,7 @@ private:
         const ggml_tensor * nodes[4];
         uint32_t node_indices[4];
         uint32_t bank_indices[4];
+        ggml_cuda_moe_graph_capability_witness capabilities[4];
         reader_witness readers[MAX_GROUP_READERS];
         use_witness bank_uses[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
         uint32_t reason;
@@ -688,6 +715,7 @@ private:
     friend class ggml_cuda_moe_legacy_cache_lease;
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+    bool admission_closed_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
     uint64_t legacy_op_count_for_test(bool is_decode) const;
