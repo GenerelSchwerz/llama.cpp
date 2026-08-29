@@ -2418,7 +2418,7 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 } // namespace
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), graph_node_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), unknown_reusable_(false) {
+    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), graph_node_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
     for (auto & index : coverage_diagnostics_.first_node_index) {
         index = UINT32_MAX;
     }
@@ -2432,6 +2432,8 @@ ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
 
 void ggml_cuda_moe_graph_plan::reset() {
     groups_.clear();
+    mmid_inventory_.clear();
+    source_uses_.clear();
     for (auto & entry : nodes_) {
         entry.node = nullptr;
     }
@@ -2456,6 +2458,7 @@ void ggml_cuda_moe_graph_plan::reset() {
         index = UINT32_MAX;
     }
     initialized_ = false;
+    inventory_complete_ = false;
     unknown_reusable_ = false;
 }
 
@@ -4788,6 +4791,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->initialized_ = true;
     auto & diagnostics = plan->coverage_diagnostics_;
     diagnostics.manifest_version = impl_->table.manifest_version;
+    std::array<const ggml_tensor *, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> prefill_authorities = {};
+    std::array<uint32_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> prefill_authority_indices;
+    std::array<uint32_t, ggml_cuda_moe_graph_plan::MAX_MMID_INVENTORY> mmid_indices;
+    prefill_authority_indices.fill(UINT32_MAX);
+    uint32_t n_mmid_indices = 0;
+    bool inventory_complete = true;
     bool cached_prefill = false;
     bool cached_decode = false;
     for (int node_index = 0; node_index < plan->graph_node_count_; ++node_index) {
@@ -4799,6 +4808,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         }
 
         ++diagnostics.cached_mmid;
+        if (n_mmid_indices == mmid_indices.size()) {
+            inventory_complete = false;
+        } else {
+            mmid_indices[n_mmid_indices++] = node_index;
+        }
         const bool prefill = moe_candidate_prefill_reader(node);
         cached_prefill = cached_prefill || prefill;
         cached_decode = cached_decode || !prefill;
@@ -4816,6 +4830,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 reason = GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED;
             } else {
                 reason = moe_candidate_coverage_reason(reverse->second);
+            }
+            if (reverse->second.active && reverse->second.group_index < impl_->table.groups.size() &&
+                    prefill_authorities[reverse->second.group_index] == nullptr) {
+                prefill_authorities[reverse->second.group_index] = node;
+                prefill_authority_indices[reverse->second.group_index] = node_index;
             }
         }
         ++diagnostics.counts[reason];
@@ -4836,11 +4855,94 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             }
         }
     }
-    if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
+    const bool pure_prefill = cached_prefill && !cached_decode;
+    if (pure_prefill) {
         plan->outcome_ = GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
-        plan->unknown_reusable_ = coverage_valid || impl_->table.groups.empty();
+        if (impl_->state.accepted && impl_->state.n_slots != 0 && !impl_->table.groups.empty()) {
+            uint32_t n_prefill_groups = 0;
+            for (uint32_t group_index = 0; group_index < impl_->table.groups.size(); ++group_index) {
+                n_prefill_groups += prefill_authorities[group_index] != nullptr;
+            }
+            try {
+                plan->groups_.reserve(n_prefill_groups);
+            } catch (const std::bad_alloc &) {
+                plan->reset();
+                execution->reset();
+                return;
+            }
+            for (uint32_t group_index = 0; group_index < impl_->table.groups.size(); ++group_index) {
+                if (prefill_authorities[group_index] == nullptr) {
+                    continue;
+                }
+                const auto & group = impl_->table.groups[group_index];
+                const uint32_t record_index = plan->groups_.size();
+                plan->groups_.emplace_back();
+                auto & record = plan->groups_.back();
+                record.candidate.generation = impl_->state.generation;
+                record.candidate.group_index = group_index;
+                record.layout = group.layout;
+                record.n_banks = moe_candidate_base_slot_bank_count(group);
+                record.prefill = 1;
+                record.authority_node = prefill_authorities[group_index];
+                record.authority_node_index = prefill_authority_indices[group_index];
+                record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
+                auto & dispatch = execution->groups_[record_index];
+                dispatch.key.candidate = record.candidate;
+                dispatch.key.layout = record.layout;
+                dispatch.key.n_banks = record.n_banks;
+                dispatch.first_reader = record.authority_node;
+            }
+            plan->n_groups_ = plan->groups_.size();
+        }
         execution->plan_ = plan;
+        execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
+        execution->n_groups_ = plan->n_groups_;
         return;
+    }
+    try {
+        plan->mmid_inventory_.reserve(n_mmid_indices);
+    } catch (const std::bad_alloc &) {
+        plan->reset();
+        execution->reset();
+        return;
+    }
+    plan->inventory_complete_ = inventory_complete;
+    for (uint32_t inventory_index = 0; inventory_index < n_mmid_indices; ++inventory_index) {
+        const uint32_t node_index = mmid_indices[inventory_index];
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
+        ggml_cuda_moe_graph_plan::mmid_witness witness;
+        witness.output = moe_candidate_ids_signature(node);
+        witness.source = moe_candidate_ids_signature(node->src[0]);
+        witness.activation = node->src[1] != nullptr ? moe_candidate_ids_signature(node->src[1]) : ggml_cuda_moe_ids_signature{};
+        witness.ids = node->src[2] != nullptr ? moe_candidate_ids_signature(node->src[2]) : ggml_cuda_moe_ids_signature{};
+        witness.node_index = node_index;
+        witness.flags = node->flags;
+        plan->mmid_inventory_.push_back(witness);
+    }
+    const bool explicitly_disabled = impl_->state.accepted &&
+        (impl_->state.n_slots == 0 || (impl_->table.groups.empty() && impl_->table.reverse_map.empty()));
+    if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
+        plan->outcome_ = cached_decode && !explicitly_disabled ?
+            GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR : GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        execution->plan_ = plan;
+        execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
+        return;
+    }
+
+    try {
+        plan->source_uses_.reserve(impl_->table.reverse_map.size());
+    } catch (const std::bad_alloc &) {
+        plan->reset();
+        execution->reset();
+        return;
+    }
+    for (const auto & entry : impl_->table.reverse_map) {
+        bool present = false;
+        int32_t use_count = 0;
+        if (!moe_candidate_graph_use(cgraph, entry.first, present, use_count)) {
+            plan->inventory_complete_ = false;
+        }
+        plan->source_uses_.push_back({entry.first, use_count, present ? 1u : 0u});
     }
 
     std::vector<ggml_cuda_moe_graph_plan::group_observation> observations;
@@ -5032,7 +5134,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         n_observed += observation.observed;
         all_observed = all_observed && observation.observed;
     }
-    plan->unknown_reusable_ = (coverage_valid || all_observed) &&
+    plan->unknown_reusable_ = plan->inventory_complete_ &&
+        plan->mmid_inventory_.size() == diagnostics.cached_mmid && (coverage_valid || all_observed) &&
         diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid;
     try {
         plan->groups_.reserve(n_observed);
@@ -5215,6 +5318,38 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     execution->plan_ = plan;
     execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
     execution->n_groups_ = plan->n_groups_;
+}
+
+bool ggml_cuda_moe_grouped_context::graph_mmid_inventory_matches(
+        const ggml_cgraph * cgraph,
+        const ggml_cuda_moe_graph_plan & plan) const {
+    if (!plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid) {
+        return false;
+    }
+    for (const auto & witness : plan.mmid_inventory_) {
+        if (witness.node_index >= static_cast<uint32_t>(cgraph->n_nodes)) {
+            return false;
+        }
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), witness.node_index);
+        if (node == nullptr || node->op != GGML_OP_MUL_MAT_ID || node->flags != witness.flags ||
+                !moe_candidate_signature_matches(witness.output, node) ||
+                !moe_candidate_signature_matches(witness.source, node->src[0]) ||
+                !moe_candidate_signature_matches(witness.activation, node->src[1]) ||
+                !moe_candidate_signature_matches(witness.ids, node->src[2]) || node->src[0] == nullptr ||
+                node->src[0]->buffer == nullptr ||
+                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(node->src[0]->buffer))) {
+            return false;
+        }
+    }
+    for (const auto & saved : plan.source_uses_) {
+        bool present = false;
+        int32_t use_count = 0;
+        if (!moe_candidate_graph_use(cgraph, saved.tensor, present, use_count) || saved.present != (present ? 1u : 0u) ||
+                saved.use_count != use_count) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
@@ -5418,11 +5553,15 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             (property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN && !plan.unknown_reusable_)) {
         return false;
     }
+    if (property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN && !graph_mmid_inventory_matches(cgraph, plan)) {
+        return false;
+    }
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
         if (plan.n_groups_ != 0) {
             return false;
         }
         execution->plan_ = &plan;
+        execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
         return true;
     }
 

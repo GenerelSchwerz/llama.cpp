@@ -421,6 +421,7 @@ public:
 
 private:
     static constexpr uint32_t MAX_NODE_BINDINGS = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * 3;
+    static constexpr uint32_t MAX_MMID_INVENTORY = MAX_NODE_BINDINGS;
     static constexpr uint32_t NODE_TABLE_SIZE = 4096;
     static constexpr uint32_t MAX_GROUP_READERS = 4;
     static constexpr uint32_t MAX_READER_CONSUMERS = 4;
@@ -467,6 +468,21 @@ private:
     };
 
     struct use_witness {
+        const ggml_tensor * tensor;
+        int32_t use_count;
+        uint32_t present;
+    };
+
+    struct mmid_witness {
+        ggml_cuda_moe_ids_signature output;
+        ggml_cuda_moe_ids_signature source;
+        ggml_cuda_moe_ids_signature activation;
+        ggml_cuda_moe_ids_signature ids;
+        uint32_t node_index;
+        int32_t flags;
+    };
+
+    struct source_use_witness {
         const ggml_tensor * tensor;
         int32_t use_count;
         uint32_t present;
@@ -549,6 +565,8 @@ private:
     static_assert(sizeof(group_observation) <= 4096, "group observation is too large");
 
     std::vector<group_record> groups_;
+    std::vector<mmid_witness> mmid_inventory_;
+    std::vector<source_use_witness> source_uses_;
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
     const void * graph_key_;
@@ -562,6 +580,7 @@ private:
     uint32_t n_nodes_;
     ggml_cuda_moe_graph_coverage_diagnostics coverage_diagnostics_;
     bool initialized_;
+    bool inventory_complete_;
     bool unknown_reusable_;
 };
 
@@ -734,6 +753,7 @@ private:
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
     uint64_t legacy_op_count_for_test(bool is_decode) const;
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
+    bool graph_mmid_inventory_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan & plan) const;
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
