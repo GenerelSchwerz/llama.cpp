@@ -158,6 +158,7 @@ struct candidate_test_fixture {
     ggml_context * ctx = nullptr;
     void * storage = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
+    ggml_backend_buffer_t cached_buffer = nullptr;
     size_t next_offset = 0;
 
     candidate_test_fixture() {
@@ -176,6 +177,9 @@ struct candidate_test_fixture {
 
     ~candidate_test_fixture() {
         ggml_free(ctx);
+        if (cached_buffer != nullptr) {
+            ggml_backend_buffer_free(cached_buffer);
+        }
         ggml_backend_buffer_free(buffer);
         free(storage);
     }
@@ -197,6 +201,16 @@ struct candidate_test_fixture {
     ggml_tensor * tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
         ggml_tensor * result = ggml_new_tensor(ctx, type, n_dims, ne);
         materialize(result);
+        return result;
+    }
+
+    ggml_tensor * cached_tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
+        if (cached_buffer == nullptr) {
+            cached_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(storage, BUFFER_SIZE);
+            CHECK(cached_buffer != nullptr);
+        }
+        ggml_tensor * result = tensor(type, n_dims, ne);
+        result->buffer = cached_buffer;
         return result;
     }
 };
@@ -714,6 +728,77 @@ static const ggml_backend_moe_candidate_bank_v1 * candidate_bank(
         }
     }
     return nullptr;
+}
+
+static void test_candidate_graph_coverage_ledger() {
+    candidate_test_fixture fixture;
+    const int64_t gate_up_ne[] = {64, 64, 4};
+    const int64_t down_ne[] = {32, 64, 4};
+    ggml_tensor * gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
+    ggml_tensor * unknown = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    ggml_tensor * ordinary = fixture.tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 2> banks = {{
+        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 group = {
+        banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+    };
+    const auto snapshot = candidate_snapshot(12, &group, 1);
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
+    CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    const candidate_route route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * gate_up_reader = candidate_mmid(fixture, gate_up, route.ids);
+    ggml_tensor * down_reader = candidate_mmid(fixture, down, route.ids);
+    ggml_tensor * unknown_reader = candidate_mmid(fixture, unknown, route.ids);
+    ggml_tensor * ordinary_reader = candidate_mmid(fixture, ordinary, route.ids);
+    ggml_cgraph * graph = candidate_graph(fixture, {
+        route.root, route.ids, gate_up_reader, down_reader, unknown_reader, ordinary_reader,
+    });
+
+    ggml_cuda_moe_graph_plan plan;
+    ggml_cuda_moe_graph_execution execution;
+    registry.compile_graph_plan(graph, 901, &plan, &execution);
+    const auto & diagnostics = plan.coverage_diagnostics();
+    CHECK(diagnostics.cached_mmid == 3);
+    CHECK(diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 2);
+    CHECK(diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
+    CHECK(diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED] == 0);
+    CHECK(diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP] == 0);
+    CHECK(diagnostics.first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == gate_up);
+    CHECK(diagnostics.first_node_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 2);
+    CHECK(diagnostics.first_group_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 0);
+    CHECK(diagnostics.first_bank_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 0);
+    CHECK(diagnostics.first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == unknown);
+    CHECK(diagnostics.first_node_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 4);
+    CHECK(execution.size() == 1 && execution.find(down_reader, nullptr));
+
+    const int64_t saved_ne0 = down->ne[0];
+    down->ne[0]--;
+    registry.compile_graph_plan(graph, 902, &plan, &execution);
+    CHECK(plan.coverage_diagnostics().cached_mmid == 3);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 1);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED] == 1);
+    CHECK(plan.coverage_diagnostics().first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED] == down);
+    down->ne[0] = saved_ne0;
+
+    ggml_cgraph view = ggml_graph_view(graph, 4, 6);
+    registry.compile_graph_plan(&view, 903, &plan, &execution);
+    CHECK(plan.coverage_diagnostics().cached_mmid == 1);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 0);
+
+    const auto disabled = candidate_snapshot(12, nullptr, 0);
+    CHECK(registry.replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    registry.compile_graph_plan(graph, 904, &plan, &execution);
+    CHECK(plan.coverage_diagnostics().cached_mmid == 3);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 3);
+    CHECK(execution.size() == 0);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, {0, 0}));
+    fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
 }
 
 static void test_candidate_producer() {
@@ -4441,6 +4526,7 @@ int main(int argc, char ** argv) {
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
+    test_candidate_graph_coverage_ledger();
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_legacy_owner_leases();

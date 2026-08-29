@@ -346,6 +346,23 @@ enum ggml_cuda_moe_graph_property_hint : uint32_t {
     GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
 };
 
+enum ggml_cuda_moe_graph_coverage_reason : uint32_t {
+    GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED = 0,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP,
+    GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT,
+};
+
+struct ggml_cuda_moe_graph_coverage_diagnostics {
+    uint32_t cached_mmid = 0;
+    uint32_t counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    const ggml_tensor * first_source[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_node_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_group_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+    uint32_t first_bank_index[GGML_CUDA_MOE_GRAPH_COVERAGE_REASON_COUNT] = {};
+};
+
 class ggml_cuda_moe_graph_plan {
 public:
     ggml_cuda_moe_graph_plan();
@@ -354,6 +371,7 @@ public:
     uint64_t registry_generation() const;
     uint64_t graph_uid() const;
     int32_t graph_node_count() const;
+    const ggml_cuda_moe_graph_coverage_diagnostics & coverage_diagnostics() const;
 
 private:
     static constexpr uint32_t MAX_NODE_BINDINGS = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * 3;
@@ -488,6 +506,7 @@ private:
     int32_t graph_node_count_;
     uint32_t n_groups_;
     uint32_t n_nodes_;
+    ggml_cuda_moe_graph_coverage_diagnostics coverage_diagnostics_;
     bool initialized_;
     bool unknown_reusable_;
 };

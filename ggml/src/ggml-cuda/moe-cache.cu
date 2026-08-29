@@ -1933,6 +1933,15 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
     owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), graph_node_count_(0), n_groups_(0), n_nodes_(0), initialized_(false), unknown_reusable_(false) {
+    for (auto & index : coverage_diagnostics_.first_node_index) {
+        index = UINT32_MAX;
+    }
+    for (auto & index : coverage_diagnostics_.first_group_index) {
+        index = UINT32_MAX;
+    }
+    for (auto & index : coverage_diagnostics_.first_bank_index) {
+        index = UINT32_MAX;
+    }
 }
 
 void ggml_cuda_moe_graph_plan::reset() {
@@ -1949,6 +1958,16 @@ void ggml_cuda_moe_graph_plan::reset() {
     graph_node_count_ = 0;
     n_groups_ = 0;
     n_nodes_ = 0;
+    coverage_diagnostics_ = {};
+    for (auto & index : coverage_diagnostics_.first_node_index) {
+        index = UINT32_MAX;
+    }
+    for (auto & index : coverage_diagnostics_.first_group_index) {
+        index = UINT32_MAX;
+    }
+    for (auto & index : coverage_diagnostics_.first_bank_index) {
+        index = UINT32_MAX;
+    }
     initialized_ = false;
     unknown_reusable_ = false;
 }
@@ -2018,6 +2037,10 @@ uint64_t ggml_cuda_moe_graph_plan::graph_uid() const {
 
 int32_t ggml_cuda_moe_graph_plan::graph_node_count() const {
     return initialized_ ? graph_node_count_ : 0;
+}
+
+const ggml_cuda_moe_graph_coverage_diagnostics & ggml_cuda_moe_graph_plan::coverage_diagnostics() const {
+    return coverage_diagnostics_;
 }
 
 ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() : plan_(nullptr), owner_(nullptr), n_groups_(0), dispatch_active_(false) {
@@ -4234,6 +4257,39 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->coverage_nodes_ = coverage_valid ? coverage_nodes : nullptr;
     plan->coverage_epoch_ = coverage_valid ? coverage_epoch : 0;
     plan->initialized_ = true;
+    auto & diagnostics = plan->coverage_diagnostics_;
+    for (int node_index = 0; node_index < plan->graph_node_count_; ++node_index) {
+        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
+        const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+        if (source == nullptr || source->buffer == nullptr ||
+                !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+            continue;
+        }
+
+        ++diagnostics.cached_mmid;
+        uint32_t reason = GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS;
+        uint32_t group_index = UINT32_MAX;
+        uint32_t bank_index = UINT32_MAX;
+        const auto reverse = impl_->table.reverse_map.find(source);
+        if (reverse != impl_->table.reverse_map.end()) {
+            group_index = reverse->second.group_index;
+            bank_index = reverse->second.bank_index;
+            if (group_index >= impl_->table.groups.size() || bank_index >= impl_->table.groups[group_index].banks.size()) {
+                reason = GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP;
+            } else if (!moe_candidate_record_matches(impl_->table.groups[group_index].banks[bank_index], source)) {
+                reason = GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED;
+            } else {
+                reason = GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED;
+            }
+        }
+        ++diagnostics.counts[reason];
+        if (diagnostics.first_node_index[reason] == UINT32_MAX) {
+            diagnostics.first_source[reason] = source;
+            diagnostics.first_node_index[reason] = node_index;
+            diagnostics.first_group_index[reason] = group_index;
+            diagnostics.first_bank_index[reason] = bank_index;
+        }
+    }
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
         plan->unknown_reusable_ = coverage_valid || impl_->table.groups.empty();
         execution->plan_ = plan;
