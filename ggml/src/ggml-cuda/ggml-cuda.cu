@@ -1955,6 +1955,8 @@ static void ggml_cuda_mul_mat_id_impl(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool mapped_experts = host_route != nullptr && host_route->expert_map != nullptr;
+    const auto source_capability = ggml_cuda_mmid_source_capability_for(src0->type);
+    const bool mapped_mmq = !mapped_experts || (source_capability.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0;
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -1974,7 +1976,7 @@ static void ggml_cuda_mul_mat_id_impl(
             }
         }
 
-        if (use_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (use_mmq && mapped_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             if (mapped_experts) {
                 int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : 0;
                 if (source_split == 0) {

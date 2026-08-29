@@ -1248,14 +1248,18 @@ static void test_mmid_capabilities() {
     query.mapping = GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
     auto capability = ggml_cuda_mmid_get_capability(query);
     CHECK(capability.selection == direct.selection && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
-    query = candidate_mmid_query(GGML_TYPE_NVFP4, 16, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
-    capability = ggml_cuda_mmid_get_capability(query);
-    CHECK((capability.selection == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED &&
-            capability.reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_MAPPING) ||
-        (capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK));
-    query.use_mmq = false;
-    capability = ggml_cuda_mmid_get_capability(query);
-    CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        query = candidate_mmid_query(type, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true);
+        capability = ggml_cuda_mmid_get_capability(query);
+        CHECK((capability.selection == GGML_CUDA_MMID_CONSUMER_MMQ || capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC) &&
+            capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+        query.mapping = GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+        capability = ggml_cuda_mmid_get_capability(query);
+        CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+        query.use_mmq = false;
+        capability = ggml_cuda_mmid_get_capability(query);
+        CHECK(capability.selection == GGML_CUDA_MMID_CONSUMER_GENERIC && capability.reason == GGML_CUDA_MMID_CAPABILITY_OK);
+    }
     query = candidate_mmid_query(GGML_TYPE_IQ1_M, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true);
     CHECK(ggml_cuda_mmid_get_capability(query).selection == GGML_CUDA_MMID_CONSUMER_GENERIC);
     query = candidate_mmid_query(GGML_TYPE_Q4_K, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true, 32 * 1024);
@@ -5004,6 +5008,19 @@ static void test_cached_mmid_prefill_and_overflow() {
     CHECK(mapped_first == mapped_second);
     (void) run_cached_mmid_path_test(
         cuda_backend.get(), reference_backend.get(), cuda_prefill, reference_prefill, {0, 1, 2, 3, 4, 5});
+
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        auto cuda_fp4 = build_cached_mmid_path_test_graph(
+            cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, 128, 3, 2);
+        auto reference_fp4 = build_cached_mmid_path_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), type, 128, 3, 2);
+        initialize_cached_mmid_path_test_graphs(cuda_fp4, reference_fp4);
+        const auto fp4_first = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_fp4, reference_fp4, mapped_ids);
+        const auto fp4_second = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_fp4, reference_fp4, mapped_ids);
+        CHECK(fp4_first == fp4_second);
+    }
 
     auto cuda_decode = build_cached_mmid_path_test_graph(
         cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0, 128, 6, 1);

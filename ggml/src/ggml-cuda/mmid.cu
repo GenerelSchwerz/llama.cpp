@@ -99,11 +99,8 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
             query.n_tokens <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(query.cc)) {
         result.selection = GGML_CUDA_MMID_CONSUMER_MMVF;
     } else if (query.use_mmq && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
+            (!mapped || (result.source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0) &&
             ggml_cuda_should_use_mmq(query.source_type, query.cc, query.n_tokens, query.n_experts, query.smpbo)) {
-        if (mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) == 0) {
-            result.reason = GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_MAPPING;
-            return result;
-        }
         result.selection = GGML_CUDA_MMID_CONSUMER_MMQ;
     } else if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
             ggml_cuda_should_use_mmf(query.source_type, query.cc, query.warp_size, query.source_ne, query.source_nb,
