@@ -1492,7 +1492,7 @@ static bool moe_candidate_original_direct_scale_consumer(
                 bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE &&
                 bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT &&
                 bank.info.type == GGML_TYPE_F32 && bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN &&
-                moe_candidate_record_matches(bank, reshape->src[0])) {
+                reshape->ne[1] == bank.ne[0] && moe_candidate_record_matches(bank, reshape->src[0])) {
             const int64_t reshape_ne[GGML_MAX_DIMS] = {1, bank.ne[0], 1, 1};
             const int64_t repeat_ne[GGML_MAX_DIMS] = {1, bank.ne[0], producer->ne[2], 1};
             const int64_t rows_ne[GGML_MAX_DIMS] = {1, ids->ne[0], ids->ne[1], ids->ne[2]};
@@ -1565,7 +1565,8 @@ static bool moe_candidate_original_direct_scale_witness_matches(
         bank.info.role == scale_role &&
         bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE &&
         bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT && bank.info.type == GGML_TYPE_F32 &&
-        bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN && moe_candidate_record_matches(bank, reshape->src[0]);
+        bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN && reshape->ne[1] == bank.ne[0] &&
+        moe_candidate_record_matches(bank, reshape->src[0]);
 }
 
 static bool moe_candidate_validate_route(

@@ -5122,6 +5122,53 @@ static void test_active_grouped_dispatch_generic() {
     fprintf(stderr, "test-moe-cache: active grouped Q3 and mixed ordinary/F3 OK\n");
 }
 
+static void test_active_grouped_fused_down_scale_extent() {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+    CHECK(backend != nullptr);
+    auto graph = build_active_grouped_dispatch_graph(
+        backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true);
+    initialize_active_grouped_dispatch_graph(graph, 733);
+    register_active_grouped_dispatch(
+        backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+    CHECK(context != nullptr);
+
+    const auto coverage = candidate_certify_graph(*context, graph.graph);
+    std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+    ggml_cuda_moe_graph_execution execution;
+    CHECK(context->prepare_graph_execution(
+        graph.graph, 880, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+
+    graph.down_scale_reshape->ne[1]++;
+    graph.down_scale_repeat->ne[1]++;
+    CHECK(context->prepare_graph_execution(
+        graph.graph, 881, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &plan, &execution,
+        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
+
+    graph.down_scale_reshape->ne[1]--;
+    graph.down_scale_repeat->ne[1]--;
+    CHECK(context->prepare_graph_execution(
+        graph.graph, 882, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &plan, &execution,
+        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+    const ggml_cuda_moe_graph_plan * recovered_plan = plan.get();
+    CHECK(context->prepare_graph_execution(
+        graph.graph, 883, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &plan, &execution,
+        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+    CHECK(plan.get() == recovered_plan && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+}
+
 static void test_active_grouped_dispatch() {
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
@@ -5141,6 +5188,7 @@ static void test_active_grouped_dispatch() {
         GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 48);
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12, true);
+    test_active_grouped_fused_down_scale_extent();
     fprintf(stderr, "test-moe-cache: Gemma fused original-direct down scale exact OK\n");
     test_active_grouped_dispatch_decline();
     test_active_grouped_empty_policy();
