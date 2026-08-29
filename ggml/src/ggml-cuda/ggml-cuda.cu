@@ -3077,7 +3077,7 @@ static bool ggml_cuda_mul_mat_id(
 
     if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
         const auto result = ctx.moe_grouped_context->prepare_graph_group(group, binding, dst, ctx.stream());
-        if (result == GGML_CUDA_MOE_GROUPED_DECODE_ERROR) {
+        if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
             return false;
         }
     }
@@ -3095,6 +3095,10 @@ static bool ggml_cuda_mul_mat_id(
         ggml_cuda_mul_mat_id_impl(ctx, dst, ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]));
         dst->src[0] = original_weight;
         dst->src[2] = original_ids;
+        if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
+                !ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
+            return false;
+        }
         return true;
     }
     if (group != nullptr && group->state != GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY) {
@@ -5062,8 +5066,11 @@ static int ggml_cuda_try_fuse(
 
                 ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
                 if (up_group != nullptr && gate_group == up_group && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
-                    const auto result = cuda_ctx->moe_grouped_context->prepare_graph_group(up_group, up_binding, up, cuda_ctx->stream());
-                    if (result == GGML_CUDA_MOE_GROUPED_DECODE_ERROR) {
+                    ggml_tensor * first_reader = cgraph->nodes[i];
+                    const auto & first_binding = first_reader == up ? up_binding : gate_binding;
+                    const auto result = cuda_ctx->moe_grouped_context->prepare_graph_group(
+                        up_group, first_binding, first_reader, cuda_ctx->stream());
+                    if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
                         return -1;
                     }
                 }
@@ -5629,12 +5636,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             return GGML_STATUS_FAILED;
         }
     }
-    const bool moe_dispatch = moe_execution.size() != 0;
+    const bool moe_dispatch = moe_execution.requires_dispatch();
     if (moe_dispatch) {
         if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
             return GGML_STATUS_FAILED;
         }
-        if (use_cuda_graph && moe_execution.has_stream_grouped_candidate()) {
+        if (use_cuda_graph && moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY) {
             use_cuda_graph = false;
             cuda_graph_update_required = false;
         }

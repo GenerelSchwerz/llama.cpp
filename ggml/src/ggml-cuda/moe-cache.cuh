@@ -259,9 +259,10 @@ enum ggml_cuda_moe_group_authority : uint32_t {
     GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED,
 };
 
-enum ggml_cuda_moe_graph_group_class : uint32_t {
-    GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY = 0,
-    GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE,
+enum ggml_cuda_moe_graph_outcome : uint32_t {
+    GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY = 0,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR,
 };
 
 class ggml_cuda_moe_group_call_lease {
@@ -322,10 +323,11 @@ struct ggml_cuda_moe_graph_group_dispatch {
     ggml_cuda_moe_group_call_lease authority;
     ggml_cuda_moe_grouped_transaction transaction;
     const ggml_cuda_moe_graph_capability_witness * capabilities = nullptr;
+    const ggml_tensor * first_reader = nullptr;
+    const ggml_tensor * last_reader = nullptr;
     const int32_t * remapped_ids = nullptr;
     const void * bank_data[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
     cudaStream_t stream = nullptr;
-    uint32_t classification = GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY;
     uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY;
     uint32_t n_slots = 0;
 };
@@ -414,6 +416,7 @@ public:
     uint64_t registry_generation() const;
     uint64_t graph_uid() const;
     int32_t graph_node_count() const;
+    ggml_cuda_moe_graph_outcome outcome() const;
     const ggml_cuda_moe_graph_coverage_diagnostics & coverage_diagnostics() const;
 
 private:
@@ -424,6 +427,7 @@ private:
 
     enum group_reason : uint32_t {
         GROUP_REASON_ELIGIBLE = 0,
+        GROUP_REASON_PREFILL,
         GROUP_REASON_DESCRIPTOR,
         GROUP_REASON_SOURCE,
         GROUP_REASON_GEOMETRY,
@@ -498,6 +502,8 @@ private:
         bool external_consumer;
         bool unproven;
         bool has_ids;
+        bool prefill;
+        bool decode;
     };
 
     struct group_record {
@@ -509,7 +515,7 @@ private:
         uint32_t n_banks;
         uint32_t ids_root_node_index;
         uint32_t ids_node_index;
-        uint32_t classification;
+        uint32_t prefill;
         const ggml_tensor * authority_node;
         uint32_t authority_node_index;
         const ggml_tensor * nodes[4];
@@ -551,6 +557,7 @@ private:
     uint64_t graph_uid_;
     uint64_t coverage_epoch_;
     int32_t graph_node_count_;
+    ggml_cuda_moe_graph_outcome outcome_;
     uint32_t n_groups_;
     uint32_t n_nodes_;
     ggml_cuda_moe_graph_coverage_diagnostics coverage_diagnostics_;
@@ -573,6 +580,8 @@ public:
     const ggml_cuda_moe_group_call_lease * find_authority(const ggml_tensor * node) const;
     bool resolve_streams(ggml_cuda_moe_graph_stream_resolver resolver, void * data);
     bool has_stream_grouped_candidate() const;
+    bool requires_dispatch() const;
+    ggml_cuda_moe_graph_outcome outcome() const;
     uint32_t size() const;
 
 private:
@@ -699,6 +708,11 @@ public:
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
             cudaStream_t stream);
+    bool finish_graph_group(
+            ggml_cuda_moe_graph_group_dispatch * group,
+            const ggml_cuda_moe_graph_binding & binding,
+            const ggml_tensor * node,
+            cudaStream_t stream);
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
     ggml_cuda_moe_grouped_decode_result prepare_decode(
             const ggml_cuda_moe_complete_group_key & key,
@@ -721,7 +735,6 @@ private:
     uint64_t legacy_op_count_for_test(bool is_decode) const;
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
-    bool rollback_group_to_legacy(ggml_cuda_moe_graph_group_dispatch & group);
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
