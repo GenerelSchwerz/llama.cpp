@@ -777,6 +777,9 @@ struct moe_candidate_bank_record {
 
 struct moe_candidate_group_record {
     uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_INVALID;
+    uint32_t semantic_group_index = UINT32_MAX;
+    uint32_t flags = 0;
     const ggml_tensor * down = nullptr;
     std::vector<moe_candidate_bank_record> banks;
 };
@@ -851,6 +854,34 @@ static bool moe_candidate_is_block_scale(uint32_t role) {
 static bool moe_candidate_is_bias(uint32_t role) {
     return role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS &&
         role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS;
+}
+
+static uint32_t moe_candidate_required_base_roles(uint32_t layout) {
+    switch (layout) {
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE:
+            return (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP:
+            return (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED:
+            return (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
+                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+        default:
+            return 0;
+    }
+}
+
+static bool moe_candidate_routed_base(const ggml_backend_moe_candidate_tensor_v2 & record) {
+    return record.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE &&
+        record.role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT &&
+        record.role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT;
+}
+
+static bool moe_candidate_slot_resource(const moe_candidate_bank_record & record) {
+    return record.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND &&
+        (record.info.index_modes & GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT) != 0;
 }
 
 static uint32_t moe_candidate_base_role(uint32_t role) {
@@ -1004,7 +1035,7 @@ static const moe_candidate_bank_record * moe_candidate_find_role(const moe_candi
 static uint32_t moe_candidate_slot_bank_count(const moe_candidate_group_record & group) {
     uint32_t result = 0;
     for (const auto & bank : group.banks) {
-        result += bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
+        result += moe_candidate_slot_resource(bank);
     }
     return result;
 }
@@ -1358,20 +1389,17 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
         return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_TENSOR;
     }
 
+    const auto source = ggml_cuda_mmid_source_capability_for(tensor->type);
+    if ((source.flags & GGML_CUDA_MMID_SOURCE_ADVERTISED) == 0) {
+        return GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE;
+    }
+
     uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
     uint32_t index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT |
         GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP;
-    switch (tensor->type) {
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_BF16:
-            break;
-        case GGML_TYPE_NVFP4:
-            encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND;
-            index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT;
-            break;
-        default:
-            return GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE;
+    if (tensor->type == GGML_TYPE_NVFP4) {
+        encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_NVFP4_COMPOUND;
+        index_modes = GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT;
     }
 
     const int64_t block_size = ggml_blck_size(tensor->type);
@@ -1394,6 +1422,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_weight(
     record.info.group_index = group_index;
     record.info.role = role;
     record.info.type = tensor->type;
+    record.info.source_flags = source.flags;
     record.info.encoding = encoding;
     record.info.movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
     record.info.index_modes = index_modes;
@@ -1464,6 +1493,7 @@ static void moe_candidate_hash_bank(uint64_t & hash, const moe_candidate_bank_re
     moe_candidate_hash_value(hash, bank.buffer_size);
     moe_candidate_hash_value(hash, bank.info.role);
     moe_candidate_hash_value(hash, bank.info.type);
+    moe_candidate_hash_value(hash, bank.info.source_flags);
     moe_candidate_hash_value(hash, bank.info.encoding);
     moe_candidate_hash_value(hash, bank.info.movement);
     moe_candidate_hash_value(hash, bank.info.index_modes);
@@ -1509,18 +1539,24 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
         by_role[bank.role] = &bank;
     }
 
-    const bool has_gate = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT] != nullptr;
-    const bool has_up = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT] != nullptr;
-    const bool has_gate_up = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT] != nullptr;
-    const bool has_down = by_role[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT] != nullptr;
-    if ((input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && (!has_gate || !has_up || has_gate_up || !has_down)) ||
-            (input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && (has_gate || has_up || !has_gate_up || !has_down)) ||
-            (input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP)) {
+    uint32_t base_roles = 0;
+    for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
+            role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
+        if (by_role[role] != nullptr) {
+            base_roles |= 1u << role;
+        }
+    }
+    const uint32_t required_base_roles = moe_candidate_required_base_roles(input.layout);
+    if ((input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+            input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) ||
+            base_roles != required_base_roles) {
         return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT;
     }
 
     moe_candidate_group_record group;
     group.layout = input.layout;
+    group.domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
+    group.semantic_group_index = group_index;
     group.banks.reserve(input.n_banks);
     const ggml_tensor * weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT] = {};
     std::array<moe_candidate_bank_record, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_COUNT> records = {};
@@ -1570,7 +1606,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
     uint32_t slot_index = 0;
     for (uint32_t input_index = 0; input_index < input.n_banks; ++input_index) {
         auto record = records[input.banks[input_index].role];
-        if (record.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
+        if (moe_candidate_slot_resource(record)) {
             record.slot_index = slot_index++;
         }
         group.banks.push_back(record);
@@ -1588,7 +1624,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
     }
     for (uint32_t bank_index = 0; bank_index < group.banks.size(); ++bank_index) {
         auto & bank = group.banks[bank_index];
-        if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
+        if (moe_candidate_slot_resource(bank)) {
             uint64_t bytes = 0;
             if (!moe_candidate_mul(bank.info.expert_stride, n_slots, bytes) ||
                     !moe_candidate_add(table.slot_bound_bytes, bytes, table.slot_bound_bytes)) {
@@ -1739,10 +1775,29 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
     if ((snapshot.flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE) != 0) {
         inherited_group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
     }
+    for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+        uint32_t routed_roles = 0;
+        for (const auto * record : records[group_index]) {
+            if (!moe_candidate_routed_base(*record)) {
+                continue;
+            }
+            const uint32_t role = 1u << record->role;
+            if ((routed_roles & role) != 0) {
+                group_rejections[group_index] = GGML_CUDA_MOE_CANDIDATE_REJECT_DUPLICATE_ROLE;
+                break;
+            }
+            routed_roles |= role;
+        }
+        const uint32_t required_roles = moe_candidate_required_base_roles(snapshot.groups[group_index].layout);
+        if (group_rejections[group_index] == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE && routed_roles != 0 && routed_roles != required_roles) {
+            group_rejections[group_index] = GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT;
+        }
+    }
     const bool snapshot_dormant = snapshot.flags != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE;
     for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
         const auto & group = snapshot.groups[group_index];
-        if (snapshot_dormant || group.flags != GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_NONE ||
+        if (group_rejections[group_index] != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE || snapshot_dormant ||
+                group.flags != GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_NONE ||
                 group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY ||
                 (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
                  group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP)) {
@@ -1818,6 +1873,12 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
         return active_rejection;
     }
     table.manifest_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+    for (uint32_t active_group = 0; active_group < active_storage.size(); ++active_group) {
+        const uint32_t semantic_group = active_storage[active_group].semantic_group_index;
+        table.groups[active_group].domain = snapshot.groups[semantic_group].domain;
+        table.groups[active_group].semantic_group_index = semantic_group;
+        table.groups[active_group].flags = inherited_group_flags | snapshot.groups[semantic_group].flags;
+    }
 
     for (uint32_t tensor_index = 0; tensor_index < snapshot.n_tensors; ++tensor_index) {
         const auto & record = snapshot.tensors[tensor_index];
@@ -1848,11 +1909,19 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
                     }
                 }
             }
-            entry.descriptor.info.type = record.tensor->type;
-            entry.descriptor.info.role = record.role;
-            entry.descriptor.info.group_index = active_group;
-            entry.descriptor_valid = moe_candidate_source(owner, record.tensor, ggml_nbytes(record.tensor), entry.descriptor) ==
-                GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+            ggml_cuda_moe_candidate_rejection descriptor_rejection;
+            if (moe_candidate_routed_base(record)) {
+                descriptor_rejection = moe_candidate_weight(owner, record.tensor, record.role, active_group, entry.descriptor);
+            } else {
+                entry.descriptor.info.type = record.tensor->type;
+                entry.descriptor.info.role = record.role;
+                entry.descriptor.info.group_index = active_group;
+                descriptor_rejection = moe_candidate_source(owner, record.tensor, ggml_nbytes(record.tensor), entry.descriptor);
+            }
+            entry.descriptor_valid = descriptor_rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE;
+            if (entry.rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE && !entry.descriptor_valid) {
+                entry.rejection = descriptor_rejection;
+            }
             reverse = table.reverse_map.emplace(record.tensor, std::move(entry)).first;
         } else {
             reverse->second.semantic_group_index = record.group_index;
@@ -3772,6 +3841,9 @@ bool ggml_cuda_moe_grouped_context::get_group(
         info->key = key;
         info->down = group.down;
         info->layout = group.layout;
+        info->domain = group.domain;
+        info->semantic_group_index = group.semantic_group_index;
+        info->flags = group.flags;
         info->n_banks = static_cast<uint32_t>(group.banks.size());
         info->n_slots = impl_->table.n_slots;
     }
@@ -4606,7 +4678,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             group_index = reverse->second.group_index;
             bank_index = reverse->second.bank_index;
             if (!reverse->second.descriptor_valid) {
-                reason = GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP;
+                reason = reverse->second.rejection == GGML_CUDA_MOE_CANDIDATE_REJECT_NONE ?
+                    GGML_CUDA_MOE_GRAPH_COVERAGE_INVALID_REVERSE_MAP : moe_candidate_coverage_reason(reverse->second);
             } else if (!moe_candidate_reverse_matches(impl_->table, reverse->second, source)) {
                 reason = GGML_CUDA_MOE_GRAPH_COVERAGE_SOURCE_CHANGED;
             } else {

@@ -99,6 +99,11 @@ struct ggml_cuda_moe_grouped_context_test_access {
     static size_t graph_group_observation_size() {
         return sizeof(ggml_cuda_moe_graph_plan::group_observation);
     }
+
+    static uint32_t graph_group_classification(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
+        CHECK(group_index < plan.groups_.size());
+        return plan.groups_[group_index].classification;
+    }
 };
 
 static cudaStream_t candidate_test_graph_stream(void * data, const ggml_tensor *) {
@@ -839,8 +844,8 @@ static void test_candidate_graph_coverage_ledger() {
     ggml_tensor * override_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
     ggml_tensor * incomplete_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
     ggml_tensor * incomplete_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
-    ggml_tensor * unsupported_gate_up = fixture.cached_tensor(GGML_TYPE_F16, 3, gate_up_ne);
-    ggml_tensor * unsupported_down = fixture.cached_tensor(GGML_TYPE_F16, 3, down_ne);
+    ggml_tensor * unsupported_gate_up = fixture.cached_tensor(GGML_TYPE_I8, 3, gate_up_ne);
+    ggml_tensor * unsupported_down = fixture.cached_tensor(GGML_TYPE_I8, 3, down_ne);
     ggml_tensor * excluded_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
     ggml_tensor * opaque_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
     ggml_tensor * missing_cached = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
@@ -1052,6 +1057,139 @@ static void test_mmid_capabilities() {
     CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_IO);
     query = candidate_mmid_query(GGML_TYPE_Q8_K, 16, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
     CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER);
+}
+
+static void test_candidate_generic_physical_truth() {
+    candidate_test_fixture fixture;
+    ggml_cuda_moe_grouped_context registry(&fixture.owner);
+    const int64_t weight_ne[] = {256, 256, 4};
+    constexpr uint32_t cached = GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
+
+    ggml_tensor * gate_q3 = fixture.cached_tensor(GGML_TYPE_Q3_K, 3, weight_ne);
+    ggml_tensor * up_iq3 = fixture.cached_tensor(GGML_TYPE_IQ3_XXS, 3, weight_ne);
+    ggml_tensor * down_iq3 = fixture.cached_tensor(GGML_TYPE_IQ3_S, 3, weight_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> mixed_banks = {{
+        {gate_q3, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up_iq3, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down_iq3, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 mixed_group = {
+        mixed_banks.data(), mixed_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto v1_snapshot = candidate_snapshot(12, &mixed_group, 1);
+    CHECK(registry.replace(&v1_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const auto v1_state = registry.state();
+
+    ggml_cuda_moe_candidate_group_key key;
+    ggml_cuda_moe_candidate_group_info group_info;
+    CHECK(registry.find_down_group_key(down_iq3, &key) && registry.get_group(key, &group_info));
+    CHECK(group_info.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
+    CHECK(group_info.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+    CHECK(group_info.semantic_group_index == 0 && group_info.flags == 0);
+
+    std::array<ggml_backend_moe_candidate_group_v2, 2> groups_v2 = {{
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, 0, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_tensor_v2, 3> tensors_v2 = {{
+        {gate_q3, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {up_iq3, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {down_iq3, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+    }};
+    const auto v2_snapshot = candidate_snapshot_v2(12, groups_v2.data(), groups_v2.size(), tensors_v2.data(), tensors_v2.size());
+    CHECK(registry.replace(&v2_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const auto v2_state = registry.state();
+    CHECK(v2_state.n_groups == 1 && v2_state.n_weights == 3);
+    CHECK(v2_state.logical_signature == v1_state.logical_signature);
+    CHECK(registry.find_down_group_key(down_iq3, &key) && key.group_index == 0 && registry.get_group(key, &group_info));
+    CHECK(group_info.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+    CHECK(group_info.semantic_group_index == 1 && group_info.flags == 0);
+
+    for (const ggml_tensor * weight : {gate_q3, up_iq3, down_iq3}) {
+        ggml_cuda_moe_candidate_bank_info info;
+        const auto source = ggml_cuda_mmid_source_capability_for(weight->type);
+        CHECK(registry.find_weight(weight, &info));
+        CHECK(info.type == weight->type && info.source_flags == source.flags);
+        CHECK(info.source_flags & GGML_CUDA_MMID_SOURCE_ADVERTISED);
+        CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+        CHECK(info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND);
+        CHECK(info.index_modes == (GGML_CUDA_MOE_CANDIDATE_INDEX_GROUP_SLOT_DIRECT |
+            GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_SOURCE_MAP));
+        CHECK(info.byte_extent == ggml_nbytes(weight) && info.expert_stride == weight->nb[2]);
+    }
+
+    const candidate_route mixed_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * gate_q3_reader = candidate_mmid(fixture, gate_q3, mixed_route.ids);
+    ggml_tensor * up_iq3_reader = candidate_mmid(fixture, up_iq3, mixed_route.ids);
+    ggml_tensor * down_iq3_reader = candidate_mmid(fixture, down_iq3, mixed_route.ids);
+    ggml_cgraph * mixed_graph = candidate_graph(fixture, {
+        mixed_route.root, mixed_route.ids, gate_q3_reader, up_iq3_reader, down_iq3_reader,
+    });
+    ggml_cuda_moe_graph_plan plan;
+    ggml_cuda_moe_graph_execution execution;
+    registry.compile_graph_plan(mixed_graph, 1001, &plan, &execution);
+    CHECK(execution.size() == 1 && !execution.find(down_iq3_reader, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_classification(plan, 0) ==
+        GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, key));
+
+    ggml_tensor * gate_q8k = fixture.cached_tensor(GGML_TYPE_Q8_K, 3, weight_ne);
+    ggml_tensor * up_q8k = fixture.cached_tensor(GGML_TYPE_Q8_K, 3, weight_ne);
+    ggml_tensor * down_q8k = fixture.cached_tensor(GGML_TYPE_Q8_K, 3, weight_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> q8k_banks = {{
+        {gate_q8k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up_q8k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down_q8k, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 q8k_group = {
+        q8k_banks.data(), q8k_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto q8k_snapshot = candidate_snapshot(12, &q8k_group, 1);
+    CHECK(registry.replace(&q8k_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.find_down_group_key(down_q8k, &key));
+    for (const ggml_tensor * weight : {gate_q8k, up_q8k, down_q8k}) {
+        ggml_cuda_moe_candidate_bank_info info;
+        CHECK(registry.find_weight(weight, &info));
+        CHECK(info.type == GGML_TYPE_Q8_K && info.source_flags == GGML_CUDA_MMID_SOURCE_ADVERTISED);
+        CHECK(info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN);
+    }
+    const candidate_route q8k_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * gate_q8k_reader = candidate_mmid(fixture, gate_q8k, q8k_route.ids);
+    ggml_tensor * up_q8k_reader = candidate_mmid(fixture, up_q8k, q8k_route.ids);
+    ggml_tensor * down_q8k_reader = candidate_mmid(fixture, down_q8k, q8k_route.ids);
+    ggml_cgraph * q8k_graph = candidate_graph(fixture, {
+        q8k_route.root, q8k_route.ids, gate_q8k_reader, up_q8k_reader, down_q8k_reader,
+    });
+    registry.compile_graph_plan(q8k_graph, 1002, &plan, &execution);
+    CHECK(execution.size() == 1 && !execution.find(down_q8k_reader, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_classification(plan, 0) ==
+        GGML_CUDA_MOE_GRAPH_GROUP_LEGACY_ONLY);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, key));
+
+    ggml_tensor * gate_q4 = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, weight_ne);
+    ggml_tensor * up_q4 = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, weight_ne);
+    ggml_tensor * down_q4 = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, weight_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> q4_banks = {{
+        {gate_q4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {up_q4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {down_q4, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    ggml_backend_moe_candidate_group_v1 q4_group = {
+        q4_banks.data(), q4_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto q4_snapshot = candidate_snapshot(12, &q4_group, 1);
+    CHECK(registry.replace(&q4_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const candidate_route q4_route = candidate_top_k_route(fixture, 4, 2);
+    ggml_tensor * gate_q4_reader = candidate_mmid(fixture, gate_q4, q4_route.ids);
+    ggml_tensor * up_q4_reader = candidate_mmid(fixture, up_q4, q4_route.ids);
+    ggml_tensor * down_q4_reader = candidate_mmid(fixture, down_q4, q4_route.ids);
+    ggml_cgraph * q4_graph = candidate_graph(fixture, {
+        q4_route.root, q4_route.ids, gate_q4_reader, up_q4_reader, down_q4_reader,
+    });
+    registry.compile_graph_plan(q4_graph, 1003, &plan, &execution);
+    auto * dispatch = execution.find_group(down_q4_reader, nullptr);
+    CHECK(dispatch != nullptr && dispatch->classification == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ELIGIBLE);
+    fprintf(stderr, "test-moe-cache: generic physical candidate truth OK\n");
 }
 
 static void test_candidate_producer() {
@@ -1454,10 +1592,10 @@ static void test_candidate_registry(bool benchmark) {
     expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE);
     down->nb[2] = down_stride;
 
-    const int64_t q5k_ne[] = {256, 32, 4};
-    ggml_tensor * q5k = fixture.tensor(GGML_TYPE_Q5_K, 3, q5k_ne);
+    const int64_t unsupported_ne[] = {256, 32, 4};
+    ggml_tensor * unsupported = fixture.tensor(GGML_TYPE_I8, 3, unsupported_ne);
     bad_banks = banks;
-    bad_banks[0].tensor = q5k;
+    bad_banks[0].tensor = unsupported;
     group.banks = bad_banks.data();
     expect_rejected(GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
 
@@ -4857,6 +4995,7 @@ int main(int argc, char ** argv) {
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
     test_candidate_graph_coverage_ledger();
     test_mmid_capabilities();
+    test_candidate_generic_physical_truth();
     test_candidate_producer();
     test_candidate_registry(registry_bench);
     test_legacy_owner_leases();

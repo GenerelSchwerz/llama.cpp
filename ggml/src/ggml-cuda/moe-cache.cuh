@@ -108,6 +108,7 @@ struct ggml_cuda_moe_candidate_bank_info {
     uint32_t group_index = 0;
     uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     uint32_t type = GGML_TYPE_COUNT;
+    uint32_t source_flags = 0;
     uint32_t encoding = GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN;
     uint32_t movement = GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND;
     uint32_t index_modes = 0;
@@ -122,6 +123,9 @@ struct ggml_cuda_moe_candidate_group_info {
     ggml_cuda_moe_candidate_group_key key;
     const ggml_tensor * down = nullptr;
     uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+    uint32_t domain = GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_INVALID;
+    uint32_t semantic_group_index = UINT32_MAX;
+    uint32_t flags = 0;
     uint32_t n_banks = 0;
     uint32_t n_slots = 0;
 };
