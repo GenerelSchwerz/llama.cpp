@@ -5626,7 +5626,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
 bool ggml_cuda_moe_grouped_context::graph_mmid_inventory_matches(
         const ggml_cgraph * cgraph,
         const ggml_cuda_moe_graph_plan & plan) const {
-    if (!plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid ||
+    uint32_t current_mmid_count = 0;
+    uint64_t current_mmid_fingerprint = 0;
+    if (!moe_candidate_graph_mmid_inventory(cgraph, &current_mmid_count, &current_mmid_fingerprint) ||
+            current_mmid_count != plan.coverage_mmid_count_ ||
+            current_mmid_fingerprint != plan.coverage_mmid_fingerprint_ ||
+            !plan.inventory_complete_ || plan.mmid_inventory_.size() != plan.coverage_diagnostics_.cached_mmid ||
             plan.coverage_mmid_count_ != plan.mmid_inventory_.size()) {
         return false;
     }
