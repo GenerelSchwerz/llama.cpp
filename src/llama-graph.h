@@ -1357,7 +1357,7 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool allow_compact_kq_mask = true) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
