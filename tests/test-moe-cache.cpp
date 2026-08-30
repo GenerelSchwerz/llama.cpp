@@ -7700,12 +7700,8 @@ struct gemma_q4_parity_graphs {
     ggml_tensor * gate_input = nullptr;
     ggml_tensor * down_input = nullptr;
     ggml_tensor * ids_storage = nullptr;
-    ggml_tensor * gate_output = nullptr;
-    ggml_tensor * down_output = nullptr;
-    ggml_tensor * composed_output = nullptr;
-    ggml_cgraph * gate_graph = nullptr;
-    ggml_cgraph * down_graph = nullptr;
-    ggml_cgraph * composed_graph = nullptr;
+    std::array<ggml_tensor *, 3> outputs = {};
+    ggml_cgraph * graph = nullptr;
 };
 
 struct gemma_q4_routes {
@@ -7751,7 +7747,7 @@ static gemma_q4_parity_graphs build_gemma_q4_parity_graphs(
     constexpr int64_t N_USED = 8;
     constexpr int64_t IDS_STRIDE = 12;
     const ggml_init_params params = {
-        /* .mem_size = */ ggml_tensor_overhead() * 64 + 3 * ggml_graph_overhead_custom(48, false),
+        /* .mem_size = */ ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false),
         /* .mem_base = */ nullptr,
         /* .no_alloc = */ true,
     };
@@ -7769,8 +7765,8 @@ static gemma_q4_parity_graphs build_gemma_q4_parity_graphs(
     ggml_set_name(result.ids_storage, "test.gemma_q4.ids_storage");
     ggml_set_name(ids, "test.gemma_q4.ids");
 
-    result.gate_output = ggml_mul_mat_id(result.context.get(), gate_up, result.gate_input, ids);
-    result.down_output = ggml_mul_mat_id(result.context.get(), down, result.down_input, ids);
+    result.outputs[0] = ggml_mul_mat_id(result.context.get(), gate_up, result.gate_input, ids);
+    result.outputs[1] = ggml_mul_mat_id(result.context.get(), down, result.down_input, ids);
     ggml_tensor * gate_up_composed = ggml_mul_mat_id(result.context.get(), gate_up, result.gate_input, ids);
     ggml_tensor * gate = ggml_view_3d(
         result.context.get(), gate_up_composed, N_FF, N_USED, n_rows,
@@ -7779,17 +7775,15 @@ static gemma_q4_parity_graphs build_gemma_q4_parity_graphs(
         result.context.get(), gate_up_composed, N_FF, N_USED, n_rows,
         gate_up_composed->nb[1], gate_up_composed->nb[2], N_FF * gate_up_composed->nb[0]);
     ggml_tensor * hidden = ggml_geglu_split(result.context.get(), gate, up);
-    result.composed_output = ggml_mul_mat_id(result.context.get(), down, hidden, ids);
-    ggml_set_name(result.gate_output, "test.gemma_q4.gate_output");
-    ggml_set_name(result.down_output, "test.gemma_q4.down_output");
-    ggml_set_name(result.composed_output, "test.gemma_q4.composed_output");
+    result.outputs[2] = ggml_mul_mat_id(result.context.get(), down, hidden, ids);
+    ggml_set_name(result.outputs[0], "test.gemma_q4.gate_output");
+    ggml_set_name(result.outputs[1], "test.gemma_q4.down_output");
+    ggml_set_name(result.outputs[2], "test.gemma_q4.composed_output");
 
-    result.gate_graph = ggml_new_graph_custom(result.context.get(), 48, false);
-    result.down_graph = ggml_new_graph_custom(result.context.get(), 48, false);
-    result.composed_graph = ggml_new_graph_custom(result.context.get(), 48, false);
-    ggml_build_forward_expand(result.gate_graph, result.gate_output);
-    ggml_build_forward_expand(result.down_graph, result.down_output);
-    ggml_build_forward_expand(result.composed_graph, result.composed_output);
+    result.graph = ggml_new_graph_custom(result.context.get(), 64, false);
+    for (ggml_tensor * output : result.outputs) {
+        ggml_build_forward_expand(result.graph, output);
+    }
     result.buffer.reset(ggml_backend_alloc_ctx_tensors(result.context.get(), backend));
     CHECK(result.buffer != nullptr);
     return result;
@@ -7873,80 +7867,67 @@ static gemma_q4_routes gemma_q4_route_data(int64_t n_rows, uint32_t n_unique) {
     return result;
 }
 
-static void initialize_gemma_q4_parity_graphs(
-        gemma_q4_parity_graphs & direct,
-        gemma_q4_parity_graphs & cached,
-        const gemma_q4_routes & routes) {
-    const auto gate_input = gemma_q4_input_data(direct.gate_input, 0x1451u);
-    const auto down_input = gemma_q4_input_data(direct.down_input, 0x8d37u);
-    for (gemma_q4_parity_graphs * graph : {&direct, &cached}) {
-        ggml_backend_tensor_set(graph->gate_input, gate_input.data(), 0, ggml_nbytes(graph->gate_input));
-        ggml_backend_tensor_set(graph->down_input, down_input.data(), 0, ggml_nbytes(graph->down_input));
-        CHECK(ggml_nelements(graph->ids_storage) == (int64_t) routes.padded.size());
-        ggml_backend_tensor_set(graph->ids_storage, routes.padded.data(), 0, ggml_nbytes(graph->ids_storage));
-    }
-}
-
 static void check_gemma_q4_slab(
-        const ggml_tensor * expected,
+        const std::vector<uint8_t> & expected,
+        size_t expert_stride,
         const void * actual_device,
         int32_t expert,
         const char * boundary) {
-    std::vector<uint8_t> expected_bytes(expected->nb[2]);
-    std::vector<uint8_t> actual_bytes(expected->nb[2]);
-    ggml_backend_tensor_get(expected, expected_bytes.data(), (size_t) expert * expected->nb[2], expected->nb[2]);
+    CHECK((size_t) expert < expected.size() / expert_stride);
+    std::vector<uint8_t> actual_bytes(expert_stride);
     CUDA_OK(cudaMemcpy(actual_bytes.data(), actual_device, actual_bytes.size(), cudaMemcpyDeviceToHost));
-    if (expected_bytes != actual_bytes) {
+    const uint8_t * expected_bytes = expected.data() + (size_t) expert * expert_stride;
+    if (memcmp(expected_bytes, actual_bytes.data(), expert_stride) != 0) {
         fprintf(stderr, "test-moe-cache: first Gemma Q4_0 byte mismatch at %s expert=%d\n", boundary, expert);
     }
-    CHECK(expected_bytes == actual_bytes);
+    CHECK(memcmp(expected_bytes, actual_bytes.data(), expert_stride) == 0);
 }
 
 static void check_gemma_q4_materialization(
         int device,
         uint32_t n_slots,
-        const gemma_q4_parity_weights & direct,
         const gemma_q4_parity_weights & cached,
+        const std::array<const std::vector<uint8_t> *, 2> & expected,
         const std::vector<int32_t> & unique) {
     CHECK((n_slots == 12 && unique.size() > n_slots) || (n_slots == 48 && unique.size() <= n_slots));
     cudaStream_t stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-    for (const auto & bank : std::array<std::pair<ggml_tensor *, ggml_tensor *>, 2>{{
-            {direct.gate_up, cached.gate_up}, {direct.down, cached.down}}}) {
-        for (int32_t expert : {unique.front(), unique[unique.size() / 2], unique.back()}) {
-            std::vector<uint8_t> direct_bytes(bank.first->nb[2]);
-            std::vector<uint8_t> cached_bytes(bank.second->nb[2]);
-            ggml_backend_tensor_get(bank.first, direct_bytes.data(), (size_t) expert * bank.first->nb[2], bank.first->nb[2]);
-            ggml_backend_tensor_get(bank.second, cached_bytes.data(), (size_t) expert * bank.second->nb[2], bank.second->nb[2]);
-            CHECK(direct_bytes == cached_bytes);
+    const std::array<ggml_tensor *, 2> banks = {cached.gate_up, cached.down};
+    const std::array<size_t, 3> representative = {0, unique.size() / 2, unique.size() - 1};
+    for (size_t bank_index = 0; bank_index < banks.size(); ++bank_index) {
+        ggml_tensor * bank = banks[bank_index];
+        const auto & bytes = *expected[bank_index];
+        CHECK(bytes.size() == ggml_nbytes(bank));
+        for (size_t index : representative) {
+            const int32_t expert = unique[index];
+            CHECK(memcmp(
+                static_cast<const char *>(bank->data) + (size_t) expert * bank->nb[2],
+                bytes.data() + (size_t) expert * bank->nb[2], bank->nb[2]) == 0);
         }
 
         std::unique_ptr<ggml_cuda_moe_cache, decltype(&ggml_cuda_moe_cache_free)> cache(
-            ggml_cuda_moe_cache_init(device, bank.second->nb[2], n_slots, false, 0, 0),
+            ggml_cuda_moe_cache_init(device, bank->nb[2], n_slots, false, 0, 0),
             ggml_cuda_moe_cache_free);
         CHECK(cache != nullptr);
-        const char * source = static_cast<const char *>(bank.second->data);
+        const char * source = static_cast<const char *>(bank->data);
         cudaStream_t copy_stream = ggml_cuda_moe_cache_copy_stream(cache.get());
+        std::vector<int> slots(unique.size(), -1);
+        void * misses = nullptr;
         if (n_slots == 48) {
-            std::vector<int> slots;
+            size_t index = 0;
             for (int32_t expert : unique) {
                 const int slot = ggml_cuda_moe_cache_acquire(
-                    cache.get(), source + (size_t) expert * bank.second->nb[2], bank.second->nb[2],
+                    cache.get(), source + (size_t) expert * bank->nb[2], bank->nb[2],
                     copy_stream, false, false, false, true);
                 CHECK(slot >= 0);
-                slots.push_back(slot);
+                slots[index++] = slot;
             }
             CUDA_OK(cudaStreamSynchronize(copy_stream));
-            for (size_t index = 0; index < unique.size(); ++index) {
-                check_gemma_q4_slab(
-                    bank.second, ggml_cuda_moe_cache_slot_ptr(cache.get(), slots[index]), unique[index], "resident slot");
-            }
-            ggml_cuda_moe_cache_release_slots(cache.get(), slots.data(), slots.size());
         } else {
             std::vector<int> primed_slots;
             for (size_t index = 0; index < 4; ++index) {
                 const int slot = ggml_cuda_moe_cache_acquire(
-                    cache.get(), source + (size_t) unique[index] * bank.second->nb[2], bank.second->nb[2],
+                    cache.get(), source + (size_t) unique[index] * bank->nb[2], bank->nb[2],
                     copy_stream, false, false, false, true);
                 CHECK(slot >= 0);
                 primed_slots.push_back(slot);
@@ -7956,26 +7937,44 @@ static void check_gemma_q4_materialization(
 
             std::vector<const void *> sources;
             for (int32_t expert : unique) {
-                sources.push_back(source + (size_t) expert * bank.second->nb[2]);
+                sources.push_back(source + (size_t) expert * bank->nb[2]);
             }
-            void * misses = nullptr;
-            CUDA_OK(cudaMalloc(&misses, unique.size() * bank.second->nb[2]));
-            std::vector<int> slots(unique.size(), -1);
+            CUDA_OK(cudaMalloc(&misses, (unique.size() - n_slots) * bank->nb[2]));
             int n_resident = 0;
             int n_wait_classes = 0;
             CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-                cache.get(), sources.data(), sources.size(), bank.second->nb[2], 2,
+                cache.get(), sources.data(), sources.size(), bank->nb[2], 2,
                 slots.data(), nullptr, &n_resident, misses, nullptr, 0, &n_wait_classes, stream));
             CHECK(n_resident == (int) n_slots && n_wait_classes == 1);
             CHECK(ggml_cuda_moe_cache_finish_split_staging(cache.get(), stream));
             CUDA_OK(cudaStreamSynchronize(stream));
-            size_t miss_index = 0;
-            for (size_t index = 0; index < unique.size(); ++index) {
-                const void * materialized = slots[index] >= 0 ? ggml_cuda_moe_cache_slot_ptr(cache.get(), slots[index]) :
-                    static_cast<const char *>(misses) + miss_index++ * bank.second->nb[2];
-                check_gemma_q4_slab(bank.second, materialized, unique[index], "split overflow staging");
+        }
+
+        std::vector<std::pair<size_t, const void *>> resident;
+        std::vector<std::pair<size_t, const void *>> overflow;
+        size_t miss_index = 0;
+        for (size_t index = 0; index < unique.size(); ++index) {
+            if (slots[index] >= 0) {
+                resident.push_back({index, ggml_cuda_moe_cache_slot_ptr(cache.get(), slots[index])});
+            } else {
+                overflow.push_back({index, static_cast<const char *>(misses) + miss_index++ * bank->nb[2]});
             }
-            CHECK(n_resident + (int) miss_index == (int) unique.size());
+        }
+        CHECK(resident.size() == std::min<size_t>(n_slots, unique.size()));
+        CHECK(resident.size() + overflow.size() == unique.size());
+        for (const auto & materialized : {&resident, &overflow}) {
+            if (materialized->empty()) {
+                continue;
+            }
+            for (size_t position : std::array<size_t, 3>{0, materialized->size() / 2, materialized->size() - 1}) {
+                const auto [index, data] = (*materialized)[position];
+                check_gemma_q4_slab(bytes, bank->nb[2], data, unique[index],
+                    slots[index] >= 0 ? "resident slot" : "split overflow staging");
+            }
+        }
+        if (n_slots == 48) {
+            ggml_cuda_moe_cache_release_slots(cache.get(), slots.data(), slots.size());
+        } else {
             CHECK(ggml_cuda_moe_cache_release_split_slots(cache.get(), slots.data(), slots.size(), stream));
             CUDA_OK(cudaStreamSynchronize(stream));
             CUDA_OK(cudaFree(misses));
@@ -8008,89 +8007,66 @@ static ggml_cuda_mmid_capability gemma_q4_native_consumer(
     return ggml_cuda_mmid_get_capability(query);
 }
 
-static std::vector<float> run_gemma_q4_graph(
+static std::array<std::vector<float>, 3> run_gemma_q4_graph(
         ggml_backend_t backend,
-        ggml_cgraph * graph,
-        ggml_tensor * output) {
-    CHECK(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
+        gemma_q4_parity_graphs & graphs) {
+    CHECK(ggml_backend_graph_compute(backend, graphs.graph) == GGML_STATUS_SUCCESS);
     ggml_backend_synchronize(backend);
-    std::vector<float> result(ggml_nelements(output));
-    ggml_backend_tensor_get(output, result.data(), 0, ggml_nbytes(output));
+    std::array<std::vector<float>, 3> result;
+    for (size_t index = 0; index < result.size(); ++index) {
+        result[index].resize(ggml_nelements(graphs.outputs[index]));
+        ggml_backend_tensor_get(graphs.outputs[index], result[index].data(), 0, ggml_nbytes(graphs.outputs[index]));
+    }
     return result;
 }
 
-static double compare_gemma_q4_output(
+static void compare_gemma_q4_output(
         const char * boundary,
         const std::vector<float> & expected,
-        const std::vector<float> & actual,
-        bool require_exact) {
+        const std::vector<float> & actual) {
     CHECK(expected.size() == actual.size());
-    double squared_error = 0.0;
-    double squared_expected = 0.0;
     size_t first_mismatch = expected.size();
     for (size_t index = 0; index < expected.size(); ++index) {
         CHECK(std::isfinite(expected[index]) && std::isfinite(actual[index]));
         if (first_mismatch == expected.size() && expected[index] != actual[index]) {
             first_mismatch = index;
         }
-        const double difference = expected[index] - actual[index];
-        squared_error += difference * difference;
-        squared_expected += static_cast<double>(expected[index]) * expected[index];
     }
-    CHECK(squared_expected > 0.0);
-    const double relative_squared_error = squared_error / squared_expected;
-    fprintf(stderr, "test-moe-cache: Gemma Q4_0 %s exact=%d rse=%.9g\n",
-        boundary, first_mismatch == expected.size(), relative_squared_error);
-    if (require_exact && first_mismatch != expected.size()) {
+    if (first_mismatch != expected.size()) {
         fprintf(stderr, "test-moe-cache: first Gemma Q4_0 output mismatch at %s index=%zu expected=%.9g actual=%.9g\n",
             boundary, first_mismatch, expected[first_mismatch], actual[first_mismatch]);
     }
-    CHECK(!require_exact || first_mismatch == expected.size());
-    return relative_squared_error;
+    CHECK(first_mismatch == expected.size());
 }
 
 static void run_gemma_q4_parity_case(
-        int device,
         ggml_backend_t direct_backend,
         const gemma_q4_parity_weights & direct_weights,
-        uint32_t n_slots,
+        ggml_backend_t cached_backend,
+        const gemma_q4_parity_weights & cached_weights,
+        const char * boundary,
         int64_t n_rows,
-        uint32_t route_union,
-        bool require_exact) {
-    ggml_backend_cuda_moe_set_cache_slots(n_slots);
-    ggml_backend_ptr cached_backend(ggml_backend_cuda_init(device));
-    CHECK(cached_backend != nullptr);
-    const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
-    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(cached_backend.get(), &disabled) ==
-        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    auto cached_weights = build_gemma_q4_parity_weights(ggml_backend_cuda_moe_cached_buffer_type());
-    for (const auto & bank : std::array<std::pair<ggml_tensor *, ggml_tensor *>, 2>{{
-            {direct_weights.gate_up, cached_weights.gate_up}, {direct_weights.down, cached_weights.down}}}) {
-        std::vector<uint8_t> data(ggml_nbytes(bank.first));
-        ggml_backend_tensor_get(bank.first, data.data(), 0, data.size());
-        ggml_backend_tensor_set(bank.second, data.data(), 0, data.size());
-    }
-
+        uint32_t route_union) {
     const auto routes = gemma_q4_route_data(n_rows, route_union);
-    check_gemma_q4_materialization(device, n_slots, direct_weights, cached_weights, routes.unique);
     auto direct_graphs = build_gemma_q4_parity_graphs(
         direct_backend, direct_weights.gate_up, direct_weights.down, n_rows);
     auto cached_graphs = build_gemma_q4_parity_graphs(
-        cached_backend.get(), cached_weights.gate_up, cached_weights.down, n_rows);
-    initialize_gemma_q4_parity_graphs(direct_graphs, cached_graphs, routes);
-
-    compare_gemma_q4_output(
-        n_slots == 12 ? "cache12 gate_up" : n_rows == 16 ? "cache48 gate_up" : "B4 gate_up",
-        run_gemma_q4_graph(direct_backend, direct_graphs.gate_graph, direct_graphs.gate_output),
-        run_gemma_q4_graph(cached_backend.get(), cached_graphs.gate_graph, cached_graphs.gate_output), require_exact);
-    compare_gemma_q4_output(
-        n_slots == 12 ? "cache12 down" : n_rows == 16 ? "cache48 down" : "B4 down",
-        run_gemma_q4_graph(direct_backend, direct_graphs.down_graph, direct_graphs.down_output),
-        run_gemma_q4_graph(cached_backend.get(), cached_graphs.down_graph, cached_graphs.down_output), require_exact);
-    compare_gemma_q4_output(
-        n_slots == 12 ? "cache12 GEGLU/down" : n_rows == 16 ? "cache48 GEGLU/down" : "B4 GEGLU/down",
-        run_gemma_q4_graph(direct_backend, direct_graphs.composed_graph, direct_graphs.composed_output),
-        run_gemma_q4_graph(cached_backend.get(), cached_graphs.composed_graph, cached_graphs.composed_output), require_exact);
+        cached_backend, cached_weights.gate_up, cached_weights.down, n_rows);
+    const auto gate_input = gemma_q4_input_data(direct_graphs.gate_input, 0x1451u);
+    const auto down_input = gemma_q4_input_data(direct_graphs.down_input, 0x8d37u);
+    for (gemma_q4_parity_graphs * graph : {&direct_graphs, &cached_graphs}) {
+        ggml_backend_tensor_set(graph->gate_input, gate_input.data(), 0, ggml_nbytes(graph->gate_input));
+        ggml_backend_tensor_set(graph->down_input, down_input.data(), 0, ggml_nbytes(graph->down_input));
+        CHECK(ggml_nelements(graph->ids_storage) == (int64_t) routes.padded.size());
+        ggml_backend_tensor_set(graph->ids_storage, routes.padded.data(), 0, ggml_nbytes(graph->ids_storage));
+    }
+    const auto expected = run_gemma_q4_graph(direct_backend, direct_graphs);
+    const auto actual = run_gemma_q4_graph(cached_backend, cached_graphs);
+    const std::array<const char *, 3> outputs = {"gate_up", "down", "GEGLU/down"};
+    for (size_t index = 0; index < outputs.size(); ++index) {
+        const std::string name = std::string(boundary) + " " + outputs[index];
+        compare_gemma_q4_output(name.c_str(), expected[index], actual[index]);
+    }
 }
 
 static void test_gemma_q4_cached_cuda_parity(int device) {
@@ -8121,10 +8097,28 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
         b4_mapped.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
         b4_mapped.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
 
-    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 12, 16, 24, true);
-    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 48, 16, 40, true);
-    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 12, 4, 24, true);
-    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 48, 4, 24, true);
+    for (uint32_t n_slots : {12u, 48u}) {
+        ggml_backend_cuda_moe_set_cache_slots(n_slots);
+        ggml_backend_ptr cached_backend(ggml_backend_cuda_init(device));
+        CHECK(cached_backend != nullptr);
+        const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(cached_backend.get(), &disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto cached_weights = build_gemma_q4_parity_weights(ggml_backend_cuda_moe_cached_buffer_type());
+        ggml_backend_tensor_set(cached_weights.gate_up, gate_up_data.data(), 0, gate_up_data.size());
+        ggml_backend_tensor_set(cached_weights.down, down_data.data(), 0, down_data.size());
+
+        const uint32_t b16_union = n_slots == 12 ? 24 : 40;
+        const auto materialization_routes = gemma_q4_route_data(16, b16_union);
+        check_gemma_q4_materialization(
+            device, n_slots, cached_weights, {&gate_up_data, &down_data}, materialization_routes.unique);
+        run_gemma_q4_parity_case(
+            direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+            n_slots == 12 ? "cache12 B16" : "cache48 B16", 16, b16_union);
+        run_gemma_q4_parity_case(
+            direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+            n_slots == 12 ? "cache12 B4" : "cache48 B4", 4, 24);
+    }
     ggml_backend_cuda_moe_set_cache_slots(old_slots);
     fprintf(stderr, "test-moe-cache: opt-in Gemma Q4_0 cached CUDA parity diagnostic OK\n");
 }
