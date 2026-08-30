@@ -16,10 +16,11 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 DEPTHS=(0 1 4); [ $# -gt 0 ] && DEPTHS=("$@")
 rc=0
 BASE=""
-for D in "${DEPTHS[@]}"; do
+for I in "${!DEPTHS[@]}"; do
+  D="${DEPTHS[$I]}"
   echo "== pipeline depth=$D  ctx=$CTX  prefill lengths=$LENGTHS"
   LOG=$(mktemp /tmp/r4-kv-pipeline.XXXX.log)
-  GGML_KV_PIPELINE_DEPTH=$D taskset -c "$PIN" "$BUILD/bin/llama-server" -m "$MODEL" \
+  taskset -c "$PIN" "$BUILD/bin/llama-server" -m "$MODEL" --kv-pipeline-depth "$D" \
     -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
     -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -c "$CTX" --parallel 1 \
     --host 127.0.0.1 --port "$PORT" --no-warmup > "$LOG" 2>&1 &
@@ -30,7 +31,7 @@ for D in "${DEPTHS[@]}"; do
   done
   OUT=$(mktemp /tmp/r4-kv-pipeline.XXXX.hashes)
   if python3 "$HERE/r4-kv-pipeline-exact.py" "$PORT" "$LENGTHS" "$OUT"; then
-    if [ -z "$BASE" ]; then
+    if [ "$I" -eq 0 ]; then
       BASE="$OUT"
     elif ! cmp -s "$BASE" "$OUT"; then
       diff -u "$BASE" "$OUT"
@@ -42,6 +43,9 @@ for D in "${DEPTHS[@]}"; do
   kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
   rm -f "$LOG"
   [ "$OUT" = "$BASE" ] || rm -f "$OUT"
+  if [ "$I" -eq 0 ] && [ -z "$BASE" ]; then
+    break
+  fi
 done
 [ -z "$BASE" ] || rm -f "$BASE"
 exit $rc

@@ -24,7 +24,7 @@ arm () { # $1 pipeline depth, $2 context depth, $3 reps
   ( while true; do nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits; sleep 0.25; done ) > "$vram" 2>/dev/null &
   local sampler=$!
   local ts
-  ts=$(GGML_KV_PIPELINE_DEPTH=$1 taskset -c "$PIN" "$BUILD/bin/llama-bench" -m "$MODEL" \
+  ts=$(taskset -c "$PIN" "$BUILD/bin/llama-bench" -m "$MODEL" --kv-pipeline-depth "$1" \
         -ngl 99 -sm none -mg 0 -t 3 -nkvo 1 $BENCH_KV_OPTS \
         -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 --no-warmup -p 0 -n "$NGEN" -d "$2" -r "$3" -o json \
         2>/dev/null \

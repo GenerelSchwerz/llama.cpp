@@ -358,6 +358,7 @@ struct cmd_params {
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<bool>                kv_cpu_pinned;
+    std::vector<int>                 kv_pipeline_depth;
     std::vector<bool>                recurrent_state_offload;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
@@ -405,6 +406,7 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* kv_cpu_pinned        */ { false },
+    /* kv_pipeline_depth    */ { 1 },
     /* recurrent_state_offload */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
@@ -477,6 +479,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -kvcp, --kv-cpu-pinned <0|1>                      (default: %s)\n", join(cmd_params_defaults.kv_cpu_pinned, ",").c_str());
+    printf("  -kvpd, --kv-pipeline-depth <0...14>                (default: %s)\n", join(cmd_params_defaults.kv_pipeline_depth, ",").c_str());
     printf("  -rso, --recurrent-state-offload <0|1>             (default: %s)\n", join(cmd_params_defaults.recurrent_state_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
@@ -854,6 +857,19 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.kv_cpu_pinned.insert(params.kv_cpu_pinned.end(), p.begin(), p.end());
+            } else if (arg == "-kvpd" || arg == "--kv-pipeline-depth") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                for (int depth : p) {
+                    if (depth < 0 || depth > 14) {
+                        invalid_param = true;
+                        break;
+                    }
+                }
+                params.kv_pipeline_depth.insert(params.kv_pipeline_depth.end(), p.begin(), p.end());
             } else if (arg == "-rso" || arg == "--recurrent-state-offload") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1211,6 +1227,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.kv_cpu_pinned.empty()) {
         params.kv_cpu_pinned = cmd_params_defaults.kv_cpu_pinned;
     }
+    if (params.kv_pipeline_depth.empty()) {
+        params.kv_pipeline_depth = cmd_params_defaults.kv_pipeline_depth;
+    }
     if (params.recurrent_state_offload.empty()) {
         params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
     }
@@ -1278,6 +1297,7 @@ struct cmd_params_instance {
     int                main_gpu;
     bool               no_kv_offload;
     bool               kv_cpu_pinned;
+    int                kv_pipeline_depth;
     bool               recurrent_state_offload;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
@@ -1361,6 +1381,7 @@ struct cmd_params_instance {
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
         cparams.kv_cpu_pinned   = kv_cpu_pinned;
+        cparams.kv_pipeline_depth = kv_pipeline_depth;
         cparams.recurrent_state_offload = recurrent_state_offload;
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
@@ -1397,6 +1418,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
     for (const auto & kvcp : params.kv_cpu_pinned)
+    for (const auto & kvpd : params.kv_pipeline_depth)
     for (const auto & rso : params.recurrent_state_offload)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
@@ -1429,6 +1451,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ kvcp,
+                /* .kv_pipeline_depth     = */ kvpd,
                 /* .recurrent_state_offload = */ rso,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1468,6 +1491,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ kvcp,
+                /* .kv_pipeline_depth     = */ kvpd,
                 /* .recurrent_state_offload = */ rso,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1507,6 +1531,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .kv_cpu_pinned         = */ kvcp,
+                /* .kv_pipeline_depth     = */ kvpd,
                 /* .recurrent_state_offload = */ rso,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
@@ -1551,6 +1576,7 @@ struct test {
     int                      main_gpu;
     bool                     no_kv_offload;
     bool                     kv_cpu_pinned;
+    int                      kv_pipeline_depth;
     bool                     recurrent_state_offload;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
@@ -1593,6 +1619,7 @@ struct test {
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         kv_cpu_pinned  = inst.kv_cpu_pinned;
+        kv_pipeline_depth = inst.kv_pipeline_depth;
         recurrent_state_offload = inst.recurrent_state_offload;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
@@ -1658,7 +1685,7 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload",
+            "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "kv_pipeline_depth", "recurrent_state_offload",
             "flash_attn",     "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
@@ -1674,7 +1701,7 @@ struct test {
     static field_type get_field_type(const std::string & field) {
         if (field == "build_number" || field == "n_batch" || field == "n_ubatch" || field == "n_threads" ||
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
-            field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
+            field == "main_gpu" || field == "kv_pipeline_depth" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
             return INT;
@@ -1753,6 +1780,7 @@ struct test {
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
                                             std::to_string(kv_cpu_pinned),
+                                            std::to_string(kv_pipeline_depth),
                                             std::to_string(recurrent_state_offload),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
@@ -1953,6 +1981,9 @@ struct markdown_printer : public printer {
         if (field == "kv_cpu_pinned") {
             return 4;
         }
+        if (field == "kv_pipeline_depth") {
+            return 4;
+        }
         if (field == "recurrent_state_offload") {
             return 3;
         }
@@ -1983,6 +2014,9 @@ struct markdown_printer : public printer {
         }
         if (field == "kv_cpu_pinned") {
             return "kvcp";
+        }
+        if (field == "kv_pipeline_depth") {
+            return "kvpd";
         }
         if (field == "recurrent_state_offload") {
             return "rso";
@@ -2070,6 +2104,9 @@ struct markdown_printer : public printer {
         }
         if (params.kv_cpu_pinned.size() > 1 || params.kv_cpu_pinned != cmd_params_defaults.kv_cpu_pinned) {
             fields.emplace_back("kv_cpu_pinned");
+        }
+        if (params.kv_pipeline_depth.size() > 1 || params.kv_pipeline_depth != cmd_params_defaults.kv_pipeline_depth) {
+            fields.emplace_back("kv_pipeline_depth");
         }
         if (params.recurrent_state_offload.size() > 1 ||
             params.recurrent_state_offload != cmd_params_defaults.recurrent_state_offload) {

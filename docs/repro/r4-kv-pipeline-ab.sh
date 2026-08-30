@@ -1,6 +1,6 @@
 #!/bin/bash
 # R4: pipelined delivery of a host-resident KV cache, A/B/A/B with reversed arm order.
-# The two arms are the same binary: GGML_KV_PIPELINE_DEPTH=0 is the ordered path.
+# The two arms are the same binary: --kv-pipeline-depth 0 is the ordered path.
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-ab.sh [depth ...]
 set -u
@@ -18,7 +18,7 @@ for opt in kvcp rso; do
 done
 
 run () { # $1 label, $2 pipeline depth, $3 context depth, $4 reps
-  GGML_KV_PIPELINE_DEPTH=$2 taskset -c "$PIN" "$BUILD/bin/llama-bench" -m "$MODEL" \
+  taskset -c "$PIN" "$BUILD/bin/llama-bench" -m "$MODEL" --kv-pipeline-depth "$2" \
     -ngl 99 -sm none -mg 0 -t 3 -nkvo 1 $BENCH_KV_OPTS \
     -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 --no-warmup -p 0 -n 128 -d "$3" -r "$4" -o json \
     2>/dev/null \
