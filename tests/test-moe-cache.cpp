@@ -2142,6 +2142,14 @@ static void test_candidate_producer() {
     CHECK(registry.replace(&disabled.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 48);
 
+    llama_model_params uncached_params = llama_model_default_params();
+    std::unique_ptr<llama_model> uncached(llama_model_create(LLM_ARCH_LLAMA, uncached_params));
+    CHECK(uncached != nullptr && uncached->moe_expert_cache_slots() == 0);
+    llama_moe_candidate_snapshot uncached_snapshot(*uncached, loras);
+    CHECK(uncached_snapshot.get().n_slots == 0 && uncached_snapshot.get().n_groups == 0);
+    CHECK(registry.replace(&uncached_snapshot.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 0);
+
     llama_model_params gemma_params = llama_model_default_params();
     gemma_params.moe_expert_cache_slots = 12;
     std::unique_ptr<llama_model> gemma(llama_model_create(LLM_ARCH_GEMMA4, gemma_params));
@@ -7235,8 +7243,6 @@ static void test_cached_mmid_fusion_decline() {
     ggml_backend_ptr cpu_backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
     CHECK(cuda_backend != nullptr && cpu_backend != nullptr);
 
-    const int old_slots = ggml_backend_cuda_moe_get_cache_slots();
-    ggml_backend_cuda_moe_set_cache_slots(4);
     ggml_cuda_moe_cache_free_all();
 
     cached_fusion_test_graph cuda_graph = build_cached_fusion_test_graph(
@@ -7282,7 +7288,6 @@ static void test_cached_mmid_fusion_decline() {
     CHECK(squared_expected > 0.0 && squared_error / squared_expected < 2e-2);
 
     ggml_cuda_moe_cache_free_all();
-    ggml_backend_cuda_moe_set_cache_slots(old_slots);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, "test-moe-cache: cached MMID F1-F5 decline OK\n");
 }

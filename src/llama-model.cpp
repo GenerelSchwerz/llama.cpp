@@ -2709,11 +2709,7 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
 #ifdef GGML_USE_CUDA
-    // If --moe-expert-cache-size was used, surface hit/miss stats before
-    // tearing down. The flag's value is read from the global ggml-cuda
-    // setter (set by llama_model_load); no-op when the cache wasn't
-    // configured. Avoids needing access to llama_model::params (protected).
-    if (model && ggml_backend_cuda_moe_get_cache_slots() > 0) {
+    if (model && model->moe_expert_cache_slots() > 0) {
         ggml_backend_cuda_moe_log_and_reset_stats();
     }
 #endif

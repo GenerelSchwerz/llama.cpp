@@ -206,6 +206,7 @@ struct server_slot {
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
+    bool moe_cache_enabled = false;
 
     common_memory mem;
 
@@ -647,9 +648,7 @@ struct server_slot {
         common_speculative_print_stats(spec);
 
 #ifdef GGML_USE_CUDA
-        // If --moe-expert-cache-size is enabled, print and reset cache stats
-        // per request so each completion shows its own hit rate.
-        if (ggml_backend_cuda_moe_get_cache_slots() > 0) {
+        if (moe_cache_enabled) {
             ggml_backend_cuda_moe_log_and_reset_stats();
         }
 #endif
@@ -1265,6 +1264,7 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            slot.moe_cache_enabled = params_base.n_moe_expert_cache_slots > 0;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot;
