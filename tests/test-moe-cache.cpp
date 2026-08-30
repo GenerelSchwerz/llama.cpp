@@ -6854,6 +6854,8 @@ static void test_active_grouped_in_place_inventory_reuse_case(bool registered) {
         ggml_graph_add_node(graph, reader);
     }
     candidate_rebuild_graph_uses(graph);
+    candidate_stamp_execution(graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1);
     std::array<int32_t, 3> saved_use_counts = {};
     for (uint32_t bank_index = 0; bank_index < added.banks.size(); ++bank_index) {
         saved_use_counts[bank_index] = candidate_graph_use_count(graph, added.banks[bank_index]);
