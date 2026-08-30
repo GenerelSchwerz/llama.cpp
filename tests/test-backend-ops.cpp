@@ -490,8 +490,7 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
-static bool backend_has_flash_attn_causal_prefix(ggml_backend_t backend) {
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+static bool backend_has_flash_attn_causal_prefix(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     using fn_t = bool (*)(ggml_backend_dev_t);
     auto fn = (fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_flash_attn_causal_prefix_supported");
@@ -2507,8 +2506,13 @@ struct test_set_rows : public test_case {
     // See dicussion here: https://github.com/ggml-org/llama.cpp/pull/23760#issuecomment-4566312209
     double max_nmse_err(ggml_backend_t backend) override {
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        if (type_dst == GGML_TYPE_Q8_0 && strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
-            return std::max(test_case::max_nmse_err(backend), 2e-7);
+        if (type_dst == GGML_TYPE_Q8_0) {
+            if (strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+                return std::max(test_case::max_nmse_err(backend), 2e-7);
+            }
+            if (strcmp(ggml_backend_reg_name(reg), "HTP") == 0) {
+                return std::max(test_case::max_nmse_err(backend), 5e-6);
+            }
         }
         return test_case::max_nmse_err(backend);
     }
@@ -4215,9 +4219,10 @@ struct test_ssm_scan : public test_case {
     const int64_t n_seqs;
     const bool    xbc_overlap;
     const int64_t K;
+    const bool    weak_decay;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap, K);
+        return VARS_TO_STR10(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, xbc_overlap, K, weak_decay);
     }
 
     test_ssm_scan(ggml_type type = GGML_TYPE_F32,
@@ -4228,8 +4233,9 @@ struct test_ssm_scan : public test_case {
             int64_t n_seq_tokens = 32,
             int64_t n_seqs = 32,
             bool xbc_overlap = false,
-            int64_t K = 1)
-        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap), K(K) {}
+            int64_t K = 1,
+            bool weak_decay = false)
+        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), xbc_overlap(xbc_overlap), K(K), weak_decay(weak_decay) {}
 
     double max_nmse_err() override {
         // SSD path (head_dim > 1) uses FP16 intermediates (M matrix, X_dt); Mamba-1 is pure FP32.
@@ -4282,7 +4288,7 @@ struct test_ssm_scan : public test_case {
                 continue;
             } else if (t->ne[1] == n_head && t->ne[2] == 1) {
                 // A {1 or d_state, n_head}: negative decay (2-D tensor, ne[2]==1 distinguishes from 3-D/4-D tensors)
-                init_tensor_uniform(t, -1.0f, -0.5f);
+                init_tensor_uniform(t, weak_decay ? -0.02f : -1.0f, weak_decay ? -0.005f : -0.5f);
             } else {
                 init_tensor_uniform(t);
             }
@@ -7841,12 +7847,10 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
-    const bool compact_causal_prefix;
     const bool compact_equivalence;
 
     std::string vars() override {
         return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k) +
-            " compact_causal_prefix=" + std::to_string(int(compact_causal_prefix)) +
             " compact_equivalence=" + std::to_string(int(compact_equivalence));
     }
 
@@ -7885,16 +7889,10 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, bool compact_causal_prefix = false, bool compact_equivalence = false)
+                        bool kv_view = true, bool v_is_view_of_k = false, bool compact_equivalence = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k),
-          compact_causal_prefix(compact_causal_prefix), compact_equivalence(compact_equivalence) {}
-
-    test_flash_attn_ext(int64_t hsk, int64_t hsv, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb,
-                        bool mask, bool sinks, float max_bias, float logit_softcap, ggml_prec prec,
-                        ggml_type type_K, ggml_type type_V, bool compact_causal_prefix, bool compact_equivalence)
-        : test_flash_attn_ext(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V,
-              {0, 1, 2, 3}, true, false, compact_causal_prefix, compact_equivalence) {}
+          compact_equivalence(compact_equivalence) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -7942,10 +7940,10 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         ggml_tensor * m_explicit = nullptr;
+        GGML_ASSERT(!compact_equivalence || mask);
         if (mask) {
-            GGML_ASSERT(!compact_equivalence || compact_causal_prefix);
-            GGML_ASSERT(!compact_causal_prefix || (nr23[1] == 1 && max_bias == 0.0f));
-            m = compact_causal_prefix ?
+            GGML_ASSERT(!compact_equivalence || (nr23[1] == 1 && max_bias == 0.0f));
+            m = compact_equivalence ?
                 ggml_new_tensor_1d(ctx, GGML_TYPE_I64, nb) :
                 ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
@@ -7990,7 +7988,7 @@ struct test_flash_attn_ext : public test_case {
                 }
                 ggml_backend_tensor_set(t, values.data(), 0, values.size()*sizeof(values[0]));
             } else if (strcmp(t->name, "m") == 0) {
-                if (compact_causal_prefix) {
+                if (compact_equivalence) {
                     const int64_t first = kv > nb ? kv - nb : 0;
                     std::vector<int64_t> values(ggml_nelements(t));
                     for (int64_t iq = 0; iq < nb; ++iq) {
@@ -9601,6 +9599,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_conv_transpose_2d({3, 2, 3, 1}, {2, 2, 1, 3}, 1, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 1}, {3, 3, 1, 9}, 2, kernel_type));
         test_cases.emplace_back(new test_conv_transpose_2d({129, 63, 35, 1}, {3, 3, 48, 35}, 1, kernel_type));
+        test_cases.emplace_back(new test_conv_transpose_2d({10, 10, 9, 2}, {3, 3, 1, 9}, 2, kernel_type)); // for multiple batches
     }
 
     test_cases.emplace_back(new test_count_equal(GGML_TYPE_F32, {4,  500, 1, 1}));
@@ -9938,6 +9937,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 4, 2, false, /*K=*/4)); // Mamba-2 rollback snapshots
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, false, /*K=*/3)); // Mamba-2 rollback overflow
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 128, 64, 16, 2, 8, 2, /*K=*/3)); // rollback snapshots match prefix states
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 64, 4)); // Metal SSD one chunk MMA only, no seq tail
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 65, 2)); // SSD one chunk + 1-token sequential tail
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
 
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 32, 1));
@@ -10182,7 +10185,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, 1));
+    // For issue 27873
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
+
+    for (int k : {1, 63, 65}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
+    }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
     // gpt-oss issue with Vulkan mmq_id
@@ -10533,6 +10541,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (int k : {4, 8, 16, 32}) {
+        for (int nrows : {1, 8, 16}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {151936, nrows, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,   nrows, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8193,   nrows, 1, 1}, k));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {8192,   nrows, 1, 1}, k, true));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k, true));
+        }
+    }
+
     for (int k : {1, 2, 3, 7, 15}) {
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16, 10, 10, 10}, k));
         test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {60, 10, 10, 10}, k));
@@ -10703,16 +10722,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {4, 1}, 512,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {4, 1}, 512,   3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext( 40,  40, 4, {1, 1}, 512,  17, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {4, 1}, 512,  65, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {1, 1}, 512,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16,  true, true));
-    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {4, 1}, 512,   2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 512,  65, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true));
-    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 16384, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, true, true));
-    test_cases.emplace_back(new test_flash_attn_ext( 64,  64, 4, {4, 1}, 512,   2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, true, true));
+    const auto add_compact_causal_test = [&](int64_t hs, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, ggml_type type_K, ggml_type type_V) {
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, nr23, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                type_K, type_V, {0, 1, 2, 3}, true, false, true));
+    };
+
+    add_compact_causal_test( 64, {4, 1},   512,   1, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test( 64, {4, 1},   512,   3, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test( 40, {1, 1},   512,  17, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test(128, {4, 1},   512,  65, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test(256, {1, 1},   512,  64, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test(256, {6, 1},   512, 256, GGML_TYPE_F16,  GGML_TYPE_F16);
+    add_compact_causal_test( 64, {4, 1},   512,   2, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    add_compact_causal_test(256, {6, 1},   512,  65, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    add_compact_causal_test(256, {6, 1}, 16384,   1, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    add_compact_causal_test( 64, {4, 1},   512,   2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0);
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -11288,7 +11312,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
-    for (auto k : {1, 10, 40, 400}) {
+    // widths around the tiling threshold
+    for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {
+        for (auto nrows : {1, 16}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
+        }
+    }
+    for (auto k : {1, 4, 8, 10, 16, 32, 40, 400}) {
         for (auto nrows : {1, 16}) {
             for (auto cols : {k, 1000, 65000, 200000}) {
                 test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, k));
@@ -11935,7 +11965,7 @@ int main(int argc, char ** argv) {
 
     size_t n_ok = 0;
     const bool compact_tests_selected = mode == MODE_TEST &&
-        (op_names_filter == nullptr || std::regex_search(std::string("COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE"), std::regex(op_names_filter)));
+        op_names_filter_selects(op_names_filter, "COMPACT_CAUSAL_DESCRIPTOR_EQUIVALENCE");
 
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -11971,7 +12001,7 @@ int main(int argc, char ** argv) {
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
         bool ok;
-        if (compact_tests_selected && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && !backend_has_flash_attn_causal_prefix(backend.get())) {
+        if (compact_tests_selected && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && !backend_has_flash_attn_causal_prefix(dev)) {
             fprintf(stderr, "CUDA backend does not advertise compact causal mask support\n");
             ok = false;
         } else {

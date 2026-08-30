@@ -41,6 +41,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
@@ -49,7 +50,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     //     are put into the template specialization without GQA optimizations.
     bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && t->type == GGML_TYPE_I64)) {
+        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && compact_causal_prefix)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -366,6 +367,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const bool compact_causal_prefix = mask && mask->type == GGML_TYPE_I64;
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -377,7 +379,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
-        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && t->type == GGML_TYPE_I64)) {
+        if (t == nullptr || ggml_is_quantized(t->type) || (t == mask && compact_causal_prefix)) {
             continue;
         }
         for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
@@ -450,7 +452,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     if (mask) {
-        if (mask->type == GGML_TYPE_I64) {
+        if (compact_causal_prefix) {
             if (mask->ne[0] != Q->ne[1] || mask->ne[1] != 1 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
                     mask->nb[0] != ggml_type_size(mask->type) || max_bias != 0.0f) {
                 return BEST_FATTN_KERNEL_NONE;
