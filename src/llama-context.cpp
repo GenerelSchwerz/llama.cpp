@@ -446,11 +446,7 @@ llama_context::llama_context(
         }
 
         if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-            if (memory && memory->get_supports_partial_kv()) {
-                cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
-            } else {
-                LLAMA_LOG_WARN("%s: partial GPU KV residency is not supported for this memory layout; ignoring kv_gpu_layers\n", __func__);
-            }
+            cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
         }
     }
 

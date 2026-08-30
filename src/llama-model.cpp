@@ -34,6 +34,7 @@
 #include <map>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2230,15 +2231,79 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
+// memory. Taking them in layer order fills the device that owns the first layers and leaves the
+// free memory of the others unused, so take one layer per owning device in turn.
+static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & model, uint32_t n_layers) {
+    std::set<uint32_t> ret;
+    if (n_layers == 0) {
+        return ret;
+    }
+
+    const llama_hparams & hparams = model.hparams;
+
+    // A model split by tensor mishandles an iSWA cache whose layers are partly device- and partly
+    // host-resident: the result stays coherent but measurably degrades. Leave the whole cache in
+    // host memory there until the mix is understood.
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+            if (hparams.is_swa(il)) {
+                LLAMA_LOG_WARN("%s: kv_gpu_layers is not supported for an iSWA cache split by tensor, ignoring it\n",
+                        __func__);
+                return ret;
+            }
+        }
+    }
+
+    std::vector<ggml_backend_dev_t>    devs;
+    std::vector<std::vector<uint32_t>> devs_ils;
+
+    for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        auto * dev = model.dev_layer(il);
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        auto it = std::find(devs.begin(), devs.end(), dev);
+        if (it == devs.end()) {
+            devs.push_back(dev);
+            devs_ils.emplace_back();
+            it = devs.end() - 1;
+        }
+        devs_ils[it - devs.begin()].push_back(il);
+    }
+
+    for (size_t i = 0; ret.size() < n_layers; i++) {
+        bool any = false;
+        for (size_t d = 0; d < devs.size() && ret.size() < n_layers; d++) {
+            if (i < devs_ils[d].size()) {
+                ret.insert(devs_ils[d][i]);
+                any = true;
+            }
+        }
+        if (!any) {
+            break;
+        }
+    }
+
+    return ret;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
-    const llama_memory_placement_options placement = {
+    llama_memory_placement_options placement = {
         cparams.kv_cpu_pinned,
-        cparams.kv_gpu_layers,
         cparams.offload_kqv || cparams.recurrent_state_offload,
     };
-    llama_memory_placement_options specialized_placement = placement;
-    specialized_placement.gpu_resident_layers = 0;
+    // resolved here rather than per cache, so that a cache built from several sub-caches shares
+    // one budget instead of giving each of them the full count
+    placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers);
+    if (!placement.gpu_resident_ils.empty()) {
+        LLAMA_LOG_INFO("%s: partial GPU KV residency: %zu of %u requested attention layers device-resident\n",
+                __func__, placement.gpu_resident_ils.size(), cparams.kv_gpu_layers);
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2281,7 +2346,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         filter_idx,
                         nullptr,
-                        specialized_placement);
+                        placement);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2335,7 +2400,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -2388,7 +2453,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2416,7 +2481,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mtp,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2433,7 +2498,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2458,7 +2523,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                     break;
                 }
             }
@@ -2522,7 +2587,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* attn_offload      */ cparams.offload_kqv,
-                            /* placement         */ specialized_placement,
+                            /* placement         */ placement,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2615,7 +2680,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    specialized_placement);
+                                    placement);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2633,7 +2698,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    specialized_placement);
+                                    placement);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
