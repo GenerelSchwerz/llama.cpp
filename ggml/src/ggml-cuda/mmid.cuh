@@ -76,6 +76,7 @@ struct ggml_cuda_mmid_capability {
 
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type);
 ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query);
+bool ggml_cuda_mmid_can_use_compact_mmvq(const ggml_cuda_mmid_capability_query & query, int64_t n_compact_experts);
 bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens);
 
 void ggml_cuda_launch_mm_ids_helper(

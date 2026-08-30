@@ -1476,6 +1476,13 @@ static void test_mmid_capabilities() {
     CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_INVALID_IO);
     query = candidate_mmid_query(GGML_TYPE_Q8_K, 16, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
     CHECK(ggml_cuda_mmid_get_capability(query).reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER);
+
+    query = candidate_mmid_query(GGML_TYPE_Q4_0, 4, GGML_CUDA_MMID_MAPPING_DIRECT, true);
+    CHECK(ggml_cuda_mmid_can_use_compact_mmvq(query, 12));
+    query = candidate_mmid_query(GGML_TYPE_Q4_0, 16, GGML_CUDA_MMID_MAPPING_DIRECT, true);
+    CHECK(!ggml_cuda_mmid_can_use_compact_mmvq(query, 12));
+    query = candidate_mmid_query(GGML_TYPE_Q4_0, 4, GGML_CUDA_MMID_MAPPING_SOURCE_MAP, true);
+    CHECK(!ggml_cuda_mmid_can_use_compact_mmvq(query, 12));
 }
 
 static void test_scheduler_execution_certificate() {
@@ -1645,15 +1652,20 @@ static void test_graph_execution_certificate_policy() {
 
     ggml_set_name(gate_up, "test.policy.gate_up");
     ggml_set_name(down, "test.policy.down");
-    auto no_equivalent_consumer = make_graph(2, 2);
-    candidate_stamp_execution(no_equivalent_consumer.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+    auto compact_mmvq_without_mmq_name = make_graph(2, 2);
+    candidate_stamp_execution(compact_mmvq_without_mmq_name.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, 2);
     {
         ggml_cuda_moe_graph_plan plan;
         ggml_cuda_moe_graph_execution execution;
-        compile(no_equivalent_consumer, 1199, plan, execution);
-        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY && execution.size() == 1);
-        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_consumer_equivalence_reason(plan, 0));
+        compile(compact_mmvq_without_mmq_name, 1199, plan, execution);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 0));
+        for (uint32_t bank_index = 0; bank_index < 2; ++bank_index) {
+            const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(plan, 0, bank_index);
+            CHECK(capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ && capability.use_mmq == 0 &&
+                capability.mapping == GGML_CUDA_MMID_MAPPING_DIRECT);
+        }
     }
     ggml_set_name(gate_up, "test_policy_gate_up_weight");
     ggml_set_name(down, "test_policy_down_weight");
@@ -5343,7 +5355,8 @@ static void test_active_grouped_multirow_graph_modes_case(
         uint32_t n_experts = 8,
         uint32_t n_used = 2,
         uint32_t n_slots = 12,
-        bool legacy_mmq_names = false) {
+        bool test_large_transition = false,
+        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
     CHECK((n_rows == 2 || n_rows == 3 || n_rows == 4) && n_used * n_rows <= 32 && n_used * n_rows <= n_slots);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
@@ -5352,20 +5365,19 @@ static void test_active_grouped_multirow_graph_modes_case(
     CHECK(reference_backend != nullptr && candidate_backend != nullptr);
     auto reference = build_active_grouped_dispatch_graph(
         reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, n_rows, n_experts, n_used, 256);
+        layout, false, n_rows, n_experts, n_used, 256);
     auto candidate = build_active_grouped_dispatch_graph(
         candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, n_rows, n_experts, n_used, 256);
+        layout, false, n_rows, n_experts, n_used, 256);
     initialize_active_grouped_dispatch_graphs({&reference, &candidate});
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
         GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    register_active_grouped_dispatch(
-        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, n_slots);
+    register_active_grouped_dispatch(candidate_backend.get(), candidate, layout, n_slots);
     auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
     CHECK(context != nullptr);
     (void) candidate_certify_graph(*context, candidate.graph);
-    const bool test_transition = legacy_mmq_names || (n_slots == 12 && n_rows == 2);
+    const bool test_transition = test_large_transition || (n_slots == 12 && n_rows == 2);
     cached_mmid_path_test_graph reference_prefill;
     cached_mmid_path_test_graph candidate_prefill;
     std::vector<int32_t> prefill_ids;
@@ -5386,7 +5398,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             prefill_ids.push_back(static_cast<int32_t>((route + 5) % n_experts));
         }
     }
-    if (legacy_mmq_names) {
+    {
         ggml_cuda_moe_graph_plan plan;
         ggml_cuda_moe_graph_execution execution;
         context->compile_graph_plan(candidate.graph, candidate.graph->uid, &plan, &execution);
@@ -5394,11 +5406,11 @@ static void test_active_grouped_multirow_graph_modes_case(
         for (uint32_t bank_index = 0; bank_index < candidate.banks.size(); ++bank_index) {
             const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(plan, 0, bank_index);
             CHECK(capability.tensor == candidate.banks[bank_index] &&
-                capability.consumer == GGML_CUDA_MMID_CONSUMER_MMQ && capability.use_mmq == 1 &&
+                capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ && capability.use_mmq == 1 &&
                 capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
                 capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
                 capability.phase == GGML_CUDA_MMID_PHASE_PREFILL &&
-                capability.mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP &&
+                capability.mapping == GGML_CUDA_MMID_MAPPING_DIRECT &&
                 capability.n_experts == n_experts && capability.source_ne[2] == n_experts &&
                 capability.grouped_ne[2] == n_slots && capability.top_k == n_used &&
                 capability.n_rows == n_rows && capability.n_routes == n_used * n_rows &&
@@ -6120,6 +6132,8 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(device, 2);
     test_active_grouped_multirow_graph_modes_case(device, 3);
     test_active_grouped_multirow_graph_modes_case(device, 4);
+    test_active_grouped_multirow_graph_modes_case(
+        device, 4, 8, 2, 12, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
     test_active_grouped_same_key_row_transitions(device);
     test_active_grouped_cache12_route_limit_transition(device);

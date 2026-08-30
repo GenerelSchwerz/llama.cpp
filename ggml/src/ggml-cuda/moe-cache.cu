@@ -1228,13 +1228,16 @@ static ggml_cuda_moe_graph_capability_witness moe_candidate_capability(
     legacy_query.n_tokens = n_tokens;
     legacy_query.n_experts = ne[2];
     legacy_query.phase = n_rows == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
-    legacy_query.mapping = n_rows == 1 ? GGML_CUDA_MMID_MAPPING_DIRECT : GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+    legacy_query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
     legacy_query.use_mmq = ggml_cuda_moe_use_mmq(tensor, n_tokens);
     const auto & info = ggml_cuda_info();
     if (device >= 0 && device < info.device_count) {
         legacy_query.cc = info.devices[device].cc;
         legacy_query.warp_size = info.devices[device].warp_size;
         legacy_query.smpbo = info.devices[device].smpbo;
+    }
+    if (n_rows > 1 && !ggml_cuda_mmid_can_use_compact_mmvq(legacy_query, n_slots)) {
+        legacy_query.mapping = GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
     }
     const auto legacy = ggml_cuda_mmid_get_capability(legacy_query);
 

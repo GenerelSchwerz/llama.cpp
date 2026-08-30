@@ -2335,9 +2335,6 @@ bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
 static bool ggml_cuda_moe_use_compact_mmvq(const ggml_tensor * dst, int64_t n_compact_experts) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
-    if (src1->ne[2] > MMVQ_MAX_BATCH_SIZE) {
-        return false;
-    }
     ggml_cuda_mmid_capability_query query;
     query.source_type = src0->type;
     query.input_type = src1->type;
@@ -2357,17 +2354,7 @@ static bool ggml_cuda_moe_use_compact_mmvq(const ggml_tensor * dst, int64_t n_co
     query.cc = info.devices[device].cc;
     query.warp_size = info.devices[device].warp_size;
     query.smpbo = info.devices[device].smpbo;
-    const auto direct = ggml_cuda_mmid_get_capability(query);
-    if (direct.reason != GGML_CUDA_MMID_CAPABILITY_OK || direct.selection != GGML_CUDA_MMID_CONSUMER_MMVQ ||
-            n_compact_experts <= 0 || query.source_nb[2] > SIZE_MAX / (size_t) n_compact_experts) {
-        return false;
-    }
-    query.n_experts = n_compact_experts;
-    query.source_ne[2] = n_compact_experts;
-    query.source_nb[3] = query.source_nb[2] * (size_t) n_compact_experts;
-    query.preferred_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ;
-    const auto compact = ggml_cuda_mmid_get_capability(query);
-    return compact.reason == GGML_CUDA_MMID_CAPABILITY_OK && compact.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+    return ggml_cuda_mmid_can_use_compact_mmvq(query, n_compact_experts);
 }
 
 static int ggml_cuda_moe_layer_from_name(const char * name) {

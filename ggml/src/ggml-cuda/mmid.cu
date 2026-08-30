@@ -138,6 +138,27 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
     return result;
 }
 
+bool ggml_cuda_mmid_can_use_compact_mmvq(
+        const ggml_cuda_mmid_capability_query & query,
+        int64_t n_compact_experts) {
+    if (query.mapping != GGML_CUDA_MMID_MAPPING_DIRECT || n_compact_experts <= 0 ||
+            query.source_nb[2] > SIZE_MAX / (size_t) n_compact_experts) {
+        return false;
+    }
+    const auto direct = ggml_cuda_mmid_get_capability(query);
+    if (direct.reason != GGML_CUDA_MMID_CAPABILITY_OK || direct.selection != GGML_CUDA_MMID_CONSUMER_MMVQ) {
+        return false;
+    }
+
+    ggml_cuda_mmid_capability_query compact = query;
+    compact.n_experts = n_compact_experts;
+    compact.source_ne[2] = n_compact_experts;
+    compact.source_nb[3] = compact.source_nb[2] * (size_t) n_compact_experts;
+    compact.preferred_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ;
+    const auto capability = ggml_cuda_mmid_get_capability(compact);
+    return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK && capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+}
+
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
     uint32_t data;
