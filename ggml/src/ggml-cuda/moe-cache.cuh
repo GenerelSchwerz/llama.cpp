@@ -650,6 +650,7 @@ public:
     const ggml_cuda_moe_group_call_lease * find_authority(const ggml_tensor * node) const;
     bool resolve_streams(ggml_cuda_moe_graph_stream_resolver resolver, void * data);
     bool has_stream_grouped_candidate() const;
+    bool has_coherent_grouped_streams() const;
     bool requires_dispatch() const;
     ggml_cuda_moe_graph_outcome outcome() const;
     ggml_cuda_moe_graph_dispatch_mode dispatch_mode() const;

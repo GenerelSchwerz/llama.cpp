@@ -5851,7 +5851,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             return GGML_STATUS_FAILED;
         }
         const auto outcome = moe_execution.outcome();
-        if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && !moe_execution.has_coherent_grouped_streams()) {
+            force_moe_direct();
+        } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
             if (use_cuda_graph && !cuda_graph_update_required) {
                 if (graph == nullptr || graph->moe_resource_fingerprint == 0) {
                     force_moe_direct();

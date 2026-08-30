@@ -3040,6 +3040,18 @@ bool ggml_cuda_moe_graph_execution::has_stream_grouped_candidate() const {
     return false;
 }
 
+bool ggml_cuda_moe_graph_execution::has_coherent_grouped_streams() const {
+    if (plan_ == nullptr || dispatch_active_ || plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED || n_groups_ == 0) {
+        return false;
+    }
+    for (uint32_t record_index = 0; record_index < n_groups_; ++record_index) {
+        if (groups_[record_index].stream == nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool ggml_cuda_moe_graph_execution::requires_dispatch() const {
     return plan_ != nullptr && (n_groups_ != 0 ||
         (plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && plan_->coverage_diagnostics_.cached_mmid != 0));
