@@ -1633,34 +1633,42 @@ void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cuda
     }
 }
 
-#define DECL_MMQ_CASE(type)                                                               \
-    template void mul_mat_q_case<type, false>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
+#define DECL_MMQ_CASE_HELPER(type, use_x_map)                                                               \
+    template void mul_mat_q_case<type, use_x_map>(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) \
 
-extern DECL_MMQ_CASE(GGML_TYPE_Q1_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q2_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q4_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q4_1);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_0);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_1);
-extern DECL_MMQ_CASE(GGML_TYPE_Q8_0);
+#define DECL_MMQ_CASE(type)                     \
+    DECL_MMQ_CASE_HELPER(type, false);          \
+    DECL_MMQ_CASE_HELPER(type, true)            \
+
+#define EXTERN_DECL_MMQ_CASE(type)              \
+    extern DECL_MMQ_CASE_HELPER(type, false);   \
+    extern DECL_MMQ_CASE_HELPER(type, true)     \
+
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q1_0);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q2_0);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q4_0);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q4_1);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q5_0);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q5_1);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q8_0);
 // -----------------------------------------
-extern DECL_MMQ_CASE(GGML_TYPE_Q2_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q3_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q4_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q5_K);
-extern DECL_MMQ_CASE(GGML_TYPE_Q6_K);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q2_K);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q3_K);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q4_K);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q5_K);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_Q6_K);
 // -----------------------------------------
-extern DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
-extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ1_S);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ2_XXS);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ2_XS);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ2_S);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ3_XXS);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ3_S);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ4_NL);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);
 // -----------------------------------------
-extern DECL_MMQ_CASE(GGML_TYPE_MXFP4);
-extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_MXFP4);
+EXTERN_DECL_MMQ_CASE(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
