@@ -5699,7 +5699,7 @@ static void test_active_grouped_multirow_graph_modes_case(
         n_experts, n_used, n_rows);
 }
 
-static void test_active_grouped_same_key_row_transitions(int device) {
+static void test_active_grouped_same_key_row_transitions(int device, uint32_t n_slots) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
@@ -5735,11 +5735,11 @@ static void test_active_grouped_same_key_row_transitions(int device) {
     initialize_active_grouped_dispatch_graphs({&reference_b2, &candidate_b2});
     initialize_active_grouped_dispatch_graphs({&reference_b3, &candidate_b3});
     initialize_active_grouped_dispatch_graphs({&reference_b4, &candidate_b4});
-    const auto disabled = candidate_snapshot(48, nullptr, 0);
+    const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
         GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     register_active_grouped_dispatch(
-        candidate_backend.get(), candidate_b4, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 48);
+        candidate_backend.get(), candidate_b4, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, n_slots);
 
     ggml_tensor * shared_first_node = candidate_b4.graph->nodes[0];
     CHECK(shared_first_node != nullptr && shared_first_node->op != GGML_OP_MUL_MAT_ID);
@@ -5793,7 +5793,7 @@ static void test_active_grouped_same_key_row_transitions(int device) {
     ggml_cuda_moe_grouped_resource_info initial_info;
     CHECK(context->acquire_group_resources(group_key, &initial_resource) &&
         context->get_group_resources(initial_resource, &initial_info));
-    CHECK(initial_info.down == candidate_b4.down && initial_info.n_slots == 48 &&
+    CHECK(initial_info.down == candidate_b4.down && initial_info.n_slots == n_slots &&
         initial_info.n_banks == candidate_b4.banks.size() && !initial_info.transaction_active);
     const uint64_t resource_generation = initial_resource.resource_generation;
     std::array<void *, 2> bank_data = {
@@ -5806,7 +5806,7 @@ static void test_active_grouped_same_key_row_transitions(int device) {
         ggml_cuda_moe_grouped_resource_info info;
         CHECK(context->acquire_group_resources(group_key, &resource) && context->get_group_resources(resource, &info));
         CHECK(resource.resource_generation == resource_generation && info.down == candidate_b4.down &&
-            info.n_slots == 48 && info.n_banks == candidate_b4.banks.size() && !info.transaction_active);
+            info.n_slots == n_slots && info.n_banks == candidate_b4.banks.size() && !info.transaction_active);
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_bank_data(
                 *context, group_key, candidate_b4.banks[0]) == bank_data[0] &&
             ggml_cuda_moe_grouped_context_test_access::device_bank_data(
@@ -5885,8 +5885,9 @@ static void test_active_grouped_same_key_row_transitions(int device) {
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, capture_available ?
-        "test-moe-cache: shared-bank cache48 B4/B3/B2/B1 capture transition OK\n" :
-        "test-moe-cache: shared-bank cache48 B4/B3/B2/B1 direct transition OK (CUDA graphs unavailable)\n");
+        "test-moe-cache: shared-bank cache%u B4/B3/B2/B1 capture transition OK\n" :
+        "test-moe-cache: shared-bank cache%u B4/B3/B2/B1 direct transition OK (CUDA graphs unavailable)\n",
+        n_slots);
 }
 
 static void test_active_grouped_cache12_route_limit_transition(int device) {
@@ -6213,7 +6214,8 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(
         device, 4, 8, 2, 12, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
-    test_active_grouped_same_key_row_transitions(device);
+    test_active_grouped_same_key_row_transitions(device, 48);
+    test_active_grouped_same_key_row_transitions(device, 138);
     test_active_grouped_cache12_route_limit_transition(device);
     test_active_grouped_legacy_phase_telemetry(device);
     test_active_grouped_stream_coherence_fallback(device);
@@ -8928,6 +8930,64 @@ static void test_grouped_decode_independent_rows(int device) {
     key.execution_semantic_key = 1;
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
     CUDA_OK(cudaStreamDestroy(stream));
+
+    {
+        grouped_decode_fixture k32_fixture(device, true, grouped_decode_fixture::SOURCE_BYTES, 64);
+        ggml_tensor * k32_gate_up = k32_fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+        ggml_tensor * k32_down = k32_fixture.weight(GGML_TYPE_Q4_0, 32, 32);
+        memset(k32_gate_up->data, 41, ggml_nbytes(k32_gate_up));
+        memset(k32_down->data, 53, ggml_nbytes(k32_down));
+        std::array<ggml_backend_moe_candidate_bank_v1, 2> k32_banks = {{
+            {k32_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+            {k32_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        }};
+        const ggml_backend_moe_candidate_group_v1 k32_group = {
+            k32_banks.data(), k32_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+        };
+        const auto k32_snapshot = candidate_snapshot(32, &k32_group, 1);
+        ggml_cuda_moe_grouped_context k32_registry(ggml_backend_get_device(k32_fixture.backend), device);
+        CHECK(k32_registry.replace(&k32_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        ggml_tensor * k32_ids = k32_fixture.ids(32);
+        auto k32_key = grouped_decode_key(k32_registry, k32_down, k32_ids, k32_group.layout, k32_group.n_banks);
+        const std::array<int32_t, 32> first_routes = {
+            31, 7, 31, 2, 7, 18, 4, 18, 9, 2, 11, 4, 15, 9, 23, 11,
+            27, 15, 5, 23, 29, 27, 1, 5, 30, 29, 3, 1, 6, 30, 3, 63,
+        };
+        auto changed_routes = first_routes;
+        changed_routes.back() = 62;
+        std::array<int32_t, 64> slots;
+        slots.fill(-1);
+        int32_t next_slot = 0;
+        const auto expected_remap = [&](const std::array<int32_t, 32> & routes) {
+            std::array<int32_t, 32> result = {};
+            for (uint32_t route = 0; route < routes.size(); ++route) {
+                if (slots[routes[route]] < 0) {
+                    slots[routes[route]] = next_slot++;
+                }
+                result[route] = slots[routes[route]];
+            }
+            return result;
+        };
+        const auto first_remap = expected_remap(first_routes);
+        const auto changed_remap = expected_remap(changed_routes);
+        cudaStream_t k32_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&k32_stream, cudaStreamNonBlocking));
+        const auto run_k32 = [&](const std::array<int32_t, 32> & routes, const std::array<int32_t, 32> & expected) {
+            CUDA_OK(cudaMemcpyAsync(k32_ids->data, routes.data(), sizeof(routes), cudaMemcpyHostToDevice, k32_stream));
+            ggml_cuda_moe_grouped_decode_acquisition k32_decode;
+            CHECK(k32_registry.prepare_decode(k32_key, k32_stream, &k32_decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+            CUDA_OK(cudaStreamSynchronize(k32_stream));
+            std::array<int32_t, 32> actual = {};
+            CUDA_OK(cudaMemcpy(actual.data(), k32_decode.remapped_ids, sizeof(actual), cudaMemcpyDeviceToHost));
+            CHECK(actual == expected);
+            CHECK(k32_registry.finish_decode(k32_decode, k32_stream));
+        };
+        run_k32(first_routes, first_remap);
+        run_k32(first_routes, first_remap);
+        run_k32(changed_routes, changed_remap);
+        CUDA_OK(cudaStreamSynchronize(k32_stream));
+        CUDA_OK(cudaStreamDestroy(k32_stream));
+    }
 }
 
 static void test_grouped_clock_refresh_case(int device, uint32_t n_slots) {
@@ -9104,6 +9164,7 @@ static void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+    test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, true, 12);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
         for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {

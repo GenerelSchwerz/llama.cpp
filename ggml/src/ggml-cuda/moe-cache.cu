@@ -2454,6 +2454,12 @@ static __device__ void moe_grouped_warp_min(unsigned long long & age, uint32_t &
     }
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static __device__ uint32_t moe_grouped_lane_mask_lt(uint32_t lane) {
+    return lane == 0 ? 0 : UINT32_MAX >> (WARP_SIZE - lane);
+}
+#endif
+
 struct moe_grouped_device_scope {
     explicit moe_grouped_device_scope(int device) : previous(ggml_cuda_get_device()) {
         ggml_cuda_set_device(device);
@@ -2586,75 +2592,128 @@ static __global__ void moe_grouped_plan_decode(
     }
     __syncthreads();
 
-    if (thread < n_routes) {
-        bool first = true;
-        for (uint32_t previous = 0; previous < thread; ++previous) {
-            first = first && route_experts[previous] != route_experts[thread];
-        }
-        unique_scan[thread] = first ? 1 : 0;
-    }
-    __syncthreads();
-    for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
-        uint32_t add = 0;
-        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
-            add = unique_scan[thread - offset];
-        }
-        __syncthreads();
-        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
-            unique_scan[thread] += add;
-        }
-        __syncthreads();
-    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (n_routes == top_k) {
+        if (thread < WARP_SIZE) {
+            const uint32_t lane = thread;
+            const bool active = lane < n_routes;
+            const int32_t expert = active ? route_experts[lane] : -1;
+            uint32_t first_lane = lane;
+#pragma unroll
+            for (uint32_t source = 0; source < WARP_SIZE; ++source) {
+                const int32_t other = __shfl_sync(0xffffffff, expert, source, WARP_SIZE);
+                if (active && source < first_lane && other == expert) {
+                    first_lane = source;
+                }
+            }
+            const bool first = active && first_lane == lane;
+            const uint32_t first_mask = __ballot_sync(0xffffffff, first);
+            const uint32_t unique = __popc(first_mask & moe_grouped_lane_mask_lt(first_lane));
+            if (active) {
+                route_unique[lane] = unique;
+            }
 
-    if (thread == 0) {
-        plan->n_unique = unique_scan[n_routes - 1];
-    }
-    if (thread < n_routes) {
-        uint32_t first = thread;
-        for (uint32_t previous = 0; previous < thread; ++previous) {
-            if (route_experts[previous] == route_experts[thread]) {
-                first = previous;
-                break;
+            int32_t slot = -1;
+            bool invalid_slot = false;
+            if (first) {
+                slot = slot_for_expert[expert];
+                invalid_slot = slot < -1 ||
+                    (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert));
+                plan->unique_experts[unique] = expert;
+                plan->unique_slots[unique] = slot;
+                plan->unique_misses[unique] = slot < 0 ? 1 : 0;
+            }
+            const uint32_t invalid_mask = __ballot_sync(0xffffffff, invalid_slot);
+            const bool miss = first && slot < 0;
+            const uint32_t miss_mask = __ballot_sync(0xffffffff, miss);
+            if (miss) {
+                const uint32_t miss_index = __popc(miss_mask & moe_grouped_lane_mask_lt(lane));
+                plan->miss_unique[miss_index] = unique;
+                plan->miss_experts[miss_index] = expert;
+            }
+            if (lane == 0) {
+                if (invalid_mask != 0) {
+                    moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+                }
+                plan->n_unique = __popc(first_mask);
+                plan->n_misses = __popc(miss_mask);
+            }
+            __syncwarp(0xffffffff);
+        }
+        __syncthreads();
+    } else
+#endif
+    {
+        if (thread < n_routes) {
+            bool first = true;
+            for (uint32_t previous = 0; previous < thread; ++previous) {
+                first = first && route_experts[previous] != route_experts[thread];
+            }
+            unique_scan[thread] = first ? 1 : 0;
+        }
+        __syncthreads();
+        for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
+            uint32_t add = 0;
+            if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
+                add = unique_scan[thread - offset];
+            }
+            __syncthreads();
+            if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
+                unique_scan[thread] += add;
+            }
+            __syncthreads();
+        }
+
+        if (thread == 0) {
+            plan->n_unique = unique_scan[n_routes - 1];
+        }
+        if (thread < n_routes) {
+            uint32_t first = thread;
+            for (uint32_t previous = 0; previous < thread; ++previous) {
+                if (route_experts[previous] == route_experts[thread]) {
+                    first = previous;
+                    break;
+                }
+            }
+            route_unique[thread] = unique_scan[first] - 1;
+            if (first == thread) {
+                plan->unique_experts[route_unique[thread]] = route_experts[thread];
             }
         }
-        route_unique[thread] = unique_scan[first] - 1;
-        if (first == thread) {
-            plan->unique_experts[route_unique[thread]] = route_experts[thread];
-        }
-    }
-    __syncthreads();
+        __syncthreads();
 
-    if (thread < plan->n_unique) {
-        const int32_t expert = plan->unique_experts[thread];
-        const int32_t slot = slot_for_expert[expert];
-        if (slot < -1 || (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert))) {
-            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
-        }
-        plan->unique_slots[thread] = slot;
-        plan->unique_misses[thread] = slot < 0 ? 1 : 0;
-        miss_scan[thread] = plan->unique_misses[thread];
-    }
-    __syncthreads();
-    for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
-        uint32_t add = 0;
-        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
-            add = miss_scan[thread - offset];
+        if (thread < plan->n_unique) {
+            const int32_t expert = plan->unique_experts[thread];
+            const int32_t slot = slot_for_expert[expert];
+            if (slot < -1 || (slot >= 0 && ((uint32_t) slot >= n_slots || expert_for_slot[slot] != expert))) {
+                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            }
+            plan->unique_slots[thread] = slot;
+            plan->unique_misses[thread] = slot < 0 ? 1 : 0;
+            miss_scan[thread] = plan->unique_misses[thread];
         }
         __syncthreads();
-        if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
-            miss_scan[thread] += add;
+        for (uint32_t offset = 1; offset < MOE_GROUPED_MAX_DECODE_ROUTES; offset *= 2) {
+            uint32_t add = 0;
+            if (thread < MOE_GROUPED_MAX_DECODE_ROUTES && thread >= offset) {
+                add = miss_scan[thread - offset];
+            }
+            __syncthreads();
+            if (thread < MOE_GROUPED_MAX_DECODE_ROUTES) {
+                miss_scan[thread] += add;
+            }
+            __syncthreads();
+        }
+        if (thread == 0) {
+            plan->n_misses = miss_scan[plan->n_unique - 1];
         }
         __syncthreads();
-    }
-    if (thread == 0) {
-        plan->n_misses = miss_scan[plan->n_unique - 1];
-    }
-    __syncthreads();
 
-    if (thread < plan->n_unique && plan->unique_misses[thread]) {
-        const uint32_t miss = miss_scan[thread] - 1;
-        plan->miss_unique[miss] = thread;
-        plan->miss_experts[miss] = plan->unique_experts[thread];
+        if (thread < plan->n_unique && plan->unique_misses[thread]) {
+            const uint32_t miss = miss_scan[thread] - 1;
+            plan->miss_unique[miss] = thread;
+            plan->miss_experts[miss] = plan->unique_experts[thread];
+        }
     }
     for (uint32_t slot = thread; slot < n_slots; slot += blockDim.x) {
         const int32_t resident = expert_for_slot[slot];
