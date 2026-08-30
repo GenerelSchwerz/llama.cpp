@@ -1,11 +1,25 @@
 #pragma once
 
 // Keep this header usable by host C++ consumers.
-#include <cuda_runtime.h>
+#if defined(GGML_USE_HIP)
+#include <hip/hip_runtime_api.h>
+#elif defined(GGML_USE_MUSA)
+#include <musa_runtime.h>
+#else
+#include <cuda_runtime_api.h>
+#endif
 #include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
+
+#if defined(GGML_USE_HIP)
+using ggml_cuda_moe_stream_t = hipStream_t;
+#elif defined(GGML_USE_MUSA)
+using ggml_cuda_moe_stream_t = musaStream_t;
+#else
+using ggml_cuda_moe_stream_t = cudaStream_t;
+#endif
 
 #include "ggml-backend.h"
 
@@ -349,13 +363,13 @@ struct ggml_cuda_moe_graph_group_dispatch {
     const ggml_tensor * last_reader = nullptr;
     const int32_t * remapped_ids = nullptr;
     const void * bank_data[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
-    cudaStream_t stream = nullptr;
+    ggml_cuda_moe_stream_t stream = nullptr;
     uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY;
     uint32_t n_slots = 0;
     bool defer_completion = false;
 };
 
-using ggml_cuda_moe_graph_stream_resolver = cudaStream_t (*)(void * data, const ggml_tensor * node);
+using ggml_cuda_moe_graph_stream_resolver = ggml_cuda_moe_stream_t (*)(void * data, const ggml_tensor * node);
 
 struct ggml_cuda_moe_graph_binding {
     ggml_cuda_moe_complete_group_key key;
@@ -712,7 +726,8 @@ public:
     ggml_cuda_moe_legacy_cache_lease acquire_legacy_cache(
             const ggml_tensor * tensor,
             const ggml_cuda_moe_legacy_acquisition * expected = nullptr,
-            const ggml_cuda_moe_group_call_lease * authority = nullptr);
+            const ggml_cuda_moe_group_call_lease * authority = nullptr,
+            ggml_cuda_moe_stream_t compute_stream = nullptr);
     void prefetch_legacy_siblings(
             const ggml_cuda_moe_legacy_cache_lease & source,
             const int32_t * expert_ids,
@@ -774,7 +789,7 @@ public:
             uint64_t coverage_mmid_fingerprint = 0) const;
     bool graph_resource_fingerprint(
             const ggml_cuda_moe_graph_execution & execution,
-            cudaStream_t stream,
+            ggml_cuda_moe_stream_t stream,
             uint64_t * fingerprint,
             std::vector<std::shared_ptr<void>> * leases = nullptr) const;
     bool activate_graph_resources(
@@ -793,19 +808,19 @@ public:
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
-            cudaStream_t stream);
+            ggml_cuda_moe_stream_t stream);
     bool finish_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
-            cudaStream_t stream);
+            ggml_cuda_moe_stream_t stream);
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
     ggml_cuda_moe_grouped_decode_result prepare_decode(
             const ggml_cuda_moe_complete_group_key & key,
-            cudaStream_t compute_stream,
+            ggml_cuda_moe_stream_t compute_stream,
             ggml_cuda_moe_grouped_decode_acquisition * acquisition,
             const ggml_cuda_moe_group_call_lease * authority = nullptr);
-    bool finish_decode(const ggml_cuda_moe_grouped_decode_acquisition & acquisition, cudaStream_t compute_stream);
+    bool finish_decode(const ggml_cuda_moe_grouped_decode_acquisition & acquisition, ggml_cuda_moe_stream_t compute_stream);
     void shutdown();
 
 private:
@@ -818,13 +833,18 @@ private:
     bool admission_closed_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
+    void * device_bank_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
+    bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
+    bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
+    size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
+    void fail_borrowed_cache_init_after_probe_for_test();
     uint64_t legacy_op_count_for_test(bool is_decode) const;
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_mmid_inventory_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan & plan) const;
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
     bool graph_resource_fingerprint_locked(
             const ggml_cuda_moe_graph_execution & execution,
-            cudaStream_t stream,
+            ggml_cuda_moe_stream_t stream,
             uint64_t * fingerprint,
             std::vector<std::shared_ptr<void>> * leases) const;
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
@@ -916,7 +936,7 @@ int ggml_cuda_moe_cache_acquire(
     struct ggml_cuda_moe_cache * cache,
     const void * host_src,
     size_t       byte_count,
-    cudaStream_t copy_stream,
+    ggml_cuda_moe_stream_t copy_stream,
     bool         use_l2,
     bool         is_decode,
     bool         is_prefetch,
@@ -935,7 +955,7 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     int                  n_host_srcs,
     size_t               byte_count,
     void *               dst,
-    cudaStream_t         compute_stream);
+    ggml_cuda_moe_stream_t compute_stream);
 
 bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,
@@ -950,20 +970,20 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     uint32_t *           stage_ready,
     int                  stage_ready_capacity,
     int *                out_n_wait_classes,
-    cudaStream_t         compute_stream);
+    ggml_cuda_moe_stream_t compute_stream);
 
 bool ggml_cuda_moe_cache_can_overlap_staging(
     const struct ggml_cuda_moe_cache * cache);
 
 bool ggml_cuda_moe_cache_finish_split_staging(
     struct ggml_cuda_moe_cache * cache,
-    cudaStream_t         compute_stream);
+    ggml_cuda_moe_stream_t compute_stream);
 
 bool ggml_cuda_moe_cache_release_split_slots(
     struct ggml_cuda_moe_cache * cache,
     const int *          slot_ids,
     int                  n_slot_ids,
-    cudaStream_t         compute_stream);
+    ggml_cuda_moe_stream_t compute_stream);
 
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
@@ -999,11 +1019,11 @@ void * ggml_cuda_moe_cache_slot_ptr(
 // Inspectors.
 size_t       ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * cache);
 int          ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache);
-cudaStream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache);
+ggml_cuda_moe_stream_t ggml_cuda_moe_cache_copy_stream(const struct ggml_cuda_moe_cache * cache);
 
 bool ggml_cuda_moe_cache_mark_used(
     struct ggml_cuda_moe_cache * cache,
-    cudaStream_t compute_stream);
+    ggml_cuda_moe_stream_t compute_stream);
 
 // Telemetry.
 void ggml_cuda_moe_cache_stats(

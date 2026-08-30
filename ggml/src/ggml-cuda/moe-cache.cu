@@ -3176,6 +3176,20 @@ ggml_cuda_moe_cache * ggml_cuda_moe_legacy_cache_lease::get() const noexcept {
     return cache_;
 }
 
+static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
+        int device,
+        size_t slot_size_bytes,
+        int n_slots,
+        bool source_is_mmap,
+        size_t l2_budget_bytes,
+        int l2_target_slots,
+        void * slot_pool_d,
+        cudaEvent_t wait_event,
+        bool fail_after_stream_probe);
+
+static bool ggml_cuda_moe_cache_prepare_legacy(ggml_cuda_moe_cache * cache, cudaEvent_t grouped_done);
+static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cudaStream_t grouped_stream);
+
 struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {}
 
@@ -3188,6 +3202,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
     }
 
+    struct grouped_resource;
+
     struct legacy_record {
         ggml_cuda_moe_legacy_acquisition acquisition;
         const void * source_data = nullptr;
@@ -3199,6 +3215,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t type = GGML_TYPE_COUNT;
         uint32_t active_leases = 0;
         ggml_cuda_moe_cache * cache = nullptr;
+        std::shared_ptr<grouped_resource> backing;
         bool building_cache = false;
     };
 
@@ -3273,6 +3290,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::unique_ptr<grouped_device_resource> device;
         uint64_t active_transaction_token = 0;
         cudaStream_t active_decode_stream = nullptr;
+        bool legacy_dirty = false;
+        bool building_device = false;
     };
 
     struct resource_build_input {
@@ -3305,6 +3324,7 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     using legacy_record_map = std::unordered_map<const ggml_tensor *, std::unique_ptr<legacy_record>>;
     using legacy_record_list = std::vector<std::unique_ptr<legacy_record>>;
+    using terminal_legacy_records = std::array<std::unique_ptr<legacy_record>, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS>;
     using resource_slots = std::vector<std::shared_ptr<grouped_resource>>;
     using graph_coverage_map = std::unordered_map<const void *, graph_coverage_record>;
 
@@ -3332,6 +3352,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     size_t legacy_l2_budget_bytes = 0;
     std::atomic<bool> legacy_debug_mm{false};
     bool legacy_policy_initialized = false;
+    bool fail_borrowed_cache_init_after_probe_for_test = false;
     moe_cache_op_phase_stats legacy_op_stats[2];
     moe_cache_telemetry retired_telemetry;
     std::atomic<moe_grouped_decode_debug_stats *> grouped_debug{nullptr};
@@ -3574,6 +3595,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (resource->snapshot.acquisition.candidate.generation != key.candidate.generation ||
                 resource->snapshot.acquisition.candidate.group_index != key.candidate.group_index ||
                 resource->snapshot.layout != key.layout || resource->snapshot.banks.size() != key.n_banks ||
+                (resource->legacy_dirty && group_authorities[key.candidate.group_index].authority != GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED) ||
                 resource->active_transaction_token != 0 || next_transaction_token == UINT64_MAX) {
             return nullptr;
         }
@@ -3602,6 +3624,51 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     void retire_legacy_records(legacy_record_map records);
     void retire_legacy_records(legacy_record_list records);
+    void retire_legacy_records(terminal_legacy_records records);
+
+    void detach_legacy_records_for_resource(
+            const std::shared_ptr<grouped_resource> & resource,
+            terminal_legacy_records & retired) {
+        uint32_t count = 0;
+        for (auto it = legacy_records.begin(); it != legacy_records.end();) {
+            if (it->second->backing != resource) {
+                ++it;
+                continue;
+            }
+            GGML_ASSERT(it->second->active_leases == 0 && !it->second->building_cache);
+            GGML_ASSERT(count < retired.size());
+            retired[count++] = std::move(it->second);
+            it = legacy_records.erase(it);
+        }
+    }
+
+    bool retire_failed_group_resource(const ggml_cuda_moe_grouped_transaction & transaction) {
+        std::shared_ptr<grouped_resource> retired;
+        terminal_legacy_records retired_legacy;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            auto * resource = find_resource(transaction);
+            if (resource == nullptr) {
+                return false;
+            }
+            if (resource->device != nullptr && resource->active_decode_stream != nullptr) {
+                GGML_ASSERT(resource->device->completion != nullptr);
+                CUDA_CHECK(cudaEventRecord(resource->device->completion, resource->active_decode_stream));
+                resource->device->has_completion = true;
+                resource->device->completion_stream = resource->active_decode_stream;
+            }
+            resource->active_transaction_token = 0;
+            resource->active_decode_stream = nullptr;
+            const uint32_t group_index = transaction.acquisition.candidate.group_index;
+            retired = std::move(resources[group_index]);
+            detach_legacy_records_for_resource(retired, retired_legacy);
+            refreshing[group_index] = 0;
+            resource_cv.notify_all();
+        }
+        retire_legacy_records(std::move(retired_legacy));
+        retired.reset();
+        return true;
+    }
 
     bool has_active_transaction() const {
         for (const auto & resource : resources) {
@@ -3942,6 +4009,68 @@ struct ggml_cuda_moe_grouped_context::impl {
         return true;
     }
 
+    bool acquire_group_resources_impl(
+            const ggml_cuda_moe_candidate_group_key & key,
+            ggml_cuda_moe_grouped_acquisition * acquisition) {
+        resource_build_input input;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (draining || replacement_pending || !state.accepted || key.generation != state.generation ||
+                    key.group_index >= table.groups.size() || refreshing[key.group_index]) {
+                return false;
+            }
+            if (key.group_index < resources.size() && resources[key.group_index] != nullptr) {
+                *acquisition = resources[key.group_index]->snapshot.acquisition;
+                return true;
+            }
+            if (next_resource_generation == UINT64_MAX ||
+                    !capture_resource_input(key, ++next_resource_generation, input)) {
+                return false;
+            }
+        }
+
+        resource_slots prospective;
+        auto resource = make_grouped_resource(input);
+        if (resource == nullptr) {
+            return false;
+        }
+        try {
+            prospective.resize(input.n_groups);
+            prospective[key.group_index] = std::move(resource);
+        } catch (const std::bad_alloc &) {
+            return false;
+        }
+
+        ggml_cuda_moe_grouped_acquisition result;
+        bool installed = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!draining && !replacement_pending && state.accepted && input.candidate.generation == state.generation &&
+                    input.candidate.group_index < table.groups.size() && input.n_slots == table.n_slots &&
+                    input.n_groups == table.groups.size()) {
+                const auto & group = table.groups[input.candidate.group_index];
+                if (input.down == group.down && input.layout == group.layout && input.n_banks == moe_candidate_resource_bank_count(group)) {
+                    auto * prospective_resource = prospective[input.candidate.group_index].get();
+                    const bool valid = prospective_resource != nullptr && resource_matches_table(*prospective_resource);
+                    if (valid && resources.empty()) {
+                        resources = std::move(prospective);
+                    } else if (valid && resources.size() == input.n_groups && resources[input.candidate.group_index] == nullptr) {
+                        resources[input.candidate.group_index] = std::move(prospective[input.candidate.group_index]);
+                    }
+                    if (input.candidate.group_index < resources.size() && resources[input.candidate.group_index] != nullptr &&
+                            !refreshing[input.candidate.group_index] && resource_matches_table(*resources[input.candidate.group_index])) {
+                        result = resources[input.candidate.group_index]->snapshot.acquisition;
+                        installed = true;
+                    }
+                }
+            }
+        }
+        if (installed) {
+            *acquisition = result;
+        }
+        return installed;
+    }
+
     std::unique_ptr<grouped_device_resource> make_device_resource(
             const grouped_snapshot & snapshot,
             cudaStream_t compute_stream) const {
@@ -4019,10 +4148,49 @@ struct ggml_cuda_moe_grouped_context::impl {
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->plan, 0, sizeof(moe_grouped_decode_plan), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemcpyAsync(
                     result->device_banks, device_banks.data(), snapshot.banks.size() * sizeof(moe_grouped_device_bank),
-                    cudaMemcpyHostToDevice, compute_stream))) {
+                    cudaMemcpyHostToDevice, compute_stream)) ||
+                !moe_grouped_cuda_success(cudaEventRecord(result->completion, compute_stream))) {
+            (void) cudaStreamSynchronize(compute_stream);
             return nullptr;
         }
+        result->has_completion = true;
+        result->completion_stream = compute_stream;
         return result;
+#endif
+    }
+
+    bool cold_reset_grouped_resource(grouped_resource & resource, cudaStream_t compute_stream) const {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_UNUSED(resource);
+        GGML_UNUSED(compute_stream);
+        return false;
+#else
+        if (resource.device == nullptr || compute_stream == nullptr) {
+            return false;
+        }
+        auto & device_resource = *resource.device;
+        moe_grouped_device_scope device_scope(device);
+        if (device_resource.has_completion && device_resource.completion_stream != compute_stream &&
+                !moe_grouped_cuda_success(cudaStreamWaitEvent(compute_stream, device_resource.completion, 0))) {
+            return false;
+        }
+        if (!moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.slot_for_expert, 0xff, device_resource.n_experts * sizeof(int32_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.expert_for_slot, 0xff, resource.snapshot.n_slots * sizeof(int32_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.last_used, 0, resource.snapshot.n_slots * sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(device_resource.device_clock, 0, sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(device_resource.plan, 0, sizeof(moe_grouped_decode_plan), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaEventRecord(device_resource.completion, compute_stream))) {
+            return false;
+        }
+        device_resource.clock_bound = 0;
+        // Captured planners keep using the same device_clock pointer after a logical reset.
+        device_resource.has_completion = true;
+        device_resource.completion_stream = compute_stream;
+        resource.legacy_dirty = false;
+        return true;
 #endif
     }
 
@@ -4082,6 +4250,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             cudaStream_t compute_stream) {
         resource_build_input input;
         std::shared_ptr<grouped_resource> retired;
+        std::shared_ptr<grouped_resource> stable;
         bool captured = false;
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -4090,14 +4259,33 @@ struct ggml_cuda_moe_grouped_context::impl {
                     !refreshing[acquisition.candidate.group_index] || resource->active_transaction_token != 0) {
                 return false;
             }
-            if (resources[acquisition.candidate.group_index].use_count() != 1) {
-                refreshing[acquisition.candidate.group_index] = 0;
-                return false;
+            const auto & current = resources[acquisition.candidate.group_index];
+            for (const auto & entry : legacy_records) {
+                if (entry.second->backing == current) {
+                    stable = current;
+                    break;
+                }
             }
-            if (next_resource_generation != UINT64_MAX) {
-                captured = capture_resource_input(acquisition.candidate, ++next_resource_generation, input);
+            if (stable == nullptr) {
+                if (current.use_count() != 1) {
+                    refreshing[acquisition.candidate.group_index] = 0;
+                    return false;
+                }
+                if (next_resource_generation != UINT64_MAX) {
+                    captured = capture_resource_input(acquisition.candidate, ++next_resource_generation, input);
+                }
+                retired = std::move(resources[acquisition.candidate.group_index]);
             }
-            retired = std::move(resources[acquisition.candidate.group_index]);
+        }
+        if (stable != nullptr) {
+            const bool reset = cold_reset_grouped_resource(*stable, compute_stream);
+            std::lock_guard<std::mutex> lock(mutex);
+            const uint32_t group_index = acquisition.candidate.group_index;
+            if (group_index < resources.size() && resources[group_index] == stable &&
+                    acquisition.candidate.generation == state.generation) {
+                refreshing[group_index] = 0;
+            }
+            return reset;
         }
         retired.reset();
         if (!captured) {
@@ -4444,6 +4632,65 @@ bool ggml_cuda_moe_grouped_context::get_clock_bound_for_test(
     return true;
 }
 
+void * ggml_cuda_moe_grouped_context::device_bank_data_for_test(
+        const ggml_cuda_moe_candidate_group_key & key,
+        const ggml_tensor * tensor) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (tensor == nullptr || key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+        return nullptr;
+    }
+    const auto * resource = impl_->resources[key.group_index].get();
+    if (resource == nullptr || resource->device == nullptr ||
+            resource->snapshot.acquisition.candidate.generation != key.generation) {
+        return nullptr;
+    }
+    for (uint32_t bank_index = 0; bank_index < resource->snapshot.banks.size(); ++bank_index) {
+        if (resource->snapshot.banks[bank_index].tensor == tensor && bank_index < resource->device->bank_data.size()) {
+            return resource->device->bank_data[bank_index];
+        }
+    }
+    return nullptr;
+}
+
+bool ggml_cuda_moe_grouped_context::device_resource_complete_for_test(
+        const ggml_cuda_moe_candidate_group_key & key) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+        return false;
+    }
+    const auto * resource = impl_->resources[key.group_index].get();
+    return resource != nullptr && resource->device != nullptr && resource->device->completion != nullptr &&
+        resource->device->has_completion && resource->device->completion_stream != nullptr;
+}
+
+bool ggml_cuda_moe_grouped_context::graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+        return false;
+    }
+    const auto * resource = impl_->resources[key.group_index].get();
+    return resource != nullptr && resource->device != nullptr && resource->device->graph_clock_active;
+}
+
+size_t ggml_cuda_moe_grouped_context::legacy_backing_count_for_test(
+        const ggml_cuda_moe_candidate_group_key & key) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    size_t result = 0;
+    for (const auto & entry : impl_->legacy_records) {
+        const auto & record = *entry.second;
+        if (record.backing != nullptr && record.acquisition.registered_source &&
+                record.acquisition.candidate_generation == key.generation && record.acquisition.group_index == key.group_index) {
+            ++result;
+        }
+    }
+    return result;
+}
+
+void ggml_cuda_moe_grouped_context::fail_borrowed_cache_init_after_probe_for_test() {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->fail_borrowed_cache_init_after_probe_for_test = true;
+}
+
 uint64_t ggml_cuda_moe_grouped_context::legacy_op_count_for_test(bool is_decode) const {
     return impl_->legacy_op_stats[moe_cache_phase_index(is_decode)].ops.load(std::memory_order_relaxed);
 }
@@ -4610,7 +4857,8 @@ void ggml_cuda_moe_grouped_context::end_legacy_operation(ggml_cuda_moe_legacy_op
 ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_cache(
         const ggml_tensor * tensor,
         const ggml_cuda_moe_legacy_acquisition * expected,
-        const ggml_cuda_moe_group_call_lease * authority) {
+        const ggml_cuda_moe_group_call_lease * authority,
+        cudaStream_t compute_stream) {
     ggml_cuda_moe_legacy_cache_lease result;
     if (tensor == nullptr) {
         return result;
@@ -4662,6 +4910,9 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
             }
         }
         record->active_leases++;
+        if (record->backing != nullptr) {
+            record->backing->legacy_dirty = true;
+        }
         result.owner_ = this;
         result.record_ = record;
         result.cache_ = record->cache;
@@ -4773,6 +5024,9 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                 return result;
             }
             record->active_leases++;
+            if (record->backing != nullptr) {
+                record->backing->legacy_dirty = true;
+            }
             result.owner_ = this;
             result.record_ = record;
             result.cache_ = record->cache;
@@ -4809,9 +5063,79 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
     impl_->retire_legacy_records(std::move(retired));
 
     ggml_cuda_moe_cache * prospective = nullptr;
+    std::shared_ptr<impl::grouped_resource> backing;
+    void * slot_pool_d = nullptr;
+    cudaEvent_t grouped_done = nullptr;
+    bool stable_backing_required = false;
+    if (record->acquisition.registered_source) {
+        const ggml_cuda_moe_candidate_group_key key = {
+            record->acquisition.candidate_generation,
+            record->acquisition.group_index,
+        };
+        ggml_cuda_moe_grouped_acquisition acquisition;
+        if (impl_->acquire_group_resources_impl(key, &acquisition)) {
+            bool needs_device = false;
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                if (record->building_cache && authority_matches(record->acquisition) &&
+                        key.group_index < impl_->resources.size()) {
+                    backing = impl_->resources[key.group_index];
+                    if (backing != nullptr && backing->device == nullptr && !backing->building_device && compute_stream != nullptr) {
+                        backing->building_device = true;
+                        needs_device = true;
+                    } else if (backing != nullptr && backing->device == nullptr && backing->building_device) {
+                        stable_backing_required = true;
+                    }
+                }
+            }
+            if (needs_device) {
+                auto device = impl_->make_device_resource(backing->snapshot, compute_stream);
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                if (record->building_cache && authority_matches(record->acquisition) &&
+                        key.group_index < impl_->resources.size() && impl_->resources[key.group_index] == backing) {
+                    if (device != nullptr && backing->device == nullptr && impl_->next_device_resource_serial != UINT64_MAX) {
+                        device->serial = ++impl_->next_device_resource_serial;
+                        backing->device = std::move(device);
+                    }
+                    backing->building_device = false;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lock(impl_->mutex);
+                if (record->building_cache && authority_matches(record->acquisition) &&
+                        key.group_index < impl_->resources.size() && impl_->resources[key.group_index] == backing &&
+                        backing != nullptr && backing->device != nullptr) {
+                    stable_backing_required = true;
+                    for (uint32_t bank_index = 0; bank_index < backing->snapshot.banks.size(); ++bank_index) {
+                        const auto & bank = backing->snapshot.banks[bank_index];
+                        if (bank.tensor == tensor && bank.source_data == tensor->data && bank.expert_stride == tensor->nb[2] &&
+                                bank_index < backing->device->bank_data.size()) {
+                            slot_pool_d = backing->device->bank_data[bank_index];
+                            break;
+                        }
+                    }
+                    if (backing->device->has_completion) {
+                        grouped_done = backing->device->completion;
+                    }
+                }
+            }
+        }
+    }
+    bool fail_after_stream_probe = false;
+    if (slot_pool_d != nullptr) {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        fail_after_stream_probe = impl_->fail_borrowed_cache_init_after_probe_for_test;
+        impl_->fail_borrowed_cache_init_after_probe_for_test = false;
+    }
     try {
-        prospective = ggml_cuda_moe_cache_init(
-            impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
+        if (slot_pool_d != nullptr) {
+            prospective = ggml_cuda_moe_cache_init_with_pool(
+                impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap,
+                l2_budget_bytes, l2_target_slots, slot_pool_d, grouped_done, fail_after_stream_probe);
+        } else if (!stable_backing_required) {
+            prospective = ggml_cuda_moe_cache_init(
+                impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
+        }
         if (prospective != nullptr) {
             ggml_cuda_moe_cache_set_metadata(prospective, tensor->name[0] ? tensor->name : "?", tensor->data, tensor->ne[2]);
         }
@@ -4827,6 +5151,10 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                 existing->second.get() == record && record->building_cache && impl::legacy_record_matches(*record, tensor) && record->cache == nullptr &&
                 record->active_leases != UINT32_MAX && prospective != nullptr && authority_matches(record->acquisition)) {
             record->cache = prospective;
+            record->backing = slot_pool_d != nullptr ? backing : nullptr;
+            if (record->backing != nullptr) {
+                record->backing->legacy_dirty = true;
+            }
             prospective = nullptr;
             record->active_leases++;
             result.owner_ = this;
@@ -5038,67 +5366,7 @@ bool ggml_cuda_moe_grouped_context::acquire_group_resources(
         }
     }
     std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
-
-    impl::resource_build_input input;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->draining || impl_->replacement_pending || !impl_->state.accepted ||
-                key.generation != impl_->state.generation || key.group_index >= impl_->table.groups.size() || impl_->refreshing[key.group_index]) {
-            return false;
-        }
-        if (key.group_index < impl_->resources.size() && impl_->resources[key.group_index] != nullptr) {
-            *acquisition = impl_->resources[key.group_index]->snapshot.acquisition;
-            return true;
-        }
-        if (impl_->next_resource_generation == UINT64_MAX) {
-            return false;
-        }
-        if (!impl_->capture_resource_input(key, ++impl_->next_resource_generation, input)) {
-            return false;
-        }
-    }
-
-    impl::resource_slots prospective;
-    auto resource = impl::make_grouped_resource(input);
-    if (resource == nullptr) {
-        return false;
-    }
-    try {
-        prospective.resize(input.n_groups);
-        prospective[key.group_index] = std::move(resource);
-    } catch (const std::bad_alloc &) {
-        return false;
-    }
-
-    ggml_cuda_moe_grouped_acquisition result;
-    bool installed = false;
-    {
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->draining && !impl_->replacement_pending && impl_->state.accepted && input.candidate.generation == impl_->state.generation &&
-                input.candidate.group_index < impl_->table.groups.size() && input.n_slots == impl_->table.n_slots &&
-                input.n_groups == impl_->table.groups.size()) {
-            const auto & group = impl_->table.groups[input.candidate.group_index];
-            if (input.down == group.down && input.layout == group.layout && input.n_banks == moe_candidate_resource_bank_count(group)) {
-                auto * prospective_resource = prospective[input.candidate.group_index].get();
-                const bool valid = prospective_resource != nullptr && impl_->resource_matches_table(*prospective_resource);
-                if (valid && impl_->resources.empty()) {
-                    impl_->resources = std::move(prospective);
-                } else if (valid && impl_->resources.size() == input.n_groups && impl_->resources[input.candidate.group_index] == nullptr) {
-                    impl_->resources[input.candidate.group_index] = std::move(prospective[input.candidate.group_index]);
-                }
-                if (input.candidate.group_index < impl_->resources.size() && impl_->resources[input.candidate.group_index] != nullptr &&
-                        !impl_->refreshing[input.candidate.group_index] &&
-                        impl_->resource_matches_table(*impl_->resources[input.candidate.group_index])) {
-                    result = impl_->resources[input.candidate.group_index]->snapshot.acquisition;
-                    installed = true;
-                }
-            }
-        }
-    }
-    if (installed) {
-        *acquisition = result;
-    }
-    return installed;
+    return impl_->acquire_group_resources_impl(key, acquisition);
 }
 
 bool ggml_cuda_moe_grouped_context::begin_group_transaction(
@@ -5112,6 +5380,8 @@ bool ggml_cuda_moe_grouped_context::begin_group_transaction(
     auto * resource = impl_->find_resource(acquisition);
     if (impl_->draining || impl_->replacement_pending || resource == nullptr ||
             impl_->refreshing[acquisition.candidate.group_index] || resource->active_transaction_token != 0 ||
+            (resource->legacy_dirty && impl_->group_authorities[acquisition.candidate.group_index].authority !=
+                GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED) ||
             impl_->next_transaction_token == UINT64_MAX) {
         return false;
     }
@@ -6908,9 +7178,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             }
             desired[record_index] = grouped_call ? GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED : GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
             const auto & current = impl_->group_authorities[group_index];
-            const bool has_wrong_resource = desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY &&
-                group_index < impl_->resources.size() && impl_->resources[group_index] != nullptr;
-            barrier[record_index] = current.authority != desired[record_index] || has_wrong_resource ||
+            barrier[record_index] = current.authority != desired[record_index] ||
                 (desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED && current.active_calls != 0);
             has_barrier = has_barrier || barrier[record_index];
             epoch_count += current.authority != desired[record_index];
@@ -6951,9 +7219,23 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
 
     impl::legacy_record_list retired_legacy;
     impl::resource_slots retired_resources;
+    struct cache_handoff {
+        ggml_cuda_moe_cache * cache;
+        cudaEvent_t grouped_done;
+        cudaStream_t grouped_stream;
+        bool to_legacy;
+    };
+    struct grouped_reset {
+        std::shared_ptr<impl::grouped_resource> resource;
+        cudaStream_t stream;
+    };
+    std::vector<cache_handoff> cache_handoffs;
+    std::vector<grouped_reset> grouped_resets;
     try {
         retired_legacy.reserve(legacy_capacity);
         retired_resources.resize(resource_capacity);
+        cache_handoffs.reserve(legacy_capacity);
+        grouped_resets.reserve(n_groups);
     } catch (const std::bad_alloc &) {
         return false;
     }
@@ -6990,26 +7272,73 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 continue;
             }
             const uint32_t group_index = execution->groups_[record_index].key.candidate.group_index;
+            const auto resource = group_index < impl_->resources.size() ? impl_->resources[group_index] : nullptr;
             if (desired[record_index] == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
-                if (group_index < impl_->resources.size()) {
-                    retired_resources[group_index] = std::move(impl_->resources[group_index]);
-                }
                 impl_->refreshing[group_index] = 0;
+                if (resource != nullptr && resource->device == nullptr) {
+                    retired_resources[group_index] = std::move(impl_->resources[group_index]);
+                } else if (resource != nullptr) {
+                    const cudaEvent_t completion = resource->device->has_completion ? resource->device->completion : nullptr;
+                    for (const auto & entry : impl_->legacy_records) {
+                        const auto & legacy = *entry.second;
+                        if (legacy.acquisition.registered_source && legacy.acquisition.group_index == group_index &&
+                                legacy.backing == resource && legacy.cache != nullptr) {
+                            cache_handoffs.push_back({legacy.cache, completion, nullptr, true});
+                        }
+                    }
+                }
             } else {
                 for (auto it = impl_->legacy_records.begin(); it != impl_->legacy_records.end();) {
                     if (it->second->acquisition.registered_source && it->second->acquisition.group_index == group_index) {
-                        retired_legacy.push_back(std::move(it->second));
-                        it = impl_->legacy_records.erase(it);
+                        if (resource != nullptr && resource->device != nullptr && it->second->backing == resource &&
+                                it->second->cache != nullptr) {
+                            cache_handoffs.push_back({it->second->cache, nullptr, execution->groups_[record_index].stream, false});
+                            ++it;
+                        } else {
+                            retired_legacy.push_back(std::move(it->second));
+                            it = impl_->legacy_records.erase(it);
+                        }
                     } else {
                         ++it;
                     }
+                }
+                if (resource != nullptr && resource->device != nullptr && resource->legacy_dirty) {
+                    grouped_resets.push_back({resource, execution->groups_[record_index].stream});
                 }
             }
         }
     }
 
+    bool transition_ok = true;
+    for (const auto & handoff : cache_handoffs) {
+        transition_ok = handoff.to_legacy ?
+            ggml_cuda_moe_cache_prepare_legacy(handoff.cache, handoff.grouped_done) :
+            ggml_cuda_moe_cache_handoff_grouped(handoff.cache, handoff.grouped_stream);
+        if (!transition_ok) {
+            break;
+        }
+    }
+    for (const auto & reset : grouped_resets) {
+        if (transition_ok) {
+            transition_ok = impl_->cold_reset_grouped_resource(*reset.resource, reset.stream);
+        }
+    }
     impl::retire_resources(std::move(retired_resources));
     impl_->retire_legacy_records(std::move(retired_legacy));
+
+    if (!transition_ok) {
+        {
+            std::lock_guard<std::mutex> lock(impl_->mutex);
+            for (uint32_t record_index = 0; record_index < n_groups; ++record_index) {
+                if (barrier[record_index]) {
+                    impl_->group_authorities[execution->groups_[record_index].key.candidate.group_index].admission_closed = false;
+                }
+            }
+            impl_->authority_transition_pending = false;
+        }
+        impl_->resource_cv.notify_all();
+        return false;
+    }
 
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -7020,6 +7349,14 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             if (current.authority != desired[record_index]) {
                 current.authority = desired[record_index];
                 current.epoch = ++impl_->next_group_authority_epoch;
+            }
+            if (current.authority == GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
+                for (auto & entry : impl_->legacy_records) {
+                    auto & legacy = *entry.second;
+                    if (legacy.acquisition.registered_source && legacy.acquisition.group_index == group_index) {
+                        legacy.acquisition.group_authority_epoch = current.epoch;
+                    }
+                }
             }
             current.admission_closed = false;
             ++current.active_calls;
@@ -7211,7 +7548,6 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
     if (execution == nullptr || execution->owner_ != this || !execution->dispatch_active_) {
         return false;
     }
-    std::array<std::shared_ptr<impl::grouped_resource>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> retired;
     auto * debug = impl_->debug_stats();
     bool success = true;
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
@@ -7226,22 +7562,7 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
                 if (debug != nullptr) {
                     debug->finish_error.fetch_add(1, std::memory_order_relaxed);
                 }
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                auto * resource = impl_->find_resource(group.transaction);
-                if (resource != nullptr) {
-                    if (resource->device != nullptr && resource->active_decode_stream != nullptr) {
-                        GGML_ASSERT(resource->device->completion != nullptr);
-                        CUDA_CHECK(cudaEventRecord(resource->device->completion, resource->active_decode_stream));
-                        resource->device->has_completion = true;
-                        resource->device->completion_stream = resource->active_decode_stream;
-                    }
-                    resource->active_transaction_token = 0;
-                    resource->active_decode_stream = nullptr;
-                    const uint32_t group_index = group.transaction.acquisition.candidate.group_index;
-                    retired[record_index] = std::move(impl_->resources[group_index]);
-                    impl_->refreshing[group_index] = 0;
-                    impl_->resource_cv.notify_all();
-                }
+                (void) impl_->retire_failed_group_resource(group.transaction);
             } else if (debug != nullptr) {
                 const uint32_t group_index = group.key.candidate.group_index;
                 debug->completed.fetch_add(1, std::memory_order_relaxed);
@@ -7257,22 +7578,7 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
             ggml_cuda_moe_grouped_decode_acquisition decode;
             decode.transaction = group.transaction;
             if (!finish_decode(decode, group.stream)) {
-                std::lock_guard<std::mutex> lock(impl_->mutex);
-                auto * resource = impl_->find_resource(group.transaction);
-                if (resource != nullptr) {
-                    if (resource->device != nullptr && resource->active_decode_stream != nullptr) {
-                        GGML_ASSERT(resource->device->completion != nullptr);
-                        CUDA_CHECK(cudaEventRecord(resource->device->completion, resource->active_decode_stream));
-                        resource->device->has_completion = true;
-                        resource->device->completion_stream = resource->active_decode_stream;
-                    }
-                    resource->active_transaction_token = 0;
-                    resource->active_decode_stream = nullptr;
-                    const uint32_t group_index = group.transaction.acquisition.candidate.group_index;
-                    retired[record_index] = std::move(impl_->resources[group_index]);
-                    impl_->refreshing[group_index] = 0;
-                    impl_->resource_cv.notify_all();
-                }
+                (void) impl_->retire_failed_group_resource(group.transaction);
             }
         } else if (grouped && group.state != GGML_CUDA_MOE_GRAPH_GROUP_FINISHED) {
             success = false;
@@ -7289,9 +7595,6 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
     }
     execution->dispatch_active_ = false;
     execution->dispatch_mode_ = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
-    for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
-        retired[record_index].reset();
-    }
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
         execution->groups_[record_index].authority = {};
     }
@@ -7419,11 +7722,15 @@ struct ggml_cuda_moe_cache {
     int      n_slots;
 
     void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
+    bool     owns_slot_pool;
 
     // Dedicated copy stream for cache fills, prefetches, and staging copies.
     cudaStream_t copy_stream;
     cudaEvent_t  compute_done;
     cudaEvent_t  stage_done;
+    cudaEvent_t  handoff_done;
+    cudaStream_t last_compute_stream;
+    bool         has_compute_done;
     bool         stream_mem_ops_supported;
 
     // Per-slot state.
@@ -7518,14 +7825,16 @@ static void ggml_cuda_moe_cache_append_expert_counts(
     counts.insert(counts.end(), cache->expert_access_counts.begin(), cache->expert_access_counts.end());
 }
 
-extern "C"
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
-    int    device,
-    size_t slot_size_bytes,
-    int    n_slots,
-    bool   source_is_mmap,
-    size_t l2_budget_bytes,
-    int    l2_target_slots) {
+static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
+        int device,
+        size_t slot_size_bytes,
+        int n_slots,
+        bool source_is_mmap,
+        size_t l2_budget_bytes,
+        int l2_target_slots,
+        void * slot_pool_d,
+        cudaEvent_t wait_event,
+        bool fail_after_stream_probe) {
 
     if (slot_size_bytes == 0 || n_slots <= 0) {
         return nullptr;
@@ -7547,10 +7856,14 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->device          = device;
     c->slot_size_bytes = slot_size_bytes;
     c->n_slots         = n_slots;
-    c->slot_pool_d     = nullptr;
+    c->slot_pool_d     = slot_pool_d;
+    c->owns_slot_pool  = slot_pool_d == nullptr;
     c->copy_stream     = nullptr;
     c->compute_done    = nullptr;
     c->stage_done      = nullptr;
+    c->handoff_done    = nullptr;
+    c->last_compute_stream = nullptr;
+    c->has_compute_done = false;
     c->stream_mem_ops_supported = false;
     c->access_counter  = 0;
     c->source_is_mmap  = source_is_mmap;
@@ -7558,25 +7871,38 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     c->l2_budget_bytes = l2_budget_bytes;
     c->l2_target_slots = l2_target_slots;
 
-    err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
-                (size_t)n_slots * slot_size_bytes, cudaGetErrorString(err));
-        delete c;
-        cudaSetDevice(prev_device);
-        return nullptr;
+    if (c->owns_slot_pool) {
+        err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
+                    (size_t)n_slots * slot_size_bytes, cudaGetErrorString(err));
+            delete c;
+            cudaSetDevice(prev_device);
+            return nullptr;
+        }
     }
 
     err = cudaStreamCreateWithFlags(&c->copy_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaStreamCreate failed: %s\n", cudaGetErrorString(err));
-        cudaFree(c->slot_pool_d);
+        if (c->owns_slot_pool) {
+            cudaFree(c->slot_pool_d);
+        }
+        delete c;
+        cudaSetDevice(prev_device);
+        return nullptr;
+    }
+    if (wait_event != nullptr && !moe_grouped_cuda_success(cudaStreamWaitEvent(c->copy_stream, wait_event, 0))) {
+        cudaStreamDestroy(c->copy_stream);
+        if (c->owns_slot_pool) {
+            cudaFree(c->slot_pool_d);
+        }
         delete c;
         cudaSetDevice(prev_device);
         return nullptr;
     }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
     bool can_use_stream_mem_ops = true;
 #if CUDA_VERSION < 13000
     CUdevice cu_device;
@@ -7587,28 +7913,49 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
             &stream_mem_ops_attribute, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS, cu_device) == CUDA_SUCCESS &&
         stream_mem_ops_attribute != 0;
 #endif
-    if (can_use_stream_mem_ops &&
-        cuStreamWriteValue32(
-            c->copy_stream, (CUdeviceptr)c->slot_pool_d, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS) {
-        err = cudaStreamSynchronize(c->copy_stream);
-        if (err != cudaSuccess) {
-            fprintf(stderr, "moe-cache: stream memory operation probe failed: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
-            (void)cudaStreamDestroy(c->copy_stream);
-            (void)cudaFree(c->slot_pool_d);
-            delete c;
-            (void)cudaSetDevice(prev_device);
-            return nullptr;
+    uint32_t * stream_mem_probe = nullptr;
+    if (can_use_stream_mem_ops && cudaMalloc(&stream_mem_probe, sizeof(*stream_mem_probe)) == cudaSuccess) {
+        if (cuStreamWriteValue32(
+                c->copy_stream, (CUdeviceptr) stream_mem_probe, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS) {
+            err = cudaStreamSynchronize(c->copy_stream);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "moe-cache: stream memory operation probe failed: %s\n", cudaGetErrorString(err));
+                (void) cudaGetLastError();
+                (void) cudaFree(stream_mem_probe);
+                (void) cudaStreamDestroy(c->copy_stream);
+                if (c->owns_slot_pool) {
+                    (void) cudaFree(c->slot_pool_d);
+                }
+                delete c;
+                (void) cudaSetDevice(prev_device);
+                return nullptr;
+            }
+            c->stream_mem_ops_supported = true;
         }
-        c->stream_mem_ops_supported = true;
+        (void) cudaFree(stream_mem_probe);
+    } else {
+        (void) cudaGetLastError();
     }
 #endif
+
+    if (fail_after_stream_probe) {
+        (void) cudaStreamSynchronize(c->copy_stream);
+        (void) cudaStreamDestroy(c->copy_stream);
+        if (c->owns_slot_pool) {
+            (void) cudaFree(c->slot_pool_d);
+        }
+        delete c;
+        (void) cudaSetDevice(prev_device);
+        return nullptr;
+    }
 
     err = cudaEventCreateWithFlags(&c->compute_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
         cudaStreamDestroy(c->copy_stream);
-        cudaFree(c->slot_pool_d);
+        if (c->owns_slot_pool) {
+            cudaFree(c->slot_pool_d);
+        }
         delete c;
         cudaSetDevice(prev_device);
         return nullptr;
@@ -7619,7 +7966,23 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
         cudaEventDestroy(c->compute_done);
         cudaStreamDestroy(c->copy_stream);
-        cudaFree(c->slot_pool_d);
+        if (c->owns_slot_pool) {
+            cudaFree(c->slot_pool_d);
+        }
+        delete c;
+        cudaSetDevice(prev_device);
+        return nullptr;
+    }
+
+    err = cudaEventCreateWithFlags(&c->handoff_done, cudaEventDisableTiming);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
+        cudaEventDestroy(c->stage_done);
+        cudaEventDestroy(c->compute_done);
+        cudaStreamDestroy(c->copy_stream);
+        if (c->owns_slot_pool) {
+            cudaFree(c->slot_pool_d);
+        }
         delete c;
         cudaSetDevice(prev_device);
         return nullptr;
@@ -7659,6 +8022,18 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
 }
 
 extern "C"
+struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
+        int device,
+        size_t slot_size_bytes,
+        int n_slots,
+        bool source_is_mmap,
+        size_t l2_budget_bytes,
+        int l2_target_slots) {
+    return ggml_cuda_moe_cache_init_with_pool(
+        device, slot_size_bytes, n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots, nullptr, nullptr, false);
+}
+
+extern "C"
 void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     if (!cache) return;
 
@@ -7686,13 +8061,70 @@ void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache) {
     if (cache->stage_done) {
         cudaEventDestroy(cache->stage_done);
     }
-    if (cache->slot_pool_d) {
+    if (cache->handoff_done) {
+        cudaEventDestroy(cache->handoff_done);
+    }
+    if (cache->owns_slot_pool && cache->slot_pool_d) {
         cudaFree(cache->slot_pool_d);
     }
     moe_cache_l2_free(cache->l2);
     cudaSetDevice(prev_device);
 
     delete cache;
+}
+
+static void ggml_cuda_moe_cache_clear_slots_locked(ggml_cuda_moe_cache * cache) {
+    for (uint32_t pins : cache->slot_pin_count) {
+        GGML_ASSERT(pins == 0);
+    }
+    std::fill(cache->slot_to_host.begin(), cache->slot_to_host.end(), nullptr);
+    std::fill(cache->last_used.begin(), cache->last_used.end(), 0);
+    std::fill(cache->slot_prefetched.begin(), cache->slot_prefetched.end(), 0);
+    std::fill(cache->slot_hit_count.begin(), cache->slot_hit_count.end(), 0);
+    std::fill(cache->slot_fill_access.begin(), cache->slot_fill_access.end(), 0);
+    cache->host_to_slot.clear();
+    cache->access_counter = 0;
+}
+
+static bool ggml_cuda_moe_cache_prepare_legacy(ggml_cuda_moe_cache * cache, cudaEvent_t grouped_done) {
+    if (cache == nullptr || cache->owns_slot_pool) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(cache->mu);
+    if (grouped_done != nullptr && !moe_grouped_cuda_success(cudaStreamWaitEvent(cache->copy_stream, grouped_done, 0))) {
+        return false;
+    }
+    ggml_cuda_moe_cache_clear_slots_locked(cache);
+    cache->last_compute_stream = nullptr;
+    cache->has_compute_done = false;
+    return true;
+}
+
+static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cudaStream_t grouped_stream) {
+    if (cache == nullptr || cache->owns_slot_pool || grouped_stream == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(cache->mu);
+    if (!moe_grouped_cuda_success(cudaEventRecord(cache->handoff_done, cache->copy_stream)) ||
+            !moe_grouped_cuda_success(cudaStreamWaitEvent(grouped_stream, cache->handoff_done, 0)) ||
+            (cache->has_compute_done && !moe_grouped_cuda_success(cudaStreamWaitEvent(grouped_stream, cache->compute_done, 0)))) {
+        return false;
+    }
+    ggml_cuda_moe_cache_clear_slots_locked(cache);
+    return true;
+}
+
+static bool ggml_cuda_moe_cache_record_compute_locked(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream) {
+    if (cache->has_compute_done && cache->last_compute_stream != compute_stream &&
+            !moe_grouped_cuda_success(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0))) {
+        return false;
+    }
+    if (!moe_grouped_cuda_success(cudaEventRecord(cache->compute_done, compute_stream))) {
+        return false;
+    }
+    cache->last_compute_stream = compute_stream;
+    cache->has_compute_done = true;
+    return true;
 }
 
 void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(legacy_record_map records) {
@@ -7724,6 +8156,27 @@ void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(legacy_record_li
         record->cache = nullptr;
     }
     records.clear();
+    try {
+        std::lock_guard<std::mutex> lock(telemetry_mutex);
+        moe_cache_add_telemetry(retired_telemetry, std::move(retired));
+    } catch (...) {
+    }
+}
+
+void ggml_cuda_moe_grouped_context::impl::retire_legacy_records(terminal_legacy_records records) {
+    moe_cache_telemetry retired;
+    for (auto & record : records) {
+        if (record == nullptr) {
+            continue;
+        }
+        try {
+            moe_cache_capture_telemetry(retired, record->cache, false);
+        } catch (...) {
+        }
+        ggml_cuda_moe_cache_free(record->cache);
+        record->cache = nullptr;
+        record.reset();
+    }
     try {
         std::lock_guard<std::mutex> lock(telemetry_mutex);
         moe_cache_add_telemetry(retired_telemetry, std::move(retired));
@@ -8066,7 +8519,9 @@ bool ggml_cuda_moe_cache_copy_to_staging(
         return false;
     }
 
-    CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
+    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+        return false;
+    }
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
     for (int i = 0; i < n_host_srcs;) {
@@ -8154,7 +8609,9 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         CUDA_CHECK(cudaMemsetAsync(
             stage_ready, 0, (size_t)stage_ready_capacity * sizeof(uint32_t), compute_stream));
     }
-    CUDA_CHECK(cudaEventRecord(cache->compute_done, compute_stream));
+    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+        return false;
+    }
     CUDA_CHECK(cudaStreamWaitEvent(cache->copy_stream, cache->compute_done, 0));
 
     for (int i = 0; i < n_host_srcs; ++i) {
@@ -8312,9 +8769,8 @@ bool ggml_cuda_moe_cache_release_split_slots(
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
-    cudaError_t err = cudaEventRecord(cache->compute_done, compute_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "moe-cache: cudaEventRecord failed: %s\n", cudaGetErrorString(err));
+    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+        fprintf(stderr, "moe-cache: cudaEventRecord failed\n");
         return false;
     }
 
@@ -8349,6 +8805,9 @@ bool ggml_cuda_moe_cache_grow_pool(
 
     if (min_slot_size_bytes <= cache->slot_size_bytes) {
         return true; // already big enough
+    }
+    if (!cache->owns_slot_pool) {
+        return false;
     }
 
     int prev_device = 0;
@@ -8436,9 +8895,8 @@ bool ggml_cuda_moe_cache_mark_used(
     }
 
     std::lock_guard<std::mutex> lk(cache->mu);
-    cudaError_t err = cudaEventRecord(cache->compute_done, compute_stream);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "moe-cache: cudaEventRecord failed: %s\n", cudaGetErrorString(err));
+    if (!ggml_cuda_moe_cache_record_compute_locked(cache, compute_stream)) {
+        fprintf(stderr, "moe-cache: cudaEventRecord failed\n");
         return false;
     }
     return true;

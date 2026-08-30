@@ -2809,7 +2809,7 @@ static void ggml_cuda_mul_mat_id_cached(
     auto * owner = ctx.moe_grouped_context;
     auto owner_lease = owner != nullptr ? owner->begin_legacy_operation() : ggml_cuda_moe_legacy_operation_lease{};
     auto * leased_owner = owner_lease ? owner : nullptr;
-    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority) : ggml_cuda_moe_legacy_cache_lease{};
+    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority, stream) : ggml_cuda_moe_legacy_cache_lease{};
     ggml_cuda_moe_cache * cache = cache_lease.get();
 
     std::vector<char> ids_host_storage;
