@@ -1688,6 +1688,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.attn_split      = std::any_of(params.attn_split, params.attn_split + llama_max_devices(),
             [](float f) { return f != 0.0f; }) ? params.attn_split : nullptr;
