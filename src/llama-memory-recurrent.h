@@ -116,6 +116,8 @@ public:
     // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    // a second conv history that must stay replicated across devices, so it cannot share the r row
+    std::vector<ggml_tensor *> p_l;
 
 private:
     friend class llama_memory_recurrent_context;
@@ -136,6 +138,7 @@ private:
 
     size_t size_r_bytes() const;
     size_t size_s_bytes() const;
+    size_t size_p_bytes() const;
 
     bool seq_id_valid(llama_seq_id seq_id) const;
     int32_t find_sparse_snapshot_plane(llama_seq_id seq_id, llama_pos pos) const;
@@ -189,6 +192,7 @@ public:
 
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 

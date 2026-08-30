@@ -127,8 +127,8 @@ static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tens
     return true;
 }
 
-static bool dummy_backend_device_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t) {
-    return true;
+static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
+    return device->context == buft->context;
 }
 
 static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false) {
@@ -154,9 +154,12 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.buffer_type.iface.is_host       = dummy_backend_buffer_type_is_host;
 
     b.device = std::make_unique<ggml_backend_device>();
+    b.device->context             = b.context.get();
     b.device->iface.get_type      = dummy_backend_device_get_type;
     b.device->iface.supports_op   = dummy_backend_device_supports_op;
     b.device->iface.supports_buft = dummy_backend_device_supports_buft;
+
+    b.buffer_type.device = b.device.get();
 
     b.handle = std::make_unique<ggml_backend>();
     b.handle->iface.get_name      = dummy_backend_get_name;
@@ -1124,6 +1127,41 @@ static void test_resizable_buffers_owner_borrower_teardown_order() {
     }
 }
 
+static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    GGML_ASSERT(graph->n_nodes == 3);
+    params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
+}
+
+static bool graph_reuses_allocation(bool add_alloc_dep) {
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[4];
+    x[0] = make_input_with_size(ctx, 16);
+    x[1] = ggml_scale(ctx, x[0], 2.0f);
+    x[2] = ggml_scale(ctx, x[1], 2.0f);
+    x[3] = ggml_scale(ctx, x[2], 2.0f);
+
+    ggml_set_output(x[3]);
+    ggml_build_forward_expand(graph, x[3]);
+
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    if (add_alloc_dep) {
+        backend.handle->iface.graph_optimize = test_backend_graph_optimize;
+    }
+
+    ggml_backend_t             backend_ptr = backend.handle.get();
+    ggml_backend_buffer_type_t buft        = &backend.buffer_type;
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    return x[1]->data == x[2]->data;
+}
+
+static void test_graph_optimize_alloc_dep() {
+    GGML_ASSERT(graph_reuses_allocation(false));
+    GGML_ASSERT(!graph_reuses_allocation(true));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1155,5 +1193,6 @@ int main() {
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
+    run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }
