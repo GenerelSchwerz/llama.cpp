@@ -331,6 +331,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
 #ifdef GGML_USE_CUDA
         if (params.moe_expert_cache_slots > 0) {
+            ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =

@@ -9691,20 +9691,20 @@ void ggml_cuda_moe_cache_free_all(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Process-wide compatibility value for older callers
+// Process-wide legacy route publication hint
 // ---------------------------------------------------------------------------
 
-static std::atomic<int> g_moe_cache_slots_compat{0};
+static std::atomic<int> g_moe_cache_route_publication_slots{0};
 
 extern "C"
 void ggml_backend_cuda_moe_set_cache_slots(int n_slots) {
     if (n_slots < 0) n_slots = 0;
-    g_moe_cache_slots_compat.store(n_slots, std::memory_order_relaxed);
+    g_moe_cache_route_publication_slots.store(n_slots, std::memory_order_relaxed);
 }
 
 extern "C"
 int ggml_backend_cuda_moe_get_cache_slots(void) {
-    return g_moe_cache_slots_compat.load(std::memory_order_relaxed);
+    return g_moe_cache_route_publication_slots.load(std::memory_order_relaxed);
 }
 
 extern "C"

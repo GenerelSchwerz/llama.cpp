@@ -2370,24 +2370,11 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
     };
 }
 
-static bool ggml_cuda_moe_has_cached_ids_consumer(const ggml_cgraph * cgraph, const ggml_tensor * ids) {
-    for (int i = 0; i < cgraph->n_nodes; ++i) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && node->op == GGML_OP_MUL_MAT_ID &&
-                node->src[2] == ids && node->src[0] != nullptr &&
-                node->src[0]->buffer != nullptr && ggml_backend_buft_is_cuda_moe_cached(node->src[0]->buffer->buft)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         ggml_backend_cuda_context & ctx,
-        const ggml_cgraph * cgraph,
         const ggml_tensor * ids) {
     const size_t count = (size_t) ids->ne[0];
-    if (!ggml_cuda_moe_has_cached_ids_consumer(cgraph, ids) || ids->ne[1] * ids->ne[2] != 1 ||
+    if (ggml_backend_cuda_moe_get_cache_slots() <= 0 || ids->ne[1] * ids->ne[2] != 1 ||
             ids->nb[0] != sizeof(int32_t) || ggml_nbytes(ids) != count*sizeof(int32_t)) {
         return {};
     }
@@ -4714,7 +4701,7 @@ static int ggml_cuda_try_fuse(
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
-                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, cgraph, ids);
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
@@ -4731,7 +4718,7 @@ static int ggml_cuda_try_fuse(
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
-                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, cgraph, ids);
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }

@@ -44,7 +44,7 @@ GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_
 // these process-wide entry points do not allocate or free resources.
 GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 
-// Compatibility value for older callers. Model-owned cache resources use backend candidate snapshots and do not read this process-wide value.
+// Legacy route publication hint. Model-owned cache resources use backend candidate snapshots and do not read this process-wide value.
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_cache_slots(int n_slots);
 GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_l2_pinned_cache_size(size_t bytes);
