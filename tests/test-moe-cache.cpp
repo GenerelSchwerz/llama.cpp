@@ -6856,6 +6856,7 @@ static void test_active_grouped_in_place_inventory_reuse_case(bool registered) {
     candidate_rebuild_graph_uses(graph);
     candidate_stamp_execution(graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1);
+    const uint64_t source_graph_uid = graph->execution_certificate.source_graph_uid;
     std::array<int32_t, 3> saved_use_counts = {};
     for (uint32_t bank_index = 0; bank_index < added.banks.size(); ++bank_index) {
         saved_use_counts[bank_index] = candidate_graph_use_count(graph, added.banks[bank_index]);
@@ -6880,6 +6881,8 @@ static void test_active_grouped_in_place_inventory_reuse_case(bool registered) {
         added.readers[reader_index]->op = saved_ops[reader_index];
     }
     candidate_rebuild_graph_uses(graph);
+    candidate_stamp_execution(graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1, source_graph_uid);
     for (uint32_t bank_index = 0; bank_index < added.banks.size(); ++bank_index) {
         CHECK(candidate_graph_use_count(graph, added.banks[bank_index]) == saved_use_counts[bank_index]);
     }
@@ -6905,6 +6908,8 @@ static void test_active_grouped_in_place_inventory_reuse_case(bool registered) {
         added.readers[reader_index]->op = GGML_OP_NONE;
     }
     candidate_rebuild_graph_uses(graph);
+    candidate_stamp_execution(graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1, source_graph_uid);
     CHECK(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
     ggml_backend_synchronize(backend.get());
     CHECK(active_grouped_legacy_op_count(backend.get()) == 0);
