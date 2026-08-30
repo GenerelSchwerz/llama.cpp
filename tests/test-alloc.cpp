@@ -204,8 +204,8 @@ static bool dummy_backend_device_supports_op(ggml_backend_dev_t, const ggml_tens
     return true;
 }
 
-static bool dummy_backend_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
-    return buft == ((dummy_backend_context *) dev->context)->buffer_type;
+static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
+    return device->context == buft->context;
 }
 
 static dummy_backend dummy_backend_init(
@@ -256,6 +256,8 @@ static dummy_backend dummy_backend_init(
     b.device->iface.event_synchronize = dummy_backend_device_event_synchronize;
     b.device->reg                     = b.registry.get();
     b.device->context                 = b.context.get();
+
+    b.buffer_type.device = b.device.get();
 
     b.handle = std::make_unique<ggml_backend>();
     b.context->backend_interface.get_name         = dummy_backend_get_name;
@@ -1570,6 +1572,41 @@ static void test_transport_excludes_non_cuda() {
     GGML_ASSERT(sycl.context->transfer_backend_count == 0);
 }
 
+static void test_backend_graph_optimize(ggml_backend_t, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
+    GGML_ASSERT(graph->n_nodes == 3);
+    params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
+}
+
+static bool graph_reuses_allocation(bool add_alloc_dep) {
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[4];
+    x[0] = make_input_with_size(ctx, 16);
+    x[1] = ggml_scale(ctx, x[0], 2.0f);
+    x[2] = ggml_scale(ctx, x[1], 2.0f);
+    x[3] = ggml_scale(ctx, x[2], 2.0f);
+
+    ggml_set_output(x[3]);
+    ggml_build_forward_expand(graph, x[3]);
+
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    if (add_alloc_dep) {
+        backend.handle->iface.graph_optimize = test_backend_graph_optimize;
+    }
+
+    ggml_backend_t             backend_ptr = backend.handle.get();
+    ggml_backend_buffer_type_t buft        = &backend.buffer_type;
+    ggml_backend_sched_ptr     sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, false, true));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph));
+
+    return x[1]->data == x[2]->data;
+}
+
+static void test_graph_optimize_alloc_dep() {
+    GGML_ASSERT(graph_reuses_allocation(false));
+    GGML_ASSERT(!graph_reuses_allocation(true));
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1611,5 +1648,6 @@ int main() {
     run("test_transport_excludes_meta", test_transport_excludes_meta);
     run("test_transport_requires_annotation", test_transport_requires_annotation);
     run("test_transport_excludes_non_cuda", test_transport_excludes_non_cuda);
+    run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }

@@ -2813,7 +2813,8 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     const llama_hparams & hparams,
     const llama_cparams & cparams,
     const llama_kv_cache_context * mctx_cur,
-    bool is_reserve) {
+    bool is_reserve,
+    bool allow_compact_kq_mask) {
 
     auto inp = std::make_unique<llm_graph_input_attn_kv>(hparams, cparams, mctx_cur);
 
@@ -2823,9 +2824,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(
-                ctx0, mctx_cur, ubatch, cparams, inp->self_k_idxs,
-                is_reserve, inp->self_kq_mask_causal_prefix_n_kv);
+        if (allow_compact_kq_mask) {
+            inp->self_kq_mask = build_attn_inp_kq_mask(
+                    ctx0, mctx_cur, ubatch, cparams, inp->self_k_idxs,
+                    is_reserve, inp->self_kq_mask_causal_prefix_n_kv);
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask_dense(ctx0, mctx_cur, ubatch, cparams);
+        }
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
 
@@ -2839,7 +2844,7 @@ llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_context *>(mctx);
 
     auto inp = build_attn_inp_kv_impl(
-            ctx0, ubatch, hparams, cparams, mctx_cur, is_reserve);
+            ctx0, ubatch, hparams, cparams, mctx_cur, is_reserve, true);
 
     return (llm_graph_input_attn_kv *) res->add_input(std::move(inp));
 }
@@ -3602,12 +3607,12 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
     );
 }
 
-llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid(bool allow_compact_kq_mask) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
     auto inp_attn = build_attn_inp_kv_impl(
-            ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), is_reserve);
+            ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), is_reserve, allow_compact_kq_mask);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
