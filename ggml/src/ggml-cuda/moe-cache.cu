@@ -8617,7 +8617,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         slot_ids[i] = it == cache->host_to_slot.end() ? -1 : it->second;
         n_resident += slot_ids[i] >= 0;
         if (source_wait_class != nullptr) {
-            source_wait_class[i] = slot_ids[i] >= 0 ? 0 : -1;
+            source_wait_class[i] = slot_ids[i] >= 0 ? 1 : -1;
         }
     }
     if (n_resident == n_host_srcs) {
