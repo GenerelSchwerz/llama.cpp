@@ -369,8 +369,7 @@ transport never enabled because the scheduler is given a depth of 0.
   [Tensor parallelism](#tensor-parallelism).
 - The scheduler must be configured with the device's own default buffer type. A
   scheduler built on a split or host buffer type keeps the ordered path.
-- `GGML_KV_PIPELINE_DEPTH` overrides the depth for tools that do not expose the
-  command-line option, such as `llama-bench`.
+- `GGML_KV_PIPELINE_DEPTH` and `GGML_KV_PIPELINE_BUDGET_MIB` provide scheduler defaults. Explicit scheduler settings and command-line options take precedence.
 
 ## Tensor parallelism
 

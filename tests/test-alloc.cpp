@@ -5,8 +5,10 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -1296,6 +1298,121 @@ static void test_transport_prefix_and_configuration() {
     GGML_ASSERT(cuda.context->transfer_backend_count == 0);
 }
 
+static void test_transport_empty_graph() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_context();
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.graph) == GGML_STATUS_SUCCESS);
+}
+
+static size_t transport_fallback_buffer_size(int depth) {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto graph = make_context();
+
+    ggml_tensor * weight = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, 4, 4);
+    ggml_tensor * source = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, 4, 1);
+    ggml_tensor * output = ggml_mul_mat(graph.ctx, weight, source);
+    source->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_set_stable_prefix(source, ggml_nbytes(source));
+    ggml_build_forward_expand(graph.graph, output);
+
+    ggml_backend_buffer_ptr weight_buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, ggml_nbytes(weight)));
+    ggml_backend_buffer_ptr source_buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, ggml_nbytes(source)));
+    weight->buffer = weight_buffer.get();
+    weight->data   = ggml_backend_buffer_get_base(weight_buffer.get());
+    source->buffer = source_buffer.get();
+    source->data   = ggml_backend_buffer_get_base(source_buffer.get());
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), depth));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.graph));
+    return ggml_backend_sched_get_buffer_size(sched.get(), cuda.handle.get());
+}
+
+static void test_transport_fallback_keeps_allocator_plan() {
+    const size_t ordered   = transport_fallback_buffer_size(0);
+    const size_t pipelined = transport_fallback_buffer_size(1);
+    GGML_ASSERT(ordered > 0 && pipelined == ordered);
+}
+
+static void set_test_env(const char * name, const char * value) {
+#ifdef _WIN32
+    GGML_ASSERT(_putenv_s(name, value) == 0);
+#else
+    GGML_ASSERT(setenv(name, value, 1) == 0);
+#endif
+}
+
+static void restore_test_env(const char * name, bool had_value, const std::string & value) {
+#ifdef _WIN32
+    GGML_ASSERT(_putenv_s(name, had_value ? value.c_str() : "") == 0);
+#else
+    GGML_ASSERT(had_value ? setenv(name, value.c_str(), 1) == 0 : unsetenv(name) == 0);
+#endif
+}
+
+static void test_transport_environment_is_fallback() {
+    const char * depth_env = getenv("GGML_KV_PIPELINE_DEPTH");
+    const char * budget_env = getenv("GGML_KV_PIPELINE_BUDGET_MIB");
+    const bool had_depth = depth_env != nullptr;
+    const bool had_budget = budget_env != nullptr;
+    const std::string depth_old = depth_env ? depth_env : "";
+    const std::string budget_old = budget_env ? budget_env : "";
+
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+
+    set_test_env("GGML_KV_PIPELINE_DEPTH", "4");
+    set_test_env("GGML_KV_PIPELINE_BUDGET_MIB", "8");
+    {
+        auto graph = make_transport_graph(cpu, 64);
+        ggml_set_stable_prefix(graph.source, 64);
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+        int64_t deliveries = 0;
+        transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+        GGML_ASSERT(deliveries == 1);
+    }
+    {
+        auto graph = make_transport_graph(cpu, 64);
+        ggml_set_stable_prefix(graph.source, 64);
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
+        ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+        int64_t deliveries = -1;
+        transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+        GGML_ASSERT(deliveries == 0);
+    }
+
+    set_test_env("GGML_KV_PIPELINE_DEPTH", "bad");
+    set_test_env("GGML_KV_PIPELINE_BUDGET_MIB", "bad");
+    {
+        ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
+    }
+
+    restore_test_env("GGML_KV_PIPELINE_DEPTH", had_depth, depth_old);
+    restore_test_env("GGML_KV_PIPELINE_BUDGET_MIB", had_budget, budget_old);
+}
+
 static void test_transport_depth_zero() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
@@ -1485,6 +1602,9 @@ int main() {
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
     run("test_transport_prefix_and_configuration", test_transport_prefix_and_configuration);
+    run("test_transport_empty_graph", test_transport_empty_graph);
+    run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
+    run("test_transport_environment_is_fallback", test_transport_environment_is_fallback);
     run("test_transport_depth_zero", test_transport_depth_zero);
     run("test_transport_budget_recovers", test_transport_budget_recovers);
     run("test_transport_partial_backend_failure", test_transport_partial_backend_failure);

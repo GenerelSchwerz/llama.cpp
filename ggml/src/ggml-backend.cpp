@@ -1745,6 +1745,54 @@ static bool ggml_backend_sched_input_is_staged(ggml_backend_sched_t sched, int s
     return tr->input_staged[base + input_id] != 0;
 }
 
+static bool ggml_backend_sched_size_add(size_t a, size_t b, size_t * result);
+static bool ggml_backend_sched_size_pad(size_t size, size_t alignment, size_t * result);
+
+static void ggml_backend_sched_transport_clear_addresses(ggml_backend_sched_t sched) {
+    const struct ggml_backend_sched_transport * tr = &sched->transport;
+
+    for (int i = 0; i < tr->plan_n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (!ggml_backend_sched_input_is_staged(sched, i, j)) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            input_cpy->data   = NULL;
+            input_cpy->buffer = NULL;
+        }
+    }
+}
+
+static void ggml_backend_sched_transport_assign_addresses(ggml_backend_sched_t sched) {
+    const struct ggml_backend_sched_transport * tr = &sched->transport;
+
+    for (int i = 0; i < tr->plan_n_splits; i++) {
+        if (tr->split_order[i] < 0) {
+            continue;
+        }
+
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        struct ggml_backend_sched_transport_ring * r = &sched->transport.rings[split->backend_id];
+        char * const ring = (char *) ggml_backend_buffer_get_base(r->buffer);
+        char * slot = ring + (size_t)(tr->split_order[i] % tr->n_slots) * r->slot_size;
+
+        size_t offset = 0;
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (!ggml_backend_sched_input_is_staged(sched, i, j)) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            input_cpy->data   = slot + offset;
+            input_cpy->buffer = r->buffer;
+            size_t input_size;
+            GGML_ASSERT(ggml_backend_sched_size_pad(ggml_nbytes(split->inputs[j]), r->alignment, &input_size));
+            GGML_ASSERT(ggml_backend_sched_size_add(offset, input_size, &offset));
+        }
+        GGML_ASSERT(offset <= r->slot_size);
+    }
+}
+
 // sync_consumers must be false once the scheduler's backends may already be gone, which is the
 // case on the teardown path: llama_context and other owners outlive the scheduler only by
 // declaration order, and the backends it points at are not the scheduler's to keep alive.
@@ -1889,13 +1937,15 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_transport * tr = &sched->transport;
 
     tr->n_staged = 0;
+    tr->plan_n_splits = 0;
+    tr->plan_n_inputs = 0;
     for (int i = 0; i < sched->n_backends; i++) {
         tr->rings[i].n_staged    = 0;
         tr->rings[i].consumed    = 0;
         tr->rings[i].scan_cursor = 0;
     }
 
-    if (!ggml_backend_sched_transport_enabled(sched)) {
+    if (!ggml_backend_sched_transport_enabled(sched) || sched->n_splits == 0) {
         return;
     }
 
@@ -1933,54 +1983,89 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
     tr->plan_n_splits = sched->n_splits;
     tr->plan_n_inputs = n_inputs_total;
 
+    int n_candidates = 0;
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         for (int j = 0; j < split->n_inputs; j++) {
             if (ggml_backend_sched_input_can_stage(sched, split, j)) {
                 tr->input_staged[tr->split_input_ofs[i] + j] = 1;
+                n_candidates++;
             }
         }
     }
 
-    // A staged input copy may only be read by the split that owns it. The scheduler creates one
-    // copy per (tensor, backend) rather than per split, so a later split can be pointed at the
-    // same copy without it appearing in that split's input list -- and by then the ring may have
-    // recycled the slot. A view of the copy is excluded for the same reason: its address was
-    // resolved from the copy's own, so redirecting the copy afterwards would leave it behind.
+    if (n_candidates == 0) {
+        for (int i = 0; i < sched->n_splits; i++) {
+            tr->split_order[i] = -1;
+        }
+        return;
+    }
+
+    // A ring copy must have one owner and no views or later readers.
+    // Build one lookup table, then scan each graph node once.
+    size_t staged_hash_size = n_candidates;
+    staged_hash_size += staged_hash_size/4 + 1;
+    struct ggml_hash_set staged_copies = ggml_hash_set_new(staged_hash_size);
+    int * staged_owner = (int *) malloc(staged_copies.size * sizeof(int));
+    GGML_ASSERT(staged_owner != NULL);
+    for (size_t i = 0; i < staged_copies.size; i++) {
+        staged_owner[i] = -1;
+    }
+
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         for (int j = 0; j < split->n_inputs; j++) {
             if (!tr->input_staged[tr->split_input_ofs[i] + j]) {
                 continue;
             }
-            const struct ggml_tensor * input_cpy =
-                tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            const size_t id = ggml_hash_find_or_insert(&staged_copies, input_cpy);
+            if (staged_owner[id] == -1) {
+                staged_owner[id] = i;
+            } else {
+                staged_owner[id] = -2;
+            }
+        }
+    }
 
-            bool disqualified = false;
-            for (int k = 0; k < sched->n_splits && !disqualified; k++) {
-                const struct ggml_cgraph * g = &sched->splits[k].graph;
-                for (int n = 0; n < g->n_nodes && !disqualified; n++) {
-                    if (g->nodes[n]->view_src == input_cpy) {
-                        disqualified = true;
-                        break;
-                    }
-                    if (k <= i) {
-                        continue;
-                    }
-                    for (int sr = 0; sr < GGML_MAX_SRC; sr++) {
-                        if (g->nodes[n]->src[sr] == input_cpy) {
-                            disqualified = true;
-                            break;
-                        }
-                    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_cgraph * graph = &sched->splits[i].graph;
+        for (int j = 0; j < graph->n_nodes; j++) {
+            const struct ggml_tensor * node = graph->nodes[j];
+            if (node->view_src != NULL) {
+                const size_t id = ggml_hash_find(&staged_copies, node->view_src);
+                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id)) {
+                    staged_owner[id] = -2;
                 }
             }
+            for (int k = 0; k < GGML_MAX_SRC; k++) {
+                if (node->src[k] == NULL) {
+                    continue;
+                }
+                const size_t id = ggml_hash_find(&staged_copies, node->src[k]);
+                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id) && staged_owner[id] >= 0 && i > staged_owner[id]) {
+                    staged_owner[id] = -2;
+                }
+            }
+        }
+    }
 
-            if (disqualified) {
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (!tr->input_staged[tr->split_input_ofs[i] + j]) {
+                continue;
+            }
+            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
+            const size_t id = ggml_hash_find(&staged_copies, input_cpy);
+            GGML_ASSERT(id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id));
+            if (staged_owner[id] < 0) {
                 tr->input_staged[tr->split_input_ofs[i] + j] = 0;
             }
         }
     }
+    free(staged_owner);
+    ggml_hash_set_free(&staged_copies);
 
     // per-ring slot size and delivery order. The budget is applied to what this graph needs, so
     // that a run whose window stays small keeps the ring whatever -n_ctx says. slot_size_max is
@@ -2143,30 +2228,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         }
     }
 
-    for (int i = 0; i < sched->n_splits; i++) {
-        if (tr->split_order[i] < 0) {
-            continue;
-        }
-
-        struct ggml_backend_sched_split * split = &sched->splits[i];
-        struct ggml_backend_sched_transport_ring * r = &tr->rings[split->backend_id];
-        char * const ring = (char *) ggml_backend_buffer_get_base(r->buffer);
-        char * slot = ring + (size_t)(tr->split_order[i] % tr->n_slots) * r->slot_size;
-
-        size_t offset = 0;
-        for (int j = 0; j < split->n_inputs; j++) {
-            if (!ggml_backend_sched_input_is_staged(sched, i, j)) {
-                continue;
-            }
-            struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
-            input_cpy->data   = slot + offset;
-            input_cpy->buffer = r->buffer;
-            size_t input_size;
-            GGML_ASSERT(ggml_backend_sched_size_pad(ggml_nbytes(split->inputs[j]), r->alignment, &input_size));
-            GGML_ASSERT(ggml_backend_sched_size_add(offset, input_size, &offset));
-        }
-        GGML_ASSERT(offset <= r->slot_size);
-    }
+    ggml_backend_sched_transport_assign_addresses(sched);
 }
 
 // Issue the stable prefix of every staged split on this ring that is within the look-ahead of what
@@ -2289,10 +2351,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             ggml_backend_synchronize(sched->backends[i]);
         }
 
+        ggml_backend_sched_transport_clear_addresses(sched);
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+        ggml_backend_sched_transport_assign_addresses(sched);
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -2313,6 +2377,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
 
     struct ggml_backend_sched_transport * tr = &sched->transport;
+    bool named_ordered_now = false;
     // a reused graph keeps the plan that was made for it, so the split list it describes must be
     // the one about to run
     int n_inputs_now = 0;
@@ -2399,6 +2464,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (tr->debug >= 3 && !tr->named_ordered) {
                     GGML_LOG_INFO("%s: ordered copy %s %zu KiB from %s\n", __func__, input->name,
                             ggml_nbytes(input) >> 10, ggml_backend_buft_name(input->buffer->buft));
+                    named_ordered_now = true;
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -2516,6 +2582,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         if (tr->debug >= 3 && !tr->named_ordered) {
                             GGML_LOG_INFO("%s: ordered copy %s %zu KiB from %s\n", __func__, input->name,
                                     ggml_nbytes(input) >> 10, ggml_backend_buft_name(input->buffer->buft));
+                            named_ordered_now = true;
                         }
                     }
                 }
@@ -2589,6 +2656,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (named_ordered_now) {
+        tr->named_ordered = true;
+    }
+
     if (tr->debug >= 2) {
         tr->t_graph_us += ggml_time_us() - t_graph_0;
         tr->n_graphs++;
@@ -2618,13 +2689,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             tr->p_bytes_early  = tr->n_bytes_early;
             tr->p_bytes_late   = tr->n_bytes_late;
             tr->p_bytes_ordered = tr->n_bytes_ordered;
-            tr->named_ordered   = true;
             tr->p_stop_depth   = tr->n_stop_depth;
             tr->p_wait_recycle = tr->n_wait_recycle;
         }
     }
 
     return GGML_STATUS_SUCCESS;
+}
+
+static bool ggml_backend_sched_transport_depth_from_env(int * depth) {
+    const char * env = getenv("GGML_KV_PIPELINE_DEPTH");
+    if (env == NULL) {
+        return false;
+    }
+
+    char * end = NULL;
+    errno = 0;
+    const long value = strtol(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value < 0 || value > GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN) {
+        GGML_LOG_WARN("%s: ignoring invalid GGML_KV_PIPELINE_DEPTH value: %s\n", __func__, env);
+        return false;
+    }
+
+    *depth = (int) value;
+    return true;
+}
+
+static bool ggml_backend_sched_transport_budget_from_env(size_t * budget) {
+    const char * env = getenv("GGML_KV_PIPELINE_BUDGET_MIB");
+    if (env == NULL) {
+        return false;
+    }
+
+    char * end = NULL;
+    errno = 0;
+    const unsigned long long value = strtoull(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value > SIZE_MAX/(1024u*1024u)) {
+        GGML_LOG_WARN("%s: ignoring invalid GGML_KV_PIPELINE_BUDGET_MIB value: %s\n", __func__, env);
+        return false;
+    }
+
+    *budget = (size_t) value*(1024u*1024u);
+    return true;
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
@@ -2694,6 +2800,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
 
     sched->transport.budget = GGML_SCHED_TRANSPORT_BUDGET;
+    ggml_backend_sched_transport_budget_from_env(&sched->transport.budget);
     {
         const char * GGML_SCHED_TRANSPORT_DEBUG = getenv("GGML_SCHED_TRANSPORT_DEBUG");
         sched->transport.debug = GGML_SCHED_TRANSPORT_DEBUG ? atoi(GGML_SCHED_TRANSPORT_DEBUG) : 0;
@@ -2701,6 +2808,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->op_offload = op_offload;
 
     ggml_backend_sched_reset(sched);
+
+    int transport_depth;
+    if (ggml_backend_sched_transport_depth_from_env(&transport_depth)) {
+        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched, transport_depth));
+    }
 
     return sched;
 }
@@ -2719,18 +2831,6 @@ bool ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
     struct ggml_backend_sched_transport * tr = &sched->transport;
     if (tr->config_locked) {
         return false;
-    }
-
-    const char * env = getenv("GGML_KV_PIPELINE_DEPTH");
-    if (env != NULL) {
-        char * end = NULL;
-        errno = 0;
-        const long value = strtol(env, &end, 10);
-        if (errno != 0 || end == env || *end != '\0' || value < 0 || value > GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN) {
-            GGML_LOG_ERROR("%s: invalid GGML_KV_PIPELINE_DEPTH value: %s\n", __func__, env);
-            return false;
-        }
-        depth = (int) value;
     }
 
     depth = std::min(depth, GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN);
@@ -2805,18 +2905,6 @@ bool ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched
 
     if (sched->transport.config_locked) {
         return false;
-    }
-
-    const char * env = getenv("GGML_KV_PIPELINE_BUDGET_MIB");
-    if (env != NULL) {
-        char * end = NULL;
-        errno = 0;
-        const unsigned long long value = strtoull(env, &end, 10);
-        if (errno != 0 || end == env || *end != '\0' || value > SIZE_MAX/(1024u*1024u)) {
-            GGML_LOG_ERROR("%s: invalid GGML_KV_PIPELINE_BUDGET_MIB value: %s\n", __func__, env);
-            return false;
-        }
-        bytes = (size_t) value*(1024u*1024u);
     }
 
     if (sched->transport.budget != bytes) {
