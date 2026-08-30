@@ -105,6 +105,13 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return context.device_bank_data_for_test(key, tensor);
     }
 
+    static const float * device_scale_data(
+            const ggml_cuda_moe_grouped_context & context,
+            const ggml_cuda_moe_candidate_group_key & key,
+            const ggml_tensor * tensor) {
+        return context.device_scale_data_for_test(key, tensor);
+    }
+
     static bool device_resource_complete(
             const ggml_cuda_moe_grouped_context & context,
             const ggml_cuda_moe_candidate_group_key & key) {
@@ -5053,6 +5060,17 @@ static void check_active_grouped_contract(
     CHECK(context->prepare_graph_group(group, first_binding, graph.readers[0], stream) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CHECK(group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && group->transaction.transaction_token != 0);
     CHECK(group->remapped_ids != nullptr && group->n_slots == n_slots);
+    if (graph.gate_scale != nullptr) {
+        const std::array<ggml_tensor *, 3> scales = {graph.gate_scale, graph.up_scale, graph.down_scale};
+        CHECK(group->n_scale_shadows == scales.size());
+        for (uint32_t scale = 0; scale < scales.size(); ++scale) {
+            CHECK(group->scale_tensors[scale] == scales[scale] && group->scale_data[scale] != nullptr);
+            CHECK(group->scale_data[scale] ==
+                ggml_cuda_moe_grouped_context_test_access::device_scale_data(*context, group->key.candidate, scales[scale]));
+        }
+    } else {
+        CHECK(group->n_scale_shadows == 0);
+    }
     const int32_t * remapped_ids = group->remapped_ids;
 
     for (size_t i = 0; i < graph.readers.size(); ++i) {
@@ -7102,9 +7120,144 @@ static void test_active_grouped_inventory_reuse() {
     fprintf(stderr, "test-moe-cache: complete MMID inventory production seam OK\n");
 }
 
+static std::vector<float> active_grouped_tensor_sentinel(ggml_tensor * tensor) {
+    std::vector<float> result(ggml_nelements(tensor), -23456.5f);
+    ggml_backend_tensor_set(tensor, result.data(), 0, ggml_nbytes(tensor));
+    return result;
+}
+
+static std::vector<float> active_grouped_tensor_values(const ggml_tensor * tensor) {
+    std::vector<float> result(ggml_nelements(tensor));
+    ggml_backend_tensor_get(tensor, result.data(), 0, ggml_nbytes(tensor));
+    return result;
+}
+
+static void check_active_grouped_scale_shadows(
+        ggml_cuda_moe_grouped_context & context,
+        const ggml_cuda_moe_candidate_group_key & key,
+        const active_grouped_dispatch_graph & graph,
+        const std::array<int32_t, 2> & experts,
+        const std::array<const float *, 3> & expected_pointers) {
+    const std::array<ggml_tensor *, 3> scales = {graph.gate_scale, graph.up_scale, graph.down_scale};
+    for (uint32_t scale = 0; scale < scales.size(); ++scale) {
+        const float * shadow = ggml_cuda_moe_grouped_context_test_access::device_scale_data(context, key, scales[scale]);
+        CHECK(shadow != nullptr && shadow == expected_pointers[scale]);
+        const auto original = active_grouped_tensor_values(scales[scale]);
+        for (int32_t expert : experts) {
+            const int32_t slot = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(context, key, expert);
+            CHECK(slot >= 0);
+            float actual = 0.0f;
+            CUDA_OK(cudaMemcpy(&actual, shadow + slot, sizeof(actual), cudaMemcpyDeviceToHost));
+            CHECK(memcmp(&actual, &original[expert], sizeof(actual)) == 0);
+        }
+    }
+}
+
 static void test_active_grouped_nvfp4_scales() {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
+    {
+        constexpr uint32_t n_slots = 4;
+        ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+        CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+        auto reference = build_active_grouped_dispatch_graph_types(
+            reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(),
+            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4},
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, true, 1);
+        auto candidate = build_active_grouped_dispatch_graph_types(
+            candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(),
+            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4},
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, true, 1);
+        initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+        const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        CHECK(replace_active_grouped_nvfp4_dispatch_v2(candidate_backend.get(), candidate, n_slots) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+        auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+        ggml_cuda_moe_candidate_group_key key;
+        CHECK(context != nullptr && context->find_down_group_key(candidate.down, &key));
+        check_active_grouped_contract(candidate_backend.get(), candidate, n_slots);
+        const std::array<ggml_tensor *, 3> scales = {candidate.gate_scale, candidate.up_scale, candidate.down_scale};
+        std::array<const float *, 3> scale_pointers = {};
+        for (uint32_t scale = 0; scale < scales.size(); ++scale) {
+            scale_pointers[scale] = ggml_cuda_moe_grouped_context_test_access::device_scale_data(
+                *context, key, scales[scale]);
+            CHECK(scale_pointers[scale] != nullptr);
+        }
+
+        ggml_cuda_graph_capture_state_for_test captured = {};
+        const std::array<int32_t, 2> first_experts = {
+            active_grouped_route(candidate, 0, 0, 0), active_grouped_route(candidate, 0, 0, 1),
+        };
+        const std::array<int32_t, 2> middle_experts = {
+            active_grouped_route(candidate, 1, 0, 0), active_grouped_route(candidate, 1, 0, 1),
+        };
+        const std::array<int32_t, 2> replacement_experts = {
+            active_grouped_route(candidate, 2, 0, 0), active_grouped_route(candidate, 2, 0, 1),
+        };
+        for (uint32_t pass = 0; pass < 6; ++pass) {
+            const uint32_t route_variant = pass >= 4 ? 2 : pass >= 2 ? 1 : 0;
+            set_active_grouped_dispatch_logits({&reference, &candidate}, route_variant);
+            const auto reference_down_sentinel = active_grouped_tensor_sentinel(reference.down_output);
+            const auto candidate_down_sentinel = active_grouped_tensor_sentinel(candidate.down_output);
+            const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+            const auto actual = run_active_grouped_dispatch(
+                candidate_backend.get(), candidate, candidate.n_used * (pass + 2), true);
+            check_active_grouped_exact_output(expected, actual);
+            CHECK(active_grouped_tensor_values(reference.down_output) != reference_down_sentinel);
+            CHECK(active_grouped_tensor_values(candidate.down_output) == candidate_down_sentinel);
+            for (uint32_t scale = 0; scale < scales.size(); ++scale) {
+                CHECK(ggml_cuda_moe_grouped_context_test_access::device_scale_data(
+                    *context, key, scales[scale]) == scale_pointers[scale]);
+            }
+
+            ggml_cuda_graph_capture_state_for_test state = {};
+            CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &state));
+            if (pass == 0 || !state.capture_available) {
+                CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete &&
+                    state.moe_resource_fingerprint == 0);
+            } else if (pass == 1) {
+                CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
+                    state.execution_semantic_key != 0 && state.moe_resource_fingerprint != 0);
+                captured = state;
+            } else {
+                CHECK(state.graph == captured.graph && state.instance == captured.instance &&
+                    state.execution_semantic_key == captured.execution_semantic_key &&
+                    state.moe_resource_fingerprint == captured.moe_resource_fingerprint);
+            }
+            if (pass == 0) {
+                check_active_grouped_scale_shadows(*context, key, candidate, first_experts, scale_pointers);
+            }
+            if (pass == 3) {
+                check_active_grouped_scale_shadows(*context, key, candidate, middle_experts, scale_pointers);
+            }
+            if (pass == 5) {
+                check_active_grouped_scale_shadows(*context, key, candidate, replacement_experts, scale_pointers);
+                for (int32_t expert : first_experts) {
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(*context, key, expert) == -1);
+                }
+            }
+        }
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) == 0);
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(telemetry.registered == 1 && telemetry.covered == 1);
+        CHECK(telemetry.plan_calls == 8 && telemetry.plan_compiles == 2 && telemetry.plan_reuses == 6);
+        CHECK(telemetry.calls == 7 && telemetry.ready == 7 && telemetry.completed == 7);
+        CHECK(telemetry.admitted_banks == 7 * candidate.banks.size());
+        CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 &&
+            telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+        CHECK(telemetry.h2d_banks == 6 * candidate.banks.size());
+        uint64_t bytes_per_expert = 0;
+        for (const ggml_tensor * bank : candidate.banks) {
+            bytes_per_expert += bank->nb[2];
+        }
+        CHECK(telemetry.h2d_bytes == 6 * bytes_per_expert);
+    }
+
     constexpr uint32_t n_rows = 2;
     for (uint32_t n_slots : {12u, 48u}) {
         ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
@@ -7157,10 +7310,12 @@ static void test_active_grouped_nvfp4_scales() {
         std::vector<float> actual;
         ggml_cuda_graph_capture_state_for_test captured = {};
         for (int pass = 0; pass < 4; ++pass) {
+            const auto candidate_down_sentinel = active_grouped_tensor_sentinel(candidate.down_output);
             const auto current_expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
             const auto current_actual = run_active_grouped_dispatch(
                 candidate_backend.get(), candidate, n_rows * candidate.n_used * (pass + 2), false);
             check_active_grouped_exact_output(current_expected, current_actual);
+            CHECK(active_grouped_tensor_values(candidate.down_output) != candidate_down_sentinel);
             check_active_grouped_routes(reference, n_rows, 0);
             check_active_grouped_routes(candidate, n_rows, 0);
             if (pass == 0) {

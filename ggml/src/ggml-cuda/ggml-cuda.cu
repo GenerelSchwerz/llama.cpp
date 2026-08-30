@@ -3123,6 +3123,59 @@ static bool ggml_cuda_moe_group_views(
     return true;
 }
 
+static bool ggml_cuda_moe_grouped_mmvq(
+        const ggml_cuda_moe_graph_group_dispatch * group,
+        const ggml_cuda_moe_graph_binding & binding) {
+    if (group == nullptr || group->capabilities == nullptr || binding.slot_index >= group->key.n_banks) {
+        return false;
+    }
+    const auto & capability = group->capabilities[binding.slot_index];
+    return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ;
+}
+
+static bool ggml_cuda_moe_grouped_b1_scale_fusion(
+        const ggml_cuda_moe_graph_group_dispatch * group,
+        const ggml_cuda_moe_graph_binding & binding) {
+    return group != nullptr && group->key.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+        group->key.n_banks == 3 && group->key.ids.ne[1] == 1 && group->key.ids.ne[2] == 1 && group->key.ids.ne[3] == 1 &&
+        (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ||
+            binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ||
+            binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) &&
+        ggml_cuda_moe_grouped_mmvq(group, binding) &&
+        group->capabilities[binding.slot_index].source_type == GGML_TYPE_NVFP4;
+}
+
+static bool ggml_cuda_moe_group_scale_view(
+        const ggml_cuda_moe_graph_group_dispatch & group,
+        const ggml_cuda_moe_graph_binding & binding,
+        const ggml_tensor * scale,
+        ggml_tensor & scale_view) {
+    if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE || !ggml_cuda_moe_grouped_b1_scale_fusion(&group, binding) ||
+            group.n_scale_shadows != 3 || group.n_slots == 0 || scale == nullptr) {
+        return false;
+    }
+    const uint32_t scale_index = binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ? 0 :
+        binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ? 1 : 2;
+    if (group.scale_tensors[scale_index] != scale || group.scale_data[scale_index] == nullptr ||
+            scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_n_dims(scale) != 1 ||
+            ggml_nelements(scale) != group.capabilities[binding.slot_index].n_experts) {
+        return false;
+    }
+    scale_view = *scale;
+    scale_view.data = const_cast<float *>(group.scale_data[scale_index]);
+    scale_view.ne[0] = group.n_slots;
+    scale_view.ne[1] = 1;
+    scale_view.ne[2] = 1;
+    scale_view.ne[3] = 1;
+    scale_view.nb[0] = sizeof(float);
+    scale_view.nb[1] = group.n_slots * sizeof(float);
+    scale_view.nb[2] = scale_view.nb[1];
+    scale_view.nb[3] = scale_view.nb[2];
+    return true;
+}
+
 // Public entry point for GGML_OP_MUL_MAT_ID. Routes cached-buffer tensors
 // through the staging path; everything else goes straight to the regular
 // implementation, preserving existing behavior bit-for-bit.
@@ -5059,8 +5112,20 @@ static int ggml_cuda_try_fuse(
                 ggml_tensor * up_out_n     = with_bias ? cgraph->nodes[up_bias_idx] : up_scale_n;
                 const ggml_tensor * glu = cgraph->nodes[glu_idx];
 
+                ggml_cuda_moe_graph_binding up_binding;
+                ggml_cuda_moe_graph_binding gate_binding;
+                auto * up_group = execution != nullptr ? execution->find_group(up_n, &up_binding) : nullptr;
+                auto * gate_group = execution != nullptr ? execution->find_group(gate_n, &gate_binding) : nullptr;
+                const bool grouped_pair = !with_bias && up_group != nullptr && gate_group == up_group &&
+                    (up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED ||
+                        up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE);
+                const bool grouped_fusion_equivalent = grouped_pair &&
+                    ggml_cuda_moe_grouped_b1_scale_fusion(up_group, up_binding) &&
+                    ggml_cuda_moe_grouped_b1_scale_fusion(gate_group, gate_binding);
+
                 if (!ggml_cuda_should_fuse_mul_mat(up_n, gate_n, glu,
-                        with_bias ? up_out_n : nullptr, with_bias ? gate_out_n : nullptr, up_scale_n, gate_scale_n)) {
+                        with_bias ? up_out_n : nullptr, with_bias ? gate_out_n : nullptr,
+                        up_scale_n, gate_scale_n, grouped_pair)) {
                     continue;
                 }
 
@@ -5087,8 +5152,44 @@ static int ggml_cuda_try_fuse(
                 fusion_data.gate_scale = gate_scale;
                 fusion_data.glu_op     = ggml_get_glu_op(glu);
 
-                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+                if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, grouped_pair) &&
+                        (!grouped_pair || grouped_fusion_equivalent)) {
                     ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up_n, src0, ids, &fusion_data);
+                    if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
+                        const auto result = cuda_ctx->moe_grouped_context->prepare_graph_group(
+                            up_group, gate_binding, gate_n, cuda_ctx->stream());
+                        if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
+                            return -1;
+                        }
+                    }
+                    if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                        ggml_tensor up_view;
+                        ggml_tensor gate_view;
+                        ggml_tensor ids_view;
+                        ggml_tensor gate_ids_view;
+                        ggml_tensor up_scale_view;
+                        ggml_tensor gate_scale_view;
+                        if (up_n->src[2] != up_group->key.ids.tensor || gate_n->src[2] != up_group->key.ids.tensor ||
+                                up_group->stream != cuda_ctx->stream() ||
+                                !ggml_cuda_moe_group_views(*up_group, up_binding, src0, up_view, ids_view) ||
+                                !ggml_cuda_moe_group_views(*up_group, gate_binding, gate_n->src[0], gate_view, gate_ids_view) ||
+                                ids_view.data != gate_ids_view.data ||
+                                !ggml_cuda_moe_group_scale_view(*up_group, up_binding, up_scale, up_scale_view) ||
+                                !ggml_cuda_moe_group_scale_view(*up_group, gate_binding, gate_scale, gate_scale_view)) {
+                            return -1;
+                        }
+                        fusion_data.gate = &gate_view;
+                        fusion_data.gate_ids = &ids_view;
+                        fusion_data.x_scale = &up_scale_view;
+                        fusion_data.gate_scale = &gate_scale_view;
+                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, &up_view, src1, &ids_view, cgraph->nodes[glu_idx], &fusion_data);
+                        fused_mul_mat_vec = true;
+                        fused_node_count = n_ops;
+                        break;
+                    }
+                    if (ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+                        continue;
+                    }
                     ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, cgraph->nodes[glu_idx], &fusion_data);
                     fused_mul_mat_vec = true;
                     fused_node_count  = n_ops;
@@ -5199,18 +5300,8 @@ static int ggml_cuda_try_fuse(
             const bool grouped_pair = up_group != nullptr && gate_group == up_group &&
                 (up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED ||
                     up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE);
-            const auto grouped_mmvq = [](const ggml_cuda_moe_graph_group_dispatch * group,
-                                         const ggml_cuda_moe_graph_binding & binding) {
-                if (group == nullptr || group->capabilities == nullptr || binding.slot_index >= group->key.n_banks) {
-                    return false;
-                }
-                const auto & capability = group->capabilities[binding.slot_index];
-                return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
-                    capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
-                    capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ;
-            };
             const bool grouped_fusion_equivalent = grouped_pair &&
-                grouped_mmvq(up_group, up_binding) && grouped_mmvq(gate_group, gate_binding);
+                ggml_cuda_moe_grouped_mmvq(up_group, up_binding) && ggml_cuda_moe_grouped_mmvq(gate_group, gate_binding);
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up, grouped_pair) &&
                     (!grouped_pair || grouped_fusion_equivalent)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -5332,12 +5423,41 @@ static int ggml_cuda_try_fuse(
             const ggml_tensor * src1 = mm_node->src[1];
             const ggml_tensor * ids  = mm_node->src[2];
 
+            ggml_cuda_moe_graph_binding binding;
+            auto * group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(mm_node, &binding) : nullptr;
+            const bool grouped_down = !with_bias && group != nullptr &&
+                group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE &&
+                binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
+                ggml_cuda_moe_grouped_b1_scale_fusion(group, binding);
+
             ggml_cuda_mm_fusion_args_host fusion_data{};
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, grouped_down)) {
                 ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, mm_node, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                if (grouped_down) {
+                    ggml_tensor bank_view;
+                    ggml_tensor ids_view;
+                    ggml_tensor scale_view;
+                    if (group->stream != cuda_ctx->stream() || ids != group->key.ids.tensor ||
+                            !ggml_cuda_moe_group_views(*group, binding, src0, bank_view, ids_view) ||
+                            !ggml_cuda_moe_group_scale_view(*group, binding, scale, scale_view)) {
+                        return -1;
+                    }
+                    fusion_data.x_scale = &scale_view;
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &bank_view, src1, &ids_view, out_node, &fusion_data);
+                    if (!cuda_ctx->moe_grouped_context->finish_graph_group(
+                            group, binding, mm_node, cuda_ctx->stream())) {
+                        return -1;
+                    }
+                    fused_mul_mat_vec = true;
+                    fused_node_count = n_ops;
+                    break;
+                }
+                if (ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+                    continue;
+                }
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;

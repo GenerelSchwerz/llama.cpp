@@ -264,9 +264,12 @@ struct ggml_cuda_moe_grouped_decode_acquisition {
     ggml_cuda_moe_grouped_transaction transaction;
     const int32_t * remapped_ids = nullptr;
     ggml_cuda_moe_grouped_decode_bank banks[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+    const ggml_tensor * scale_tensors[3] = {};
+    const float * scale_data[3] = {};
     uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
     uint32_t n_banks = 0;
     uint32_t n_slots = 0;
+    uint32_t n_scale_shadows = 0;
 };
 
 enum ggml_cuda_moe_group_authority : uint32_t {
@@ -366,9 +369,12 @@ struct ggml_cuda_moe_graph_group_dispatch {
     const ggml_tensor * last_reader = nullptr;
     const int32_t * remapped_ids = nullptr;
     const void * bank_data[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS] = {};
+    const ggml_tensor * scale_tensors[3] = {};
+    const float * scale_data[3] = {};
     ggml_cuda_moe_stream_t stream = nullptr;
     uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY;
     uint32_t n_slots = 0;
+    uint32_t n_scale_shadows = 0;
     bool defer_completion = false;
 };
 
@@ -843,6 +849,7 @@ private:
             uint32_t expert,
             int32_t * slot) const;
     void * device_bank_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
+    const float * device_scale_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
