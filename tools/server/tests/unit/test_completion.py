@@ -1,7 +1,10 @@
+import json
 import pytest
 import requests
 import time
 import random
+
+from concurrent.futures import ThreadPoolExecutor
 
 from openai import OpenAI
 from utils import *
@@ -603,24 +606,106 @@ def test_logit_bias(tokenize, openai_style):
     assert all(output_text.find(" " + tok + " ") == -1 for tok in exclude)
 
 
-def test_cancel_request():
+def test_cancel_active_request_and_reuse_slot():
     global server
-    server.n_ctx = 4096
-    server.n_predict = -1
-    server.n_slots = 1
+    server.n_ctx = 2048
+    server.n_slots = 2
+    server.server_continuous_batching = True
     server.server_slots = True
+    server.temperature = 0.0
     server.start()
-    # send a request that will take a long time, but cancel it before it finishes
+
+    cancel_response = None
+    executor = None
+    survivor_future = None
     try:
-        server.make_request("POST", "/completion", data={
-            "prompt": "I believe the meaning of life is",
-        }, timeout=0.1)
-    except requests.exceptions.ReadTimeout:
-        pass # expected
-    # make sure the slot is free
-    time.sleep(2)
-    res = server.make_request("GET", "/slots")
-    assert res.body[0]["is_processing"] == False
+        executor = ThreadPoolExecutor(max_workers=1)
+        reference_request = {
+            "prompt": "A reusable slot must answer this deterministic prompt:",
+            "id_slot": 0,
+            "n_predict": 16,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "return_tokens": True,
+        }
+        reference = server.make_request("POST", "/completion", data=reference_request)
+        assert reference.status_code == 200
+        assert reference.body["id_slot"] == 0
+
+        cancel_request = {
+            "prompt": "This request should remain active until its client disconnects. " * 24,
+            "id_slot": 0,
+            "n_predict": 512,
+            "ignore_eos": True,
+            "cache_prompt": False,
+            "stream": True,
+        }
+        cancel_url = f"http://{server.server_host}:{server.server_port}/completion"
+        cancel_response = requests.post(cancel_url, json=cancel_request, stream=True, timeout=(5, 60))
+        assert cancel_response.status_code == 200
+        cancel_lines = cancel_response.iter_lines(chunk_size=1)
+        first_cancel_chunk = None
+        for line in cancel_lines:
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            chunk = json.loads(line[6:])
+            if chunk["tokens_predicted"] > 0:
+                first_cancel_chunk = chunk
+                break
+        assert first_cancel_chunk is not None
+        assert first_cancel_chunk["stop"] is False
+        assert len(first_cancel_chunk["tokens"]) == 1
+
+        survivor_request = {
+            "prompt": "This overlapping request must survive another client's cancellation:",
+            "id_slot": 1,
+            "n_predict": 128,
+            "ignore_eos": True,
+            "cache_prompt": False,
+        }
+        survivor_future = executor.submit(server.make_request, "POST", "/completion", survivor_request)
+        deadline = time.time() + 10
+        while True:
+            slots_response = server.make_request("GET", "/slots")
+            slots = {slot["id"]: slot for slot in slots_response.body}
+            if slots[0]["is_processing"] and slots[1]["is_processing"]:
+                break
+            assert time.time() < deadline
+            time.sleep(0.01)
+        cancel_response.close()
+
+        deadline = time.time() + 10
+        while True:
+            slots_response = server.make_request("GET", "/slots")
+            slots = {slot["id"]: slot for slot in slots_response.body}
+            if not slots[0]["is_processing"]:
+                break
+            assert time.time() < deadline
+            time.sleep(0.01)
+
+        survivor = survivor_future.result(timeout=60)
+
+        assert survivor.status_code == 200
+        assert survivor.body["id_slot"] == 1
+        assert survivor.body["stop"] is True
+
+        reused = server.make_request("POST", "/completion", data=reference_request)
+        assert reused.status_code == 200
+        assert reused.body["id_slot"] == 0
+        assert reused.body["tokens"] == reference.body["tokens"]
+        assert reused.body["content"] == reference.body["content"]
+
+        slots_response = server.make_request("GET", "/slots")
+        assert slots_response.status_code == 200
+        assert all(slot["is_processing"] is False for slot in slots_response.body)
+    finally:
+        if cancel_response is not None:
+            cancel_response.close()
+        if survivor_future is not None and not survivor_future.done():
+            server.stop()
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        server.stop()
 
 
 # this test exercises the host-memory prompt cache
