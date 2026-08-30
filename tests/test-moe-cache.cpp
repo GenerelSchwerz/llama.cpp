@@ -2160,6 +2160,22 @@ static void test_candidate_producer() {
     CHECK(registry.replace(&shadowed.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.state().accepted == 1 && registry.state().n_groups == 3 && registry.state().n_slots == 48);
 
+    llama_adapter_lora overridden_adapter(overridden.get());
+    overridden_adapter.ab_map.emplace(separate.ffn_gate_exps->name, llama_adapter_lora_weight());
+    loras.emplace(&overridden_adapter, 1.0f);
+    llama_moe_candidate_snapshot shadowed_lora(*overridden, loras);
+    CHECK(shadowed_lora.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
+    CHECK((shadowed_lora.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) == 0);
+    CHECK(shadowed_lora.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA);
+    const auto * shadowed_lora_tensor = candidate_tensor(shadowed_lora.get(), separate.ffn_gate_exps);
+    CHECK((shadowed_lora_tensor->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES) == 0);
+    CHECK(shadowed_lora_tensor->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER);
+    CHECK(shadowed_lora_tensor->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA);
+    CHECK(registry.replace(&shadowed_lora.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 2 && registry.state().n_slots == 48);
+    CHECK(!registry.find_weight(separate.ffn_gate_exps, nullptr));
+    loras.clear();
+
     llama_model_params uncached_params = llama_model_default_params();
     std::unique_ptr<llama_model> uncached(llama_model_create(LLM_ARCH_LLAMA, uncached_params));
     CHECK(uncached != nullptr && uncached->moe_expert_cache_slots() == 0);
