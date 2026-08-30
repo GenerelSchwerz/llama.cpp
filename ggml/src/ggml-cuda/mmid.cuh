@@ -63,7 +63,9 @@ struct ggml_cuda_mmid_capability_query {
     size_t smpbo = 0;
     ggml_cuda_mmid_phase phase = GGML_CUDA_MMID_PHASE_DECODE;
     ggml_cuda_mmid_mapping mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    ggml_cuda_mmid_consumer preferred_consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED;
     bool use_mmq = false;
+    bool independent_rows = false;
 };
 
 struct ggml_cuda_mmid_capability {
@@ -74,6 +76,7 @@ struct ggml_cuda_mmid_capability {
 
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type);
 ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query);
+bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens);
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,

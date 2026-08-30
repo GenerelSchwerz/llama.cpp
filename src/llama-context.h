@@ -269,7 +269,7 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, const llama_ubatch * ubatch = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -399,6 +399,8 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
     std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v2_t>> moe_candidate_replace_fns;
+    uint64_t graph_execution_owner_namespace = 0;
+    uint64_t graph_execution_owner_generation = 1;
     bool moe_candidate_refresh_pending = true;
 
     // pointers and buffer types used for the compute buffer of each backend

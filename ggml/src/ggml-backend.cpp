@@ -795,6 +795,8 @@ struct ggml_backend_sched {
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
+    struct ggml_cgraph * source_graph;
+    uint64_t source_graph_uid;
 
     // graph splits
     struct ggml_backend_sched_split * splits;
@@ -1072,6 +1074,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     graph->uid = ggml_graph_next_uid();
+    sched->source_graph = graph;
+    sched->source_graph_uid = graph->uid;
 
     // pass 1: assign backends to ops with pre-allocated inputs
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -1594,9 +1598,68 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_graph_execution_certificate * certificate) {
+    static_assert(sizeof(struct ggml_graph_execution_certificate) == 96, "unexpected graph execution certificate size");
+
+    if (certificate == nullptr ||
+            certificate->magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
+            certificate->abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
+            certificate->struct_size != sizeof(*certificate) ||
+            certificate->flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE ||
+            certificate->domain < GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
+            certificate->domain > GGML_GRAPH_EXECUTION_DOMAIN_MTP ||
+            certificate->row_semantics < GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+            certificate->row_semantics > GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE ||
+            certificate->n_rows == 0 || certificate->n_sequences == 0 ||
+            certificate->owner_namespace == 0 || certificate->owner_generation == 0 ||
+            certificate->source_graph_uid != 0 || certificate->split_graph_uid != 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < sizeof(certificate->reserved)/sizeof(certificate->reserved[0]); ++i) {
+        if (certificate->reserved[i] != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static enum ggml_status ggml_backend_sched_dispatch_split(
+        ggml_backend_t backend,
+        struct ggml_cgraph * graph,
+        uint64_t source_graph_uid,
+        const struct ggml_graph_execution_certificate & certificate) {
+    graph->execution_certificate = {};
+    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
+        graph->execution_certificate = certificate;
+        graph->execution_certificate.source_graph_uid = source_graph_uid;
+        graph->execution_certificate.split_graph_uid = graph->uid;
+    }
+
+    const enum ggml_status status = ggml_backend_graph_compute_async(backend, graph);
+    graph->execution_certificate = {};
+    return status;
+}
+
+static enum ggml_status ggml_backend_sched_compute_splits(
+        ggml_backend_sched_t sched,
+        uint64_t source_graph_uid,
+        struct ggml_graph_execution_certificate certificate) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
+        if (source_graph_uid == 0) {
+            certificate = {};
+        }
+        for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
+            if (splits[split_id].graph.uid == 0) {
+                certificate = {};
+                break;
+            }
+        }
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1743,11 +1806,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         if (!sched->callback_eval) {
-            enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            enum ggml_status ec = ggml_backend_sched_dispatch_split(
+                split_backend, &split->graph, source_graph_uid, certificate);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
         } else {
+            split->graph.execution_certificate = {};
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
                 struct ggml_tensor * t = split->graph.nodes[j0];
@@ -1921,6 +1986,8 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
         sched->is_reset = true;
     }
     sched->is_alloc = false;
+    sched->source_graph = nullptr;
+    sched->source_graph_uid = 0;
 }
 
 void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes) {
@@ -1974,13 +2041,32 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
-    enum ggml_status err = ggml_backend_sched_graph_compute_async(sched, graph);
+    return ggml_backend_sched_graph_compute_ext(sched, graph, nullptr);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_ext(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate) {
+    enum ggml_status err = ggml_backend_sched_graph_compute_async_ext(sched, graph, certificate);
     ggml_backend_sched_synchronize(sched);
     return err;
 }
 
 enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_graph_compute_async_ext(sched, graph, nullptr);
+}
+
+enum ggml_status ggml_backend_sched_graph_compute_async_ext(
+        ggml_backend_sched_t sched,
+        struct ggml_cgraph * graph,
+        const struct ggml_graph_execution_certificate * certificate) {
     GGML_ASSERT(sched);
+    struct ggml_graph_execution_certificate certificate_value = {};
+    if (ggml_backend_sched_execution_certificate_valid(certificate)) {
+        certificate_value = *certificate;
+    }
+
     if (!sched->is_reset && !sched->is_alloc) {
         ggml_backend_sched_reset(sched);
     }
@@ -1991,7 +2077,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
-    return ggml_backend_sched_compute_splits(sched);
+    if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
+        certificate_value = {};
+    }
+
+    return ggml_backend_sched_compute_splits(sched, sched->source_graph_uid, certificate_value);
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {

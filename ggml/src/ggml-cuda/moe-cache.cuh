@@ -227,6 +227,7 @@ struct ggml_cuda_moe_ids_signature {
 struct ggml_cuda_moe_complete_group_key {
     ggml_cuda_moe_candidate_group_key candidate;
     ggml_cuda_moe_ids_signature ids;
+    uint64_t execution_semantic_key = 0;
     uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
     uint32_t n_banks = 0;
 };
@@ -310,6 +311,10 @@ struct ggml_cuda_moe_graph_capability_witness {
     const void * source_data = nullptr;
     uint64_t byte_extent = 0;
     uint64_t expert_stride = 0;
+    int64_t source_ne[GGML_MAX_DIMS] = {};
+    size_t source_nb[GGML_MAX_DIMS] = {};
+    int64_t grouped_ne[GGML_MAX_DIMS] = {};
+    size_t grouped_nb[GGML_MAX_DIMS] = {};
     int64_t n_tokens = 0;
     int64_t n_experts = 0;
     size_t smpbo = 0;
@@ -323,8 +328,16 @@ struct ggml_cuda_moe_graph_capability_witness {
     uint32_t output_type = GGML_TYPE_COUNT;
     uint32_t phase = 0;
     uint32_t mapping = 0;
+    uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
     uint32_t consumer = 0;
     uint32_t reason = 0;
+    uint32_t equivalence_reason = 0;
+    uint32_t top_k = 0;
+    uint32_t n_rows = 0;
+    uint32_t n_routes = 0;
+    uint32_t row_stride = 0;
+    uint32_t n_slots = 0;
+    uint32_t use_mmq = 0;
 };
 
 struct ggml_cuda_moe_graph_group_dispatch {
@@ -439,10 +452,12 @@ private:
     enum group_reason : uint32_t {
         GROUP_REASON_ELIGIBLE = 0,
         GROUP_REASON_PREFILL,
+        GROUP_REASON_EXECUTION,
         GROUP_REASON_DESCRIPTOR,
         GROUP_REASON_SOURCE,
         GROUP_REASON_GEOMETRY,
         GROUP_REASON_CAPABILITY,
+        GROUP_REASON_CONSUMER_EQUIVALENCE,
         GROUP_REASON_ROUTE,
         GROUP_REASON_DUPLICATE_ROLE,
         GROUP_REASON_MIXED_IDS,
@@ -509,6 +524,11 @@ private:
         uint32_t seen_roles;
         uint32_t n_banks;
         uint32_t n_readers;
+        uint64_t execution_semantic_key;
+        uint32_t top_k;
+        uint32_t n_rows;
+        uint32_t n_routes;
+        uint32_t row_stride;
         const ggml_tensor * authority_node;
         uint32_t authority_node_index;
         bool observed;
@@ -516,6 +536,7 @@ private:
         bool source_invalid;
         bool geometry_invalid;
         bool capability_invalid;
+        bool consumer_incompatible;
         bool route_invalid;
         bool duplicate_role;
         bool mixed_ids;
@@ -525,6 +546,7 @@ private:
         bool has_ids;
         bool prefill;
         bool decode;
+        bool execution_ineligible;
     };
 
     struct group_record {
@@ -537,6 +559,11 @@ private:
         uint32_t ids_root_node_index;
         uint32_t ids_node_index;
         uint32_t prefill;
+        uint64_t execution_semantic_key;
+        uint32_t top_k;
+        uint32_t n_rows;
+        uint32_t n_routes;
+        uint32_t row_stride;
         const ggml_tensor * authority_node;
         uint32_t authority_node_index;
         const ggml_tensor * nodes[4];
@@ -577,6 +604,8 @@ private:
     const void * coverage_nodes_;
     uint64_t registry_generation_;
     uint64_t graph_uid_;
+    uint64_t execution_semantic_key_;
+    ggml_graph_execution_certificate execution_certificate_;
     uint64_t coverage_epoch_;
     uint64_t coverage_mmid_fingerprint_;
     int32_t graph_node_count_;
@@ -807,6 +836,21 @@ private:
 };
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
+
+struct ggml_cuda_graph_capture_state_for_test {
+    uintptr_t graph = 0;
+    uintptr_t instance = 0;
+    uint64_t execution_semantic_key = 0;
+    uint64_t moe_resource_fingerprint = 0;
+    bool capture_available = false;
+    bool warmup_complete = false;
+};
+
+bool ggml_cuda_graph_capture_state_query_for_test(
+        ggml_backend_t backend,
+        const ggml_cgraph * cgraph,
+        ggml_cuda_graph_capture_state_for_test * state);
+uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph);
 
 #endif
 

@@ -1941,9 +1941,10 @@ struct ggml_cuda_mul_mat_id_host_route {
 };
 
 // Shared by the regular and cached-buffer dispatch paths.
-static void ggml_cuda_mul_mat_id_impl(
+static bool ggml_cuda_mul_mat_id_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool use_mmq,
-        const ggml_cuda_mul_mat_id_host_route * host_route = nullptr) {
+        const ggml_cuda_mul_mat_id_host_route * host_route = nullptr,
+        ggml_cuda_mmid_consumer required_consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -1962,21 +1963,26 @@ static void ggml_cuda_mul_mat_id_impl(
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (!mapped_experts && ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) &&
+                    (required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+                        required_consumer == GGML_CUDA_MMID_CONSUMER_MMVQ)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                    return;
+                    return true;
                 }
-            } else {
+            } else if (required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+                    required_consumer == GGML_CUDA_MMID_CONSUMER_MMVF) {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
                     ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
-                    return;
+                    return true;
                 }
             }
         }
 
-        if (use_mmq && mapped_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if ((required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+                required_consumer == GGML_CUDA_MMID_CONSUMER_MMQ) &&
+                use_mmq && mapped_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
             if (mapped_experts) {
                 int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : 0;
                 if (source_split == 0) {
@@ -2003,13 +2009,20 @@ static void ggml_cuda_mul_mat_id_impl(
             } else {
                 ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             }
-            return;
+            return true;
         }
 
-        if (!mapped_experts && ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+        if ((required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+                required_consumer == GGML_CUDA_MMID_CONSUMER_MMF) && !mapped_experts &&
+                ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
-            return;
+            return true;
         }
+    }
+
+    if (required_consumer != GGML_CUDA_MMID_CONSUMER_UNSUPPORTED &&
+            required_consumer != GGML_CUDA_MMID_CONSUMER_GENERIC) {
+        return false;
     }
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
@@ -2188,6 +2201,7 @@ static void ggml_cuda_mul_mat_id_impl(
         ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
+    return true;
 }
 
 struct ggml_cuda_moe_ids_cache_key {
@@ -2313,7 +2327,7 @@ static ggml_cuda_moe_ids_kind ggml_cuda_moe_ids_kind_from_name(const char * name
     return GGML_CUDA_MOE_IDS_KIND_NONE;
 }
 
-static bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
+bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
     const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(src0->name);
     return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens > 1;
 }
@@ -3093,13 +3107,27 @@ static bool ggml_cuda_mul_mat_id(
                 !ggml_cuda_moe_group_views(*group, binding, src0, bank_view, ids_view)) {
             return false;
         }
+        if (binding.slot_index >= group->key.n_banks || group->capabilities == nullptr) {
+            return false;
+        }
+        const auto & capability = group->capabilities[binding.slot_index];
+        const bool use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
+        if (capability.use_mmq != static_cast<uint32_t>(use_mmq) ||
+                capability.consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+                capability.consumer == GGML_CUDA_MMID_CONSUMER_GENERIC) {
+            return false;
+        }
         ggml_tensor * original_weight = dst->src[0];
         ggml_tensor * original_ids = dst->src[2];
         dst->src[0] = &bank_view;
         dst->src[2] = &ids_view;
-        ggml_cuda_mul_mat_id_impl(ctx, dst, ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]));
+        const bool dispatched = ggml_cuda_mul_mat_id_impl(
+            ctx, dst, use_mmq, nullptr, static_cast<ggml_cuda_mmid_consumer>(capability.consumer));
         dst->src[0] = original_weight;
         dst->src[2] = original_ids;
+        if (!dispatched) {
+            return false;
+        }
         if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
                 !ctx.moe_grouped_context->finish_graph_group(group, binding, dst, ctx.stream())) {
             return false;
@@ -3744,15 +3772,18 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    const uint64_t execution_semantic_key = ggml_cuda_moe_execution_semantic_key(cgraph);
 
     if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+        cgraph->uid == graph->uid && execution_semantic_key == graph->execution_semantic_key) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
 
+    res = execution_semantic_key != graph->execution_semantic_key;
     graph->uid = cgraph->uid;
+    graph->execution_semantic_key = execution_semantic_key;
 
     // Check if the graph size has changed
     if ((int)graph->node_props.size() != cgraph->n_nodes) {
@@ -3809,6 +3840,38 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     }
 }
 #endif // USE_CUDA_GRAPH
+
+bool ggml_cuda_graph_capture_state_query_for_test(
+        ggml_backend_t backend,
+        const ggml_cgraph * cgraph,
+        ggml_cuda_graph_capture_state_for_test * state) {
+    if (state == nullptr) {
+        return false;
+    }
+    *state = {};
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr ||
+            cgraph == nullptr || cgraph->n_nodes == 0) {
+        return false;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    const auto graph = context->cuda_graphs.find(cgraph->nodes[0]);
+    if (graph == context->cuda_graphs.end() || graph->second == nullptr) {
+        return false;
+    }
+#ifdef USE_CUDA_GRAPH
+    ggml_cuda_set_device(context->device);
+    bool has_cached_mmid = false;
+    state->capture_available = graph->second->is_enabled() &&
+        ggml_cuda_info().devices[context->device].cc >= GGML_CUDA_CC_VOLTA &&
+        ggml_cuda_graph_check_compability(const_cast<ggml_cgraph *>(cgraph), &has_cached_mmid);
+    state->graph = reinterpret_cast<uintptr_t>(graph->second->graph);
+    state->instance = reinterpret_cast<uintptr_t>(graph->second->instance);
+    state->execution_semantic_key = graph->second->execution_semantic_key;
+    state->moe_resource_fingerprint = graph->second->moe_resource_fingerprint;
+    state->warmup_complete = graph->second->warmup_complete;
+#endif
+    return true;
+}
 
 static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
                                                 const ggml_tensor * view,
@@ -5081,7 +5144,20 @@ static int ggml_cuda_try_fuse(
             const bool grouped_pair = up_group != nullptr && gate_group == up_group &&
                 (up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED ||
                     up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE);
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, grouped_pair)) {
+            const auto grouped_mmvq = [](const ggml_cuda_moe_graph_group_dispatch * group,
+                                         const ggml_cuda_moe_graph_binding & binding) {
+                if (group == nullptr || group->capabilities == nullptr || binding.slot_index >= group->key.n_banks) {
+                    return false;
+                }
+                const auto & capability = group->capabilities[binding.slot_index];
+                return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+                    capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+                    capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ;
+            };
+            const bool grouped_fusion_equivalent = grouped_pair &&
+                grouped_mmvq(up_group, up_binding) && grouped_mmvq(gate_group, gate_binding);
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, grouped_pair) &&
+                    (!grouped_pair || grouped_fusion_equivalent)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);

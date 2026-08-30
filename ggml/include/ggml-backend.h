@@ -507,6 +507,10 @@ extern "C" {
     GGML_API bool                 ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph); // returns success
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // The stamped certificate in each backend cgraph is valid only during its graph_compute callback.
+    // Backends must synchronously validate and copy required fields before returning and must not retain its address.
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
+    GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async_ext(ggml_backend_sched_t sched, struct ggml_cgraph * graph, const struct ggml_graph_execution_certificate * certificate);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.

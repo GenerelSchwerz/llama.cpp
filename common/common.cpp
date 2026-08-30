@@ -1316,6 +1316,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         auto cparams_dft = common_context_params_to_llama(params_dft);
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        } else if (has_draft) {
+            cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_DRAFT;
         }
         cparams_dft.n_rs_seq = 0;
 

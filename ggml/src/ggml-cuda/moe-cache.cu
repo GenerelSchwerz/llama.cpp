@@ -62,6 +62,8 @@ namespace {
 
 static constexpr uint64_t MOE_CACHE_MM_SAMPLE_RATE = 64;
 static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
+static constexpr uint32_t MOE_GROUPED_MAX_DECODE_ROUTES = 32;
+static constexpr uint32_t MOE_GROUPED_MAX_INDEPENDENT_ROWS = 4;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
 
@@ -1210,52 +1212,100 @@ static ggml_cuda_moe_graph_capability_witness moe_candidate_capability(
         uint32_t input_type,
         uint32_t output_type,
         int64_t n_tokens,
+        uint32_t top_k,
+        uint32_t n_rows,
+        uint32_t n_routes,
+        uint32_t row_stride,
+        uint32_t n_slots,
+        uint32_t row_semantics,
         int device) {
-    ggml_cuda_mmid_capability_query query;
-    query.source_type = static_cast<ggml_type>(source_type);
-    query.input_type = static_cast<ggml_type>(input_type);
-    query.output_type = static_cast<ggml_type>(output_type);
-    memcpy(query.source_ne, ne, sizeof(query.source_ne));
-    memcpy(query.source_nb, nb, sizeof(query.source_nb));
-    query.n_tokens = n_tokens;
-    query.n_experts = ne[2];
-    query.phase = GGML_CUDA_MMID_PHASE_DECODE;
-    query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    ggml_cuda_mmid_capability_query legacy_query;
+    legacy_query.source_type = static_cast<ggml_type>(source_type);
+    legacy_query.input_type = static_cast<ggml_type>(input_type);
+    legacy_query.output_type = static_cast<ggml_type>(output_type);
+    memcpy(legacy_query.source_ne, ne, sizeof(legacy_query.source_ne));
+    memcpy(legacy_query.source_nb, nb, sizeof(legacy_query.source_nb));
+    legacy_query.n_tokens = n_tokens;
+    legacy_query.n_experts = ne[2];
+    legacy_query.phase = n_rows == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
+    legacy_query.mapping = n_rows == 1 ? GGML_CUDA_MMID_MAPPING_DIRECT : GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+    legacy_query.use_mmq = ggml_cuda_moe_use_mmq(tensor, n_tokens);
     const auto & info = ggml_cuda_info();
     if (device >= 0 && device < info.device_count) {
-        query.cc = info.devices[device].cc;
-        query.warp_size = info.devices[device].warp_size;
-        query.smpbo = info.devices[device].smpbo;
+        legacy_query.cc = info.devices[device].cc;
+        legacy_query.warp_size = info.devices[device].warp_size;
+        legacy_query.smpbo = info.devices[device].smpbo;
     }
-    const auto capability = ggml_cuda_mmid_get_capability(query);
+    const auto legacy = ggml_cuda_mmid_get_capability(legacy_query);
+
+    ggml_cuda_mmid_capability_query grouped_query = legacy_query;
+    grouped_query.phase = GGML_CUDA_MMID_PHASE_DECODE;
+    grouped_query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    grouped_query.preferred_consumer = legacy.selection;
+    grouped_query.independent_rows = row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+    grouped_query.n_experts = n_slots;
+    grouped_query.source_ne[2] = n_slots;
+    const bool grouped_geometry_valid = n_slots != 0 && grouped_query.source_nb[2] <= SIZE_MAX / n_slots;
+    if (grouped_geometry_valid) {
+        grouped_query.source_nb[3] = grouped_query.source_nb[2] * n_slots;
+    }
+    const auto grouped = grouped_geometry_valid ? ggml_cuda_mmid_get_capability(grouped_query) : ggml_cuda_mmid_capability{};
 
     ggml_cuda_moe_graph_capability_witness result;
     result.tensor = tensor;
     result.source_data = source_data;
     result.byte_extent = byte_extent;
     result.expert_stride = expert_stride;
-    result.n_tokens = query.n_tokens;
-    result.n_experts = query.n_experts;
-    result.smpbo = query.smpbo;
+    memcpy(result.source_ne, legacy_query.source_ne, sizeof(result.source_ne));
+    memcpy(result.source_nb, legacy_query.source_nb, sizeof(result.source_nb));
+    memcpy(result.grouped_ne, grouped_query.source_ne, sizeof(result.grouped_ne));
+    memcpy(result.grouped_nb, grouped_query.source_nb, sizeof(result.grouped_nb));
+    result.n_tokens = legacy_query.n_tokens;
+    result.n_experts = legacy_query.n_experts;
+    result.smpbo = legacy_query.smpbo;
     result.device = device;
-    result.cc = query.cc;
-    result.warp_size = query.warp_size;
+    result.cc = legacy_query.cc;
+    result.warp_size = legacy_query.warp_size;
     result.role = role;
     result.source_type = source_type;
-    result.source_flags = capability.source.flags;
+    result.source_flags = legacy.source.flags;
     result.input_type = input_type;
     result.output_type = output_type;
-    result.phase = query.phase;
-    result.mapping = query.mapping;
-    result.consumer = capability.selection;
-    result.reason = capability.reason;
+    result.phase = legacy_query.phase;
+    result.mapping = legacy_query.mapping;
+    result.row_semantics = row_semantics;
+    result.consumer = legacy.selection;
+    result.reason = legacy.reason;
+    result.equivalence_reason = !grouped_geometry_valid ? GGML_CUDA_MMID_CAPABILITY_INVALID_GEOMETRY : grouped.reason;
+    result.top_k = top_k;
+    result.n_rows = n_rows;
+    result.n_routes = n_routes;
+    result.row_stride = row_stride;
+    result.n_slots = n_slots;
+    result.use_mmq = legacy_query.use_mmq;
     return result;
 }
 
 static bool moe_candidate_capability_supported(const ggml_cuda_moe_graph_capability_witness & capability) {
     return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
         capability.consumer != GGML_CUDA_MMID_CONSUMER_UNSUPPORTED &&
         capability.consumer != GGML_CUDA_MMID_CONSUMER_GENERIC;
+}
+
+static bool moe_candidate_capability_equivalence_unavailable(
+        const ggml_cuda_moe_graph_capability_witness & capability) {
+    return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        (capability.consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+            capability.consumer == GGML_CUDA_MMID_CONSUMER_GENERIC ||
+            capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER);
+}
+
+static bool moe_candidate_capability_invariant_valid(
+        const ggml_cuda_moe_graph_capability_witness & capability) {
+    return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        (capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK ||
+            moe_candidate_capability_equivalence_unavailable(capability));
 }
 
 static const char * moe_candidate_capability_reason_name(uint32_t reason) {
@@ -1277,25 +1327,38 @@ static bool moe_candidate_capability_matches(
         const ggml_cuda_moe_graph_capability_witness & capability,
         const moe_candidate_bank_record & bank,
         const ggml_tensor * node,
+        uint32_t top_k,
+        uint32_t n_rows,
+        uint32_t n_routes,
+        uint32_t row_stride,
+        uint32_t n_slots,
         int device) {
-    int cc = 0;
-    int warp_size = 0;
-    size_t smpbo = 0;
-    const auto & info = ggml_cuda_info();
-    if (device >= 0 && device < info.device_count) {
-        cc = info.devices[device].cc;
-        warp_size = info.devices[device].warp_size;
-        smpbo = info.devices[device].smpbo;
+    if (node == nullptr || node->src[1] == nullptr) {
+        return false;
     }
-    return node != nullptr && node->src[1] != nullptr &&
-        capability.tensor == bank.info.tensor && capability.source_data == bank.info.source_data &&
-        capability.byte_extent == bank.info.byte_extent && capability.expert_stride == bank.info.expert_stride &&
-        capability.n_tokens == node->src[1]->ne[2] && capability.n_experts == bank.ne[2] &&
-        capability.smpbo == smpbo && capability.device == device && capability.cc == cc && capability.warp_size == warp_size &&
-        capability.role == bank.info.role && capability.source_type == bank.info.type &&
-        capability.source_flags == bank.info.source_flags && capability.input_type == static_cast<uint32_t>(node->src[1]->type) &&
-        capability.output_type == static_cast<uint32_t>(node->type) && capability.phase == GGML_CUDA_MMID_PHASE_DECODE &&
-        capability.mapping == GGML_CUDA_MMID_MAPPING_DIRECT;
+    const auto current = moe_candidate_capability(
+        bank.info.tensor, bank.info.source_data, bank.info.byte_extent, bank.info.expert_stride, bank.ne, bank.nb,
+        bank.info.role, bank.info.type, node->src[1]->type, node->type, node->src[1]->ne[2],
+        top_k, n_rows, n_routes, row_stride, n_slots,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, device);
+    return capability.tensor == current.tensor && capability.source_data == current.source_data &&
+        capability.byte_extent == current.byte_extent && capability.expert_stride == current.expert_stride &&
+        memcmp(capability.source_ne, current.source_ne, sizeof(capability.source_ne)) == 0 &&
+        memcmp(capability.source_nb, current.source_nb, sizeof(capability.source_nb)) == 0 &&
+        memcmp(capability.grouped_ne, current.grouped_ne, sizeof(capability.grouped_ne)) == 0 &&
+        memcmp(capability.grouped_nb, current.grouped_nb, sizeof(capability.grouped_nb)) == 0 &&
+        capability.n_tokens == current.n_tokens && capability.n_experts == current.n_experts &&
+        capability.smpbo == current.smpbo && capability.device == current.device && capability.cc == current.cc &&
+        capability.warp_size == current.warp_size && capability.role == current.role &&
+        capability.source_type == current.source_type && capability.source_flags == current.source_flags &&
+        capability.input_type == current.input_type && capability.output_type == current.output_type &&
+        capability.phase == current.phase && capability.mapping == current.mapping &&
+        capability.row_semantics == current.row_semantics && capability.consumer == current.consumer &&
+        capability.reason == current.reason && capability.equivalence_reason == current.equivalence_reason &&
+        capability.top_k == current.top_k && capability.n_rows == current.n_rows &&
+        capability.n_routes == current.n_routes && capability.row_stride == current.row_stride &&
+        capability.n_slots == current.n_slots &&
+        capability.use_mmq == current.use_mmq;
 }
 
 static bool moe_candidate_ids_valid(const ggml_tensor * ids) {
@@ -1310,9 +1373,153 @@ static bool moe_candidate_ids_valid(const ggml_tensor * ids) {
     return true;
 }
 
-static bool moe_candidate_prefill_reader(const ggml_tensor * node) {
+static bool moe_candidate_execution_certificate_present(const ggml_cgraph * cgraph) {
+    static const ggml_graph_execution_certificate empty = {};
+    return cgraph != nullptr && memcmp(&cgraph->execution_certificate, &empty, sizeof(empty)) != 0;
+}
+
+static bool moe_candidate_execution_certificate(
+        const ggml_cgraph * cgraph,
+        ggml_graph_execution_certificate * certificate,
+        uint64_t * semantic_key) {
+    if (certificate != nullptr) {
+        *certificate = {};
+    }
+    if (semantic_key != nullptr) {
+        *semantic_key = 0;
+    }
+    if (cgraph == nullptr) {
+        return false;
+    }
+
+    const auto & current = cgraph->execution_certificate;
+    if (current.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
+            current.abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
+            current.struct_size != sizeof(current) || current.flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE ||
+            current.domain < GGML_GRAPH_EXECUTION_DOMAIN_MAIN || current.domain > GGML_GRAPH_EXECUTION_DOMAIN_MTP ||
+            current.row_semantics < GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+            current.row_semantics > GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE ||
+            current.n_rows == 0 || current.n_sequences == 0 || current.owner_namespace == 0 || current.owner_generation == 0 ||
+            current.source_graph_uid == 0 || current.split_graph_uid == 0 || current.source_graph_uid == current.split_graph_uid ||
+            cgraph->uid == 0 || current.split_graph_uid != cgraph->uid) {
+        return false;
+    }
+    for (uint64_t value : current.reserved) {
+        if (value != 0) {
+            return false;
+        }
+    }
+
+    uint64_t key = UINT64_C(1469598103934665603);
+    moe_candidate_hash_value(key, current.magic);
+    moe_candidate_hash_value(key, current.abi_version);
+    moe_candidate_hash_value(key, current.struct_size);
+    moe_candidate_hash_value(key, current.flags);
+    moe_candidate_hash_value(key, current.domain);
+    moe_candidate_hash_value(key, current.row_semantics);
+    moe_candidate_hash_value(key, current.n_rows);
+    moe_candidate_hash_value(key, current.n_sequences);
+    moe_candidate_hash_value(key, current.owner_namespace);
+    moe_candidate_hash_value(key, current.owner_generation);
+    if (certificate != nullptr) {
+        *certificate = current;
+    }
+    if (semantic_key != nullptr) {
+        *semantic_key = key != 0 ? key : 1;
+    }
+    return true;
+}
+
+static bool moe_candidate_execution_semantics_equal(
+        ggml_graph_execution_certificate first,
+        ggml_graph_execution_certificate second) {
+    first.source_graph_uid = 0;
+    first.split_graph_uid = 0;
+    second.source_graph_uid = 0;
+    second.split_graph_uid = 0;
+    return memcmp(&first, &second, sizeof(first)) == 0;
+}
+
+enum moe_candidate_execution_phase : uint32_t {
+    MOE_CANDIDATE_EXECUTION_PHASE_UNKNOWN = 0,
+    MOE_CANDIDATE_EXECUTION_PHASE_DECODE,
+    MOE_CANDIDATE_EXECUTION_PHASE_PREFILL,
+    MOE_CANDIDATE_EXECUTION_PHASE_SPECULATIVE,
+};
+
+static moe_candidate_execution_phase moe_candidate_execution_phase_for(
+        const ggml_cgraph * cgraph,
+        const ggml_tensor * node) {
+    ggml_graph_execution_certificate certificate;
+    if (moe_candidate_execution_certificate(cgraph, &certificate, nullptr)) {
+        switch (certificate.row_semantics) {
+            case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT: return MOE_CANDIDATE_EXECUTION_PHASE_DECODE;
+            case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL:  return MOE_CANDIDATE_EXECUTION_PHASE_PREFILL;
+            case GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE: return MOE_CANDIDATE_EXECUTION_PHASE_SPECULATIVE;
+        }
+    }
+    if (moe_candidate_execution_certificate_present(cgraph)) {
+        return MOE_CANDIDATE_EXECUTION_PHASE_UNKNOWN;
+    }
     const ggml_tensor * ids = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr;
-    return ids != nullptr && (ids->ne[1] != 1 || ids->ne[2] != 1);
+    return ids != nullptr && (ids->ne[1] != 1 || ids->ne[2] != 1) ?
+        MOE_CANDIDATE_EXECUTION_PHASE_PREFILL : MOE_CANDIDATE_EXECUTION_PHASE_DECODE;
+}
+
+struct moe_candidate_execution_geometry {
+    uint64_t semantic_key = 0;
+    uint32_t top_k = 0;
+    uint32_t n_rows = 0;
+    uint32_t n_routes = 0;
+    uint32_t row_stride = 0;
+    moe_candidate_execution_phase phase = MOE_CANDIDATE_EXECUTION_PHASE_UNKNOWN;
+    bool certificate_valid = false;
+    bool tensor_valid = false;
+    bool grouped_eligible = false;
+};
+
+static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
+        const ggml_cgraph * cgraph,
+        const ggml_tensor * node,
+        int64_t n_experts,
+        uint32_t n_slots) {
+    moe_candidate_execution_geometry result;
+    ggml_graph_execution_certificate certificate;
+    result.certificate_valid = moe_candidate_execution_certificate(cgraph, &certificate, &result.semantic_key);
+    result.phase = moe_candidate_execution_phase_for(cgraph, node);
+
+    const ggml_tensor * activation = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[1] : nullptr;
+    const ggml_tensor * ids = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr;
+    if (!moe_candidate_ids_valid(ids) || activation == nullptr || n_experts <= 0 ||
+            ids->ne[0] <= 0 || ids->ne[0] > n_experts || ids->ne[0] > UINT32_MAX ||
+            ids->ne[1] <= 0 || ids->ne[1] > UINT32_MAX || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || ids->nb[1] % sizeof(int32_t) != 0 ||
+            static_cast<uint64_t>(ids->ne[0]) > SIZE_MAX / sizeof(int32_t)) {
+        return result;
+    }
+
+    const size_t row_bytes = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
+    if (ids->nb[1] < row_bytes || ids->nb[1] / sizeof(int32_t) > UINT32_MAX ||
+            static_cast<uint64_t>(ids->ne[1]) > SIZE_MAX / ids->nb[1] ||
+            ids->nb[2] < static_cast<size_t>(ids->ne[1]) * ids->nb[1] || ids->nb[3] < ids->nb[2] ||
+            activation->ne[2] != ids->ne[1] || activation->ne[3] != 1 ||
+            node->ne[2] != ids->ne[1] || node->ne[3] != 1 ||
+            static_cast<uint64_t>(ids->ne[0]) > UINT32_MAX / static_cast<uint64_t>(ids->ne[1])) {
+        return result;
+    }
+
+    result.top_k = static_cast<uint32_t>(ids->ne[0]);
+    result.n_rows = static_cast<uint32_t>(ids->ne[1]);
+    result.n_routes = result.top_k * result.n_rows;
+    result.row_stride = static_cast<uint32_t>(ids->nb[1] / sizeof(int32_t));
+    result.tensor_valid = true;
+    result.grouped_eligible = result.certificate_valid &&
+        certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+        certificate.n_rows == result.n_rows && certificate.n_sequences == result.n_rows &&
+        result.n_rows >= 1 && result.n_rows <= MOE_GROUPED_MAX_INDEPENDENT_ROWS &&
+        result.n_routes <= MOE_GROUPED_MAX_DECODE_ROUTES && result.n_routes <= n_slots;
+    return result;
 }
 
 static ggml_cuda_moe_ids_signature moe_candidate_ids_signature(const ggml_tensor * ids) {
@@ -1574,8 +1781,8 @@ static bool moe_candidate_validate_route(
         int64_t n_experts,
         moe_candidate_route_proof & proof) {
     if (!moe_candidate_ids_valid(ids) || ids->op != GGML_OP_VIEW || (ids->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
-            ids->ne[0] <= 0 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->nb[0] != sizeof(int32_t) ||
-            !ggml_is_contiguous(ids) || ids->src[0] == nullptr || ids->view_src != ids->src[0] || ids->view_offs != 0) {
+            ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->nb[0] != sizeof(int32_t) ||
+            ids->src[0] == nullptr || ids->view_src != ids->src[0] || ids->view_offs != 0) {
         return false;
     }
     size_t op_view_offs = 0;
@@ -2186,9 +2393,14 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
 
 } // namespace
 
+uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph) {
+    uint64_t result = 0;
+    (void) moe_candidate_execution_certificate(cgraph, nullptr, &result);
+    return result;
+}
+
 namespace {
 
-static constexpr uint32_t MOE_GROUPED_MAX_DECODE_ROUTES = 32;
 static constexpr uint32_t MOE_GROUPED_MAX_SLOTS = 256;
 static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS = 128;
@@ -2260,6 +2472,8 @@ static __global__ void moe_grouped_set_clock(uint64_t * clock, uint64_t value) {
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
+        uint32_t top_k,
+        uint32_t row_stride,
         uint32_t n_experts,
         uint32_t n_slots,
         const int32_t * slot_for_expert,
@@ -2323,12 +2537,15 @@ static __global__ void moe_grouped_plan_decode(
     }
     __syncthreads();
 
-    if (n_routes == 0 || n_routes > MOE_GROUPED_MAX_DECODE_ROUTES || n_slots == 0 ||
+    if (n_routes == 0 || n_routes > MOE_GROUPED_MAX_DECODE_ROUTES || top_k == 0 ||
+            row_stride < top_k || n_routes % top_k != 0 || n_slots == 0 ||
             n_slots > MOE_GROUPED_MAX_SLOTS || n_routes > n_slots) {
         moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
     }
     if (thread < n_routes) {
-        const int32_t expert = ids[thread];
+        const uint32_t row = thread / top_k;
+        const uint32_t column = thread % top_k;
+        const int32_t expert = ids[row * row_stride + column];
         if (expert < 0 || (uint32_t) expert >= n_experts) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_ROUTE);
         }
@@ -2567,7 +2784,7 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 } // namespace
 
 ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
-    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), coverage_epoch_(0), coverage_mmid_fingerprint_(0), graph_node_count_(0), coverage_mmid_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
+    owner_(nullptr), graph_key_(nullptr), coverage_nodes_(nullptr), registry_generation_(0), graph_uid_(0), execution_semantic_key_(0), execution_certificate_(), coverage_epoch_(0), coverage_mmid_fingerprint_(0), graph_node_count_(0), coverage_mmid_count_(0), outcome_(GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR), n_groups_(0), n_nodes_(0), initialized_(false), inventory_complete_(false), unknown_reusable_(false) {
     for (auto & index : coverage_diagnostics_.first_node_index) {
         index = UINT32_MAX;
     }
@@ -2590,6 +2807,8 @@ void ggml_cuda_moe_graph_plan::reset() {
     coverage_nodes_ = nullptr;
     registry_generation_ = 0;
     graph_uid_ = 0;
+    execution_semantic_key_ = 0;
+    execution_certificate_ = {};
     coverage_epoch_ = 0;
     coverage_mmid_fingerprint_ = 0;
     graph_node_count_ = 0;
@@ -4978,10 +5197,21 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
     return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
 #else
     const ggml_tensor * ids = key.ids.tensor;
+    const uint32_t top_k = ids != nullptr && ids->ne[0] > 0 && ids->ne[0] <= UINT32_MAX ?
+        static_cast<uint32_t>(ids->ne[0]) : 0;
+    const uint32_t n_rows = ids != nullptr && ids->ne[1] > 0 && ids->ne[1] <= UINT32_MAX ?
+        static_cast<uint32_t>(ids->ne[1]) : 0;
+    const uint32_t n_routes = top_k != 0 && n_rows != 0 && top_k <= UINT32_MAX / n_rows ? top_k * n_rows : 0;
+    const uint32_t row_stride = ids != nullptr && ids->nb[1] % sizeof(int32_t) == 0 &&
+        ids->nb[1] / sizeof(int32_t) <= UINT32_MAX ? static_cast<uint32_t>(ids->nb[1] / sizeof(int32_t)) : 0;
     if (ids == nullptr || ids->buffer == nullptr || ids->buffer->buft != ggml_backend_cuda_buffer_type(impl_->device) ||
             ids->data != key.ids.data || ids->buffer != key.ids.buffer || ids->type != key.ids.type ||
-            ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[0] > MOE_GROUPED_MAX_DECODE_ROUTES ||
-            ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || !ggml_is_contiguous(ids)) {
+            ids->type != GGML_TYPE_I32 || (authority != nullptr && key.execution_semantic_key == 0) ||
+            top_k == 0 || n_rows == 0 ||
+            n_rows > MOE_GROUPED_MAX_INDEPENDENT_ROWS || n_routes == 0 ||
+            n_routes > MOE_GROUPED_MAX_DECODE_ROUTES || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->nb[0] != sizeof(int32_t) || row_stride < top_k ||
+            ids->nb[2] < static_cast<size_t>(n_rows) * ids->nb[1] || ids->nb[3] < ids->nb[2]) {
         return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
     }
     for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
@@ -5007,7 +5237,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             std::lock_guard<std::mutex> lock(impl_->mutex);
             resource = impl_->begin_decode(key, compute_stream, transaction, resource_missing);
         }
-        if (resource == nullptr || (uint32_t) ids->ne[0] > resource->snapshot.n_slots) {
+        if (resource == nullptr || n_routes > resource->snapshot.n_slots) {
             if (resource != nullptr) {
                 (void) end_group_transaction(transaction);
             }
@@ -5041,7 +5271,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
 
         uint64_t clock_begin = 0;
         uint64_t clock_end = 0;
-        const auto reservation = impl_->reserve_clock(transaction, static_cast<uint32_t>(ids->ne[0]), clock_begin, clock_end);
+        const auto reservation = impl_->reserve_clock(transaction, n_routes, clock_begin, clock_end);
         if (reservation == impl::CLOCK_RESERVATION_REFRESH) {
             if (attempt != 0) {
                 (void) end_group_transaction(transaction);
@@ -5072,7 +5302,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         }
 
         moe_grouped_plan_decode<<<1, MOE_GROUPED_PLAN_THREADS, 0, compute_stream>>>(
-            static_cast<const int32_t *>(ids->data), (uint32_t) ids->ne[0], device.n_experts, resource->snapshot.n_slots,
+            static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
+            device.n_experts, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
         CUDA_CHECK(cudaGetLastError());
@@ -5156,6 +5387,8 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     plan->owner_ = impl_.get();
     plan->registry_generation_ = impl_->state.generation;
     plan->graph_uid_ = graph_uid;
+    (void) moe_candidate_execution_certificate(
+        cgraph, &plan->execution_certificate_, &plan->execution_semantic_key_);
     plan->graph_node_count_ = ggml_graph_n_nodes(const_cast<ggml_cgraph *>(cgraph));
     plan->graph_key_ = plan->graph_node_count_ > 0 ? ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), 0) : nullptr;
     const bool coverage_valid = coverage_epoch != 0 && coverage_nodes == cgraph->nodes && coverage_mmid_fingerprint != 0;
@@ -5190,7 +5423,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         } else {
             mmid_indices[n_mmid_indices++] = node_index;
         }
-        const bool prefill = moe_candidate_prefill_reader(node);
+        const bool prefill = moe_candidate_execution_phase_for(cgraph, node) == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL;
         cached_prefill = cached_prefill || prefill;
         cached_decode = cached_decode || !prefill;
         uint32_t reason = GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS;
@@ -5426,9 +5659,21 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             observation.unproven = true;
         }
         const ggml_tensor * ids = node->src[2];
-        const bool prefill = moe_candidate_prefill_reader(node);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+        const bool prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL;
         observation.prefill = observation.prefill || prefill;
         observation.decode = observation.decode || !prefill;
+        if (observation.n_readers == 1) {
+            observation.execution_semantic_key = geometry.semantic_key;
+            observation.top_k = geometry.top_k;
+            observation.n_rows = geometry.n_rows;
+            observation.n_routes = geometry.n_routes;
+            observation.row_stride = geometry.row_stride;
+        } else if (observation.execution_semantic_key != geometry.semantic_key ||
+                observation.top_k != geometry.top_k || observation.n_rows != geometry.n_rows ||
+                observation.n_routes != geometry.n_routes || observation.row_stride != geometry.row_stride) {
+            observation.execution_ineligible = true;
+        }
         if (!moe_candidate_record_matches(bank, node->src[0])) {
             observation.source_invalid = true;
         }
@@ -5448,32 +5693,36 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             observation.node_indices[role_slot] = node_index;
             observation.bank_indices[role_slot] = entry.bank_index;
         }
-        if (prefill) {
+        if (!geometry.tensor_valid) {
+            observation.geometry_invalid = true;
+            continue;
+        }
+        if (!geometry.grouped_eligible) {
+            observation.execution_ineligible = true;
             continue;
         }
         const uint32_t input_type = node->src[1] != nullptr ? node->src[1]->type : GGML_TYPE_COUNT;
         const int64_t n_tokens = node->src[1] != nullptr ? node->src[1]->ne[2] : 0;
         const auto capability = moe_candidate_capability(
             bank.info.tensor, bank.info.source_data, bank.info.byte_extent, bank.info.expert_stride, bank.ne, bank.nb,
-            bank.info.role, bank.info.type, input_type, node->type, n_tokens, impl_->device);
+            bank.info.role, bank.info.type, input_type, node->type, n_tokens,
+            geometry.top_k, geometry.n_rows, geometry.n_routes, geometry.row_stride, impl_->state.n_slots,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, impl_->device);
         if (bank.slot_index >= observation.n_banks) {
             observation.unproven = true;
         } else if (observation.capabilities[bank.slot_index].tensor == nullptr) {
             observation.capabilities[bank.slot_index] = capability;
         } else if (!moe_candidate_capability_matches(
-                observation.capabilities[bank.slot_index], bank, node, impl_->device) ||
+                observation.capabilities[bank.slot_index], bank, node, geometry.top_k, geometry.n_rows,
+                geometry.n_routes, geometry.row_stride, impl_->state.n_slots, impl_->device) ||
                 observation.capabilities[bank.slot_index].consumer != capability.consumer ||
                 observation.capabilities[bank.slot_index].reason != capability.reason) {
             observation.unproven = true;
         }
-        if (capability.source_flags != bank.info.source_flags || !moe_candidate_capability_supported(capability)) {
+        if (capability.source_flags != bank.info.source_flags || !moe_candidate_capability_invariant_valid(capability)) {
             observation.capability_invalid = true;
-        }
-        if (!moe_candidate_ids_valid(ids) || node->src[1] == nullptr ||
-                node->src[1]->ne[2] != 1 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-                node->ne[2] != 1 || node->ne[3] != 1) {
-            observation.geometry_invalid = true;
-            continue;
+        } else if (moe_candidate_capability_equivalence_unavailable(capability)) {
+            observation.consumer_incompatible = true;
         }
         const auto ids_signature = moe_candidate_ids_signature(ids);
         if (observation.has_ids && !moe_candidate_ids_equal(observation.ids, ids_signature)) {
@@ -5539,6 +5788,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         record.layout = group.layout;
         record.n_banks = observation.n_banks;
         record.prefill = observation.prefill && !observation.decode;
+        record.execution_semantic_key = observation.execution_semantic_key;
+        record.top_k = observation.top_k;
+        record.n_rows = observation.n_rows;
+        record.n_routes = observation.n_routes;
+        record.row_stride = observation.row_stride;
         record.authority_node = observation.authority_node;
         record.authority_node_index = observation.authority_node_index;
         record.n_readers = observation.n_readers;
@@ -5551,6 +5805,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             n_slot_banks == 3 && n_original_direct_aux == 3;
         const bool geometry_only = original_direct_nvfp4 && observation.geometry_invalid;
         const bool discover_original_direct_aux = original_direct_nvfp4 && !observation.geometry_invalid &&
+            !observation.execution_ineligible &&
             observation.has_ids && !observation.route_invalid && !observation.mixed_ids &&
             !observation.duplicate_role && observation.seen_roles == observation.required_roles &&
             observation.n_readers == 3;
@@ -5568,6 +5823,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 observation.external_consumer = true;
             }
             for (uint32_t consumer_index = 0; !observation.geometry_invalid && !observation.prefill &&
+                    !observation.execution_ineligible &&
                     consumer_index < reader.n_consumers; ++consumer_index) {
                 const auto & consumer = reader.consumers[consumer_index];
                 if (moe_candidate_auxiliary_consumer(consumer.node, reader.output.tensor, reader.ids.tensor)) {
@@ -5632,8 +5888,12 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_SOURCE;
         } else if (observation.geometry_invalid) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
+        } else if (observation.execution_ineligible && !record.prefill) {
+            record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION;
         } else if (observation.capability_invalid) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CAPABILITY;
+        } else if (observation.consumer_incompatible) {
+            record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE;
         } else if (observation.decode && (observation.route_invalid || !observation.has_ids)) {
             record.reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE;
         } else if (observation.duplicate_role) {
@@ -5662,6 +5922,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         key.key.candidate = record.candidate;
         key.key.layout = record.layout;
         key.key.n_banks = record.n_banks;
+        key.key.execution_semantic_key = record.execution_semantic_key;
         key.capabilities = record.capabilities;
         key.first_reader = record.authority_node;
         if (observation.ids.tensor != nullptr) {
@@ -5700,31 +5961,35 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     bool mixed_certificate = call_prefill && call_decode && complete_slice;
     bool decode_certificate = call_decode && !call_prefill && complete_slice;
     bool decode_legacy_certificate = call_decode && !call_prefill && complete_slice;
-    uint32_t materialization_groups = 0;
+    uint32_t legacy_groups = 0;
     for (const auto & record : plan->groups_) {
         const auto & observation = observations[record.candidate.group_index];
         const bool prefill_group = observation.prefill && !observation.decode;
         const bool decode_group = observation.decode && !observation.prefill;
         const bool materialization_legacy = decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION;
+        const bool execution_legacy = decode_group &&
+            record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION;
+        const bool consumer_legacy = decode_group &&
+            record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE;
         mixed_certificate = mixed_certificate &&
             ((prefill_group && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL) ||
                 (decode_group && (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
-                    materialization_legacy)));
+                    materialization_legacy || execution_legacy || consumer_legacy)));
         decode_certificate = decode_certificate && decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
         decode_legacy_certificate = decode_legacy_certificate && decode_group &&
-            (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE || materialization_legacy);
-        materialization_groups += materialization_legacy;
+            (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
+                materialization_legacy || execution_legacy || consumer_legacy);
+        legacy_groups += materialization_legacy || execution_legacy || consumer_legacy;
     }
-    decode_legacy_certificate = decode_legacy_certificate && materialization_groups != 0;
+    decode_legacy_certificate = decode_legacy_certificate && legacy_groups != 0;
     plan->outcome_ = call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         mixed_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         decode_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED :
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     if (decode_legacy_certificate) {
-        GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: reason=source_not_cuda_mapped groups=%u\n",
-            materialization_groups);
+        GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
     }
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
@@ -5823,10 +6088,8 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                     bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
                 return false;
             }
-            const ggml_tensor * ids = node->src[2];
-            if (!moe_candidate_prefill_reader(node) && (!moe_candidate_ids_valid(ids) || node->src[1] == nullptr ||
-                    node->src[1]->ne[2] != 1 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-                    node->ne[2] != 1 || node->ne[3] != 1)) {
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+            if (!geometry.tensor_valid) {
                 geometry_invalid = true;
             }
         }
@@ -5842,6 +6105,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
     bool source_invalid = false;
     bool geometry_invalid = false;
     bool capability_invalid = false;
+    bool consumer_incompatible = false;
     bool route_invalid = false;
     bool duplicate_role = false;
     bool mixed_ids = false;
@@ -5851,6 +6115,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
     bool has_ids = false;
     bool prefill = false;
     bool decode = false;
+    bool execution_ineligible = false;
     uint32_t seen_roles = 0;
 
     for (uint32_t reader_index = 0; reader_index < record.n_readers; ++reader_index) {
@@ -5871,13 +6136,25 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         if (bank.info.role != reader.role || !moe_candidate_record_matches(bank, node->src[0])) {
             source_invalid = true;
         }
-        const bool reader_prefill = moe_candidate_prefill_reader(node);
+        const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
+        const bool reader_prefill = geometry.phase == MOE_CANDIDATE_EXECUTION_PHASE_PREFILL;
         prefill = prefill || reader_prefill;
         decode = decode || !reader_prefill;
-        if (!reader_prefill && (bank.slot_index >= record.n_banks ||
-                !moe_candidate_capability_matches(record.capabilities[bank.slot_index], bank, node, impl_->device) ||
-                !moe_candidate_capability_supported(record.capabilities[bank.slot_index]))) {
-            capability_invalid = true;
+        if (record.execution_semantic_key != geometry.semantic_key || record.top_k != geometry.top_k ||
+                record.n_rows != geometry.n_rows || record.n_routes != geometry.n_routes ||
+                record.row_stride != geometry.row_stride || !geometry.grouped_eligible) {
+            execution_ineligible = true;
+        }
+        if (geometry.grouped_eligible) {
+            if (bank.slot_index >= record.n_banks || !moe_candidate_capability_matches(
+                    record.capabilities[bank.slot_index], bank, node, geometry.top_k, geometry.n_rows,
+                    geometry.n_routes, geometry.row_stride, impl_->state.n_slots, impl_->device)) {
+                capability_invalid = true;
+            } else if (!moe_candidate_capability_invariant_valid(record.capabilities[bank.slot_index])) {
+                capability_invalid = true;
+            } else if (moe_candidate_capability_equivalence_unavailable(record.capabilities[bank.slot_index])) {
+                consumer_incompatible = true;
+            }
         }
         if (reader.bank_index < GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
             bank_readers[reader.bank_index]++;
@@ -5886,9 +6163,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         }
 
         const ggml_tensor * ids = node->src[2];
-        const bool geometry_valid = reader_prefill || (moe_candidate_ids_valid(ids) && node->src[1] != nullptr &&
-            node->src[1]->ne[2] == 1 && ids->ne[1] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1 &&
-            node->ne[2] == 1 && node->ne[3] == 1);
+        const bool geometry_valid = geometry.tensor_valid;
         if (!geometry_valid) {
             geometry_invalid = true;
         }
@@ -5900,7 +6175,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
             duplicate_role = duplicate_role || (seen_roles & role_bit) != 0;
             seen_roles |= role_bit;
         }
-        if (!reader_prefill && geometry_valid) {
+        if (geometry.grouped_eligible) {
             const auto current_ids = moe_candidate_ids_signature(ids);
             if (has_ids) {
                 mixed_ids = mixed_ids || !moe_candidate_ids_equal(ids_signature, current_ids);
@@ -5954,7 +6229,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                 }
             }
         }
-        if (original_direct_nvfp4 && !reader_prefill && geometry_valid &&
+        if (original_direct_nvfp4 && geometry.grouped_eligible &&
                 (reader.n_consumers != 1 || reader.n_auxiliary_nodes != 3)) {
             auxiliary = true;
         }
@@ -5987,8 +6262,12 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_SOURCE;
     } else if (geometry_invalid) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
+    } else if (execution_ineligible && !(prefill && !decode)) {
+        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION;
     } else if (capability_invalid) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CAPABILITY;
+    } else if (consumer_incompatible) {
+        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE;
     } else if (decode && (route_invalid || !has_ids)) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE;
     } else if (duplicate_role) {
@@ -6003,10 +6282,10 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MISSING_ROLE;
     } else if (unproven) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_UNPROVEN;
-    } else if (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION) {
-        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION;
     } else if (prefill && !decode) {
         reason = ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL;
+    } else if (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION) {
+        reason = ggml_cuda_moe_graph_plan::GROUP_REASON_MATERIALIZATION;
     }
     return reason == record.reason && record.prefill == (prefill && !decode) && !unproven;
 }
@@ -6025,6 +6304,14 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         execution->reset();
     }
     if (cgraph == nullptr || execution == nullptr || property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED) {
+        return false;
+    }
+
+    ggml_graph_execution_certificate execution_certificate = {};
+    uint64_t execution_semantic_key = 0;
+    (void) moe_candidate_execution_certificate(cgraph, &execution_certificate, &execution_semantic_key);
+    if (execution_semantic_key != plan.execution_semantic_key_ ||
+            !moe_candidate_execution_semantics_equal(execution_certificate, plan.execution_certificate_)) {
         return false;
     }
 
@@ -6072,6 +6359,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         dispatch.key.candidate = record.candidate;
         dispatch.key.layout = record.layout;
         dispatch.key.n_banks = record.n_banks;
+        dispatch.key.execution_semantic_key = record.execution_semantic_key;
         dispatch.capabilities = record.capabilities;
         dispatch.first_reader = record.authority_node;
         const uint32_t down_slot = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT -
@@ -6141,11 +6429,14 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
             const auto & bank = group.banks[bank_index];
             const ggml_tensor * ids = node != nullptr ? node->src[2] : nullptr;
+            const auto geometry = moe_candidate_execution_geometry_for(cgraph, node, bank.ne[2], impl_->state.n_slots);
             if (node == nullptr || node != record.nodes[role_slot] || node->op != GGML_OP_MUL_MAT_ID ||
                     (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
                     bank.info.role != role || !moe_candidate_record_matches(bank, node->src[0]) || !moe_candidate_ids_valid(ids) ||
-                    node_index <= record.ids_node_index || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-                    node->ne[2] != 1 || node->ne[3] != 1) {
+                    node_index <= record.ids_node_index || !geometry.grouped_eligible ||
+                    geometry.semantic_key != record.execution_semantic_key || geometry.top_k != record.top_k ||
+                    geometry.n_rows != record.n_rows || geometry.n_routes != record.n_routes ||
+                    geometry.row_stride != record.row_stride) {
                 return false;
             }
             const auto current_ids = moe_candidate_ids_signature(ids);
@@ -6286,6 +6577,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
     }
     uint64_t result = 1469598103934665603ULL;
     moe_grouped_resource_fingerprint_add(result, impl_->state.generation);
+    moe_grouped_resource_fingerprint_add(result, execution.plan_->execution_semantic_key_);
     moe_grouped_resource_fingerprint_add(result, execution.n_groups_);
     auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
     moe_grouped_resource_fingerprint_add(
@@ -6293,8 +6585,20 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
     for (uint32_t record_index = 0; record_index < execution.n_groups_; ++record_index) {
         const auto & group = execution.groups_[record_index];
         const uint32_t group_index = group.key.candidate.group_index;
+        const uint32_t top_k = group.key.ids.ne[0] > 0 && group.key.ids.ne[0] <= UINT32_MAX ?
+            static_cast<uint32_t>(group.key.ids.ne[0]) : 0;
+        const uint32_t n_rows = group.key.ids.ne[1] > 0 && group.key.ids.ne[1] <= UINT32_MAX ?
+            static_cast<uint32_t>(group.key.ids.ne[1]) : 0;
+        const uint32_t n_routes = top_k != 0 && n_rows != 0 && top_k <= UINT32_MAX / n_rows ? top_k * n_rows : 0;
+        const uint32_t row_stride = group.key.ids.nb[1] % sizeof(int32_t) == 0 &&
+            group.key.ids.nb[1] / sizeof(int32_t) <= UINT32_MAX ?
+                static_cast<uint32_t>(group.key.ids.nb[1] / sizeof(int32_t)) : 0;
         if (group.stream != stream || group.key.candidate.generation != impl_->state.generation ||
-                group_index >= impl_->resources.size()) {
+                group.key.execution_semantic_key == 0 ||
+                group.key.execution_semantic_key != execution.plan_->execution_semantic_key_ ||
+                top_k == 0 || n_rows == 0 || n_rows > MOE_GROUPED_MAX_INDEPENDENT_ROWS ||
+                n_routes == 0 || n_routes > MOE_GROUPED_MAX_DECODE_ROUTES || row_stride < top_k ||
+                group.capabilities == nullptr || group_index >= impl_->resources.size()) {
             return false;
         }
         const auto * resource = impl_->resources[group_index].get();
@@ -6316,6 +6620,11 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
             return false;
         }
         moe_grouped_resource_fingerprint_add(result, group_index);
+        moe_grouped_resource_fingerprint_add(result, group.key.execution_semantic_key);
+        moe_grouped_resource_fingerprint_add(result, top_k);
+        moe_grouped_resource_fingerprint_add(result, n_rows);
+        moe_grouped_resource_fingerprint_add(result, n_routes);
+        moe_grouped_resource_fingerprint_add(result, row_stride);
         moe_grouped_resource_fingerprint_add(result, resource->snapshot.acquisition.resource_generation);
         moe_grouped_resource_fingerprint_add(result, device.serial);
         moe_grouped_resource_fingerprint_add(result, group.stream);
@@ -6326,11 +6635,58 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         moe_grouped_resource_fingerprint_add(result, device.plan);
         moe_grouped_resource_fingerprint_add(result, device.device_banks);
         for (uint32_t bank_index = 0; bank_index < resource->snapshot.banks.size(); ++bank_index) {
-            if (device.bank_data[bank_index] == nullptr) {
+            const auto & bank = resource->snapshot.banks[bank_index];
+            const auto & capability = group.capabilities[bank_index];
+            int64_t grouped_ne[GGML_MAX_DIMS];
+            size_t grouped_nb[GGML_MAX_DIMS];
+            memcpy(grouped_ne, bank.ne, sizeof(grouped_ne));
+            memcpy(grouped_nb, bank.nb, sizeof(grouped_nb));
+            grouped_ne[2] = impl_->state.n_slots;
+            const bool grouped_stride_valid = grouped_nb[2] <= SIZE_MAX / impl_->state.n_slots;
+            if (grouped_stride_valid) {
+                grouped_nb[3] = grouped_nb[2] * impl_->state.n_slots;
+            }
+            if (device.bank_data[bank_index] == nullptr || !moe_candidate_capability_supported(capability) ||
+                    capability.tensor != bank.tensor || capability.source_data != bank.source_data ||
+                    capability.byte_extent != bank.byte_extent || capability.expert_stride != bank.expert_stride ||
+                    memcmp(capability.source_ne, bank.ne, sizeof(capability.source_ne)) != 0 ||
+                    memcmp(capability.source_nb, bank.nb, sizeof(capability.source_nb)) != 0 ||
+                    !grouped_stride_valid || memcmp(capability.grouped_ne, grouped_ne, sizeof(grouped_ne)) != 0 ||
+                    memcmp(capability.grouped_nb, grouped_nb, sizeof(grouped_nb)) != 0 ||
+                    capability.top_k != top_k || capability.n_rows != n_rows || capability.n_routes != n_routes ||
+                    capability.row_stride != row_stride || capability.n_slots != impl_->state.n_slots) {
                 return false;
             }
             moe_grouped_resource_fingerprint_add(result, device.bank_data[bank_index]);
-            moe_grouped_resource_fingerprint_add(result, resource->snapshot.banks[bank_index].source_data);
+            moe_grouped_resource_fingerprint_add(result, bank.source_data);
+            moe_grouped_resource_fingerprint_add(result, capability.consumer);
+            moe_grouped_resource_fingerprint_add(result, capability.reason);
+            moe_grouped_resource_fingerprint_add(result, capability.equivalence_reason);
+            moe_grouped_resource_fingerprint_add(result, capability.phase);
+            moe_grouped_resource_fingerprint_add(result, capability.mapping);
+            moe_grouped_resource_fingerprint_add(result, capability.row_semantics);
+            moe_grouped_resource_fingerprint_add(result, capability.use_mmq);
+            moe_grouped_resource_fingerprint_add(result, capability.n_tokens);
+            moe_grouped_resource_fingerprint_add(result, capability.n_experts);
+            moe_grouped_resource_fingerprint_add(result, capability.smpbo);
+            moe_grouped_resource_fingerprint_add(result, capability.device);
+            moe_grouped_resource_fingerprint_add(result, capability.cc);
+            moe_grouped_resource_fingerprint_add(result, capability.warp_size);
+            moe_grouped_resource_fingerprint_add(result, capability.top_k);
+            moe_grouped_resource_fingerprint_add(result, capability.n_rows);
+            moe_grouped_resource_fingerprint_add(result, capability.n_routes);
+            moe_grouped_resource_fingerprint_add(result, capability.row_stride);
+            moe_grouped_resource_fingerprint_add(result, capability.n_slots);
+            moe_grouped_resource_fingerprint_add(result, capability.source_type);
+            moe_grouped_resource_fingerprint_add(result, capability.source_flags);
+            moe_grouped_resource_fingerprint_add(result, capability.input_type);
+            moe_grouped_resource_fingerprint_add(result, capability.output_type);
+            for (uint32_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                moe_grouped_resource_fingerprint_add(result, capability.source_ne[dim]);
+                moe_grouped_resource_fingerprint_add(result, capability.source_nb[dim]);
+                moe_grouped_resource_fingerprint_add(result, capability.grouped_ne[dim]);
+                moe_grouped_resource_fingerprint_add(result, capability.grouped_nb[dim]);
+            }
         }
     }
     *fingerprint = result != 0 ? result : 1;
@@ -6410,7 +6766,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
     for (uint32_t record_index = 0; record_index < execution->n_groups_; ++record_index) {
         auto & group = execution->groups_[record_index];
         auto * resource = impl_->resources[group.key.candidate.group_index].get();
-        const uint32_t n_routes = static_cast<uint32_t>(group.key.ids.ne[0]);
+        const uint32_t n_routes = static_cast<uint32_t>(group.key.ids.ne[0] * group.key.ids.ne[1]);
         if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED || resource == nullptr || resource->device == nullptr ||
                 n_routes == 0 || n_routes > resource->snapshot.n_slots || resource->device->clock_bound > UINT64_MAX - n_routes ||
                 (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY && !resource->device->graph_clock_active)) {
@@ -6449,7 +6805,7 @@ bool ggml_cuda_moe_grouped_context::activate_graph_resources(
         auto & group = execution->groups_[record_index];
         auto & resource = *impl_->resources[group.key.candidate.group_index];
         auto & device = *resource.device;
-        const uint32_t n_routes = static_cast<uint32_t>(group.key.ids.ne[0]);
+        const uint32_t n_routes = static_cast<uint32_t>(group.key.ids.ne[0] * group.key.ids.ne[1]);
         resource.active_transaction_token = ++impl_->next_transaction_token;
         resource.active_decode_stream = group.stream;
         group.transaction.acquisition = resource.snapshot.acquisition;
@@ -6706,6 +7062,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph
     if (group == nullptr || node == nullptr || stream == nullptr || !armed ||
             group->stream != stream || node != group->first_reader || binding.key.candidate.generation != group->key.candidate.generation ||
             binding.key.candidate.group_index != group->key.candidate.group_index || binding.slot_index >= group->key.n_banks ||
+            binding.key.execution_semantic_key != group->key.execution_semantic_key ||
             group->capabilities == nullptr) {
         return record_prepare_error();
     }
@@ -6742,7 +7099,10 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph
             }
             const auto & bank = *bank_ptr;
             if (bank.info.role != moe_candidate_expected_base_role(candidate.layout, bank_index) ||
-                    !moe_candidate_capability_matches(group->capabilities[bank_index], bank, node, impl_->device) ||
+                    !moe_candidate_capability_matches(group->capabilities[bank_index], bank, node,
+                        static_cast<uint32_t>(group->key.ids.ne[0]), static_cast<uint32_t>(group->key.ids.ne[1]),
+                        static_cast<uint32_t>(group->key.ids.ne[0] * group->key.ids.ne[1]),
+                        static_cast<uint32_t>(group->key.ids.nb[1] / sizeof(int32_t)), impl_->state.n_slots, impl_->device) ||
                     !moe_candidate_capability_supported(group->capabilities[bank_index])) {
                 return record_prepare_error();
             }

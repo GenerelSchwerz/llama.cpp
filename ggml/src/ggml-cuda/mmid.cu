@@ -70,7 +70,7 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
         result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
         return result;
     }
-    if ((query.phase == GGML_CUDA_MMID_PHASE_DECODE && query.n_tokens != 1) ||
+    if ((query.phase == GGML_CUDA_MMID_PHASE_DECODE && query.n_tokens != 1 && !query.independent_rows) ||
             (query.phase == GGML_CUDA_MMID_PHASE_PREFILL && query.n_tokens <= 1)) {
         result.reason = GGML_CUDA_MMID_CAPABILITY_INVALID_PHASE;
         return result;
@@ -92,19 +92,44 @@ ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_cap
     }
 
     const bool mapped = query.mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
-    if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMVQ) != 0 && query.n_tokens <= MMVQ_MAX_BATCH_SIZE &&
-            query.n_tokens <= get_mmvq_mmid_max_batch(query.source_type, query.cc)) {
+    const auto supported = [&](ggml_cuda_mmid_consumer consumer) {
+        switch (consumer) {
+            case GGML_CUDA_MMID_CONSUMER_MMVQ:
+                return !mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMVQ) != 0 &&
+                    query.n_tokens <= MMVQ_MAX_BATCH_SIZE &&
+                    query.n_tokens <= get_mmvq_mmid_max_batch(query.source_type, query.cc);
+            case GGML_CUDA_MMID_CONSUMER_MMVF:
+                return !mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
+                    query.n_tokens <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(query.cc);
+            case GGML_CUDA_MMID_CONSUMER_MMQ:
+                return query.use_mmq && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
+                    (!mapped || (result.source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0) &&
+                    ggml_cuda_should_use_mmq(query.source_type, query.cc, query.n_tokens, query.n_experts, query.smpbo);
+            case GGML_CUDA_MMID_CONSUMER_MMF:
+                return !mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
+                    ggml_cuda_should_use_mmf(query.source_type, query.cc, query.warp_size, query.source_ne, query.source_nb,
+                        query.n_tokens, true);
+            case GGML_CUDA_MMID_CONSUMER_GENERIC:
+                return (result.source.flags & GGML_CUDA_MMID_SOURCE_GENERIC) != 0;
+            case GGML_CUDA_MMID_CONSUMER_UNSUPPORTED:
+                return false;
+        }
+        return false;
+    };
+
+    if (query.preferred_consumer != GGML_CUDA_MMID_CONSUMER_UNSUPPORTED) {
+        if (!supported(query.preferred_consumer)) {
+            result.reason = GGML_CUDA_MMID_CAPABILITY_UNSUPPORTED_CONSUMER;
+            return result;
+        }
+        result.selection = query.preferred_consumer;
+    } else if (supported(GGML_CUDA_MMID_CONSUMER_MMVQ)) {
         result.selection = GGML_CUDA_MMID_CONSUMER_MMVQ;
-    } else if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
-            query.n_tokens <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(query.cc)) {
+    } else if (supported(GGML_CUDA_MMID_CONSUMER_MMVF)) {
         result.selection = GGML_CUDA_MMID_CONSUMER_MMVF;
-    } else if (query.use_mmq && (result.source.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
-            (!mapped || (result.source.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0) &&
-            ggml_cuda_should_use_mmq(query.source_type, query.cc, query.n_tokens, query.n_experts, query.smpbo)) {
+    } else if (supported(GGML_CUDA_MMID_CONSUMER_MMQ)) {
         result.selection = GGML_CUDA_MMID_CONSUMER_MMQ;
-    } else if (!mapped && (result.source.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0 &&
-            ggml_cuda_should_use_mmf(query.source_type, query.cc, query.warp_size, query.source_ne, query.source_nb,
-                query.n_tokens, true)) {
+    } else if (supported(GGML_CUDA_MMID_CONSUMER_MMF)) {
         result.selection = GGML_CUDA_MMID_CONSUMER_MMF;
     } else {
         result.selection = GGML_CUDA_MMID_CONSUMER_GENERIC;

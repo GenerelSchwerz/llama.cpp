@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -33,9 +34,46 @@
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
+        case LLAMA_CONTEXT_TYPE_DRAFT  : return LLM_GRAPH_TYPE_DEFAULT;
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static uint64_t graph_execution_next_owner_namespace() {
+    static std::atomic<uint64_t> next_namespace { 1 };
+    const uint64_t result = next_namespace.fetch_add(1, std::memory_order_relaxed);
+    GGML_ASSERT(result != 0);
+    return result;
+}
+
+static bool ubatch_has_independent_rows(const llama_ubatch & ubatch) {
+    if (ubatch.n_tokens == 0 || ubatch.n_seq_tokens != 1 ||
+            ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs_unq != ubatch.n_tokens ||
+            ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr || ubatch.seq_id_unq == nullptr) {
+        return false;
+    }
+
+    for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+        if (ubatch.n_seq_id[row] != 1 || ubatch.seq_id[row] == nullptr) {
+            return false;
+        }
+        const llama_seq_id row_id = ubatch.seq_id[row][0];
+        bool listed = false;
+        for (uint32_t seq = 0; seq < ubatch.n_seqs_unq; ++seq) {
+            listed = listed || ubatch.seq_id_unq[seq] == row_id;
+        }
+        if (!listed) {
+            return false;
+        }
+        for (uint32_t previous = 0; previous < row; ++previous) {
+            if (ubatch.seq_id[previous][0] == row_id) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 struct llm_fused_op_probe {
@@ -307,6 +345,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    graph_execution_owner_namespace = graph_execution_next_owner_namespace();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -1915,7 +1955,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -3014,7 +3054,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+    const llama_ubatch * ubatch) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3034,7 +3075,27 @@ ggml_status llama_context::graph_compute(
     if (shared_workspace_peer() != nullptr) {
         workspace_in_flight = true;
     }
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+    ggml_status status;
+    if (ubatch != nullptr && ubatch_has_independent_rows(*ubatch)) {
+        ggml_graph_execution_certificate certificate = {};
+        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+        certificate.struct_size = sizeof(certificate);
+        certificate.owner_namespace = graph_execution_owner_namespace;
+        certificate.owner_generation = graph_execution_owner_generation;
+        certificate.n_rows = ubatch->n_tokens;
+        certificate.n_sequences = ubatch->n_seqs_unq;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+        switch (cparams.ctx_type) {
+            case LLAMA_CONTEXT_TYPE_DEFAULT: certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;  break;
+            case LLAMA_CONTEXT_TYPE_DRAFT  : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT; break;
+            case LLAMA_CONTEXT_TYPE_MTP    : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;   break;
+        }
+        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    } else {
+        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
