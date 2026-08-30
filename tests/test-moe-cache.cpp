@@ -7799,15 +7799,80 @@ static void test_owner_legacy_cache(int device) {
     CHECK(first_gate && second_gate && first_gate.get() != nullptr && second_gate.get() != nullptr);
     CHECK(first_gate.get() != second_gate.get());
     CHECK(ggml_cuda_moe_cache_n_slots(first_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
-    const int32_t experts[] = {1, 3};
-    first.prefetch_legacy_siblings(first_gate, experts, 2, true, true);
+    for (uint32_t expert = 0; expert < grouped_decode_fixture::N_EXPERTS; ++expert) {
+        memset(static_cast<char *>(down->data) + expert * down->nb[2], 1 + expert, down->nb[2]);
+    }
+
     auto first_down = first.acquire_legacy_cache(down);
     CHECK(first_down && first_down.get() != nullptr && first_down.acquisition().registered_source == 1);
+    const bool overlap = ggml_cuda_moe_cache_can_overlap_staging(first_down.get());
+    cudaStream_t prefetch_compute_stream = nullptr;
+    void * prefetch_staging = nullptr;
+    uint32_t * prefetch_stage_ready = nullptr;
+    host_barrier prefetch_barrier;
+    if (overlap) {
+        CUDA_OK(cudaStreamCreateWithFlags(&prefetch_compute_stream, cudaStreamNonBlocking));
+        CUDA_OK(cudaMalloc(&prefetch_staging, 2 * down->nb[2]));
+        CUDA_OK(cudaMalloc(&prefetch_stage_ready, 3 * sizeof(uint32_t)));
+        CUDA_OK(cudaLaunchHostFunc(ggml_cuda_moe_cache_copy_stream(first_down.get()), wait_on_host_barrier, &prefetch_barrier));
+        while (!prefetch_barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
+    const int32_t experts[] = {1, 3};
+    first.prefetch_legacy_siblings(first_gate, experts, 2, true, true);
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t evictions = 0;
     ggml_cuda_moe_cache_stats(first_down.get(), &hits, &misses, &evictions);
     CHECK(hits == 0 && misses == 2 && evictions == 0);
+
+    if (overlap) {
+        const int32_t split_experts[] = {1, 3, 0, 2, 4, 5};
+        const void * split_sources[6];
+        for (int i = 0; i < 6; ++i) {
+            split_sources[i] = static_cast<const char *>(down->data) + split_experts[i] * down->nb[2];
+        }
+        int slot_ids[6] = {-1, -1, -1, -1, -1, -1};
+        int32_t wait_classes[6] = {-1, -1, -1, -1, -1, -1};
+        int n_resident = 0;
+        int n_wait_classes = 0;
+        const bool prepared = ggml_cuda_moe_cache_prepare_split_staging(
+            first_down.get(), split_sources, 6, down->nb[2], 1, slot_ids, wait_classes,
+            &n_resident, prefetch_staging, prefetch_stage_ready, 3, &n_wait_classes, prefetch_compute_stream);
+        prefetch_barrier.released.store(true, std::memory_order_release);
+        if (prepared) {
+            CHECK(ggml_cuda_moe_cache_finish_split_staging(first_down.get(), prefetch_compute_stream));
+            CHECK(ggml_cuda_moe_cache_release_split_slots(first_down.get(), slot_ids, 6, prefetch_compute_stream));
+        }
+        CUDA_OK(cudaStreamSynchronize(prefetch_compute_stream));
+        CUDA_OK(cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(first_down.get())));
+        CHECK(prepared);
+        CHECK(n_resident == 4 && n_wait_classes == 3);
+        CHECK(wait_classes[0] == 1 && wait_classes[1] == 1);
+        CHECK(wait_classes[2] == 1 && wait_classes[3] == 1);
+        CHECK(wait_classes[4] == 2 && wait_classes[5] == 2);
+
+        std::vector<uint8_t> prefetch_readback(down->nb[2]);
+        for (int i = 0; i < n_resident; ++i) {
+            CUDA_OK(cudaMemcpy(prefetch_readback.data(), ggml_cuda_moe_cache_slot_ptr(first_down.get(), slot_ids[i]),
+                down->nb[2], cudaMemcpyDeviceToHost));
+            CHECK(std::all_of(prefetch_readback.begin(), prefetch_readback.end(),
+                [&](uint8_t value) { return value == 1 + split_experts[i]; }));
+        }
+        std::vector<uint8_t> staging_readback(2 * down->nb[2]);
+        CUDA_OK(cudaMemcpy(staging_readback.data(), prefetch_staging, staging_readback.size(), cudaMemcpyDeviceToHost));
+        for (int i = n_resident; i < 6; ++i) {
+            CHECK(std::all_of(
+                staging_readback.begin() + (i - n_resident) * down->nb[2],
+                staging_readback.begin() + (i - n_resident + 1) * down->nb[2],
+                [&](uint8_t value) { return value == 1 + split_experts[i]; }));
+        }
+        CUDA_OK(cudaFree(prefetch_stage_ready));
+        CUDA_OK(cudaFree(prefetch_staging));
+        CUDA_OK(cudaStreamDestroy(prefetch_compute_stream));
+    }
 
     auto second_up = second.acquire_legacy_cache(up);
     CHECK(second_up && second_up.get() != nullptr && second_up.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
