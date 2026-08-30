@@ -132,9 +132,6 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
     snapshot.struct_size = sizeof(snapshot);
     snapshot.n_slots = std::max(model.moe_expert_cache_slots(), 0);
     const bool tensor_overrides = model.has_tensor_overrides();
-    if (tensor_overrides) {
-        snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_TENSOR_OVERRIDES;
-    }
 
     auto has_lora = [&](ggml_tensor * tensor) {
         for (const auto & lora : loras) {
@@ -206,7 +203,7 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
         }
 
         const uint32_t group_index = groups.size();
-        uint32_t group_flags = tensor_overrides ? GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES : 0;
+        uint32_t group_flags = 0;
         if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID || !source.route_present) {
             group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
         }
@@ -226,8 +223,13 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
                 mark_typed_alias(tensor);
                 return;
             }
-            uint32_t flags = tensor_overrides ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
-            if (is_cached(tensor)) {
+            const bool cached = is_cached(tensor);
+            const bool overridden = tensor_overrides && !cached;
+            uint32_t flags = overridden ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
+            if (overridden) {
+                groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES;
+            }
+            if (cached) {
                 flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
             }
             if (has_lora(tensor)) {
@@ -286,8 +288,9 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
             snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
             return;
         }
-        uint32_t flags = tensor_overrides ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
-        if (is_cached(tensor)) {
+        const bool cached = is_cached(tensor);
+        uint32_t flags = tensor_overrides && !cached ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
+        if (cached) {
             flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
         }
         if (has_lora(tensor)) {
@@ -315,9 +318,6 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
             break;
         }
         uint32_t flags = GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
-        if (tensor_overrides) {
-            flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES;
-        }
         if (has_lora(const_cast<ggml_tensor *>(tensor))) {
             flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA;
         }

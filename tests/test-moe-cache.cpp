@@ -2135,12 +2135,30 @@ static void test_candidate_producer() {
     params.moe_expert_cache_slots = 48;
     std::unique_ptr<llama_model> overridden(llama_model_create(LLM_ARCH_LLAMA, params));
     overridden->layers = model->layers;
-    llama_moe_candidate_snapshot disabled(*overridden, loras);
-    CHECK(disabled.get().n_slots == 48 && disabled.get().n_groups == 4);
-    CHECK(disabled.get().flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_TENSOR_OVERRIDES);
-    CHECK(candidate_tensor(disabled.get(), separate.ffn_gate_exps)->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES);
-    CHECK(registry.replace(&disabled.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 0 && registry.state().n_slots == 48);
+    CHECK(overridden->has_tensor_overrides());
+    ggml_backend_buffer_t saved_buffer = separate.ffn_gate_exps->buffer;
+    separate.ffn_gate_exps->buffer = fixture.buffer;
+    llama_moe_candidate_snapshot affected(*overridden, loras);
+    CHECK(affected.get().n_slots == 48 && affected.get().n_groups == 4);
+    CHECK(affected.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
+    CHECK(affected.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES);
+    CHECK(candidate_tensor(affected.get(), separate.ffn_gate_exps)->flags &
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES);
+    CHECK((candidate_tensor(affected.get(), separate.ffn_gate_exps)->flags &
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) == 0);
+    CHECK(registry.replace(&affected.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 2 && registry.state().n_slots == 48);
+
+    separate.ffn_gate_exps->buffer = saved_buffer;
+    llama_moe_candidate_snapshot shadowed(*overridden, loras);
+    CHECK(shadowed.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
+    CHECK((shadowed.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) == 0);
+    CHECK((candidate_tensor(shadowed.get(), separate.ffn_gate_exps)->flags &
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES) == 0);
+    CHECK(candidate_tensor(shadowed.get(), separate.ffn_gate_exps)->flags &
+        GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER);
+    CHECK(registry.replace(&shadowed.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().accepted == 1 && registry.state().n_groups == 3 && registry.state().n_slots == 48);
 
     llama_model_params uncached_params = llama_model_default_params();
     std::unique_ptr<llama_model> uncached(llama_model_create(LLM_ARCH_LLAMA, uncached_params));
@@ -2152,8 +2170,9 @@ static void test_candidate_producer() {
 
     llama_model_params gemma_params = llama_model_default_params();
     gemma_params.moe_expert_cache_slots = 12;
+    gemma_params.tensor_buft_overrides = overrides;
     std::unique_ptr<llama_model> gemma(llama_model_create(LLM_ARCH_GEMMA4, gemma_params));
-    CHECK(gemma != nullptr);
+    CHECK(gemma != nullptr && gemma->has_tensor_overrides());
     gemma->layers.resize(30);
     for (auto & layer : gemma->layers) {
         layer.ffn_gate_inp = fixture.tensor(GGML_TYPE_F32, 2, router_ne);
@@ -2164,12 +2183,19 @@ static void test_candidate_producer() {
     llama_moe_candidate_snapshot gemma_produced(*gemma, loras);
     const auto & gemma_snapshot = gemma_produced.get();
     CHECK(gemma_snapshot.n_slots == 12 && gemma_snapshot.n_groups == 30);
+    CHECK(gemma_snapshot.flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
     for (uint32_t group_index = 0; group_index < gemma_snapshot.n_groups; ++group_index) {
         const auto & group = gemma_snapshot.groups[group_index];
         CHECK(group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
         CHECK(group.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
-        CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_gate_up_exps)->group_index == group_index);
-        CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_down_exps)->group_index == group_index);
+        CHECK((group.flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) == 0);
+        const auto * gate_up = candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_gate_up_exps);
+        const auto * down = candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_down_exps);
+        CHECK(gate_up->group_index == group_index && down->group_index == group_index);
+        CHECK((gate_up->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES) == 0);
+        CHECK((down->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES) == 0);
+        CHECK(gate_up->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER);
+        CHECK(down->flags & GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER);
         CHECK(candidate_tensor(gemma_snapshot, gemma->layers[group_index].ffn_down_exps_s)->status ==
             GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
     }
