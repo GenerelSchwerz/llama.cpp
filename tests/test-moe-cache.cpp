@@ -500,6 +500,15 @@ static void candidate_rebuild_graph_uses(ggml_cgraph * graph) {
     }
 }
 
+static void candidate_insert_graph_node(ggml_cgraph * graph, int32_t node_index, ggml_tensor * node) {
+    CHECK(graph != nullptr && node != nullptr && node_index >= 0 && node_index <= graph->n_nodes && graph->n_nodes < graph->size);
+    memmove(graph->nodes + node_index + 1, graph->nodes + node_index,
+        (graph->n_nodes - node_index) * sizeof(graph->nodes[0]));
+    graph->nodes[node_index] = node;
+    ++graph->n_nodes;
+    candidate_rebuild_graph_uses(graph);
+}
+
 static int32_t candidate_graph_use_count(const ggml_cgraph * graph, const ggml_tensor * tensor) {
     const size_t hash_pos = ggml_hash_find(&graph->visited_hash_set, tensor);
     CHECK(hash_pos != GGML_HASHSET_FULL && ggml_bitset_get(graph->visited_hash_set.used, hash_pos));
@@ -5250,6 +5259,8 @@ static void test_active_grouped_multirow_graph_modes_case(
         candidate_prefill = build_cached_mmid_path_test_graph(
             candidate_backend.get(), candidate.banks[0], candidate.banks[1], prefill_used, 2);
         initialize_cached_mmid_path_test_graphs(candidate_prefill, reference_prefill);
+        candidate_insert_graph_node(candidate_prefill.graph, 0, candidate.graph->nodes[0]);
+        CHECK(candidate_prefill.graph->nodes[0] == candidate.graph->nodes[0]);
         prefill_ids.reserve(2 * prefill_used);
         for (int64_t route = 0; route < prefill_used; ++route) {
             prefill_ids.push_back(static_cast<int32_t>(route));
@@ -5291,6 +5302,7 @@ static void test_active_grouped_multirow_graph_modes_case(
     uintptr_t captured_graph = 0;
     uintptr_t captured_instance = 0;
     uint64_t captured_semantic_key = 0;
+    uint64_t captured_resource_fingerprint = 0;
     const uint64_t n_routes = n_used * n_rows;
     bool capture_available = false;
     bool transition_executed = false;
@@ -5333,7 +5345,8 @@ static void test_active_grouped_multirow_graph_modes_case(
             captured_graph = candidate_graph.graph;
             captured_instance = candidate_graph.instance;
             captured_semantic_key = candidate_graph.execution_semantic_key;
-            CHECK(captured_semantic_key != 0);
+            captured_resource_fingerprint = candidate_graph.moe_resource_fingerprint;
+            CHECK(captured_semantic_key != 0 && captured_resource_fingerprint != 0);
         } else {
             CHECK(candidate_graph.graph == captured_graph && candidate_graph.instance == captured_instance &&
                 candidate_graph.warmup_complete && candidate_graph.moe_resource_fingerprint != 0 &&
@@ -5350,6 +5363,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             if (capture_available) {
                 CHECK(ggml_cuda_moe_grouped_context_test_access::graph_clock_active(*context, key));
             }
+            (void) candidate_certify_graph(*context, candidate_prefill.graph);
             (void) run_cached_mmid_path_test(
                 candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
             CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
@@ -5357,6 +5371,14 @@ static void test_active_grouped_multirow_graph_modes_case(
             CHECK(lease && lease.get() != nullptr &&
                 ggml_cuda_moe_cache_slot_ptr(lease.get(), 0) ==
                     ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, key, candidate.banks[0]));
+            if (capture_available) {
+                ggml_cuda_graph_capture_state_for_test retained_graph;
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &retained_graph));
+                CHECK(retained_graph.graph == captured_graph && retained_graph.instance == captured_instance &&
+                    retained_graph.warmup_complete && retained_graph.execution_semantic_key == captured_semantic_key &&
+                    retained_graph.moe_resource_fingerprint == captured_resource_fingerprint);
+            }
+            (void) candidate_certify_graph(*context, candidate.graph);
             transition_executed = true;
         }
     }
@@ -5378,14 +5400,91 @@ static void test_active_grouped_multirow_graph_modes_case(
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
     CHECK(executed_passes == (capture_available ? 4u : transition_executed ? 2u : 1u));
-    CHECK(telemetry.plan_calls == executed_passes && telemetry.plan_compiles == 1 &&
-        telemetry.plan_reuses == executed_passes - 1);
+    const uint64_t transition_plan_compiles = transition_executed ? 2 : 1;
+    CHECK(telemetry.plan_calls == executed_passes && telemetry.plan_compiles == transition_plan_compiles &&
+        telemetry.plan_reuses == executed_passes - transition_plan_compiles);
     CHECK(telemetry.calls == executed_passes && telemetry.ready == executed_passes && telemetry.completed == executed_passes);
     CHECK(telemetry.ready_min == executed_passes && telemetry.ready_max == executed_passes);
     CHECK(telemetry.completed_min == executed_passes && telemetry.completed_max == executed_passes);
     CHECK(telemetry.admitted_banks == executed_passes * candidate.banks.size());
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
     CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+
+    if (capture_available && test_transition) {
+        auto expected = std::vector<float>();
+        auto actual = std::vector<float>();
+        ggml_cuda_graph_capture_state_for_test invalidated_graph;
+        const auto recapture_main = [&]() {
+            candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
+            (void) candidate_certify_graph(*context, candidate.graph);
+            for (uint32_t pass = 0; pass < 2; ++pass) {
+                expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+                actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+                check_active_grouped_exact_output(expected, actual);
+            }
+            ggml_cuda_graph_capture_state_for_test state;
+            CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &state));
+            CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete && state.moe_resource_fingerprint != 0);
+        };
+
+        const auto inventory_shape = [](const ggml_cgraph * graph) {
+            std::pair<uint32_t, int32_t> result = {0, -1};
+            for (int32_t node_index = 0; node_index < graph->n_nodes; ++node_index) {
+                const ggml_tensor * node = graph->nodes[node_index];
+                const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+                if (source == nullptr || source->buffer == nullptr ||
+                        !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+                    continue;
+                }
+                if (result.second < 0) {
+                    result.second = node_index;
+                }
+                ++result.first;
+            }
+            return result;
+        };
+        CHECK(candidate.graph->n_nodes > 1 && candidate.graph->nodes[1]->op == GGML_OP_VIEW);
+        candidate_insert_graph_node(candidate_prefill.graph, 1, candidate.graph->nodes[1]);
+        const auto certified_inventory = inventory_shape(candidate_prefill.graph);
+        const auto stale_coverage = candidate_certify_graph(*context, candidate_prefill.graph);
+        CHECK(certified_inventory.first == stale_coverage.mmid_count && stale_coverage.mmid_count == candidate.banks.size());
+        ggml_tensor * inventory_padding = candidate_prefill.graph->nodes[1];
+        memmove(candidate_prefill.graph->nodes + 1, candidate_prefill.graph->nodes + 2,
+            (candidate_prefill.graph->n_nodes - 2) * sizeof(candidate_prefill.graph->nodes[0]));
+        candidate_prefill.graph->nodes[candidate_prefill.graph->n_nodes - 1] = inventory_padding;
+        candidate_rebuild_graph_uses(candidate_prefill.graph);
+        const auto stale_inventory = inventory_shape(candidate_prefill.graph);
+        CHECK(candidate_prefill.graph->nodes[0] == candidate.graph->nodes[0] &&
+            stale_inventory.first == certified_inventory.first && stale_inventory.second + 1 == certified_inventory.second);
+        (void) run_cached_mmid_path_test(
+            candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
+        CHECK(invalidated_graph.graph == 0 && invalidated_graph.instance == 0 &&
+            !invalidated_graph.warmup_complete && invalidated_graph.moe_resource_fingerprint == 0);
+
+        recapture_main();
+        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
+        (void) candidate_certify_graph(*context, candidate.graph);
+        expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+        actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        check_active_grouped_exact_output(expected, actual);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
+        CHECK(invalidated_graph.graph == 0 && invalidated_graph.instance == 0 &&
+            !invalidated_graph.warmup_complete && invalidated_graph.moe_resource_fingerprint == 0);
+
+        recapture_main();
+        register_active_grouped_dispatch(
+            candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, n_slots);
+        (void) candidate_certify_graph(*context, candidate.graph);
+        expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+        actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        check_active_grouped_exact_output(expected, actual);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
+        CHECK(invalidated_graph.graph == 0 && invalidated_graph.instance == 0 &&
+            !invalidated_graph.warmup_complete && invalidated_graph.moe_resource_fingerprint == 0);
+    }
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, capture_available ?
         "test-moe-cache: active grouped E%u K%u B%u direct/capture/replay dynamic routes OK\n" :

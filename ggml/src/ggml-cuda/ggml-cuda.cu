@@ -3767,49 +3767,63 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * has_c
     return use_cuda_graph;
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    bool res = false;
+struct ggml_cuda_graph_property_probe {
+    bool changed;
+    bool uid_match;
+};
 
+static ggml_cuda_graph::node_properties ggml_cuda_graph_node_properties(const ggml_tensor * node) {
+    ggml_cuda_graph::node_properties prop = {};
+    memcpy(&prop.node, node, sizeof(ggml_tensor));
+
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        if (node->src[j]) {
+            prop.node_src_data_ptrs[j] = node->src[j]->data;
+            memcpy(prop.node_src_ne[j], node->src[j]->ne, sizeof(prop.node_src_ne[j]));
+            memcpy(prop.node_src_nb[j], node->src[j]->nb, sizeof(prop.node_src_nb[j]));
+        }
+    }
+    return prop;
+}
+
+static ggml_cuda_graph_property_probe ggml_cuda_graph_probe_properties(
+        ggml_backend_cuda_context * cuda_ctx,
+        ggml_cgraph * cgraph) {
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    const ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     const uint64_t execution_semantic_key = ggml_cuda_moe_execution_semantic_key(cgraph);
 
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid && execution_semantic_key == graph->execution_semantic_key) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
-        return false;
+        return {false, true};
     }
 
-    res = execution_semantic_key != graph->execution_semantic_key;
-    graph->uid = cgraph->uid;
-    graph->execution_semantic_key = execution_semantic_key;
-
-    // Check if the graph size has changed
-    if ((int)graph->node_props.size() != cgraph->n_nodes) {
-        res = true;
-        graph->node_props.resize(cgraph->n_nodes);
+    if (execution_semantic_key != graph->execution_semantic_key ||
+            (int) graph->node_props.size() != cgraph->n_nodes) {
+        return {true, false};
     }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_cuda_graph::node_properties prop = {};
-        memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
-
-        for (int j = 0; j < GGML_MAX_SRC; ++j) {
-            if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
-            }
-        }
-
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
-            graph->node_props[i] = prop;
-            res = true;
+        const auto prop = ggml_cuda_graph_node_properties(cgraph->nodes[i]);
+        if (memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            return {true, false};
         }
     }
 
-    return res;
+    return {false, false};
+}
+
+static void ggml_cuda_graph_commit_properties(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+    graph->uid = cgraph->uid;
+    graph->execution_semantic_key = ggml_cuda_moe_execution_semantic_key(cgraph);
+    graph->node_props.resize(cgraph->n_nodes);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        graph->node_props[i] = ggml_cuda_graph_node_properties(cgraph->nodes[i]);
+    }
 }
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
@@ -5663,6 +5677,37 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static void ggml_cuda_graph_invalidate_moe_capture(ggml_cuda_graph * graph) {
+    if (graph == nullptr) {
+        return;
+    }
+#ifdef USE_CUDA_GRAPH
+    graph->warmup_complete = false;
+    if (graph->moe_resource_fingerprint != 0) {
+        if (graph->instance != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+            graph->instance = nullptr;
+        }
+        if (graph->graph != nullptr) {
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+            graph->graph = nullptr;
+        }
+        graph->moe_resource_witnesses.clear();
+    }
+#endif
+    graph->moe_resource_fingerprint = 0;
+}
+
+#ifdef USE_CUDA_GRAPH
+static bool ggml_cuda_graph_has_complete_moe_capture(const ggml_cuda_graph * graph) {
+    return graph != nullptr && graph->graph != nullptr && graph->instance != nullptr && graph->warmup_complete &&
+        graph->execution_semantic_key != 0 && graph->moe_resource_fingerprint != 0 && !graph->node_props.empty() &&
+        !graph->moe_resource_witnesses.empty() && std::all_of(
+            graph->moe_resource_witnesses.begin(), graph->moe_resource_witnesses.end(),
+            [](const std::weak_ptr<void> & witness) { return !witness.expired(); });
+}
+#endif
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -5671,6 +5716,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     bool graph_has_cached_mmid      = false;
+#ifdef USE_CUDA_GRAPH
+    bool graph_enabled_compatible   = false;
+    bool graph_properties_changed   = false;
+    bool graph_property_uid_match   = false;
+#endif
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = nullptr;
 #ifdef USE_CUDA_GRAPH
@@ -5682,36 +5732,25 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
     ggml_cuda_moe_graph_property_hint moe_property_hint = GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN;
     ggml_cuda_moe_graph_execution moe_execution;
+#ifdef USE_CUDA_GRAPH
+    std::shared_ptr<ggml_cuda_moe_graph_plan> prepared_plan;
+#endif
+    uint64_t coverage_epoch = 0;
+    uint64_t coverage_mmid_fingerprint = 0;
+    const void * coverage_nodes = nullptr;
+    uint32_t coverage_mmid_count = 0;
 
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &graph_has_cached_mmid);
-        if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
-            moe_property_hint = properties_changed ? GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED : GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED;
-
-            if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
-                    graph->warmup_complete = true;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = true;
-                }
-                // else: properties changed or first call - execute directly (use_cuda_graph stays false)
-            } else {
-                // Post-warmup: normal CUDA graph operation
-                if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
-                } else {
-                    use_cuda_graph = true;
-                    cuda_graph_update_required = graph->instance == nullptr;
-                }
-            }
+        graph_enabled_compatible = ggml_cuda_graph_check_compability(cgraph, &graph_has_cached_mmid);
+        if (graph_enabled_compatible) {
+            const auto property_probe = ggml_cuda_graph_probe_properties(cuda_ctx, cgraph);
+            graph_properties_changed = property_probe.changed;
+            graph_property_uid_match = property_probe.uid_match;
+            moe_property_hint = graph_properties_changed ?
+                GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED : GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED;
         }
     }
 #endif // USE_CUDA_GRAPH
@@ -5719,10 +5758,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (cuda_ctx->moe_grouped_context != nullptr) {
         std::shared_ptr<ggml_cuda_moe_graph_plan> local_plan;
         std::shared_ptr<ggml_cuda_moe_graph_plan> * plan = &local_plan;
-        uint64_t coverage_epoch = 0;
-        uint64_t coverage_mmid_fingerprint = 0;
-        const void * coverage_nodes = nullptr;
-        uint32_t coverage_mmid_count = 0;
         if (graph->moe_coverage_nodes != cgraph->nodes || graph->moe_coverage_n_nodes != cgraph->n_nodes) {
             cuda_ctx->recover_moe_graph(cgraph, graph);
         }
@@ -5738,42 +5773,81 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cgraph, cgraph->uid, moe_property_hint, plan, &moe_execution, coverage_epoch, coverage_nodes,
             coverage_mmid_count, coverage_mmid_fingerprint);
         if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
+            ggml_cuda_graph_invalidate_moe_capture(graph);
             return GGML_STATUS_FAILED;
         }
+#ifdef USE_CUDA_GRAPH
+        prepared_plan = *plan;
+#endif
     }
     const bool moe_dispatch = moe_execution.requires_dispatch();
     ggml_cuda_moe_graph_dispatch_mode moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
     uint64_t moe_resource_fingerprint = 0;
     std::vector<std::shared_ptr<void>> moe_resource_leases;
     std::vector<std::weak_ptr<void>> moe_resource_witnesses;
-    const auto force_moe_direct = [&]() {
+    const auto set_moe_direct = [&]() {
         moe_resource_leases.clear();
         moe_resource_witnesses.clear();
         use_cuda_graph = false;
         cuda_graph_update_required = false;
-        if (graph != nullptr) {
-#ifdef USE_CUDA_GRAPH
-            graph->warmup_complete = false;
-            if (graph->moe_resource_fingerprint != 0) {
-                if (graph->instance != nullptr) {
-                    CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
-                    graph->instance = nullptr;
-                }
-                if (graph->graph != nullptr) {
-                    CUDA_CHECK(cudaGraphDestroy(graph->graph));
-                    graph->graph = nullptr;
-                }
-                graph->moe_resource_witnesses.clear();
-            }
-#endif
-            graph->moe_resource_fingerprint = 0;
-        }
     };
-    if (graph_has_cached_mmid && moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+    const auto force_moe_direct = [&]() {
+        set_moe_direct();
+        ggml_cuda_graph_invalidate_moe_capture(graph);
+    };
+    bool retain_grouped_capture = false;
+#ifdef USE_CUDA_GRAPH
+    if (graph_enabled_compatible && graph_has_cached_mmid && prepared_plan != nullptr && moe_dispatch &&
+            moe_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY &&
+            prepared_plan->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY &&
+            prepared_plan->has_certified_complete_mmid_inventory() &&
+            prepared_plan->size() != 0 && prepared_plan->size() == moe_execution.size() &&
+            prepared_plan->graph_node_count() == cgraph->n_nodes && coverage_epoch != 0 &&
+            coverage_nodes == cgraph->nodes && coverage_mmid_fingerprint != 0) {
+        const auto & diagnostics = prepared_plan->coverage_diagnostics();
+        retain_grouped_capture = diagnostics.cached_mmid != 0 &&
+            coverage_mmid_count == diagnostics.cached_mmid &&
+            diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid &&
+            ggml_cuda_graph_has_complete_moe_capture(graph);
+    }
+
+    if (retain_grouped_capture) {
+        set_moe_direct();
+        graph->uid = 0;
+    } else if (graph_enabled_compatible) {
+        if (!graph_property_uid_match) {
+            ggml_cuda_graph_commit_properties(cuda_ctx, cgraph);
+        }
+        if (graph_properties_changed && graph->moe_resource_fingerprint != 0) {
+            force_moe_direct();
+        } else if (!graph->warmup_complete) {
+            // Warmup: need at least 2 calls with no property change on the 2nd call
+            if (!graph_properties_changed) {
+                graph->warmup_complete = true;
+                GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
+                use_cuda_graph = true;
+                cuda_graph_update_required = true;
+            }
+            // else: properties changed or first call - execute directly (use_cuda_graph stays false)
+        } else if (graph_properties_changed) {
+            // Properties changed - reset warmup, execute directly until stable again
+            graph->warmup_complete = false;
+            GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+        } else {
+            use_cuda_graph = true;
+            cuda_graph_update_required = graph->instance == nullptr;
+        }
+    } else if (graph != nullptr && graph->moe_resource_fingerprint != 0) {
+        force_moe_direct();
+    }
+#endif
+    if (!retain_grouped_capture && graph_has_cached_mmid &&
+            moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
         force_moe_direct();
     }
     if (moe_dispatch) {
         if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
+            force_moe_direct();
             return GGML_STATUS_FAILED;
         }
         const auto outcome = moe_execution.outcome();
@@ -5809,10 +5883,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR) {
             force_moe_direct();
             moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
-        } else if (graph != nullptr && graph->moe_resource_fingerprint != 0) {
+        } else if (!retain_grouped_capture && graph != nullptr && graph->moe_resource_fingerprint != 0) {
             force_moe_direct();
         }
         if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
+            force_moe_direct();
             return GGML_STATUS_FAILED;
         }
         if ((moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE ||
@@ -5821,11 +5896,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     &moe_execution, moe_dispatch_mode, moe_resource_fingerprint,
                     moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY ? &graph->moe_resource_witnesses : nullptr)) {
             if (!cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
+                force_moe_direct();
                 return GGML_STATUS_FAILED;
             }
             force_moe_direct();
             moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
             if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
+                force_moe_direct();
                 return GGML_STATUS_FAILED;
             }
         }
@@ -5853,6 +5930,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     const bool dispatch_finished = !moe_dispatch || cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution);
     if (!graph_evaluated || !dispatch_finished) {
+        force_moe_direct();
         return GGML_STATUS_FAILED;
     }
 

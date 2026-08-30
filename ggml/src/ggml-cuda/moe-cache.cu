@@ -2902,6 +2902,13 @@ ggml_cuda_moe_graph_outcome ggml_cuda_moe_graph_plan::outcome() const {
     return initialized_ ? outcome_ : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
 }
 
+bool ggml_cuda_moe_graph_plan::has_certified_complete_mmid_inventory() const {
+    return initialized_ && unknown_reusable_ && inventory_complete_ && coverage_epoch_ != 0 &&
+        coverage_nodes_ != nullptr && coverage_mmid_fingerprint_ != 0 &&
+        coverage_mmid_count_ == coverage_diagnostics_.cached_mmid &&
+        mmid_inventory_.size() == coverage_mmid_count_;
+}
+
 const ggml_cuda_moe_graph_coverage_diagnostics & ggml_cuda_moe_graph_plan::coverage_diagnostics() const {
     return coverage_diagnostics_;
 }

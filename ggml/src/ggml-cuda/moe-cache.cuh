@@ -454,6 +454,7 @@ public:
     uint64_t graph_uid() const;
     int32_t graph_node_count() const;
     ggml_cuda_moe_graph_outcome outcome() const;
+    bool has_certified_complete_mmid_inventory() const;
     const ggml_cuda_moe_graph_coverage_diagnostics & coverage_diagnostics() const;
 
 private:
