@@ -5917,6 +5917,69 @@ static void test_active_grouped_cache12_route_limit_transition(int device) {
         "test-moe-cache: shared-bank cache12 K8 B1/B2-legacy/B1 direct transition OK (CUDA graphs unavailable)\n");
 }
 
+static void test_active_grouped_legacy_phase_telemetry(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+    auto reference = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
+    auto candidate = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
+    initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+    const auto disabled = candidate_snapshot(12, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    CHECK(context != nullptr);
+
+    struct phase_case {
+        uint32_t domain;
+        uint32_t row_semantics;
+        uint32_t n_sequences;
+        bool certified;
+        bool is_decode;
+    };
+    const std::array<phase_case, 6> cases = {{
+        {GGML_GRAPH_EXECUTION_DOMAIN_MAIN,  GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, true,  true},
+        {GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, true,  true},
+        {GGML_GRAPH_EXECUTION_DOMAIN_MTP,   GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, true,  true},
+        {GGML_GRAPH_EXECUTION_DOMAIN_MAIN,  GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, 1, true,  true},
+        {GGML_GRAPH_EXECUTION_DOMAIN_MAIN,  GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,  1, true,  false},
+        {GGML_GRAPH_EXECUTION_DOMAIN_INVALID, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID,    0, false, false},
+    }};
+    for (size_t index = 0; index < cases.size(); ++index) {
+        const auto & current = cases[index];
+        if (current.certified) {
+            candidate_stamp_execution(
+                candidate.graph, current.domain, current.row_semantics, candidate.n_rows, current.n_sequences);
+        } else {
+            candidate.graph->uid = ggml_graph_next_uid();
+            candidate.graph->execution_certificate = {};
+        }
+        (void) candidate_certify_graph(*context, candidate.graph);
+        set_active_grouped_dispatch_logits({&reference, &candidate}, index % 3);
+        const uint64_t decode_before = active_grouped_legacy_op_count(candidate_backend.get(), true);
+        const uint64_t prefill_before = active_grouped_legacy_op_count(candidate_backend.get(), false);
+        const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        CHECK(expected == actual);
+        check_active_grouped_routes(reference, reference.n_rows, index % 3);
+        check_active_grouped_routes(candidate, candidate.n_rows, index % 3);
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) ==
+            decode_before + (current.is_decode ? candidate.banks.size() : 0));
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), false) ==
+            prefill_before + (current.is_decode ? 0 : candidate.banks.size()));
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: certified legacy phase telemetry OK\n");
+}
+
 static void test_active_grouped_stream_coherence_fallback(int device) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
@@ -6060,6 +6123,7 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
     test_active_grouped_same_key_row_transitions(device);
     test_active_grouped_cache12_route_limit_transition(device);
+    test_active_grouped_legacy_phase_telemetry(device);
     test_active_grouped_stream_coherence_fallback(device);
 }
 
@@ -8985,6 +9049,7 @@ int main(int argc, char ** argv) {
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
     const bool grouped_multirow_only = argc == 2 && strcmp(argv[1], "--grouped-multirow-only") == 0;
+    const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     if (gemma_q4_parity_only) {
         int dev = 0;
@@ -8996,6 +9061,12 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_active_grouped_multirow_graph_modes(dev);
+        return 0;
+    }
+    if (legacy_phase_telemetry_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_legacy_phase_telemetry(dev);
         return 0;
     }
     test_candidate_graph_coverage_ledger();

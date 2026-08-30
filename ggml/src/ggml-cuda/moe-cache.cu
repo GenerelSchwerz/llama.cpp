@@ -3088,7 +3088,9 @@ ggml_cuda_moe_group_call_lease::ggml_cuda_moe_group_call_lease(ggml_cuda_moe_gro
         candidate_generation_(other.candidate_generation_),
         authority_epoch_(other.authority_epoch_),
         group_index_(other.group_index_),
-        authority_(other.authority_) {
+        authority_(other.authority_),
+        execution_domain_(other.execution_domain_),
+        row_semantics_(other.row_semantics_) {
     other.owner_ = nullptr;
 }
 
@@ -3104,6 +3106,8 @@ ggml_cuda_moe_group_call_lease & ggml_cuda_moe_group_call_lease::operator=(ggml_
     authority_epoch_ = other.authority_epoch_;
     group_index_ = other.group_index_;
     authority_ = other.authority_;
+    execution_domain_ = other.execution_domain_;
+    row_semantics_ = other.row_semantics_;
     other.owner_ = nullptr;
     return *this;
 }
@@ -3114,6 +3118,21 @@ ggml_cuda_moe_group_call_lease::operator bool() const noexcept {
 
 ggml_cuda_moe_group_authority ggml_cuda_moe_group_call_lease::authority() const noexcept {
     return authority_;
+}
+
+bool ggml_cuda_moe_group_call_lease::legacy_telemetry_is_decode(bool fallback) const noexcept {
+    if (owner_ == nullptr || execution_domain_ < GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
+            execution_domain_ > GGML_GRAPH_EXECUTION_DOMAIN_MTP) {
+        return fallback;
+    }
+    if (row_semantics_ == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL) {
+        return false;
+    }
+    if (row_semantics_ == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+            row_semantics_ == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE) {
+        return true;
+    }
+    return fallback;
 }
 
 ggml_cuda_moe_legacy_operation_lease::ggml_cuda_moe_legacy_operation_lease() noexcept = default;
@@ -7221,6 +7240,8 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 lease.authority_epoch_ = current.epoch;
                 lease.group_index_ = group_index;
                 lease.authority_ = current.authority;
+                lease.execution_domain_ = execution->plan_->execution_certificate_.domain;
+                lease.row_semantics_ = execution->plan_->execution_certificate_.row_semantics;
                 auto & dispatch = execution->groups_[record_index];
                 dispatch.transaction = {};
                 dispatch.remapped_ids = nullptr;
@@ -7385,6 +7406,8 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             lease.authority_epoch_ = current.epoch;
             lease.group_index_ = group_index;
             lease.authority_ = current.authority;
+            lease.execution_domain_ = execution->plan_->execution_certificate_.domain;
+            lease.row_semantics_ = execution->plan_->execution_certificate_.row_semantics;
             auto & dispatch = execution->groups_[record_index];
             dispatch.transaction = {};
             dispatch.remapped_ids = nullptr;

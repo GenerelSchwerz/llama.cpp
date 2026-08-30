@@ -294,6 +294,7 @@ public:
 
     explicit operator bool() const noexcept;
     ggml_cuda_moe_group_authority authority() const noexcept;
+    bool legacy_telemetry_is_decode(bool fallback) const noexcept;
 
 private:
     friend class ggml_cuda_moe_grouped_context;
@@ -303,6 +304,8 @@ private:
     uint64_t authority_epoch_ = 0;
     uint32_t group_index_ = UINT32_MAX;
     ggml_cuda_moe_group_authority authority_ = GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
+    uint32_t execution_domain_ = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+    uint32_t row_semantics_ = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
 };
 
 enum ggml_cuda_moe_graph_group_state : uint32_t {

@@ -2611,7 +2611,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
                                         size_t ids_host_nb0,
                                         size_t ids_host_nb1,
                                         size_t ids_host_nb2,
-                                        bool is_decode,
+                                        bool single_row,
+                                        bool telemetry_is_decode,
                                         bool overflow,
                                         ggml_cuda_moe_cache * cache,
                                         ggml_cuda_moe_grouped_context * owner) {
@@ -2647,8 +2648,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     const int n_unique = (int)unique_experts.size();
     GGML_ASSERT(n_unique > 0);
-    const bool compact_mmvq = !is_decode && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
-    const bool compact_source = is_decode || compact_mmvq;
+    const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
+    const bool compact_source = single_row || compact_mmvq;
 
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
@@ -2743,7 +2744,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             cache, split_slot_ids.data(), n_unique, stream);
         GGML_ASSERT(slots_released);
         ggml_cuda_moe_record_legacy_op(owner,
-            is_decode, true, overflow, (uint64_t)n_unique, (uint64_t)ggml_nbytes(ids),
+            telemetry_is_decode, true, overflow, (uint64_t)n_unique, (uint64_t)ggml_nbytes(ids),
             0, 0, 0, 0, 0, 0, (uint64_t)(ggml_time_us() - op_start_us), false);
         return;
     }
@@ -2789,7 +2790,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         GGML_ASSERT(dispatched);
 
         ggml_cuda_moe_record_legacy_op(owner,
-            is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
+            telemetry_is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
             0, 0, 0, 0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
         return;
     }
@@ -2810,7 +2811,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     dst->src[0] = orig_src0;
 
     ggml_cuda_moe_record_legacy_op(owner,
-        is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
+        telemetry_is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
         0, 0, 0, 0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
 }
 
@@ -2847,7 +2848,9 @@ static void ggml_cuda_mul_mat_id_cached(
     ggml_tensor * ids  = dst->src[2];   // routing decision
 
     cudaStream_t stream = ctx.stream();
-    const bool   is_decode = ids->ne[1] * ids->ne[2] == 1;
+    const bool   single_row = ids->ne[1] * ids->ne[2] == 1;
+    const bool   telemetry_is_decode = authority != nullptr ?
+        authority->legacy_telemetry_is_decode(single_row) : single_row;
     const bool   use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
     auto * owner = ctx.moe_grouped_context;
     auto owner_lease = owner != nullptr ? owner->begin_legacy_operation() : ggml_cuda_moe_legacy_operation_lease{};
@@ -2869,7 +2872,8 @@ static void ggml_cuda_mul_mat_id_cached(
 
     if (cache == nullptr) {
         ggml_cuda_mul_mat_id_staged(
-            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2, is_decode, false, nullptr, leased_owner);
+            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
+            single_row, telemetry_is_decode, false, nullptr, leased_owner);
         return;
     }
 
@@ -2911,22 +2915,25 @@ static void ggml_cuda_mul_mat_id_cached(
 
     if (overflow) {
         if (ids_group_pending && leased_owner != nullptr) {
-            leased_owner->prefetch_legacy_siblings(cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, is_decode);
+            leased_owner->prefetch_legacy_siblings(
+                cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, telemetry_is_decode);
         }
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
         ggml_cuda_mul_mat_id_staged(
-            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2, is_decode, true, cache, leased_owner);
+            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
+            single_row, telemetry_is_decode, true, cache, leased_owner);
         return;
     }
 
-    const bool compact_mmvq = !is_decode && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
-    const bool compact_source = is_decode || compact_mmvq;
+    const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
+    const bool compact_source = single_row || compact_mmvq;
 
     const int64_t acquire_start_us = ggml_time_us();
 
     if (leased_owner != nullptr) {
-        leased_owner->prefetch_legacy_siblings(cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, is_decode);
+        leased_owner->prefetch_legacy_siblings(
+            cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, telemetry_is_decode);
     }
 
     // 5. Reset sentinels and acquire each unique expert on this tensor's cache.
@@ -2947,7 +2954,8 @@ static void ggml_cuda_mul_mat_id_cached(
                 if (expert_to_slot[eid] >= 0) continue;
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
-                int slot = ggml_cuda_moe_cache_acquire(cache, host_ptr, expert_stride, copy_stream, use_l2, is_decode, false, true);
+                int slot = ggml_cuda_moe_cache_acquire(
+                    cache, host_ptr, expert_stride, copy_stream, use_l2, telemetry_is_decode, false, true);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
@@ -2965,7 +2973,8 @@ static void ggml_cuda_mul_mat_id_cached(
         // Cache had an internal failure (e.g., cudaMemcpyAsync error mid-op).
         // Fall back so we still produce correct output.
         ggml_cuda_mul_mat_id_staged(
-            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2, is_decode, false, nullptr, leased_owner);
+            ctx, dst, *ids_host_bytes, ids_host_nb0, ids_host_nb1, ids_host_nb2,
+            single_row, telemetry_is_decode, false, nullptr, leased_owner);
         return;
     }
     const uint64_t acquire_time_us = (uint64_t) (ggml_time_us() - acquire_start_us);
@@ -3048,7 +3057,7 @@ static void ggml_cuda_mul_mat_id_cached(
     ggml_cuda_moe_cache_release_slots(cache, pinned_slots.data(), (int) pinned_slots.size());
 
     ggml_cuda_moe_record_legacy_op(leased_owner,
-        is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
+        telemetry_is_decode, false, false, (uint64_t) unique_eids.size(), (uint64_t) ggml_nbytes(ids),
         ids_d2h_time_us, ids_d2h_sync_count, acquire_time_us, remap_time_us,
         1, copy_wait_event_time_us, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
 }
