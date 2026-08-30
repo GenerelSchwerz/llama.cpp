@@ -2259,7 +2259,8 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
     std::vector<std::vector<uint32_t>> devs_ils;
 
     for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-        if (!hparams.has_kv(il)) {
+        // a recurrent layer keeps its state elsewhere, so it must not take from the budget
+        if (!hparams.has_kv(il) || hparams.is_recr(il)) {
             continue;
         }
         auto * dev = model.dev_layer(il);
