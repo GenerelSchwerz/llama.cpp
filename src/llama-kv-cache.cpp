@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 
 static bool ggml_is_power_of_2(int n) {
@@ -180,6 +181,45 @@ llama_kv_cache::llama_kv_cache(
     const bool is_mla = hparams.is_mla();
     uint32_t n_gpu_resident = 0;
 
+    // Pick the layers that stay device-resident when the cache is otherwise host-resident.
+    // Taking them in layer order fills the device that owns the first layers and leaves the free
+    // memory of the others unused, so take one layer per device in turn instead.
+    std::set<uint32_t> gpu_resident_ils;
+    if (!offload && placement.gpu_resident_layers > 0) {
+        std::vector<ggml_backend_dev_t>    devs;
+        std::vector<std::vector<uint32_t>> devs_ils;
+
+        for (uint32_t il = 0; il < n_layer; il++) {
+            if (!hparams.has_kv(il) || (filter && !filter(il))) {
+                continue;
+            }
+            auto * dev = model.dev_layer(il);
+            if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+            auto it = std::find(devs.begin(), devs.end(), dev);
+            if (it == devs.end()) {
+                devs.push_back(dev);
+                devs_ils.emplace_back();
+                it = devs.end() - 1;
+            }
+            devs_ils[it - devs.begin()].push_back(il);
+        }
+
+        for (size_t i = 0; gpu_resident_ils.size() < placement.gpu_resident_layers; i++) {
+            bool any = false;
+            for (size_t d = 0; d < devs.size() && gpu_resident_ils.size() < placement.gpu_resident_layers; d++) {
+                if (i < devs_ils[d].size()) {
+                    gpu_resident_ils.insert(devs_ils[d][i]);
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+        }
+    }
+
     enum class kv_store_side {
         key,
         value,
@@ -285,7 +325,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
+        const bool layer_offload = offload || gpu_resident_ils.count(il) > 0;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (layer_offload) {
