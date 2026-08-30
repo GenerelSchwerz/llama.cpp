@@ -4325,7 +4325,8 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_rows = 1,
         uint32_t n_experts = 8,
         uint32_t n_used = 2,
-        uint32_t n_dim = 256) {
+        uint32_t n_dim = 256,
+        const active_grouped_dispatch_graph * shared_banks = nullptr) {
     CHECK(n_rows >= 1 && n_rows <= 4 && n_used >= 1 && n_used <= n_experts);
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
@@ -4342,13 +4343,27 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     result.n_experts = n_experts;
     result.n_used = n_used;
     result.n_rows = n_rows;
-    result.weights.reset(ggml_init(weight_params));
+    CHECK(shared_banks == nullptr ||
+        (shared_banks->n_experts == n_experts && shared_banks->n_used == n_used));
+    if (shared_banks == nullptr) {
+        result.weights.reset(ggml_init(weight_params));
+    }
     result.nodes.reset(ggml_init(node_params));
-    CHECK(result.weights != nullptr && result.nodes != nullptr);
+    CHECK((shared_banks != nullptr || result.weights != nullptr) && result.nodes != nullptr);
 
+    size_t shared_bank_index = 0;
     auto add_bank = [&](ggml_type type, int64_t ne1, uint32_t role, const char * name) {
-        ggml_tensor * tensor = ggml_new_tensor_3d(result.weights.get(), type, n_dim, ne1, n_experts);
-        ggml_set_name(tensor, name);
+        ggml_tensor * tensor = nullptr;
+        if (shared_banks != nullptr) {
+            CHECK(shared_bank_index < shared_banks->banks.size() && shared_bank_index < shared_banks->roles.size());
+            tensor = shared_banks->banks[shared_bank_index];
+            CHECK(tensor != nullptr && tensor->type == type && tensor->ne[0] == n_dim && tensor->ne[1] == ne1 &&
+                tensor->ne[2] == n_experts && shared_banks->roles[shared_bank_index] == role);
+            ++shared_bank_index;
+        } else {
+            tensor = ggml_new_tensor_3d(result.weights.get(), type, n_dim, ne1, n_experts);
+            ggml_set_name(tensor, name);
+        }
         result.banks.push_back(tensor);
         result.roles.push_back(role);
         return tensor;
@@ -4368,7 +4383,14 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     result.down = add_bank(types[layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 1 : 2],
         n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
         "test_active_down_weight");
-    if (original_direct_nvfp4_scales) {
+    if (shared_banks != nullptr) {
+        result.gate_scale = shared_banks->gate_scale;
+        result.up_scale = shared_banks->up_scale;
+        result.down_scale = shared_banks->down_scale;
+        CHECK((original_direct_nvfp4_scales && result.gate_scale != nullptr && result.up_scale != nullptr && result.down_scale != nullptr) ||
+            (!original_direct_nvfp4_scales && result.gate_scale == nullptr && result.up_scale == nullptr &&
+                (original_direct_down_scale == (result.down_scale != nullptr))));
+    } else if (original_direct_nvfp4_scales) {
         CHECK(layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
             types[0] == GGML_TYPE_NVFP4 && types[1] == GGML_TYPE_NVFP4 && types[2] == GGML_TYPE_NVFP4);
         result.gate_scale = ggml_new_tensor_1d(result.weights.get(), GGML_TYPE_F32, n_experts);
@@ -4427,10 +4449,16 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     ggml_build_forward_expand(result.graph, result.output);
     candidate_stamp_execution(result.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
-    result.weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result.weights.get(), weight_buft));
+    if (shared_banks == nullptr) {
+        result.weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result.weights.get(), weight_buft));
+    } else {
+        CHECK(shared_bank_index == shared_banks->banks.size());
+    }
     result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
-    CHECK(result.weight_buffer != nullptr && result.node_buffer != nullptr);
-    ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    CHECK((shared_banks != nullptr || result.weight_buffer != nullptr) && result.node_buffer != nullptr);
+    if (result.weight_buffer != nullptr) {
+        ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
     return result;
 }
 
@@ -4443,10 +4471,11 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         uint32_t n_rows = 1,
         uint32_t n_experts = 8,
         uint32_t n_used = 2,
-        uint32_t n_dim = 256) {
+        uint32_t n_dim = 256,
+        const active_grouped_dispatch_graph * shared_banks = nullptr) {
     return build_active_grouped_dispatch_graph_types(
         backend, weight_buft, {type, type, type}, layout, original_direct_down_scale, false,
-        n_rows, n_experts, n_used, n_dim);
+        n_rows, n_experts, n_used, n_dim, shared_banks);
 }
 
 static constexpr int32_t active_grouped_route_variants[3][4][2] = {
@@ -5175,7 +5204,7 @@ static void check_active_grouped_routes(
             }
         }
     }
-    CHECK(has_repeated_expert);
+    CHECK(n_rows == 1 || has_repeated_expert);
 }
 
 static void check_active_grouped_exact_output(
@@ -5227,7 +5256,7 @@ static void test_active_grouped_multirow_graph_modes_case(
         uint32_t n_used = 2,
         uint32_t n_slots = 12,
         bool legacy_mmq_names = false) {
-    CHECK((n_rows == 2 || n_rows == 4) && n_used * n_rows <= 32 && n_used * n_rows <= n_slots);
+    CHECK((n_rows == 2 || n_rows == 3 || n_rows == 4) && n_used * n_rows <= 32 && n_used * n_rows <= n_slots);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
@@ -5492,10 +5521,321 @@ static void test_active_grouped_multirow_graph_modes_case(
         n_experts, n_used, n_rows);
 }
 
+static void test_active_grouped_same_key_row_transitions(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+
+    auto candidate_b4 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 4);
+    auto candidate_b1 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1, 8, 2, 256, &candidate_b4);
+    auto candidate_b2 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 8, 2, 256, &candidate_b4);
+    auto candidate_b3 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 3, 8, 2, 256, &candidate_b4);
+    auto reference_b1 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1);
+    auto reference_b2 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2);
+    auto reference_b3 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 3);
+    auto reference_b4 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 4);
+
+    initialize_active_grouped_dispatch_graphs({&reference_b1, &candidate_b1});
+    initialize_active_grouped_dispatch_graphs({&reference_b2, &candidate_b2});
+    initialize_active_grouped_dispatch_graphs({&reference_b3, &candidate_b3});
+    initialize_active_grouped_dispatch_graphs({&reference_b4, &candidate_b4});
+    const auto disabled = candidate_snapshot(48, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate_b4, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 48);
+
+    ggml_tensor * shared_first_node = candidate_b4.graph->nodes[0];
+    CHECK(shared_first_node != nullptr && shared_first_node->op != GGML_OP_MUL_MAT_ID);
+    candidate_insert_graph_node(candidate_b1.graph, 0, shared_first_node);
+    candidate_insert_graph_node(candidate_b2.graph, 0, shared_first_node);
+    candidate_insert_graph_node(candidate_b3.graph, 0, shared_first_node);
+    CHECK(candidate_b1.graph->nodes[0] == shared_first_node && candidate_b2.graph->nodes[0] == shared_first_node &&
+        candidate_b3.graph->nodes[0] == shared_first_node && candidate_b4.graph->nodes[0] == shared_first_node);
+
+    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    CHECK(context != nullptr);
+    std::array<active_grouped_dispatch_graph *, 4> references = {
+        &reference_b1, &reference_b2, &reference_b3, &reference_b4,
+    };
+    std::array<active_grouped_dispatch_graph *, 4> candidates = {
+        &candidate_b1, &candidate_b2, &candidate_b3, &candidate_b4,
+    };
+    for (const auto * candidate : candidates) {
+        CHECK(candidate->banks == candidate_b4.banks && candidate->down == candidate_b4.down);
+    }
+    std::array<uint64_t, 4> semantic_keys = {};
+    for (uint32_t row_index = 0; row_index < candidates.size(); ++row_index) {
+        semantic_keys[row_index] = ggml_cuda_moe_execution_semantic_key(candidates[row_index]->graph);
+        CHECK(semantic_keys[row_index] != 0);
+        for (uint32_t previous = 0; previous < row_index; ++previous) {
+            CHECK(semantic_keys[previous] != semantic_keys[row_index]);
+        }
+    }
+
+    uint32_t executed_passes = 0;
+    const auto run_checked = [&](uint32_t n_rows, uint32_t route_variant) {
+        CHECK(n_rows >= 1 && n_rows <= 4 && route_variant < 3);
+        auto & reference = *references[n_rows - 1];
+        auto & candidate = *candidates[n_rows - 1];
+        set_active_grouped_dispatch_logits({&reference, &candidate}, route_variant);
+        std::vector<float> sentinel(ggml_nelements(candidate.output), -4096.0f - n_rows);
+        ggml_backend_tensor_set(candidate.output, sentinel.data(), 0, sentinel.size() * sizeof(float));
+        const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        ++executed_passes;
+        check_active_grouped_exact_output(expected, actual);
+        check_active_grouped_routes(reference, n_rows, route_variant);
+        check_active_grouped_routes(candidate, n_rows, route_variant);
+    };
+
+    (void) candidate_certify_graph(*context, candidate_b4.graph);
+    run_checked(4, 0);
+    ggml_cuda_moe_candidate_group_key group_key;
+    CHECK(context->find_down_group_key(candidate_b4.down, &group_key));
+    ggml_cuda_moe_grouped_acquisition initial_resource;
+    ggml_cuda_moe_grouped_resource_info initial_info;
+    CHECK(context->acquire_group_resources(group_key, &initial_resource) &&
+        context->get_group_resources(initial_resource, &initial_info));
+    CHECK(initial_info.down == candidate_b4.down && initial_info.n_slots == 48 &&
+        initial_info.n_banks == candidate_b4.banks.size() && !initial_info.transaction_active);
+    const uint64_t resource_generation = initial_resource.resource_generation;
+    std::array<void *, 2> bank_data = {
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, group_key, candidate_b4.banks[0]),
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, group_key, candidate_b4.banks[1]),
+    };
+    CHECK(resource_generation != 0 && bank_data[0] != nullptr && bank_data[1] != nullptr);
+    const auto check_resource_identity = [&]() {
+        ggml_cuda_moe_grouped_acquisition resource;
+        ggml_cuda_moe_grouped_resource_info info;
+        CHECK(context->acquire_group_resources(group_key, &resource) && context->get_group_resources(resource, &info));
+        CHECK(resource.resource_generation == resource_generation && info.down == candidate_b4.down &&
+            info.n_slots == 48 && info.n_banks == candidate_b4.banks.size() && !info.transaction_active);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_bank_data(
+                *context, group_key, candidate_b4.banks[0]) == bank_data[0] &&
+            ggml_cuda_moe_grouped_context_test_access::device_bank_data(
+                *context, group_key, candidate_b4.banks[1]) == bank_data[1]);
+    };
+    ggml_cuda_graph_capture_state_for_test state;
+    CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b4.graph, &state));
+    const bool capture_available = state.capture_available;
+    CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete && state.moe_resource_fingerprint == 0 &&
+        (!capture_available || state.execution_semantic_key == semantic_keys[3]));
+
+    if (!capture_available) {
+        for (uint32_t n_rows : {3u, 2u, 1u, 4u}) {
+            (void) candidate_certify_graph(*context, candidates[n_rows - 1]->graph);
+            run_checked(n_rows, n_rows % 3);
+            check_resource_identity();
+        }
+    } else {
+        run_checked(4, 0);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b4.graph, &state));
+        CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
+            state.execution_semantic_key == semantic_keys[3] && state.moe_resource_fingerprint != 0);
+        uintptr_t captured_graph = state.graph;
+        uintptr_t captured_instance = state.instance;
+        run_checked(4, 1);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b4.graph, &state));
+        CHECK(state.graph == captured_graph && state.instance == captured_instance && state.warmup_complete &&
+            state.execution_semantic_key == semantic_keys[3] && state.moe_resource_fingerprint != 0);
+        const uint64_t b4_resource_fingerprint = state.moe_resource_fingerprint;
+
+        uint64_t previous_semantic_key = semantic_keys[3];
+        const std::array<uint32_t, 4> transitions = {3, 2, 1, 4};
+        for (uint32_t transition = 0; transition < transitions.size(); ++transition) {
+            const uint32_t n_rows = transitions[transition];
+            auto * graph = candidates[n_rows - 1]->graph;
+            const uint64_t semantic_key = semantic_keys[n_rows - 1];
+            CHECK(semantic_key != previous_semantic_key);
+            (void) candidate_certify_graph(*context, graph);
+            const uint32_t direct_variant = (transition + 2) % 3;
+            run_checked(n_rows, direct_variant);
+            check_resource_identity();
+            CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), graph, &state));
+            CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete &&
+                state.execution_semantic_key == semantic_key && state.moe_resource_fingerprint == 0);
+            if (n_rows == 4) {
+                run_checked(4, direct_variant);
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), graph, &state));
+                CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
+                    state.execution_semantic_key == semantic_keys[3] &&
+                    state.moe_resource_fingerprint == b4_resource_fingerprint);
+                captured_graph = state.graph;
+                captured_instance = state.instance;
+                run_checked(4, (direct_variant + 1) % 3);
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), graph, &state));
+                CHECK(state.graph == captured_graph && state.instance == captured_instance && state.warmup_complete &&
+                    state.execution_semantic_key == semantic_keys[3] &&
+                    state.moe_resource_fingerprint == b4_resource_fingerprint);
+            }
+            previous_semantic_key = semantic_key;
+        }
+        CHECK(previous_semantic_key == semantic_keys[3]);
+    }
+
+    CHECK(active_grouped_legacy_op_count(reference_backend.get(), true) +
+        active_grouped_legacy_op_count(reference_backend.get(), false) == executed_passes * reference_b1.banks.size());
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) == 0 &&
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
+    const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(telemetry.registered == 1 && telemetry.covered == 1 && telemetry.plan_calls == executed_passes &&
+        telemetry.plan_compiles == 5 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles &&
+        telemetry.calls == executed_passes &&
+        telemetry.ready == executed_passes && telemetry.completed == executed_passes &&
+        telemetry.admitted_banks == executed_passes * candidate_b1.banks.size());
+    CHECK(telemetry.ready_min == executed_passes && telemetry.ready_max == executed_passes &&
+        telemetry.completed_min == executed_passes && telemetry.completed_max == executed_passes);
+    CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, capture_available ?
+        "test-moe-cache: shared-bank cache48 B4/B3/B2/B1 capture transition OK\n" :
+        "test-moe-cache: shared-bank cache48 B4/B3/B2/B1 direct transition OK (CUDA graphs unavailable)\n");
+}
+
+static void test_active_grouped_cache12_route_limit_transition(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+
+    auto candidate_b1 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1, 128, 8);
+    auto candidate_b2 = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8, 256, &candidate_b1);
+    auto reference_b1 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1, 128, 8);
+    auto reference_b2 = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
+    initialize_active_grouped_dispatch_graphs({&reference_b1, &candidate_b1});
+    initialize_active_grouped_dispatch_graphs({&reference_b2, &candidate_b2});
+    const auto disabled = candidate_snapshot(12, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate_b1, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    CHECK(candidate_b2.banks == candidate_b1.banks && candidate_b2.down == candidate_b1.down);
+
+    ggml_tensor * shared_first_node = candidate_b1.graph->nodes[0];
+    CHECK(shared_first_node != nullptr && shared_first_node->op != GGML_OP_MUL_MAT_ID);
+    candidate_insert_graph_node(candidate_b2.graph, 0, shared_first_node);
+    CHECK(candidate_b2.graph->nodes[0] == candidate_b1.graph->nodes[0]);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    CHECK(context != nullptr);
+
+    uint32_t executed_passes = 0;
+    const auto run_checked = [&](active_grouped_dispatch_graph & reference,
+                                 active_grouped_dispatch_graph & candidate,
+                                 uint32_t route_variant) {
+        set_active_grouped_dispatch_logits({&reference, &candidate}, route_variant);
+        std::vector<float> sentinel(ggml_nelements(candidate.output), -8192.0f - candidate.n_rows);
+        ggml_backend_tensor_set(candidate.output, sentinel.data(), 0, sentinel.size() * sizeof(float));
+        const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        ++executed_passes;
+        check_active_grouped_exact_output(expected, actual);
+        check_active_grouped_routes(reference, reference.n_rows, route_variant);
+        check_active_grouped_routes(candidate, candidate.n_rows, route_variant);
+    };
+
+    (void) candidate_certify_graph(*context, candidate_b1.graph);
+    run_checked(reference_b1, candidate_b1, 0);
+    ggml_cuda_moe_candidate_group_key group_key;
+    ggml_cuda_moe_grouped_acquisition initial_resource;
+    CHECK(context->find_down_group_key(candidate_b1.down, &group_key) &&
+        context->acquire_group_resources(group_key, &initial_resource));
+    const uint64_t resource_generation = initial_resource.resource_generation;
+    std::array<void *, 2> bank_data = {
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, group_key, candidate_b1.banks[0]),
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, group_key, candidate_b1.banks[1]),
+    };
+    CHECK(resource_generation != 0 && bank_data[0] != nullptr && bank_data[1] != nullptr);
+    ggml_cuda_graph_capture_state_for_test state;
+    CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b1.graph, &state));
+    const bool capture_available = state.capture_available;
+    uint64_t b1_resource_fingerprint = 0;
+    if (capture_available) {
+        run_checked(reference_b1, candidate_b1, 0);
+        run_checked(reference_b1, candidate_b1, 1);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b1.graph, &state));
+        CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete && state.moe_resource_fingerprint != 0);
+        b1_resource_fingerprint = state.moe_resource_fingerprint;
+    }
+
+    (void) candidate_certify_graph(*context, candidate_b2.graph);
+    run_checked(reference_b2, candidate_b2, 2);
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == candidate_b1.banks.size());
+    if (capture_available) {
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b2.graph, &state));
+        CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete && state.moe_resource_fingerprint == 0);
+    }
+
+    (void) candidate_certify_graph(*context, candidate_b1.graph);
+    run_checked(reference_b1, candidate_b1, 2);
+    if (capture_available) {
+        run_checked(reference_b1, candidate_b1, 2);
+        run_checked(reference_b1, candidate_b1, 0);
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b1.graph, &state));
+        CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
+            state.moe_resource_fingerprint == b1_resource_fingerprint);
+    }
+
+    ggml_cuda_moe_grouped_acquisition final_resource;
+    CHECK(context->acquire_group_resources(group_key, &final_resource));
+    CHECK(final_resource.resource_generation == resource_generation &&
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(
+            *context, group_key, candidate_b1.banks[0]) == bank_data[0] &&
+        ggml_cuda_moe_grouped_context_test_access::device_bank_data(
+            *context, group_key, candidate_b1.banks[1]) == bank_data[1]);
+    CHECK(active_grouped_legacy_op_count(reference_backend.get(), true) +
+        active_grouped_legacy_op_count(reference_backend.get(), false) == executed_passes * candidate_b1.banks.size());
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == candidate_b1.banks.size());
+    const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    const uint32_t grouped_passes = executed_passes - 1;
+    CHECK(telemetry.registered == 1 && telemetry.covered == 1);
+    CHECK(telemetry.plan_calls == grouped_passes);
+    CHECK(telemetry.plan_compiles == 2 && telemetry.plan_reuses == grouped_passes - telemetry.plan_compiles);
+    CHECK(telemetry.calls == grouped_passes && telemetry.ready == grouped_passes && telemetry.completed == grouped_passes);
+    CHECK(telemetry.admitted_banks == grouped_passes * candidate_b1.banks.size());
+    CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, capture_available ?
+        "test-moe-cache: shared-bank cache12 K8 B1/B2-legacy/B1 capture transition OK\n" :
+        "test-moe-cache: shared-bank cache12 K8 B1/B2-legacy/B1 direct transition OK (CUDA graphs unavailable)\n");
+}
+
 static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(device, 2);
+    test_active_grouped_multirow_graph_modes_case(device, 3);
     test_active_grouped_multirow_graph_modes_case(device, 4);
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
+    test_active_grouped_same_key_row_transitions(device);
+    test_active_grouped_cache12_route_limit_transition(device);
 }
 
 static void test_active_grouped_dispatch_types_case(
