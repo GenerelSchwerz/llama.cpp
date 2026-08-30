@@ -144,9 +144,15 @@ int llama_completion(int argc, char ** argv) {
     // be processed under a mode of its own and the model reloaded once in between
     const llama_split_mode split_mode_gen = params.split_mode;
     bool split_mode_switch_pending = false;
+    std::vector<float> tensor_split_arg;
+    std::vector<llama_model_tensor_buft_override> tensor_buft_overrides_arg;
     if (params.prefill_split_mode >= 0 && (llama_split_mode) params.prefill_split_mode != params.split_mode) {
         params.split_mode = (llama_split_mode) params.prefill_split_mode;
         split_mode_switch_pending = true;
+        // the fit writes the placement it found back into these, and a placement that suits one
+        // split mode does not suit the other. keep the arguments so the second load can fit again
+        tensor_split_arg.assign(std::begin(params.tensor_split), std::end(params.tensor_split));
+        tensor_buft_overrides_arg = params.tensor_buft_overrides;
     }
 
     auto llama_init = common_init_from_params(params);
@@ -691,13 +697,31 @@ int llama_completion(int argc, char ** argv) {
             llama_init.reset(); // free the device memory before asking for it again
             ctx = nullptr; model = nullptr; smpl = nullptr;
 
-            params.split_mode = split_mode_gen;
-            llama_init = common_init_from_params(params);
+            auto load_under = [&](llama_split_mode sm) {
+                params.split_mode = sm;
+                params.n_ctx      = n_ctx; // both phases must agree, the state is restored into the second one
+                std::copy(tensor_split_arg.begin(), tensor_split_arg.end(), params.tensor_split);
+                params.tensor_buft_overrides = tensor_buft_overrides_arg;
+                return common_init_from_params(params);
+            };
+
+            llama_init = load_under(split_mode_gen);
+            if (llama_init->context() == NULL) {
+                // the generation split mode does not fit on the devices. the prompt is still in the
+                // state we just read, so finish the request under the mode that already fit
+                LOG_WRN("%s: the generation split mode does not fit, generating under the prefill split mode\n", __func__);
+                llama_init.reset(); // release what the failed attempt still holds before retrying
+                llama_init = load_under((llama_split_mode) params.prefill_split_mode);
+            }
             ctx   = llama_init->context();
             model = llama_init->model();
             smpl  = llama_init->sampler(0);
             if (ctx == NULL) {
                 LOG_ERR("%s: failed to reload the model under the generation split mode\n", __func__);
+                return 1;
+            }
+            if ((int) llama_n_ctx(ctx) != n_ctx) {
+                LOG_ERR("%s: the reloaded context is %d tokens, expected %d\n", __func__, (int) llama_n_ctx(ctx), n_ctx);
                 return 1;
             }
             mem   = llama_get_memory(ctx);

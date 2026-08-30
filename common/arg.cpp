@@ -898,6 +898,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    // the switch reloads the model, so it needs a moment where nothing is generating, and it carries
+    // one sequence. neither holds once several sequences share the context
+    if (params.prefill_split_mode >= 0 && params.n_parallel != 1) {
+        throw std::invalid_argument("error: --prefill-split-mode requires --parallel 1\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -2922,7 +2928,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("invalid value");
             }
         }
-    ).set_env("LLAMA_ARG_PREFILL_SPLIT_MODE"));
+    ).set_env("LLAMA_ARG_PREFILL_SPLIT_MODE").set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
