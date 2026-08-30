@@ -8932,6 +8932,48 @@ static void test_grouped_decode_independent_rows(int device) {
     CUDA_OK(cudaStreamDestroy(stream));
 
     {
+        grouped_decode_fixture k8_fixture(device, true, grouped_decode_fixture::SOURCE_BYTES, 256);
+        ggml_tensor * k8_gate_up = k8_fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+        ggml_tensor * k8_down = k8_fixture.weight(GGML_TYPE_Q4_0, 32, 32);
+        memset(k8_gate_up->data, 37, ggml_nbytes(k8_gate_up));
+        memset(k8_down->data, 43, ggml_nbytes(k8_down));
+        std::array<ggml_backend_moe_candidate_bank_v1, 2> k8_banks = {{
+            {k8_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+            {k8_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        }};
+        const ggml_backend_moe_candidate_group_v1 k8_group = {
+            k8_banks.data(), k8_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+        };
+        const auto k8_snapshot = candidate_snapshot(138, &k8_group, 1);
+        ggml_cuda_moe_grouped_context k8_registry(ggml_backend_get_device(k8_fixture.backend), device);
+        CHECK(k8_registry.replace(&k8_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        ggml_tensor * k8_ids = k8_fixture.ids(8);
+        auto k8_key = grouped_decode_key(k8_registry, k8_down, k8_ids, k8_group.layout, k8_group.n_banks);
+        const std::array<int32_t, 8> first_routes = {255, 0, 127, 42, 7, 201, 86, 13};
+        auto changed_routes = first_routes;
+        changed_routes.back() = 241;
+        const std::array<int32_t, 8> first_remap = {0, 1, 2, 3, 4, 5, 6, 7};
+        const std::array<int32_t, 8> changed_remap = {0, 1, 2, 3, 4, 5, 6, 8};
+        cudaStream_t k8_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&k8_stream, cudaStreamNonBlocking));
+        const auto run_k8 = [&](const std::array<int32_t, 8> & routes, const std::array<int32_t, 8> & expected) {
+            CUDA_OK(cudaMemcpyAsync(k8_ids->data, routes.data(), sizeof(routes), cudaMemcpyHostToDevice, k8_stream));
+            ggml_cuda_moe_grouped_decode_acquisition k8_decode;
+            CHECK(k8_registry.prepare_decode(k8_key, k8_stream, &k8_decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+            CUDA_OK(cudaStreamSynchronize(k8_stream));
+            std::array<int32_t, 8> actual = {};
+            CUDA_OK(cudaMemcpy(actual.data(), k8_decode.remapped_ids, sizeof(actual), cudaMemcpyDeviceToHost));
+            CHECK(actual == expected);
+            CHECK(k8_registry.finish_decode(k8_decode, k8_stream));
+        };
+        run_k8(first_routes, first_remap);
+        run_k8(first_routes, first_remap);
+        run_k8(changed_routes, changed_remap);
+        CUDA_OK(cudaStreamSynchronize(k8_stream));
+        CUDA_OK(cudaStreamDestroy(k8_stream));
+    }
+
+    {
         grouped_decode_fixture k32_fixture(device, true, grouped_decode_fixture::SOURCE_BYTES, 64);
         ggml_tensor * k32_gate_up = k32_fixture.weight(GGML_TYPE_Q4_0, 32, 64);
         ggml_tensor * k32_down = k32_fixture.weight(GGML_TYPE_Q4_0, 32, 32);

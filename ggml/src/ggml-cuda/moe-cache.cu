@@ -2599,8 +2599,7 @@ static __global__ void moe_grouped_plan_decode(
             const bool active = lane < n_routes;
             const int32_t expert = active ? route_experts[lane] : -1;
             uint32_t first_lane = lane;
-#pragma unroll
-            for (uint32_t source = 0; source < WARP_SIZE; ++source) {
+            for (uint32_t source = 0; source < n_routes; ++source) {
                 const int32_t other = __shfl_sync(0xffffffff, expert, source, WARP_SIZE);
                 if (active && source < first_lane && other == expert) {
                     first_lane = source;
