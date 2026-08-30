@@ -140,6 +140,15 @@ int llama_completion(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
 
+    // the prompt and the generation want different things from a multi-GPU split, so the prompt may
+    // be processed under a mode of its own and the model reloaded once in between
+    const llama_split_mode split_mode_gen = params.split_mode;
+    bool split_mode_switch_pending = false;
+    if (params.prefill_split_mode >= 0 && (llama_split_mode) params.prefill_split_mode != params.split_mode) {
+        params.split_mode = (llama_split_mode) params.prefill_split_mode;
+        split_mode_switch_pending = true;
+    }
+
     auto llama_init = common_init_from_params(params);
 
     ctx   = llama_init->context();
@@ -663,6 +672,48 @@ int llama_completion(int argc, char ** argv) {
 
         embd.clear();
 
+        // All of the prompt but its last token is in the cache now, so move the cache to host
+        // memory, reload the model under the generation split mode and put it back. The last token
+        // is left for the reloaded model to decode, which is what produces the logits to sample
+        // from. The reload frees the old model first, the two never hold device memory at once.
+        if (split_mode_switch_pending && n_consumed >= (int) embd_inp.size() - 1) {
+            split_mode_switch_pending = false;
+
+            const size_t state_size = llama_state_seq_get_size(ctx, 0);
+            std::vector<uint8_t> state(state_size);
+            if (llama_state_seq_get_data(ctx, state.data(), state_size, 0) != state_size) {
+                LOG_ERR("%s: failed to read the sequence state before the split mode switch\n", __func__);
+                return 1;
+            }
+            LOG_INF("%s: switching split mode for generation, carrying %.2f MiB of state\n",
+                    __func__, state_size/1024.0/1024.0);
+
+            llama_init.reset(); // free the device memory before asking for it again
+            ctx = nullptr; model = nullptr; smpl = nullptr;
+
+            params.split_mode = split_mode_gen;
+            llama_init = common_init_from_params(params);
+            ctx   = llama_init->context();
+            model = llama_init->model();
+            smpl  = llama_init->sampler(0);
+            if (ctx == NULL) {
+                LOG_ERR("%s: failed to reload the model under the generation split mode\n", __func__);
+                return 1;
+            }
+            mem   = llama_get_memory(ctx);
+            vocab = llama_model_get_vocab(model);
+            chat_templates = common_chat_templates_init(model, params.chat_template);
+
+            if (llama_state_seq_set_data(ctx, state.data(), state_size, 0) != state_size) {
+                LOG_ERR("%s: failed to restore the sequence state after the split mode switch\n", __func__);
+                return 1;
+            }
+            // the new sampler has not seen the prompt, so the repetition penalties would start empty
+            for (int i = 0; i < n_consumed; i++) {
+                common_sampler_accept(smpl, embd_inp[i], /* accept_grammar= */ false);
+            }
+        }
+
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
@@ -687,7 +738,8 @@ int llama_completion(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
-            while ((int) embd_inp.size() > n_consumed) {
+            const int n_prompt_avail = (int) embd_inp.size() - (split_mode_switch_pending ? 1 : 0);
+            while (n_prompt_avail > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 
                 // push the prompt in the sampling context in order to apply repetition penalties later

@@ -2904,6 +2904,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
     add_opt(common_arg(
+        {"-psm", "--prefill-split-mode"}, "{none,layer,row,tensor}",
+        "split mode to process the prompt under, before switching to --split-mode to generate. The model is "
+        "reloaded once between the two phases and the cache is carried over. A large batch pays for the "
+        "collective a tensor split needs and a single token does not, so the two phases can prefer different "
+        "modes (default: use --split-mode throughout)",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_NONE;
+            } else if (value == "layer") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_LAYER;
+            } else if (value == "row") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (value == "tensor") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFILL_SPLIT_MODE"));
+    add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
         [](common_params & params, const std::string & value) {
