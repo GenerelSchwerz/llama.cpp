@@ -89,6 +89,15 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return context.get_clock_bound_for_test(key, clock_bound);
     }
 
+    static int32_t device_slot_for_expert(
+            const ggml_cuda_moe_grouped_context & context,
+            const ggml_cuda_moe_candidate_group_key & key,
+            uint32_t expert) {
+        int32_t slot = -2;
+        CHECK(context.device_slot_for_expert_for_test(key, expert, &slot));
+        return slot;
+    }
+
     static void * device_bank_data(
             const ggml_cuda_moe_grouped_context & context,
             const ggml_cuda_moe_candidate_group_key & key,
@@ -8625,6 +8634,8 @@ static void test_grouped_decode_type(
 
     ggml_tensor * ids = fixture.ids();
     auto key = grouped_decode_key(registry, weights[n_banks - 1], ids, layout, n_banks);
+    const bool check_deferred_commit = type == GGML_TYPE_Q4_K && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+        pinned && n_slots == grouped_decode_fixture::N_SLOTS && !auxiliary_scale;
     cudaStream_t stream = nullptr;
     cudaStream_t wrong_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -8650,6 +8661,11 @@ static void test_grouped_decode_type(
     std::array<int32_t, 4> remapped = {};
     CUDA_OK(cudaMemcpy(remapped.data(), decode.remapped_ids, sizeof(remapped), cudaMemcpyDeviceToHost));
     CHECK((remapped == std::array<int32_t, 4>{0, 1, 0, 2}));
+    if (check_deferred_commit) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 1) == -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 3) == -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 6) == -1);
+    }
     for (uint32_t bank = 0; bank < n_banks; ++bank) {
         CHECK(decode.banks[bank].tensor == weights[bank] && decode.banks[bank].role == banks[bank].role && decode.banks[bank].type == (uint32_t) type);
         std::vector<uint8_t> row(weights[bank]->nb[2]);
@@ -8671,9 +8687,24 @@ static void test_grouped_decode_type(
     const std::array<int32_t, 4> expected_second = n_slots == grouped_decode_fixture::N_SLOTS ?
         std::array<int32_t, 4>{2, 3, 0, 2} : std::array<int32_t, 4>{2, 3, 4, 2};
     CHECK(remapped == expected_second);
+    if (check_deferred_commit) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 1) == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 3) == 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 6) == 2);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 2) == -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 7) == -1);
+    }
     CHECK(registry.finish_decode(decode, stream));
 
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+    CUDA_OK(cudaStreamSynchronize(stream));
+    if (check_deferred_commit) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 1) == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 3) == -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 6) == 2);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 2) == 3);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 7) == 0);
+    }
     host_barrier barrier;
     CUDA_OK(cudaLaunchHostFunc(stream, wait_on_host_barrier, &barrier));
     while (!barrier.entered.load(std::memory_order_acquire)) {
@@ -9142,6 +9173,8 @@ int main(int argc, char ** argv) {
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
     const bool grouped_bench = argc == 2 && strcmp(argv[1], "--grouped-bench") == 0;
+    const bool grouped_decode_only = argc == 2 && strcmp(argv[1], "--grouped-decode-only") == 0;
+    const bool grouped_replay_only = argc == 2 && strcmp(argv[1], "--grouped-replay-only") == 0;
     const bool grouped_multirow_only = argc == 2 && strcmp(argv[1], "--grouped-multirow-only") == 0;
     const bool grouped_nvfp4_only = argc == 2 && strcmp(argv[1], "--grouped-nvfp4-only") == 0;
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
@@ -9156,6 +9189,18 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_active_grouped_multirow_graph_modes(dev);
+        return 0;
+    }
+    if (grouped_decode_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_grouped_decode(dev);
+        return 0;
+    }
+    if (grouped_replay_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_grouped_graph_replay_lifecycle(dev);
         return 0;
     }
     if (grouped_nvfp4_only) {

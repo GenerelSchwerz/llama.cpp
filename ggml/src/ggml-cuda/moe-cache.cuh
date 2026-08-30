@@ -838,6 +838,10 @@ private:
     bool admission_closed_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
+    bool device_slot_for_expert_for_test(
+            const ggml_cuda_moe_candidate_group_key & key,
+            uint32_t expert,
+            int32_t * slot) const;
     void * device_bank_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
