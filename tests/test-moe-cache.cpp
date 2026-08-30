@@ -8123,7 +8123,8 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
 
     run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 12, 16, 24, true);
     run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 48, 16, 40, true);
-    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 48, 4, 24, false);
+    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 12, 4, 24, true);
+    run_gemma_q4_parity_case(device, direct_backend.get(), direct_weights, 48, 4, 24, true);
     ggml_backend_cuda_moe_set_cache_slots(old_slots);
     fprintf(stderr, "test-moe-cache: opt-in Gemma Q4_0 cached CUDA parity diagnostic OK\n");
 }

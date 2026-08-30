@@ -2332,6 +2332,44 @@ bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens) {
     return kind != GGML_CUDA_MOE_IDS_KIND_NONE && n_tokens > 1;
 }
 
+static bool ggml_cuda_moe_use_compact_mmvq(const ggml_tensor * dst, int64_t n_compact_experts) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src1->ne[2] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    ggml_cuda_mmid_capability_query query;
+    query.source_type = src0->type;
+    query.input_type = src1->type;
+    query.output_type = dst->type;
+    memcpy(query.source_ne, src0->ne, sizeof(query.source_ne));
+    memcpy(query.source_nb, src0->nb, sizeof(query.source_nb));
+    query.n_tokens = src1->ne[2];
+    query.n_experts = src0->ne[2];
+    query.phase = query.n_tokens == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
+    query.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    query.use_mmq = ggml_cuda_moe_use_mmq(src0, query.n_tokens);
+    const auto & info = ggml_cuda_info();
+    const int device = ggml_cuda_get_device();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+    query.cc = info.devices[device].cc;
+    query.warp_size = info.devices[device].warp_size;
+    query.smpbo = info.devices[device].smpbo;
+    const auto direct = ggml_cuda_mmid_get_capability(query);
+    if (direct.reason != GGML_CUDA_MMID_CAPABILITY_OK || direct.selection != GGML_CUDA_MMID_CONSUMER_MMVQ ||
+            n_compact_experts <= 0 || query.source_nb[2] > SIZE_MAX / (size_t) n_compact_experts) {
+        return false;
+    }
+    query.n_experts = n_compact_experts;
+    query.source_ne[2] = n_compact_experts;
+    query.source_nb[3] = query.source_nb[2] * (size_t) n_compact_experts;
+    query.preferred_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ;
+    const auto compact = ggml_cuda_mmid_get_capability(query);
+    return compact.reason == GGML_CUDA_MMID_CAPABILITY_OK && compact.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+}
+
 static int ggml_cuda_moe_layer_from_name(const char * name) {
     if (name == nullptr) {
         return -1;
@@ -2609,6 +2647,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
 
     const int n_unique = (int)unique_experts.size();
     GGML_ASSERT(n_unique > 0);
+    const bool compact_mmvq = !is_decode && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
+    const bool compact_source = is_decode || compact_mmvq;
 
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
@@ -2625,7 +2665,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     std::vector<int32_t> source_wait_class_host;
     ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
     int stage_ready_capacity = 0;
-    if (overflow && !is_decode && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+    if (overflow && !compact_source && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
         stage_ready_capacity = 1 + (n_unique + n_slots - 1) / n_slots;
         source_wait_class_host.resize(n_unique);
@@ -2708,7 +2748,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         return;
     }
 
-    if (is_decode) {
+    if (compact_source) {
         std::vector<int32_t> remapped_ids_host;
         remapped_ids_host.reserve(ids_total_elems);
         for (int64_t i2 = 0; i2 < ids_ne2; ++i2) {
@@ -2741,12 +2781,15 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         ggml_tensor * orig_ids = dst->src[2];
         dst->src[0] = &src0_synth;
         dst->src[2] = &ids_synth;
-        ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq);
+        const bool dispatched = ggml_cuda_mul_mat_id_impl(
+            ctx, dst, use_mmq, nullptr,
+            compact_mmvq ? GGML_CUDA_MMID_CONSUMER_MMVQ : GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
+        GGML_ASSERT(dispatched);
 
         ggml_cuda_moe_record_legacy_op(owner,
-            true, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
+            is_decode, true, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
             0, 0, 0, 0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), false);
         return;
     }
@@ -2877,6 +2920,9 @@ static void ggml_cuda_mul_mat_id_cached(
         return;
     }
 
+    const bool compact_mmvq = !is_decode && ggml_cuda_moe_use_compact_mmvq(dst, slot_capacity);
+    const bool compact_source = is_decode || compact_mmvq;
+
     const int64_t acquire_start_us = ggml_time_us();
 
     if (leased_owner != nullptr) {
@@ -2939,7 +2985,7 @@ static void ggml_cuda_mul_mat_id_cached(
 
     void * pool_d = ggml_cuda_moe_cache_slot_ptr(cache, 0);
     uint64_t remap_time_us = 0;
-    if (is_decode) {
+    if (compact_source) {
         const int64_t remap_start_us = ggml_time_us();
         const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
         std::vector<int32_t> remapped_ids_host;
@@ -2976,9 +3022,12 @@ static void ggml_cuda_mul_mat_id_cached(
         ggml_tensor * orig_ids = dst->src[2];
         dst->src[0] = &src0_synth;
         dst->src[2] = &ids_synth;
-        ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq);
+        const bool dispatched = ggml_cuda_mul_mat_id_impl(
+            ctx, dst, use_mmq, nullptr,
+            compact_mmvq ? GGML_CUDA_MMID_CONSUMER_MMVQ : GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
+        GGML_ASSERT(dispatched);
     } else {
         ggml_tensor src0_synth = *src0;
         src0_synth.ne[2] = n_experts_total;
