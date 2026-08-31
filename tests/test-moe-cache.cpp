@@ -203,6 +203,11 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY;
     }
 
+    static bool graph_group_has_auxiliary_reason(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
+        CHECK(group_index < plan.groups_.size());
+        return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_AUXILIARY;
+    }
+
     static bool graph_group_has_eligible_reason(const ggml_cuda_moe_graph_plan & plan, uint32_t group_index) {
         CHECK(group_index < plan.groups_.size());
         return plan.groups_[group_index].reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
@@ -3732,6 +3737,237 @@ static void test_grouped_graph_preflight(bool benchmark) {
     });
     registry.compile_graph_plan(auxiliary_registered_graph, 59, &plan, &execution);
     CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
+
+    registry.compile_graph_plan(auxiliary_graph, 60, &plan, &execution);
+    CHECK(plan.size() == 1 && execution.size() == 1);
+    CHECK(execution.find(auxiliary_gate_up_node, nullptr) && execution.find(auxiliary_down_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+    auxiliary_out->src[2] = fused_route_other.ids;
+    candidate_rebuild_graph_uses(auxiliary_graph);
+    registry.compile_graph_plan(auxiliary_graph, 61, &plan, &execution);
+    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
+    auxiliary_out->src[2] = fused_route.ids;
+    candidate_rebuild_graph_uses(auxiliary_graph);
+    registry.compile_graph_plan(auxiliary_graph, 62, &plan, &execution);
+    CHECK(execution.find(auxiliary_gate_up_node, nullptr));
+
+    const int64_t separate_bias_ne[] = {256, 4};
+    const int64_t separate_scale_ne[] = {4};
+    ggml_tensor * separate_gate_bias = fixture.tensor(GGML_TYPE_F32, 2, separate_bias_ne);
+    ggml_tensor * separate_up_bias = fixture.tensor(GGML_TYPE_F32, 2, separate_bias_ne);
+    ggml_tensor * separate_down_bias = fixture.tensor(GGML_TYPE_F32, 2, separate_bias_ne);
+    ggml_tensor * separate_down_scale = fixture.tensor(GGML_TYPE_F32, 1, separate_scale_ne);
+    std::array<ggml_backend_moe_candidate_bank_v1, 6> separate_bias_banks = {{
+        {separate_gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {separate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {separate_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        {separate_gate_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, 0},
+        {separate_up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, 0},
+        {separate_down_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, 0},
+    }};
+    const ggml_backend_moe_candidate_group_v1 separate_bias_group = {
+        separate_bias_banks.data(), separate_bias_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto separate_bias_snapshot = candidate_snapshot(12, &separate_bias_group, 1);
+    CHECK(registry.replace(&separate_bias_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    ggml_tensor * biased_gate_reader = candidate_mmid(fixture, separate_gate, separate_route.ids);
+    ggml_tensor * biased_up_reader = candidate_mmid(fixture, separate_up, separate_route.ids);
+    ggml_tensor * biased_down_reader = candidate_mmid(fixture, separate_down, separate_route.ids);
+    ggml_tensor * biased_gate_out = ggml_add_id(fixture.ctx, biased_gate_reader, separate_gate_bias, separate_route.ids);
+    ggml_tensor * biased_up_out = ggml_add_id(fixture.ctx, biased_up_reader, separate_up_bias, separate_route.ids);
+    ggml_tensor * biased_down_out = ggml_add_id(fixture.ctx, biased_down_reader, separate_down_bias, separate_route.ids);
+    ggml_tensor * biased_extra_consumer = ggml_dup(fixture.ctx, biased_gate_out);
+    for (ggml_tensor * node : {biased_gate_out, biased_up_out, biased_down_out, biased_extra_consumer}) {
+        fixture.materialize(node);
+        node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    }
+    ggml_cgraph * separate_bias_graph = candidate_graph(fixture, {
+        separate_route.root, separate_route.ids,
+        biased_gate_reader, biased_gate_out, biased_extra_consumer,
+        biased_up_reader, biased_up_out, biased_down_reader, biased_down_out,
+    });
+    const auto separate_bias_coverage = candidate_certify_graph(registry, separate_bias_graph);
+    registry.compile_graph_plan(
+        separate_bias_graph, 63, &plan, &execution,
+        separate_bias_coverage.epoch, separate_bias_coverage.nodes,
+        separate_bias_coverage.mmid_count, separate_bias_coverage.mmid_fingerprint);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+    CHECK(execution.find(biased_gate_reader, nullptr) && execution.find(biased_up_reader, nullptr) &&
+        execution.find(biased_down_reader, nullptr));
+    ggml_cuda_moe_graph_execution separate_bias_reused;
+    const auto bind_separate_bias = [&](uint64_t graph_uid) {
+        return registry.bind_graph_plan(
+            separate_bias_graph, graph_uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &separate_bias_reused,
+            separate_bias_coverage.epoch, separate_bias_coverage.nodes,
+            separate_bias_coverage.mmid_count, separate_bias_coverage.mmid_fingerprint);
+    };
+    CHECK(bind_separate_bias(64));
+
+    biased_gate_out->src[1] = separate_up_bias;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(!bind_separate_bias(65));
+    biased_gate_out->src[1] = separate_gate_bias;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(bind_separate_bias(66));
+
+    biased_gate_out->src[2] = fused_route_other.ids;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(!bind_separate_bias(67));
+    biased_gate_out->src[2] = separate_route.ids;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+
+    biased_gate_out->src[0] = biased_up_reader;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(!bind_separate_bias(671));
+    biased_gate_out->src[0] = biased_gate_reader;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    biased_gate_out->src[3] = separate_gate_bias;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(!bind_separate_bias(672));
+    biased_gate_out->src[3] = nullptr;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    const ggml_type saved_bias_output_type = biased_gate_out->type;
+    biased_gate_out->type = GGML_TYPE_BF16;
+    CHECK(!bind_separate_bias(673));
+    biased_gate_out->type = saved_bias_output_type;
+    const int64_t saved_bias_output_ne = biased_gate_out->ne[0];
+    biased_gate_out->ne[0]--;
+    CHECK(!bind_separate_bias(674));
+    biased_gate_out->ne[0] = saved_bias_output_ne;
+    const size_t saved_bias_output_nb = biased_gate_out->nb[1];
+    biased_gate_out->nb[1] += sizeof(float);
+    CHECK(!bind_separate_bias(675));
+    biased_gate_out->nb[1] = saved_bias_output_nb;
+
+    const ggml_type saved_bias_type = separate_gate_bias->type;
+    separate_gate_bias->type = GGML_TYPE_BF16;
+    CHECK(!bind_separate_bias(68));
+    separate_gate_bias->type = saved_bias_type;
+    const int64_t saved_bias_ne = separate_gate_bias->ne[0];
+    separate_gate_bias->ne[0]--;
+    CHECK(!bind_separate_bias(69));
+    separate_gate_bias->ne[0] = saved_bias_ne;
+    const size_t saved_bias_nb = separate_gate_bias->nb[1];
+    separate_gate_bias->nb[1] += sizeof(float);
+    CHECK(!bind_separate_bias(70));
+    separate_gate_bias->nb[1] = saved_bias_nb;
+    void * saved_bias_data = separate_gate_bias->data;
+    separate_gate_bias->data = static_cast<char *>(separate_gate_bias->data) + sizeof(float);
+    CHECK(!bind_separate_bias(71));
+    separate_gate_bias->data = saved_bias_data;
+
+    std::swap(separate_bias_graph->nodes[2], separate_bias_graph->nodes[3]);
+    CHECK(!bind_separate_bias(72));
+    std::swap(separate_bias_graph->nodes[2], separate_bias_graph->nodes[3]);
+    biased_extra_consumer->src[0] = biased_gate_reader;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(!bind_separate_bias(73));
+    ggml_cuda_moe_graph_plan extra_consumer_plan;
+    registry.compile_graph_plan(separate_bias_graph, 731, &extra_consumer_plan, &execution);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(extra_consumer_plan, 0));
+    biased_extra_consumer->src[0] = biased_gate_out;
+    candidate_rebuild_graph_uses(separate_bias_graph);
+    CHECK(bind_separate_bias(74));
+
+    separate_bias_banks[3].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS;
+    separate_bias_banks[4].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
+    const auto wrong_bias_role_snapshot = candidate_snapshot(12, &separate_bias_group, 1);
+    CHECK(registry.replace(&wrong_bias_role_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    registry.compile_graph_plan(separate_bias_graph, 75, &plan, &execution);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && !execution.find(biased_gate_reader, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
+    separate_bias_banks[3].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
+    separate_bias_banks[4].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS;
+    CHECK(registry.replace(&separate_bias_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+
+    std::array<ggml_backend_moe_candidate_bank_v1, 7> scale_bias_banks;
+    std::copy(separate_bias_banks.begin(), separate_bias_banks.end(), scale_bias_banks.begin());
+    scale_bias_banks.back() = {separate_down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
+    const ggml_backend_moe_candidate_group_v1 scale_bias_group = {
+        scale_bias_banks.data(), scale_bias_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto scale_bias_snapshot = candidate_snapshot(12, &scale_bias_group, 1);
+    CHECK(registry.replace(&scale_bias_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    registry.compile_graph_plan(separate_bias_graph, 76, &plan, &execution);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && !execution.find(biased_gate_reader, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_descriptor_reason(plan, 0));
+
+    CHECK(registry.replace(&separate_bias_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    const candidate_route biased_prefill_route = candidate_top_k_route(fixture, 4, 2, 2);
+    ggml_tensor * biased_prefill_gate = candidate_mmid(fixture, separate_gate, biased_prefill_route.ids);
+    ggml_tensor * biased_prefill_up = candidate_mmid(fixture, separate_up, biased_prefill_route.ids);
+    ggml_tensor * biased_prefill_down = candidate_mmid(fixture, separate_down, biased_prefill_route.ids);
+    ggml_tensor * biased_prefill_gate_out = ggml_add_id(
+        fixture.ctx, biased_prefill_gate, separate_gate_bias, biased_prefill_route.ids);
+    ggml_tensor * biased_prefill_up_out = ggml_add_id(
+        fixture.ctx, biased_prefill_up, separate_up_bias, biased_prefill_route.ids);
+    ggml_tensor * biased_prefill_down_out = ggml_add_id(
+        fixture.ctx, biased_prefill_down, separate_down_bias, biased_prefill_route.ids);
+    for (ggml_tensor * node : {biased_prefill_gate_out, biased_prefill_up_out, biased_prefill_down_out}) {
+        fixture.materialize(node);
+        node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    }
+    ggml_cgraph * biased_prefill_graph = candidate_graph(fixture, {
+        biased_prefill_route.root, biased_prefill_route.ids,
+        biased_prefill_gate, biased_prefill_gate_out,
+        biased_prefill_up, biased_prefill_up_out,
+        biased_prefill_down, biased_prefill_down_out,
+    });
+    registry.compile_graph_plan(biased_prefill_graph, 77, &plan, &execution);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY && execution.size() == 1);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_prefill_reason(plan, 0));
+
+    const auto check_biased_execution_unknown_reuse = [&](ggml_cgraph * graph, uint64_t graph_uid) {
+        const auto coverage = candidate_certify_graph(registry, graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> reusable_plan;
+        ggml_cuda_moe_graph_execution reusable_execution;
+        CHECK(registry.prepare_graph_execution(
+            graph, graph_uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &reusable_plan, &reusable_execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(reusable_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY && reusable_execution.size() == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_execution_reason(*reusable_plan, 0));
+        const auto * compiled_plan = reusable_plan.get();
+        CHECK(registry.prepare_graph_execution(
+            graph, graph_uid + 1, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &reusable_plan, &reusable_execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
+        CHECK(reusable_plan.get() == compiled_plan &&
+            reusable_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+    };
+    for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+        candidate_stamp_execution(separate_bias_graph, domain,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1);
+        check_biased_execution_unknown_reuse(separate_bias_graph, 780 + domain * 2);
+    }
+
+    const candidate_route biased_overslot_route = candidate_top_k_route(fixture, 4, 4, 4);
+    ggml_tensor * biased_overslot_gate = candidate_mmid(fixture, separate_gate, biased_overslot_route.ids);
+    ggml_tensor * biased_overslot_up = candidate_mmid(fixture, separate_up, biased_overslot_route.ids);
+    ggml_tensor * biased_overslot_down = candidate_mmid(fixture, separate_down, biased_overslot_route.ids);
+    ggml_tensor * biased_overslot_gate_out = ggml_add_id(
+        fixture.ctx, biased_overslot_gate, separate_gate_bias, biased_overslot_route.ids);
+    ggml_tensor * biased_overslot_up_out = ggml_add_id(
+        fixture.ctx, biased_overslot_up, separate_up_bias, biased_overslot_route.ids);
+    ggml_tensor * biased_overslot_down_out = ggml_add_id(
+        fixture.ctx, biased_overslot_down, separate_down_bias, biased_overslot_route.ids);
+    for (ggml_tensor * node : {biased_overslot_gate_out, biased_overslot_up_out, biased_overslot_down_out}) {
+        fixture.materialize(node);
+        node->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    }
+    ggml_cgraph * biased_overslot_graph = candidate_graph(fixture, {
+        biased_overslot_route.root, biased_overslot_route.ids,
+        biased_overslot_gate, biased_overslot_gate_out,
+        biased_overslot_up, biased_overslot_up_out,
+        biased_overslot_down, biased_overslot_down_out,
+    });
+    candidate_stamp_execution(biased_overslot_graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 4, 4);
+    check_biased_execution_unknown_reuse(biased_overslot_graph, 790);
 
     {
         candidate_test_fixture oversized_fixture;
@@ -4392,6 +4628,8 @@ struct active_grouped_dispatch_graph {
     std::vector<ggml_tensor *> banks;
     std::vector<ggml_tensor *> readers;
     std::vector<uint32_t> roles;
+    std::vector<ggml_tensor *> biases;
+    std::vector<uint32_t> bias_roles;
     uint32_t n_experts = 0;
     uint32_t n_used = 0;
     uint32_t n_rows = 0;
@@ -4409,10 +4647,12 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_used = 2,
         uint32_t n_dim = 256,
         const active_grouped_dispatch_graph * shared_banks = nullptr,
-        bool concurrent_stream_fixture = false) {
+        bool concurrent_stream_fixture = false,
+        bool original_direct_biases = false) {
     CHECK(n_rows >= 1 && n_rows <= 4 && n_used >= 1 && n_used <= n_experts);
     CHECK(!concurrent_stream_fixture ||
         (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_rows == 1 && n_used == 1));
+    CHECK(!original_direct_biases || (shared_banks == nullptr && !original_direct_down_scale && !original_direct_nvfp4_scales));
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
         /* .mem_base = */ nullptr,
@@ -4468,6 +4708,27 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     result.down = add_bank(types[layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 1 : 2],
         n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
         "test_active_down_weight");
+    ggml_tensor * gate_bias = nullptr;
+    ggml_tensor * up_bias = nullptr;
+    ggml_tensor * gate_up_bias = nullptr;
+    ggml_tensor * down_bias = nullptr;
+    if (original_direct_biases) {
+        const auto add_bias = [&](int64_t ne0, uint32_t role, const char * name) {
+            ggml_tensor * tensor = ggml_new_tensor_2d(result.nodes.get(), GGML_TYPE_F32, ne0, n_experts);
+            ggml_set_name(tensor, name);
+            result.biases.push_back(tensor);
+            result.bias_roles.push_back(role);
+            return tensor;
+        };
+        if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
+            gate_up_bias = add_bias(2 * n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS,
+                "test_active_gate_up_bias");
+        } else {
+            gate_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, "test_active_gate_bias");
+            up_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
+        }
+        down_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, "test_active_down_bias");
+    }
     if (shared_banks != nullptr) {
         result.gate_scale = shared_banks->gate_scale;
         result.up_scale = shared_banks->up_scale;
@@ -4507,6 +4768,9 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     if (gate_up != nullptr) {
         hidden = ggml_mul_mat_id(result.nodes.get(), gate_up, mmid_input, result.ids);
         result.readers.push_back(hidden);
+        if (gate_up_bias != nullptr) {
+            hidden = ggml_add_id(result.nodes.get(), hidden, gate_up_bias, result.ids);
+        }
         hidden = ggml_dup(result.nodes.get(), hidden);
         hidden = ggml_glu(result.nodes.get(), hidden, GGML_GLU_OP_SWIGLU, false);
     } else {
@@ -4516,6 +4780,10 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         result.readers.push_back(result.up_output);
         ggml_tensor * gate_input = result.gate_output;
         ggml_tensor * up_input = result.up_output;
+        if (gate_bias != nullptr) {
+            gate_input = ggml_add_id(result.nodes.get(), gate_input, gate_bias, result.ids);
+            up_input = ggml_add_id(result.nodes.get(), up_input, up_bias, result.ids);
+        }
         if (result.gate_scale != nullptr) {
             result.gate_scale_reshape = ggml_reshape_3d(result.nodes.get(), result.gate_scale, 1, n_experts, 1);
             result.gate_scale_repeat = ggml_repeat_4d(result.nodes.get(), result.gate_scale_reshape, 1, n_experts, n_rows, 1);
@@ -4531,6 +4799,9 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     result.down_output = ggml_mul_mat_id(result.nodes.get(), result.down, hidden, result.ids);
     result.readers.push_back(result.down_output);
     result.output = result.down_output;
+    if (down_bias != nullptr) {
+        result.output = ggml_add_id(result.nodes.get(), result.output, down_bias, result.ids);
+    }
     if (result.down_scale != nullptr) {
         result.down_scale_reshape = ggml_reshape_3d(result.nodes.get(), result.down_scale, 1, n_experts, 1);
         result.down_scale_repeat = ggml_repeat_4d(result.nodes.get(), result.down_scale_reshape, 1, n_experts, n_rows, 1);
@@ -4591,7 +4862,7 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph(
         bool concurrent_stream_fixture = false) {
     return build_active_grouped_dispatch_graph_types(
         backend, weight_buft, {type, type, type}, layout, original_direct_down_scale, false,
-        n_rows, n_experts, n_used, n_dim, shared_banks, concurrent_stream_fixture);
+        n_rows, n_experts, n_used, n_dim, shared_banks, concurrent_stream_fixture, false);
 }
 
 static constexpr int32_t active_grouped_route_variants[3][4][2] = {
@@ -4741,6 +5012,15 @@ static void initialize_active_grouped_dispatch_graphs(const std::vector<active_g
             ggml_backend_tensor_set(scales[scale_index], bytes.data(), 0, bytes.size());
         }
     }
+    for (size_t bias_index = 0; bias_index < graphs[0]->biases.size(); ++bias_index) {
+        const auto bytes = cached_fusion_test_data(graphs[0]->biases[bias_index], 157 + bias_index);
+        for (auto * graph : graphs) {
+            CHECK(graph->biases.size() == graphs[0]->biases.size() && graph->bias_roles.size() == graph->biases.size());
+            CHECK(graph->bias_roles[bias_index] == graphs[0]->bias_roles[bias_index]);
+            CHECK(ggml_nbytes(graph->biases[bias_index]) == bytes.size());
+            ggml_backend_tensor_set(graph->biases[bias_index], bytes.data(), 0, bytes.size());
+        }
+    }
     const auto input = cached_fusion_test_data(graphs[0]->input, 131);
     for (auto * graph : graphs) {
         CHECK(graph->readers.size() == graph->banks.size());
@@ -4779,6 +5059,10 @@ static void initialize_active_grouped_dispatch_graph(active_grouped_dispatch_gra
             ggml_backend_tensor_set(scales[scale_index], bytes.data(), 0, bytes.size());
         }
     }
+    for (size_t bias_index = 0; bias_index < graph.biases.size(); ++bias_index) {
+        const auto bytes = cached_fusion_test_data(graph.biases[bias_index], salt + 56 + bias_index);
+        ggml_backend_tensor_set(graph.biases[bias_index], bytes.data(), 0, bytes.size());
+    }
     const auto input = cached_fusion_test_data(graph.input, salt + 30);
     ggml_backend_tensor_set(graph.input, input.data(), 0, input.size());
     ggml_backend_tensor_set(graph.logits, logits.data(), 0, logits.size() * sizeof(float));
@@ -4790,13 +5074,16 @@ static void register_active_grouped_dispatch(
         uint32_t layout,
         uint32_t n_slots,
         bool auxiliary_first = false) {
-    std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
+    std::array<ggml_backend_moe_candidate_bank_v1, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> banks = {};
     uint32_t n_banks = 0;
     if (auxiliary_first && graph.down_scale != nullptr) {
         banks[n_banks++] = {graph.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
     }
     for (size_t i = 0; i < graph.banks.size(); ++i) {
         banks[n_banks++] = {graph.banks[i], graph.roles[i], 0};
+    }
+    for (size_t i = 0; i < graph.biases.size(); ++i) {
+        banks[n_banks++] = {graph.biases[i], graph.bias_roles[i], 0};
     }
     if (!auxiliary_first && graph.down_scale != nullptr) {
         banks[n_banks++] = {graph.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
@@ -6226,7 +6513,8 @@ static void test_active_grouped_dispatch_types_case(
         uint32_t layout,
         uint32_t n_slots,
         bool original_direct_down_scale = false,
-        bool test_owner_concurrency = false) {
+        bool test_owner_concurrency = false,
+        bool original_direct_biases = false) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
@@ -6234,11 +6522,14 @@ static void test_active_grouped_dispatch_types_case(
     ggml_backend_ptr second_backend(ggml_backend_cuda_init(0));
     CHECK(reference_backend != nullptr && first_backend != nullptr && second_backend != nullptr);
     auto reference = build_active_grouped_dispatch_graph_types(
-        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale);
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
+        false, 1, 8, 2, 256, nullptr, false, original_direct_biases);
     auto first = build_active_grouped_dispatch_graph_types(
-        first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale);
+        first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
+        false, 1, 8, 2, 256, nullptr, false, original_direct_biases);
     auto second = build_active_grouped_dispatch_graph_types(
-        second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale);
+        second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
+        false, 1, 8, 2, 256, nullptr, false, original_direct_biases);
     initialize_active_grouped_dispatch_graphs({&reference, &first, &second});
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -6266,6 +6557,24 @@ static void test_active_grouped_dispatch_types_case(
             CHECK(scale_info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT);
         }
     }
+    if (original_direct_biases) {
+        for (auto * backend : {first_backend.get(), second_backend.get()}) {
+            auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+            const auto & graph = backend == first_backend.get() ? first : second;
+            ggml_cuda_moe_candidate_group_key key;
+            ggml_cuda_moe_candidate_group_info group_info;
+            CHECK(context != nullptr && context->find_down_group_key(graph.down, &key));
+            CHECK(context->get_group(key, &group_info) &&
+                group_info.n_banks == graph.banks.size() + graph.biases.size());
+            for (uint32_t i = 0; i < graph.biases.size(); ++i) {
+                ggml_cuda_moe_candidate_bank_info bias_info;
+                CHECK(context->get_bank(key, graph.bias_roles[i], &bias_info));
+                CHECK(bias_info.tensor == graph.biases[i] && bias_info.type == GGML_TYPE_F32);
+                CHECK(bias_info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE);
+                CHECK(bias_info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT);
+            }
+        }
+    }
     check_active_grouped_contract(first_backend.get(), first, n_slots, original_direct_down_scale);
     check_active_grouped_contract(second_backend.get(), second, n_slots);
 
@@ -6273,7 +6582,7 @@ static void test_active_grouped_dispatch_types_case(
     std::vector<float> reference_output;
     std::vector<float> first_output;
     std::vector<float> second_output;
-    const bool f3_skipped = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+    const bool f3_skipped = !original_direct_biases && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
         first.banks[0]->type == first.banks[1]->type && ggml_are_same_shape(first.banks[0], first.banks[1]) &&
         ggml_are_same_stride(first.banks[0], first.banks[1]);
     for (int pass = 0; pass < 4; ++pass) {
@@ -7599,6 +7908,13 @@ static void test_active_grouped_dispatch() {
         GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 48);
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12, true);
+    test_active_grouped_dispatch_types_case(
+        {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4},
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 24, false, false, true);
+    test_active_grouped_dispatch_types_case(
+        {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4},
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 24, false, false, true);
+    fprintf(stderr, "test-moe-cache: active grouped MXFP4 separate/fused output biases exact OK\n");
     test_active_grouped_fused_down_scale_extent();
     fprintf(stderr, "test-moe-cache: Gemma fused original-direct down scale exact OK\n");
     test_active_grouped_dispatch_staged_legacy();

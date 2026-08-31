@@ -1098,10 +1098,29 @@ static bool moe_candidate_original_direct_scale(
         bank.info.byte_extent <= MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES;
 }
 
+static bool moe_candidate_original_direct_bias(
+        const moe_candidate_bank_record & bank,
+        uint32_t role,
+        const moe_candidate_bank_record & weight) {
+    uint64_t row_bytes = 0;
+    uint64_t byte_extent = 0;
+    return bank.info.role == role && bank.info.type == GGML_TYPE_F32 &&
+        bank.info.source_flags == 0 && bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN &&
+        bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE &&
+        bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT &&
+        bank.info.expert_stride == 0 && ggml_n_dims(bank.info.tensor) == 2 && bank.slot_index == UINT32_MAX &&
+        bank.ne[0] == weight.ne[1] && bank.ne[1] == weight.ne[2] && bank.ne[2] == 1 && bank.ne[3] == 1 &&
+        moe_candidate_mul(sizeof(float), bank.ne[0], row_bytes) &&
+        moe_candidate_mul(row_bytes, bank.ne[1], byte_extent) &&
+        bank.nb[0] == sizeof(float) && bank.nb[1] == row_bytes && bank.nb[2] == byte_extent && bank.nb[3] == byte_extent &&
+        bank.info.byte_extent == byte_extent;
+}
+
 static bool moe_candidate_structural_group(
         const moe_candidate_group_record & group,
         uint32_t * n_slot_banks,
-        uint32_t * n_original_direct_aux = nullptr) {
+        uint32_t * n_original_direct_aux = nullptr,
+        uint32_t * n_original_direct_bias = nullptr) {
     const uint32_t required_roles = moe_candidate_required_base_roles(group.layout);
     const uint32_t required_banks = group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 2u :
         group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3u : 0u;
@@ -1118,7 +1137,8 @@ static bool moe_candidate_structural_group(
     uint32_t slot_banks = 0;
     for (const auto & bank : group.banks) {
         const uint32_t role = bank.info.role;
-        if (moe_candidate_slot_resource(bank) && !moe_candidate_base_slot_resource(bank)) {
+        if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND &&
+                !moe_candidate_base_slot_resource(bank)) {
             return false;
         }
         if (moe_candidate_base_slot_resource(bank)) {
@@ -1136,30 +1156,48 @@ static bool moe_candidate_structural_group(
         return false;
     }
 
-    uint32_t permanent_banks = 0;
-    uint32_t permanent_roles = 0;
+    uint32_t scale_banks = 0;
+    uint32_t scale_roles = 0;
+    uint32_t bias_banks = 0;
+    uint32_t bias_roles = 0;
     for (const auto & bank : group.banks) {
         if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
             continue;
         }
         const uint32_t role = bank.info.role;
-        if (!moe_candidate_is_scale(role) || (permanent_roles & (1u << role)) != 0 ||
-                !moe_candidate_original_direct_scale(bank, role, n_experts)) {
+        if (moe_candidate_is_scale(role)) {
+            if ((scale_roles & (1u << role)) != 0 || !moe_candidate_original_direct_scale(bank, role, n_experts)) {
+                return false;
+            }
+            scale_roles |= 1u << role;
+            ++scale_banks;
+            continue;
+        }
+        if (!moe_candidate_is_bias(role) || (bias_roles & (1u << role)) != 0) {
             return false;
         }
-        permanent_roles |= 1u << role;
-        ++permanent_banks;
+        const uint32_t base_role = moe_candidate_base_role(role);
+        const auto * weight = moe_candidate_find_role(group, base_role);
+        if (weight == nullptr || (required_roles & (1u << base_role)) == 0 ||
+                !moe_candidate_original_direct_bias(bank, role, *weight)) {
+            return false;
+        }
+        bias_roles |= 1u << role;
+        ++bias_banks;
+    }
+    if (scale_banks != 0 && bias_banks != 0) {
+        return false;
     }
 
     uint32_t original_direct_aux = 0;
-    if (permanent_banks != 0) {
+    if (scale_banks != 0) {
         const uint32_t all_scale_roles = (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE) |
             (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE) |
             (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE);
         const bool fused_down_scale = group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP &&
-            permanent_banks == 1 && permanent_roles == (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE);
+            scale_banks == 1 && scale_roles == (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE);
         bool separate_nvfp4_scales = group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
-            permanent_banks == 3 && permanent_roles == all_scale_roles;
+            scale_banks == 3 && scale_roles == all_scale_roles;
         for (uint32_t bank_index = 0; separate_nvfp4_scales && bank_index < slot_banks; ++bank_index) {
             const auto * bank = moe_candidate_base_slot_bank(group, bank_index);
             separate_nvfp4_scales = bank != nullptr && bank->info.type == GGML_TYPE_NVFP4 &&
@@ -1177,6 +1215,9 @@ static bool moe_candidate_structural_group(
     if (n_original_direct_aux != nullptr) {
         *n_original_direct_aux = original_direct_aux;
     }
+    if (n_original_direct_bias != nullptr) {
+        *n_original_direct_bias = bias_banks;
+    }
     return true;
 }
 
@@ -1188,6 +1229,21 @@ static const moe_candidate_bank_record * moe_candidate_original_direct_aux_bank(
         auxiliary_index == 2 ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE :
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     return role != GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID ? moe_candidate_find_role(group, role) : nullptr;
+}
+
+static uint32_t moe_candidate_output_bias_role(uint32_t reader_role) {
+    switch (reader_role) {
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS;
+        default:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    }
 }
 
 static uint32_t moe_candidate_resource_bank_count(const moe_candidate_group_record & group) {
@@ -1595,6 +1651,12 @@ static bool moe_candidate_auxiliary_consumer(
     return false;
 }
 
+enum moe_candidate_auxiliary_kind : uint32_t {
+    MOE_CANDIDATE_AUXILIARY_NONE = 0,
+    MOE_CANDIDATE_AUXILIARY_SCALE,
+    MOE_CANDIDATE_AUXILIARY_BIAS,
+};
+
 struct moe_candidate_route_proof {
     ggml_cuda_moe_ids_signature ids;
     ggml_cuda_moe_ids_signature root;
@@ -1777,6 +1839,52 @@ static bool moe_candidate_original_direct_scale_witness_matches(
         bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT && bank.info.type == GGML_TYPE_F32 &&
         bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN && reshape->ne[1] == bank.ne[0] &&
         moe_candidate_record_matches(bank, reshape->src[0]);
+}
+
+static bool moe_candidate_original_direct_bias_consumer(
+        const ggml_tensor * consumer,
+        const ggml_tensor * producer,
+        const ggml_tensor * ids,
+        uint32_t reader_role,
+        const moe_candidate_group_record & group,
+        uint32_t * bank_index) {
+    const uint32_t bias_role = moe_candidate_output_bias_role(reader_role);
+    if (consumer == nullptr || producer == nullptr || ids == nullptr || consumer->op != GGML_OP_ADD_ID ||
+            consumer->src[0] != producer || consumer->src[1] == nullptr || consumer->src[2] != ids ||
+            bias_role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID ||
+            !moe_candidate_f32_metadata_matches(producer, producer->ne) ||
+            !moe_candidate_f32_metadata_matches(consumer, producer->ne)) {
+        return false;
+    }
+    for (uint32_t src_index = 3; src_index < GGML_MAX_SRC; ++src_index) {
+        if (consumer->src[src_index] != nullptr) {
+            return false;
+        }
+    }
+    for (uint32_t i = 0; i < group.banks.size(); ++i) {
+        const auto & bank = group.banks[i];
+        if (bank.info.role == bias_role &&
+                bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE &&
+                bank.info.index_modes == GGML_CUDA_MOE_CANDIDATE_INDEX_ORIGINAL_DIRECT &&
+                bank.info.type == GGML_TYPE_F32 && bank.info.encoding == GGML_CUDA_MOE_CANDIDATE_ENCODING_PLAIN &&
+                moe_candidate_record_matches(bank, consumer->src[1])) {
+            *bank_index = i;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool moe_candidate_original_direct_bias_witness_matches(
+        const ggml_tensor * consumer,
+        const ggml_tensor * producer,
+        const ggml_tensor * ids,
+        uint32_t reader_role,
+        const moe_candidate_group_record & group,
+        uint32_t bank_index) {
+    uint32_t current_bank_index = 0;
+    return moe_candidate_original_direct_bias_consumer(
+        consumer, producer, ids, reader_role, group, &current_bank_index) && current_bank_index == bank_index;
 }
 
 static bool moe_candidate_validate_route(
@@ -6259,15 +6367,21 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
 
         uint32_t n_slot_banks = 0;
         uint32_t n_original_direct_aux = 0;
+        uint32_t n_original_direct_bias = 0;
         const bool original_direct_nvfp4 =
-            moe_candidate_structural_group(group, &n_slot_banks, &n_original_direct_aux) &&
+            moe_candidate_structural_group(group, &n_slot_banks, &n_original_direct_aux, &n_original_direct_bias) &&
             n_slot_banks == 3 && n_original_direct_aux == 3;
         const bool geometry_only = original_direct_nvfp4 && observation.geometry_invalid;
-        const bool discover_original_direct_aux = original_direct_nvfp4 && !observation.geometry_invalid &&
+        const bool has_original_direct_witness = original_direct_nvfp4 || n_original_direct_bias != 0;
+        const bool discover_grouped_original_direct_witness = has_original_direct_witness && !observation.geometry_invalid &&
             !observation.execution_ineligible &&
             observation.has_ids && !observation.route_invalid && !observation.mixed_ids &&
             !observation.duplicate_role && observation.seen_roles == observation.required_roles &&
-            observation.n_readers == 3;
+            observation.n_readers == n_slot_banks;
+        const bool discover_legacy_bias_witness = n_original_direct_bias != 0 && !observation.geometry_invalid &&
+            observation.execution_ineligible && observation.decode && !observation.prefill;
+        const bool discover_original_direct_witness =
+            discover_grouped_original_direct_witness || discover_legacy_bias_witness;
         for (uint32_t reader_index = 0; reader_index < observation.n_readers; ++reader_index) {
             auto & reader = observation.readers[reader_index];
             if (geometry_only) {
@@ -6282,30 +6396,45 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 observation.external_consumer = true;
             }
             for (uint32_t consumer_index = 0; !observation.geometry_invalid && !observation.prefill &&
-                    !observation.execution_ineligible &&
+                    (!observation.execution_ineligible || discover_legacy_bias_witness) &&
                     consumer_index < reader.n_consumers; ++consumer_index) {
                 const auto & consumer = reader.consumers[consumer_index];
                 if (moe_candidate_auxiliary_consumer(consumer.node, reader.output.tensor, reader.ids.tensor)) {
                     uint32_t bank_index = 0;
-                    const bool discover = !original_direct_nvfp4 || discover_original_direct_aux;
-                    if (discover && reader.n_auxiliary_nodes == 0 && moe_candidate_original_direct_scale_consumer(
+                    const bool discover = !has_original_direct_witness || discover_original_direct_witness;
+                    if (discover && reader.auxiliary_kind == MOE_CANDIDATE_AUXILIARY_NONE &&
+                            moe_candidate_original_direct_scale_consumer(
                             cgraph, consumer.node_index, consumer.node, reader.output.tensor, reader.ids.tensor, reader.role, group, &bank_index,
                             reader.auxiliary_nodes, reader.auxiliary_node_indices)) {
                         reader.auxiliary_bank_index = bank_index;
                         reader.auxiliary_consumer_index = consumer_index;
                         reader.n_auxiliary_nodes = 3;
+                        reader.auxiliary_kind = MOE_CANDIDATE_AUXILIARY_SCALE;
+                        observation.bank_readers[bank_index]++;
+                    } else if (discover && reader.auxiliary_kind == MOE_CANDIDATE_AUXILIARY_NONE &&
+                            moe_candidate_original_direct_bias_consumer(
+                                consumer.node, reader.output.tensor, reader.ids.tensor, reader.role, group, &bank_index)) {
+                        reader.auxiliary_bank_index = bank_index;
+                        reader.auxiliary_consumer_index = consumer_index;
+                        reader.auxiliary_kind = MOE_CANDIDATE_AUXILIARY_BIAS;
                         observation.bank_readers[bank_index]++;
                     } else if (discover) {
                         observation.auxiliary = true;
                     }
                 }
             }
-            if (discover_original_direct_aux && (reader.n_consumers != 1 || reader.n_auxiliary_nodes != 3)) {
+            const auto * bias = moe_candidate_find_role(group, moe_candidate_output_bias_role(reader.role));
+            if (discover_original_direct_witness && bias != nullptr &&
+                    (reader.n_consumers != 1 || reader.auxiliary_kind != MOE_CANDIDATE_AUXILIARY_BIAS)) {
+                observation.auxiliary = true;
+            }
+            if (discover_original_direct_witness && original_direct_nvfp4 && bias == nullptr &&
+                    (reader.n_consumers != 1 || reader.auxiliary_kind != MOE_CANDIDATE_AUXILIARY_SCALE)) {
                 observation.auxiliary = true;
             }
             record.readers[reader_index] = reader;
         }
-        if (discover_original_direct_aux) {
+        if (discover_original_direct_witness && original_direct_nvfp4) {
             for (uint32_t auxiliary_index = 0; auxiliary_index < n_original_direct_aux; ++auxiliary_index) {
                 const auto * auxiliary = moe_candidate_original_direct_aux_bank(group, auxiliary_index);
                 if (auxiliary == nullptr || observation.bank_readers[auxiliary - group.banks.data()] != 1) {
@@ -6313,9 +6442,16 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 }
             }
         }
+        if (discover_original_direct_witness) {
+            for (uint32_t bank_index = 0; bank_index < group.banks.size(); ++bank_index) {
+                if (moe_candidate_is_bias(group.banks[bank_index].info.role) && observation.bank_readers[bank_index] != 1) {
+                    observation.auxiliary = true;
+                }
+            }
+        }
         if (!geometry_only) {
             for (uint32_t bank_index = 0; bank_index < group.banks.size(); ++bank_index) {
-                if (original_direct_nvfp4 && !discover_original_direct_aux &&
+                if (has_original_direct_witness && !discover_original_direct_witness &&
                         group.banks[bank_index].info.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_SLOT_BOUND) {
                     continue;
                 }
@@ -6524,8 +6660,10 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
 
     uint32_t structural_slot_banks = 0;
     uint32_t structural_original_direct_aux = 0;
+    uint32_t structural_original_direct_bias = 0;
     const bool original_direct_nvfp4 =
-        moe_candidate_structural_group(group, &structural_slot_banks, &structural_original_direct_aux) &&
+        moe_candidate_structural_group(
+            group, &structural_slot_banks, &structural_original_direct_aux, &structural_original_direct_bias) &&
         structural_slot_banks == 3 && structural_original_direct_aux == 3;
     if (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_GEOMETRY && original_direct_nvfp4) {
         if (record.prefill != 0 || record.n_readers == 0) {
@@ -6678,18 +6816,29 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                 return false;
             }
             if (moe_candidate_auxiliary_consumer(current, node, ids)) {
-                if (reader.n_auxiliary_nodes == 3 && reader.auxiliary_consumer_index == consumer_index &&
+                if (reader.auxiliary_kind == MOE_CANDIDATE_AUXILIARY_SCALE && reader.n_auxiliary_nodes == 3 &&
+                        reader.auxiliary_consumer_index == consumer_index &&
                         moe_candidate_original_direct_scale_witness_matches(
                             cgraph, consumer.node_index, current, node, ids, reader.role, group, reader.auxiliary_bank_index,
                             reader.auxiliary_nodes, reader.auxiliary_node_indices)) {
+                    bank_readers[reader.auxiliary_bank_index]++;
+                } else if (reader.auxiliary_kind == MOE_CANDIDATE_AUXILIARY_BIAS && reader.n_auxiliary_nodes == 0 &&
+                        reader.auxiliary_consumer_index == consumer_index &&
+                        moe_candidate_original_direct_bias_witness_matches(
+                            current, node, ids, reader.role, group, reader.auxiliary_bank_index)) {
                     bank_readers[reader.auxiliary_bank_index]++;
                 } else {
                     auxiliary = true;
                 }
             }
         }
-        if (original_direct_nvfp4 && geometry.grouped_eligible &&
-                (reader.n_consumers != 1 || reader.n_auxiliary_nodes != 3)) {
+        const auto * bias = moe_candidate_find_role(group, moe_candidate_output_bias_role(reader.role));
+        if (geometry.tensor_valid && !reader_prefill && bias != nullptr &&
+                (reader.n_consumers != 1 || reader.auxiliary_kind != MOE_CANDIDATE_AUXILIARY_BIAS)) {
+            auxiliary = true;
+        }
+        if (original_direct_nvfp4 && geometry.grouped_eligible && bias == nullptr &&
+                (reader.n_consumers != 1 || reader.auxiliary_kind != MOE_CANDIDATE_AUXILIARY_SCALE)) {
             auxiliary = true;
         }
     }
@@ -6700,6 +6849,13 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         for (uint32_t auxiliary_index = 0; auxiliary_index < n_original_direct_aux; ++auxiliary_index) {
             const auto * auxiliary_bank = moe_candidate_original_direct_aux_bank(group, auxiliary_index);
             if (auxiliary_bank == nullptr || bank_readers[auxiliary_bank - group.banks.data()] != 1) {
+                auxiliary = true;
+            }
+        }
+    }
+    if (structural_original_direct_bias != 0) {
+        for (uint32_t bank_index = 0; bank_index < group.banks.size(); ++bank_index) {
+            if (moe_candidate_is_bias(group.banks[bank_index].info.role) && bank_readers[bank_index] != 1) {
                 auxiliary = true;
             }
         }

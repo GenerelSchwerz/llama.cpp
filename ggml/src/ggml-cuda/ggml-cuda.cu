@@ -5227,6 +5227,10 @@ static int ggml_cuda_try_fuse(
             if (!up_bias_tensor || !gate_bias_tensor) {
                 continue;
             }
+            if (op == GGML_OP_MUL_MAT_ID && execution != nullptr &&
+                    (execution->find_group(up_n, nullptr) != nullptr || execution->find_group(gate_n, nullptr) != nullptr)) {
+                continue;
+            }
 
             // we don't support repeating adds
             if (bias_op == GGML_OP_ADD && (!ggml_are_same_shape(gate_bias_n->src[0], gate_bias_n->src[1]) ||
@@ -5503,6 +5507,10 @@ static int ggml_cuda_try_fuse(
         const ggml_tensor * src0 = mm_node->src[0];
         const ggml_tensor * src1 = mm_node->src[1];
         const ggml_tensor * ids  = mm_node->src[2];
+
+        if (op == GGML_OP_MUL_MAT_ID && execution != nullptr && execution->find_group(mm_node, nullptr) != nullptr) {
+            continue;
+        }
 
         if (bias_op == GGML_OP_ADD_ID && bias_node->src[2] != ids) {
             continue;

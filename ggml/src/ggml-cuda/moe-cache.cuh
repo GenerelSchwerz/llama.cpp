@@ -515,6 +515,7 @@ private:
         uint32_t auxiliary_bank_index;
         uint32_t auxiliary_consumer_index;
         uint32_t n_auxiliary_nodes;
+        uint32_t auxiliary_kind;
     };
 
     struct use_witness {
