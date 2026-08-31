@@ -14,13 +14,19 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 //
 // llama_context
@@ -29,9 +35,46 @@
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
         case LLAMA_CONTEXT_TYPE_DEFAULT: return LLM_GRAPH_TYPE_DEFAULT;
+        case LLAMA_CONTEXT_TYPE_DRAFT  : return LLM_GRAPH_TYPE_DEFAULT;
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static uint64_t graph_execution_next_owner_namespace() {
+    static std::atomic<uint64_t> next_namespace { 1 };
+    const uint64_t result = next_namespace.fetch_add(1, std::memory_order_relaxed);
+    GGML_ASSERT(result != 0);
+    return result;
+}
+
+static bool ubatch_has_independent_rows(const llama_ubatch & ubatch) {
+    if (ubatch.n_tokens == 0 || ubatch.n_seq_tokens != 1 ||
+            ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs_unq != ubatch.n_tokens ||
+            ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr || ubatch.seq_id_unq == nullptr) {
+        return false;
+    }
+
+    for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+        if (ubatch.n_seq_id[row] != 1 || ubatch.seq_id[row] == nullptr) {
+            return false;
+        }
+        const llama_seq_id row_id = ubatch.seq_id[row][0];
+        bool listed = false;
+        for (uint32_t seq = 0; seq < ubatch.n_seqs_unq; ++seq) {
+            listed = listed || ubatch.seq_id_unq[seq] == row_id;
+        }
+        if (!listed) {
+            return false;
+        }
+        for (uint32_t previous = 0; previous < row; ++previous) {
+            if (ubatch.seq_id[previous][0] == row_id) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 struct llm_fused_op_probe {
@@ -104,6 +147,217 @@ static bool llama_sched_supports_flash_attn_causal_prefix(ggml_backend_sched_t s
     return true;
 }
 
+llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
+        const llama_model & model,
+        const llama_adapter_loras & loras) {
+    snapshot.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
+    snapshot.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+    snapshot.struct_size = sizeof(snapshot);
+    snapshot.n_slots = std::max(model.moe_expert_cache_slots(), 0);
+    const bool tensor_overrides = model.has_tensor_overrides();
+
+    auto has_lora = [&](ggml_tensor * tensor) {
+        for (const auto & lora : loras) {
+            if (lora.second != 0.0f && lora.first != nullptr && lora.first->get_weight(tensor) != nullptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto is_cached = [](const ggml_tensor * tensor) {
+#ifdef GGML_USE_CUDA
+        return tensor != nullptr && tensor->buffer != nullptr &&
+            ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(tensor->buffer));
+#else
+        GGML_UNUSED(tensor);
+        return false;
+#endif
+    };
+
+    struct group_source {
+        uint32_t domain;
+        bool route_present;
+        ggml_tensor * gate;
+        ggml_tensor * up;
+        ggml_tensor * gate_up;
+        ggml_tensor * down;
+        ggml_tensor * gate_scale;
+        ggml_tensor * up_scale;
+        ggml_tensor * down_scale;
+        ggml_tensor * gate_bias;
+        ggml_tensor * up_bias;
+        ggml_tensor * gate_up_bias;
+        ggml_tensor * down_bias;
+        ggml_tensor * gate_input_scale;
+        ggml_tensor * up_input_scale;
+        ggml_tensor * down_input_scale;
+    };
+
+    std::unordered_set<const ggml_tensor *> seen;
+    groups.reserve(std::min<size_t>(model.layers.size() * 2, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS));
+    tensors.reserve(std::min<size_t>(model.layers.size() * 12, GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2));
+
+    auto mark_typed_alias = [&](const ggml_tensor * tensor) {
+        snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+        for (const auto & record : tensors) {
+            if (record.tensor == tensor && record.group_index < groups.size()) {
+                groups[record.group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+            }
+        }
+    };
+
+    auto append_group = [&](const group_source & source) {
+        if (source.gate == nullptr && source.up == nullptr && source.gate_up == nullptr && source.down == nullptr) {
+            return;
+        }
+        if (groups.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
+            snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+            return;
+        }
+
+        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+        if (source.gate != nullptr && source.up != nullptr && source.gate_up == nullptr && source.down != nullptr) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE;
+        } else if (source.gate == nullptr && source.up == nullptr && source.gate_up != nullptr && source.down != nullptr) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP;
+        } else if (source.gate == nullptr && source.up != nullptr && source.gate_up == nullptr && source.down != nullptr) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED;
+        }
+
+        const uint32_t group_index = groups.size();
+        uint32_t group_flags = 0;
+        if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID || !source.route_present) {
+            group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+        }
+        groups.push_back({layout, source.domain, group_flags, 0});
+
+        auto append_tensor = [&](ggml_tensor * tensor, uint32_t role, uint32_t status) {
+            if (tensor == nullptr) {
+                return;
+            }
+            if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {
+                groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+                snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+                return;
+            }
+            if (!seen.insert(tensor).second) {
+                groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
+                mark_typed_alias(tensor);
+                return;
+            }
+            const bool cached = is_cached(tensor);
+            const bool overridden = tensor_overrides && !cached;
+            uint32_t flags = overridden ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
+            if (overridden) {
+                groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES;
+            }
+            if (cached) {
+                flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
+            }
+            if (has_lora(tensor)) {
+                flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA;
+                if (status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                    groups[group_index].flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA;
+                }
+            }
+            tensors.push_back({tensor, group_index, role, status, flags, 0});
+        };
+
+        append_tensor(source.gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+        append_tensor(source.up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+        append_tensor(source.gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+        append_tensor(source.down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
+        append_tensor(source.gate_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+        append_tensor(source.up_scale,
+            source.gate_up != nullptr ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE,
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+        append_tensor(source.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+        append_tensor(source.gate_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+        append_tensor(source.up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+        append_tensor(source.gate_up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+        append_tensor(source.down_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+        append_tensor(source.gate_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+        append_tensor(source.up_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+        append_tensor(source.down_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+    };
+
+    for (const auto & layer : model.layers) {
+        append_group({
+            GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY,
+            layer.ffn_gate_inp != nullptr,
+            layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps,
+            layer.ffn_gate_exps_s, layer.ffn_up_exps_s, layer.ffn_down_exps_s,
+            layer.ffn_gate_exps_b, layer.ffn_up_exps_b, layer.ffn_gate_up_exps_b, layer.ffn_down_exps_b,
+            layer.ffn_gate_exps_in_s, layer.ffn_up_exps_in_s, layer.ffn_down_exps_in_s,
+        });
+        append_group({
+            GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK,
+            true,
+            layer.ffn_gate_chexps, layer.ffn_up_chexps, nullptr, layer.ffn_down_chexps,
+            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        });
+    }
+
+    auto append_excluded = [&](ggml_tensor * tensor, uint32_t status) {
+        if (tensor == nullptr) {
+            return;
+        }
+        if (!seen.insert(tensor).second) {
+            mark_typed_alias(tensor);
+            return;
+        }
+        if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {
+            snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+            return;
+        }
+        const bool cached = is_cached(tensor);
+        uint32_t flags = tensor_overrides && !cached ? GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_TENSOR_OVERRIDES : 0;
+        if (cached) {
+            flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
+        }
+        if (has_lora(tensor)) {
+            flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA;
+        }
+        tensors.push_back({tensor, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID, status, flags, 0});
+    };
+
+    for (const auto & layer : model.layers) {
+        append_excluded(layer.ffn_gate_shexp, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED);
+        append_excluded(layer.ffn_up_shexp, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED);
+        append_excluded(layer.ffn_down_shexp, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_SHARED);
+        append_excluded(layer.ffn_gate, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE);
+        append_excluded(layer.ffn_up, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE);
+        append_excluded(layer.ffn_down, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_EXCLUDED_DENSE);
+    }
+
+    for (const auto & named_tensor : model.tensors_by_name) {
+        const ggml_tensor * tensor = named_tensor.second;
+        if (!is_cached(tensor) || !seen.insert(tensor).second) {
+            continue;
+        }
+        if (tensors.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2) {
+            snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
+            break;
+        }
+        uint32_t flags = GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER;
+        if (has_lora(const_cast<ggml_tensor *>(tensor))) {
+            flags |= GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_ACTIVE_LORA;
+        }
+        tensors.push_back({tensor, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID,
+            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED, flags, 0});
+    }
+
+    snapshot.groups = groups.empty() ? nullptr : groups.data();
+    snapshot.n_groups = static_cast<uint32_t>(groups.size());
+    snapshot.tensors = tensors.empty() ? nullptr : tensors.data();
+    snapshot.n_tensors = static_cast<uint32_t>(tensors.size());
+}
+
+const ggml_backend_moe_candidate_snapshot_v2 & llama_moe_candidate_snapshot::get() const {
+    return snapshot;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -114,6 +368,8 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    graph_execution_owner_namespace = graph_execution_next_owner_namespace();
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -398,6 +654,12 @@ llama_context::llama_context(
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                }
+
+                auto moe_candidate_replace_fn = (ggml_backend_moe_candidate_replace_v2_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME);
+                if (moe_candidate_replace_fn) {
+                    moe_candidate_replace_fns.emplace_back(backend.get(), moe_candidate_replace_fn);
                 }
             }
         }
@@ -839,6 +1101,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     synchronize();
+    refresh_moe_candidates();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -1019,6 +1282,38 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     } else {
         LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
                 __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+    }
+}
+
+void llama_context::refresh_moe_candidates() {
+    if (!moe_candidate_refresh_pending) {
+        return;
+    }
+
+    moe_candidate_refresh_pending = false;
+    if (moe_candidate_replace_fns.empty()) {
+        return;
+    }
+
+    ggml_backend_moe_candidate_snapshot_v2 disabled = {};
+    disabled.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
+    disabled.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+    disabled.struct_size = sizeof(disabled);
+    disabled.n_slots = std::max(model.moe_expert_cache_slots(), 0);
+
+    try {
+        const llama_moe_candidate_snapshot candidates(model, *loras);
+        for (const auto & endpoint : moe_candidate_replace_fns) {
+            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
+                    result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
+                endpoint.second(endpoint.first, &disabled);
+            }
+        }
+    } catch (...) {
+        for (const auto & endpoint : moe_candidate_replace_fns) {
+            endpoint.second(endpoint.first, &disabled);
+        }
     }
 }
 
@@ -1685,6 +1980,7 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
         }
     }
 
+    moe_candidate_refresh_pending = true;
     sched_need_reserve = true;
 }
 
@@ -1791,7 +2087,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2922,7 +3218,8 @@ llm_graph_params llama_context::graph_params(
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+    const llama_ubatch * ubatch) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2942,7 +3239,27 @@ ggml_status llama_context::graph_compute(
     if (shared_workspace_peer() != nullptr) {
         workspace_in_flight = true;
     }
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+
+    ggml_status status;
+    if (ubatch != nullptr && ubatch_has_independent_rows(*ubatch)) {
+        ggml_graph_execution_certificate certificate = {};
+        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+        certificate.struct_size = sizeof(certificate);
+        certificate.owner_namespace = graph_execution_owner_namespace;
+        certificate.owner_generation = graph_execution_owner_generation;
+        certificate.n_rows = ubatch->n_tokens;
+        certificate.n_sequences = ubatch->n_seqs_unq;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+        switch (cparams.ctx_type) {
+            case LLAMA_CONTEXT_TYPE_DEFAULT: certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;  break;
+            case LLAMA_CONTEXT_TYPE_DRAFT  : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT; break;
+            case LLAMA_CONTEXT_TYPE_MTP    : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;   break;
+        }
+        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    } else {
+        status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

@@ -93,6 +93,40 @@ struct batch_builder {
     }
 };
 
+static void check_server_ubatch(
+        testing & t,
+        const llama_ubatch & ubatch,
+        std::initializer_list<llama_seq_id> row_ids,
+        std::initializer_list<llama_pos> positions,
+        uint32_t n_seq_tokens,
+        uint32_t n_seqs,
+        std::initializer_list<llama_seq_id> seq_ids_unq,
+        bool equal_seqs) {
+    const std::vector<llama_seq_id> expected_rows(row_ids);
+    const std::vector<llama_pos> expected_positions(positions);
+    const std::vector<llama_seq_id> expected_unq(seq_ids_unq);
+    t.assert_equal(expected_rows.size(), expected_positions.size());
+    if (!t.assert_equal(expected_rows.size(), (size_t) ubatch.n_tokens) ||
+            !t.assert_true(ubatch.n_seq_id != nullptr && ubatch.seq_id != nullptr && ubatch.seq_id_unq != nullptr)) {
+        return;
+    }
+    t.assert_equal(n_seq_tokens, ubatch.n_seq_tokens);
+    t.assert_equal(n_seqs, ubatch.n_seqs);
+    t.assert_equal(expected_unq.size(), (size_t) ubatch.n_seqs_unq);
+    t.assert_equal(equal_seqs, ubatch.equal_seqs());
+    for (size_t row = 0; row < expected_rows.size(); ++row) {
+        t.assert_equal(1, ubatch.n_seq_id[row]);
+        if (!t.assert_true(ubatch.seq_id[row] != nullptr)) {
+            return;
+        }
+        t.assert_equal(expected_rows[row], ubatch.seq_id[row][0]);
+        t.assert_equal(expected_positions[row], ubatch.pos[row]);
+    }
+    for (size_t seq = 0; seq < expected_unq.size(); ++seq) {
+        t.assert_equal(expected_unq[seq], ubatch.seq_id_unq[seq]);
+    }
+}
+
 static void test_init(testing & t) {
     llama_vocab vocab;
 
@@ -444,6 +478,115 @@ static void test_split(testing & t) {
         t.assert_equal(1, ub.seq_id_unq[1]);
         t.assert_true(ub.token != nullptr);
         t.assert_true(ub.embd == nullptr);
+    });
+
+    t.test("server_homogeneous_decode", [&](testing & t) {
+        for (uint32_t n_rows : {2u, 4u}) {
+            for (bool unified : {true, false}) {
+                batch_builder bb;
+                mock_memory mem;
+                for (uint32_t row = 0; row < n_rows; ++row) {
+                    const llama_pos pos = 10 + row;
+                    mem.ranges[row] = {0, pos - 1};
+                    bb.add(pos, {static_cast<llama_seq_id>(row)}, true);
+                }
+
+                llama_batch_allocr ba(1);
+                t.assert_true(ba.init(bb.make(), vocab, &mem, bb.n_embd, 8, false));
+                const llama_ubatch ub = unified ? ba.split_simple(4) : ba.split_equal(4, true, 0);
+                if (n_rows == 2) {
+                    check_server_ubatch(t, ub, {0, 1}, {10, 11}, 1, 2, {0, 1}, !unified);
+                } else {
+                    check_server_ubatch(t, ub, {0, 1, 2, 3}, {10, 11, 12, 13}, 1, 4, {0, 1, 2, 3}, !unified);
+                }
+                t.assert_equal(0u, unified ? ba.split_simple(4).n_tokens : ba.split_equal(4, true, 0).n_tokens);
+            }
+        }
+    });
+
+    t.test("server_mixed_decode_prompt_ub4_boundary", [&](testing & t) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+            mem.ranges[0] = {0, 9};
+            mem.ranges[1] = {0, 19};
+            bb.add(10, {0}, true);
+            bb.add(20, {1}, true);
+            bb.add(0, {2}, false);
+            bb.add(1, {2}, false);
+            bb.add(2, {2}, true);
+            return bb.make();
+        };
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_simple(4), {0, 1, 2, 2}, {10, 20, 0, 1}, 1, 4, {0, 1, 2}, false);
+            check_server_ubatch(t, ba.split_simple(4), {2}, {2}, 1, 1, {2}, false);
+        }
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_equal(4, true, 0), {0, 1, 2}, {10, 20, 0}, 1, 3, {0, 1, 2}, true);
+            check_server_ubatch(t, ba.split_equal(4, true, 0), {2, 2}, {1, 2}, 2, 1, {2}, true);
+        }
+    });
+
+    t.test("server_repeated_ids", [&](testing & t) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+            mem.ranges[2] = {0, 29};
+            bb.add(30, {2}, false);
+            bb.add(31, {2}, false);
+            bb.add(32, {2}, true);
+            return bb.make();
+        };
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_simple(3), {2, 2, 2}, {30, 31, 32}, 1, 3, {2}, false);
+        }
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_equal(3, true, 0), {2, 2, 2}, {30, 31, 32}, 3, 1, {2}, true);
+        }
+    });
+
+    t.test("server_noncontiguous_slot_ids", [&](testing & t) {
+        auto make_batch = [](batch_builder & bb, mock_memory & mem) {
+            for (llama_seq_id seq : {0, 2, 3}) {
+                const llama_pos pos = 10 + seq;
+                mem.ranges[seq] = {0, pos - 1};
+                bb.add(pos, {seq}, true);
+            }
+            return bb.make();
+        };
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_simple(4), {0, 2, 3}, {10, 12, 13}, 1, 3, {0, 2, 3}, false);
+        }
+
+        {
+            batch_builder bb;
+            mock_memory mem;
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(make_batch(bb, mem), vocab, &mem, bb.n_embd, 8, false));
+            check_server_ubatch(t, ba.split_equal(4, true, 0), {0}, {10}, 1, 1, {0}, true);
+            check_server_ubatch(t, ba.split_equal(4, true, 0), {2, 3}, {12, 13}, 1, 2, {2, 3}, true);
+        }
     });
 }
 

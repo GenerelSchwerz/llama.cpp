@@ -385,6 +385,46 @@ extern "C" {
     struct ggml_context;
     struct ggml_cgraph;
 
+#define GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC 0x47455831u
+#define GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION 1u
+
+    enum ggml_graph_execution_domain {
+        GGML_GRAPH_EXECUTION_DOMAIN_INVALID = 0,
+        GGML_GRAPH_EXECUTION_DOMAIN_MAIN    = 1,
+        GGML_GRAPH_EXECUTION_DOMAIN_DRAFT   = 2,
+        GGML_GRAPH_EXECUTION_DOMAIN_MTP     = 3,
+    };
+
+    enum ggml_graph_execution_row_semantics {
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID     = 0,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT = 1,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL  = 2,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE = 3,
+    };
+
+    enum ggml_graph_execution_certificate_flag {
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE = 0,
+    };
+
+    // Callers initialize all fields except source_graph_uid and split_graph_uid, which must be zero.
+    // owner_namespace isolates an owner; owner_generation changes when that owner's reusable state is replaced.
+    // The scheduler stamps the graph UIDs for each backend split. Invalid input is treated as uncertified execution.
+    struct ggml_graph_execution_certificate {
+        uint32_t magic;
+        uint32_t abi_version;
+        uint32_t struct_size;
+        uint32_t flags;
+        uint32_t domain;
+        uint32_t row_semantics;
+        uint32_t n_rows;
+        uint32_t n_sequences;
+        uint64_t owner_namespace;
+        uint64_t owner_generation;
+        uint64_t source_graph_uid;
+        uint64_t split_graph_uid;
+        uint64_t reserved[4];
+    };
+
     // NOTE: always add types at the end of the enum to keep backward compatibility
     enum ggml_type {
         GGML_TYPE_F32     = 0,

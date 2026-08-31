@@ -2195,6 +2195,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+int32_t llama_model::moe_expert_cache_slots() const {
+    return params.moe_expert_cache_slots;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2757,17 +2761,9 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
 #ifdef GGML_USE_CUDA
-    // If --moe-expert-cache-size was used, surface hit/miss stats before
-    // tearing down. The flag's value is read from the global ggml-cuda
-    // setter (set by llama_model_load); no-op when the cache wasn't
-    // configured. Avoids needing access to llama_model::params (protected).
-    if (model && ggml_backend_cuda_moe_get_cache_slots() > 0) {
+    if (model && model->moe_expert_cache_slots() > 0) {
         ggml_backend_cuda_moe_log_and_reset_stats();
     }
-    // Reset the observed-expert-size globals so a subsequent model load
-    // starts from a clean slate.
-    ggml_backend_cuda_moe_reset_expert_size_observation();
-    ggml_cuda_moe_cache_free_all();
 #endif
     delete model;
 }

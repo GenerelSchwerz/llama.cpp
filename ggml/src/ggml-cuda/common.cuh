@@ -1230,7 +1230,18 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+class ggml_cuda_moe_graph_plan;
+
 struct ggml_cuda_graph {
+    std::shared_ptr<ggml_cuda_moe_graph_plan> moe_graph_plan;
+    const void * moe_coverage_nodes = nullptr;
+    uint64_t moe_coverage_epoch = 0;
+    uint64_t moe_coverage_mmid_fingerprint = 0;
+    uint64_t moe_resource_fingerprint = 0;
+    std::vector<std::weak_ptr<void>> moe_resource_witnesses;
+    int32_t moe_coverage_n_nodes = 0;
+    uint32_t moe_coverage_mmid_count = 0;
+    int64_t last_used_time = 0;
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
         if (instance != nullptr) {
@@ -1247,7 +1258,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
-    int64_t last_used_time = 0;
+    uint64_t execution_semantic_key = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1414,10 +1425,14 @@ struct ggml_cuda_stream_context {
     }
 };
 
+class ggml_cuda_moe_grouped_context;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    std::once_flag moe_grouped_context_once;
+    ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1426,7 +1441,6 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
-#ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
@@ -1456,6 +1470,10 @@ struct ggml_backend_cuda_context {
         return it->second.get();
     }
 
+    void certify_moe_graph(ggml_cgraph * cgraph);
+    bool recover_moe_graph(ggml_cgraph * cgraph, ggml_cuda_graph * graph);
+
+#ifdef USE_CUDA_GRAPH
     // Check if any CUDA graph is enabled for this context (used by kernels that need to know
     // if graphs are in use without having access to the specific graph key)
     bool any_cuda_graph_enabled() const {
