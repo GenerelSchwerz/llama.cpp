@@ -140,6 +140,15 @@ int llama_completion(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
 
+    // the prompt and the generation do not want the same thing from a multi-GPU split, so the prompt
+    // may be processed under a split mode of its own
+    const llama_split_mode split_mode_gen = params.split_mode;
+    bool split_mode_switch_pending = false;
+    if (params.prefill_split_mode >= 0 && (llama_split_mode) params.prefill_split_mode != params.split_mode) {
+        params.split_mode = (llama_split_mode) params.prefill_split_mode;
+        split_mode_switch_pending = true;
+    }
+
     auto llama_init = common_init_from_params(params);
 
     ctx   = llama_init->context();
@@ -662,6 +671,16 @@ int llama_completion(int argc, char ** argv) {
         }
 
         embd.clear();
+
+        // the whole prompt is in the cache now, so move the weights to what generation wants
+        if (split_mode_switch_pending && (int) embd_inp.size() <= n_consumed) {
+            split_mode_switch_pending = false;
+
+            if (!llama_context_set_split_mode(ctx, split_mode_gen, nullptr)) {
+                LOG_WRN("%s: the generation split mode does not fit, generating under the prefill split mode\n", __func__);
+            }
+            mem = llama_get_memory(ctx);
+        }
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
 

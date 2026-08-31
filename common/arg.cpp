@@ -898,6 +898,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
+    // the switch carries the state of the whole context, so there must be a moment where nothing is
+    // generating. that does not hold once several sequences share the context
+    if (params.prefill_split_mode >= 0 && params.n_parallel != 1) {
+        throw std::invalid_argument("error: --prefill-split-mode requires --parallel 1\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||
@@ -2903,6 +2909,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_SPLIT_MODE"));
+    add_opt(common_arg(
+        {"-psm", "--prefill-split-mode"}, "{none,layer,row,tensor}",
+        "split mode to process the prompt under, before switching to --split-mode to generate. A large batch "
+        "pays for the collective a tensor split needs and a single token does not, so the two phases can "
+        "prefer different modes. The weights are placed again once between the two, the cache is carried "
+        "over (default: use --split-mode throughout)",
+        [](common_params & params, const std::string & value) {
+            if (value == "none") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_NONE;
+            } else if (value == "layer") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_LAYER;
+            } else if (value == "row") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_ROW;
+            } else if (value == "tensor") {
+                params.prefill_split_mode = LLAMA_SPLIT_MODE_TENSOR;
+            } else {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFILL_SPLIT_MODE").set_examples({LLAMA_EXAMPLE_COMPLETION}));
     add_opt(common_arg(
         {"-ts", "--tensor-split"}, "N0,N1,N2,...",
         "fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1",
