@@ -904,6 +904,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prefill-split-mode requires --parallel 1\n");
     }
 
+    // the switch happens once, after the prompt. an interactive session has more prompts after that
+    if (params.prefill_split_mode >= 0 && (params.interactive || params.interactive_first)) {
+        throw std::invalid_argument("error: --prefill-split-mode is not supported in interactive mode\n");
+    }
+
     const bool skip_model_download =
         // server will call common_params_handle_models() later, so we skip it here
         ctx_arg.ex == LLAMA_EXAMPLE_SERVER ||

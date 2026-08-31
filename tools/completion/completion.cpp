@@ -677,6 +677,10 @@ int llama_completion(int argc, char ** argv) {
             split_mode_switch_pending = false;
 
             if (!llama_context_set_split_mode(ctx, split_mode_gen, nullptr)) {
+                if (llama_model_get_split_mode(model) == split_mode_gen) {
+                    LOG_ERR("%s: the split mode switch lost the prompt, giving up\n", __func__);
+                    return 1;
+                }
                 LOG_WRN("%s: the generation split mode does not fit, generating under the prefill split mode\n", __func__);
             }
             mem = llama_get_memory(ctx);
