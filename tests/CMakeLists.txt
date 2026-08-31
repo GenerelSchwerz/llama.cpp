@@ -150,6 +150,7 @@ endif ()
 
 llama_build(test-recurrent-state-rollback.cpp)
 llama_build(test-save-load-state.cpp)
+llama_build(test-split-mode-switch.cpp)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_compile_definitions(test-recurrent-state-rollback PRIVATE LLAMA_TEST_RECURRENT_INTERNALS)
@@ -262,6 +263,31 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # Test the runtime split mode switch - skips itself when there is no GPU.
+    # --models DIR runs the whole directory, which is the way to sweep every architecture by hand
+    llama_test(
+        test-split-mode-switch
+        LABEL main
+        ARGS -m "${MODEL_DIR}/llama-dense.gguf"
+    )
+    set_tests_properties(test-split-mode-switch PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_test(
+        test-split-mode-switch
+        NAME test-split-mode-switch-moe
+        LABEL main
+        ARGS -m "${MODEL_DIR}/qwen3moe-moe.gguf"
+    )
+    set_tests_properties(test-split-mode-switch-moe PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    llama_test(
+        test-split-mode-switch
+        NAME test-split-mode-switch-iswa
+        LABEL main
+        ARGS -m "${MODEL_DIR}/gemma2-dense.gguf"
+    )
+    set_tests_properties(test-split-mode-switch-iswa PROPERTIES FIXTURES_REQUIRED generate-models)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)
