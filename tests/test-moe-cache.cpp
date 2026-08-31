@@ -4741,13 +4741,17 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_dim = 256,
         const active_grouped_dispatch_graph * shared_banks = nullptr,
         bool concurrent_stream_fixture = false,
-        bool original_direct_biases = false) {
+        bool original_direct_biases = false,
+        uint32_t n_ff = 0,
+        bool mapped_host_biases = false) {
     CHECK(n_rows >= 1 && n_rows <= 4 && n_used >= 1 && n_used <= n_experts);
+    const uint32_t ff_dim = n_ff != 0 ? n_ff : n_dim;
     CHECK(!concurrent_stream_fixture ||
         (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_rows == 1 && n_used == 1));
     CHECK(!original_direct_biases || (shared_banks == nullptr && !original_direct_down_scale && !original_direct_nvfp4_scales));
+    CHECK(!mapped_host_biases || original_direct_biases);
     const ggml_init_params weight_params = {
-        /* .mem_size = */ ggml_tensor_overhead() * 8,
+        /* .mem_size = */ ggml_tensor_overhead() * 12,
         /* .mem_base = */ nullptr,
         /* .no_alloc = */ true,
     };
@@ -4770,16 +4774,16 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     CHECK((shared_banks != nullptr || result.weights != nullptr) && result.nodes != nullptr);
 
     size_t shared_bank_index = 0;
-    auto add_bank = [&](ggml_type type, int64_t ne1, uint32_t role, const char * name) {
+    auto add_bank = [&](ggml_type type, int64_t ne0, int64_t ne1, uint32_t role, const char * name) {
         ggml_tensor * tensor = nullptr;
         if (shared_banks != nullptr) {
             CHECK(shared_bank_index < shared_banks->banks.size() && shared_bank_index < shared_banks->roles.size());
             tensor = shared_banks->banks[shared_bank_index];
-            CHECK(tensor != nullptr && tensor->type == type && tensor->ne[0] == n_dim && tensor->ne[1] == ne1 &&
+            CHECK(tensor != nullptr && tensor->type == type && tensor->ne[0] == ne0 && tensor->ne[1] == ne1 &&
                 tensor->ne[2] == n_experts && shared_banks->roles[shared_bank_index] == role);
             ++shared_bank_index;
         } else {
-            tensor = ggml_new_tensor_3d(result.weights.get(), type, n_dim, ne1, n_experts);
+            tensor = ggml_new_tensor_3d(result.weights.get(), type, ne0, ne1, n_experts);
             ggml_set_name(tensor, name);
         }
         result.banks.push_back(tensor);
@@ -4790,15 +4794,15 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     ggml_tensor * gate = nullptr;
     ggml_tensor * up = nullptr;
     if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
-        gate_up = add_bank(types[0], 2 * n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT,
+        gate_up = add_bank(types[0], n_dim, 2 * ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT,
             "test_active_gate_up_weight");
     } else {
-        gate = add_bank(types[0], n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
+        gate = add_bank(types[0], n_dim, ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
             "test_active_gate_weight");
-        up = add_bank(types[1], n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
+        up = add_bank(types[1], n_dim, ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
             "test_active_up_weight");
     }
-    result.down = add_bank(types[layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 1 : 2],
+    result.down = add_bank(types[layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 1 : 2], ff_dim,
         n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
         "test_active_down_weight");
     ggml_tensor * gate_bias = nullptr;
@@ -4807,18 +4811,19 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     ggml_tensor * down_bias = nullptr;
     if (original_direct_biases) {
         const auto add_bias = [&](int64_t ne0, uint32_t role, const char * name) {
-            ggml_tensor * tensor = ggml_new_tensor_2d(result.nodes.get(), GGML_TYPE_F32, ne0, n_experts);
+            ggml_tensor * tensor = ggml_new_tensor_2d(
+                mapped_host_biases ? result.weights.get() : result.nodes.get(), GGML_TYPE_F32, ne0, n_experts);
             ggml_set_name(tensor, name);
             result.biases.push_back(tensor);
             result.bias_roles.push_back(role);
             return tensor;
         };
         if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
-            gate_up_bias = add_bias(2 * n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS,
+            gate_up_bias = add_bias(2 * ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS,
                 "test_active_gate_up_bias");
         } else {
-            gate_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, "test_active_gate_bias");
-            up_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
+            gate_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, "test_active_gate_bias");
+            up_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
         }
         down_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, "test_active_down_bias");
     }
@@ -5263,35 +5268,39 @@ static uint64_t active_grouped_legacy_op_count(ggml_backend_t backend, bool is_d
 
 static void check_active_grouped_debug_telemetry(
         ggml_backend_t backend,
-        const active_grouped_dispatch_graph & graph) {
+        const active_grouped_dispatch_graph & graph,
+        uint64_t expected_loaded_experts = 0,
+        uint64_t expected_calls = 5) {
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
     CHECK(context != nullptr);
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
-    CHECK(telemetry.plan_calls == 6 && telemetry.plan_compiles == 2 && telemetry.plan_reuses == 4);
-    CHECK(telemetry.calls == 5 && telemetry.ready == 5 && telemetry.completed == 5);
-    CHECK(telemetry.ready_min == 5 && telemetry.ready_max == 5);
-    CHECK(telemetry.completed_min == 5 && telemetry.completed_max == 5);
-    CHECK(telemetry.admitted_banks == 5 * graph.banks.size());
+    CHECK(telemetry.plan_calls == expected_calls + 1 && telemetry.plan_compiles == 2 &&
+        telemetry.plan_reuses == expected_calls - 1);
+    CHECK(telemetry.calls == expected_calls && telemetry.ready == expected_calls && telemetry.completed == expected_calls);
+    CHECK(telemetry.ready_min == expected_calls && telemetry.ready_max == expected_calls);
+    CHECK(telemetry.completed_min == expected_calls && telemetry.completed_max == expected_calls);
+    CHECK(telemetry.admitted_banks == expected_calls * graph.banks.size());
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
     CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
-    std::vector<bool> used(graph.n_experts, false);
-    uint64_t n_loaded_experts = 0;
-    for (uint32_t row = 0; row < graph.n_rows; ++row) {
-        for (uint32_t route = 0; route < graph.n_used; ++route) {
-            const uint32_t expert = active_grouped_route(graph, 0, row, route);
-            if (!used[expert]) {
-                used[expert] = true;
-                ++n_loaded_experts;
+    if (expected_loaded_experts == 0) {
+        std::vector<bool> used(graph.n_experts, false);
+        for (uint32_t row = 0; row < graph.n_rows; ++row) {
+            for (uint32_t route = 0; route < graph.n_used; ++route) {
+                const uint32_t expert = active_grouped_route(graph, 0, row, route);
+                if (!used[expert]) {
+                    used[expert] = true;
+                    ++expected_loaded_experts;
+                }
             }
         }
     }
-    CHECK(telemetry.h2d_banks == n_loaded_experts * graph.banks.size());
+    CHECK(telemetry.h2d_banks == expected_loaded_experts * graph.banks.size());
     uint64_t bytes_per_expert = 0;
     for (const ggml_tensor * bank : graph.banks) {
         bytes_per_expert += bank->nb[2];
     }
-    CHECK(telemetry.h2d_bytes == n_loaded_experts * bytes_per_expert);
+    CHECK(telemetry.h2d_bytes == expected_loaded_experts * bytes_per_expert);
 
     const auto reset = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(reset.registered == 1 && reset.covered == 0 && reset.plan_calls == 0);
@@ -6630,27 +6639,40 @@ static void test_active_grouped_multirow_graph_modes(int device) {
 
 static void check_active_grouped_bias_shadows(
         ggml_backend_t backend,
-        const active_grouped_dispatch_graph & graph) {
+        const active_grouped_dispatch_graph & graph,
+        uint32_t expected_resident = 0) {
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
     ggml_cuda_moe_candidate_group_key key;
     CHECK(context != nullptr && context->find_down_group_key(graph.down, &key));
+    std::vector<const float *> shadows;
+    std::vector<std::vector<float>> originals;
     for (ggml_tensor * bias : graph.biases) {
-        const float * shadow = ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(*context, key, bias);
-        CHECK(shadow != nullptr && bias->type == GGML_TYPE_F32 && ggml_n_dims(bias) == 2);
-        std::vector<float> original(ggml_nelements(bias));
-        ggml_backend_tensor_get(bias, original.data(), 0, ggml_nbytes(bias));
-        for (uint32_t row = 0; row < graph.n_rows; ++row) {
-            for (uint32_t route = 0; route < graph.n_used; ++route) {
-                const int32_t expert = active_grouped_route(graph, 0, row, route);
-                const int32_t slot = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(*context, key, expert);
-                CHECK(slot >= 0);
-                std::vector<float> actual(bias->ne[0]);
-                CUDA_OK(cudaMemcpy(actual.data(), shadow + slot * bias->ne[0],
-                    actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
-                CHECK(memcmp(actual.data(), original.data() + expert * bias->ne[0],
-                    actual.size() * sizeof(float)) == 0);
-            }
+        shadows.push_back(ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(*context, key, bias));
+        CHECK(shadows.back() != nullptr && bias->type == GGML_TYPE_F32 && ggml_n_dims(bias) == 2);
+        originals.emplace_back(ggml_nelements(bias));
+        ggml_backend_tensor_get(bias, originals.back().data(), 0, ggml_nbytes(bias));
+    }
+    std::vector<bool> resident_slots(context->state().n_slots, false);
+    uint32_t n_resident = 0;
+    for (uint32_t expert = 0; expert < graph.n_experts; ++expert) {
+        const int32_t slot = ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(*context, key, expert);
+        if (slot < 0) {
+            continue;
         }
+        CHECK(static_cast<uint32_t>(slot) < resident_slots.size() && !resident_slots[slot]);
+        resident_slots[slot] = true;
+        ++n_resident;
+        for (uint32_t bias_index = 0; bias_index < graph.biases.size(); ++bias_index) {
+            ggml_tensor * bias = graph.biases[bias_index];
+            std::vector<float> actual(bias->ne[0]);
+            CUDA_OK(cudaMemcpy(actual.data(), shadows[bias_index] + slot * bias->ne[0],
+                actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK(memcmp(actual.data(), originals[bias_index].data() + expert * bias->ne[0],
+                actual.size() * sizeof(float)) == 0);
+        }
+    }
+    if (expected_resident != 0) {
+        CHECK(n_resident == expected_resident);
     }
 }
 
@@ -6661,7 +6683,11 @@ static void test_active_grouped_dispatch_types_case(
         bool original_direct_down_scale = false,
         bool test_owner_concurrency = false,
         bool original_direct_biases = false,
-        uint32_t n_rows = 1) {
+        uint32_t n_rows = 1,
+        uint32_t n_ff = 0,
+        bool auxiliary_proof = false) {
+    CHECK(!auxiliary_proof || (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_slots == 3 &&
+        test_owner_concurrency && original_direct_biases && n_rows == 1 && n_ff != 0));
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
@@ -6670,13 +6696,13 @@ static void test_active_grouped_dispatch_types_case(
     CHECK(reference_backend != nullptr && first_backend != nullptr && second_backend != nullptr);
     auto reference = build_active_grouped_dispatch_graph_types(
         reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
-        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases);
+        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     auto first = build_active_grouped_dispatch_graph_types(
         first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
-        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases);
+        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     auto second = build_active_grouped_dispatch_graph_types(
         second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
-        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases);
+        false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     initialize_active_grouped_dispatch_graphs({&reference, &first, &second});
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -6722,6 +6748,18 @@ static void test_active_grouped_dispatch_types_case(
             }
         }
     }
+    if (auxiliary_proof) {
+        CHECK(first.biases.size() == 3 && second.biases.size() == first.biases.size());
+        CHECK(first.biases[0]->ne[0] == n_ff && first.biases[1]->ne[0] == n_ff && first.biases[2]->ne[0] == 256);
+        for (const auto * graph : {&reference, &first, &second}) {
+            for (ggml_tensor * bias : graph->biases) {
+                CHECK(ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(bias->buffer)));
+                cudaPointerAttributes attributes = {};
+                CUDA_OK(cudaPointerGetAttributes(&attributes, bias->data));
+                CHECK(attributes.type == cudaMemoryTypeHost);
+            }
+        }
+    }
     check_active_grouped_contract(first_backend.get(), first, n_slots, original_direct_down_scale);
     check_active_grouped_contract(second_backend.get(), second, n_slots);
 
@@ -6733,22 +6771,41 @@ static void test_active_grouped_dispatch_types_case(
         first.banks[0]->type == first.banks[1]->type && ggml_are_same_shape(first.banks[0], first.banks[1]) &&
         ggml_are_same_stride(first.banks[0], first.banks[1]);
     for (int pass = 0; pass < 4; ++pass) {
+        if (auxiliary_proof) {
+            set_active_grouped_dispatch_logits({&reference, &first, &second}, pass % 3);
+        }
         expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-        const uint64_t expected_clock = 2 * n_rows * (pass + 2);
-        const auto current_first = run_active_grouped_dispatch(
+        const uint64_t expected_clock = auxiliary_proof ? 4 * (pass + 1) : 2 * n_rows * (pass + 2);
+        auto current_first = run_active_grouped_dispatch(
             first_backend.get(), first, expected_clock, f3_skipped, original_direct_biases && n_rows == 1);
-        const auto current_second = run_active_grouped_dispatch(
+        auto current_second = run_active_grouped_dispatch(
             second_backend.get(), second, expected_clock, f3_skipped, original_direct_biases && n_rows == 1);
+        CHECK(current_first.size() == expected.size() && current_second.size() == expected.size());
+        CHECK(memcmp(current_first.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+        CHECK(memcmp(current_second.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+        if (auxiliary_proof) {
+            current_first = run_active_grouped_dispatch(
+                first_backend.get(), first, expected_clock + 2, f3_skipped, true);
+            current_second = run_active_grouped_dispatch(
+                second_backend.get(), second, expected_clock + 2, f3_skipped, true);
+            CHECK(memcmp(current_first.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+            CHECK(memcmp(current_second.data(), expected.data(), expected.size() * sizeof(float)) == 0);
+        }
         if (pass == 0) {
             reference_output = expected;
             first_output = current_first;
             second_output = current_second;
-        } else {
+        } else if (!auxiliary_proof || pass == 3) {
             CHECK(expected == reference_output);
             CHECK(current_first == first_output && current_second == second_output);
         }
+        if (auxiliary_proof) {
+            const uint32_t expected_resident = pass == 0 ? 2 : n_slots;
+            check_active_grouped_bias_shadows(first_backend.get(), first, expected_resident);
+            check_active_grouped_bias_shadows(second_backend.get(), second, expected_resident);
+        }
     }
-    if (original_direct_biases) {
+    if (original_direct_biases && !auxiliary_proof) {
         check_active_grouped_bias_shadows(first_backend.get(), first);
         check_active_grouped_bias_shadows(second_backend.get(), second);
     }
@@ -6764,20 +6821,26 @@ static void test_active_grouped_dispatch_types_case(
         squared_expected += static_cast<double>(expected[i]) * expected[i];
     }
     CHECK(squared_expected > 0.0 && squared_error == 0.0);
-    CHECK(active_grouped_legacy_op_count(reference_backend.get()) == 4 * reference.banks.size());
-    CHECK(active_grouped_legacy_op_count(first_backend.get()) == 0);
-    CHECK(active_grouped_legacy_op_count(second_backend.get()) == 0);
-    check_active_grouped_debug_telemetry(first_backend.get(), first);
-    check_active_grouped_debug_telemetry(second_backend.get(), second);
+    const bool reference_decode = n_rows == 1;
+    CHECK(active_grouped_legacy_op_count(reference_backend.get(), reference_decode) == 4 * reference.banks.size());
+    CHECK(active_grouped_legacy_op_count(reference_backend.get(), !reference_decode) == 0);
+    CHECK(active_grouped_legacy_op_count(first_backend.get(), true) == 0 &&
+        active_grouped_legacy_op_count(first_backend.get(), false) == 0);
+    CHECK(active_grouped_legacy_op_count(second_backend.get(), true) == 0 &&
+        active_grouped_legacy_op_count(second_backend.get(), false) == 0);
+    check_active_grouped_debug_telemetry(first_backend.get(), first, auxiliary_proof ? 8 : 0, auxiliary_proof ? 9 : 5);
+    check_active_grouped_debug_telemetry(second_backend.get(), second, auxiliary_proof ? 8 : 0, auxiliary_proof ? 9 : 5);
     if (test_owner_concurrency) {
         std::array<std::vector<float>, 2> concurrent_outputs;
         std::thread first_decode([&]() {
             concurrent_outputs[0] = run_active_grouped_dispatch(
-                first_backend.get(), first, 12 * n_rows, f3_skipped, original_direct_biases && n_rows == 1);
+                first_backend.get(), first, auxiliary_proof ? 20 : 12 * n_rows,
+                f3_skipped, original_direct_biases && n_rows == 1);
         });
         std::thread second_decode([&]() {
             concurrent_outputs[1] = run_active_grouped_dispatch(
-                second_backend.get(), second, 12 * n_rows, f3_skipped, original_direct_biases && n_rows == 1);
+                second_backend.get(), second, auxiliary_proof ? 20 : 12 * n_rows,
+                f3_skipped, original_direct_biases && n_rows == 1);
         });
         first_decode.join();
         second_decode.join();
@@ -6792,6 +6855,44 @@ static void test_active_grouped_dispatch_types_case(
             CHECK(telemetry.admitted_banks == first.banks.size());
             CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
         }
+    }
+    if (auxiliary_proof) {
+        auto * first_context = ggml_cuda_moe_grouped_context_for_test(first_backend.get());
+        auto * second_context = ggml_cuda_moe_grouped_context_for_test(second_backend.get());
+        ggml_cuda_moe_candidate_group_key first_key;
+        ggml_cuda_moe_candidate_group_key second_key;
+        CHECK(first_context != nullptr && second_context != nullptr);
+        CHECK(first_context->find_down_group_key(first.down, &first_key));
+        CHECK(second_context->find_down_group_key(second.down, &second_key));
+        for (uint32_t bias = 0; bias < first.biases.size(); ++bias) {
+            CHECK(first.biases[bias]->data != second.biases[bias]->data);
+            const float * first_shadow = ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(
+                *first_context, first_key, first.biases[bias]);
+            const float * second_shadow = ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(
+                *second_context, second_key, second.biases[bias]);
+            CHECK(first_shadow != nullptr && second_shadow != nullptr && first_shadow != second_shadow);
+        }
+
+        const uint64_t legacy_before = active_grouped_legacy_op_count(first_backend.get());
+        void * saved_bias_data = first.biases[0]->data;
+        first.biases[0]->data = static_cast<char *>(saved_bias_data) + sizeof(float);
+        const auto coverage = candidate_certify_graph(*first_context, first.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> failed_plan;
+        ggml_cuda_moe_graph_execution failed_execution;
+        CHECK(first_context->prepare_graph_execution(
+            first.graph, 971, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &failed_plan, &failed_execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(failed_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && failed_execution.requires_dispatch());
+        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(*failed_plan, 0));
+        CHECK(!first_context->begin_graph_dispatch(&failed_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT));
+        CHECK(active_grouped_legacy_op_count(first_backend.get()) == legacy_before);
+        first.biases[0]->data = saved_bias_data;
+        const auto failure_telemetry =
+            ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*first_context);
+        CHECK(failure_telemetry.registered == 1 && failure_telemetry.covered == 0 &&
+            failure_telemetry.plan_calls == 0 && failure_telemetry.calls == 0);
+        CHECK(failure_telemetry.fallback == 0 && failure_telemetry.rollback == 0);
     }
     check_active_grouped_legacy_caches(reference_backend.get(), reference, false);
     for (ggml_tensor * bank : first.banks) {
@@ -8072,6 +8173,9 @@ static void test_active_grouped_dispatch() {
     test_active_grouped_dispatch_types_case(
         {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4},
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 24, false, false, true);
+    test_active_grouped_dispatch_types_case(
+        {GGML_TYPE_MXFP4, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4},
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3, false, true, true, 1, 512, true);
     fprintf(stderr, "test-moe-cache: active grouped MXFP4 separate/fused output biases exact OK\n");
     test_active_grouped_fused_down_scale_extent();
     fprintf(stderr, "test-moe-cache: Gemma fused original-direct down scale exact OK\n");
