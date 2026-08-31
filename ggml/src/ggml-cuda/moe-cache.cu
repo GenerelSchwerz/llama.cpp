@@ -67,6 +67,14 @@ static constexpr uint32_t MOE_GROUPED_MAX_INDEPENDENT_ROWS = 4;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 static std::atomic<size_t> g_moe_cache_l2_pinned_size{0};
 
+static size_t moe_cache_quantized_source_padding(uint32_t type, int64_t ne0) {
+    if (type >= GGML_TYPE_COUNT || ne0 <= 0 || !ggml_is_quantized((ggml_type) type)) {
+        return 0;
+    }
+    const int64_t remainder = ne0 % MATRIX_ROW_PADDING;
+    return remainder == 0 ? 0 : ggml_row_size((ggml_type) type, MATRIX_ROW_PADDING - remainder);
+}
+
 static bool moe_cache_mm_debug_enabled() {
     return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
 }
@@ -3454,6 +3462,7 @@ ggml_cuda_moe_cache * ggml_cuda_moe_legacy_cache_lease::get() const noexcept {
 static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         int device,
         size_t slot_size_bytes,
+        size_t trailing_padding_bytes,
         int n_slots,
         bool source_is_mmap,
         size_t l2_budget_bytes,
@@ -4388,7 +4397,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         return nullptr;
 #else
         uint32_t n_experts = 0;
-        if (device < 0 || compute_stream == nullptr || snapshot.n_slot_auxiliaries > snapshot.slot_auxiliaries.size() ||
+        if (device < 0 || compute_stream == nullptr || snapshot.n_slots == 0 ||
+                snapshot.n_slot_auxiliaries > snapshot.slot_auxiliaries.size() ||
                 !decode_eligible(snapshot, device, &n_experts)) {
             return nullptr;
         }
@@ -4434,13 +4444,19 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (!device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data, false, false, &alias_data)) {
                 return nullptr;
             }
+            if (bank.expert_stride > SIZE_MAX / snapshot.n_slots) {
+                return nullptr;
+            }
             const size_t size = bank.expert_stride * snapshot.n_slots;
+            const size_t trailing_padding = moe_cache_quantized_source_padding(bank.type, bank.ne[0]);
             const size_t bank_words = bank.expert_stride / sizeof(uint4);
-            if (bank_words > SIZE_MAX - result->words_per_miss) {
+            if (bank_words > SIZE_MAX - result->words_per_miss || size > SIZE_MAX - trailing_padding) {
                 return nullptr;
             }
             result->words_per_miss += bank_words;
-            if (!moe_grouped_cuda_success(cudaMalloc(&result->bank_data[i], size))) {
+            if (!moe_grouped_cuda_success(cudaMalloc(&result->bank_data[i], size + trailing_padding)) ||
+                    (trailing_padding > 0 && !moe_grouped_cuda_success(cudaMemsetAsync(
+                        static_cast<char *>(result->bank_data[i]) + size, 0, trailing_padding, compute_stream)))) {
                 return nullptr;
             }
             device_banks[i].source = static_cast<const char *>(alias_data);
@@ -5528,6 +5544,7 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
         }
     }
     bool fail_after_stream_probe = false;
+    const size_t trailing_padding = moe_cache_quantized_source_padding(tensor->type, tensor->ne[0]);
     if (slot_pool_d != nullptr) {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         fail_after_stream_probe = impl_->fail_borrowed_cache_init_after_probe_for_test;
@@ -5536,11 +5553,12 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
     try {
         if (slot_pool_d != nullptr) {
             prospective = ggml_cuda_moe_cache_init_with_pool(
-                impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap,
+                impl_->device, tensor->nb[2], trailing_padding, record->acquisition.n_slots, source_is_mmap,
                 l2_budget_bytes, l2_target_slots, slot_pool_d, grouped_done, fail_after_stream_probe);
         } else if (!stable_backing_required) {
-            prospective = ggml_cuda_moe_cache_init(
-                impl_->device, tensor->nb[2], record->acquisition.n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots);
+            prospective = ggml_cuda_moe_cache_init_with_pool(
+                impl_->device, tensor->nb[2], trailing_padding, record->acquisition.n_slots,
+                source_is_mmap, l2_budget_bytes, l2_target_slots, nullptr, nullptr, false);
         }
         if (prospective != nullptr) {
             ggml_cuda_moe_cache_set_metadata(prospective, tensor->name[0] ? tensor->name : "?", tensor->data, tensor->ne[2]);
@@ -8301,9 +8319,10 @@ ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_back
 struct ggml_cuda_moe_cache {
     int      device;
     size_t   slot_size_bytes;
+    size_t   trailing_padding_bytes;
     int      n_slots;
 
-    void *   slot_pool_d;            // device alloc, n_slots * slot_size_bytes
+    void *   slot_pool_d;            // device alloc, slots followed by trailing padding
     bool     owns_slot_pool;
 
     // Dedicated copy stream for cache fills, prefetches, and staging copies.
@@ -8410,6 +8429,7 @@ static void ggml_cuda_moe_cache_append_expert_counts(
 static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         int device,
         size_t slot_size_bytes,
+        size_t trailing_padding_bytes,
         int n_slots,
         bool source_is_mmap,
         size_t l2_budget_bytes,
@@ -8418,7 +8438,8 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         cudaEvent_t wait_event,
         bool fail_after_stream_probe) {
 
-    if (slot_size_bytes == 0 || n_slots <= 0) {
+    if (slot_size_bytes == 0 || n_slots <= 0 ||
+            slot_size_bytes > (SIZE_MAX - trailing_padding_bytes) / (size_t) n_slots) {
         return nullptr;
     }
 
@@ -8437,6 +8458,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     auto * c = new ggml_cuda_moe_cache;
     c->device          = device;
     c->slot_size_bytes = slot_size_bytes;
+    c->trailing_padding_bytes = trailing_padding_bytes;
     c->n_slots         = n_slots;
     c->slot_pool_d     = slot_pool_d;
     c->owns_slot_pool  = slot_pool_d == nullptr;
@@ -8454,13 +8476,24 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     c->l2_target_slots = l2_target_slots;
 
     if (c->owns_slot_pool) {
-        err = cudaMalloc(&c->slot_pool_d, (size_t)n_slots * slot_size_bytes);
+        const size_t allocation_size = (size_t) n_slots * slot_size_bytes + trailing_padding_bytes;
+        err = cudaMalloc(&c->slot_pool_d, allocation_size);
         if (err != cudaSuccess) {
             fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
-                    (size_t)n_slots * slot_size_bytes, cudaGetErrorString(err));
+                    allocation_size, cudaGetErrorString(err));
             delete c;
             cudaSetDevice(prev_device);
             return nullptr;
+        }
+        if (trailing_padding_bytes > 0) {
+            err = cudaMemset(
+                (char *) c->slot_pool_d + (size_t) n_slots * slot_size_bytes, 0, trailing_padding_bytes);
+            if (err != cudaSuccess) {
+                cudaFree(c->slot_pool_d);
+                delete c;
+                cudaSetDevice(prev_device);
+                return nullptr;
+            }
         }
     }
 
@@ -8612,7 +8645,8 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
         size_t l2_budget_bytes,
         int l2_target_slots) {
     return ggml_cuda_moe_cache_init_with_pool(
-        device, slot_size_bytes, n_slots, source_is_mmap, l2_budget_bytes, l2_target_slots, nullptr, nullptr, false);
+        device, slot_size_bytes, 0, n_slots,
+        source_is_mmap, l2_budget_bytes, l2_target_slots, nullptr, nullptr, false);
 }
 
 extern "C"
@@ -9237,81 +9271,80 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     }
 #endif
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-    std::vector<void *> batch_dsts;
-    std::vector<const void *> batch_srcs;
-    std::vector<size_t> batch_sizes;
-    cudaMemcpyAttributes attributes = {};
-    attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
-    attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
-    size_t attributes_index = 0;
-#endif
-    int n_misses = n_host_srcs - n_resident;
+    std::vector<const void *> miss_sources;
+    std::vector<int> miss_source_indices;
+    miss_sources.reserve(n_host_srcs - n_resident);
+    miss_source_indices.reserve(n_host_srcs - n_resident);
+    for (int i = 0; i < n_host_srcs; ++i) {
+        if (slot_ids[i] < 0) {
+            miss_sources.push_back(host_srcs[i]);
+            miss_source_indices.push_back(i);
+        }
+    }
+    const int n_misses = (int) miss_sources.size();
     int wave_size = n_misses;
     if (overlap) {
         const int max_staging_waves = stage_ready_capacity - 1;
         wave_size = std::max(cache->n_slots, (n_misses + max_staging_waves - 1) / max_staging_waves);
     }
+    const int n_waves = (n_misses + wave_size - 1) / wave_size;
+    if (source_wait_class != nullptr) {
+        for (int miss = 0; miss < n_misses; ++miss) {
+            source_wait_class[miss_source_indices[miss]] = 2 + miss / wave_size;
+        }
+    }
 
-    int miss = 0;
-    int wave_count = 0;
-    int wait_class = 2;
-    for (int i = 0; i < n_host_srcs;) {
-        if (slot_ids[i] >= 0) {
-            ++i;
-            continue;
-        }
-
-        const void * src = host_srcs[i];
-        int run = 1;
-        while (i + run < n_host_srcs && slot_ids[i + run] < 0 &&
-               (uintptr_t)host_srcs[i + run] == (uintptr_t)src + (size_t)run * byte_count) {
-            ++run;
-        }
-        run = std::min(run, wave_size - wave_count);
-        if (source_wait_class != nullptr) {
-            std::fill_n(source_wait_class + i, run, wait_class);
-        }
+    int copied = 0;
+    for (int wave = 0; wave < n_waves; ++wave) {
+        const int wave_end = std::min((wave + 1) * wave_size, n_misses);
+        const int copy_end = std::min(wave_end + (trailing_padding > 0 && wave + 1 < n_waves ? 1 : 0), n_misses);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-        batch_dsts.push_back((char *)miss_dst + (size_t)miss * byte_count);
-        batch_srcs.push_back(src);
-        batch_sizes.push_back((size_t)run * byte_count);
+        std::vector<void *> batch_dsts;
+        std::vector<const void *> batch_srcs;
+        std::vector<size_t> batch_sizes;
+#endif
+        while (copied < copy_end) {
+            const void * src = miss_sources[copied];
+            int run = 1;
+            while (copied + run < copy_end &&
+                   (uintptr_t) miss_sources[copied + run] == (uintptr_t) src + (size_t) run * byte_count) {
+                ++run;
+            }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+            batch_dsts.push_back((char *) miss_dst + (size_t) copied * byte_count);
+            batch_srcs.push_back(src);
+            batch_sizes.push_back((size_t) run * byte_count);
 #else
-        CUDA_CHECK(cudaMemcpyAsync(
-            (char *)miss_dst + (size_t)miss * byte_count,
-            src,
-            (size_t)run * byte_count,
-            cudaMemcpyHostToDevice,
-            cache->copy_stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                (char *) miss_dst + (size_t) copied * byte_count,
+                src,
+                (size_t) run * byte_count,
+                cudaMemcpyHostToDevice,
+                cache->copy_stream));
 #endif
-        miss += run;
-        wave_count += run;
-        i += run;
-
-        if (wave_count < wave_size && miss < n_misses) {
-            continue;
+            copied += run;
         }
-
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-        CUDA_CHECK(cudaMemcpyBatchAsync(
-            batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
-            &attributes, &attributes_index, 1, cache->copy_stream));
-        batch_dsts.clear();
-        batch_srcs.clear();
-        batch_sizes.clear();
+        if (!batch_srcs.empty()) {
+            cudaMemcpyAttributes attributes = {};
+            attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+            attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
+            size_t attributes_index = 0;
+            CUDA_CHECK(cudaMemcpyBatchAsync(
+                batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
+                &attributes, &attributes_index, 1, cache->copy_stream));
+        }
 #endif
-        if (miss == n_misses && trailing_padding > 0) {
+        if (wave + 1 == n_waves && trailing_padding > 0) {
             CUDA_CHECK(cudaMemsetAsync(
                 (char *) miss_dst + (size_t) n_misses * byte_count, 0, trailing_padding, cache->copy_stream));
         }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
         if (overlap) {
             CU_CHECK(cuStreamWriteValue32(
-                cache->copy_stream, (CUdeviceptr)(stage_ready + wait_class - 1), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+                cache->copy_stream, (CUdeviceptr)(stage_ready + wave + 1), 1, CU_STREAM_WRITE_VALUE_DEFAULT));
         }
 #endif
-        wave_count = 0;
-        ++wait_class;
     }
 
     CUDA_CHECK(cudaEventRecord(cache->stage_done, cache->copy_stream));
@@ -9319,7 +9352,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     }
     *out_n_resident = n_resident;
-    *out_n_wait_classes = overlap ? wait_class : 1;
+    *out_n_wait_classes = overlap ? 2 + n_waves : 1;
     return true;
 }
 
@@ -9414,13 +9447,29 @@ bool ggml_cuda_moe_cache_grow_pool(
         return false;
     }
 
-    void * new_pool = nullptr;
-    err = cudaMalloc(&new_pool, (size_t)cache->n_slots * min_slot_size_bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "moe-cache: grow_pool cudaMalloc(%zu) failed: %s\n",
-                (size_t)cache->n_slots * min_slot_size_bytes, cudaGetErrorString(err));
+    if (min_slot_size_bytes > (SIZE_MAX - cache->trailing_padding_bytes) / (size_t) cache->n_slots) {
         cudaSetDevice(prev_device);
         return false;
+    }
+    const size_t allocation_size =
+        (size_t) cache->n_slots * min_slot_size_bytes + cache->trailing_padding_bytes;
+    void * new_pool = nullptr;
+    err = cudaMalloc(&new_pool, allocation_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "moe-cache: grow_pool cudaMalloc(%zu) failed: %s\n",
+                allocation_size, cudaGetErrorString(err));
+        cudaSetDevice(prev_device);
+        return false;
+    }
+    if (cache->trailing_padding_bytes > 0) {
+        err = cudaMemset(
+            (char *) new_pool + (size_t) cache->n_slots * min_slot_size_bytes,
+            0, cache->trailing_padding_bytes);
+        if (err != cudaSuccess) {
+            cudaFree(new_pool);
+            cudaSetDevice(prev_device);
+            return false;
+        }
     }
 
     if (cache->slot_pool_d) {
