@@ -9291,7 +9291,7 @@ static void check_gemma_q4_materialization(
             int n_resident = 0;
             int n_wait_classes = 0;
             CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-                cache.get(), sources.data(), sources.size(), bank->nb[2], 2,
+                cache.get(), sources.data(), sources.size(), bank->nb[2], 0, 2,
                 slots.data(), nullptr, &n_resident, misses, nullptr, 0, &n_wait_classes, stream));
             CHECK(n_resident == (int) n_slots && n_wait_classes == 1);
             CHECK(ggml_cuda_moe_cache_finish_split_staging(cache.get(), stream));
@@ -9623,7 +9623,7 @@ static void test_owner_legacy_cache(int device) {
         int n_resident = 0;
         int n_wait_classes = 0;
         const bool prepared = ggml_cuda_moe_cache_prepare_split_staging(
-            first_down.get(), split_sources, 6, down->nb[2], 1, slot_ids, wait_classes,
+            first_down.get(), split_sources, 6, down->nb[2], 0, 1, slot_ids, wait_classes,
             &n_resident, prefetch_staging, prefetch_stage_ready, 3, &n_wait_classes, prefetch_compute_stream);
         prefetch_barrier.released.store(true, std::memory_order_release);
         if (prepared) {
@@ -10742,7 +10742,7 @@ int main(int argc, char ** argv) {
         int n_resident = 0;
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, 4, SLOT_BYTES, 1, slot_ids, nullptr,
+            split_cache, split_srcs, 4, SLOT_BYTES, 0, 1, slot_ids, nullptr,
             &n_resident, staging_dst, nullptr, 0, &n_wait_classes, compute_stream));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 1);
@@ -10791,7 +10791,7 @@ int main(int argc, char ** argv) {
         int n_resident = 0;
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 1, slot_ids, wait_classes,
+            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 0, 1, slot_ids, wait_classes,
             &n_resident, staging_dst, stage_ready, 3, &n_wait_classes, compute_stream));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 4);
@@ -10830,7 +10830,7 @@ int main(int argc, char ** argv) {
         int invalid_n_resident = 0;
         int invalid_n_wait_classes = 0;
         CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 1, invalid_slots, invalid_wait_classes,
+            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 0, 1, invalid_slots, invalid_wait_classes,
             &invalid_n_resident, staging_dst, (uint32_t *)staging_dst, 1,
             &invalid_n_wait_classes, compute_stream));
         CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
@@ -10842,7 +10842,7 @@ int main(int argc, char ** argv) {
     int non_overflow_resident = 0;
     int non_overflow_wait_classes = 0;
     CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
-        split_cache, non_overflow_srcs, 2, SLOT_BYTES, 1, non_overflow_slots,
+        split_cache, non_overflow_srcs, 2, SLOT_BYTES, 0, 1, non_overflow_slots,
         nullptr, &non_overflow_resident, staging_dst, nullptr, 0,
         &non_overflow_wait_classes, compute_stream));
     CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);

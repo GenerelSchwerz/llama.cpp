@@ -9142,6 +9142,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     const void * const * host_srcs,
     int                  n_host_srcs,
     size_t               byte_count,
+    size_t               trailing_padding,
     int                  min_resident,
     int *                slot_ids,
     int32_t *            source_wait_class,
@@ -9299,6 +9300,10 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         batch_srcs.clear();
         batch_sizes.clear();
 #endif
+        if (miss == n_misses && trailing_padding > 0) {
+            CUDA_CHECK(cudaMemsetAsync(
+                (char *) miss_dst + (size_t) n_misses * byte_count, 0, trailing_padding, cache->copy_stream));
+        }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM)
         if (overlap) {
             CU_CHECK(cuStreamWriteValue32(

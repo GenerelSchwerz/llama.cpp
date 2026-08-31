@@ -992,6 +992,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     const void * const * host_srcs,
     int                  n_host_srcs,
     size_t               byte_count,
+    size_t               trailing_padding,
     int                  min_resident,
     int *                slot_ids,
     int32_t *            source_wait_class,

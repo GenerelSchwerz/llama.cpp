@@ -2646,7 +2646,12 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc, dst->src[1]->ne[2], n_unique);
     const bool compact_source = single_row || compact_mmvq || compact_mmq;
 
-    ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
+    // Match CUDA tensor tail padding for staged quantized sources.
+    const int64_t row_remainder = src0->ne[0] % MATRIX_ROW_PADDING;
+    const size_t source_padding = ggml_is_quantized(src0->type) && row_remainder != 0 ?
+        ggml_row_size(src0->type, MATRIX_ROW_PADDING - row_remainder) : 0;
+    ggml_cuda_pool_alloc<char> scratch_experts(
+        ctx.pool(), (size_t) n_unique * expert_stride + source_padding);
 
     const char * src_base = (const char *)src0->data;
     std::vector<const void *> host_ptrs;
@@ -2675,7 +2680,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         const int min_resident = (n_slots + 5) / 6;
         if (!source_wait_class_host.empty()) {
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
-                cache, host_ptrs.data(), n_unique, expert_stride, min_resident,
+                cache, host_ptrs.data(), n_unique, expert_stride, source_padding, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
                 &n_resident, scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, stream);
         }
@@ -2697,6 +2702,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
                 expert_stride,
                 cudaMemcpyHostToDevice, stream));
         }
+    }
+    if (!split_staged && source_padding > 0) {
+        CUDA_CHECK(cudaMemsetAsync(
+            scratch_experts.get() + (size_t) n_unique * expert_stride, 0, source_padding, stream));
     }
 
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;
