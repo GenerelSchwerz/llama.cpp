@@ -8151,6 +8151,27 @@ static void test_cached_mmid_prefill_and_overflow() {
         CHECK(fp4_first == fp4_second);
     }
 
+    for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        auto cuda_fp4_overflow = build_cached_mmid_path_test_graph(
+            cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, 128, 4, 16);
+        auto reference_fp4_overflow = build_cached_mmid_path_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), type, 128, 4, 16);
+        initialize_cached_mmid_path_test_graphs(cuda_fp4_overflow, reference_fp4_overflow);
+        static constexpr int32_t expert_order[] = {5, 2, 7, 1, 6, 0, 4, 3};
+        std::vector<int32_t> overflow_ids(4 * 16);
+        for (int32_t token = 0; token < 16; ++token) {
+            for (int32_t route = 0; route < 4; ++route) {
+                overflow_ids[token * 4 + route] = expert_order[(token + route) % 8];
+            }
+        }
+        const auto overflow_output = run_cached_mmid_path_test(
+            cuda_backend.get(), reference_backend.get(), cuda_fp4_overflow, reference_fp4_overflow, overflow_ids);
+        std::vector<float> overflow_expected(ggml_nelements(reference_fp4_overflow.output));
+        ggml_backend_tensor_get(reference_fp4_overflow.output, overflow_expected.data(), 0,
+            ggml_nbytes(reference_fp4_overflow.output));
+        CHECK(overflow_output == overflow_expected);
+    }
+
     auto cuda_decode = build_cached_mmid_path_test_graph(
         cuda_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0, 128, 6, 1);
     auto reference_decode = build_cached_mmid_path_test_graph(

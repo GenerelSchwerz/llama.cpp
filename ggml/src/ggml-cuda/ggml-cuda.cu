@@ -2636,7 +2636,13 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     const int n_unique = (int)unique_experts.size();
     GGML_ASSERT(n_unique > 0);
     const bool compact_mmvq = !single_row && ggml_cuda_moe_use_compact_mmvq(dst, n_unique);
-    const bool compact_source = single_row || compact_mmvq;
+    const auto source_capability = ggml_cuda_mmid_source_capability_for(src0->type);
+    const bool compact_mmq = !single_row && !compact_mmvq && use_mmq &&
+        (source_capability.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0 &&
+        (source_capability.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) == 0 &&
+        ggml_cuda_should_use_mmq(
+            src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc, dst->src[1]->ne[2], n_unique);
+    const bool compact_source = single_row || compact_mmvq || compact_mmq;
 
     ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), (size_t)n_unique * expert_stride);
 
@@ -2771,7 +2777,8 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         dst->src[2] = &ids_synth;
         const bool dispatched = ggml_cuda_mul_mat_id_impl(
             ctx, dst, use_mmq, nullptr,
-            compact_mmvq ? GGML_CUDA_MMID_CONSUMER_MMVQ : GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
+            compact_mmvq ? GGML_CUDA_MMID_CONSUMER_MMVQ :
+                compact_mmq ? GGML_CUDA_MMID_CONSUMER_MMQ : GGML_CUDA_MMID_CONSUMER_UNSUPPORTED);
         dst->src[0] = orig_src0;
         dst->src[2] = orig_ids;
         GGML_ASSERT(dispatched);
