@@ -417,6 +417,15 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t h2d_bytes = 0;
 };
 
+struct ggml_cuda_moe_legacy_debug_telemetry {
+    uint64_t ops = 0;
+    uint64_t staged_ops = 0;
+    uint64_t split_staged_ops = 0;
+    uint64_t overflow_ops = 0;
+    uint64_t unique_experts_max = 0;
+    uint64_t ids_cache_hits = 0;
+};
+
 enum ggml_cuda_moe_graph_property_hint : uint32_t {
     GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN = 0,
     GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED,
@@ -751,6 +760,7 @@ public:
     void record_legacy_op(
             bool is_decode,
             bool staged,
+            bool split_staged,
             bool overflow,
             uint64_t unique_experts,
             uint64_t ids_bytes,
@@ -858,6 +868,7 @@ private:
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     void fail_borrowed_cache_init_after_probe_for_test();
     uint64_t legacy_op_count_for_test(bool is_decode) const;
+    ggml_cuda_moe_legacy_debug_telemetry legacy_debug_telemetry_for_test(bool is_decode) const;
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
     bool graph_mmid_inventory_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan & plan) const;
     bool graph_group_witness_matches(const ggml_cgraph * cgraph, const ggml_cuda_moe_graph_plan::group_record & record) const;
@@ -1007,6 +1018,7 @@ bool ggml_cuda_moe_cache_release_split_slots(
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
     bool     staged,
+    bool     split_staged,
     bool     overflow,
     uint64_t unique_experts,
     uint64_t ids_bytes,

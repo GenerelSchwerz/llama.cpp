@@ -84,6 +84,7 @@ static std::atomic<uint64_t> g_moe_cache_mm_miss_counter{0};
 struct moe_cache_op_phase_stats {
     std::atomic<uint64_t> ops{0};
     std::atomic<uint64_t> staged_ops{0};
+    std::atomic<uint64_t> split_staged_ops{0};
     std::atomic<uint64_t> overflow_ops{0};
     std::atomic<uint64_t> unique_experts{0};
     std::atomic<uint64_t> unique_experts_max{0};
@@ -598,6 +599,7 @@ struct moe_cache_phase_stats {
     uint64_t l2_fill_time_us;
     uint64_t ops;
     uint64_t staged_ops;
+    uint64_t split_staged_ops;
     uint64_t overflow_ops;
     uint64_t unique_experts;
     uint64_t unique_experts_max;
@@ -5087,6 +5089,18 @@ uint64_t ggml_cuda_moe_grouped_context::legacy_op_count_for_test(bool is_decode)
     return impl_->legacy_op_stats[moe_cache_phase_index(is_decode)].ops.load(std::memory_order_relaxed);
 }
 
+ggml_cuda_moe_legacy_debug_telemetry ggml_cuda_moe_grouped_context::legacy_debug_telemetry_for_test(bool is_decode) const {
+    const auto & stats = impl_->legacy_op_stats[moe_cache_phase_index(is_decode)];
+    ggml_cuda_moe_legacy_debug_telemetry result;
+    result.ops = stats.ops.load(std::memory_order_relaxed);
+    result.staged_ops = stats.staged_ops.load(std::memory_order_relaxed);
+    result.split_staged_ops = stats.split_staged_ops.load(std::memory_order_relaxed);
+    result.overflow_ops = stats.overflow_ops.load(std::memory_order_relaxed);
+    result.unique_experts_max = stats.unique_experts_max.load(std::memory_order_relaxed);
+    result.ids_cache_hits = stats.ids_cache_hits.load(std::memory_order_relaxed);
+    return result;
+}
+
 ggml_cuda_moe_grouped_debug_telemetry ggml_cuda_moe_grouped_context::take_grouped_debug_telemetry_for_test() {
     std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
     uint32_t registered_groups = 0;
@@ -5644,6 +5658,7 @@ void ggml_cuda_moe_grouped_context::prefetch_legacy_siblings(
 void ggml_cuda_moe_grouped_context::record_legacy_op(
         bool is_decode,
         bool staged,
+        bool split_staged,
         bool overflow,
         uint64_t unique_experts,
         uint64_t ids_bytes,
@@ -5661,6 +5676,7 @@ void ggml_cuda_moe_grouped_context::record_legacy_op(
     moe_cache_op_phase_stats & stats = impl_->legacy_op_stats[moe_cache_phase_index(is_decode)];
     stats.ops.fetch_add(1, std::memory_order_relaxed);
     stats.staged_ops.fetch_add(staged ? 1 : 0, std::memory_order_relaxed);
+    stats.split_staged_ops.fetch_add(split_staged ? 1 : 0, std::memory_order_relaxed);
     stats.overflow_ops.fetch_add(overflow ? 1 : 0, std::memory_order_relaxed);
     stats.unique_experts.fetch_add(unique_experts, std::memory_order_relaxed);
     moe_cache_atomic_max(stats.unique_experts_max, unique_experts);
@@ -9583,6 +9599,7 @@ static moe_cache_phase_stats moe_cache_take_op_stats(moe_cache_op_phase_stats & 
     };
     s.ops = take(op.ops);
     s.staged_ops = take(op.staged_ops);
+    s.split_staged_ops = take(op.split_staged_ops);
     s.overflow_ops = take(op.overflow_ops);
     s.unique_experts = take(op.unique_experts);
     s.unique_experts_max = take(op.unique_experts_max);
@@ -9626,6 +9643,7 @@ static void ggml_cuda_moe_add_phase_stats(moe_cache_phase_stats & dst, const moe
     dst.l2_fill_time_us += src.l2_fill_time_us;
     dst.ops += src.ops;
     dst.staged_ops += src.staged_ops;
+    dst.split_staged_ops += src.split_staged_ops;
     dst.overflow_ops += src.overflow_ops;
     dst.unique_experts += src.unique_experts;
     dst.unique_experts_max = std::max(dst.unique_experts_max, src.unique_experts_max);
@@ -9647,10 +9665,11 @@ static void ggml_cuda_moe_log_phase_stats(const char * name, const moe_cache_pha
     const double l2_hit_rate = l2_total > 0 ? 100.0 * (double) s.l2_hits / (double) l2_total : 0.0;
     const double avg_unique = s.ops > 0 ? (double) s.unique_experts / (double) s.ops : 0.0;
     GGML_LOG(
-        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_mib=%.2f ids_d2h_ms=%.3f ids_d2h_syncs=%llu ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f copy_wait_events=%llu copy_wait_event_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
+        "moe-cache-phase: phase=%s ops=%llu staged_ops=%llu split_staged_ops=%llu overflow_ops=%llu unique_avg=%.2f unique_max=%llu ids_mib=%.2f ids_d2h_mib=%.2f ids_d2h_ms=%.3f ids_d2h_syncs=%llu ids_cache_hits=%llu acquire_ms=%.3f remap_ms=%.3f copy_wait_events=%llu copy_wait_event_ms=%.3f op_cpu_ms=%.3f l1_hits=%llu l1_misses=%llu l1_evictions=%llu l1_hit_rate=%.2f%% l2_hits=%llu l2_misses=%llu l2_fills=%llu l2_evictions=%llu l2_fill_mib=%.2f l2_fill_ms=%.3f l2_hit_rate=%.2f%% h2d_copies=%llu h2d_mib=%.2f h2d_enqueue_ms=%.3f prefetch_hits=%llu prefetch_misses=%llu prefetch_used=%llu prefetch_h2d_copies=%llu prefetch_h2d_mib=%.2f prefetch_h2d_enqueue_ms=%.3f\n",
         name,
         (unsigned long long) s.ops,
         (unsigned long long) s.staged_ops,
+        (unsigned long long) s.split_staged_ops,
         (unsigned long long) s.overflow_ops,
         avg_unique,
         (unsigned long long) s.unique_experts_max,
@@ -10083,6 +10102,7 @@ extern "C"
 void ggml_cuda_moe_record_op_stats(
     bool     is_decode,
     bool     staged,
+    bool     split_staged,
     bool     overflow,
     uint64_t unique_experts,
     uint64_t ids_bytes,
@@ -10103,6 +10123,7 @@ void ggml_cuda_moe_record_op_stats(
     moe_cache_op_phase_stats & s = g_moe_cache_op_stats[phase];
     s.ops.fetch_add(1, std::memory_order_relaxed);
     s.staged_ops.fetch_add(staged ? 1 : 0, std::memory_order_relaxed);
+    s.split_staged_ops.fetch_add(split_staged ? 1 : 0, std::memory_order_relaxed);
     s.overflow_ops.fetch_add(overflow ? 1 : 0, std::memory_order_relaxed);
     s.unique_experts.fetch_add(unique_experts, std::memory_order_relaxed);
     moe_cache_atomic_max(s.unique_experts_max, unique_experts);

@@ -41,6 +41,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __linux__
@@ -136,6 +137,12 @@ struct ggml_cuda_moe_grouped_context_test_access {
 
     static uint64_t legacy_op_count(const ggml_cuda_moe_grouped_context & context, bool is_decode) {
         return context.legacy_op_count_for_test(is_decode);
+    }
+
+    static ggml_cuda_moe_legacy_debug_telemetry legacy_debug_telemetry(
+            const ggml_cuda_moe_grouped_context & context,
+            bool is_decode) {
+        return context.legacy_debug_telemetry_for_test(is_decode);
     }
 
     static ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry(
@@ -8610,6 +8617,424 @@ static void test_cached_mmid_prefill_and_overflow() {
     fprintf(stderr, "test-moe-cache: cached mapped prefill and overflow OK\n");
 }
 
+struct routed_separate_chain_test_graph {
+    ggml_context_ptr weights;
+    ggml_context_ptr nodes;
+    ggml_backend_buffer_ptr weight_buffer;
+    ggml_backend_buffer_ptr node_buffer;
+    ggml_cgraph * graph = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * logits = nullptr;
+    ggml_tensor * ids = nullptr;
+    ggml_tensor * route_weights = nullptr;
+    ggml_tensor * gate = nullptr;
+    ggml_tensor * up = nullptr;
+    ggml_tensor * hidden = nullptr;
+    ggml_tensor * down = nullptr;
+    ggml_tensor * weighted = nullptr;
+    ggml_tensor * output = nullptr;
+    std::array<ggml_tensor *, 3> banks = {};
+};
+
+static routed_separate_chain_test_graph build_routed_separate_chain_test_graph(
+        ggml_backend_t backend,
+        ggml_backend_buffer_type_t weight_buft,
+        int64_t n_tokens) {
+    constexpr int64_t N_EXPERTS = 64;
+    constexpr int64_t N_USED = 6;
+    constexpr int64_t N_EMBD = 2048;
+    constexpr int64_t N_FF = 1408;
+    const ggml_init_params weight_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 8,
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+    const ggml_init_params node_params = {
+        /* .mem_size = */ ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(128, false),
+        /* .mem_base = */ nullptr,
+        /* .no_alloc = */ true,
+    };
+
+    routed_separate_chain_test_graph result;
+    result.weights.reset(ggml_init(weight_params));
+    result.nodes.reset(ggml_init(node_params));
+    CHECK(result.weights != nullptr && result.nodes != nullptr);
+
+    result.banks[0] = ggml_new_tensor_3d(result.weights.get(), GGML_TYPE_Q4_K, N_EMBD, N_FF, N_EXPERTS);
+    result.banks[1] = ggml_new_tensor_3d(result.weights.get(), GGML_TYPE_Q4_K, N_EMBD, N_FF, N_EXPERTS);
+    result.banks[2] = ggml_new_tensor_3d(result.weights.get(), GGML_TYPE_Q8_0, N_FF, N_EMBD, N_EXPERTS);
+    ggml_set_name(result.banks[0], "blk.1.ffn_gate_exps.weight");
+    ggml_set_name(result.banks[1], "blk.1.ffn_up_exps.weight");
+    ggml_set_name(result.banks[2], "blk.1.ffn_down_exps.weight");
+
+    result.input = ggml_new_tensor_3d(result.nodes.get(), GGML_TYPE_F32, N_EMBD, 1, n_tokens);
+    result.logits = ggml_new_tensor_2d(result.nodes.get(), GGML_TYPE_F32, N_EXPERTS, n_tokens);
+    ggml_set_name(result.input, "test.routed.input");
+    ggml_set_name(result.logits, "test.routed.logits");
+    ggml_tensor * probs = ggml_soft_max(result.nodes.get(), result.logits);
+    result.ids = ggml_argsort_top_k(result.nodes.get(), probs, N_USED);
+    ggml_tensor * probs_3d = ggml_reshape_3d(result.nodes.get(), probs, 1, N_EXPERTS, n_tokens);
+    result.route_weights = ggml_get_rows(result.nodes.get(), probs_3d, result.ids);
+
+    result.gate = ggml_mul_mat_id(result.nodes.get(), result.banks[0], result.input, result.ids);
+    result.up = ggml_mul_mat_id(result.nodes.get(), result.banks[1], result.input, result.ids);
+    result.hidden = ggml_swiglu_split(result.nodes.get(), result.gate, result.up);
+    result.down = ggml_mul_mat_id(result.nodes.get(), result.banks[2], result.hidden, result.ids);
+    result.weighted = ggml_mul(result.nodes.get(), result.down, result.route_weights);
+
+    std::array<ggml_tensor *, N_USED> routes = {};
+    for (int64_t route = 0; route < N_USED; ++route) {
+        routes[route] = ggml_view_2d(
+            result.nodes.get(), result.weighted, N_EMBD, n_tokens, result.weighted->nb[2], route * result.weighted->nb[1]);
+    }
+    result.output = routes[0];
+    for (int64_t route = 1; route < N_USED; ++route) {
+        result.output = ggml_add(result.nodes.get(), result.output, routes[route]);
+    }
+    ggml_set_name(result.output, "test.routed.output");
+
+    result.graph = ggml_new_graph_custom(result.nodes.get(), 128, false);
+    ggml_build_forward_expand(result.graph, result.route_weights);
+    ggml_build_forward_expand(result.graph, result.output);
+    candidate_stamp_execution(result.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        n_tokens == 1 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT : GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,
+        n_tokens, 1);
+    result.weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(result.weights.get(), weight_buft));
+    result.node_buffer.reset(ggml_backend_alloc_ctx_tensors(result.nodes.get(), backend));
+    CHECK(result.weight_buffer != nullptr && result.node_buffer != nullptr);
+    ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    return result;
+}
+
+static std::vector<float> routed_separate_chain_logits(
+        int64_t n_tokens,
+        int64_t expert_span,
+        int64_t expert_offset) {
+    constexpr int64_t N_EXPERTS = 64;
+    constexpr int64_t N_USED = 6;
+    CHECK(expert_span >= N_USED && expert_span <= N_EXPERTS);
+    std::vector<float> result(N_EXPERTS * n_tokens);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t expert = 0; expert < N_EXPERTS; ++expert) {
+            result[token * N_EXPERTS + expert] = -20.0f - 0.01f * expert;
+        }
+        for (int64_t route = 0; route < N_USED; ++route) {
+            const int64_t expert = (expert_offset + (token * N_USED + route * 11) % expert_span) % N_EXPERTS;
+            result[token * N_EXPERTS + expert] = 10.0f - route;
+        }
+    }
+    return result;
+}
+
+static std::vector<uint8_t> routed_separate_chain_test_weight_data(
+        const ggml_tensor * tensor,
+        uint32_t salt) {
+    CHECK(ggml_is_quantized(tensor->type));
+    std::vector<float> values(ggml_nelements(tensor));
+    uint32_t state = 0x9e3779b9u ^ salt;
+    for (float & value : values) {
+        state = state * 1664525u + 1013904223u;
+        value = (static_cast<int32_t>((state >> 8) % 2001) - 1000) * 0.00035f;
+    }
+    std::vector<uint8_t> bytes(ggml_nbytes(tensor));
+    const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
+    CHECK(ggml_quantize_chunk(
+        tensor->type, values.data(), bytes.data(), 0, nrows, tensor->ne[0], nullptr) == bytes.size());
+    return bytes;
+}
+
+static void initialize_routed_separate_chain_test_weights(
+        routed_separate_chain_test_graph & candidate,
+        routed_separate_chain_test_graph & reference) {
+    for (size_t bank = 0; bank < candidate.banks.size(); ++bank) {
+        CHECK(candidate.banks[bank]->type == reference.banks[bank]->type &&
+            ggml_nbytes(candidate.banks[bank]) == ggml_nbytes(reference.banks[bank]));
+        ggml_tensor expert = *candidate.banks[bank];
+        expert.ne[2] = 1;
+        expert.ne[3] = 1;
+        expert.nb[3] = expert.nb[2];
+        CHECK(ggml_nbytes(&expert) == candidate.banks[bank]->nb[2]);
+        for (int64_t expert_id = 0; expert_id < candidate.banks[bank]->ne[2]; ++expert_id) {
+            const auto bytes = routed_separate_chain_test_weight_data(
+                &expert, 311 + 64 * bank + static_cast<uint32_t>(expert_id));
+            const size_t offset = expert_id * candidate.banks[bank]->nb[2];
+            ggml_backend_tensor_set(candidate.banks[bank], bytes.data(), offset, bytes.size());
+            ggml_backend_tensor_set(reference.banks[bank], bytes.data(), offset, bytes.size());
+        }
+    }
+}
+
+static void set_routed_separate_chain_test_inputs(
+        routed_separate_chain_test_graph & candidate,
+        routed_separate_chain_test_graph & reference,
+        size_t pass,
+        int64_t expert_span,
+        int64_t expert_offset) {
+    CHECK(candidate.input->ne[2] == reference.input->ne[2]);
+    const auto input = cached_fusion_test_data(candidate.input, 317 + pass);
+    const auto logits = routed_separate_chain_logits(candidate.input->ne[2], expert_span, expert_offset);
+    ggml_backend_tensor_set(candidate.input, input.data(), 0, input.size());
+    ggml_backend_tensor_set(reference.input, input.data(), 0, input.size());
+    ggml_backend_tensor_set(candidate.logits, logits.data(), 0, logits.size() * sizeof(float));
+    ggml_backend_tensor_set(reference.logits, logits.data(), 0, logits.size() * sizeof(float));
+}
+
+static void register_routed_separate_chain_test_graph(
+        ggml_backend_t backend,
+        const routed_separate_chain_test_graph & graph,
+        uint32_t n_slots) {
+    const std::array<ggml_backend_moe_candidate_bank_v1, 3> banks = {{
+        {graph.banks[0], GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {graph.banks[1], GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {graph.banks[2], GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    const ggml_backend_moe_candidate_group_v1 group = {
+        banks.data(), banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto snapshot = candidate_snapshot(n_slots, &group, 1);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(backend, &snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+}
+
+struct routed_separate_chain_test_result {
+    std::vector<int32_t> ids;
+    std::vector<float> route_weights;
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> hidden;
+    std::vector<float> down;
+    std::vector<float> weighted;
+    std::vector<float> output;
+};
+
+static routed_separate_chain_test_result run_routed_separate_chain_test_graph(
+        ggml_backend_t backend,
+        routed_separate_chain_test_graph & graph) {
+    CHECK(ggml_backend_graph_compute(backend, graph.graph) == GGML_STATUS_SUCCESS);
+    ggml_backend_synchronize(backend);
+    routed_separate_chain_test_result result;
+    result.ids.resize(ggml_nelements(graph.ids));
+    CHECK(graph.ids->view_src != nullptr && graph.ids->view_src->type == GGML_TYPE_I32 &&
+        graph.ids->nb[0] == sizeof(int32_t) && graph.ids->nb[1] % sizeof(int32_t) == 0);
+    std::vector<int32_t> sorted(ggml_nelements(graph.ids->view_src));
+    ggml_backend_tensor_get(graph.ids->view_src, sorted.data(), 0, ggml_nbytes(graph.ids->view_src));
+    const size_t row_stride = graph.ids->nb[1] / sizeof(int32_t);
+    for (int64_t row = 0; row < graph.ids->ne[1]; ++row) {
+        for (int64_t route = 0; route < graph.ids->ne[0]; ++route) {
+            result.ids[row * graph.ids->ne[0] + route] = sorted[row * row_stride + route];
+        }
+    }
+    result.route_weights.resize(ggml_nelements(graph.route_weights));
+    result.gate.resize(ggml_nelements(graph.gate));
+    result.up.resize(ggml_nelements(graph.up));
+    result.hidden.resize(ggml_nelements(graph.hidden));
+    result.down.resize(ggml_nelements(graph.down));
+    result.weighted.resize(ggml_nelements(graph.weighted));
+    result.output.resize(ggml_nelements(graph.output));
+    ggml_backend_tensor_get(graph.route_weights, result.route_weights.data(), 0, ggml_nbytes(graph.route_weights));
+    ggml_backend_tensor_get(graph.gate, result.gate.data(), 0, ggml_nbytes(graph.gate));
+    ggml_backend_tensor_get(graph.up, result.up.data(), 0, ggml_nbytes(graph.up));
+    ggml_backend_tensor_get(graph.hidden, result.hidden.data(), 0, ggml_nbytes(graph.hidden));
+    ggml_backend_tensor_get(graph.down, result.down.data(), 0, ggml_nbytes(graph.down));
+    ggml_backend_tensor_get(graph.weighted, result.weighted.data(), 0, ggml_nbytes(graph.weighted));
+    ggml_backend_tensor_get(graph.output, result.output.data(), 0, ggml_nbytes(graph.output));
+    return result;
+}
+
+static void check_routed_separate_chain_exact(
+        const char * phase,
+        const routed_separate_chain_test_result & expected,
+        const routed_separate_chain_test_result & actual) {
+    CHECK(actual.ids == expected.ids && actual.route_weights == expected.route_weights);
+    const auto check_values = [phase, &actual](
+            const char * name,
+            const std::vector<float> & expected_values,
+            const std::vector<float> & actual_values) {
+        CHECK(actual_values.size() == expected_values.size());
+        for (size_t i = 0; i < actual_values.size(); ++i) {
+            if (!std::isfinite(actual_values[i]) || !std::isfinite(expected_values[i])) {
+                fprintf(stderr, "test-moe-cache: routed %s %s first_nonfinite=%zu expected=%.9g actual=%.9g\n",
+                    phase, name, i, expected_values[i], actual_values[i]);
+                if (strcmp(name, "down") == 0) {
+                    constexpr size_t N_EMBD = 2048;
+                    constexpr size_t N_USED = 6;
+                    const size_t row = i / N_EMBD;
+                    const size_t token = row / N_USED;
+                    const size_t route = row % N_USED;
+                    fprintf(stderr, "test-moe-cache: routed %s down token=%zu route=%zu expert=%d element=%zu\n",
+                        phase, token, route, actual.ids[token * N_USED + route], i % N_EMBD);
+                }
+                CHECK(false);
+            }
+            if (actual_values[i] != expected_values[i]) {
+                fprintf(stderr, "test-moe-cache: routed %s %s first_difference=%zu expected=%.9g actual=%.9g\n",
+                    phase, name, i, expected_values[i], actual_values[i]);
+                CHECK(false);
+            }
+        }
+    };
+    check_values("gate", expected.gate, actual.gate);
+    check_values("up", expected.up, actual.up);
+    check_values("hidden", expected.hidden, actual.hidden);
+    check_values("down", expected.down, actual.down);
+    check_values("weighted", expected.weighted, actual.weighted);
+    check_values("output", expected.output, actual.output);
+}
+
+static void test_cached_mmid_routed_separate_chain() {
+    constexpr uint32_t N_SLOTS = 63;
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+
+    {
+        constexpr int64_t N_TOKENS = 512;
+        ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+        CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+        auto reference = build_routed_separate_chain_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), N_TOKENS);
+        auto candidate = build_routed_separate_chain_test_graph(
+            candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), N_TOKENS);
+        initialize_routed_separate_chain_test_weights(candidate, reference);
+        const auto disabled = candidate_snapshot(N_SLOTS, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        register_routed_separate_chain_test_graph(candidate_backend.get(), candidate, N_SLOTS);
+
+        auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+        CHECK(context != nullptr);
+        const auto coverage = candidate_certify_graph(*context, candidate.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(context->prepare_graph_execution(
+            candidate.graph, 991, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+
+        cudaStream_t cache_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&cache_stream, cudaStreamNonBlocking));
+        std::array<ggml_cuda_moe_legacy_cache_lease, 3> caches;
+        for (size_t bank = 0; bank < caches.size(); ++bank) {
+            caches[bank] = context->acquire_legacy_cache(candidate.banks[bank], nullptr, nullptr, cache_stream);
+            CHECK(caches[bank] && caches[bank].acquisition().registered_source == 1);
+            CHECK(ggml_cuda_moe_cache_n_slots(caches[bank].get()) == static_cast<int>(N_SLOTS));
+            CHECK(ggml_cuda_moe_cache_can_overlap_staging(caches[bank].get()));
+            ggml_cuda_moe_cache_reset_stats(caches[bank].get());
+        }
+        CUDA_OK(cudaStreamSynchronize(cache_stream));
+        CUDA_OK(cudaStreamDestroy(cache_stream));
+        ggml_cuda_moe_candidate_group_key group_key;
+        CHECK(context->find_down_group_key(candidate.banks[2], &group_key));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, group_key) == 3);
+
+        struct phase_spec {
+            const char * name;
+            int64_t expert_span;
+            int64_t expert_offset;
+            std::array<std::array<uint64_t, 3>, 3> cache_stats;
+            ggml_cuda_moe_legacy_debug_telemetry telemetry;
+        };
+        const std::array<phase_spec, 3> phases = {{
+            {"overflow-1", 64, 0, {{{63, 63, 0}, {0, 63, 0}, {63, 63, 0}}}, {3, 3, 3, 3, 64, 2}},
+            {"narrow", 7, 45, {{{83, 64, 1}, {20, 64, 1}, {83, 64, 1}}}, {6, 3, 3, 3, 64, 4}},
+            {"overflow-2", 64, 0, {{{89, 121, 58}, {26, 121, 58}, {152, 121, 58}}}, {9, 6, 6, 6, 64, 6}},
+        }};
+        for (size_t pass = 0; pass < phases.size(); ++pass) {
+            const auto & phase = phases[pass];
+            set_routed_separate_chain_test_inputs(
+                candidate, reference, pass, phase.expert_span, phase.expert_offset);
+            const auto expected = run_routed_separate_chain_test_graph(reference_backend.get(), reference);
+            const auto actual = run_routed_separate_chain_test_graph(candidate_backend.get(), candidate);
+            CHECK(std::unordered_set<int32_t>(actual.ids.begin(), actual.ids.end()).size() ==
+                static_cast<size_t>(phase.expert_span));
+            fprintf(stderr, "test-moe-cache: routed %s cache", phase.name);
+            for (size_t bank = 0; bank < caches.size(); ++bank) {
+                const auto & cache = caches[bank];
+                uint64_t hits = 0;
+                uint64_t misses = 0;
+                uint64_t evictions = 0;
+                ggml_cuda_moe_cache_stats(cache.get(), &hits, &misses, &evictions);
+                fprintf(stderr, " %llu/%llu/%llu",
+                    (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) evictions);
+                CHECK(hits == phase.cache_stats[bank][0]);
+                CHECK(misses == phase.cache_stats[bank][1]);
+                CHECK(evictions == phase.cache_stats[bank][2]);
+            }
+            fprintf(stderr, "\n");
+            const auto telemetry = ggml_cuda_moe_grouped_context_test_access::legacy_debug_telemetry(*context, false);
+            fprintf(stderr, "test-moe-cache: routed %s legacy %llu/%llu/%llu/%llu/%llu/%llu\n",
+                phase.name,
+                (unsigned long long) telemetry.ops,
+                (unsigned long long) telemetry.staged_ops,
+                (unsigned long long) telemetry.split_staged_ops,
+                (unsigned long long) telemetry.overflow_ops,
+                (unsigned long long) telemetry.unique_experts_max,
+                (unsigned long long) telemetry.ids_cache_hits);
+            CHECK(telemetry.ops == phase.telemetry.ops);
+            CHECK(telemetry.staged_ops == phase.telemetry.staged_ops);
+            CHECK(telemetry.split_staged_ops == phase.telemetry.split_staged_ops);
+            CHECK(telemetry.overflow_ops == phase.telemetry.overflow_ops);
+            CHECK(telemetry.unique_experts_max == phase.telemetry.unique_experts_max);
+            CHECK(telemetry.ids_cache_hits == phase.telemetry.ids_cache_hits);
+            check_routed_separate_chain_exact(phase.name, expected, actual);
+        }
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) == 0);
+        fprintf(stderr, "test-moe-cache: routed separate prefill exact OK\n");
+    }
+
+    {
+        constexpr int64_t N_TOKENS = 1;
+        ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+        CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+        auto reference = build_routed_separate_chain_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), N_TOKENS);
+        auto candidate = build_routed_separate_chain_test_graph(
+            candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), N_TOKENS);
+        initialize_routed_separate_chain_test_weights(candidate, reference);
+        set_routed_separate_chain_test_inputs(candidate, reference, 0, 64, 0);
+        const auto disabled = candidate_snapshot(N_SLOTS, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        register_routed_separate_chain_test_graph(candidate_backend.get(), candidate, N_SLOTS);
+
+        auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+        CHECK(context != nullptr);
+        const auto coverage = candidate_certify_graph(*context, candidate.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(context->prepare_graph_execution(
+            candidate.graph, 992, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        fprintf(stderr, "test-moe-cache: routed decode outcome=%u size=%u eligible=%u execution=%u materialization=%u consumer=%u auxiliary=%u\n",
+            execution.outcome(), execution.size(),
+            ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(*plan, 0),
+            ggml_cuda_moe_grouped_context_test_access::graph_group_has_execution_reason(*plan, 0),
+            ggml_cuda_moe_grouped_context_test_access::graph_group_has_materialization_reason(*plan, 0),
+            ggml_cuda_moe_grouped_context_test_access::graph_group_has_consumer_equivalence_reason(*plan, 0),
+            ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(*plan, 0));
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(*plan, 0));
+
+        const auto expected = run_routed_separate_chain_test_graph(reference_backend.get(), reference);
+        const auto actual = run_routed_separate_chain_test_graph(candidate_backend.get(), candidate);
+        check_routed_separate_chain_exact("decode", expected, actual);
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get()) == 0);
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        fprintf(stderr, "test-moe-cache: routed decode telemetry registered=%llu covered=%llu plan_calls=%llu calls=%llu ready=%llu completed=%llu\n",
+            (unsigned long long) telemetry.registered, (unsigned long long) telemetry.covered,
+            (unsigned long long) telemetry.plan_calls, (unsigned long long) telemetry.calls,
+            (unsigned long long) telemetry.ready, (unsigned long long) telemetry.completed);
+        CHECK(telemetry.registered == 1 && telemetry.covered == 1 && telemetry.plan_calls >= 1);
+        CHECK(telemetry.calls == 1 && telemetry.ready == 1 && telemetry.completed == 1);
+        CHECK(telemetry.fallback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+        fprintf(stderr, "test-moe-cache: routed separate decode exact OK\n");
+    }
+
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+}
+
 struct gemma_q4_parity_weights {
     ggml_context_ptr context;
     ggml_backend_buffer_ptr buffer;
@@ -10098,6 +10523,7 @@ int main(int argc, char ** argv) {
     test_cached_mmid_prefill_and_overflow();
     test_owner_legacy_cache(dev);
     if (cached_fusion_only) {
+        test_cached_mmid_routed_separate_chain();
         return 0;
     }
     test_grouped_decode(dev);
