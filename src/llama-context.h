@@ -318,6 +318,8 @@ private:
     llama_memory_params        mparams_mem     = {};
     enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     bool                       recurrent_state_offload_req = false;
+    bool                       offload_attn_compute_req    = false;
+    bool                       live_context_workspace_req  = false;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

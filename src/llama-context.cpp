@@ -153,6 +153,8 @@ llama_context::llama_context(
 
     // a split mode switch builds the context again and has to start from what was asked for
     recurrent_state_offload_req = params.recurrent_state_offload;
+    offload_attn_compute_req    = cparams.offload_attn_compute;
+    live_context_workspace_req  = params.live_context_workspace;
     flash_attn_type             = params.flash_attn_type;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
@@ -260,9 +262,12 @@ llama_context::llama_context(
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
-    cparams.flash_attn                         = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // a tensor split needs flash attention, so there is nothing left to resolve there
+    const bool fa_forced = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+
+    cparams.flash_attn                         = fa_forced || params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.flash_attn_causal_prefix_supported = false;
-    cparams.auto_fa                            = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.auto_fa                            = !fa_forced && params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
@@ -789,8 +794,9 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
         return false;
     }
 
-    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
-        LLAMA_LOG_ERROR("%s: split mode tensor requires flash_attn to be enabled\n", __func__);
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+            (flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED || (!cparams.flash_attn && !cparams.auto_fa))) {
+        LLAMA_LOG_ERROR("%s: split mode tensor requires flash_attn, which is off for this context\n", __func__);
         return false;
     }
 
@@ -806,8 +812,10 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
 
     // the memory and the outputs live on buffers that the new placement does not have, so take
     // everything out of them before anything is freed
+    // state_write_data always writes at least the arch, so a zero size is a failure and not an
+    // empty memory - bail before anything is freed
     std::vector<uint8_t> state(state_get_size());
-    if (!state.empty() && state_get_data(state.data(), state.size()) != state.size()) {
+    if (state.empty() || state_get_data(state.data(), state.size()) != state.size()) {
         LLAMA_LOG_ERROR("%s: failed to read the context state\n", __func__);
         return false;
     }
@@ -861,9 +869,21 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
 
         set_abort_callback(abort_callback, abort_callback_data);
 
+        // a backend sampler is bound to the buffer type of the output device, and a tensor split
+        // does not take one at all, so let set_sampler decide again
+        const auto samplers = sampling.samplers;
+        sampling.samplers.clear();
+        for (const auto & [seq_id, sampler] : samplers) {
+            set_sampler(seq_id, sampler);
+        }
+
         if (output_reserve(n_outputs_max) < n_outputs_max) {
             throw std::runtime_error("failed to reserve the output buffer");
         }
+
+        // these only ever grow once the context is built, so start them from what was asked for
+        cparams.offload_attn_compute   = offload_attn_compute_req;
+        cparams.live_context_workspace = live_context_workspace_req;
 
         cparams.recurrent_state_offload = recurrent_state_offload_req;
         if (!cparams.recurrent_state_offload && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
@@ -892,8 +912,9 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
 
     release();
 
-    bool ok = model.set_split_mode(split_mode, tensor_split);
+    const bool placed = model.set_split_mode(split_mode, tensor_split);
 
+    bool ok = placed;
     if (ok) {
         try {
             rebuild();
@@ -908,10 +929,9 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
         // a rebuild that threw may have got half way, so start from nothing again
         release();
 
-        // llama_model::set_split_mode puts the weights back itself, the context only follows it there
-        if (model.split_mode() != prev_mode &&
-                !model.set_split_mode(prev_mode, prev_tensor_split.data())) {
-            LLAMA_LOG_ERROR("%s: the previous split mode could not be restored\n", __func__);
+        // llama_model::set_split_mode puts the weights back itself when it is the one that failed
+        if (placed && !model.set_split_mode(prev_mode, prev_tensor_split.data())) {
+            LLAMA_LOG_ERROR("%s: the previous placement could not be restored - this context is done\n", __func__);
             return false;
         }
 
@@ -935,8 +955,12 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
     sampling.probs_count      = probs_count_saved;
     sampling.candidates_count = candidates_count_saved;
 
-    if (!state.empty() && state_set_data(state.data(), state.size()) == 0) {
-        LLAMA_LOG_ERROR("%s: the memory could not be restored after the switch\n", __func__);
+    if (state_set_data(state.data(), state.size()) == 0) {
+        // the memory may hold a part of what was restored, so leave it empty rather than wrong
+        if (memory) {
+            memory->clear(true);
+        }
+        LLAMA_LOG_ERROR("%s: the memory could not be restored after the switch and is now empty\n", __func__);
         return false;
     }
 
@@ -4300,13 +4324,14 @@ llama_context * llama_init_from_model(
     }
 
     if (model->split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
-            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
-            params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-        }
-        if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
+        }
+        if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+            // the context enables it, the type is kept as asked for so that a later split mode
+            // switch can resolve it again
+            LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for SPLIT_MODE_TENSOR\n", __func__);
         }
     }
 

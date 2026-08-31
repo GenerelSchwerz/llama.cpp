@@ -563,9 +563,12 @@ extern "C" {
     // whatever it already holds. The llama_memory_t of the context is replaced, so a cached one must
     // be read again with llama_get_memory.
     // The model must not be shared with another context and must have no LoRA adapter or control
-    // vector loaded. tensor_split may be NULL to keep the current one.
-    // Returns false and leaves the context in a usable state under the split mode it had before if
-    // the new split mode does not fit.
+    // vector loaded. tensor_split may be NULL to keep the current one. A backend sampler is bound to
+    // the output device and is dropped by the switch if the new split mode cannot take it.
+    // Returns false if the new split mode does not fit, which leaves the context under the one it
+    // had with its memory intact - compare llama_model_get_split_mode to tell that case apart from
+    // the rarer one where the switch happened but the memory could not be carried over, which
+    // leaves the context empty and is reported in the log.
     LLAMA_API bool llama_context_set_split_mode(
             struct llama_context * ctx,
              enum llama_split_mode split_mode,
