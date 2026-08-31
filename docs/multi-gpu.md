@@ -123,6 +123,13 @@ serves several requests from one context keeps every slot's cache across the swi
 cannot do is run two split modes at once - the split mode belongs to the model - or run while a
 `llama_decode` is in flight.
 
+`-psm` fires once, at the boundary between prompt and generation of a single request, so it does
+nothing for a server where one slot prefills while another decodes. The gap it exploits is still
+there at any number of parallel sequences - measured with `llama-batched-bench` on the setup above,
+`-npp 2048 -ntg 128`, the layer split leads prefill by 65% to 81% and the tensor split leads decoding
+by 12% to 26% from 1 to 8 parallel sequences - but taking both halves would need a scheduler that
+separates the phases, plus a policy that does not switch too often. Neither is here.
+
 Points to be aware of:
 
 - The switch costs one placement of the weights, which reads them from the model file again. It pays
