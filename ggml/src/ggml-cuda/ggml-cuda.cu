@@ -2679,6 +2679,11 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
         const int min_resident = (n_slots + 5) / 6;
         if (!source_wait_class_host.empty()) {
+            if (owner != nullptr && ggml_cuda_moe_take_split_staging_poison_for_test(owner)) {
+                CUDA_CHECK(cudaMemsetAsync(
+                    scratch_experts.get(), 0xff,
+                    (size_t) n_unique * expert_stride + source_padding, stream));
+            }
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, source_padding, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),

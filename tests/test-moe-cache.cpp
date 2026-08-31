@@ -135,6 +135,14 @@ struct ggml_cuda_moe_grouped_context_test_access {
         context.fail_borrowed_cache_init_after_probe_for_test();
     }
 
+    static void poison_split_staging(ggml_cuda_moe_grouped_context & context, uint32_t calls) {
+        context.poison_split_staging_for_test(calls);
+    }
+
+    static uint32_t split_staging_poison_calls(const ggml_cuda_moe_grouped_context & context) {
+        return context.split_staging_poison_calls_for_test();
+    }
+
     static uint64_t legacy_op_count(const ggml_cuda_moe_grouped_context & context, bool is_decode) {
         return context.legacy_op_count_for_test(is_decode);
     }
@@ -8983,6 +8991,80 @@ static void test_cached_mmid_routed_separate_chain() {
     }
 
     {
+        constexpr uint32_t MULTIWAVE_N_SLOTS = 24;
+        constexpr int64_t N_TOKENS = 512;
+        ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+        CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+        auto reference = build_routed_separate_chain_test_graph(
+            reference_backend.get(), ggml_backend_cuda_buffer_type(0), N_TOKENS);
+        auto candidate = build_routed_separate_chain_test_graph(
+            candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), N_TOKENS);
+        initialize_routed_separate_chain_test_weights(candidate, reference);
+        const auto disabled = candidate_snapshot(MULTIWAVE_N_SLOTS, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        register_routed_separate_chain_test_graph(candidate_backend.get(), candidate, MULTIWAVE_N_SLOTS);
+
+        auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+        CHECK(context != nullptr);
+        const auto coverage = candidate_certify_graph(*context, candidate.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(context->prepare_graph_execution(
+            candidate.graph, 993, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+
+        cudaStream_t cache_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&cache_stream, cudaStreamNonBlocking));
+        std::array<ggml_cuda_moe_legacy_cache_lease, 3> caches;
+        for (size_t bank = 0; bank < caches.size(); ++bank) {
+            caches[bank] = context->acquire_legacy_cache(candidate.banks[bank], nullptr, nullptr, cache_stream);
+            CHECK(caches[bank] && caches[bank].acquisition().registered_source == 1);
+            CHECK(ggml_cuda_moe_cache_n_slots(caches[bank].get()) == static_cast<int>(MULTIWAVE_N_SLOTS));
+            CHECK(ggml_cuda_moe_cache_can_overlap_staging(caches[bank].get()));
+            ggml_cuda_moe_cache_reset_stats(caches[bank].get());
+        }
+        CUDA_OK(cudaStreamSynchronize(cache_stream));
+        CUDA_OK(cudaStreamDestroy(cache_stream));
+        ggml_cuda_moe_candidate_group_key group_key;
+        CHECK(context->find_down_group_key(candidate.banks[2], &group_key));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, group_key) == 3);
+        CHECK(ggml_cuda_moe_cache_trailing_padding_bytes_for_test(caches[0].get()) == 0);
+        CHECK(ggml_cuda_moe_cache_trailing_padding_bytes_for_test(caches[1].get()) == 0);
+        CHECK(ggml_cuda_moe_cache_trailing_padding_bytes_for_test(caches[2].get()) == 136);
+        CHECK(ggml_cuda_moe_cache_trailing_padding_zero_for_test(caches[2].get()));
+
+        set_routed_separate_chain_test_inputs(candidate, reference, 17, 64, 0);
+        ggml_cuda_moe_grouped_context_test_access::poison_split_staging(*context, 3);
+        const auto expected = run_routed_separate_chain_test_graph(reference_backend.get(), reference);
+        const auto actual = run_routed_separate_chain_test_graph(candidate_backend.get(), candidate);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::split_staging_poison_calls(*context) == 0);
+        CHECK(std::unordered_set<int32_t>(actual.ids.begin(), actual.ids.end()).size() == 64);
+        const std::array<std::array<uint64_t, 3>, 3> expected_cache_stats = {{
+            {24, 24, 0}, {0, 24, 0}, {24, 24, 0},
+        }};
+        for (size_t bank = 0; bank < caches.size(); ++bank) {
+            uint64_t hits = 0;
+            uint64_t misses = 0;
+            uint64_t evictions = 0;
+            ggml_cuda_moe_cache_stats(caches[bank].get(), &hits, &misses, &evictions);
+            CHECK(hits == expected_cache_stats[bank][0]);
+            CHECK(misses == expected_cache_stats[bank][1]);
+            CHECK(evictions == expected_cache_stats[bank][2]);
+        }
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::legacy_debug_telemetry(*context, false);
+        CHECK(telemetry.ops == 3 && telemetry.staged_ops == 3 && telemetry.split_staged_ops == 3);
+        CHECK(telemetry.overflow_ops == 3 && telemetry.unique_experts_max == 64 && telemetry.ids_cache_hits == 2);
+        check_routed_separate_chain_exact("multiwave", expected, actual);
+        CHECK(ggml_cuda_moe_cache_trailing_padding_zero_for_test(caches[2].get()));
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) == 0);
+        fprintf(stderr, "test-moe-cache: routed separate cache24 two-wave exact OK\n");
+    }
+
+    {
         constexpr int64_t N_TOKENS = 1;
         ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
         ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
@@ -10536,6 +10618,7 @@ int main(int argc, char ** argv) {
     constexpr int    N_EXPERTS = 64;
     constexpr int    N_SLOTS   = 16;
     constexpr size_t SLOT_BYTES = 1024;       // 256 floats
+    constexpr size_t SOURCE_PADDING = 64;
     constexpr int    N_FLOATS  = SLOT_BYTES / sizeof(float);
     constexpr int    N_ACCESS  = 4000;
     constexpr double ZIPF_S    = 1.1;          // mild skew
@@ -10661,7 +10744,7 @@ int main(int argc, char ** argv) {
     cudaStream_t compute_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
     void * staging_dst = nullptr;
-    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES));
+    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES + SOURCE_PADDING));
     const void * staging_srcs[] = {
         resident_src_0,
         resident_src_1,
@@ -10717,7 +10800,7 @@ int main(int argc, char ** argv) {
     cudaStream_t split_copy_stream = ggml_cuda_moe_cache_copy_stream(split_cache);
     CHECK(split_copy_stream != nullptr);
     CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
-    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES));
+    CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES + SOURCE_PADDING));
     std::vector<float> split_readback(6 * N_FLOATS);
 
     for (int repeat = 0; repeat < 2; ++repeat) {
@@ -10737,12 +10820,13 @@ int main(int argc, char ** argv) {
         while (!barrier.entered.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
+        CUDA_OK(cudaMemsetAsync(staging_dst, 0xff, 4 * SLOT_BYTES + SOURCE_PADDING, compute_stream));
 
         int slot_ids[4] = {-1, -1, -1, -1};
         int n_resident = 0;
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, 4, SLOT_BYTES, 0, 1, slot_ids, nullptr,
+            split_cache, split_srcs, 4, SLOT_BYTES, SOURCE_PADDING, 1, slot_ids, nullptr,
             &n_resident, staging_dst, nullptr, 0, &n_wait_classes, compute_stream));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 1);
@@ -10783,6 +10867,7 @@ int main(int argc, char ** argv) {
         while (!barrier.entered.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
+        CUDA_OK(cudaMemsetAsync(staging_dst, 0xff, 4 * SLOT_BYTES + SOURCE_PADDING, compute_stream));
 
         int slot_ids[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
         int32_t wait_classes[N_SPLIT_SRCS] = {-1, -1, -1, -1, -1, -1};
@@ -10791,7 +10876,7 @@ int main(int argc, char ** argv) {
         int n_resident = 0;
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
-            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 0, 1, slot_ids, wait_classes,
+            split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, SOURCE_PADDING, 1, slot_ids, wait_classes,
             &n_resident, staging_dst, stage_ready, 3, &n_wait_classes, compute_stream));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 4);
@@ -10817,6 +10902,11 @@ int main(int argc, char ** argv) {
                 CHECK(split_readback[e * N_FLOATS + j] == (float)(8 + e));
             }
         }
+        std::array<uint8_t, SOURCE_PADDING> split_padding;
+        CUDA_OK(cudaMemcpy(
+            split_padding.data(), static_cast<const char *>(staging_dst) + 4 * SLOT_BYTES,
+            split_padding.size(), cudaMemcpyDeviceToHost));
+        CHECK(std::all_of(split_padding.begin(), split_padding.end(), [](uint8_t value) { return value == 0; }));
         uint32_t stage_ready_host[3] = {};
         CUDA_OK(cudaMemcpy(stage_ready_host, stage_ready, sizeof(stage_ready_host), cudaMemcpyDeviceToHost));
         CHECK(stage_ready_host[0] == 1 && stage_ready_host[1] == 1 && stage_ready_host[2] == 1);

@@ -3649,6 +3649,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     std::atomic<bool> legacy_debug_mm{false};
     bool legacy_policy_initialized = false;
     bool fail_borrowed_cache_init_after_probe_for_test = false;
+    std::atomic<uint32_t> split_staging_poison_calls_for_test{0};
     moe_cache_op_phase_stats legacy_op_stats[2];
     moe_cache_telemetry retired_telemetry;
     std::atomic<moe_grouped_decode_debug_stats *> grouped_debug{nullptr};
@@ -5099,6 +5100,28 @@ size_t ggml_cuda_moe_grouped_context::legacy_backing_count_for_test(
 void ggml_cuda_moe_grouped_context::fail_borrowed_cache_init_after_probe_for_test() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->fail_borrowed_cache_init_after_probe_for_test = true;
+}
+
+void ggml_cuda_moe_grouped_context::poison_split_staging_for_test(uint32_t calls) {
+    impl_->split_staging_poison_calls_for_test.store(calls, std::memory_order_relaxed);
+}
+
+uint32_t ggml_cuda_moe_grouped_context::split_staging_poison_calls_for_test() const {
+    return impl_->split_staging_poison_calls_for_test.load(std::memory_order_relaxed);
+}
+
+bool ggml_cuda_moe_take_split_staging_poison_for_test(ggml_cuda_moe_grouped_context * context) {
+    if (context == nullptr) {
+        return false;
+    }
+    uint32_t calls = context->impl_->split_staging_poison_calls_for_test.load(std::memory_order_relaxed);
+    while (calls > 0) {
+        if (context->impl_->split_staging_poison_calls_for_test.compare_exchange_weak(
+                calls, calls - 1, std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 uint64_t ggml_cuda_moe_grouped_context::legacy_op_count_for_test(bool is_decode) const {
@@ -9515,6 +9538,31 @@ size_t ggml_cuda_moe_cache_slot_size_bytes(const struct ggml_cuda_moe_cache * ca
 extern "C"
 int ggml_cuda_moe_cache_n_slots(const struct ggml_cuda_moe_cache * cache) {
     return cache ? cache->n_slots : 0;
+}
+
+size_t ggml_cuda_moe_cache_trailing_padding_bytes_for_test(const struct ggml_cuda_moe_cache * cache) {
+    return cache != nullptr ? cache->trailing_padding_bytes : 0;
+}
+
+bool ggml_cuda_moe_cache_trailing_padding_zero_for_test(struct ggml_cuda_moe_cache * cache) {
+    if (cache == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(cache->mu);
+    if (cache->trailing_padding_bytes == 0) {
+        return true;
+    }
+    int previous_device = 0;
+    if (cudaGetDevice(&previous_device) != cudaSuccess || cudaSetDevice(cache->device) != cudaSuccess) {
+        return false;
+    }
+    std::vector<uint8_t> padding(cache->trailing_padding_bytes);
+    const cudaError_t error = cudaMemcpy(
+        padding.data(),
+        static_cast<const char *>(cache->slot_pool_d) + (size_t) cache->n_slots * cache->slot_size_bytes,
+        padding.size(), cudaMemcpyDeviceToHost);
+    (void) cudaSetDevice(previous_device);
+    return error == cudaSuccess && std::all_of(padding.begin(), padding.end(), [](uint8_t value) { return value == 0; });
 }
 
 extern "C"

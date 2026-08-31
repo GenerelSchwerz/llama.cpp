@@ -852,6 +852,7 @@ private:
     friend class ggml_cuda_moe_group_call_lease;
     friend class ggml_cuda_moe_legacy_operation_lease;
     friend class ggml_cuda_moe_legacy_cache_lease;
+    friend bool ggml_cuda_moe_take_split_staging_poison_for_test(ggml_cuda_moe_grouped_context * context);
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
     bool admission_closed_for_test() const;
@@ -867,6 +868,8 @@ private:
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     void fail_borrowed_cache_init_after_probe_for_test();
+    void poison_split_staging_for_test(uint32_t calls);
+    uint32_t split_staging_poison_calls_for_test() const;
     uint64_t legacy_op_count_for_test(bool is_decode) const;
     ggml_cuda_moe_legacy_debug_telemetry legacy_debug_telemetry_for_test(bool is_decode) const;
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_for_test();
@@ -901,6 +904,7 @@ bool ggml_cuda_graph_capture_state_query_for_test(
         const ggml_cgraph * cgraph,
         ggml_cuda_graph_capture_state_for_test * state);
 uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph);
+bool ggml_cuda_moe_take_split_staging_poison_for_test(ggml_cuda_moe_grouped_context * context);
 
 #endif
 
@@ -1002,6 +1006,9 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     int                  stage_ready_capacity,
     int *                out_n_wait_classes,
     ggml_cuda_moe_stream_t compute_stream);
+
+size_t ggml_cuda_moe_cache_trailing_padding_bytes_for_test(const struct ggml_cuda_moe_cache * cache);
+bool ggml_cuda_moe_cache_trailing_padding_zero_for_test(struct ggml_cuda_moe_cache * cache);
 
 bool ggml_cuda_moe_cache_can_overlap_staging(
     const struct ggml_cuda_moe_cache * cache);
