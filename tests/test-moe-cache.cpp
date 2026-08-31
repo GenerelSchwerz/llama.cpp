@@ -10803,6 +10803,35 @@ int main(int argc, char ** argv) {
     CUDA_OK(cudaMalloc(&staging_dst, 4 * SLOT_BYTES + SOURCE_PADDING));
     std::vector<float> split_readback(6 * N_FLOATS);
 
+    constexpr size_t SMALL_STRIDE = SOURCE_PADDING / 2;
+    auto * padding_decline_cache = ggml_cuda_moe_cache_init(dev, SMALL_STRIDE, 2, false, 0, 0);
+    CHECK(padding_decline_cache != nullptr);
+    const void * padding_decline_srcs[] = {
+        (const char *) host_experts + 48 * SMALL_STRIDE,
+        (const char *) host_experts + 49 * SMALL_STRIDE,
+        (const char *) host_experts + 50 * SMALL_STRIDE,
+        (const char *) host_experts + 51 * SMALL_STRIDE,
+    };
+    int padding_decline_slots[4] = {-7, -7, -7, -7};
+    int padding_decline_resident = -7;
+    int padding_decline_wait_classes = -7;
+    CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
+        padding_decline_cache, padding_decline_srcs, 4, SMALL_STRIDE, SOURCE_PADDING, 1,
+        padding_decline_slots, nullptr, &padding_decline_resident, staging_dst, nullptr, 0,
+        &padding_decline_wait_classes, compute_stream));
+    CHECK(std::all_of(std::begin(padding_decline_slots), std::end(padding_decline_slots), [](int slot) { return slot == -7; }));
+    CHECK(padding_decline_resident == -7 && padding_decline_wait_classes == -7);
+    uint64_t padding_decline_hits = 0;
+    uint64_t padding_decline_misses = 0;
+    uint64_t padding_decline_evictions = 0;
+    ggml_cuda_moe_cache_stats(
+        padding_decline_cache, &padding_decline_hits, &padding_decline_misses, &padding_decline_evictions);
+    CHECK(padding_decline_hits == 0 && padding_decline_misses == 0 && padding_decline_evictions == 0);
+    CHECK(cudaStreamQuery(ggml_cuda_moe_cache_copy_stream(padding_decline_cache)) == cudaSuccess);
+    CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
+    ggml_cuda_moe_cache_free(padding_decline_cache);
+    fprintf(stderr, "test-moe-cache: split padding decline OK\n");
+
     for (int repeat = 0; repeat < 2; ++repeat) {
         const int first = 2 * repeat;
         const void * split_srcs[] = {
