@@ -202,6 +202,8 @@ extern "C" {
         LLAMA_SPLIT_MODE_TENSOR = 3,
     };
 
+    LLAMA_API const char * llama_split_mode_name(enum llama_split_mode split_mode);
+
     enum llama_load_mode {
         LLAMA_LOAD_MODE_AUTO       = -1, // auto-detect based on device capabilities
         LLAMA_LOAD_MODE_NONE       =  0, // no special loading mode
@@ -588,6 +590,21 @@ extern "C" {
 
     LLAMA_API const struct llama_vocab * llama_model_get_vocab(const struct llama_model * model);
     LLAMA_API enum llama_rope_type       llama_model_rope_type(const struct llama_model * model);
+
+    LLAMA_API enum llama_split_mode llama_model_get_split_mode(const struct llama_model * model);
+
+    // Place the model weights again for a different split mode, keeping the model object.
+    // The weights are read from the file the model was loaded from, so that path must still be readable
+    // and the model must not have been loaded from a FILE * or from metadata.
+    // tensor_split may be NULL to keep the current one. Note that it means a share of the layers under
+    // a layer split and a share of every tensor under a tensor split.
+    // Every tensor pointer inside the model is replaced, so every context and adapter built on it is
+    // invalid afterwards. Use llama_context_set_split_mode when a context exists.
+    // Returns false and puts the previous placement back if the new split mode does not fit.
+    LLAMA_API bool llama_model_set_split_mode(
+              struct llama_model * model,
+             enum llama_split_mode split_mode,
+                      const float * tensor_split);
 
     LLAMA_API int32_t llama_model_n_ctx_train  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_embd       (const struct llama_model * model);

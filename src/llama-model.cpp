@@ -1170,6 +1170,16 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // the pointers in llama_model_params are borrowed, but placing the weights again needs them,
+    // so keep an owned copy of everything that a reload reads
+    std::vector<ggml_backend_dev_t>                 devices_owned;
+    std::vector<llama_model_kv_override>            kv_overrides_owned;
+    std::vector<llama_model_tensor_buft_override>   tensor_buft_overrides_owned;
+    std::vector<std::string>                        tensor_buft_override_patterns;
+
+    std::string              load_path;
+    std::vector<std::string> load_splits;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1178,6 +1188,32 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.devices != nullptr) {
+        for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
+            pimpl->devices_owned.push_back(*dev);
+        }
+        pimpl->devices_owned.push_back(nullptr);
+        this->params.devices = pimpl->devices_owned.data();
+    }
+    if (params.kv_overrides != nullptr) {
+        for (const auto * ov = params.kv_overrides; ov->key[0] != 0; ++ov) {
+            pimpl->kv_overrides_owned.push_back(*ov);
+        }
+        pimpl->kv_overrides_owned.push_back({});
+        this->params.kv_overrides = pimpl->kv_overrides_owned.data();
+    }
+    if (params.tensor_buft_overrides != nullptr) {
+        for (const auto * ov = params.tensor_buft_overrides; ov->pattern != nullptr; ++ov) {
+            pimpl->tensor_buft_override_patterns.emplace_back(ov->pattern);
+            pimpl->tensor_buft_overrides_owned.push_back({ nullptr, ov->buft });
+        }
+        // the patterns must not move any more before their addresses are taken
+        for (size_t i = 0; i < pimpl->tensor_buft_override_patterns.size(); ++i) {
+            pimpl->tensor_buft_overrides_owned[i].pattern = pimpl->tensor_buft_override_patterns[i].c_str();
+        }
+        pimpl->tensor_buft_overrides_owned.push_back({ nullptr, nullptr });
+        this->params.tensor_buft_overrides = pimpl->tensor_buft_overrides_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1866,6 +1902,109 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+void llama_model::set_reload_source(const std::string & path, const std::vector<std::string> & splits) {
+    pimpl->load_path   = path;
+    pimpl->load_splits = splits;
+
+    // the progress callback belongs to the load that just finished and may point at a stack frame
+    // that is gone by the time the weights are placed again
+    params.progress_callback           = nullptr;
+    params.progress_callback_user_data = nullptr;
+}
+
+bool llama_model::place_tensors(llama_split_mode split_mode, const float * tensor_split) {
+    // release the current placement first, so that the new one can use the same device memory
+    pimpl->ctxs_bufs.clear();
+    pimpl->mappings.clear();
+    pimpl->mlock_bufs.clear();
+    pimpl->mlock_mmaps.clear();
+    pimpl->cpu_buft_list.clear();
+    pimpl->gpu_buft_list.clear();
+    pimpl->dev_layer.clear();
+    pimpl->dev_input  = {};
+    pimpl->dev_output = {};
+
+    tensors_by_name.clear();
+    layers.clear();
+    static_cast<llama_model_tensors &>(*this) = llama_model_tensors();
+
+    devices.clear();
+    get_split_state_ud = {};
+
+    params.split_mode = split_mode;
+    if (tensor_split != nullptr) {
+        pimpl->tensor_split_owned.assign(tensor_split, tensor_split + llama_max_devices());
+        params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+
+    if (!llama_prepare_model_devices(params, this)) {
+        return false;
+    }
+
+    try {
+        std::vector<std::string> splits = pimpl->load_splits;
+
+        llama_model_loader ml(nullptr, nullptr, nullptr, pimpl->load_path, splits, nullptr, params.load_mode,
+                params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
+        ml.lazy_mode = params.lazy_mode;
+
+        return load_tensors(ml);
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error placing the model tensors: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
+bool llama_model::split_mode_supported(llama_split_mode split_mode) const {
+    if (hparams.vocab_only || hparams.no_alloc) {
+        LLAMA_LOG_ERROR("%s: the model holds no weights to place\n", __func__);
+        return false;
+    }
+
+    if (pimpl->load_path.empty()) {
+        LLAMA_LOG_ERROR("%s: the model was not loaded from a path, so the weights cannot be placed again\n", __func__);
+        return false;
+    }
+
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && !llm_arch_supports_sm_tensor(arch)) {
+        LLAMA_LOG_ERROR("%s: split mode tensor is not implemented for architecture '%s'\n", __func__, llm_arch_name(arch));
+        return false;
+    }
+
+    return true;
+}
+
+bool llama_model::set_split_mode(llama_split_mode split_mode, const float * tensor_split) {
+    if (!split_mode_supported(split_mode)) {
+        return false;
+    }
+
+    const llama_split_mode prev_mode = params.split_mode;
+
+    // all zero means "split by free memory", which is what a model without a tensor split does
+    std::vector<float> prev_split(llama_max_devices(), 0.0f);
+    if (params.tensor_split != nullptr) {
+        std::copy(params.tensor_split, params.tensor_split + llama_max_devices(), prev_split.begin());
+    }
+
+    const int64_t t_start_us = ggml_time_us();
+
+    if (place_tensors(split_mode, tensor_split)) {
+        LLAMA_LOG_INFO("%s: placed the weights for split mode %s in %.2f s\n", __func__,
+                llama_split_mode_name(split_mode), (ggml_time_us() - t_start_us)/1e6);
+        return true;
+    }
+
+    LLAMA_LOG_WARN("%s: split mode %s does not fit, going back to %s\n", __func__,
+            llama_split_mode_name(split_mode), llama_split_mode_name(prev_mode));
+
+    if (!place_tensors(prev_mode, prev_split.data())) {
+        LLAMA_LOG_ERROR("%s: the previous placement could not be restored either - the model is now unusable\n", __func__);
+    }
+
+    return false;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -2733,6 +2872,14 @@ void llama_free_model(llama_model * model) {
 
 void llama_model_free(llama_model * model) {
     delete model;
+}
+
+enum llama_split_mode llama_model_get_split_mode(const llama_model * model) {
+    return model->split_mode();
+}
+
+bool llama_model_set_split_mode(llama_model * model, enum llama_split_mode split_mode, const float * tensor_split) {
+    return model->set_split_mode(split_mode, tensor_split);
 }
 
 int32_t llama_model_n_ctx_train(const llama_model * model) {

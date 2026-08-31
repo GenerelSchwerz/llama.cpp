@@ -604,18 +604,9 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
-struct llama_model {
-    llm_type type = LLM_TYPE_UNKNOWN;
-    llm_arch arch = LLM_ARCH_UNKNOWN;
-
-    std::string name = "n/a";
-
-    llama_hparams hparams = {};
-    llama_vocab   vocab;
-
-    // for classifier models
-    std::vector<std::string> classifier_labels;
-
+// tensors owned by the model as a whole, in one struct so that a re-place of the weights can
+// reset them together - see llama_model::set_split_mode
+struct llama_model_tensors {
     struct ggml_tensor * tok_embd   = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
@@ -680,17 +671,30 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
-    // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
-    std::vector<int32_t> target_layer_ids;
-
-    std::vector<llama_layer> layers;
-
     //Dense linear projections for SentenceTransformers models like embeddinggemma
     // For Sentence Transformers models structure see
     // https://sbert.net/docs/sentence_transformer/usage/custom_models.html#structure-of-sentence-transformer-models
     struct ggml_tensor * dense_2_out_layers   = nullptr;
     struct ggml_tensor * dense_2_out_layers_b = nullptr;
     struct ggml_tensor * dense_3_out_layers   = nullptr;
+};
+
+struct llama_model : public llama_model_tensors {
+    llm_type type = LLM_TYPE_UNKNOWN;
+    llm_arch arch = LLM_ARCH_UNKNOWN;
+
+    std::string name = "n/a";
+
+    llama_hparams hparams = {};
+    llama_vocab   vocab;
+
+    // for classifier models
+    std::vector<std::string> classifier_labels;
+
+    // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
+    std::vector<int32_t> target_layer_ids;
+
+    std::vector<llama_layer> layers;
 
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
@@ -727,6 +731,18 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+
+    // remember where the weights came from, so that they can be placed again later
+    void set_reload_source(const std::string & path, const std::vector<std::string> & splits);
+
+    // whether the weights can be placed again under this split mode at all, checked without moving anything
+    bool split_mode_supported(llama_split_mode split_mode) const;
+
+    // place the weights again for a different split mode, keeping the model object alive
+    // tensor_split may be null to keep the current one
+    // every tensor pointer in the model is replaced, so anything derived from the old ones must be rebuilt
+    // on failure the previous placement is restored and false is returned
+    bool set_split_mode(llama_split_mode split_mode, const float * tensor_split);
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -766,11 +782,17 @@ struct llama_model {
     virtual bool graph_supports_recurrent_sparse_snapshots() const;
 
 protected:
+    // free the current placement and load the weights again under the given split mode
+    bool place_tensors(llama_split_mode split_mode, const float * tensor_split);
+
     llama_model_params params;
 
     struct impl;
     std::unique_ptr<impl> pimpl;
 };
+
+// returns true on success
+bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model);
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params);
 llama_model * llama_model_create(llama_model_loader & ml, const llama_model_params & params);

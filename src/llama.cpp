@@ -46,6 +46,20 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_split_mode_name(enum llama_split_mode split_mode) {
+    switch (split_mode) {
+        case LLAMA_SPLIT_MODE_NONE:
+            return "none";
+        case LLAMA_SPLIT_MODE_LAYER:
+            return "layer";
+        case LLAMA_SPLIT_MODE_ROW:
+            return "row";
+        case LLAMA_SPLIT_MODE_TENSOR:
+            return "tensor";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_AUTO:
@@ -153,8 +167,7 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-// returns true on success
-static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -367,6 +380,11 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
+        }
+
+        // a later llama_model_set_split_mode reads the weights again from here
+        if (!fname.empty()) {
+            model->set_reload_source(fname, splits);
         }
 
         return {0, model_ptr.release()};
