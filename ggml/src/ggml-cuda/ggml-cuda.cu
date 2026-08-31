@@ -2650,8 +2650,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     const int64_t row_remainder = src0->ne[0] % MATRIX_ROW_PADDING;
     const size_t source_padding = ggml_is_quantized(src0->type) && row_remainder != 0 ?
         ggml_row_size(src0->type, MATRIX_ROW_PADDING - row_remainder) : 0;
-    ggml_cuda_pool_alloc<char> scratch_experts(
-        ctx.pool(), (size_t) n_unique * expert_stride + source_padding);
+    GGML_ASSERT(expert_stride > 0 && (size_t) n_unique <= (SIZE_MAX - source_padding) / expert_stride);
+    const size_t staged_expert_bytes = (size_t) n_unique * expert_stride;
+    const size_t staged_source_bytes = staged_expert_bytes + source_padding;
+    ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), staged_source_bytes);
 
     const char * src_base = (const char *)src0->data;
     std::vector<const void *> host_ptrs;
@@ -2668,7 +2670,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     int stage_ready_capacity = 0;
     if (overflow && !compact_source && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-        stage_ready_capacity = 1 + (n_unique + n_slots - 1) / n_slots;
+        GGML_ASSERT(n_slots > 0);
+        const size_t n_staging_waves = 1 + ((size_t) n_unique - 1) / (size_t) n_slots;
+        GGML_ASSERT(n_staging_waves < (size_t) std::numeric_limits<int>::max());
+        stage_ready_capacity = 1 + (int) n_staging_waves;
         source_wait_class_host.resize(n_unique);
         stage_ready.alloc(stage_ready_capacity);
     }
@@ -2677,12 +2682,10 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     bool split_staged = false;
     if (overflow && cache && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
         const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
-        const int min_resident = (n_slots + 5) / 6;
+        const int min_resident = n_slots / 6 + (n_slots % 6 != 0);
         if (!source_wait_class_host.empty()) {
             if (owner != nullptr && ggml_cuda_moe_take_split_staging_poison_for_test(owner)) {
-                CUDA_CHECK(cudaMemsetAsync(
-                    scratch_experts.get(), 0xff,
-                    (size_t) n_unique * expert_stride + source_padding, stream));
+                CUDA_CHECK(cudaMemsetAsync(scratch_experts.get(), 0xff, staged_source_bytes, stream));
             }
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, source_padding, min_resident,
@@ -2710,7 +2713,7 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     }
     if (!split_staged && source_padding > 0) {
         CUDA_CHECK(cudaMemsetAsync(
-            scratch_experts.get() + (size_t) n_unique * expert_stride, 0, source_padding, stream));
+            scratch_experts.get() + staged_expert_bytes, 0, source_padding, stream));
     }
 
     const size_t ids_total_elems = (size_t)ids_ne0 * ids_ne1 * ids_ne2;

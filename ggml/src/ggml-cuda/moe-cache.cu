@@ -9210,7 +9210,9 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     int *                out_n_wait_classes,
     cudaStream_t         compute_stream) {
 
-    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || min_resident <= 0 ||
+    if (!cache || !host_srcs || n_host_srcs <= 0 || byte_count == 0 || trailing_padding > byte_count ||
+        n_host_srcs > std::numeric_limits<int>::max() - 2 ||
+        (size_t) n_host_srcs > (SIZE_MAX - trailing_padding) / byte_count || min_resident <= 0 ||
         !slot_ids || !out_n_resident || !miss_dst || !out_n_wait_classes || !compute_stream ||
         ((source_wait_class == nullptr) != (stage_ready == nullptr)) ||
         (stage_ready == nullptr ? stage_ready_capacity != 0 : stage_ready_capacity < 2)) {
@@ -9296,31 +9298,35 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
 
     std::vector<const void *> miss_sources;
     std::vector<int> miss_source_indices;
-    miss_sources.reserve(n_host_srcs - n_resident);
-    miss_source_indices.reserve(n_host_srcs - n_resident);
+    miss_sources.reserve((size_t) n_host_srcs - n_resident);
+    miss_source_indices.reserve((size_t) n_host_srcs - n_resident);
     for (int i = 0; i < n_host_srcs; ++i) {
         if (slot_ids[i] < 0) {
             miss_sources.push_back(host_srcs[i]);
             miss_source_indices.push_back(i);
         }
     }
-    const int n_misses = (int) miss_sources.size();
-    int wave_size = n_misses;
+    const size_t n_misses = miss_sources.size();
+    GGML_ASSERT(n_misses > 0);
+    size_t wave_size = n_misses;
     if (overlap) {
-        const int max_staging_waves = stage_ready_capacity - 1;
-        wave_size = std::max(cache->n_slots, (n_misses + max_staging_waves - 1) / max_staging_waves);
+        const size_t max_staging_waves = (size_t) stage_ready_capacity - 1;
+        const size_t min_wave_size = 1 + (n_misses - 1) / max_staging_waves;
+        wave_size = std::max((size_t) cache->n_slots, min_wave_size);
     }
-    const int n_waves = (n_misses + wave_size - 1) / wave_size;
+    const size_t n_waves = 1 + (n_misses - 1) / wave_size;
+    GGML_ASSERT(n_waves <= (size_t) std::numeric_limits<int>::max() - 2);
     if (source_wait_class != nullptr) {
-        for (int miss = 0; miss < n_misses; ++miss) {
-            source_wait_class[miss_source_indices[miss]] = 2 + miss / wave_size;
+        for (size_t miss = 0; miss < n_misses; ++miss) {
+            source_wait_class[miss_source_indices[miss]] = (int32_t) (2 + miss / wave_size);
         }
     }
 
-    int copied = 0;
-    for (int wave = 0; wave < n_waves; ++wave) {
-        const int wave_end = std::min((wave + 1) * wave_size, n_misses);
-        const int copy_end = std::min(wave_end + (trailing_padding > 0 && wave + 1 < n_waves ? 1 : 0), n_misses);
+    size_t copied = 0;
+    size_t wave_end = 0;
+    for (size_t wave = 0; wave < n_waves; ++wave) {
+        wave_end += std::min(wave_size, n_misses - wave_end);
+        const size_t copy_end = wave_end + (trailing_padding > 0 && wave + 1 < n_waves ? 1 : 0);
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
         std::vector<void *> batch_dsts;
         std::vector<const void *> batch_srcs;
@@ -9328,7 +9334,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
 #endif
         while (copied < copy_end) {
             const void * src = miss_sources[copied];
-            int run = 1;
+            size_t run = 1;
             while (copied + run < copy_end &&
                    (uintptr_t) miss_sources[copied + run] == (uintptr_t) src + (size_t) run * byte_count) {
                 ++run;
@@ -9375,7 +9381,7 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
         CUDA_CHECK(cudaStreamWaitEvent(compute_stream, cache->stage_done, 0));
     }
     *out_n_resident = n_resident;
-    *out_n_wait_classes = overlap ? 2 + n_waves : 1;
+    *out_n_wait_classes = overlap ? (int) (2 + n_waves) : 1;
     return true;
 }
 
