@@ -1270,6 +1270,76 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(execution.size() == 0);
     CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
     CHECK(execution.requires_dispatch());
+
+    std::array<ggml_backend_moe_candidate_group_v2, 2> dormant_groups = {{
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, 0, 0},
+    }};
+    std::array<ggml_backend_moe_candidate_tensor_v2, 4> dormant_tensors = {{
+        {ungated_up, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {ungated_down, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_gate_up, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_down, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+    }};
+    const auto dormant_snapshot = candidate_snapshot_v2(
+        12, dormant_groups.data(), dormant_groups.size(), dormant_tensors.data(), dormant_tensors.size());
+    CHECK(registry.replace(&dormant_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 0 && registry.state().n_weights == 0);
+    std::array<ggml_tensor *, 4> dormant_readers = {{
+        candidate_mmid(fixture, ungated_up, v2_route.ids),
+        candidate_mmid(fixture, ungated_down, v2_route.ids),
+        candidate_mmid(fixture, chunk_gate_up, v2_route.ids),
+        candidate_mmid(fixture, chunk_down, v2_route.ids),
+    }};
+    ggml_cgraph * dormant_graph = candidate_graph(fixture, {
+        v2_route.root, v2_route.ids,
+        dormant_readers[0], dormant_readers[1], dormant_readers[2], dormant_readers[3],
+    });
+    const auto dormant_coverage = candidate_certify_graph(registry, dormant_graph);
+    registry.compile_graph_plan(
+        dormant_graph, 907, &plan, &execution, dormant_coverage.epoch, dormant_coverage.nodes,
+        dormant_coverage.mmid_count, dormant_coverage.mmid_fingerprint);
+    CHECK(plan.coverage_diagnostics().cached_mmid == dormant_readers.size());
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == dormant_readers.size());
+    CHECK(execution.size() == 0 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+    CHECK(!execution.requires_dispatch() && !execution.rejects_cached_mmid(dormant_readers[0]));
+    ggml_cuda_moe_graph_execution dormant_reused;
+    CHECK(registry.bind_graph_plan(
+        dormant_graph, 907, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, plan, &dormant_reused,
+        dormant_coverage.epoch, dormant_coverage.nodes,
+        dormant_coverage.mmid_count, dormant_coverage.mmid_fingerprint));
+    CHECK(dormant_reused.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY && dormant_reused.size() == 0);
+
+    std::array<ggml_backend_moe_candidate_group_v2, 3> mixed_dormant_groups = {{
+        {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0},
+        dormant_groups[0],
+        dormant_groups[1],
+    }};
+    std::array<ggml_backend_moe_candidate_tensor_v2, 6> mixed_dormant_tensors = {{
+        {gate_up, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {down, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {ungated_up, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {ungated_down, 1, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_gate_up, 2, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+        {chunk_down, 2, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, cached, 0},
+    }};
+    const auto mixed_dormant_snapshot = candidate_snapshot_v2(
+        12, mixed_dormant_groups.data(), mixed_dormant_groups.size(), mixed_dormant_tensors.data(), mixed_dormant_tensors.size());
+    CHECK(registry.replace(&mixed_dormant_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(registry.state().n_groups == 1 && registry.state().n_weights == 2);
+    ggml_tensor * mixed_active_gate_up = candidate_mmid(fixture, gate_up, v2_route.ids);
+    ggml_tensor * mixed_active_down = candidate_mmid(fixture, down, v2_route.ids);
+    ggml_cgraph * mixed_dormant_graph = candidate_graph(fixture, {
+        v2_route.root, v2_route.ids, mixed_active_gate_up, mixed_active_down,
+        dormant_readers[0], dormant_readers[1], dormant_readers[2], dormant_readers[3],
+    });
+    const auto mixed_dormant_coverage = candidate_certify_graph(registry, mixed_dormant_graph);
+    registry.compile_graph_plan(
+        mixed_dormant_graph, 908, &plan, &execution, mixed_dormant_coverage.epoch, mixed_dormant_coverage.nodes,
+        mixed_dormant_coverage.mmid_count, mixed_dormant_coverage.mmid_fingerprint);
+    CHECK(execution.size() == 1 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+    CHECK(execution.find(mixed_active_gate_up, nullptr) && execution.find(mixed_active_down, nullptr));
+    CHECK(!execution.rejects_cached_mmid(dormant_readers[0]));
     fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
 }
 
@@ -3107,6 +3177,24 @@ static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(execution.find(separate_down_node, &binding) && binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && binding.key.n_banks == 3);
     CHECK(!execution.find(fused_bias, nullptr));
 
+    const int64_t route_weight_ne[] = {1, 4, 1};
+    ggml_tensor * route_weight_source = fixture.tensor(GGML_TYPE_F32, 3, route_weight_ne);
+    ggml_tensor * route_weights = ggml_get_rows(fixture.ctx, route_weight_source, fused_route.ids);
+    fixture.materialize(route_weights);
+    route_weights->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_tensor * weighted_gate_up = candidate_mmid(fixture, fused_gate_up, fused_route.ids);
+    ggml_tensor * weighted_down = candidate_mmid(fixture, fused_down, fused_route.ids);
+    ggml_tensor * weighted_output = ggml_mul(fixture.ctx, weighted_down, route_weights);
+    fixture.materialize(weighted_output);
+    weighted_output->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    ggml_cgraph * weighted_graph = candidate_graph(fixture, {
+        fused_route.root, fused_route.ids, route_weights, weighted_gate_up, weighted_down, weighted_output,
+    });
+    registry.compile_graph_plan(weighted_graph, 410, &plan, &execution);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+    CHECK(execution.find(weighted_gate_up, nullptr) && execution.find(weighted_down, nullptr));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 0));
+
     {
         ggml_cuda_moe_graph_execution stream_execution;
         registry.compile_graph_plan(complete_graph, 41, &plan, &stream_execution);
@@ -3720,7 +3808,8 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_out, auxiliary_down_node,
     });
     registry.compile_graph_plan(auxiliary_graph, 58, &plan, &execution);
-    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(plan.size() == 1 && execution.size() == 1 && execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
 
     std::array<ggml_backend_moe_candidate_bank_v1, 3> auxiliary_banks = {{
         {fused_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
@@ -3736,7 +3825,8 @@ static void test_grouped_graph_preflight(bool benchmark) {
         fused_route.root, fused_route.ids, auxiliary_gate_up_node, auxiliary_down_node,
     });
     registry.compile_graph_plan(auxiliary_registered_graph, 59, &plan, &execution);
-    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(plan.size() == 1 && execution.size() == 1 && execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
 
     registry.compile_graph_plan(auxiliary_graph, 60, &plan, &execution);
@@ -3746,8 +3836,8 @@ static void test_grouped_graph_preflight(bool benchmark) {
     auxiliary_out->src[2] = fused_route_other.ids;
     candidate_rebuild_graph_uses(auxiliary_graph);
     registry.compile_graph_plan(auxiliary_graph, 61, &plan, &execution);
-    CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(auxiliary_gate_up_node, nullptr));
-    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
+    CHECK(plan.size() == 1 && execution.size() == 1 && execution.find(auxiliary_gate_up_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
     auxiliary_out->src[2] = fused_route.ids;
     candidate_rebuild_graph_uses(auxiliary_graph);
@@ -3878,7 +3968,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
     const auto wrong_bias_role_snapshot = candidate_snapshot(12, &separate_bias_group, 1);
     CHECK(registry.replace(&wrong_bias_role_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     registry.compile_graph_plan(separate_bias_graph, 75, &plan, &execution);
-    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && !execution.find(biased_gate_reader, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY && execution.find(biased_gate_reader, nullptr));
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_auxiliary_reason(plan, 0));
     separate_bias_banks[3].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
     separate_bias_banks[4].role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS;

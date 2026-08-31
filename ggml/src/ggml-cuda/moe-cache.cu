@@ -1644,7 +1644,9 @@ static bool moe_candidate_auxiliary_consumer(
             return true;
         }
         const ggml_tensor * other = consumer->src[1 - src_index];
-        if (consumer->op == GGML_OP_MUL && other != nullptr && other->op == GGML_OP_GET_ROWS && other->src[1] == ids) {
+        const ggml_tensor * repeat = other != nullptr && other->op == GGML_OP_GET_ROWS ? other->src[0] : nullptr;
+        if (consumer->op == GGML_OP_MUL && other != nullptr && other->op == GGML_OP_GET_ROWS && other->src[1] == ids &&
+                repeat != nullptr && repeat->op == GGML_OP_REPEAT && repeat->src[0] != nullptr && repeat->src[0]->op == GGML_OP_RESHAPE) {
             return true;
         }
     }
@@ -6108,10 +6110,13 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             impl_->table.submitted_groups == 0 && impl_->table.submitted_tensors == 0;
     const bool explicitly_disabled = impl_->state.accepted &&
         (impl_->state.n_slots == 0 || empty_manifest);
+    const bool dormant_decode_legacy = impl_->state.accepted && impl_->state.n_slots != 0 &&
+        cached_decode && !cached_prefill && diagnostics.cached_mmid != 0 &&
+        diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == diagnostics.cached_mmid;
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
-        plan->outcome_ = cached_decode && !explicitly_disabled ?
-            GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR : GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
-        plan->unknown_reusable_ = explicitly_disabled && certified_inventory;
+        plan->outcome_ = dormant_decode_legacy ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY :
+            cached_decode && !explicitly_disabled ? GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR : GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY;
+        plan->unknown_reusable_ = (explicitly_disabled || dormant_decode_legacy) && certified_inventory;
         execution->plan_ = plan;
         execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
         return;
@@ -6325,8 +6330,10 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     for (const auto & observation : observations) {
         n_observed += observation.observed;
     }
+    const uint32_t registered_coverage = diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED];
+    const uint32_t dormant_coverage = diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT];
     plan->unknown_reusable_ = certified_inventory &&
-        diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid;
+        registered_coverage + dormant_coverage == diagnostics.cached_mmid;
     try {
         plan->groups_.reserve(n_observed);
     } catch (const std::bad_alloc &) {
@@ -6550,11 +6557,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     }
     const bool call_prefill = cached_prefill || observed_prefill;
     const bool call_decode = cached_decode || observed_decode;
-    const bool complete_coverage = diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == diagnostics.cached_mmid;
+    const bool complete_coverage = registered_coverage + dormant_coverage == diagnostics.cached_mmid;
     const bool complete_slice = complete_coverage &&
-        observed_cached_readers == diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] && plan->n_groups_ != 0;
+        observed_cached_readers == registered_coverage && (plan->n_groups_ != 0 || dormant_coverage != 0);
     bool mixed_certificate = call_prefill && call_decode && complete_slice;
-    bool decode_certificate = call_decode && !call_prefill && complete_slice;
+    bool decode_certificate = call_decode && !call_prefill && complete_slice && dormant_coverage == 0;
     bool decode_legacy_certificate = call_decode && !call_prefill && complete_slice;
     uint32_t legacy_groups = 0;
     for (const auto & record : plan->groups_) {
@@ -6567,24 +6574,26 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION;
         const bool consumer_legacy = decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE;
+        const bool auxiliary_legacy = decode_group &&
+            record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_AUXILIARY;
         mixed_certificate = mixed_certificate &&
             ((prefill_group && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL) ||
                 (decode_group && (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
-                    materialization_legacy || execution_legacy || consumer_legacy)));
+                    materialization_legacy || execution_legacy || consumer_legacy || auxiliary_legacy)));
         decode_certificate = decode_certificate && decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
         decode_legacy_certificate = decode_legacy_certificate && decode_group &&
             (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
-                materialization_legacy || execution_legacy || consumer_legacy);
-        legacy_groups += materialization_legacy || execution_legacy || consumer_legacy;
+                materialization_legacy || execution_legacy || consumer_legacy || auxiliary_legacy);
+        legacy_groups += materialization_legacy || execution_legacy || consumer_legacy || auxiliary_legacy;
     }
-    decode_legacy_certificate = decode_legacy_certificate && legacy_groups != 0;
+    decode_legacy_certificate = decode_legacy_certificate && (legacy_groups != 0 || dormant_coverage != 0);
     plan->outcome_ = call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         mixed_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         decode_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED :
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     if (decode_legacy_certificate) {
-        GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
+        GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups + (dormant_coverage != 0));
     }
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
