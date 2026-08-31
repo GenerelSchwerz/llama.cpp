@@ -766,6 +766,23 @@ llama_context * llama_context::shared_workspace_peer() const {
     return sched_buffer_owner != nullptr ? sched_buffer_owner : sched_buffer_borrower;
 }
 
+// the two split modes do not put the same bytes on the same device, so report what is left where
+static void llama_log_device_memory(const char * func, const char * when) {
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+
+        LLAMA_LOG_INFO("%s: %s the switch: %s has %zu MiB of %zu MiB free\n", func, when,
+                ggml_backend_dev_name(dev), free/1024/1024, total/1024/1024);
+    }
+}
+
 bool llama_context::set_split_mode(llama_split_mode split_mode, const float * tensor_split) {
     const auto & hparams = model.hparams;
 
@@ -910,6 +927,9 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
     LLAMA_LOG_INFO("%s: switching the split mode from %s to %s, carrying %.2f MiB of state\n", __func__,
             llama_split_mode_name(prev_mode), llama_split_mode_name(split_mode), state.size()/1024.0/1024.0);
 
+    llama_log_device_memory(__func__, "before");
+
+    // the old placement goes first, so the devices never hold both at once
     release();
 
     const bool placed = model.set_split_mode(split_mode, tensor_split);
@@ -954,6 +974,8 @@ bool llama_context::set_split_mode(llama_split_mode split_mode, const float * te
     sampling.logits_count     = logits_count_saved;
     sampling.probs_count      = probs_count_saved;
     sampling.candidates_count = candidates_count_saved;
+
+    llama_log_device_memory(__func__, "after");
 
     if (state_set_data(state.data(), state.size()) == 0) {
         // the memory may hold a part of what was restored, so leave it empty rather than wrong

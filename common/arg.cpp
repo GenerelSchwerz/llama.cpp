@@ -898,12 +898,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         throw std::invalid_argument("error: --prompt-cache-all not supported in interactive mode yet\n");
     }
 
-    // the switch carries the state of the whole context, so there must be a moment where nothing is
-    // generating. that does not hold once several sequences share the context
-    if (params.prefill_split_mode >= 0 && params.n_parallel != 1) {
-        throw std::invalid_argument("error: --prefill-split-mode requires --parallel 1\n");
-    }
-
     // the switch happens once, after the prompt. an interactive session has more prompts after that
     if (params.prefill_split_mode >= 0 && (params.interactive || params.interactive_first)) {
         throw std::invalid_argument("error: --prefill-split-mode is not supported in interactive mode\n");

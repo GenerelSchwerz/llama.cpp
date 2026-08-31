@@ -52,7 +52,7 @@ static llama_context * make_context(llama_model * model, const common_params & p
     return llama_init_from_model(model, cparams);
 }
 
-static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, int & n_past, int32_t n_batch) {
+static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, int & n_past, int32_t n_batch, llama_seq_id seq_id = 0) {
     llama_batch_ptr batch(n_batch, 0, 1);
 
     for (size_t i = 0; i < tokens.size(); i += n_batch) {
@@ -60,7 +60,7 @@ static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, int 
 
         common_batch_clear(batch.get());
         for (size_t j = 0; j < n; j++) {
-            common_batch_add(batch.get(), tokens[i + j], n_past + (int) j, {0}, i + j == tokens.size() - 1);
+            common_batch_add(batch.get(), tokens[i + j], n_past + (int) j, {seq_id}, i + j == tokens.size() - 1);
         }
 
         if (llama_decode(ctx, batch.get())) {
@@ -73,7 +73,7 @@ static bool decode_tokens(llama_context * ctx, const llama_tokens & tokens, int 
     return true;
 }
 
-static llama_tokens generate_greedy(llama_context * ctx, int & n_past, int32_t n_predict) {
+static llama_tokens generate_greedy(llama_context * ctx, int & n_past, int32_t n_predict, llama_seq_id seq_id = 0) {
     auto sparams = llama_sampler_chain_default_params();
     auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
     llama_sampler_chain_add(smpl.get(), llama_sampler_init_greedy());
@@ -86,7 +86,7 @@ static llama_tokens generate_greedy(llama_context * ctx, int & n_past, int32_t n
         result.push_back(id);
 
         common_batch_clear(batch.get());
-        common_batch_add(batch.get(), id, n_past, {0}, true);
+        common_batch_add(batch.get(), id, n_past, {seq_id}, true);
 
         if (llama_decode(ctx, batch.get())) {
             LOG_ERR("%s: failed to decode\n", __func__);
@@ -450,6 +450,113 @@ static void test_tensor_split(test_ctx & t, llama_split_mode from, llama_split_m
     t.pass(name);
 }
 
+// several sequences share one context, which is the case a server is in: the switch has to carry
+// all of them, not just the one that happens to be generating
+static void test_multi_seq(test_ctx & t, llama_split_mode from, llama_split_mode to, bool kv_unified) {
+    const std::string name = std::string("multi seq ") + llama_split_mode_name(from) + " -> " +
+        llama_split_mode_name(to) + (kv_unified ? " (unified kv)" : " (kv per seq)");
+
+    const int32_t n_seqs = 4;
+
+    common_params params = t.params;
+    params.n_parallel = n_seqs;
+    params.kv_unified = kv_unified;
+    params.n_ctx      = t.params.n_ctx * n_seqs;
+
+    llama_model_ptr model{load_model(t.path, params, from)};
+    if (!model) {
+        t.skip(name, "the model does not load under the first split mode");
+        return;
+    }
+
+    llama_context_ptr ctx{make_context(model.get(), params)};
+    if (!ctx) {
+        t.skip(name, "the context does not build under the first split mode");
+        return;
+    }
+
+    // one prompt per sequence, each a different slice of the token pool
+    std::vector<llama_tokens> heads(n_seqs);
+    std::vector<llama_token>  last(n_seqs);
+    std::vector<int>          n_past(n_seqs, 0);
+
+    for (int s = 0; s < n_seqs; s++) {
+        llama_tokens prompt(t.prompt.begin(), t.prompt.end());
+        std::rotate(prompt.begin(), prompt.begin() + s + 1, prompt.end());
+
+        heads[s].assign(prompt.begin(), prompt.end() - 1);
+        last[s] = prompt.back();
+
+        if (!decode_tokens(ctx.get(), heads[s], n_past[s], params.n_batch, s)) {
+            t.fail(name, "failed to decode the prompt of a sequence");
+            return;
+        }
+    }
+
+    const std::vector<uint8_t> state = get_state(ctx.get());
+    if (state.empty()) {
+        t.fail(name, "failed to read the state");
+        return;
+    }
+
+    if (!llama_context_set_split_mode(ctx.get(), to, nullptr)) {
+        t.skip(name, "the split mode was rejected");
+        return;
+    }
+
+    if (get_state(ctx.get()) != state) {
+        t.fail(name, "the state of all sequences is not the same after the switch");
+        return;
+    }
+
+    std::vector<llama_tokens> got(n_seqs);
+    for (int s = 0; s < n_seqs; s++) {
+        int n_past_s = n_past[s];
+        if (!decode_tokens(ctx.get(), {last[s]}, n_past_s, params.n_batch, s)) {
+            t.fail(name, "failed to decode the last prompt token of a sequence");
+            return;
+        }
+        got[s] = generate_greedy(ctx.get(), n_past_s, params.n_predict, s);
+        if (got[s].empty()) {
+            t.fail(name, "failed to generate for a sequence");
+            return;
+        }
+    }
+
+    ctx.reset();
+    model.reset();
+
+    // the reference reaches the same state without ever switching
+    llama_model_ptr model_ref{load_model(t.path, params, to)};
+    if (!model_ref) {
+        t.fail(name, "failed to load the reference model");
+        return;
+    }
+    llama_context_ptr ctx_ref{make_context(model_ref.get(), params)};
+    if (!ctx_ref) {
+        t.fail(name, "failed to create the reference context");
+        return;
+    }
+    if (llama_state_set_data(ctx_ref.get(), state.data(), state.size()) != state.size()) {
+        t.fail(name, "failed to restore the state into the reference");
+        return;
+    }
+
+    for (int s = 0; s < n_seqs; s++) {
+        int n_past_s = n_past[s];
+        if (!decode_tokens(ctx_ref.get(), {last[s]}, n_past_s, params.n_batch, s)) {
+            t.fail(name, "failed to decode the last prompt token on the reference");
+            return;
+        }
+        if (generate_greedy(ctx_ref.get(), n_past_s, params.n_predict, s) != got[s]) {
+            t.fail(name, "a sequence generates differently after the switch");
+            return;
+        }
+    }
+
+    t.pass(name);
+}
+
 // the model level API on its own, without a context on top of it
 static void test_model_only(test_ctx & t, llama_split_mode from, llama_split_mode to) {
     const std::string name = std::string("model only ") + llama_split_mode_name(from) + " -> " + llama_split_mode_name(to);
@@ -543,6 +650,9 @@ static bool run_tests_for_model(const std::string & path, const common_params & 
     test_round_trip(t, LLAMA_SPLIT_MODE_TENSOR, LLAMA_SPLIT_MODE_LAYER);
     test_no_change (t, LLAMA_SPLIT_MODE_LAYER,  LLAMA_SPLIT_MODE_TENSOR);
     test_tensor_split(t, LLAMA_SPLIT_MODE_LAYER, LLAMA_SPLIT_MODE_TENSOR);
+    test_multi_seq (t, LLAMA_SPLIT_MODE_LAYER,  LLAMA_SPLIT_MODE_TENSOR, /*kv_unified =*/ true);
+    test_multi_seq (t, LLAMA_SPLIT_MODE_LAYER,  LLAMA_SPLIT_MODE_TENSOR, /*kv_unified =*/ false);
+    test_multi_seq (t, LLAMA_SPLIT_MODE_TENSOR, LLAMA_SPLIT_MODE_LAYER,  /*kv_unified =*/ false);
     test_model_only(t, LLAMA_SPLIT_MODE_LAYER,  LLAMA_SPLIT_MODE_TENSOR);
 
     n_pass += t.n_pass;

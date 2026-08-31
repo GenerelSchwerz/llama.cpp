@@ -118,18 +118,47 @@ if (!llama_context_set_split_mode(ctx, LLAMA_SPLIT_MODE_TENSOR, NULL)) {
 llama-completion -m model.gguf -psm layer -sm tensor -ctk f16 -ctv f16 -np 1 -f long-prompt.txt
 ```
 
+All sequences of the context are carried, not only the one that was generating, so a caller that
+serves several requests from one context keeps every slot's cache across the switch. What the switch
+cannot do is run two split modes at once - the split mode belongs to the model - or run while a
+`llama_decode` is in flight.
+
 Points to be aware of:
 
 - The switch costs one placement of the weights, which reads them from the model file again. It pays
   off once the prefill saving is larger than that, so it is for long prompts, not short ones.
-- Both modes have to fit on the devices, and they do not place the same bytes on the same device.
-  If the second mode does not fit, the call returns false and the context keeps running under the
-  mode it already had.
 - A `-ts` is a share of the layers under a layer split and a share of every tensor under a tensor
   split. The library call takes a `tensor_split` of its own for that reason; `-psm` uses the one the
   model already has.
 - The model must not be shared with another context, and must have no LoRA adapter or control vector
   loaded. Every `llama_memory_t` taken from the context before the switch is invalid after it.
+
+#### Device memory
+
+The old placement is freed before the new one is asked for, so the devices never hold both. The peak
+is the **per-device maximum of the two modes**, not their sum, and not the maximum of the two totals:
+one device can be at its layer-split peak while the other is at its tensor-split peak. Measured on an
+RTX 4070 + RTX 3060, `Qwen3.8-27B-UD-IQ2_M` at `-c 20480` with an f16 cache, sampled at 10 Hz:
+
+| config | GPU0 peak | GPU1 peak |
+| --- | ---: | ---: |
+| `-sm layer` | 5806 MiB | 6188 MiB |
+| `-sm tensor` | 6418 MiB | 6164 MiB |
+| `-psm layer -sm tensor` | 6362 MiB | 6180 MiB |
+
+So the largest context that survives a switch is smaller than what either pure mode could hold. Size
+for the maximum of the two, per device.
+
+If the new mode does not fit anyway, the allocation failure is caught: the previous placement is put
+back, the context is built on it again and the memory is restored, and the call returns false. The
+request is not lost. Checked by holding 5976 MiB on GPU0 with a helper process, which leaves room for
+the layer split but not for the tensor split:
+
+| run | result |
+| --- | --- |
+| `-sm layer` | generates |
+| `-sm tensor` | out of memory at load, request lost |
+| `-psm layer -sm tensor` | out of memory during the switch, warns, generates under the layer split |
 
 ### 6. With NCCL
 
