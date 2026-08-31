@@ -105,7 +105,7 @@ static bool llama_sched_supports_flash_attn_causal_prefix(ggml_backend_sched_t s
 }
 
 llama_context::llama_context(
-        const llama_model & model,
+              llama_model & model,
               llama_context_params params) :
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
@@ -150,6 +150,10 @@ llama_context::llama_context(
     cparams.live_context_workspace  = params.live_context_workspace;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
+
+    // a split mode switch builds the context again and has to start from what was asked for
+    recurrent_state_offload_req = params.recurrent_state_offload;
+    flash_attn_type             = params.flash_attn_type;
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
@@ -362,45 +366,7 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // GPU backends
-        for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
-            if (backend == nullptr) {
-                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
-            }
-            backends.emplace_back(backend);
-        }
-
-        // add ACCEL backends (such as BLAS)
-        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
-                if (backend == nullptr) {
-                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
-                }
-                backends.emplace_back(backend);
-            }
-        }
-
-        // add CPU backend
-        backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-        if (backend_cpu == nullptr) {
-            throw std::runtime_error("failed to initialize CPU backend");
-        }
-        backends.emplace_back(backend_cpu);
-
-        // create a list of the set_n_threads functions in the backends
-        for (auto & backend : backends) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
-            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
-            if (reg) {
-                auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-                if (ggml_backend_set_n_threads_fn) {
-                    set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
-                }
-            }
-        }
+        init_backends();
 
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
@@ -418,7 +384,7 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
+        mparams_mem = {
             /*.type_k    =*/ params.type_k,
             /*.type_v    =*/ params.type_v,
             /*.swa_full  =*/ params.swa_full,
@@ -426,88 +392,12 @@ llama_context::llama_context(
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
         };
 
-        memory.reset(model.create_memory(params_mem, cparams));
-
-        if (cparams.live_context_workspace && hparams.no_alloc) {
-            cparams.live_context_workspace = false;
-        } else if (cparams.live_context_workspace && (!memory || memory->get_attn_reserve_capacity() == 0)) {
-            LLAMA_LOG_WARN("%s: live-context workspace sizing unsupported; using full-context reserve\n", __func__);
-            cparams.live_context_workspace = false;
-        }
-
-        if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-            if (memory && memory->get_supports_partial_kv()) {
-                cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
-            } else {
-                LLAMA_LOG_WARN("%s: partial GPU KV residency is not supported for this memory layout; ignoring kv_gpu_layers\n", __func__);
-            }
-        }
+        init_memory();
     }
 
     // init backends
     if (!hparams.vocab_only) {
-        LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
-
-        backend_buft.clear();
-        backend_ptrs.clear();
-        backend_buf_exp_size.clear();
-
-        for (auto & backend : backends) {
-            auto * buft = ggml_backend_get_default_buffer_type(backend.get());
-            auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
-                // use the host buffer of the first device CPU for faster transfer of the intermediate state
-                const auto & dev = model.devices[0];
-                auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
-                if (host_buft) {
-                    buft = host_buft;
-                }
-            }
-
-            backend_buft.push_back(buft);
-            backend_ptrs.push_back(backend.get());
-            backend_buf_exp_size.push_back(0);
-        }
-
-        LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
-
-        // TODO: move these checks to ggml_backend_sched
-        // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
-        bool pipeline_parallel =
-            model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
-            model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
-            cparams.offload_kqv &&
-            !model.has_tensor_overrides();
-
-        // pipeline parallelism requires support for async compute and events in all devices
-        if (pipeline_parallel) {
-            for (auto & backend : backends) {
-                auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
-                if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
-                    // ignore CPU backend
-                    // TODO: should we ignore ACCEL types too?
-                    continue;
-                }
-                auto * dev = ggml_backend_get_device(backend.get());
-                ggml_backend_dev_props props;
-                ggml_backend_dev_get_props(dev, &props);
-                if (!props.caps.async || !props.caps.events) {
-                    // device does not support async compute or events
-                    pipeline_parallel = false;
-                    break;
-                }
-            }
-        }
-
-        cparams.pipeline_parallel = pipeline_parallel;
-
-        if (cparams.pipeline_parallel) {
-            LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
-        }
-
-        sched_reserve();
+        init_sched();
 
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
@@ -525,6 +415,134 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+}
+
+void llama_context::init_backends() {
+    // GPU backends
+    for (const auto & dev : model.devices) {
+        ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+        if (backend == nullptr) {
+            throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+        }
+        backends.emplace_back(backend);
+    }
+
+    // add ACCEL backends (such as BLAS)
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+            if (backend == nullptr) {
+                throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
+            }
+            backends.emplace_back(backend);
+        }
+    }
+
+    // add CPU backend
+    backend_cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    if (backend_cpu == nullptr) {
+        throw std::runtime_error("failed to initialize CPU backend");
+    }
+    backends.emplace_back(backend_cpu);
+
+    // create a list of the set_n_threads functions in the backends
+    for (auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg) {
+            auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+            if (ggml_backend_set_n_threads_fn) {
+                set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+            }
+        }
+    }
+}
+
+void llama_context::init_memory() {
+    const auto & hparams = model.hparams;
+
+    memory.reset(model.create_memory(mparams_mem, cparams));
+
+    if (cparams.live_context_workspace && hparams.no_alloc) {
+        cparams.live_context_workspace = false;
+    } else if (cparams.live_context_workspace && (!memory || memory->get_attn_reserve_capacity() == 0)) {
+        LLAMA_LOG_WARN("%s: live-context workspace sizing unsupported; using full-context reserve\n", __func__);
+        cparams.live_context_workspace = false;
+    }
+
+    if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+        if (memory && memory->get_supports_partial_kv()) {
+            cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
+        } else {
+            LLAMA_LOG_WARN("%s: partial GPU KV residency is not supported for this memory layout; ignoring kv_gpu_layers\n", __func__);
+        }
+    }
+}
+
+void llama_context::init_sched() {
+    LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
+
+    backend_buft.clear();
+    backend_ptrs.clear();
+    backend_buf_exp_size.clear();
+
+    for (auto & backend : backends) {
+        auto * buft = ggml_backend_get_default_buffer_type(backend.get());
+        auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+
+        if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            // use the host buffer of the first device CPU for faster transfer of the intermediate state
+            const auto & dev = model.devices[0];
+            auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
+            if (host_buft) {
+                buft = host_buft;
+            }
+        }
+
+        backend_buft.push_back(buft);
+        backend_ptrs.push_back(backend.get());
+        backend_buf_exp_size.push_back(0);
+    }
+
+    LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
+
+    // TODO: move these checks to ggml_backend_sched
+    // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+    bool pipeline_parallel =
+        model.n_devices() > 1 &&
+        model.n_gpu_layers() > model.hparams.n_layer_all &&
+        model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+        cparams.offload_kqv &&
+        !model.has_tensor_overrides();
+
+    // pipeline parallelism requires support for async compute and events in all devices
+    if (pipeline_parallel) {
+        for (auto & backend : backends) {
+            auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+            if (dev_type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                // ignore CPU backend
+                // TODO: should we ignore ACCEL types too?
+                continue;
+            }
+            auto * dev = ggml_backend_get_device(backend.get());
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev, &props);
+            if (!props.caps.async || !props.caps.events) {
+                // device does not support async compute or events
+                pipeline_parallel = false;
+                break;
+            }
+        }
+    }
+
+    cparams.pipeline_parallel = pipeline_parallel;
+
+    if (cparams.pipeline_parallel) {
+        LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+    }
+
+    sched_reserve();
 }
 
 llama_context::~llama_context() {
@@ -741,6 +759,188 @@ llama_context::sched_reserve_plan llama_context::make_sched_reserve_plan(
 
 llama_context * llama_context::shared_workspace_peer() const {
     return sched_buffer_owner != nullptr ? sched_buffer_owner : sched_buffer_borrower;
+}
+
+bool llama_context::set_split_mode(llama_split_mode split_mode, const float * tensor_split) {
+    const auto & hparams = model.hparams;
+
+    if (model.split_mode() == split_mode && tensor_split == nullptr) {
+        return true;
+    }
+
+    if (hparams.vocab_only || hparams.no_alloc) {
+        LLAMA_LOG_ERROR("%s: this context holds no weights\n", __func__);
+        return false;
+    }
+
+    if (opt_ctx != nullptr || cparams.ctx_other != nullptr || shared_workspace_peer() != nullptr) {
+        LLAMA_LOG_ERROR("%s: not supported for a context that is tied to another context\n", __func__);
+        return false;
+    }
+
+    // both keep tensors of their own on the devices of the old placement
+    if (!model.loras.empty() || !cvec->is_empty()) {
+        LLAMA_LOG_ERROR("%s: not supported while a LoRA adapter or a control vector is loaded\n", __func__);
+        return false;
+    }
+
+    // checked here so that a split mode the model cannot take costs nothing
+    if (!model.split_mode_supported(split_mode)) {
+        return false;
+    }
+
+    if (split_mode == LLAMA_SPLIT_MODE_TENSOR && flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED) {
+        LLAMA_LOG_ERROR("%s: split mode tensor requires flash_attn to be enabled\n", __func__);
+        return false;
+    }
+
+    synchronize();
+
+    const llama_split_mode prev_mode = model.split_mode();
+
+    // all zero means "split by free memory", which is what a model without a tensor split does
+    std::vector<float> prev_tensor_split(llama_max_devices(), 0.0f);
+    if (model.tensor_split() != nullptr) {
+        std::copy(model.tensor_split(), model.tensor_split() + llama_max_devices(), prev_tensor_split.begin());
+    }
+
+    // the memory and the outputs live on buffers that the new placement does not have, so take
+    // everything out of them before anything is freed
+    std::vector<uint8_t> state(state_get_size());
+    if (!state.empty() && state_get_data(state.data(), state.size()) != state.size()) {
+        LLAMA_LOG_ERROR("%s: failed to read the context state\n", __func__);
+        return false;
+    }
+
+    const int64_t n_vocab = model.vocab.n_tokens();
+    uint32_t n_outputs_max = n_seq_max();
+    if (logits.size > 0 && n_vocab > 0) {
+        n_outputs_max = (uint32_t) (logits.size / n_vocab);
+    }
+
+    std::vector<uint8_t> outputs(buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0);
+    if (!outputs.empty()) {
+        memcpy(outputs.data(), ggml_backend_buffer_get_base(buf_output.get()), outputs.size());
+    }
+
+    const uint32_t               n_outputs_saved        = n_outputs;
+    const std::vector<int32_t>   output_ids_saved       = output_ids;
+    const std::vector<swap_info> output_swaps_saved     = output_swaps;
+    const std::vector<uint32_t>  logits_count_saved     = sampling.logits_count;
+    const std::vector<uint32_t>  probs_count_saved      = sampling.probs_count;
+    const std::vector<uint32_t>  candidates_count_saved = sampling.candidates_count;
+
+    auto release = [&]() {
+        mem_storage.clear();
+        memory.reset();
+
+        reset_sched_workspace();
+
+        buf_output.reset();
+        logits     = {nullptr, 0};
+        embd       = {nullptr, 0};
+        embd_nextn = {nullptr, 0};
+        for (auto & layer_inp : embd_layer_inp) {
+            layer_inp = {nullptr, 0};
+        }
+        sampling.logits     = {nullptr, 0};
+        sampling.probs      = {nullptr, 0};
+        sampling.sampled    = {nullptr, 0};
+        sampling.candidates = {nullptr, 0};
+
+        set_n_threads_fns.clear();
+        backend_ptrs.clear();
+        backend_buft.clear();
+        backend_buf_exp_size.clear();
+        backend_cpu = nullptr;
+        backends.clear();
+    };
+
+    auto rebuild = [&]() {
+        init_backends();
+
+        set_abort_callback(abort_callback, abort_callback_data);
+
+        if (output_reserve(n_outputs_max) < n_outputs_max) {
+            throw std::runtime_error("failed to reserve the output buffer");
+        }
+
+        cparams.recurrent_state_offload = recurrent_state_offload_req;
+        if (!cparams.recurrent_state_offload && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
+                (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch))) {
+            cparams.recurrent_state_offload = true;
+        }
+
+        // the split mode decides where an op can run, so resolve the automatic choices again.
+        // this has to happen before the memory module is built, because the cache layout follows
+        // flash_attn as it was asked for, not as it was resolved
+        const bool fa_forced = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+
+        cparams.flash_attn         = fa_forced || flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+        cparams.auto_fa            = !fa_forced && flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+        cparams.fused_dsv4_hc_pre  = true;
+        cparams.fused_dsv4_hc_comb = true;
+        cparams.fused_dsv4_hc_post = true;
+        cparams.auto_fhc           = true;
+
+        init_memory();
+        init_sched();
+    };
+
+    LLAMA_LOG_INFO("%s: switching the split mode from %s to %s, carrying %.2f MiB of state\n", __func__,
+            llama_split_mode_name(prev_mode), llama_split_mode_name(split_mode), state.size()/1024.0/1024.0);
+
+    release();
+
+    bool ok = model.set_split_mode(split_mode, tensor_split);
+
+    if (ok) {
+        try {
+            rebuild();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: failed to build the context for split mode %s: %s\n", __func__,
+                    llama_split_mode_name(split_mode), err.what());
+            ok = false;
+        }
+    }
+
+    if (!ok) {
+        // a rebuild that threw may have got half way, so start from nothing again
+        release();
+
+        // llama_model::set_split_mode puts the weights back itself, the context only follows it there
+        if (model.split_mode() != prev_mode &&
+                !model.set_split_mode(prev_mode, prev_tensor_split.data())) {
+            LLAMA_LOG_ERROR("%s: the previous split mode could not be restored\n", __func__);
+            return false;
+        }
+
+        try {
+            rebuild();
+        } catch (const std::exception & err) {
+            LLAMA_LOG_ERROR("%s: the context could not be built again: %s\n", __func__, err.what());
+            return false;
+        }
+    }
+
+    if (!outputs.empty()) {
+        const size_t n_bytes = std::min(outputs.size(), ggml_backend_buffer_get_size(buf_output.get()));
+        memcpy(ggml_backend_buffer_get_base(buf_output.get()), outputs.data(), n_bytes);
+    }
+
+    n_outputs                 = n_outputs_saved;
+    output_ids                = output_ids_saved;
+    output_swaps              = output_swaps_saved;
+    sampling.logits_count     = logits_count_saved;
+    sampling.probs_count      = probs_count_saved;
+    sampling.candidates_count = candidates_count_saved;
+
+    if (!state.empty() && state_set_data(state.data(), state.size()) == 0) {
+        LLAMA_LOG_ERROR("%s: the memory could not be restored after the switch\n", __func__);
+        return false;
+    }
+
+    return ok;
 }
 
 void llama_context::reset_sched_workspace() {
@@ -4170,6 +4370,10 @@ llama_context * llama_init_from_model(
     }
 
     return nullptr;
+}
+
+bool llama_context_set_split_mode(llama_context * ctx, enum llama_split_mode split_mode, const float * tensor_split) {
+    return ctx->set_split_mode(split_mode, tensor_split);
 }
 
 // deprecated

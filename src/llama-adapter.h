@@ -15,6 +15,8 @@
 //
 
 struct llama_adapter_cvec {
+    bool is_empty() const { return tensors.empty(); }
+
     ggml_tensor * tensor_for(int il) const;
 
     ggml_tensor * apply_to(ggml_context * ctx, ggml_tensor * cur, int  il) const;

@@ -556,6 +556,21 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
+    // Place the model weights for another split mode and build the context again on top of them.
+    // A large batch and a single token do not want the same split, so a caller that knows which phase
+    // it is in can pick the split mode per phase instead of once per model.
+    // The memory, the logits and the output ids are carried across, so the context keeps working on
+    // whatever it already holds. The llama_memory_t of the context is replaced, so a cached one must
+    // be read again with llama_get_memory.
+    // The model must not be shared with another context and must have no LoRA adapter or control
+    // vector loaded. tensor_split may be NULL to keep the current one.
+    // Returns false and leaves the context in a usable state under the split mode it had before if
+    // the new split mode does not fit.
+    LLAMA_API bool llama_context_set_split_mode(
+            struct llama_context * ctx,
+             enum llama_split_mode split_mode,
+                      const float * tensor_split);
+
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);

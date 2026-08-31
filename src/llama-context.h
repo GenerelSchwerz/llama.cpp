@@ -52,7 +52,7 @@ struct llama_context {
 
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
-            const llama_model & model,
+                  llama_model & model,
                   llama_context_params params);
 
     ~llama_context();
@@ -270,7 +270,18 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // place the model weights for another split mode and build this context again on top of them
+    // the memory, the logits and the output ids are carried across
+    // on failure the previous split mode is restored and false is returned
+    bool set_split_mode(llama_split_mode split_mode, const float * tensor_split);
+
 private:
+    // the three steps that build everything derived from the model devices, shared by the
+    // constructor and by set_split_mode
+    void init_backends();
+    void init_memory();
+    void init_sched();
+
     void reset_sched_workspace();
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
@@ -299,9 +310,14 @@ private:
     // members
     //
 
-    const llama_model & model;
+    llama_model & model;
 
     llama_cparams cparams;
+
+    // kept so that the context can be built again after the model weights are placed differently
+    llama_memory_params        mparams_mem     = {};
+    enum llama_flash_attn_type flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+    bool                       recurrent_state_offload_req = false;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

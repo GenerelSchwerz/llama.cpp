@@ -36,6 +36,7 @@ Set with `--split-mode` / `-sm`.
 |---|---|---|---|---|
 | `-sm` | `--split-mode` | `none` \| `layer` \| `tensor` | `layer` | See modes above. |
 | `-ts` | `--tensor-split` | comma-separated proportions, e.g. `3,1` | mode-dependent | How much of the model goes to each GPU. If omitted, `layer`/`row` use automatic splitting proportional to memory, while `tensor` splits tensor segments evenly. With `3,1` on two GPUs, GPU 0 gets 75 %, GPU 1 gets 25 %. The values follow the order in `--device`. |
+| `-psm` | `--prefill-split-mode` | `none` \| `layer` \| `tensor` | unset | Split mode to process the prompt under, before switching to `--split-mode` to generate. See "Switching the split mode at runtime" below. `llama-completion` only, and requires `--parallel 1`. |
 | `-mg` | `--main-gpu` | integer device index | `0` | The single GPU used in `--split-mode none`. |
 | `-ngl` | `--n-gpu-layers` / `--gpu-layers` | integer \| `auto` \| `all` | `auto` | Maximum number of layers to keep in VRAM. Use `999` or `all` to push everything possible to the GPUs. |
 | `-dev` | `--device` | comma-separated device names, or `none` | auto | Restrict which devices llama.cpp may use. See `--list-devices` for names. |
@@ -92,7 +93,45 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
   - **State-space / RWKV-style:** Mamba, Mamba2 (and the hybrid Mamba-attention models above)
   - **Other:** PLAMO2, MiniCPM3, Gemma-3n, OLMo2, BitNet, T5
 
-### 5. With NCCL
+### 5. Switching the split mode at runtime
+
+A prompt and a single generated token do not want the same split. Tensor parallelism pays for a
+collective per layer: the cost of that collective scales with the batch, the benefit does not. A
+layer split pays no collective but runs the devices one after the other, so a batch of one gets no
+parallelism from it. Prefill therefore prefers `layer` and generation prefers `tensor`, and the gap
+can be tens of percent in both directions.
+
+`llama_context_set_split_mode` places the weights again for another split mode without dropping the
+context. The KV cache, the logits and the output ids are carried across, so a caller can process the
+prompt under one mode and generate under the other:
+
+```c
+// the prompt is in the cache, now generate under the mode that suits a batch of one
+if (!llama_context_set_split_mode(ctx, LLAMA_SPLIT_MODE_TENSOR, NULL)) {
+    // the mode does not fit on the devices - the context is still usable under the old one
+}
+```
+
+`llama-completion` exposes this as `--prefill-split-mode` / `-psm`:
+
+```bash
+llama-completion -m model.gguf -psm layer -sm tensor -ctk f16 -ctv f16 -np 1 -f long-prompt.txt
+```
+
+Points to be aware of:
+
+- The switch costs one placement of the weights, which reads them from the model file again. It pays
+  off once the prefill saving is larger than that, so it is for long prompts, not short ones.
+- Both modes have to fit on the devices, and they do not place the same bytes on the same device.
+  If the second mode does not fit, the call returns false and the context keeps running under the
+  mode it already had.
+- A `-ts` is a share of the layers under a layer split and a share of every tensor under a tensor
+  split. The library call takes a `tensor_split` of its own for that reason; `-psm` uses the one the
+  model already has.
+- The model must not be shared with another context, and must have no LoRA adapter or control vector
+  loaded. Every `llama_memory_t` taken from the context before the switch is invalid after it.
+
+### 6. With NCCL
 
 There's no runtime flag for NCCL - it's selected at build time (`-DGGML_CUDA_NCCL=ON`, this is the default). Note that NCCL is **not** automatically distributed with CUDA and you may need to install it manually - when in doubt check the CMake log to see whether or not it can find the package. When llama.cpp is compiled with NCCL support it uses it automatically for cross-GPU reductions in `tensor` mode. When NCCL is missing on a multi-GPU build, you'll see this one-time warning and performance will be lower:
 
@@ -101,7 +140,7 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
-### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
+### 7. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
 
 CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
 
