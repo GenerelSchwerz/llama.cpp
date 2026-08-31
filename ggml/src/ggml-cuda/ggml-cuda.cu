@@ -3160,18 +3160,25 @@ static bool ggml_cuda_moe_group_scale_view(
         const ggml_tensor * scale,
         ggml_tensor & scale_view) {
     if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE || !ggml_cuda_moe_grouped_b1_scale_fusion(&group, binding) ||
-            group.n_scale_shadows != 3 || group.n_slots == 0 || scale == nullptr) {
+            group.n_auxiliary_shadows != 3 || group.n_slots == 0 || scale == nullptr) {
         return false;
     }
-    const uint32_t scale_index = binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ? 0 :
-        binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ? 1 : 2;
-    if (group.scale_tensors[scale_index] != scale || group.scale_data[scale_index] == nullptr ||
+    const uint32_t scale_role = binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ?
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE :
+        binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ?
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE;
+    uint32_t auxiliary_index = 0;
+    while (auxiliary_index < group.n_auxiliary_shadows &&
+            (group.auxiliary_roles[auxiliary_index] != scale_role || group.auxiliary_tensors[auxiliary_index] != scale)) {
+        ++auxiliary_index;
+    }
+    if (auxiliary_index == group.n_auxiliary_shadows || group.auxiliary_data[auxiliary_index] == nullptr ||
             scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(scale) || ggml_n_dims(scale) != 1 ||
             ggml_nelements(scale) != group.capabilities[binding.slot_index].n_experts) {
         return false;
     }
     scale_view = *scale;
-    scale_view.data = const_cast<float *>(group.scale_data[scale_index]);
+    scale_view.data = const_cast<float *>(group.auxiliary_data[auxiliary_index]);
     scale_view.ne[0] = group.n_slots;
     scale_view.ne[1] = 1;
     scale_view.ne[2] = 1;
@@ -3180,6 +3187,54 @@ static bool ggml_cuda_moe_group_scale_view(
     scale_view.nb[1] = group.n_slots * sizeof(float);
     scale_view.nb[2] = scale_view.nb[1];
     scale_view.nb[3] = scale_view.nb[2];
+    return true;
+}
+
+static uint32_t ggml_cuda_moe_bias_role(uint32_t weight_role) {
+    switch (weight_role) {
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS;
+        case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS;
+        default:
+            return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    }
+}
+
+static bool ggml_cuda_moe_group_bias_view(
+        const ggml_cuda_moe_graph_group_dispatch & group,
+        const ggml_cuda_moe_graph_binding & binding,
+        const ggml_tensor * bias,
+        ggml_tensor & bias_view) {
+    if (group.state != GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE || group.n_slots == 0 || bias == nullptr ||
+            binding.slot_index >= group.key.n_banks || !ggml_cuda_moe_grouped_mmvq(&group, binding)) {
+        return false;
+    }
+    const uint32_t bias_role = ggml_cuda_moe_bias_role(binding.role);
+    uint32_t auxiliary_index = 0;
+    while (auxiliary_index < group.n_auxiliary_shadows &&
+            (group.auxiliary_roles[auxiliary_index] != bias_role || group.auxiliary_tensors[auxiliary_index] != bias)) {
+        ++auxiliary_index;
+    }
+    if (bias_role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID || auxiliary_index == group.n_auxiliary_shadows ||
+            group.auxiliary_data[auxiliary_index] == nullptr || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias) ||
+            ggml_n_dims(bias) != 2 || bias->ne[0] <= 0 ||
+            bias->ne[1] != group.capabilities[binding.slot_index].n_experts) {
+        return false;
+    }
+    bias_view = *bias;
+    bias_view.data = const_cast<float *>(group.auxiliary_data[auxiliary_index]);
+    bias_view.ne[1] = group.n_slots;
+    bias_view.ne[2] = 1;
+    bias_view.ne[3] = 1;
+    bias_view.nb[0] = sizeof(float);
+    bias_view.nb[1] = bias_view.ne[0] * sizeof(float);
+    bias_view.nb[2] = bias_view.nb[1] * group.n_slots;
+    bias_view.nb[3] = bias_view.nb[2];
     return true;
 }
 
@@ -4492,7 +4547,8 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         const ggml_tensor * ffn_up_bias   = cgraph->nodes[node_idx + 3];
         const ggml_tensor * glu           = cgraph->nodes[node_idx + 4];
 
-        if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias)) {
+        if (ggml_cuda_should_fuse_mul_mat(ffn_up, ffn_gate, glu, ffn_up_bias, ffn_gate_bias,
+                nullptr, nullptr, allow_cached)) {
             int out_nodes[] = { node_idx + 4 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
@@ -5209,7 +5265,8 @@ static int ggml_cuda_try_fuse(
             }
         }
 
-        if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {})) {
+        if (ggml_cuda_can_fuse(cgraph, i, { op, bias_op, op, bias_op, GGML_OP_GLU }, {},
+                op == GGML_OP_MUL_MAT_ID)) {
             ggml_tensor * glu         = cgraph->nodes[i + 4];
             ggml_tensor * gate_bias_n = glu->src[0];
             ggml_tensor * up_bias_n   = glu->src[1];
@@ -5234,11 +5291,6 @@ static int ggml_cuda_try_fuse(
             if (!up_bias_tensor || !gate_bias_tensor) {
                 continue;
             }
-            if (op == GGML_OP_MUL_MAT_ID && execution != nullptr &&
-                    (execution->find_group(up_n, nullptr) != nullptr || execution->find_group(gate_n, nullptr) != nullptr)) {
-                continue;
-            }
-
             // we don't support repeating adds
             if (bias_op == GGML_OP_ADD && (!ggml_are_same_shape(gate_bias_n->src[0], gate_bias_n->src[1]) ||
                                            !ggml_are_same_shape(up_bias_n->src[0], up_bias_n->src[1]))) {
@@ -5248,6 +5300,17 @@ static int ggml_cuda_try_fuse(
             const ggml_tensor * src0 = up_n->src[0];
             const ggml_tensor * src1 = up_n->src[1];
             const ggml_tensor * ids  = up_n->src[2];
+
+            ggml_cuda_moe_graph_binding up_binding;
+            ggml_cuda_moe_graph_binding gate_binding;
+            auto * up_group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(up_n, &up_binding) : nullptr;
+            auto * gate_group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(gate_n, &gate_binding) : nullptr;
+            const bool grouped_pair = up_group != nullptr && gate_group == up_group &&
+                (up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED ||
+                    up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) &&
+                up_binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT &&
+                gate_binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT &&
+                ggml_cuda_moe_grouped_mmvq(up_group, up_binding) && ggml_cuda_moe_grouped_mmvq(up_group, gate_binding);
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
@@ -5263,7 +5326,7 @@ static int ggml_cuda_try_fuse(
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n, grouped_pair)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
@@ -5271,6 +5334,45 @@ static int ggml_cuda_try_fuse(
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
 
                 ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, up_n, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+                if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
+                    if (up_group->first_reader != gate_n && up_group->first_reader != up_n) {
+                        return -1;
+                    }
+                    const bool gate_first = up_group->first_reader == gate_n;
+                    const auto result = cuda_ctx->moe_grouped_context->prepare_graph_group(
+                        up_group, gate_first ? gate_binding : up_binding, gate_first ? gate_n : up_n, cuda_ctx->stream());
+                    if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
+                        return -1;
+                    }
+                }
+                if (grouped_pair && up_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE) {
+                    ggml_tensor up_view;
+                    ggml_tensor gate_view;
+                    ggml_tensor ids_view;
+                    ggml_tensor gate_ids_view;
+                    ggml_tensor up_bias_view;
+                    ggml_tensor gate_bias_view;
+                    if (up_n->src[2] != up_group->key.ids.tensor || gate_n->src[2] != up_group->key.ids.tensor ||
+                            up_group->stream != cuda_ctx->stream() ||
+                            !ggml_cuda_moe_group_views(*up_group, up_binding, src0, up_view, ids_view) ||
+                            !ggml_cuda_moe_group_views(*up_group, gate_binding, gate_n->src[0], gate_view, gate_ids_view) ||
+                            ids_view.data != gate_ids_view.data ||
+                            !ggml_cuda_moe_group_bias_view(*up_group, up_binding, up_bias_tensor, up_bias_view) ||
+                            !ggml_cuda_moe_group_bias_view(*up_group, gate_binding, gate_bias_tensor, gate_bias_view)) {
+                        return -1;
+                    }
+                    fusion_data.gate = &gate_view;
+                    fusion_data.gate_ids = &gate_ids_view;
+                    fusion_data.x_bias = &up_bias_view;
+                    fusion_data.gate_bias = &gate_bias_view;
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, &up_view, src1, &ids_view, glu, &fusion_data);
+                    fused_mul_mat_vec = true;
+                    fused_node_count = 5;
+                    break;
+                }
+                if (ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+                    continue;
+                }
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 5;
@@ -5515,9 +5617,10 @@ static int ggml_cuda_try_fuse(
         const ggml_tensor * src1 = mm_node->src[1];
         const ggml_tensor * ids  = mm_node->src[2];
 
-        if (op == GGML_OP_MUL_MAT_ID && execution != nullptr && execution->find_group(mm_node, nullptr) != nullptr) {
-            continue;
-        }
+        ggml_cuda_moe_graph_binding binding;
+        auto * group = op == GGML_OP_MUL_MAT_ID && execution != nullptr ? execution->find_group(mm_node, &binding) : nullptr;
+        const bool grouped_down = group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE &&
+            binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT && ggml_cuda_moe_grouped_mmvq(group, binding);
 
         if (bias_op == GGML_OP_ADD_ID && bias_node->src[2] != ids) {
             continue;
@@ -5538,8 +5641,29 @@ static int ggml_cuda_try_fuse(
             break;
         }
 
-        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+        if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node, grouped_down)) {
             ggml_cuda_moe_shadow_probe(*cuda_ctx, execution, mm_node, src0, ids, &fusion_data, op == GGML_OP_MUL_MAT_ID);
+            if (grouped_down) {
+                ggml_tensor bank_view;
+                ggml_tensor ids_view;
+                ggml_tensor bias_view;
+                if (group->stream != cuda_ctx->stream() || ids != group->key.ids.tensor ||
+                        !ggml_cuda_moe_group_views(*group, binding, src0, bank_view, ids_view) ||
+                        !ggml_cuda_moe_group_bias_view(*group, binding, bias_tensor, bias_view)) {
+                    return -1;
+                }
+                fusion_data.x_bias = &bias_view;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, &bank_view, src1, &ids_view, bias_node, &fusion_data);
+                if (!cuda_ctx->moe_grouped_context->finish_graph_group(group, binding, mm_node, cuda_ctx->stream())) {
+                    return -1;
+                }
+                fused_mul_mat_vec = true;
+                fused_node_count = 2;
+                break;
+            }
+            if (ggml_backend_buft_is_cuda_moe_cached(src0->buffer->buft)) {
+                continue;
+            }
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
