@@ -1807,6 +1807,13 @@ static bool ggml_backend_sched_input_is_staged(ggml_backend_sched_t sched, int s
 static bool ggml_backend_sched_size_add(size_t a, size_t b, size_t * result);
 static bool ggml_backend_sched_size_pad(size_t size, size_t alignment, size_t * result);
 
+// A ring entry costs what the backend would allocate for it, which can be more than its data:
+// a buffer type may ask for padding past ggml_nbytes(), and its kernels may write into it.
+static bool ggml_backend_sched_transport_entry_size(
+        ggml_backend_buffer_type_t buft, const struct ggml_tensor * t, size_t alignment, size_t * result) {
+    return ggml_backend_sched_size_pad(ggml_backend_buft_get_alloc_size(buft, t), alignment, result);
+}
+
 static void ggml_backend_sched_transport_clear_addresses(ggml_backend_sched_t sched) {
     const struct ggml_backend_sched_transport * tr = &sched->transport;
 
@@ -1842,10 +1849,14 @@ static void ggml_backend_sched_transport_assign_addresses(ggml_backend_sched_t s
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
-            input_cpy->data   = slot + offset;
-            input_cpy->buffer = r->buffer;
+            // bind through the backend, so that the entry is initialized the same way as any other
+            // tensor the buffer holds. A previous plan may have left this copy bound already.
+            input_cpy->data   = NULL;
+            input_cpy->buffer = NULL;
+            const enum ggml_status status = ggml_backend_tensor_alloc(r->buffer, input_cpy, slot + offset);
+            GGML_ASSERT(status == GGML_STATUS_SUCCESS);
             size_t input_size;
-            GGML_ASSERT(ggml_backend_sched_size_pad(ggml_nbytes(split->inputs[j]), r->alignment, &input_size));
+            GGML_ASSERT(ggml_backend_sched_transport_entry_size(ggml_backend_buffer_get_type(r->buffer), input_cpy, r->alignment, &input_size));
             GGML_ASSERT(ggml_backend_sched_size_add(offset, input_size, &offset));
         }
         GGML_ASSERT(offset <= r->slot_size);
@@ -2148,10 +2159,11 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             }
             const struct ggml_tensor * input = split->inputs[j];
             const struct ggml_tensor * base  = input->view_src ? input->view_src : input;
+            const struct ggml_tensor * entry = tensor_copy(split->inputs[j], bid, sched->cur_copy);
             size_t input_size;
             size_t input_size_max;
-            if (!ggml_backend_sched_size_pad(ggml_nbytes(input), tr->rings[bid].alignment, &input_size) ||
-                !ggml_backend_sched_size_pad(ggml_nbytes(base), tr->rings[bid].alignment, &input_size_max) ||
+            if (!ggml_backend_sched_transport_entry_size(sched->bufts[bid], entry, tr->rings[bid].alignment, &input_size) ||
+                !ggml_backend_sched_transport_entry_size(sched->bufts[bid], base,  tr->rings[bid].alignment, &input_size_max) ||
                 !ggml_backend_sched_size_add(need, input_size, &need) ||
                 !ggml_backend_sched_size_add(need_max, input_size_max, &need_max)) {
                 size_overflow[bid] = true;

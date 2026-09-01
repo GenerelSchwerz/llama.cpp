@@ -124,7 +124,7 @@ RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F,
 
 `llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order
 (`docs/repro/r4-kv-pipeline-ab.sh`, `docs/repro/r4-kv-pipeline-context-sweep.sh`),
-at `--kv-pipeline-budget 512` so the 32,768 ring is allowed:
+with no cap on the ring:
 
 | depth | ordered | pipelined | gain | peak device memory |
 |---:|---|---|---:|---:|
@@ -132,11 +132,18 @@ at `--kv-pipeline-budget 512` so the 32,768 ring is allowed:
 | 16,384 | 19.4344, 19.4828 | 31.0981, 31.0931 | **+59.8%** | +86 to +104 MiB |
 | 32,768 | 12.9453, 12.9400 | 15.4571, 15.4516 | **+19.4%** | +206 MiB |
 
-> These need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have them:
-> the repro scripts probed `--help`, found nothing, and quietly dropped both. The
-> same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the pipeline
-> buys +6.7% instead of +60%, because a host-resident recurrent state costs more
-> than the transport can win back. `llama-bench` takes them again.
+> These rows were taken before the budget existed, so they are the uncapped
+> numbers. The 32,768 ring is 204 MiB and the default cap is 128 MiB, so that row
+> does not reproduce on the current default: it needs `-kvpb 512`, which
+> `llama-bench` did not take until now. The scripts pass it, and the row is due a
+> re-measurement on the current head.
+
+> These also need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have
+> them: the repro scripts probed `--help`, found nothing, and quietly dropped
+> both. The same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the
+> pipeline buys +6.7% instead of +60%, because a host-resident recurrent state
+> costs more than the transport can win back. `llama-bench` takes them again, and
+> the scripts now fail rather than drop an option the build does not have.
 
 `llama-server`, one request, `temperature 0, top_k 1, seed 1234`:
 

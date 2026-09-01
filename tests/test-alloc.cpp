@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <string>
@@ -31,6 +32,29 @@ struct dummy_backend_context {
     int event_wait_count = 0;
     int set_tensor_async_count = 0;
     size_t set_tensor_async_bytes = 0;
+    size_t alloc_size_pad = 0;
+
+    // what the backend was asked to hold and to move, so that a test can check the entries a
+    // transport ring lays out and the bytes it delivers into them
+    struct tensor_binding {
+        const ggml_tensor *   tensor;
+        ggml_backend_buffer_t buffer;
+        const char *          data;
+        size_t                size;
+    };
+    struct tensor_delivery {
+        const ggml_tensor * tensor;
+        const char *        src;
+        size_t              offset;
+        size_t              size;
+    };
+    struct event_step {
+        bool                 is_wait;
+        ggml_backend_event_t event;
+    };
+    std::vector<tensor_binding>  bindings;
+    std::vector<tensor_delivery> deliveries;
+    std::vector<event_step>      event_steps;
     ggml_backend_buffer_type_t buffer_type = nullptr;
     ggml_backend_i backend_interface = {};
 
@@ -76,6 +100,12 @@ static size_t dummy_backend_buffer_type_get_max_size(ggml_backend_buffer_type_t 
     return ctx->max_buffer_size;
 }
 
+static size_t dummy_backend_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buft->context;
+    // only a tensor that is no op's output may ask for more than its data [TAG_ALLOC_SIZE_EXPAND]
+    return ggml_nbytes(tensor) + (ggml_op_is_empty(tensor->op) ? ctx->alloc_size_pad : 0);
+}
+
 static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
     return ((dummy_backend_context *) buft->context)->buffer_is_host;
 }
@@ -101,7 +131,17 @@ static void * dummy_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
     return ctx->buffer_bases[i - ctx->buffers.begin()];
 }
 
-static ggml_status dummy_backend_buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor *) {
+static ggml_status dummy_backend_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
+    const size_t size = ggml_backend_buffer_get_alloc_size(buffer, tensor);
+
+    for (auto & b : ctx->bindings) {
+        if (b.tensor == tensor) {
+            b = { tensor, buffer, (const char *) tensor->data, size };
+            return GGML_STATUS_SUCCESS;
+        }
+    }
+    ctx->bindings.push_back({ tensor, buffer, (const char *) tensor->data, size });
     return GGML_STATUS_SUCCESS;
 }
 
@@ -133,18 +173,23 @@ static void dummy_backend_free(ggml_backend_t backend) {
     delete backend;
 }
 
-static void dummy_backend_set_tensor_async(ggml_backend_t backend, ggml_tensor *, const void *, size_t, size_t size) {
+static void dummy_backend_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
     ctx->set_tensor_async_count++;
     ctx->set_tensor_async_bytes += size;
+    ctx->deliveries.push_back({ tensor, (const char *) data, offset, size });
 }
 
 static void dummy_backend_synchronize(ggml_backend_t) {}
 
-static void dummy_backend_event_record(ggml_backend_t, ggml_backend_event_t) {}
+static void dummy_backend_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
+    ((dummy_backend_context *) backend->context)->event_steps.push_back({ false, event });
+}
 
-static void dummy_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t) {
-    ((dummy_backend_context *) backend->context)->event_wait_count++;
+static void dummy_backend_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
+    dummy_backend_context * ctx = (dummy_backend_context *) backend->context;
+    ctx->event_wait_count++;
+    ctx->event_steps.push_back({ true, event });
 }
 
 static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml_cgraph *) {
@@ -237,6 +282,7 @@ static dummy_backend dummy_backend_init(
     b.buffer_type.iface.alloc_buffer  = dummy_backend_buffer_type_alloc_buffer;
     b.buffer_type.iface.get_alignment = dummy_backend_buffer_type_get_alignment;
     b.buffer_type.iface.get_max_size  = dummy_backend_buffer_type_get_max_size;
+    b.buffer_type.iface.get_alloc_size = dummy_backend_buffer_type_get_alloc_size;
     b.buffer_type.iface.is_host       = dummy_backend_buffer_type_is_host;
     b.context->buffer_type            = &b.buffer_type;
 
@@ -313,6 +359,34 @@ static transport_graph make_transport_graph(dummy_backend & cpu, size_t size) {
     source->data = ggml_backend_buffer_get_base(buffer.get());
 
     return { std::move(result), std::move(buffer), source, output };
+}
+
+struct transport_graph_pair {
+    test_context_with_graph ctx;
+    ggml_backend_buffer_ptr buffer;
+    ggml_tensor * sources[2];
+    ggml_tensor * output;
+};
+
+// two transported inputs in one split, so that the ring lays out more than one entry per slot
+static transport_graph_pair make_transport_graph_pair(dummy_backend & cpu, size_t size) {
+    GGML_ASSERT(size % sizeof(float) == 0);
+    auto result = make_context();
+    ggml_tensor * s0 = ggml_new_tensor_1d(result.ctx, GGML_TYPE_F32, size/sizeof(float));
+    ggml_tensor * s1 = ggml_new_tensor_1d(result.ctx, GGML_TYPE_F32, size/sizeof(float));
+    ggml_tensor * output = ggml_add(result.ctx, s0, s1);
+    s0->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    s1->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_build_forward_expand(result.graph, output);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, 2*size));
+    char * base = (char *) ggml_backend_buffer_get_base(buffer.get());
+    s0->buffer = buffer.get();
+    s0->data   = base;
+    s1->buffer = buffer.get();
+    s1->data   = base + size;
+
+    return { std::move(result), std::move(buffer), { s0, s1 }, output };
 }
 
 static void transport_stats(
@@ -1300,6 +1374,97 @@ static void test_transport_prefix_and_configuration() {
     GGML_ASSERT(cuda.context->transfer_backend_count == 0);
 }
 
+// The ring must hold what the backend allocates for an entry, deliver every byte of it exactly
+// once, and never wait on an event it has not recorded.
+static void test_transport_entry_allocation() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+
+    // ask for more room per entry than its data needs, the way a quantized tensor does
+    cuda.context->alloc_size_pad = 32;
+
+    const size_t nbytes = 128;
+    auto graph = make_transport_graph_pair(cpu, nbytes);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 4096));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+
+    // one input goes early in part, the other whole
+    ggml_set_stable_prefix(graph.sources[0], nbytes/2);
+    ggml_set_stable_prefix(graph.sources[1], nbytes);
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = 0;
+    int64_t early = 0;
+    int64_t late = 0;
+    transport_stats(sched.get(), &deliveries, &early, &late);
+    GGML_ASSERT(deliveries == 1 && early == (int64_t) (nbytes + nbytes/2) && late == (int64_t) (nbytes/2));
+
+    std::vector<const dummy_backend_context::tensor_binding *> entries;
+    for (const auto & b : cuda.context->bindings) {
+        if (strncmp(b.tensor->name, "CUDA#", 5) == 0) {
+            entries.push_back(&b);
+        }
+    }
+    GGML_ASSERT(entries.size() == 2);
+
+    for (const auto * e : entries) {
+        // bound through the buffer, with the room the buffer type asks for
+        GGML_ASSERT(e->size == ggml_nbytes(e->tensor) + cuda.context->alloc_size_pad);
+
+        const char * base = (const char *) ggml_backend_buffer_get_base(e->buffer);
+        GGML_ASSERT(e->data >= base);
+        GGML_ASSERT(e->data + e->size <= base + ggml_backend_buffer_get_size(e->buffer));
+
+        // and no entry, padding included, reaches into another one
+        for (const auto * other : entries) {
+            GGML_ASSERT(other == e || other->data + other->size <= e->data || other->data >= e->data + e->size);
+        }
+
+        // every byte of the entry is delivered once, in order, from the matching source offset
+        std::vector<dummy_backend_context::tensor_delivery> parts;
+        for (const auto & d : cuda.context->deliveries) {
+            if (d.tensor == e->tensor) {
+                parts.push_back(d);
+            }
+        }
+        GGML_ASSERT(!parts.empty());
+        std::sort(parts.begin(), parts.end(),
+                [](const dummy_backend_context::tensor_delivery & a, const dummy_backend_context::tensor_delivery & b) {
+                    return a.offset < b.offset;
+                });
+        const char * src = parts.front().src;
+        GGML_ASSERT(src == (const char *) graph.sources[0]->data || src == (const char *) graph.sources[1]->data);
+        size_t covered = 0;
+        for (const auto & d : parts) {
+            GGML_ASSERT(d.offset == covered);
+            GGML_ASSERT(d.src == src + d.offset);
+            covered += d.size;
+        }
+        GGML_ASSERT(covered == ggml_nbytes(e->tensor));
+    }
+
+    // nothing waits on an event before it is recorded
+    const auto & steps = cuda.context->event_steps;
+    GGML_ASSERT(!steps.empty());
+    for (size_t i = 0; i < steps.size(); i++) {
+        if (!steps[i].is_wait) {
+            continue;
+        }
+        bool recorded = false;
+        for (size_t j = 0; j < i && !recorded; j++) {
+            recorded = !steps[j].is_wait && steps[j].event == steps[i].event;
+        }
+        GGML_ASSERT(recorded);
+    }
+}
+
 static void test_transport_empty_graph() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
@@ -1639,6 +1804,7 @@ int main() {
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
     run("test_transport_prefix_and_configuration", test_transport_prefix_and_configuration);
+    run("test_transport_entry_allocation", test_transport_entry_allocation);
     run("test_transport_empty_graph", test_transport_empty_graph);
     run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
     run("test_transport_environment_is_fallback", test_transport_environment_is_fallback);
