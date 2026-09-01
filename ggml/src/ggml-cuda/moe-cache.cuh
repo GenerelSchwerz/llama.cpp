@@ -310,6 +310,7 @@ private:
     ggml_cuda_moe_group_authority authority_ = GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
     uint32_t execution_domain_ = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
     uint32_t row_semantics_ = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    bool prefill_resident_certified_ = false;
 };
 
 enum ggml_cuda_moe_graph_group_state : uint32_t {
@@ -544,6 +545,13 @@ private:
         int32_t flags;
     };
 
+    struct prefill_add_id_witness {
+        consumer_witness consumer;
+        uint32_t group_record;
+        uint32_t bank_index;
+        uint32_t reader_role;
+    };
+
     struct group_observation {
         ggml_cuda_moe_ids_signature ids;
         ggml_cuda_moe_ids_signature route_root;
@@ -634,6 +642,7 @@ private:
 
     std::vector<group_record> groups_;
     std::vector<mmid_witness> mmid_inventory_;
+    std::vector<prefill_add_id_witness> prefill_add_id_witnesses_;
     std::array<node_entry, NODE_TABLE_SIZE> nodes_;
     const void * owner_;
     const void * graph_key_;
@@ -673,6 +682,7 @@ public:
     bool has_stream_grouped_candidate() const;
     bool has_coherent_grouped_streams() const;
     bool requires_dispatch() const;
+    bool has_prefill_resident_witnesses() const;
     ggml_cuda_moe_graph_outcome outcome() const;
     ggml_cuda_moe_graph_dispatch_mode dispatch_mode() const;
     uint32_t size() const;
@@ -839,6 +849,16 @@ public:
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream);
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
+    bool prefill_add_id_source(
+            const ggml_cuda_moe_graph_execution & execution,
+            const ggml_tensor * node,
+            ggml_cuda_moe_stream_t stream,
+            const float ** source) const;
+    bool finish_prefill_add_id(
+            const ggml_cuda_moe_graph_execution & execution,
+            const ggml_tensor * node,
+            ggml_cuda_moe_stream_t stream,
+            const float * source) const;
     ggml_cuda_moe_grouped_decode_result prepare_decode(
             const ggml_cuda_moe_complete_group_key & key,
             ggml_cuda_moe_stream_t compute_stream,
@@ -864,6 +884,16 @@ private:
             int32_t * slot) const;
     void * device_bank_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
     const float * device_auxiliary_data_for_test(const ggml_cuda_moe_candidate_group_key & key, const ggml_tensor * tensor) const;
+    const float * device_prefill_auxiliary_data_for_test(
+            const ggml_cuda_moe_candidate_group_key & key,
+            const ggml_tensor * tensor,
+            size_t * byte_extent,
+            uint64_t * resource_generation) const;
+    bool prefill_auxiliary_ordering_for_test(
+            const ggml_cuda_moe_candidate_group_key & key,
+            uint64_t * cross_stream_waits,
+            uint64_t * pending_declines) const;
+    bool set_prefill_resident_budget_for_test(size_t byte_budget);
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;

@@ -113,6 +113,29 @@ struct ggml_cuda_moe_grouped_context_test_access {
         return context.device_auxiliary_data_for_test(key, tensor);
     }
 
+    static const float * device_prefill_auxiliary_data(
+            const ggml_cuda_moe_grouped_context & context,
+            const ggml_cuda_moe_candidate_group_key & key,
+            const ggml_tensor * tensor,
+            size_t * byte_extent = nullptr,
+            uint64_t * resource_generation = nullptr) {
+        return context.device_prefill_auxiliary_data_for_test(key, tensor, byte_extent, resource_generation);
+    }
+
+    static bool set_prefill_resident_budget(
+            ggml_cuda_moe_grouped_context & context,
+            size_t byte_budget) {
+        return context.set_prefill_resident_budget_for_test(byte_budget);
+    }
+
+    static bool prefill_auxiliary_ordering(
+            const ggml_cuda_moe_grouped_context & context,
+            const ggml_cuda_moe_candidate_group_key & key,
+            uint64_t * cross_stream_waits,
+            uint64_t * pending_declines) {
+        return context.prefill_auxiliary_ordering_for_test(key, cross_stream_waits, pending_declines);
+    }
+
     static bool device_resource_complete(
             const ggml_cuda_moe_grouped_context & context,
             const ggml_cuda_moe_candidate_group_key & key) {
@@ -156,6 +179,10 @@ struct ggml_cuda_moe_grouped_context_test_access {
     static ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry(
             ggml_cuda_moe_grouped_context & context) {
         return context.take_grouped_debug_telemetry_for_test();
+    }
+
+    static size_t prefill_add_id_witness_count(const ggml_cuda_moe_graph_plan & plan) {
+        return plan.prefill_add_id_witnesses_.size();
     }
 
     static size_t graph_reader_witness_size() {
@@ -8159,7 +8186,304 @@ static void test_active_grouped_fused_down_scale_extent() {
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
 }
 
+static void test_prefill_resident_biases() {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    constexpr uint32_t n_slots = 12;
+    constexpr uint32_t n_rows = 2;
+    constexpr uint32_t n_experts = 128;
+    constexpr uint32_t n_used = 8;
+
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+    ggml_backend_ptr parallel_backend(ggml_backend_cuda_init(0));
+    ggml_backend_ptr declined_backend(ggml_backend_cuda_init(0));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr &&
+        parallel_backend != nullptr && declined_backend != nullptr);
+    auto make_graph = [](ggml_backend_t backend, uint32_t rows, uint32_t experts, uint32_t used) {
+        return build_active_grouped_dispatch_graph_types(
+            backend, ggml_backend_cuda_moe_cached_buffer_type(),
+            {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0},
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, false,
+            rows, experts, used, 64, nullptr, false, true, 96, true);
+    };
+    auto reference = make_graph(reference_backend.get(), n_rows, n_experts, n_used);
+    auto candidate = make_graph(candidate_backend.get(), n_rows, n_experts, n_used);
+    auto parallel = make_graph(parallel_backend.get(), n_rows, n_experts, n_used);
+    auto declined = make_graph(declined_backend.get(), n_rows, n_experts, n_used);
+    for (auto * graph : {&reference, &candidate, &parallel, &declined}) {
+        candidate_stamp_execution(graph->graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, n_rows, 1);
+    }
+    initialize_active_grouped_dispatch_graphs({&reference, &candidate, &parallel, &declined});
+
+    size_t bias_bytes = 0;
+    for (const ggml_tensor * bias : candidate.biases) {
+        CHECK(ggml_nbytes(bias) <= SIZE_MAX - bias_bytes);
+        bias_bytes += ggml_nbytes(bias);
+    }
+    CHECK(bias_bytes > 1 && candidate.biases.size() == 3);
+    const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(candidate_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(parallel_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(declined_backend.get(), &disabled) ==
+        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto * candidate_context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    auto * parallel_context = ggml_cuda_moe_grouped_context_for_test(parallel_backend.get());
+    auto * declined_context = ggml_cuda_moe_grouped_context_for_test(declined_backend.get());
+    CHECK(candidate_context != nullptr && parallel_context != nullptr && declined_context != nullptr);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_prefill_resident_budget(*candidate_context, bias_bytes));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_prefill_resident_budget(*parallel_context, bias_bytes));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_prefill_resident_budget(*declined_context, bias_bytes - 1));
+
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, n_slots);
+    register_active_grouped_dispatch(
+        parallel_backend.get(), parallel, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, n_slots);
+    register_active_grouped_dispatch(
+        declined_backend.get(), declined, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, n_slots);
+    const auto candidate_coverage = candidate_certify_graph(*candidate_context, candidate.graph);
+    (void) candidate_certify_graph(*parallel_context, parallel.graph);
+    (void) candidate_certify_graph(*declined_context, declined.graph);
+    std::shared_ptr<ggml_cuda_moe_graph_plan> prefill_plan;
+    ggml_cuda_moe_graph_execution prefill_execution;
+    CHECK(candidate_context->prepare_graph_execution(
+        candidate.graph, 990, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &prefill_plan, &prefill_execution,
+        candidate_coverage.epoch, candidate_coverage.nodes, candidate_coverage.mmid_count,
+        candidate_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(prefill_plan->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+    CHECK(prefill_plan->has_certified_complete_mmid_inventory());
+    CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_add_id_witness_count(*prefill_plan) == candidate.biases.size());
+    for (ggml_tensor * reader : candidate.readers) {
+        CHECK(prefill_execution.find_group(reader, nullptr) != nullptr);
+    }
+
+    const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+    std::array<std::vector<float>, 2> parallel_outputs;
+    std::thread first([&]() {
+        parallel_outputs[0] = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+    });
+    std::thread second([&]() {
+        parallel_outputs[1] = run_active_grouped_dispatch(parallel_backend.get(), parallel, 0, false);
+    });
+    first.join();
+    second.join();
+    check_active_grouped_exact_output(expected, parallel_outputs[0]);
+    check_active_grouped_exact_output(expected, parallel_outputs[1]);
+    check_active_grouped_exact_output(
+        expected, run_active_grouped_dispatch(declined_backend.get(), declined, 0, false));
+    check_active_grouped_routes(candidate, n_rows, 0);
+    CHECK(active_grouped_route(candidate, 0, 0, n_used - 1) >= static_cast<int32_t>(n_slots));
+
+    ggml_cuda_moe_candidate_group_key candidate_key;
+    ggml_cuda_moe_candidate_group_key parallel_key;
+    ggml_cuda_moe_candidate_group_key declined_key;
+    CHECK(candidate_context->find_down_group_key(candidate.down, &candidate_key));
+    CHECK(parallel_context->find_down_group_key(parallel.down, &parallel_key));
+    CHECK(declined_context->find_down_group_key(declined.down, &declined_key));
+    std::array<const float *, 3> candidate_residents = {};
+    uint64_t first_resource_generation = 0;
+    for (uint32_t i = 0; i < candidate.biases.size(); ++i) {
+        size_t extent = 0;
+        uint64_t generation = 0;
+        candidate_residents[i] = ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+            *candidate_context, candidate_key, candidate.biases[i], &extent, &generation);
+        CHECK(candidate_residents[i] != nullptr && extent == ggml_nbytes(candidate.biases[i]) && generation != 0);
+        CHECK(candidate_residents[i] != ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(
+            *candidate_context, candidate_key, candidate.biases[i]));
+        if (i == 0) {
+            first_resource_generation = generation;
+        } else {
+            CHECK(generation == first_resource_generation);
+        }
+        std::vector<float> resident(ggml_nelements(candidate.biases[i]));
+        CUDA_OK(cudaMemcpy(resident.data(), candidate_residents[i], extent, cudaMemcpyDeviceToHost));
+        CHECK(resident == active_grouped_tensor_values(candidate.biases[i]));
+
+        const float * parallel_resident = ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+            *parallel_context, parallel_key, parallel.biases[i]);
+        CHECK(parallel_resident != nullptr && parallel_resident != candidate_residents[i]);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+            *declined_context, declined_key, declined.biases[i]) == nullptr);
+    }
+
+    std::array<const ggml_tensor *, 3> add_nodes = {};
+    for (int32_t node_index = 0; node_index < ggml_graph_n_nodes(candidate.graph); ++node_index) {
+        const ggml_tensor * node = ggml_graph_node(candidate.graph, node_index);
+        if (node->op != GGML_OP_ADD_ID) {
+            continue;
+        }
+        for (uint32_t bias = 0; bias < candidate.biases.size(); ++bias) {
+            if (node->src[1] == candidate.biases[bias]) {
+                CHECK(add_nodes[bias] == nullptr);
+                add_nodes[bias] = node;
+            }
+        }
+    }
+    CHECK(std::all_of(add_nodes.begin(), add_nodes.end(), [](const ggml_tensor * node) { return node != nullptr; }));
+    const uint32_t routed_expert = active_grouped_route(candidate, 0, 0, 0);
+    const size_t first_row_bytes = candidate.biases[0]->ne[0] * sizeof(float);
+    const size_t second_row_bytes = candidate.biases[1]->ne[0] * sizeof(float);
+    std::vector<float> first_expected(candidate.biases[0]->ne[0]);
+    std::vector<float> second_expected(candidate.biases[1]->ne[0]);
+    const auto first_original = active_grouped_tensor_values(candidate.biases[0]);
+    const auto second_original = active_grouped_tensor_values(candidate.biases[1]);
+    memcpy(first_expected.data(), first_original.data() + routed_expert * candidate.biases[0]->ne[0], first_row_bytes);
+    memcpy(second_expected.data(), second_original.data() + routed_expert * candidate.biases[1]->ne[0], second_row_bytes);
+    CHECK(std::any_of(first_expected.begin(), first_expected.end(), [](float value) { return value != 0.0f; }));
+
+    cudaStream_t first_stream = nullptr;
+    cudaStream_t second_stream = nullptr;
+    float * staged = nullptr;
+    float * first_result = nullptr;
+    float * second_result = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&first_stream, cudaStreamNonBlocking));
+    CUDA_OK(cudaStreamCreateWithFlags(&second_stream, cudaStreamNonBlocking));
+    CHECK(first_stream != second_stream);
+    CUDA_OK(cudaMalloc(&staged, first_row_bytes));
+    CUDA_OK(cudaMalloc(&first_result, first_row_bytes));
+    CUDA_OK(cudaMalloc(&second_result, second_row_bytes));
+    uint64_t waits_before = 0;
+    uint64_t declines_before = 0;
+    CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_auxiliary_ordering(
+        *candidate_context, candidate_key, &waits_before, &declines_before));
+    CHECK(candidate_context->begin_graph_dispatch(&prefill_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY));
+    const float * first_source = nullptr;
+    const float * second_source = nullptr;
+    CHECK(candidate_context->prefill_add_id_source(
+        prefill_execution, add_nodes[0], first_stream, &first_source));
+    CHECK(first_source == candidate_residents[0]);
+    CHECK(!candidate_context->prefill_add_id_source(
+        prefill_execution, add_nodes[1], second_stream, &second_source));
+    CHECK(second_source == nullptr);
+    CUDA_OK(cudaMemsetAsync(staged, 0, first_row_bytes, first_stream));
+    host_barrier first_barrier;
+    CUDA_OK(cudaLaunchHostFunc(first_stream, wait_on_host_barrier, &first_barrier));
+    CUDA_OK(cudaMemcpyAsync(staged, first_source + routed_expert * candidate.biases[0]->ne[0],
+        first_row_bytes, cudaMemcpyDeviceToDevice, first_stream));
+    CHECK(candidate_context->finish_prefill_add_id(
+        prefill_execution, add_nodes[0], first_stream, first_source));
+    while (!first_barrier.entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    CHECK(candidate_context->prefill_add_id_source(
+        prefill_execution, add_nodes[1], second_stream, &second_source));
+    CHECK(second_source == candidate_residents[1]);
+    CUDA_OK(cudaMemcpyAsync(first_result, staged, first_row_bytes, cudaMemcpyDeviceToDevice, second_stream));
+    CUDA_OK(cudaMemcpyAsync(second_result, second_source + routed_expert * candidate.biases[1]->ne[0],
+        second_row_bytes, cudaMemcpyDeviceToDevice, second_stream));
+    CHECK(candidate_context->finish_prefill_add_id(
+        prefill_execution, add_nodes[1], second_stream, second_source));
+    CHECK(candidate_context->finish_graph_dispatch(&prefill_execution));
+    uint64_t waits_after = 0;
+    uint64_t declines_after = 0;
+    CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_auxiliary_ordering(
+        *candidate_context, candidate_key, &waits_after, &declines_after));
+    CHECK(waits_after == waits_before + 2 && declines_after == declines_before + 1);
+    first_barrier.released.store(true, std::memory_order_release);
+    CUDA_OK(cudaStreamSynchronize(second_stream));
+    CUDA_OK(cudaStreamSynchronize(first_stream));
+    std::vector<float> first_actual(first_expected.size());
+    std::vector<float> second_actual(second_expected.size());
+    CUDA_OK(cudaMemcpy(first_actual.data(), first_result, first_row_bytes, cudaMemcpyDeviceToHost));
+    CUDA_OK(cudaMemcpy(second_actual.data(), second_result, second_row_bytes, cudaMemcpyDeviceToHost));
+    CHECK(first_actual == first_expected && second_actual == second_expected);
+    CUDA_OK(cudaFree(second_result));
+    CUDA_OK(cudaFree(first_result));
+    CUDA_OK(cudaFree(staged));
+    CUDA_OK(cudaStreamDestroy(second_stream));
+    CUDA_OK(cudaStreamDestroy(first_stream));
+    check_active_grouped_exact_output(
+        expected, run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false));
+
+    for (uint32_t i = 0; i < candidate.biases.size(); ++i) {
+        const auto changed = cached_fusion_test_data(candidate.biases[i], 900 + i);
+        ggml_backend_tensor_set(candidate.biases[i], changed.data(), 0, changed.size());
+    }
+    check_active_grouped_exact_output(
+        expected, run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false));
+    check_active_grouped_exact_output(
+        expected, run_active_grouped_dispatch(parallel_backend.get(), parallel, 0, false));
+
+    for (uint32_t i = 0; i < declined.biases.size(); ++i) {
+        const auto changed = cached_fusion_test_data(declined.biases[i], 950 + i);
+        ggml_backend_tensor_set(declined.biases[i], changed.data(), 0, changed.size());
+        ggml_backend_tensor_set(reference.biases[i], changed.data(), 0, changed.size());
+    }
+    const auto declined_expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+    const auto declined_actual = run_active_grouped_dispatch(declined_backend.get(), declined, 0, false);
+    check_active_grouped_exact_output(declined_expected, declined_actual);
+    CHECK(declined_actual != expected);
+
+    for (uint32_t i = 0; i < candidate.biases.size(); ++i) {
+        const auto changed = cached_fusion_test_data(candidate.biases[i], 900 + i);
+        ggml_backend_tensor_set(reference.biases[i], changed.data(), 0, changed.size());
+    }
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, n_slots);
+    (void) candidate_certify_graph(*candidate_context, candidate.graph);
+    ggml_cuda_moe_candidate_group_key refreshed_key;
+    CHECK(candidate_context->find_down_group_key(candidate.down, &refreshed_key));
+    CHECK(refreshed_key.generation != candidate_key.generation);
+    const auto refreshed_expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+    const auto refreshed_actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+    check_active_grouped_exact_output(refreshed_expected, refreshed_actual);
+    CHECK(refreshed_actual != expected);
+    size_t refreshed_extent = 0;
+    uint64_t refreshed_generation = 0;
+    CHECK(ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+        *candidate_context, candidate_key, candidate.biases[0]) == nullptr);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+        *candidate_context, refreshed_key, candidate.biases[0], &refreshed_extent, &refreshed_generation) != nullptr);
+    CHECK(refreshed_extent == ggml_nbytes(candidate.biases[0]) && refreshed_generation != first_resource_generation);
+
+    {
+        ggml_backend_ptr decode_reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr decode_candidate_backend(ggml_backend_cuda_init(0));
+        CHECK(decode_reference_backend != nullptr && decode_candidate_backend != nullptr);
+        auto decode_reference = make_graph(decode_reference_backend.get(), 1, 8, 2);
+        auto decode_candidate = make_graph(decode_candidate_backend.get(), 1, 8, 2);
+        initialize_active_grouped_dispatch_graphs({&decode_reference, &decode_candidate});
+        const auto decode_disabled = candidate_snapshot(3, nullptr, 0);
+        CHECK(ggml_backend_cuda_moe_candidate_replace_v1(decode_reference_backend.get(), &decode_disabled) ==
+            GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        register_active_grouped_dispatch(
+            decode_candidate_backend.get(), decode_candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3);
+        auto * decode_context = ggml_cuda_moe_grouped_context_for_test(decode_candidate_backend.get());
+        CHECK(decode_context != nullptr);
+        (void) candidate_certify_graph(*decode_context, decode_candidate.graph);
+        const auto decode_expected = run_active_grouped_dispatch(decode_reference_backend.get(), decode_reference, 0, false);
+        const auto decode_actual = run_active_grouped_dispatch(
+            decode_candidate_backend.get(), decode_candidate, decode_candidate.n_used, true);
+        check_active_grouped_exact_output(decode_expected, decode_actual);
+        ggml_cuda_moe_candidate_group_key decode_key;
+        CHECK(decode_context->find_down_group_key(decode_candidate.down, &decode_key));
+        for (ggml_tensor * bias : decode_candidate.biases) {
+            const float * resident = ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+                *decode_context, decode_key, bias);
+            const float * shadow = ggml_cuda_moe_grouped_context_test_access::device_auxiliary_data(
+                *decode_context, decode_key, bias);
+            CHECK(resident == nullptr && shadow != nullptr);
+        }
+    }
+
+    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+    candidate_context->shutdown();
+    ggml_backend_synchronize(candidate_backend.get());
+    CHECK(ggml_cuda_moe_grouped_context_test_access::device_prefill_auxiliary_data(
+        *candidate_context, refreshed_key, candidate.biases[0]) == nullptr);
+    check_active_grouped_exact_output(
+        expected, run_active_grouped_dispatch(parallel_backend.get(), parallel, 0, false));
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: bounded prefill resident F32 biases exact OK\n");
+}
+
 static void test_active_grouped_dispatch() {
+    test_prefill_resident_biases();
     test_active_grouped_materialization_eligibility();
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12, false, true);
@@ -10543,6 +10867,11 @@ int main(int argc, char ** argv) {
     const bool grouped_nvfp4_only = argc == 2 && strcmp(argv[1], "--grouped-nvfp4-only") == 0;
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
+    const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
+    if (prefill_resident_only) {
+        test_prefill_resident_biases();
+        return 0;
+    }
     if (gemma_q4_parity_only) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));

@@ -3439,9 +3439,25 @@ static bool ggml_cuda_compute_forward(
         case GGML_OP_ADD1: // TODO: more efficient implementation
             ggml_cuda_op_add(ctx, dst);
             break;
-        case GGML_OP_ADD_ID:
-            ggml_cuda_op_add_id(ctx, dst);
+        case GGML_OP_ADD_ID: {
+            const float * prefill_source = nullptr;
+            if (execution != nullptr && ctx.moe_grouped_context != nullptr &&
+                    ctx.moe_grouped_context->prefill_add_id_source(
+                        *execution, dst, ctx.stream(), &prefill_source)) {
+                ggml_tensor source_view = *dst->src[1];
+                ggml_tensor dst_view = *dst;
+                source_view.data = const_cast<float *>(prefill_source);
+                dst_view.src[1] = &source_view;
+                ggml_cuda_op_add_id(ctx, &dst_view);
+                if (!ctx.moe_grouped_context->finish_prefill_add_id(
+                        *execution, dst, ctx.stream(), prefill_source)) {
+                    return false;
+                }
+            } else {
+                ggml_cuda_op_add_id(ctx, dst);
+            }
             break;
+        }
         case GGML_OP_SUB:
             ggml_cuda_op_sub(ctx, dst);
             break;
@@ -6215,7 +6231,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         force_moe_direct();
     }
 #endif
-    if (!retain_grouped_capture && graph_has_cached_mmid &&
+    const bool prefill_resident_witnesses = moe_execution.has_prefill_resident_witnesses();
+    if (!retain_grouped_capture && (graph_has_cached_mmid || prefill_resident_witnesses) &&
             moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
         force_moe_direct();
     }

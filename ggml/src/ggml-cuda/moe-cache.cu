@@ -62,6 +62,7 @@ namespace {
 
 static constexpr uint64_t MOE_CACHE_MM_SAMPLE_RATE = 64;
 static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
+static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
 static constexpr uint32_t MOE_GROUPED_MAX_DECODE_ROUTES = 32;
 static constexpr uint32_t MOE_GROUPED_MAX_INDEPENDENT_ROWS = 4;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
@@ -793,6 +794,8 @@ struct moe_candidate_group_record {
     uint32_t semantic_group_index = UINT32_MAX;
     uint32_t flags = 0;
     const ggml_tensor * down = nullptr;
+    uint64_t prefill_resident_auxiliary_bytes = 0;
+    bool prefill_resident_auxiliary = false;
     std::vector<moe_candidate_bank_record> banks;
 };
 
@@ -822,6 +825,7 @@ struct moe_candidate_table {
     uint64_t logical_signature = 0;
     uint64_t slot_bound_bytes = 0;
     uint64_t permanent_candidate_bytes = 0;
+    bool prefill_resident_auxiliary = false;
     std::vector<moe_candidate_group_record> groups;
     std::unordered_map<const ggml_tensor *, uint32_t> down_map;
     std::unordered_map<const ggml_tensor *, moe_candidate_reverse_entry> reverse_map;
@@ -1298,6 +1302,54 @@ static const moe_candidate_bank_record * moe_candidate_slot_auxiliary_bank(
         }
     }
     return nullptr;
+}
+
+static void moe_candidate_set_prefill_resident_policy(moe_candidate_table & table, size_t byte_budget) {
+    uint64_t total = 0;
+    bool valid = true;
+    for (auto & group : table.groups) {
+        group.prefill_resident_auxiliary = false;
+        group.prefill_resident_auxiliary_bytes = 0;
+        uint32_t n_banks = 0;
+        uint32_t n_scales = 0;
+        uint32_t n_biases = 0;
+        if (!moe_candidate_structural_group(group, &n_banks, &n_scales, &n_biases) || n_biases == 0 || n_scales != 0) {
+            continue;
+        }
+        uint64_t group_bytes = 0;
+        bool eligible = true;
+        for (uint32_t auxiliary = 0; auxiliary < n_biases; ++auxiliary) {
+            const auto * bank = moe_candidate_slot_auxiliary_bank(group, auxiliary);
+            if (bank == nullptr || !moe_candidate_is_bias(bank->info.role) || bank->info.type != GGML_TYPE_F32 ||
+                    !ggml_backend_buft_is_cuda_moe_cached(bank->buft)) {
+                eligible = false;
+                break;
+            }
+            if (!moe_candidate_add(group_bytes, bank->info.byte_extent, group_bytes)) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            break;
+        }
+        if (!eligible) {
+            continue;
+        }
+        if (group_bytes == 0 || !moe_candidate_add(total, group_bytes, total)) {
+            valid = false;
+            break;
+        }
+        group.prefill_resident_auxiliary_bytes = group_bytes;
+    }
+    valid = valid && total != 0 && total <= byte_budget;
+    table.prefill_resident_auxiliary = valid;
+    for (auto & group : table.groups) {
+        group.prefill_resident_auxiliary = valid && group.prefill_resident_auxiliary_bytes != 0;
+        if (!valid) {
+            group.prefill_resident_auxiliary_bytes = 0;
+        }
+    }
 }
 
 static uint32_t moe_candidate_resource_bank_count(const moe_candidate_group_record & group) {
@@ -1941,6 +1993,36 @@ static bool moe_candidate_original_direct_bias_witness_matches(
     uint32_t current_bank_index = 0;
     return moe_candidate_original_direct_bias_consumer(
         consumer, producer, ids, reader_role, group, &current_bank_index) && current_bank_index == bank_index;
+}
+
+static bool moe_candidate_prefill_add_id_witness(
+        const ggml_tensor * consumer,
+        const moe_candidate_group_record & group,
+        uint32_t * bank_index,
+        uint32_t * reader_role) {
+    if (consumer == nullptr || consumer->op != GGML_OP_ADD_ID || consumer->src[0] == nullptr ||
+            consumer->src[1] == nullptr || consumer->src[2] == nullptr ||
+            consumer->src[0]->op != GGML_OP_MUL_MAT_ID || consumer->src[0]->src[0] == nullptr ||
+            consumer->src[0]->src[2] != consumer->src[2]) {
+        return false;
+    }
+    for (const auto & bank : group.banks) {
+        if (!moe_candidate_is_bias(bank.info.role) || bank.info.tensor != consumer->src[1]) {
+            continue;
+        }
+        const uint32_t role = moe_candidate_base_role(bank.info.role);
+        const auto * base = moe_candidate_find_role(group, role);
+        if (base == nullptr || !moe_candidate_record_matches(*base, consumer->src[0]->src[0]) ||
+                !moe_candidate_original_direct_bias_witness_matches(
+                    consumer, consumer->src[0], consumer->src[2], role, group,
+                    static_cast<uint32_t>(&bank - group.banks.data()))) {
+            return false;
+        }
+        *bank_index = static_cast<uint32_t>(&bank - group.banks.data());
+        *reader_role = role;
+        return true;
+    }
+    return false;
 }
 
 static bool moe_candidate_validate_route(
@@ -3044,6 +3126,7 @@ ggml_cuda_moe_graph_plan::ggml_cuda_moe_graph_plan() :
 void ggml_cuda_moe_graph_plan::reset() {
     groups_.clear();
     mmid_inventory_.clear();
+    prefill_add_id_witnesses_.clear();
     for (auto & entry : nodes_) {
         entry.node = nullptr;
     }
@@ -3302,6 +3385,10 @@ bool ggml_cuda_moe_graph_execution::requires_dispatch() const {
         (plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR && plan_->coverage_diagnostics_.cached_mmid != 0));
 }
 
+bool ggml_cuda_moe_graph_execution::has_prefill_resident_witnesses() const {
+    return plan_ != nullptr && !plan_->prefill_add_id_witnesses_.empty();
+}
+
 ggml_cuda_moe_graph_outcome ggml_cuda_moe_graph_execution::outcome() const {
     return plan_ != nullptr ? plan_->outcome_ : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
 }
@@ -3335,7 +3422,8 @@ ggml_cuda_moe_group_call_lease::ggml_cuda_moe_group_call_lease(ggml_cuda_moe_gro
         group_index_(other.group_index_),
         authority_(other.authority_),
         execution_domain_(other.execution_domain_),
-        row_semantics_(other.row_semantics_) {
+        row_semantics_(other.row_semantics_),
+        prefill_resident_certified_(other.prefill_resident_certified_) {
     other.owner_ = nullptr;
 }
 
@@ -3353,6 +3441,7 @@ ggml_cuda_moe_group_call_lease & ggml_cuda_moe_group_call_lease::operator=(ggml_
     authority_ = other.authority_;
     execution_domain_ = other.execution_domain_;
     row_semantics_ = other.row_semantics_;
+    prefill_resident_certified_ = other.prefill_resident_certified_;
     other.owner_ = nullptr;
     return *this;
 }
@@ -3509,6 +3598,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
         uint32_t n_slots = 0;
         uint32_t n_slot_auxiliaries = 0;
+        uint64_t prefill_resident_auxiliary_bytes = 0;
+        bool prefill_resident_auxiliary = false;
         std::array<ggml_cuda_moe_grouped_bank_descriptor, 3> slot_auxiliaries;
         std::vector<ggml_cuda_moe_grouped_bank_descriptor> banks;
     };
@@ -3530,6 +3621,11 @@ struct ggml_cuda_moe_grouped_context::impl {
                 }
             }
             for (float * data : auxiliary_data) {
+                if (data != nullptr) {
+                    (void) cudaFree(data);
+                }
+            }
+            for (float * data : prefill_auxiliary_data) {
                 if (data != nullptr) {
                     (void) cudaFree(data);
                 }
@@ -3564,6 +3660,12 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::vector<void *> bank_data;
         std::array<float *, 3> auxiliary_data = {};
         std::array<size_t, 3> auxiliary_n_values = {};
+        std::array<float *, 3> prefill_auxiliary_data = {};
+        const ggml_tensor * prefill_auxiliary_pending_node = nullptr;
+        const float * prefill_auxiliary_pending_source = nullptr;
+        cudaStream_t prefill_auxiliary_pending_stream = nullptr;
+        uint64_t prefill_auxiliary_cross_stream_waits = 0;
+        uint64_t prefill_auxiliary_pending_declines = 0;
         int32_t * slot_for_expert = nullptr;
         int32_t * expert_for_slot = nullptr;
         uint64_t * last_used = nullptr;
@@ -3599,6 +3701,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t n_groups = 0;
         uint32_t n_banks = 0;
         uint32_t n_slot_auxiliaries = 0;
+        uint64_t prefill_resident_auxiliary_bytes = 0;
+        bool prefill_resident_auxiliary = false;
         std::array<moe_candidate_bank_record, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> banks;
         std::array<moe_candidate_bank_record, 3> slot_auxiliaries;
     };
@@ -3646,6 +3750,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     uint32_t active_legacy_operations = 0;
     uint64_t next_legacy_authority_epoch = 0;
     size_t legacy_l2_budget_bytes = 0;
+    size_t prefill_resident_auxiliary_budget = MOE_PREFILL_RESIDENT_AUX_BUDGET;
     std::atomic<bool> legacy_debug_mm{false};
     bool legacy_policy_initialized = false;
     bool fail_borrowed_cache_init_after_probe_for_test = false;
@@ -4065,6 +4170,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         const auto & group = table.groups[key.group_index];
         input.down = group.down;
         input.layout = group.layout;
+        input.prefill_resident_auxiliary = group.prefill_resident_auxiliary;
+        input.prefill_resident_auxiliary_bytes = group.prefill_resident_auxiliary_bytes;
         uint32_t n_scales = 0;
         uint32_t n_biases = 0;
         if (!moe_candidate_structural_group(group, &input.n_banks, &n_scales, &n_biases) ||
@@ -4124,6 +4231,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             snapshot.layout = input.layout;
             snapshot.n_slots = input.n_slots;
             snapshot.n_slot_auxiliaries = input.n_slot_auxiliaries;
+            snapshot.prefill_resident_auxiliary = input.prefill_resident_auxiliary;
+            snapshot.prefill_resident_auxiliary_bytes = input.prefill_resident_auxiliary_bytes;
             for (uint32_t i = 0; i < input.n_slot_auxiliaries; ++i) {
                 snapshot.slot_auxiliaries[i] = make_descriptor(input.slot_auxiliaries[i]);
             }
@@ -4187,6 +4296,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint32_t n_scales = 0;
         uint32_t n_biases = 0;
         if (snapshot.down != group.down || snapshot.layout != group.layout ||
+                snapshot.prefill_resident_auxiliary != group.prefill_resident_auxiliary ||
+                snapshot.prefill_resident_auxiliary_bytes != group.prefill_resident_auxiliary_bytes ||
                 !moe_candidate_structural_group(group, &n_slot_banks, &n_scales, &n_biases) ||
                 snapshot.banks.size() != n_slot_banks || snapshot.banks.size() != moe_candidate_resource_bank_count(group) ||
                 snapshot.n_slot_auxiliaries != n_scales + n_biases) {
@@ -4214,7 +4325,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             const void * source_data,
             bool allow_device,
             bool require_identity,
-            const void ** alias_data = nullptr) {
+            const void ** alias_data = nullptr,
+            bool * host_alias = nullptr) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         GGML_UNUSED(buffer_base);
         GGML_UNUSED(data_offset);
@@ -4222,6 +4334,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         GGML_UNUSED(allow_device);
         GGML_UNUSED(require_identity);
         GGML_UNUSED(alias_data);
+        GGML_UNUSED(host_alias);
         GGML_UNUSED(device);
         return false;
 #else
@@ -4230,6 +4343,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (alias_data != nullptr) {
             *alias_data = nullptr;
         }
+        if (host_alias != nullptr) {
+            *host_alias = false;
+        }
         if (buffer_base == nullptr || source_data == nullptr || device < 0 ||
                 !moe_grouped_cuda_success(cudaPointerGetAttributes(&attributes, buffer_base))) {
             return false;
@@ -4237,6 +4353,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (attributes.type == cudaMemoryTypeHost) {
             if (!moe_grouped_cuda_success(cudaHostGetDevicePointer(&alias_base, const_cast<void *>(buffer_base), 0))) {
                 return false;
+            }
+            if (host_alias != nullptr) {
+                *host_alias = true;
             }
         } else if (allow_device && attributes.type == cudaMemoryTypeDevice && attributes.device == device) {
             alias_base = const_cast<void *>(buffer_base);
@@ -4391,10 +4510,12 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     std::unique_ptr<grouped_device_resource> make_device_resource(
             const grouped_snapshot & snapshot,
-            cudaStream_t compute_stream) const {
+            cudaStream_t compute_stream,
+            bool prefill_resident_certified = false) const {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         GGML_UNUSED(snapshot);
         GGML_UNUSED(compute_stream);
+        GGML_UNUSED(prefill_resident_certified);
         return nullptr;
 #else
         uint32_t n_experts = 0;
@@ -4406,11 +4527,13 @@ struct ggml_cuda_moe_grouped_context::impl {
 
         moe_grouped_device_scope device_scope(device);
         std::array<moe_grouped_device_auxiliary, 3> device_auxiliaries = {};
+        std::array<bool, 3> auxiliary_host_alias = {};
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             const auto & auxiliary = snapshot.slot_auxiliaries[i];
             const void * alias_data = nullptr;
             if (!descriptor_matches(auxiliary) ||
-                    !device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data, true, true, &alias_data) ||
+                    !device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
+                        true, true, &alias_data, &auxiliary_host_alias[i]) ||
                     auxiliary.type != GGML_TYPE_F32 || !ggml_is_contiguous(auxiliary.tensor)) {
                 return nullptr;
             }
@@ -4491,6 +4614,27 @@ struct ggml_cuda_moe_grouped_context::impl {
                 !moe_grouped_cuda_success(cudaEventCreateWithFlags(&result->completion, cudaEventDisableTiming))) {
             return nullptr;
         }
+        bool prefill_resident = prefill_resident_certified && snapshot.prefill_resident_auxiliary &&
+            snapshot.prefill_resident_auxiliary_bytes != 0;
+        uint64_t resident_bytes = 0;
+        for (uint32_t i = 0; prefill_resident && i < snapshot.n_slot_auxiliaries; ++i) {
+            const auto & auxiliary = snapshot.slot_auxiliaries[i];
+            prefill_resident = auxiliary_host_alias[i] && moe_candidate_is_bias(auxiliary.role) &&
+                auxiliary.byte_extent != 0 && auxiliary.byte_extent <= SIZE_MAX &&
+                moe_candidate_add(resident_bytes, auxiliary.byte_extent, resident_bytes) &&
+                moe_grouped_cuda_success(cudaMalloc(
+                    &result->prefill_auxiliary_data[i], static_cast<size_t>(auxiliary.byte_extent)));
+        }
+        prefill_resident = prefill_resident && snapshot.n_slot_auxiliaries != 0 &&
+            resident_bytes == snapshot.prefill_resident_auxiliary_bytes;
+        if (!prefill_resident) {
+            for (uint32_t i = 0; i < result->prefill_auxiliary_data.size(); ++i) {
+                if (result->prefill_auxiliary_data[i] != nullptr) {
+                    (void) cudaFree(result->prefill_auxiliary_data[i]);
+                    result->prefill_auxiliary_data[i] = nullptr;
+                }
+            }
+        }
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             if (!moe_grouped_cuda_success(cudaMemsetAsync(
                     result->auxiliary_data[i], 0,
@@ -4514,8 +4658,26 @@ struct ggml_cuda_moe_grouped_context::impl {
                     !moe_grouped_cuda_success(cudaMemcpyAsync(
                         result->device_auxiliaries, device_auxiliaries.data(),
                         snapshot.n_slot_auxiliaries * sizeof(moe_grouped_device_auxiliary),
-                        cudaMemcpyHostToDevice, compute_stream))) ||
-                !moe_grouped_cuda_success(cudaEventRecord(result->completion, compute_stream))) {
+                        cudaMemcpyHostToDevice, compute_stream)))) {
+            (void) cudaStreamSynchronize(compute_stream);
+            return nullptr;
+        }
+        bool resident_copied = prefill_resident;
+        for (uint32_t i = 0; resident_copied && i < snapshot.n_slot_auxiliaries; ++i) {
+            resident_copied = moe_grouped_cuda_success(cudaMemcpyAsync(
+                result->prefill_auxiliary_data[i], snapshot.slot_auxiliaries[i].source_data,
+                static_cast<size_t>(snapshot.slot_auxiliaries[i].byte_extent), cudaMemcpyHostToDevice, compute_stream));
+        }
+        if (prefill_resident && !resident_copied) {
+            (void) cudaStreamSynchronize(compute_stream);
+            for (uint32_t i = 0; i < result->prefill_auxiliary_data.size(); ++i) {
+                if (result->prefill_auxiliary_data[i] != nullptr) {
+                    (void) cudaFree(result->prefill_auxiliary_data[i]);
+                    result->prefill_auxiliary_data[i] = nullptr;
+                }
+            }
+        }
+        if (!moe_grouped_cuda_success(cudaEventRecord(result->completion, compute_stream))) {
             (void) cudaStreamSynchronize(compute_stream);
             return nullptr;
         }
@@ -4753,6 +4915,7 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     int32_t publish(moe_candidate_table && replacement) {
         std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
+        moe_candidate_set_prefill_resident_policy(replacement, prefill_resident_auxiliary_budget);
         legacy_record_map retired_legacy;
         resource_slots retired;
         uint32_t old_registered_groups = 0;
@@ -5061,6 +5224,72 @@ const float * ggml_cuda_moe_grouped_context::device_auxiliary_data_for_test(
         }
     }
     return nullptr;
+}
+
+const float * ggml_cuda_moe_grouped_context::device_prefill_auxiliary_data_for_test(
+        const ggml_cuda_moe_candidate_group_key & key,
+        const ggml_tensor * tensor,
+        size_t * byte_extent,
+        uint64_t * resource_generation) const {
+    if (byte_extent != nullptr) {
+        *byte_extent = 0;
+    }
+    if (resource_generation != nullptr) {
+        *resource_generation = 0;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (tensor == nullptr || key.generation != impl_->state.generation || key.group_index >= impl_->resources.size()) {
+        return nullptr;
+    }
+    const auto * resource = impl_->resources[key.group_index].get();
+    if (resource == nullptr || resource->device == nullptr ||
+            resource->snapshot.acquisition.candidate.generation != key.generation) {
+        return nullptr;
+    }
+    for (uint32_t auxiliary = 0; auxiliary < resource->snapshot.n_slot_auxiliaries; ++auxiliary) {
+        if (resource->snapshot.slot_auxiliaries[auxiliary].tensor != tensor) {
+            continue;
+        }
+        const float * data = resource->device->prefill_auxiliary_data[auxiliary];
+        if (data == nullptr) {
+            return nullptr;
+        }
+        if (byte_extent != nullptr) {
+            *byte_extent = static_cast<size_t>(resource->snapshot.slot_auxiliaries[auxiliary].byte_extent);
+        }
+        if (resource_generation != nullptr) {
+            *resource_generation = resource->snapshot.acquisition.resource_generation;
+        }
+        return data;
+    }
+    return nullptr;
+}
+
+bool ggml_cuda_moe_grouped_context::prefill_auxiliary_ordering_for_test(
+        const ggml_cuda_moe_candidate_group_key & key,
+        uint64_t * cross_stream_waits,
+        uint64_t * pending_declines) const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (cross_stream_waits == nullptr || pending_declines == nullptr || key.generation != impl_->state.generation ||
+            key.group_index >= impl_->resources.size() || impl_->resources[key.group_index] == nullptr ||
+            impl_->resources[key.group_index]->device == nullptr) {
+        return false;
+    }
+    const auto & device = *impl_->resources[key.group_index]->device;
+    *cross_stream_waits = device.prefill_auxiliary_cross_stream_waits;
+    *pending_declines = device.prefill_auxiliary_pending_declines;
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::set_prefill_resident_budget_for_test(size_t byte_budget) {
+    std::lock_guard<std::mutex> lifecycle_lock(impl_->resource_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->draining || impl_->replacement_pending || !impl_->resources.empty() ||
+            (impl_->state.accepted && !impl_->table.groups.empty())) {
+        return false;
+    }
+    impl_->prefill_resident_auxiliary_budget = byte_budget;
+    return true;
 }
 
 bool ggml_cuda_moe_grouped_context::device_resource_complete_for_test(
@@ -5534,7 +5763,9 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                 }
             }
             if (needs_device) {
-                auto device = impl_->make_device_resource(backing->snapshot, compute_stream);
+                auto device = impl_->make_device_resource(
+                    backing->snapshot, compute_stream,
+                    authority != nullptr && authority->prefill_resident_certified_);
                 std::lock_guard<std::mutex> lock(impl_->mutex);
                 if (record->building_cache && authority_matches(record->acquisition) &&
                         key.group_index < impl_->resources.size() && impl_->resources[key.group_index] == backing) {
@@ -6253,6 +6484,68 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 dispatch.first_reader = record.authority_node;
             }
             plan->n_groups_ = plan->groups_.size();
+            if (certified_inventory && impl_->table.prefill_resident_auxiliary) {
+                try {
+                    bool resident_bindings = true;
+                    for (uint32_t inventory_index = 0; resident_bindings && inventory_index < n_mmid_indices; ++inventory_index) {
+                        const ggml_tensor * node = ggml_graph_node(
+                            const_cast<ggml_cgraph *>(cgraph), mmid_indices[inventory_index]);
+                        const auto * reverse = moe_candidate_active_reverse(impl_->table, node->src[0]);
+                        if (reverse == nullptr || reverse->group_index >= impl_->table.groups.size() ||
+                                !impl_->table.groups[reverse->group_index].prefill_resident_auxiliary) {
+                            continue;
+                        }
+                        uint32_t record_index = 0;
+                        while (record_index < plan->n_groups_ &&
+                                plan->groups_[record_index].candidate.group_index != reverse->group_index) {
+                            ++record_index;
+                        }
+                        const auto & bank = impl_->table.groups[reverse->group_index].banks[reverse->bank_index];
+                        resident_bindings = record_index < plan->n_groups_ &&
+                            plan->insert(node, record_index, bank.info.role, reverse->bank_index, bank.slot_index);
+                    }
+                    if (!resident_bindings) {
+                        throw std::bad_alloc();
+                    }
+                    plan->prefill_add_id_witnesses_.reserve(plan->n_groups_ * 3);
+                    for (uint32_t node_index = 0; node_index < static_cast<uint32_t>(plan->graph_node_count_); ++node_index) {
+                        const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
+                        if (node == nullptr || node->src[0] == nullptr) {
+                            continue;
+                        }
+                        uint32_t producer_index = 0;
+                        while (producer_index < node_index &&
+                                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), producer_index) != node->src[0]) {
+                            ++producer_index;
+                        }
+                        if (producer_index == node_index) {
+                            continue;
+                        }
+                        for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
+                            const auto & group = impl_->table.groups[plan->groups_[record_index].candidate.group_index];
+                            uint32_t bank_index = UINT32_MAX;
+                            uint32_t reader_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+                            if (!group.prefill_resident_auxiliary ||
+                                    !moe_candidate_prefill_add_id_witness(node, group, &bank_index, &reader_role)) {
+                                continue;
+                            }
+                            ggml_cuda_moe_graph_plan::prefill_add_id_witness witness = {};
+                            witness.consumer.node = node;
+                            memcpy(witness.consumer.src, node->src, sizeof(witness.consumer.src));
+                            witness.consumer.node_index = node_index;
+                            witness.consumer.src_index = 1;
+                            witness.consumer.op = node->op;
+                            witness.group_record = record_index;
+                            witness.bank_index = bank_index;
+                            witness.reader_role = reader_role;
+                            plan->prefill_add_id_witnesses_.push_back(witness);
+                            break;
+                        }
+                    }
+                } catch (const std::bad_alloc &) {
+                    plan->prefill_add_id_witnesses_.clear();
+                }
+            }
         }
         execution->plan_ = plan;
         execution->owner_ = const_cast<ggml_cuda_moe_grouped_context *>(this);
@@ -7103,6 +7396,36 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
     if (property_hint == GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN && !graph_mmid_inventory_matches(cgraph, plan)) {
         return false;
     }
+    for (const auto & witness : plan.prefill_add_id_witnesses_) {
+        if (witness.consumer.node_index >= static_cast<uint32_t>(n_nodes) ||
+                witness.group_record >= plan.groups_.size()) {
+            return false;
+        }
+        const auto & record = plan.groups_[witness.group_record];
+        if (record.candidate.group_index >= impl_->table.groups.size()) {
+            return false;
+        }
+        const ggml_tensor * node = ggml_graph_node(
+            const_cast<ggml_cgraph *>(cgraph), witness.consumer.node_index);
+        if (node == nullptr) {
+            return false;
+        }
+        uint32_t producer_index = 0;
+        while (producer_index < witness.consumer.node_index &&
+                ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), producer_index) != node->src[0]) {
+            ++producer_index;
+        }
+        uint32_t bank_index = UINT32_MAX;
+        uint32_t reader_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+        if (node != witness.consumer.node || node->op != witness.consumer.op ||
+                producer_index == witness.consumer.node_index ||
+                memcmp(node->src, witness.consumer.src, sizeof(witness.consumer.src)) != 0 ||
+                !moe_candidate_prefill_add_id_witness(
+                    node, impl_->table.groups[record.candidate.group_index],
+                    &bank_index, &reader_role) || bank_index != witness.bank_index || reader_role != witness.reader_role) {
+            return false;
+        }
+    }
     if (!impl_->state.accepted || impl_->state.n_slots == 0 || impl_->table.groups.empty()) {
         if (plan.n_groups_ != 0) {
             return false;
@@ -7411,6 +7734,26 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         if (auxiliary_values_per_miss != device.auxiliary_values_per_miss) {
             return false;
         }
+        bool any_prefill_resident = false;
+        bool all_prefill_resident = resource->snapshot.prefill_resident_auxiliary &&
+            resource->snapshot.n_slot_auxiliaries != 0;
+        uint64_t prefill_resident_bytes = 0;
+        for (uint32_t auxiliary = 0; auxiliary < device.prefill_auxiliary_data.size(); ++auxiliary) {
+            const bool present = device.prefill_auxiliary_data[auxiliary] != nullptr;
+            any_prefill_resident = any_prefill_resident || present;
+            if (auxiliary < resource->snapshot.n_slot_auxiliaries) {
+                const auto & descriptor = resource->snapshot.slot_auxiliaries[auxiliary];
+                const bool valid = present && moe_candidate_is_bias(descriptor.role) &&
+                    moe_candidate_add(prefill_resident_bytes, descriptor.byte_extent, prefill_resident_bytes);
+                all_prefill_resident = all_prefill_resident && valid;
+            } else if (present) {
+                return false;
+            }
+        }
+        if (any_prefill_resident != all_prefill_resident ||
+                (any_prefill_resident && prefill_resident_bytes != resource->snapshot.prefill_resident_auxiliary_bytes)) {
+            return false;
+        }
         moe_grouped_resource_fingerprint_add(result, group_index);
         moe_grouped_resource_fingerprint_add(result, group.key.execution_semantic_key);
         moe_grouped_resource_fingerprint_add(result, top_k);
@@ -7435,6 +7778,9 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
             moe_grouped_resource_fingerprint_add(result, resource->snapshot.slot_auxiliaries[auxiliary].tensor);
             moe_grouped_resource_fingerprint_add(result, resource->snapshot.slot_auxiliaries[auxiliary].source_data);
             moe_grouped_resource_fingerprint_add(result, resource->snapshot.slot_auxiliaries[auxiliary].role);
+            moe_grouped_resource_fingerprint_add(result, device.prefill_auxiliary_data[auxiliary]);
+            moe_grouped_resource_fingerprint_add(result, resource->snapshot.slot_auxiliaries[auxiliary].byte_extent);
+            moe_grouped_resource_fingerprint_add(result, resource->snapshot.acquisition.resource_generation);
         }
         for (uint32_t bank_index = 0; bank_index < resource->snapshot.banks.size(); ++bank_index) {
             const auto & bank = resource->snapshot.banks[bank_index];
@@ -7780,6 +8126,12 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 lease.authority_ = current.authority;
                 lease.execution_domain_ = execution->plan_->execution_certificate_.domain;
                 lease.row_semantics_ = execution->plan_->execution_certificate_.row_semantics;
+                lease.prefill_resident_certified_ = std::any_of(
+                    execution->plan_->prefill_add_id_witnesses_.begin(),
+                    execution->plan_->prefill_add_id_witnesses_.end(),
+                    [record_index](const ggml_cuda_moe_graph_plan::prefill_add_id_witness & witness) {
+                        return witness.group_record == record_index;
+                    });
                 auto & dispatch = execution->groups_[record_index];
                 dispatch.transaction = {};
                 dispatch.remapped_ids = nullptr;
@@ -7950,6 +8302,12 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             lease.authority_ = current.authority;
             lease.execution_domain_ = execution->plan_->execution_certificate_.domain;
             lease.row_semantics_ = execution->plan_->execution_certificate_.row_semantics;
+            lease.prefill_resident_certified_ = std::any_of(
+                execution->plan_->prefill_add_id_witnesses_.begin(),
+                execution->plan_->prefill_add_id_witnesses_.end(),
+                [record_index](const ggml_cuda_moe_graph_plan::prefill_add_id_witness & witness) {
+                    return witness.group_record == record_index;
+                });
             auto & dispatch = execution->groups_[record_index];
             dispatch.transaction = {};
             dispatch.remapped_ids = nullptr;
@@ -7969,6 +8327,150 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
     }
     impl_->resource_cv.notify_all();
     return true;
+}
+
+bool ggml_cuda_moe_grouped_context::prefill_add_id_source(
+        const ggml_cuda_moe_graph_execution & execution,
+        const ggml_tensor * node,
+        ggml_cuda_moe_stream_t stream,
+        const float ** source) const {
+    if (source != nullptr) {
+        *source = nullptr;
+    }
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(execution);
+    GGML_UNUSED(node);
+    GGML_UNUSED(stream);
+    return false;
+#else
+    if (source == nullptr || node == nullptr || stream == nullptr || execution.owner_ != this ||
+            execution.plan_ == nullptr || execution.plan_->owner_ != impl_.get() || !execution.dispatch_active_ ||
+            (execution.dispatch_mode_ != GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY &&
+                execution.dispatch_mode_ != GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT) ||
+            execution.plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY ||
+            !execution.plan_->has_certified_complete_mmid_inventory()) {
+        return false;
+    }
+
+    const ggml_cuda_moe_graph_plan::prefill_add_id_witness * matched = nullptr;
+    for (const auto & witness : execution.plan_->prefill_add_id_witnesses_) {
+        if (witness.consumer.node == node) {
+            matched = &witness;
+            break;
+        }
+    }
+    if (matched == nullptr || matched->group_record >= execution.n_groups_) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const auto & record = execution.plan_->groups_[matched->group_record];
+    const auto & dispatch = execution.groups_[matched->group_record];
+    const uint32_t group_index = record.candidate.group_index;
+    if (record.reason != ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL ||
+            record.candidate.generation != impl_->state.generation || group_index >= impl_->table.groups.size() ||
+            group_index >= impl_->resources.size() || dispatch.state != GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY ||
+            !dispatch.authority || dispatch.authority.owner_ != this ||
+            dispatch.authority.candidate_generation_ != impl_->state.generation ||
+            dispatch.authority.group_index_ != group_index ||
+            dispatch.authority.authority_ != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY) {
+        return false;
+    }
+    const auto & authority = impl_->group_authorities[group_index];
+    if (authority.authority != GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY || authority.active_calls == 0 ||
+            authority.epoch != dispatch.authority.authority_epoch_) {
+        return false;
+    }
+    const auto & group = impl_->table.groups[group_index];
+    uint32_t bank_index = UINT32_MAX;
+    uint32_t reader_role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    if (!group.prefill_resident_auxiliary ||
+            !moe_candidate_prefill_add_id_witness(node, group, &bank_index, &reader_role) ||
+            bank_index != matched->bank_index || reader_role != matched->reader_role) {
+        return false;
+    }
+    const auto * resource = impl_->resources[group_index].get();
+    if (resource == nullptr || resource->device == nullptr || !impl_->resource_matches_table(*resource) ||
+            resource->snapshot.acquisition.candidate.generation != impl_->state.generation) {
+        return false;
+    }
+    uint32_t auxiliary_index = 0;
+    while (auxiliary_index < resource->snapshot.n_slot_auxiliaries &&
+            resource->snapshot.slot_auxiliaries[auxiliary_index].tensor != node->src[1]) {
+        ++auxiliary_index;
+    }
+    if (auxiliary_index == resource->snapshot.n_slot_auxiliaries) {
+        return false;
+    }
+    const auto & descriptor = resource->snapshot.slot_auxiliaries[auxiliary_index];
+    auto & device_resource = *resource->device;
+    if (!impl_->descriptor_matches(descriptor) || descriptor.role != group.banks[bank_index].info.role ||
+            device_resource.prefill_auxiliary_data[auxiliary_index] == nullptr ||
+            device_resource.completion == nullptr || !device_resource.has_completion) {
+        return false;
+    }
+    if (device_resource.prefill_auxiliary_pending_node != nullptr) {
+        ++device_resource.prefill_auxiliary_pending_declines;
+        return false;
+    }
+    moe_grouped_device_scope device_scope(impl_->device);
+    if (device_resource.completion_stream != stream) {
+        if (!moe_grouped_cuda_success(cudaStreamWaitEvent(stream, device_resource.completion, 0))) {
+            return false;
+        }
+        ++device_resource.prefill_auxiliary_cross_stream_waits;
+    }
+    *source = device_resource.prefill_auxiliary_data[auxiliary_index];
+    device_resource.prefill_auxiliary_pending_node = node;
+    device_resource.prefill_auxiliary_pending_source = *source;
+    device_resource.prefill_auxiliary_pending_stream = stream;
+    return true;
+#endif
+}
+
+bool ggml_cuda_moe_grouped_context::finish_prefill_add_id(
+        const ggml_cuda_moe_graph_execution & execution,
+        const ggml_tensor * node,
+        ggml_cuda_moe_stream_t stream,
+        const float * source) const {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(execution);
+    GGML_UNUSED(node);
+    GGML_UNUSED(stream);
+    GGML_UNUSED(source);
+    return false;
+#else
+    if (execution.owner_ != this || execution.plan_ == nullptr || execution.plan_->owner_ != impl_.get() ||
+            node == nullptr || stream == nullptr || source == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (uint32_t record_index = 0; record_index < execution.n_groups_; ++record_index) {
+        const uint32_t group_index = execution.plan_->groups_[record_index].candidate.group_index;
+        if (group_index >= impl_->resources.size() || impl_->resources[group_index] == nullptr ||
+                impl_->resources[group_index]->device == nullptr) {
+            continue;
+        }
+        auto & device_resource = *impl_->resources[group_index]->device;
+        if (device_resource.prefill_auxiliary_pending_node != node ||
+                device_resource.prefill_auxiliary_pending_source != source ||
+                device_resource.prefill_auxiliary_pending_stream != stream) {
+            continue;
+        }
+        moe_grouped_device_scope device_scope(impl_->device);
+        bool completed = moe_grouped_cuda_success(cudaEventRecord(device_resource.completion, stream));
+        if (!completed) {
+            completed = moe_grouped_cuda_success(cudaStreamSynchronize(stream));
+        } else {
+            device_resource.completion_stream = stream;
+        }
+        device_resource.prefill_auxiliary_pending_node = nullptr;
+        device_resource.prefill_auxiliary_pending_source = nullptr;
+        device_resource.prefill_auxiliary_pending_stream = nullptr;
+        return completed;
+    }
+    return false;
+#endif
 }
 
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_graph_group(
