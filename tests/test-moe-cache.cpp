@@ -37,6 +37,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -1906,6 +1907,66 @@ static void test_graph_execution_certificate_policy() {
     graph_case callback_case = {parent_case.route, parent_case.gate_up, parent_case.down, &callback};
     CHECK(callback.uid == 0 && ggml_cuda_moe_execution_semantic_key(&callback) == 0);
     check_execution_legacy(callback_case, 0);
+
+    const int64_t parallel_ne[] = {256, 256, 8};
+    ggml_tensor * parallel_gate = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, parallel_ne);
+    ggml_tensor * parallel_up = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, parallel_ne);
+    ggml_tensor * parallel_down = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, parallel_ne);
+    ggml_set_name(parallel_gate, "test_parallel_gate_weight");
+    ggml_set_name(parallel_up, "test_parallel_up_weight");
+    ggml_set_name(parallel_down, "test_parallel_down_weight");
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> parallel_banks = {{
+        {parallel_gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
+        {parallel_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
+        {parallel_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+    }};
+    const ggml_backend_moe_candidate_group_v1 parallel_group = {
+        parallel_banks.data(), parallel_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0,
+    };
+    const auto make_parallel_graph = [&](int64_t n_rows) {
+        graph_case result;
+        result.route = candidate_top_k_route(fixture, 8, 8, n_rows);
+        result.gate_up = candidate_mmid(fixture, parallel_gate, result.route.ids);
+        ggml_tensor * up = candidate_mmid(fixture, parallel_up, result.route.ids);
+        result.down = candidate_mmid(fixture, parallel_down, result.route.ids);
+        result.graph = candidate_graph(fixture, {result.route.root, result.route.ids, result.gate_up, up, result.down});
+        candidate_stamp_execution(result.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
+        return result;
+    };
+
+    const auto parallel_snapshot = candidate_snapshot(132, &parallel_group, 1);
+    CHECK(registry.replace(&parallel_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto parallel = make_parallel_graph(16);
+    {
+        ggml_cuda_moe_graph_plan plan;
+        ggml_cuda_moe_graph_execution execution;
+        compile(parallel, 1260, plan, execution);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.find(parallel.down, nullptr));
+        for (uint32_t bank_index = 0; bank_index < parallel_banks.size(); ++bank_index) {
+            const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(plan, 0, bank_index);
+            CHECK(capability.consumer == GGML_CUDA_MMID_CONSUMER_MMQ && capability.use_mmq == 1 &&
+                capability.mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP);
+        }
+    }
+
+    const auto low_slot_snapshot = candidate_snapshot(48, &parallel_group, 1);
+    CHECK(registry.replace(&low_slot_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    check_execution_legacy(parallel, 1261);
+
+    CHECK(registry.replace(&parallel_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto over_slots = make_parallel_graph(17);
+    check_execution_legacy(over_slots, 1262);
+
+    const auto wide_snapshot = candidate_snapshot(300, &parallel_group, 1);
+    CHECK(registry.replace(&wide_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    auto wide = make_parallel_graph(33);
+    {
+        ggml_cuda_moe_graph_plan plan;
+        ggml_cuda_moe_graph_execution execution;
+        compile(wide, 1263, plan, execution);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.find(wide.down, nullptr));
+    }
 }
 
 static void test_candidate_generic_physical_truth() {
@@ -4786,7 +4847,7 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         bool original_direct_biases = false,
         uint32_t n_ff = 0,
         bool mapped_host_biases = false) {
-    CHECK(n_rows >= 1 && n_rows <= 4 && n_used >= 1 && n_used <= n_experts);
+    CHECK(n_rows >= 1 && n_used >= 1 && n_used <= n_experts);
     const uint32_t ff_dim = n_ff != 0 ? n_ff : n_dim;
     CHECK(!concurrent_stream_fixture ||
         (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_rows == 1 && n_used == 1));
@@ -5057,7 +5118,10 @@ static int32_t active_grouped_route(
         return active_grouped_route_variants[route_variant][row][route];
     }
     CHECK(graph.n_experts == 128 && graph.n_used == 8);
-    return active_grouped_practical_route_variants[route_variant][row][route];
+    if (row < 4) {
+        return active_grouped_practical_route_variants[route_variant][row][route];
+    }
+    return (31 * route_variant + 7 * row + 13 * route) % graph.n_experts;
 }
 
 static void set_active_grouped_contract_routes(active_grouped_dispatch_graph & graph) {
@@ -5090,7 +5154,7 @@ static std::vector<float> active_grouped_logits(
         uint32_t route_variant = 0) {
     CHECK(route_variant < 3);
     CHECK(graph.logits != nullptr && graph.logits->ne[0] == graph.n_experts &&
-        graph.logits->ne[1] == graph.n_rows && graph.n_rows >= 1 && graph.n_rows <= 4);
+        graph.logits->ne[1] == graph.n_rows && graph.n_rows >= 1);
     std::vector<float> result(graph.logits->ne[0] * graph.logits->ne[1]);
     for (uint32_t row = 0; row < graph.logits->ne[1]; ++row) {
         for (uint32_t expert = 0; expert < graph.logits->ne[0]; ++expert) {
@@ -5892,18 +5956,21 @@ static void test_active_grouped_multirow_graph_modes_case(
         uint32_t n_used = 2,
         uint32_t n_slots = 12,
         bool test_large_transition = false,
-        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
-    CHECK((n_rows == 2 || n_rows == 3 || n_rows == 4) && n_used * n_rows <= 32 && n_used * n_rows <= n_slots);
+        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP,
+        ggml_type type = GGML_TYPE_Q4_0,
+        ggml_cuda_mmid_consumer expected_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ,
+        ggml_cuda_mmid_mapping expected_mapping = GGML_CUDA_MMID_MAPPING_DIRECT) {
+    CHECK(n_rows >= 2 && n_slots > 0 && n_used <= n_slots / n_rows);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
     ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
     CHECK(reference_backend != nullptr && candidate_backend != nullptr);
     auto reference = build_active_grouped_dispatch_graph(
-        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type,
         layout, false, n_rows, n_experts, n_used, 256);
     auto candidate = build_active_grouped_dispatch_graph(
-        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type,
         layout, false, n_rows, n_experts, n_used, 256);
     initialize_active_grouped_dispatch_graphs({&reference, &candidate});
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
@@ -5941,12 +6008,12 @@ static void test_active_grouped_multirow_graph_modes_case(
         CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
         for (uint32_t bank_index = 0; bank_index < candidate.banks.size(); ++bank_index) {
             const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(plan, 0, bank_index);
-            CHECK(capability.tensor == candidate.banks[bank_index] &&
-                capability.consumer == GGML_CUDA_MMID_CONSUMER_MMVQ && capability.use_mmq == 1 &&
-                capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
-                capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK &&
-                capability.phase == GGML_CUDA_MMID_PHASE_PREFILL &&
-                capability.mapping == GGML_CUDA_MMID_MAPPING_DIRECT &&
+            CHECK(capability.tensor == candidate.banks[bank_index]);
+            CHECK(capability.consumer == expected_consumer && capability.use_mmq == 1);
+            CHECK(capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+                capability.equivalence_reason == GGML_CUDA_MMID_CAPABILITY_OK);
+            CHECK(capability.phase == GGML_CUDA_MMID_PHASE_PREFILL && capability.mapping == expected_mapping);
+            CHECK(
                 capability.n_experts == n_experts && capability.source_ne[2] == n_experts &&
                 capability.grouped_ne[2] == n_slots && capability.top_k == n_used &&
                 capability.n_rows == n_rows && capability.n_routes == n_used * n_rows &&
@@ -6672,6 +6739,9 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(
         device, 4, 8, 2, 12, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
+    test_active_grouped_multirow_graph_modes_case(
+        device, 16, 128, 8, 132, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+        GGML_TYPE_Q4_K, GGML_CUDA_MMID_CONSUMER_MMQ, GGML_CUDA_MMID_MAPPING_SOURCE_MAP);
     test_active_grouped_same_key_row_transitions(device, 48);
     test_active_grouped_same_key_row_transitions(device, 138);
     test_active_grouped_cache12_route_limit_transition(device);
@@ -9903,7 +9973,7 @@ struct grouped_decode_fixture {
             CHECK(posix_memalign(&source_storage, 64, source_bytes) == 0);
             source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(source_storage, source_bytes);
         }
-        ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 256);
+        ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 4096);
         CHECK(source_buffer != nullptr && ids_buffer != nullptr);
         ggml_init_params params = {};
         params.mem_size = 32 * ggml_tensor_overhead();
@@ -10459,6 +10529,161 @@ static void test_grouped_decode_independent_rows(int device) {
         run_k32(changed_routes, changed_remap);
         CUDA_OK(cudaStreamSynchronize(k32_stream));
         CUDA_OK(cudaStreamDestroy(k32_stream));
+    }
+
+    {
+        constexpr uint32_t n_experts = 320;
+        constexpr uint32_t n_slots = 300;
+        constexpr uint32_t top_k = 8;
+        constexpr uint32_t large_rows = 33;
+        constexpr uint32_t large_routes = top_k * large_rows;
+        constexpr uint32_t small_rows = 16;
+        constexpr uint32_t small_routes = top_k * small_rows;
+        grouped_decode_fixture generic_fixture(device, true, grouped_decode_fixture::SOURCE_BYTES, n_experts);
+        ggml_tensor * generic_gate_up = generic_fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+        ggml_tensor * generic_down = generic_fixture.weight(GGML_TYPE_Q4_0, 32, 32);
+        const std::array<ggml_tensor *, 2> generic_weights = {generic_gate_up, generic_down};
+        for (uint32_t bank = 0; bank < generic_weights.size(); ++bank) {
+            ggml_tensor * weight = generic_weights[bank];
+            for (uint32_t expert = 0; expert < n_experts; ++expert) {
+                auto * row = static_cast<uint8_t *>(weight->data) + expert * weight->nb[2];
+                for (size_t byte = 0; byte < weight->nb[2]; ++byte) {
+                    row[byte] = static_cast<uint8_t>(17 * (bank + 1) + 13 * expert + byte + 29 * (expert >> 8));
+                }
+                row[0] = expert & 0xff;
+                row[1] = expert >> 8;
+                row[2] = bank;
+            }
+        }
+        std::array<ggml_backend_moe_candidate_bank_v1, 2> generic_banks = {{
+            {generic_gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
+            {generic_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
+        }};
+        const ggml_backend_moe_candidate_group_v1 generic_group = {
+            generic_banks.data(), generic_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0,
+        };
+        const auto generic_snapshot = candidate_snapshot(n_slots, &generic_group, 1);
+        ggml_cuda_moe_grouped_context generic_registry(ggml_backend_get_device(generic_fixture.backend), device);
+        CHECK(generic_registry.replace(&generic_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        ggml_tensor * generic_ids = generic_fixture.ids(large_routes);
+        const auto set_geometry = [&](uint32_t n_rows) {
+            generic_ids->ne[0] = top_k;
+            generic_ids->ne[1] = n_rows;
+            generic_ids->nb[1] = top_k * sizeof(int32_t);
+            generic_ids->nb[2] = n_rows * generic_ids->nb[1];
+            generic_ids->nb[3] = generic_ids->nb[2];
+        };
+        set_geometry(large_rows);
+        auto generic_key = grouped_decode_key(
+            generic_registry, generic_down, generic_ids, generic_group.layout, generic_group.n_banks);
+        cudaStream_t generic_stream = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&generic_stream, cudaStreamNonBlocking));
+
+        std::vector<int32_t> large(large_routes);
+        std::vector<int32_t> large_expected(large_routes);
+        for (uint32_t route = 0; route < large_routes; ++route) {
+            large[route] = (37 * route) % n_experts;
+            large_expected[route] = route;
+        }
+        const auto run = [&](const ggml_cuda_moe_complete_group_key & key,
+                const std::vector<int32_t> & routes, const std::vector<int32_t> & expected,
+                uint32_t expected_slots, const std::vector<int32_t> * expected_slot_experts = nullptr) {
+            CUDA_OK(cudaMemcpyAsync(generic_ids->data, routes.data(), routes.size() * sizeof(int32_t),
+                cudaMemcpyHostToDevice, generic_stream));
+            ggml_cuda_moe_grouped_decode_acquisition current;
+            CHECK(generic_registry.prepare_decode(key, generic_stream, &current) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+            CHECK(current.n_slots == expected_slots && current.n_banks == generic_weights.size());
+            CUDA_OK(cudaStreamSynchronize(generic_stream));
+            std::vector<int32_t> actual(routes.size());
+            CUDA_OK(cudaMemcpy(actual.data(), current.remapped_ids,
+                actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            CHECK(actual == expected);
+            if (expected_slot_experts != nullptr) {
+                CHECK(expected_slot_experts->size() == expected_slots);
+                for (uint32_t bank = 0; bank < generic_weights.size(); ++bank) {
+                    const ggml_tensor * weight = generic_weights[bank];
+                    std::vector<uint8_t> physical(expected_slots * weight->nb[2]);
+                    CUDA_OK(cudaMemcpy(physical.data(), current.banks[bank].data,
+                        physical.size(), cudaMemcpyDeviceToHost));
+                    for (uint32_t slot = 0; slot < expected_slots; ++slot) {
+                        const int32_t expert = (*expected_slot_experts)[slot];
+                        CHECK(expert >= 0 && static_cast<uint32_t>(expert) < n_experts);
+                        CHECK(memcmp(physical.data() + slot * weight->nb[2],
+                            static_cast<const uint8_t *>(weight->data) + expert * weight->nb[2],
+                            weight->nb[2]) == 0);
+                    }
+                }
+            }
+            CHECK(generic_registry.finish_decode(current, generic_stream));
+        };
+        run(generic_key, large, large_expected, n_slots);
+
+        std::vector<bool> initially_resident(n_experts, false);
+        for (int32_t expert : large) {
+            CHECK(!initially_resident[expert]);
+            initially_resident[expert] = true;
+        }
+        std::vector<int32_t> updated(large.begin(), large.begin() + 208);
+        for (uint32_t expert = 0; expert < n_experts; ++expert) {
+            if (!initially_resident[expert]) {
+                updated.push_back(expert);
+            }
+        }
+        CHECK(updated.size() == large_routes);
+        std::vector<int32_t> updated_expected(large_routes);
+        std::iota(updated_expected.begin(), updated_expected.begin() + 208, 0);
+        std::vector<int32_t> expected_slot_experts(n_slots, -1);
+        for (uint32_t route = 0; route < large_routes; ++route) {
+            expected_slot_experts[route] = large[route];
+        }
+        for (uint32_t miss = 0; miss < n_experts - large_routes; ++miss) {
+            updated_expected[208 + miss] = miss < n_slots - large_routes ?
+                large_routes + miss : 208 + miss - (n_slots - large_routes);
+            expected_slot_experts[updated_expected[208 + miss]] = updated[208 + miss];
+        }
+        CHECK(std::all_of(expected_slot_experts.begin(), expected_slot_experts.end(),
+            [](int32_t expert) { return expert >= 0; }));
+        run(generic_key, updated, updated_expected, n_slots, &expected_slot_experts);
+
+        set_geometry(small_rows);
+        generic_key = grouped_decode_key(
+            generic_registry, generic_down, generic_ids, generic_group.layout, generic_group.n_banks);
+        std::vector<int32_t> small(small_routes);
+        std::vector<int32_t> small_expected(small_routes);
+        for (uint32_t route = 0; route < small_routes; ++route) {
+            small[route] = large[small_routes - 1 - route];
+            small_expected[route] = small_routes - 1 - route;
+        }
+        run(generic_key, small, small_expected, n_slots);
+        CUDA_OK(cudaStreamSynchronize(generic_stream));
+        for (uint32_t route = 0; route < 208; ++route) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(
+                generic_registry, generic_key.candidate, large[route]) == static_cast<int32_t>(route));
+        }
+        for (uint32_t miss = 0; miss < n_experts - large_routes; ++miss) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(
+                generic_registry, generic_key.candidate, updated[208 + miss]) == updated_expected[208 + miss]);
+        }
+        for (uint32_t route = 208; route < 228; ++route) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(
+                generic_registry, generic_key.candidate, large[route]) == -1);
+        }
+        for (uint32_t route = 228; route < large_routes; ++route) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(
+                generic_registry, generic_key.candidate, large[route]) == static_cast<int32_t>(route));
+        }
+
+        const auto replacement_snapshot = candidate_snapshot(340, &generic_group, 1);
+        CHECK(generic_registry.replace(&replacement_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        ggml_cuda_moe_grouped_decode_acquisition stale;
+        CHECK(generic_registry.prepare_decode(generic_key, generic_stream, &stale) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
+        const auto replacement_key = grouped_decode_key(
+            generic_registry, generic_down, generic_ids, generic_group.layout, generic_group.n_banks);
+        std::vector<int32_t> replacement_expected(small_routes);
+        std::iota(replacement_expected.begin(), replacement_expected.end(), 0);
+        run(replacement_key, small, replacement_expected, 340);
+        CUDA_OK(cudaStreamSynchronize(generic_stream));
+        CUDA_OK(cudaStreamDestroy(generic_stream));
     }
 }
 
