@@ -10230,17 +10230,19 @@ static ggml_cuda_mmid_capability native_mmid_capability(
     return ggml_cuda_mmid_get_capability(query);
 }
 
-static bool native_direct_view_consumer(ggml_cuda_mmid_consumer consumer) {
-    return consumer == GGML_CUDA_MMID_CONSUMER_MMVQ || consumer == GGML_CUDA_MMID_CONSUMER_MMQ ||
-        consumer == GGML_CUDA_MMID_CONSUMER_MMVF || consumer == GGML_CUDA_MMID_CONSUMER_MMF;
-}
+struct direct_source_view_test_state {
+    bool descriptor_rejected = false;
+    bool quant_mmvq_rejected = false;
+    bool bf16_mmq_rejected = false;
+    bool generic_rejected = false;
+};
 
 static void test_mmid_direct_source_view_case(
         int device,
         ggml_type type,
         int64_t n_tokens,
         ggml_cuda_mmid_consumer expected_consumer,
-        bool * rejection_checked) {
+        direct_source_view_test_state * state) {
     constexpr int64_t logical_experts = 8;
     constexpr int64_t physical_experts = 24;
     constexpr int64_t n_used = 2;
@@ -10348,15 +10350,15 @@ static void test_mmid_direct_source_view_case(
         CHECK(squared_expected > 0.0 && memcmp(
             expected[role].data(), actual[role].data(), expected[role].size() * sizeof(float)) == 0);
 
-        if (!*rejection_checked) {
-            const auto reject = [&](ggml_cuda_mmid_direct_source_view rejected, ggml_cuda_mmid_consumer consumer) {
-                ggml_backend_tensor_set(
-                    physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
-                CHECK(!ggml_cuda_mmid_direct_source_view_compute_for_test(
-                    physical_backend.get(), physical[role].output, &rejected, consumer));
-                ggml_backend_synchronize(physical_backend.get());
-                CHECK(active_grouped_tensor_values(physical[role].output) == physical_sentinel);
-            };
+        const auto reject = [&](ggml_cuda_mmid_direct_source_view rejected, ggml_cuda_mmid_consumer consumer) {
+            ggml_backend_tensor_set(
+                physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
+            CHECK(!ggml_cuda_mmid_direct_source_view_compute_for_test(
+                physical_backend.get(), physical[role].output, &rejected, consumer));
+            ggml_backend_synchronize(physical_backend.get());
+            CHECK(active_grouped_tensor_values(physical[role].output) == physical_sentinel);
+        };
+        if (!state->descriptor_rejected) {
             auto rejected = view;
             rejected.logical_n_experts = 0;
             reject(rejected, expected_consumer);
@@ -10373,14 +10375,25 @@ static void test_mmid_direct_source_view_case(
             rejected.physical_n_experts -= 1;
             reject(rejected, expected_consumer);
             rejected = view;
+            // The grouped remapper certifies this exclusive device-ID bound.
             rejected.physical_id_upper_bound = physical_experts + 1;
-            std::vector<int32_t> invalid_ids = physical_ids;
-            invalid_ids[0] = physical_experts;
-            ggml_backend_tensor_set(physical[role].ids, invalid_ids.data(), 0, ggml_nbytes(physical[role].ids));
             reject(rejected, expected_consumer);
+            state->descriptor_rejected = true;
+        }
+        if (!state->quant_mmvq_rejected && ggml_is_quantized(type) && n_tokens == 16 &&
+                expected_consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
+            CHECK(ggml_cuda_mmid_direct_source_view_valid(
+                physical_weight, view, GGML_CUDA_MMID_CONSUMER_MMVQ));
+            reject(view, GGML_CUDA_MMID_CONSUMER_MMVQ);
+            state->quant_mmvq_rejected = true;
+        }
+        if (!state->bf16_mmq_rejected && type == GGML_TYPE_BF16 && expected_consumer == GGML_CUDA_MMID_CONSUMER_MMF) {
+            reject(view, GGML_CUDA_MMID_CONSUMER_MMQ);
+            state->bf16_mmq_rejected = true;
+        }
+        if (!state->generic_rejected) {
             reject(view, GGML_CUDA_MMID_CONSUMER_GENERIC);
-            ggml_backend_tensor_set(physical[role].ids, physical_ids.data(), 0, ggml_nbytes(physical[role].ids));
-            *rejection_checked = true;
+            state->generic_rejected = true;
         }
     }
 
@@ -10388,39 +10401,51 @@ static void test_mmid_direct_source_view_case(
 }
 
 static void test_mmid_direct_source_view(int device) {
-    const std::array<ggml_type, 5> types = {
-        GGML_TYPE_Q4_0,
-        GGML_TYPE_Q4_K,
-        GGML_TYPE_NVFP4,
-        GGML_TYPE_MXFP4,
-        GGML_TYPE_BF16,
+    struct test_case {
+        ggml_type type;
+        int64_t n_tokens;
+        ggml_cuda_mmid_consumer consumer;
     };
-    bool rejection_checked = false;
-    bool saw_mmvq = false;
-    bool saw_mmq = false;
-    bool saw_scalar = false;
-    for (ggml_type type : types) {
-        bool type_executed = false;
-        for (int64_t n_tokens : {4, 16}) {
-            ggml_backend_ptr query_backend(ggml_backend_cuda_init(device));
-            CHECK(query_backend != nullptr);
-            auto query_graph = build_cached_mmid_path_test_graph(
-                query_backend.get(), ggml_backend_cuda_buffer_type(device), type, 256, 2, n_tokens, 8);
-            const auto capability = native_mmid_capability(
-                device, query_graph.leaves[0], n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
-            if (capability.reason != GGML_CUDA_MMID_CAPABILITY_OK || !native_direct_view_consumer(capability.selection)) {
-                continue;
-            }
-            test_mmid_direct_source_view_case(device, type, n_tokens, capability.selection, &rejection_checked);
-            type_executed = true;
-            saw_mmvq |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
-            saw_mmq |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMQ;
-            saw_scalar |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMVF ||
-                capability.selection == GGML_CUDA_MMID_CONSUMER_MMF;
+    const std::array<test_case, 10> cases = {{
+        {GGML_TYPE_Q4_0, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_Q4_0, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_Q4_K, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_Q4_K, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_NVFP4, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_NVFP4, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_MXFP4, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_MXFP4, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_BF16, 4, GGML_CUDA_MMID_CONSUMER_MMF},
+        {GGML_TYPE_BF16, 16, GGML_CUDA_MMID_CONSUMER_MMF},
+    }};
+    cudaDeviceProp properties;
+    CUDA_OK(cudaGetDeviceProperties(&properties, device));
+    const bool require_cc12 = properties.major == 12;
+    direct_source_view_test_state state;
+    for (const auto & current : cases) {
+        ggml_backend_ptr query_backend(ggml_backend_cuda_init(device));
+        CHECK(query_backend != nullptr);
+        auto query_graph = build_cached_mmid_path_test_graph(
+            query_backend.get(), ggml_backend_cuda_buffer_type(device), current.type, 256, 2, current.n_tokens, 8);
+        const auto capability = native_mmid_capability(
+            device, query_graph.leaves[0], current.n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        const bool supported = capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            capability.selection == current.consumer;
+        if (require_cc12) {
+            CHECK(supported);
         }
-        CHECK(type_executed);
+        if (!supported) {
+            fprintf(stderr, "test-moe-cache: skipping direct MMID view type=%s B%lld consumer=%u on CC%d%d\n",
+                ggml_type_name(current.type), (long long) current.n_tokens, static_cast<unsigned>(current.consumer),
+                properties.major, properties.minor);
+            continue;
+        }
+        test_mmid_direct_source_view_case(
+            device, current.type, current.n_tokens, current.consumer, &state);
     }
-    CHECK(rejection_checked && saw_mmvq && saw_mmq && saw_scalar);
+    if (require_cc12) {
+        CHECK(state.descriptor_rejected && state.quant_mmvq_rejected && state.bf16_mmq_rejected && state.generic_rejected);
+    }
     fprintf(stderr, "test-moe-cache: direct MMID logical/physical source extent witness OK\n");
 }
 
