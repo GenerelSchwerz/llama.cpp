@@ -2359,6 +2359,28 @@ void common_validate_speculative_params(
         const common_params_speculative & params,
         int32_t target_ubatch_raw,
         int32_t target_ubatch_effective) {
+    uint32_t model_backed_types = 0;
+    uint32_t n_model_backed = 0;
+    for (const common_speculative_type type : params.types) {
+        const bool model_backed =
+            type == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+            type == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+            type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+            type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+            type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        if (!model_backed) {
+            continue;
+        }
+        const uint32_t type_bit = 1u << type;
+        if ((model_backed_types & type_bit) == 0) {
+            model_backed_types |= type_bit;
+            ++n_model_backed;
+        }
+    }
+    if (n_model_backed > 1) {
+        throw std::invalid_argument("only one model-backed speculative mode may be selected");
+    }
+
     const bool has_mtp = std::find(
             params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
 

@@ -203,3 +203,46 @@ def test_multi_requests_parallel(n_slots: int, n_requests: int):
     for res in results:
         assert res.status_code == 200
         assert match_regex("(wise|kind|owl|answer)+", res.body["content"])
+
+
+@pytest.mark.parametrize("n_batch,n_ubatch", [
+    (8, 8),
+    (12, 8),
+])
+def test_parallel_verification_spans_are_atomic(n_batch: int, n_ubatch: int, monkeypatch):
+    global server
+    monkeypatch.setenv("LLAMA_ARG_SPEC_DRAFT_P_MIN", "0")
+    server.n_slots = 3
+    server.n_batch = n_batch
+    server.n_ubatch = n_ubatch
+    server.spec_draft_n_min = 1
+    server.spec_draft_n_max = 5
+    server.spec_synth_rates = [0.0] * server.spec_draft_n_max
+    server.start()
+
+    n_predict = 8
+    request = {
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": n_predict,
+        "ignore_eos": True,
+        "return_tokens": True,
+    }
+    tasks = [(server.make_request, ("POST", "/completion", request)) for _ in range(server.n_slots)]
+    results = parallel_function_calls(tasks)
+
+    for res in results:
+        assert res.status_code == 200
+
+    expected_content = results[0].body["content"]
+    expected_tokens = results[0].body["tokens"]
+    assert len(expected_tokens) == n_predict
+    for res in results:
+        assert res.body["content"] == expected_content
+        assert res.body["tokens"] == expected_tokens
+        assert res.body["tokens_predicted"] == n_predict
+        assert res.body["stop_type"] == "limit"
+        assert res.body["timings"]["predicted_n"] == n_predict
+        assert res.body["timings"]["draft_n"] == 20
+        assert res.body["timings"]["draft_n_accepted"] == 0

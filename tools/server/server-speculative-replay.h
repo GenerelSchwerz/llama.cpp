@@ -7,12 +7,12 @@
 #include <utility>
 
 template <class TokenRange>
-bool server_sparse_batch_slot_is_affected(
-        int32_t replay_slot_id, bool sparse_verification, const TokenRange & tokens, int32_t slot_id) {
+bool server_failed_batch_slot_is_affected(
+        int32_t replay_slot_id, bool include_batch_slots, const TokenRange & tokens, int32_t slot_id) {
     if (replay_slot_id >= 0) {
         return replay_slot_id == slot_id;
     }
-    if (!sparse_verification) {
+    if (!include_batch_slots) {
         return false;
     }
     for (const auto & token : tokens) {
@@ -21,6 +21,16 @@ bool server_sparse_batch_slot_is_affected(
         }
     }
     return false;
+}
+
+inline int32_t server_atomic_batch_retry_size(int32_t n_batch, int32_t span) {
+    GGML_ASSERT(n_batch > 0);
+    GGML_ASSERT(span > 0);
+    return (n_batch / 2 / span) * span;
+}
+
+inline bool server_atomic_batch_decode_is_retryable(int32_t decode_result) {
+    return decode_result == 1;
 }
 
 // Owns replay state for one speculative batch.

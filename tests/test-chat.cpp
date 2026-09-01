@@ -211,13 +211,13 @@ static void test_speculative_replay_state_transitions() {
     assert_equals(false, state.mtp_gpu_snapshots_armed());
 }
 
-static void test_speculative_replay_failure_slot_scope() {
+static void test_speculative_failed_batch_helpers() {
     struct test_token {
         int32_t id_slot;
     };
     struct test_case {
         int32_t replay_slot_id;
-        bool sparse_verification;
+        bool include_batch_slots;
         std::array<bool, 5> affected;
     };
 
@@ -235,8 +235,8 @@ static void test_speculative_replay_failure_slot_scope() {
             state.arm_mtp_gpu_snapshots();
         }
         for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
-            if (server_sparse_batch_slot_is_affected(
-                        test.replay_slot_id, test.sparse_verification, tokens, int32_t(slot_id))) {
+            if (server_failed_batch_slot_is_affected(
+                        test.replay_slot_id, test.include_batch_slots, tokens, int32_t(slot_id))) {
                 states[slot_id].reset();
             }
         }
@@ -244,6 +244,28 @@ static void test_speculative_replay_failure_slot_scope() {
             assert_equals(test.affected[slot_id], !states[slot_id].mtp_gpu_snapshots_armed());
         }
     }
+
+    struct retry_case {
+        int32_t n_batch;
+        int32_t span;
+        int32_t expected;
+    };
+    const std::array<retry_case, 6> retry_cases = {
+        retry_case { 24, 6, 12 },
+        retry_case { 18, 6,  6 },
+        retry_case { 12, 6,  6 },
+        retry_case {  8, 6,  0 },
+        retry_case {  6, 6,  0 },
+        retry_case { 25, 6, 12 },
+    };
+    for (const auto & test : retry_cases) {
+        assert_equals(test.expected, server_atomic_batch_retry_size(test.n_batch, test.span));
+    }
+
+    assert_equals(true,  server_atomic_batch_decode_is_retryable(1));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(2));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(-1));
+    assert_equals(false, server_atomic_batch_decode_is_retryable(-2));
 }
 
 // Helper to format a code point as a readable string
@@ -7331,7 +7353,7 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_speculative_replay_state_transitions();
-        test_speculative_replay_failure_slot_scope();
+        test_speculative_failed_batch_helpers();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

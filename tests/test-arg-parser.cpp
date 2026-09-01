@@ -271,6 +271,7 @@ static void test(void) {
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "10" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8" }, false, -1, -1, -1 },
     };
     for (const auto & test_case : mtp_cases) {
         params = common_params();
@@ -615,6 +616,54 @@ static void test_mtp_draft_ubatch_validation() {
     common_validate_speculative_params(params, 512, 512);
 }
 
+static void test_model_backed_speculative_validation() {
+    const std::vector<common_speculative_type> draftless = {
+        COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
+        COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
+        COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
+        COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    };
+    const common_speculative_type model_backed[] = {
+        COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,
+        COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,
+        COMMON_SPECULATIVE_TYPE_DRAFT_MTP,
+        COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,
+        COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,
+    };
+
+    common_params_speculative params;
+    params.types = draftless;
+    common_validate_speculative_params(params, 512, 512);
+
+    for (const common_speculative_type type : model_backed) {
+        params.types = draftless;
+        params.types.insert(params.types.begin() + 2, type);
+        common_validate_speculative_params(params, 512, 512);
+
+        params.types = { type, type };
+        common_validate_speculative_params(params, 512, 512);
+    }
+
+    const size_t n_model_backed = sizeof(model_backed) / sizeof(model_backed[0]);
+    for (size_t i = 0; i < n_model_backed; ++i) {
+        for (size_t j = i + 1; j < n_model_backed; ++j) {
+            params.types = {
+                model_backed[i],
+                COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
+                model_backed[j],
+            };
+            bool rejected = false;
+            try {
+                common_validate_speculative_params(params, 512, 512);
+            } catch (const std::invalid_argument &) {
+                rejected = true;
+            }
+            assert(rejected);
+        }
+    }
+}
+
 static void test_mtp_state_boundaries() {
     std::vector<uint8_t> state;
     const std::vector<uint8_t> malformed = { 0x01, 0x02, 0x03 };
@@ -630,6 +679,7 @@ int main(void) {
         test();
         test_draft_ubatch_override();
         test_mtp_draft_ubatch_validation();
+        test_model_backed_speculative_validation();
         test_mtp_state_boundaries();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());

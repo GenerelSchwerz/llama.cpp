@@ -133,6 +133,7 @@ struct server_batch {
     server_slot * slot_batched = nullptr;
     server_slot * replay_slot = nullptr;
     bool mtp_sparse_snapshots = false;
+    int32_t speculative_verification_span = 0;
 
     // in embd mode, we temporarily swap out the tokens arr and restore it on clear()
     bool has_embd = false;
@@ -189,6 +190,7 @@ struct server_batch {
         slot_batched = nullptr;
         replay_slot = nullptr;
         mtp_sparse_snapshots = false;
+        speculative_verification_span = 0;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         batch_rendered    = false;
@@ -530,6 +532,11 @@ struct server_slot {
         } else {
             SLT_DBG(*this, "generate_draft: id=%d, #tokens=%zu, #draft=%zu, pos_next=%d\n",
                     sampled, prompt.tokens.size(), spec_draft.size(), prompt.tokens.pos_next());
+
+            const int32_t verification_span = int32_t(spec_draft.size() + 1);
+            GGML_ASSERT(batch.speculative_verification_span == 0 ||
+                    batch.speculative_verification_span == verification_span);
+            batch.speculative_verification_span = verification_span;
 
             GGML_ASSERT(spec_i_batch.empty());
 
@@ -901,8 +908,8 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
-    llama_seq_id capped_mtp_next_verification_slot = 0;
-    bool capped_mtp_prompt_turn = false;
+    llama_seq_id spec_next_verification_slot = 0;
+    bool spec_prompt_turn = false;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1282,8 +1289,8 @@ private:
         }
 
         slots.clear();
-        capped_mtp_next_verification_slot = 0;
-        capped_mtp_prompt_turn = false;
+        spec_next_verification_slot = 0;
+        spec_prompt_turn = false;
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -2818,14 +2825,15 @@ private:
         }
     }
 
-    void clear_failed_sparse_batch_state() {
+    void clear_failed_batch_state() {
         const int32_t replay_slot_id = batch.replay_slot != nullptr ? batch.replay_slot->id : -1;
-        if (replay_slot_id < 0 && !batch.mtp_sparse_snapshots) {
+        const bool include_batch_slots = batch.mtp_sparse_snapshots || batch.speculative_verification_span > 0;
+        if (replay_slot_id < 0 && !include_batch_slots) {
             return;
         }
         for (auto & slot : slots) {
-            if (slot.is_processing() && server_sparse_batch_slot_is_affected(
-                        replay_slot_id, batch.mtp_sparse_snapshots, batch.tokens, slot.id)) {
+            if (slot.is_processing() && server_failed_batch_slot_is_affected(
+                        replay_slot_id, include_batch_slots, batch.tokens, slot.id)) {
                 slot.prompt_clear();
             }
         }
@@ -2972,7 +2980,7 @@ private:
                 }
             } catch (const std::exception & e) {
                 SRV_ERR("decode() failed: %s\n", e.what());
-                clear_failed_sparse_batch_state();
+                clear_failed_batch_state();
                 abort_all_slots("decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
@@ -2982,7 +2990,7 @@ private:
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
-                clear_failed_sparse_batch_state();
+                clear_failed_batch_state();
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
             }
@@ -3060,6 +3068,10 @@ private:
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        const int32_t n_batch = llama_n_batch(ctx_tgt);
+        const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        const int32_t spec_verification_limit = std::min(n_batch, n_ubatch);
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
@@ -3114,7 +3126,8 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = std::min(
+                        slot.get_n_draft_max(), std::max(0, spec_verification_limit - 1));
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
@@ -3219,73 +3232,71 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
-        const bool capped_mtp_verification = params_base.speculative.is_mtp_rs_capped() &&
-                batch.replay_slot == nullptr && !generating.empty();
-        if (capped_mtp_verification) {
+        const bool spec_verification = spec && batch.replay_slot == nullptr && !generating.empty();
+        if (spec_verification) {
             const auto first = std::find_if(generating.begin(), generating.end(), [&](const server_slot * slot) {
-                return slot->id >= capped_mtp_next_verification_slot;
+                return slot->id >= spec_next_verification_slot;
             });
             if (first != generating.end()) {
                 std::rotate(generating.begin(), first, generating.end());
             }
         }
 
-        const bool capped_mtp_empty_draft_class = capped_mtp_verification && generating.front()->spec_draft.empty();
-        const size_t capped_mtp_verification_size = capped_mtp_verification && !capped_mtp_empty_draft_class
+        const bool spec_empty_draft_class = spec_verification && generating.front()->spec_draft.empty();
+        // schedule complete equal-length verification spans within both batch limits
+        const size_t spec_verification_size = spec_verification && !spec_empty_draft_class
                 ? generating.front()->spec_draft.size() + 1 : 0;
-        const bool capped_mtp_prompt_ready = capped_mtp_verification && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+        const bool spec_prompt_ready = spec_verification && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.is_processing() &&
                     (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
         });
-        bool capped_mtp_prompt_only = false;
-        if (capped_mtp_verification_size > 1 && capped_mtp_prompt_ready) {
-            capped_mtp_prompt_only = capped_mtp_prompt_turn;
-            capped_mtp_prompt_turn = !capped_mtp_prompt_turn;
+        bool spec_prompt_only = false;
+        if (spec_verification_size > 1 && spec_prompt_ready) {
+            spec_prompt_only = spec_prompt_turn;
+            spec_prompt_turn = !spec_prompt_turn;
         }
-        if (capped_mtp_prompt_only) {
+        if (spec_prompt_only) {
             slot_batched = nullptr;
         }
 
-        const size_t capped_mtp_batch_limit = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
-        size_t capped_mtp_verification_tokens = 0;
-        server_slot * capped_mtp_scheduled_anchor = nullptr;
-        if (!capped_mtp_prompt_only) {
+        size_t spec_verification_tokens = 0;
+        server_slot * spec_scheduled_anchor = nullptr;
+        if (!spec_prompt_only) {
             iterate(generating, [&](server_slot & slot) {
-                if (capped_mtp_verification) {
-                    if (slot.spec_draft.empty() != capped_mtp_empty_draft_class) {
+                if (spec_verification) {
+                    if (slot.spec_draft.empty() != spec_empty_draft_class) {
                         return;
                     }
-                    if (!capped_mtp_empty_draft_class && slot.spec_draft.size() + 1 != capped_mtp_verification_size) {
+                    if (!spec_empty_draft_class && slot.spec_draft.size() + 1 != spec_verification_size) {
                         return;
                     }
-                    if (!capped_mtp_empty_draft_class &&
-                            capped_mtp_verification_tokens + capped_mtp_verification_size > capped_mtp_batch_limit) {
+                    if (!spec_empty_draft_class &&
+                            spec_verification_tokens + spec_verification_size > (size_t) spec_verification_limit) {
                         return;
                     }
                 }
                 slot.handle_last_sampled_token(batch);
-                if (capped_mtp_verification && capped_mtp_scheduled_anchor == nullptr) {
-                    capped_mtp_scheduled_anchor = &slot;
+                if (spec_verification && spec_scheduled_anchor == nullptr) {
+                    spec_scheduled_anchor = &slot;
                 }
-                if (!capped_mtp_empty_draft_class && capped_mtp_verification_size != 0) {
-                    capped_mtp_verification_tokens += capped_mtp_verification_size;
-                    batch.mtp_sparse_snapshots = true;
+                if (!spec_empty_draft_class && spec_verification_size != 0) {
+                    spec_verification_tokens += spec_verification_size;
+                    if (params_base.speculative.is_mtp_rs_capped()) {
+                        batch.mtp_sparse_snapshots = true;
+                    }
                 }
             });
         }
-        if (capped_mtp_scheduled_anchor != nullptr) {
-            capped_mtp_next_verification_slot = capped_mtp_scheduled_anchor->id + 1;
+        if (spec_scheduled_anchor != nullptr) {
+            spec_next_verification_slot = spec_scheduled_anchor->id + 1;
         }
 
         // process in chunks of params.n_batch
-        int32_t n_batch  = llama_n_batch(ctx_tgt);
-        int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
-
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (batch.replay_slot == nullptr && (capped_mtp_prompt_only || capped_mtp_verification_size == 0) &&
+        if (batch.replay_slot == nullptr && (spec_prompt_only || spec_verification_size == 0) &&
                 (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
@@ -3931,7 +3942,7 @@ private:
                     err = "Compute error.";
                 }
 
-                // TODO: handle ret == 2 (abort) when we start aborting
+                // TODO: handle ret == 2 (abort) for ordinary batches
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
@@ -3952,9 +3963,22 @@ private:
                 }
             }
 
+            if (batch.speculative_verification_span > 0 &&
+                    !server_atomic_batch_decode_is_retryable(ret)) {
+                throw std::runtime_error(string_format(
+                        "atomic speculative verification decode failed, ret = %d", ret));
+            }
+
             // retry with half the batch size to try to find a free slot in the KV cache
             if (!try_clear_idle_slots()) {
-                n_batch /= 2;
+                if (batch.speculative_verification_span > 0) {
+                    n_batch = server_atomic_batch_retry_size(n_batch, batch.speculative_verification_span);
+                    if (n_batch == 0) {
+                        throw std::runtime_error("cannot retry an atomic speculative verification batch");
+                    }
+                } else {
+                    n_batch /= 2;
+                }
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
@@ -4014,15 +4038,22 @@ private:
             return idx >= off && idx < off + n_batch_tokens;
         };
 
-        // TODO @ngxson : it's tricky to make sub-batch compatible with common_sampler_sample_and_accept_n,
-        // so for now we will throw an error in this case: https://github.com/ggml-org/llama.cpp/issues/24840
-        iterate_post_decode([&](server_slot & slot) {
-            for (auto & i : slot.spec_i_batch) {
+        // complete speculative spans can be retried in separate sub-batches
+        for (const server_slot & slot : slots) {
+            if (slot.spec_i_batch.empty()) {
+                continue;
+            }
+            const bool intersects_view = slot.spec_i_batch.front() < off + n_batch_tokens &&
+                    slot.spec_i_batch.back() >= off;
+            if (!intersects_view) {
+                continue;
+            }
+            for (const int32_t i : slot.spec_i_batch) {
                 if (!is_inside_view(i)) {
                     throw std::runtime_error(string_format("speculative batch index %d is not inside the current sub-batch [%d, %d)", i, off, off + n_batch_tokens));
                 }
             }
-        });
+        }
 
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
@@ -4124,7 +4155,8 @@ private:
         // speculative decoding - main model sample and accept
         iterate_post_decode([&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
-                    slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
+                    slot.spec_draft.empty() || slot.spec_i_batch.empty() ||
+                    !is_inside_view(slot.spec_i_batch.front())) {
                 return;
             }
 
@@ -4141,6 +4173,11 @@ private:
                 llama_tokens accepted;
                 if (!gpu_snapshot_replay) {
                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                    if (off > 0) {
+                        for (int32_t & i : slot.spec_i_batch) {
+                            i -= off;
+                        }
+                    }
                     const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                     accepted = synth_probs.empty()
                         ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
