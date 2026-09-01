@@ -1813,27 +1813,32 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
         t->data = (void *) 0x2000000000000000; // FIXME
     }
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
+        ggml_context * ctx_simple = meta_buf_ctx->stc_static.ctxs[i].get();
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
 
         // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
         // For those edge cases, allocate a dummy buffer instead.
         bool any_nonzero_slice = false;
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx_simple); t != nullptr; t = ggml_get_next_tensor(ctx_simple, t)) {
             if (ggml_nelements(t) != 0) {
                 any_nonzero_slice = true;
                 break;
             }
         }
         if (any_nonzero_slice) {
-            meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
+            meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_simple, simple_buft));
         } else {
             meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx_simple); t != nullptr; t = ggml_get_next_tensor(ctx_simple, t)) {
                 t->buffer = meta_buf_ctx->bufs[i].get();
             }
         }
         if (meta_buf_ctx->bufs[i] == nullptr) {
+            // the loop above already pointed the tensors at the buffer that is freed here
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                t->buffer = nullptr;
+                t->data   = nullptr;
+            }
             ggml_backend_buffer_free(meta_buf);
             return nullptr;
         }
