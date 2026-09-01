@@ -493,6 +493,125 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
     assert res.body["timings"]["prompt_n"] == 1
 
 
+#
+# Prompt cache reuse on a multimodal server (mmproj loaded).
+#
+# Cache reuse is gated on real media chunks, not on has_mtmd.
+# Text-only prompts must still reuse a shifted matching chunk while an mmproj is loaded.
+# Reuse stays disabled while either the cached or the incoming prompt carries media.
+# swa_full keeps the shifted match valid: the default SWA cache drops it on checkpoint validation.
+# cache_ram 0 disables the RAM prompt cache so only the n_cache_reuse shift path can reuse tokens.
+#
+
+CACHE_REUSE_LEAD = "Throw away this opening line."
+
+CACHE_REUSE_TEXT = (
+    " Alpha beta gamma delta epsilon zeta eta theta iota kappa"
+    " lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega."
+)
+
+
+def test_cache_reuse_text_only_with_mmproj(mmproj_server):
+    server = mmproj_server
+    server.cache_reuse = 4
+    server.swa_full = True
+    server.cache_ram = 0
+    server.start()
+
+    # prime the slot with a text-only prompt that has an extra leading sentence
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_LEAD + CACHE_REUSE_TEXT,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+
+    # resend without the leading sentence: the shared chunk must shift its KV cache and be reused
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_TEXT,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+    cache_n = res.body["timings"]["cache_n"]
+    prompt_n = res.body["timings"]["prompt_n"]
+    assert cache_n > 10  # the matching chunk was shifted and reused
+    assert prompt_n < cache_n
+
+
+def test_cache_reuse_disabled_when_media_present(mmproj_server):
+    server = mmproj_server
+    server.cache_reuse = 4
+    server.swa_full = True
+    server.cache_ram = 0
+    server.start()
+
+    img = _get_img_base64(IMG_URL_CAT)
+
+    # cached prompt: a shiftable text chunk followed by media.
+    # the chunk would be shifted and reused if the media gate were missing.
+    res = server.make_request("POST", "/completions", data={
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "prompt": {
+            "prompt_string": CACHE_REUSE_LEAD + CACHE_REUSE_TEXT + " <__media__>",
+            "multimodal_data": [img],
+        },
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_TEXT,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] < 10  # media in the cached prompt blocks reuse
+
+    # incoming prompt: the same shiftable text chunk followed by media.
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_LEAD + CACHE_REUSE_TEXT,
+        "id_slot": 1,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completions", data={
+        "id_slot": 1,
+        "cache_prompt": True,
+        "n_predict": 1,
+        "prompt": {
+            "prompt_string": CACHE_REUSE_TEXT + " <__media__>",
+            "multimodal_data": [img],
+        },
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] < 10  # media in the incoming prompt blocks reuse
+
+    # slot 0 no longer holds media: a later text-only prompt reuses its shifted chunk again
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_LEAD + CACHE_REUSE_TEXT,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+
+    res = server.make_request("POST", "/completion", data={
+        "prompt": CACHE_REUSE_TEXT,
+        "id_slot": 0,
+        "cache_prompt": True,
+        "n_predict": 1,
+    })
+    assert res.status_code == 200
+    assert res.body["timings"]["cache_n"] > 10  # reuse resumes once the media is gone
+
+
 def test_slot_restore_media_file_without_mmproj(mmproj_server):
     server = mmproj_server
     server.start()
