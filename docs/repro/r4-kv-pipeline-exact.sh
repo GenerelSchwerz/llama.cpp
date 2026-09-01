@@ -11,6 +11,7 @@ PIN="${LLAMA_KV_TASKSET:-0,2,4}"
 PORT="${LLAMA_KV_PORT:-18099}"
 LENGTHS="${LLAMA_KV_LENGTHS:-2048,18432}"
 CTX="${LLAMA_KV_CTX:-32768}"
+BUDGET="${LLAMA_KV_BUDGET:-512}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DEPTHS=(0 1 4); [ $# -gt 0 ] && DEPTHS=("$@")
@@ -21,7 +22,7 @@ for I in "${!DEPTHS[@]}"; do
   echo "== pipeline depth=$D  ctx=$CTX  prefill lengths=$LENGTHS"
   LOG=$(mktemp /tmp/r4-kv-pipeline.XXXX.log)
   taskset -c "$PIN" "$BUILD/bin/llama-server" -m "$MODEL" --kv-pipeline-depth "$D" \
-    -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
+    --kv-pipeline-budget "$BUDGET" -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
     -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -c "$CTX" --parallel 1 \
     --host 127.0.0.1 --port "$PORT" --no-warmup > "$LOG" 2>&1 &
   SRV=$!
