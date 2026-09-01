@@ -413,7 +413,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
-    static const std::regex pattern_output_weight("output\\.weight");
+    // a model with tied embeddings has no output.weight - its output projection is a copy of the
+    // embedding table under the name of the table. Only that copy reaches the meta device, the
+    // table itself stays on the input device, so the name is unambiguous here.
+    static const std::regex pattern_output_weight("(output|token_embd)\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
