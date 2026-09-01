@@ -750,7 +750,8 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // cparams.kv_gpu_layers is updated to the number of layers that became device-resident
+    llama_memory_i * create_memory(const llama_memory_params & params, llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

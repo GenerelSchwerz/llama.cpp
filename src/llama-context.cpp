@@ -445,6 +445,7 @@ llama_context::llama_context(
             cparams.live_context_workspace = false;
         }
 
+        // create_memory lowered kv_gpu_layers to the layers that became device-resident
         if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
             cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
         }

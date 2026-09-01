@@ -2417,18 +2417,25 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
     return ret;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
     llama_memory_i * res;
     llama_memory_placement_options placement = {
         cparams.kv_cpu_pinned,
         cparams.offload_kqv || cparams.recurrent_state_offload,
     };
-    // resolved here rather than per cache, so that a cache built from several sub-caches shares
-    // one budget instead of giving each of them the full count
-    placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers);
-    if (!placement.gpu_resident_ils.empty()) {
-        LLAMA_LOG_INFO("%s: partial GPU KV residency: %zu of %u requested attention layers device-resident\n",
-                __func__, placement.gpu_resident_ils.size(), cparams.kv_gpu_layers);
+    // Resolved here rather than per cache, so that a cache built from several sub-caches shares one
+    // budget instead of giving each of them the full count. An offloaded cache is device-resident
+    // already, so it needs no set and must not pay for measuring the links.
+    if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+        placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers);
+        if (placement.gpu_resident_ils.empty()) {
+            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: partial GPU KV residency: %zu of %u requested attention layers device-resident\n",
+                    __func__, placement.gpu_resident_ils.size(), cparams.kv_gpu_layers);
+        }
+        // the attention compute follows the cache, so report back what the cache got
+        cparams.kv_gpu_layers = (uint32_t) placement.gpu_resident_ils.size();
     }
 
     switch (arch) {
