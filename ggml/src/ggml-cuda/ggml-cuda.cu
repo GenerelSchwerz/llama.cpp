@@ -1999,7 +1999,8 @@ struct ggml_cuda_mul_mat_id_host_route {
 static bool ggml_cuda_mul_mat_id_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, bool use_mmq,
         const ggml_cuda_mul_mat_id_host_route * host_route = nullptr,
-        ggml_cuda_mmid_consumer required_consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED) {
+        ggml_cuda_mmid_consumer required_consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED,
+        const ggml_cuda_mmid_direct_source_view * direct_source_view = nullptr) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2011,6 +2012,11 @@ static bool ggml_cuda_mul_mat_id_impl(
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const bool mapped_experts = host_route != nullptr && host_route->expert_map != nullptr;
+    if (direct_source_view != nullptr && (mapped_experts ||
+            !ggml_cuda_mmid_direct_source_view_valid(src0, *direct_source_view, required_consumer))) {
+        return false;
+    }
+    const int64_t chooser_ne02 = direct_source_view != nullptr ? direct_source_view->logical_n_experts : ne02;
     const auto source_capability = ggml_cuda_mmid_source_capability_for(src0->type);
     const bool mapped_mmq = !mapped_experts || (source_capability.flags & GGML_CUDA_MMID_SOURCE_MAPPED_MMQ) != 0;
 
@@ -2037,7 +2043,7 @@ static bool ggml_cuda_mul_mat_id_impl(
 
         if ((required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
                 required_consumer == GGML_CUDA_MMID_CONSUMER_MMQ) &&
-                use_mmq && mapped_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+                use_mmq && mapped_mmq && ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/chooser_ne02)) {
             if (mapped_experts) {
                 int32_t source_split = host_route->secondary_data ? host_route->secondary_begin : 0;
                 if (source_split == 0) {
@@ -2067,9 +2073,12 @@ static bool ggml_cuda_mul_mat_id_impl(
             return true;
         }
 
+        int64_t chooser_ne[GGML_MAX_DIMS];
+        memcpy(chooser_ne, src0->ne, sizeof(chooser_ne));
+        chooser_ne[2] = chooser_ne02;
         if ((required_consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
                 required_consumer == GGML_CUDA_MMID_CONSUMER_MMF) && !mapped_experts &&
-                ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
+                ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, chooser_ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
             return true;
         }
@@ -2257,6 +2266,21 @@ static bool ggml_cuda_mul_mat_id_impl(
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
     return true;
+}
+
+bool ggml_cuda_mmid_direct_source_view_compute_for_test(
+        ggml_backend_t backend,
+        ggml_tensor * dst,
+        const ggml_cuda_mmid_direct_source_view * view,
+        ggml_cuda_mmid_consumer consumer) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr || dst == nullptr ||
+            dst->op != GGML_OP_MUL_MAT_ID || dst->src[0] == nullptr || dst->src[1] == nullptr) {
+        return false;
+    }
+    auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(context->device);
+    return ggml_cuda_mul_mat_id_impl(
+        *context, dst, ggml_cuda_moe_use_mmq(dst->src[0], dst->src[1]->ne[2]), nullptr, consumer, view);
 }
 
 struct ggml_cuda_moe_ids_cache_key {
@@ -3355,8 +3379,16 @@ static bool ggml_cuda_mul_mat_id(
         ggml_tensor * original_ids = dst->src[2];
         dst->src[0] = &bank_view;
         dst->src[2] = &ids_view;
+        const ggml_cuda_mmid_direct_source_view direct_source_view = {
+            bank_view.type,
+            capability.n_slots,
+            bank_view.ne[2],
+            group->n_slots,
+            bank_view.nb[2],
+        };
         const bool dispatched = ggml_cuda_mul_mat_id_impl(
-            ctx, dst, use_mmq, nullptr, static_cast<ggml_cuda_mmid_consumer>(capability.consumer));
+            ctx, dst, use_mmq, nullptr, static_cast<ggml_cuda_mmid_consumer>(capability.consumer),
+            &direct_source_view);
         dst->src[0] = original_weight;
         dst->src[2] = original_ids;
         if (!dispatched) {

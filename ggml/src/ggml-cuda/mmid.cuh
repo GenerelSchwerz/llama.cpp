@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -74,10 +75,27 @@ struct ggml_cuda_mmid_capability {
     ggml_cuda_mmid_capability_reason reason = GGML_CUDA_MMID_CAPABILITY_UNADVERTISED_SOURCE;
 };
 
+struct ggml_cuda_mmid_direct_source_view {
+    ggml_type source_type = GGML_TYPE_COUNT;
+    int64_t logical_n_experts = 0;
+    int64_t physical_n_experts = 0;
+    int64_t physical_id_upper_bound = 0;
+    size_t expert_stride = 0;
+};
+
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type);
 ggml_cuda_mmid_capability ggml_cuda_mmid_get_capability(const ggml_cuda_mmid_capability_query & query);
 bool ggml_cuda_mmid_can_use_compact_mmvq(const ggml_cuda_mmid_capability_query & query, int64_t n_compact_experts);
 bool ggml_cuda_moe_use_mmq(const ggml_tensor * src0, int64_t n_tokens);
+bool ggml_cuda_mmid_direct_source_view_valid(
+        const ggml_tensor * source,
+        const ggml_cuda_mmid_direct_source_view & view,
+        ggml_cuda_mmid_consumer consumer);
+bool ggml_cuda_mmid_direct_source_view_compute_for_test(
+        ggml_backend_t backend,
+        ggml_tensor * dst,
+        const ggml_cuda_mmid_direct_source_view * view,
+        ggml_cuda_mmid_consumer consumer);
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,

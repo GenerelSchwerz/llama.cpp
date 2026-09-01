@@ -6033,6 +6033,7 @@ static ggml_cuda_mmid_capability native_mmid_capability(
         const ggml_tensor * weight,
         int64_t n_rows,
         ggml_cuda_mmid_mapping mapping);
+static void test_mmid_direct_source_view(int device);
 
 static void check_active_grouped_capabilities(
         ggml_cuda_moe_grouped_context & context,
@@ -7144,6 +7145,7 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_cache12_route_limit_transition(device);
     test_active_grouped_legacy_phase_telemetry(device);
     test_active_grouped_stream_coherence_fallback(device);
+    test_mmid_direct_source_view(device);
 }
 
 static void check_active_grouped_bias_shadows(
@@ -9058,8 +9060,8 @@ static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         ggml_type weight_type,
         int64_t n_out,
         int64_t n_used,
-        int64_t n_tokens) {
-    constexpr int64_t N_EXPERTS = 8;
+        int64_t n_tokens,
+        int64_t n_experts = 8) {
     constexpr int64_t N_IN = 256;
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
@@ -9077,7 +9079,7 @@ static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
     result.nodes.reset(ggml_init(node_params));
     CHECK(result.weights != nullptr && result.nodes != nullptr);
 
-    const int64_t weight_ne[] = {N_IN, n_out, N_EXPERTS};
+    const int64_t weight_ne[] = {N_IN, n_out, n_experts};
     ggml_tensor * weight = ggml_new_tensor(result.weights.get(), weight_type, 3, weight_ne);
     ggml_set_name(weight, "test.paths.ffn_up_exps.weight");
     const int64_t input_ne[] = {N_IN, 1, n_tokens};
@@ -10226,6 +10228,200 @@ static ggml_cuda_mmid_capability native_mmid_capability(
     query.mapping = mapping;
     query.use_mmq = ggml_cuda_moe_use_mmq(weight, n_rows);
     return ggml_cuda_mmid_get_capability(query);
+}
+
+static bool native_direct_view_consumer(ggml_cuda_mmid_consumer consumer) {
+    return consumer == GGML_CUDA_MMID_CONSUMER_MMVQ || consumer == GGML_CUDA_MMID_CONSUMER_MMQ ||
+        consumer == GGML_CUDA_MMID_CONSUMER_MMVF || consumer == GGML_CUDA_MMID_CONSUMER_MMF;
+}
+
+static void test_mmid_direct_source_view_case(
+        int device,
+        ggml_type type,
+        int64_t n_tokens,
+        ggml_cuda_mmid_consumer expected_consumer,
+        bool * rejection_checked) {
+    constexpr int64_t logical_experts = 8;
+    constexpr int64_t physical_experts = 24;
+    constexpr int64_t n_used = 2;
+    constexpr int64_t n_out = 256;
+    constexpr int64_t physical_begin = physical_experts - logical_experts;
+    const std::array<const char *, 3> role_names = {
+        "test.direct_view.ffn_gate_exps.weight",
+        "test.direct_view.ffn_up_exps.weight",
+        "test.direct_view.ffn_down_exps.weight",
+    };
+
+    ggml_backend_ptr baseline_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr physical_backend(ggml_backend_cuda_init(device));
+    CHECK(baseline_backend != nullptr && physical_backend != nullptr);
+    std::array<cached_mmid_path_test_graph, 3> baseline;
+    std::array<cached_mmid_path_test_graph, 3> physical;
+    for (size_t role = 0; role < role_names.size(); ++role) {
+        baseline[role] = build_cached_mmid_path_test_graph(
+            baseline_backend.get(), ggml_backend_cuda_buffer_type(device), type, n_out, n_used, n_tokens, logical_experts);
+        physical[role] = build_cached_mmid_path_test_graph(
+            physical_backend.get(), ggml_backend_cuda_buffer_type(device), type, n_out, n_used, n_tokens, physical_experts);
+        ggml_set_name(baseline[role].leaves[0], role_names[role]);
+        ggml_set_name(physical[role].leaves[0], role_names[role]);
+    }
+
+    std::vector<int32_t> baseline_ids(n_tokens * n_used);
+    std::vector<int32_t> physical_ids(n_tokens * n_used);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t route = 0; route < n_used; ++route) {
+            const int32_t expert = (3 * token + 5 * route) % logical_experts;
+            baseline_ids[token * n_used + route] = expert;
+            physical_ids[token * n_used + route] = physical_begin + expert;
+        }
+    }
+
+    std::array<std::vector<float>, 3> expected;
+    std::array<std::vector<float>, 3> actual;
+    for (size_t role = 0; role < role_names.size(); ++role) {
+        ggml_tensor * baseline_weight = baseline[role].leaves[0];
+        ggml_tensor * physical_weight = physical[role].leaves[0];
+        CHECK(baseline_weight->nb[2] == physical_weight->nb[2] && baseline_weight->ne[2] == logical_experts &&
+            physical_weight->ne[2] == physical_experts);
+        auto baseline_bytes = cached_fusion_test_data(baseline_weight, 1201 + role);
+        auto physical_bytes = cached_fusion_test_data(physical_weight, 1301 + role);
+        for (int64_t expert = 0; expert < logical_experts; ++expert) {
+            const size_t source_offset = expert * baseline_weight->nb[2];
+            const size_t physical_offset = (physical_begin + expert) * physical_weight->nb[2];
+            memcpy(physical_bytes.data() + physical_offset, baseline_bytes.data() + source_offset, baseline_weight->nb[2]);
+            CHECK(memcmp(
+                physical_bytes.data() + physical_offset,
+                baseline_bytes.data() + source_offset,
+                baseline_weight->nb[2]) == 0);
+        }
+        ggml_backend_tensor_set(baseline_weight, baseline_bytes.data(), 0, baseline_bytes.size());
+        ggml_backend_tensor_set(physical_weight, physical_bytes.data(), 0, physical_bytes.size());
+
+        const auto input = cached_fusion_test_data(baseline[role].leaves[1], 1401 + role);
+        CHECK(input.size() == ggml_nbytes(physical[role].leaves[1]));
+        ggml_backend_tensor_set(baseline[role].leaves[1], input.data(), 0, input.size());
+        ggml_backend_tensor_set(physical[role].leaves[1], input.data(), 0, input.size());
+        ggml_backend_tensor_set(baseline[role].ids, baseline_ids.data(), 0, ggml_nbytes(baseline[role].ids));
+        ggml_backend_tensor_set(physical[role].ids, physical_ids.data(), 0, ggml_nbytes(physical[role].ids));
+
+        const auto baseline_capability = native_mmid_capability(
+            device, baseline_weight, n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        ggml_tensor logical_physical_weight = *physical_weight;
+        logical_physical_weight.ne[2] = logical_experts;
+        logical_physical_weight.nb[3] = logical_physical_weight.nb[2] * logical_experts;
+        const auto logical_physical_capability = native_mmid_capability(
+            device, &logical_physical_weight, n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        CHECK(baseline_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            baseline_capability.selection == expected_consumer &&
+            logical_physical_capability.reason == baseline_capability.reason &&
+            logical_physical_capability.selection == baseline_capability.selection);
+
+        const ggml_cuda_mmid_direct_source_view view = {
+            physical_weight->type,
+            logical_experts,
+            physical_experts,
+            physical_experts,
+            physical_weight->nb[2],
+        };
+        CHECK(ggml_cuda_mmid_direct_source_view_valid(physical_weight, view, expected_consumer));
+
+        const std::vector<float> baseline_sentinel(ggml_nelements(baseline[role].output), -17001.25f);
+        const std::vector<float> physical_sentinel(ggml_nelements(physical[role].output), -18001.5f);
+        ggml_backend_tensor_set(
+            baseline[role].output, baseline_sentinel.data(), 0, ggml_nbytes(baseline[role].output));
+        ggml_backend_tensor_set(
+            physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
+        CHECK(ggml_backend_graph_compute(baseline_backend.get(), baseline[role].graph) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_cuda_mmid_direct_source_view_compute_for_test(
+            physical_backend.get(), physical[role].output, &view, expected_consumer));
+        ggml_backend_synchronize(baseline_backend.get());
+        ggml_backend_synchronize(physical_backend.get());
+        expected[role] = active_grouped_tensor_values(baseline[role].output);
+        actual[role] = active_grouped_tensor_values(physical[role].output);
+        CHECK(expected[role] != baseline_sentinel && actual[role] != physical_sentinel &&
+            expected[role].size() == actual[role].size());
+        double squared_expected = 0.0;
+        for (size_t value = 0; value < expected[role].size(); ++value) {
+            CHECK(std::isfinite(expected[role][value]) && std::isfinite(actual[role][value]));
+            squared_expected += static_cast<double>(expected[role][value]) * expected[role][value];
+        }
+        CHECK(squared_expected > 0.0 && memcmp(
+            expected[role].data(), actual[role].data(), expected[role].size() * sizeof(float)) == 0);
+
+        if (!*rejection_checked) {
+            const auto reject = [&](ggml_cuda_mmid_direct_source_view rejected, ggml_cuda_mmid_consumer consumer) {
+                ggml_backend_tensor_set(
+                    physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
+                CHECK(!ggml_cuda_mmid_direct_source_view_compute_for_test(
+                    physical_backend.get(), physical[role].output, &rejected, consumer));
+                ggml_backend_synchronize(physical_backend.get());
+                CHECK(active_grouped_tensor_values(physical[role].output) == physical_sentinel);
+            };
+            auto rejected = view;
+            rejected.logical_n_experts = 0;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.logical_n_experts = static_cast<int64_t>(INT_MAX) + 1;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.expert_stride += ggml_type_size(type);
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.source_type = GGML_TYPE_COUNT;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.physical_n_experts -= 1;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.physical_id_upper_bound = physical_experts + 1;
+            std::vector<int32_t> invalid_ids = physical_ids;
+            invalid_ids[0] = physical_experts;
+            ggml_backend_tensor_set(physical[role].ids, invalid_ids.data(), 0, ggml_nbytes(physical[role].ids));
+            reject(rejected, expected_consumer);
+            reject(view, GGML_CUDA_MMID_CONSUMER_GENERIC);
+            ggml_backend_tensor_set(physical[role].ids, physical_ids.data(), 0, ggml_nbytes(physical[role].ids));
+            *rejection_checked = true;
+        }
+    }
+
+    CHECK(memcmp(expected[2].data(), actual[2].data(), expected[2].size() * sizeof(float)) == 0);
+}
+
+static void test_mmid_direct_source_view(int device) {
+    const std::array<ggml_type, 5> types = {
+        GGML_TYPE_Q4_0,
+        GGML_TYPE_Q4_K,
+        GGML_TYPE_NVFP4,
+        GGML_TYPE_MXFP4,
+        GGML_TYPE_BF16,
+    };
+    bool rejection_checked = false;
+    bool saw_mmvq = false;
+    bool saw_mmq = false;
+    bool saw_scalar = false;
+    for (ggml_type type : types) {
+        bool type_executed = false;
+        for (int64_t n_tokens : {4, 16}) {
+            ggml_backend_ptr query_backend(ggml_backend_cuda_init(device));
+            CHECK(query_backend != nullptr);
+            auto query_graph = build_cached_mmid_path_test_graph(
+                query_backend.get(), ggml_backend_cuda_buffer_type(device), type, 256, 2, n_tokens, 8);
+            const auto capability = native_mmid_capability(
+                device, query_graph.leaves[0], n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+            if (capability.reason != GGML_CUDA_MMID_CAPABILITY_OK || !native_direct_view_consumer(capability.selection)) {
+                continue;
+            }
+            test_mmid_direct_source_view_case(device, type, n_tokens, capability.selection, &rejection_checked);
+            type_executed = true;
+            saw_mmvq |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+            saw_mmq |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMQ;
+            saw_scalar |= capability.selection == GGML_CUDA_MMID_CONSUMER_MMVF ||
+                capability.selection == GGML_CUDA_MMID_CONSUMER_MMF;
+        }
+        CHECK(type_executed);
+    }
+    CHECK(rejection_checked && saw_mmvq && saw_mmq && saw_scalar);
+    fprintf(stderr, "test-moe-cache: direct MMID logical/physical source extent witness OK\n");
 }
 
 static std::array<std::vector<float>, 3> run_gemma_q4_graph(
