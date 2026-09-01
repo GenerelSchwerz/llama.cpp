@@ -486,22 +486,25 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
 }
 
 // The scheduler names a tensor it copies in from another backend "<backend>#<name>#<copy>", where
-// <name> is the graph name of the source plus the suffixes ggml appends for views. Undo both, so
+// <name> is the graph name of the source plus the suffixes ggml appends for views. The name is cut
+// to GGML_MAX_NAME, so what follows the source can be missing or half there. Undo what is left, so
 // that the copy can be recognised under the name the graph gave it.
 static std::string ggml_backend_meta_copy_source_name(const char * name) {
-    std::string decorated = name;
-    const size_t first = decorated.find('#');
-    const size_t last  = decorated.rfind('#');
-    if (first == std::string::npos || last <= first) {
-        return decorated;
+    std::string ret = name;
+    const size_t first = ret.find('#');
+    if (first == std::string::npos) {
+        return ret;
     }
-    std::string ret = decorated.substr(first + 1, last - first - 1);
-    while (!ret.empty() && ret.back() == ')') {
-        const size_t paren = ret.rfind(" (");
-        if (paren == std::string::npos) {
-            break;
-        }
-        ret.erase(paren);
+    ret.erase(0, first + 1);
+    // ggml writes a view suffix as " (...)", a graph name has no spaces
+    const size_t suffix = ret.find(" (");
+    if (suffix != std::string::npos) {
+        ret.erase(suffix);
+        return ret;
+    }
+    const size_t copy = ret.rfind('#');
+    if (copy != std::string::npos && ret.find_first_not_of("0123456789", copy + 1) == std::string::npos) {
+        ret.erase(copy);
     }
     return ret;
 }
