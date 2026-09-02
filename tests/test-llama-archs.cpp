@@ -7,6 +7,7 @@
 #include "ggml-cpp.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
@@ -68,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v/--verbose] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-speculative-limits]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -433,7 +434,7 @@ static void phase_workspace_count_synchronize(ggml_backend_t backend) {
 }
 
 static llama_context_ptr make_phase_workspace_context(
-        llama_model * model, llama_context_type type, llama_context * other = nullptr);
+        llama_model * model, llama_context_type type, llama_context * other = nullptr, uint32_t n_seq_max = 1);
 
 static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
@@ -783,19 +784,127 @@ static llama_batch make_mtp_batch(
 }
 
 static llama_context_ptr make_phase_workspace_context(
-        llama_model * model, llama_context_type type, llama_context * other) {
+        llama_model * model, llama_context_type type, llama_context * other, uint32_t n_seq_max) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 32;
     params.n_batch = 32;
     params.n_ubatch = 32;
-    params.n_seq_max = 1;
-    params.n_outputs_max = type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 4;
+    params.n_seq_max = n_seq_max;
+    params.n_outputs_max = type == LLAMA_CONTEXT_TYPE_MTP ? n_seq_max : 4;
     params.n_threads = 4;
     params.n_threads_batch = 4;
     params.ctx_type = type;
     params.ctx_other = other;
     params.phase_aware_workspace = true;
     return llama_context_ptr(llama_init_from_model(model, params));
+}
+
+static void test_speculative_limits(size_t seed) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    const uint32_t n_seq = 2;
+    llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, n_seq);
+    llama_context_ptr draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get(), n_seq);
+    GGML_ASSERT(target && draft);
+
+    const llama_tokens prompt_match = { 99, 1, 2, 3, 4, 1 };
+    const llama_tokens prompt_none  = { 99, 1, 2, 3, 4, 5 };
+
+    auto make_spec = [&](int32_t n_max, int32_t n_min, std::vector<common_speculative_type> types) {
+        common_params_speculative params;
+        params.types = std::move(types);
+        params.draft.n_max = n_max;
+        params.draft.n_min = n_min;
+        params.draft.p_min = 0.0f;
+        params.draft.ctx_tgt = target.get();
+        params.draft.ctx_dft = draft.get();
+        params.ngram_simple.size_n = 2;
+        params.ngram_simple.size_m = 2;
+        return common_speculative_ptr(common_speculative_init(params, n_seq));
+    };
+
+    {
+        auto spec = make_spec(2, 0, { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP });
+        llama_tokens result_zero;
+        llama_tokens result_positive;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 0, 0, 2, &prompt_match, &result_zero,
+        };
+        common_speculative_get_draft_params(spec.get(), 1) = {
+            true, 1, 0, 6, &prompt_none, &result_positive,
+        };
+
+        common_speculative_draft(spec.get());
+
+        GGML_ASSERT(result_zero.empty());
+        GGML_ASSERT(result_positive.size() == 1);
+        GGML_ASSERT(!common_speculative_get_draft_params(spec.get(), 0).drafting);
+        GGML_ASSERT(!common_speculative_get_draft_params(spec.get(), 1).drafting);
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == -1);
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 1) == 0);
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 1, 0, -1));
+    }
+
+    {
+        auto spec = make_spec(0, 0, { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE, COMMON_SPECULATIVE_TYPE_DRAFT_MTP });
+        llama_tokens result_ngram;
+        llama_tokens result_none;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, -1, 0, 2, &prompt_match, &result_ngram,
+        };
+        common_speculative_get_draft_params(spec.get(), 1) = {
+            true, -1, 0, 6, &prompt_none, &result_none,
+        };
+
+        common_speculative_draft(spec.get());
+
+        GGML_ASSERT(result_ngram == llama_tokens({ 3, 4 }));
+        GGML_ASSERT(result_none.empty());
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 0) == -1);
+        GGML_ASSERT(llama_memory_seq_pos_max(llama_get_memory(draft.get()), 1) == -1);
+    }
+
+    {
+        auto spec = make_spec(2, 0, { COMMON_SPECULATIVE_TYPE_DRAFT_MTP });
+        llama_tokens result_short;
+        llama_tokens result_long;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 1, 0, 2, &prompt_none, &result_short,
+        };
+        common_speculative_get_draft_params(spec.get(), 1) = {
+            true, -1, 0, 6, &prompt_none, &result_long,
+        };
+
+        common_speculative_draft(spec.get());
+
+        GGML_ASSERT(result_short.size() == 1);
+        GGML_ASSERT(result_long.size() == 2);
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 1, 0, -1));
+    }
+
+    {
+        auto spec = make_spec(2, 2, { COMMON_SPECULATIVE_TYPE_DRAFT_MTP });
+        llama_tokens result;
+        common_speculative_get_draft_params(spec.get(), 0) = {
+            true, 1, 0, 2, &prompt_none, &result,
+        };
+
+        common_speculative_draft(spec.get());
+
+        GGML_ASSERT(result.empty());
+        GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+    }
 }
 
 static void test_phase_workspace_mtp_lifecycle(size_t seed) {
@@ -1394,6 +1503,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool run_speculative_limits = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -1441,6 +1551,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-speculative-limits") == 0) {
+            run_speculative_limits = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1456,6 +1570,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
             test_live_context_workspace_unsupported(seed);
+            return 0;
+        }
+        if (run_speculative_limits) {
+            test_speculative_limits(seed);
             return 0;
         }
         if (!out.empty()) {

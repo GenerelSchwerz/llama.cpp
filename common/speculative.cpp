@@ -2997,6 +2997,10 @@ void common_speculative_draft(common_speculative * spec) {
         for (auto & dp : dparams) {
             GGML_ASSERT(!dp.drafting || dp.result->empty());
 
+            if (dp.drafting && dp.n_max == 0) {
+                dp.drafting = false;
+            }
+
             if (dp.drafting) {
                 n_drafting++;
             }
@@ -3008,6 +3012,10 @@ void common_speculative_draft(common_speculative * spec) {
     }
 
     for (auto & impl : spec->impls) {
+        if (impl->n_max == 0) {
+            continue;
+        }
+
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
