@@ -9,8 +9,10 @@ There are **no new build (CMake) options**. Everything here is set at runtime on
 `llama-cli`, `llama-server`, `llama-completion` and friends. Every flag also has
 an `LLAMA_ARG_*` environment variable, shown in each entry.
 
-Two of the feature groups are still in open pull requests and are marked
-**(PR #57)** and **(PR #39)**. The rest is already on `llama/dev`.
+Some feature groups are not on `llama/dev` yet and are marked with the branch or
+pull request they come from: **(PR #57)**, **(PR #39)**, and
+**(branch `moe-cache-drafting`)** for the CUDA MoE expert cache. Everything else
+is already on `llama/dev`.
 
 ---
 
@@ -31,6 +33,9 @@ Two of the feature groups are still in open pull requests and are marked
 | `--spec-draft-ubatch-size`, `--ubatch-size-draft`, `-ubd` | `N` | `0` (inherit) | Separate physical batch size for the draft context |
 | `--spec-draft-kv-gpu-layers`, `--kv-gpu-layers-draft` | `N` | inherit target | `--kv-gpu-layers` for the draft context only |
 | `--spec-mtp-rs-planes` | `N` | `0` (auto) | Cap the recurrent rollback planes for `draft-mtp` to save memory |
+| `--moe-expert-cache-size` **(branch `moe-cache-drafting`)** | `N` | `0` (off) | CUDA only: keep `N` routed MoE expert slabs per expert tensor on the GPU, page the rest from host RAM |
+| `--moe-expert-cache-l2-pinned-mb` **(branch `moe-cache-drafting`)** | MiB | `0` (off) | CUDA only: pinned-host L2 cache for memory-mapped expert sources |
+| `--experimental-logs` **(branch `moe-cache-drafting`)** | flag | off | Verbose debug logs (MoE cache dispatch, L2, page residency, ...) |
 
 ### Optimizations that run with no flag
 
@@ -39,6 +44,8 @@ Two of the feature groups are still in open pull requests and are marked
 - **`-sm tensor` + `--no-kv-offload` is now correct** **(PR #57)** - this combination used to abort or return wrong text.
 - **Quantization kept for host KV stores** - a `q8_0` / `q4_0` KV cache stays quantized when copied to host, so the copy is half or a quarter of the bytes.
 - **Shared target / draft workspaces for MTP** - lower peak memory when running `draft-mtp` speculative decoding.
+- **MoE expert cache internals** **(branch `moe-cache-drafting`)** - once `--moe-expert-cache-size` is set, sibling prefetch, overflow staging, cached MMQ/MMVQ dispatch, CUDA graph capture/replay, grouped decode, and small F32 expert bias residency all run automatically.
+- **Dense penalty counts** **(branch `moe-cache-drafting`)** - the penalties sampler uses a vocabulary-sized dense count table; no flag, no behavior change.
 
 ### Extra `llama-bench` options **(PR #39)**
 
@@ -49,6 +56,10 @@ Two of the feature groups are still in open pull requests and are marked
 
 `GGML_KV_PIPELINE_DEPTH`, `GGML_KV_PIPELINE_BUDGET_MIB` (same as the flags, **PR
 #39**), `GGML_SCHED_TRANSPORT_DEBUG=1|2|3` (print KV transport timing, **PR #39**).
+
+`GGML_CUDA_NO_PINNED` (upstream) also affects the MoE expert cache: the cold-slab
+host pool and the L2 fall back to pageable memory when it is set **(branch
+`moe-cache-drafting`)**.
 
 ---
 
@@ -379,3 +390,120 @@ llama-bench -m model.gguf -p 0 -n 128 -d 16384 \
   -fa 1 -nkvo 1 -kvcp 1 -rso 1 -ctk q8_0 -ctv q8_0 \
   -kvpd 0,1
 ```
+
+---
+
+## 7. CUDA MoE expert cache (branch `moe-cache-drafting`, not yet merged)
+
+> This whole section describes the `moe-cache-drafting` branch. It is not on
+> `llama/dev` yet, so the flag names and defaults below may still change before
+> it merges.
+
+### The problem this solves
+
+A Mixture-of-Experts model has far more expert weight than any one token uses.
+Today you either keep every expert on the GPU (large VRAM cost) or push whole
+layers to the CPU with `--cpu-moe` / `--n-cpu-moe` (every token that routes to a
+CPU-resident expert runs that matmul on the CPU, which is slow).
+
+The MoE expert cache is a middle option: keep a fixed number of expert slabs per
+expert tensor in GPU memory, and page the cold ones in from host RAM on demand
+with LRU eviction. A token that hits the cache runs fully on the GPU; a miss
+copies one slab across PCIe. It is **CUDA only** and **opt-in**.
+
+### `--moe-expert-cache-size N`
+
+Env: `LLAMA_ARG_MOE_EXPERT_CACHE_SIZE`. Default `0` (disabled). Negative is
+rejected.
+
+**What it does.** Keeps `N` expert slabs per cached expert tensor on each owning
+CUDA device. This is **per expert tensor, per device**, not a process-wide total.
+When set, the loader forces routed `ffn_up` / `ffn_down` / `ffn_gate` /
+`ffn_gate_up` expert weights (including chunked-expert names) into the cache
+buffer. This override **wins over** `--cpu-moe`, `--n-cpu-moe`, and manual
+`-ot` / `--override-tensor` for those tensors. Shared experts, dense FFNs, and
+everything else keep their normal placement. Set `0` (or omit) to restore the
+baseline placement and execution path exactly.
+
+**When to use it.** An MoE model whose experts do not all fit in VRAM, where
+`--n-cpu-moe` leaves you CPU-bound. Raise `N` until GPU memory is nearly full.
+GPU memory used is roughly `N x expert-slab-stride` for every cached expert
+tensor on the device, plus metadata and staging.
+
+**How.**
+
+```bash
+llama-server -m mixtral-style.gguf -ngl 99 -fit off \
+  --moe-expert-cache-size 8
+```
+
+> `--fit` (auto memory sizing) does **not** account for these pools and will
+> overestimate free VRAM. Use `-fit off` and size `-c` / the cache yourself when
+> the fit is tight.
+
+### `--moe-expert-cache-l2-pinned-mb N`
+
+Env: `LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB`. Default `0` (disabled). Negative
+is rejected.
+
+**What it does.** Adds a second, pinned-host LRU cache, used **only** for
+memory-mapped expert sources. `N` is a total MiB budget shared across all mapped
+expert banks. It holds recently read mmap slabs in pinned host memory before the
+GPU copy, so a re-read does not fault from disk again. The main expert cache
+(`--moe-expert-cache-size`) must also be enabled. It disables itself if pinned
+allocation fails.
+
+**When to use it.** You run an mmap'd MoE model (the default load path) with the
+expert cache on and see slow misses from disk. Give it a few hundred MiB.
+
+**How.**
+
+```bash
+llama-server -m mixtral-style.gguf -ngl 99 -fit off \
+  --moe-expert-cache-size 8 --moe-expert-cache-l2-pinned-mb 512
+```
+
+### `--experimental-logs`
+
+No env alias. Off by default.
+
+**What it does.** Turns on verbose experimental debug logging: MoE cache
+hit/miss/eviction detail, matrix-dispatch and grouped-execution decisions, L2
+activity, and page residency. Without it you still get the basic hit / miss /
+eviction / hit-rate summary lines.
+
+**When to use it.** Tuning `--moe-expert-cache-size`, or reporting a bug. It is
+noisy - do not leave it on for normal runs.
+
+### What runs automatically once the cache is on
+
+No flags for any of these:
+
+- **Sibling prefetch, bounded overflow staging, cached prefill MMQ/MMVQ
+  dispatch, CUDA graph capture/replay** - implementation details of a cache hit.
+- **Grouped decode fast path** - certified single-token decode graphs (including
+  `-np 1` and parallel one-token-per-sequence batches) run a fused grouped
+  kernel when the whole expert group fits in `N` slots and the kernel supports
+  the type. Anything unsupported (mixed prompt/decode batch, active LoRA, tensor
+  overrides, too few slots, ...) falls back to the normal cached `mul_mat_id`
+  path. Restricted to the main target context.
+- **Resident small expert biases** - eligible small contiguous F32 expert biases
+  stay on the GPU for prefill, under a fixed 32 MiB budget.
+
+### Limits and interactions
+
+- **CUDA only.** On a non-CUDA build the setting is accepted but does nothing.
+- **Layer split is fine** - each CUDA device owns its own cache for the layers
+  it runs. **Row split and tensor split of cached expert weights are not
+  supported** and not tested; use layer split or a single GPU.
+- **Speculative decoding** - a separately loaded draft model inherits the cache
+  size; MTP uses the target weights. Draft and MTP contexts use the legacy
+  cached path, not the grouped fast path. Sampling controls are unchanged
+  (`-bs` / backend sampling stays opt-in and off by default).
+- **Server stats** - the server prints and resets aggregate cache counters at
+  request timing boundaries and on model unload. With parallel requests this is
+  a process-wide reset, not strict per-request attribution.
+- **Library API** - `llama_model_params::moe_expert_cache_slots` is the
+  equivalent of `--moe-expert-cache-size`; set it before loading the model. The
+  low-level buffer-type and mmap-source hooks live in `ggml-backend.h` /
+  `ggml-cuda.h` (`ggml_backend_cuda_moe_cached_buffer_type()` and friends).
