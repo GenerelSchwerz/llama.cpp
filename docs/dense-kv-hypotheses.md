@@ -47,6 +47,12 @@ per generated token, which at gen4 x16 speeds is around 29 ms and caps generatio
 A fully dense model, where every layer is an attention layer, is roughly 4x worse than the
 hybrid reference at the same hidden size.
 
+**Correction from measurement.** Density is the wrong axis; the sliding window dominates it.
+Muse-Glimmer-30B is fully dense at 52 attention layers, but 39 of them are SWA-2048 and its
+`n_embd_k_gqa` is 256, so beyond the window only 13 layers grow: 7072 B per context token
+against the hybrid reference's 34816 B. The fully dense model is 4.9x *cheaper* per context
+token here, not 4x worse. Read the geometry, not the architecture class.
+
 Three consequences shape the list:
 
 1. The cost is linear in context and re-paid every token. Only H17 and H18 change that.
@@ -104,6 +110,42 @@ Any `-nkvo` measurement on a hybrid model is meaningless without
 `--recurrent-state-offload`, and every measurement below sets it. Whether the default should
 follow `offload_kqv` at all is a separate question, and it is worth asking: `-nkvo` alone
 costs 2.06x of generation for 149.62 MiB.
+
+---
+
+## Quantized KV with `-nkvo` aborted on many models
+
+Found while setting up H13, unrelated to `--split-mode tensor` and not what #57 fixes; it
+reproduces on a single device with no split mode at all.
+
+`stage_store_rows()` casts the current rows to the cache type before storing them into a
+host-resident cache. That cast is a `GGML_OP_CPY` whose output is a quantized tensor in the
+compute buffer, so the backend's `get_alloc_size` sizes it. CUDA pads a quantized tensor
+whose row is not a multiple of `MATRIX_ROW_PADDING`, 512, and `GGML_OP_CPY` was missing from
+`ggml_backend_op_alloc_size_may_expand()`, so the allocation assert fired at context
+creation.
+
+The condition is `n_embd_k_gqa % 512 != 0` with a quantized cache type under `-nkvo`:
+
+| model | `n_embd_k_gqa` | `-nkvo` with `q8_0` |
+|---|---|---|
+| Qwen3.8-27B      | 1024 | worked, 1024 is a multiple of 512 |
+| Muse-Glimmer-30B |  256 | aborted |
+
+`f16` was unaffected; every quantized pair aborted. This is why the whole reference set for
+this file is a hybrid model: the fully dense one could not run the configuration at all.
+
+With it fixed, Muse-Glimmer-30B across a 4070 and a 3060, tg64 at depth:
+
+| depth | device KV | host KV | penalty |
+|---|---|---|---|
+|  2048 | 19.67 | 15.73 | 20% |
+|  8192 | 19.23 | 13.69 | 29% |
+| 32768 | 17.71 |  9.18 | 48% |
+
+Read the host column as a slow-link case: the second card is gen3 x4, about 3.5 GB/s against
+the 4070's 24.6, and it holds half the layers. The fitted slope is 4.8 GB/s, which is what a
+mix of those two links predicts.
 
 ---
 
@@ -567,6 +609,28 @@ two is the whole hypothesis. Also time a server cache-reuse turn end to end.
 
 **Risk.** Cells outside the live extent must genuinely never be read before they are
 rewritten. Confirm against the defrag and `seq_cp` paths.
+
+**Measured and implemented.** The risk turned out to be void. A cell at or past
+`used_max_p1()` is empty, and `set_input_k_shift()` already wrote a shift of 0 for an empty
+cell, so the old graph was applying an identity rotation to the whole tail. Skipping it is
+exactly equivalent, and logits after a shift are bit-identical at every size tested.
+
+Muse-Glimmer-30B, host-resident cache, 256 live cells, cost of the shift above a plain
+decode:
+
+| `-c` | plain decode | before | after |
+|---|---|---|---|
+|   8192 | 49.3 ms |  66.8 ms | 19.6 ms |
+|  32768 | 49.1 ms | 197.8 ms | 16.1 ms |
+| 131072 | 49.3 ms | 687.2 ms | 16.6 ms |
+
+At `-c 131072` one shift cost 14x a plain decode for 256 live tokens. The remaining cost no
+longer grows with `-c`, which is the whole point. Several streams keep the old behaviour,
+because their per-stream extents are not contiguous in the cache and one rope view cannot
+express them.
+
+Note for anyone repeating this: Qwen3.8 cannot be used to measure it. It is an M-RoPE model,
+and `seq_add()` asserts `n_pos_per_embd() == 1`, so context shift does not apply to it at all.
 
 ---
 
