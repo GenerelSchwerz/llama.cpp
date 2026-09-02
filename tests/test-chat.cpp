@@ -10,6 +10,7 @@
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
 #include "../tools/server/server-speculative-replay.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
 #include "chat.h"
 #include "common.h"
@@ -209,6 +210,76 @@ static void test_speculative_replay_state_transitions() {
     state.arm_mtp_gpu_snapshots();
     state.reset();
     assert_equals(false, state.mtp_gpu_snapshots_armed());
+
+    llama_tokens pending_prompt = { 44, 55 };
+    std::vector<uint8_t> pending_mtp = { 6, 7 };
+    state.arm_mtp_gpu_snapshots();
+    state.begin_mtp_gpu_replay({ 66 }, std::move(replayed_sampler), 0);
+    const bool cleared_pending = server_clear_pending_mtp_gpu_replay_on_release(state, [&]() {
+        pending_prompt.clear();
+        pending_mtp.clear();
+    });
+    state.reset();
+    assert_equals(true, cleared_pending);
+    assert_equals(true, pending_prompt.empty());
+    assert_equals(true, pending_mtp.empty());
+    assert_equals(false, state.mtp_gpu_replay_pending());
+}
+
+static void test_server_slot_state_lifecycle_helpers() {
+    assert_equals(true, server_slot_state_file_io_supported(false));
+    assert_equals(false, server_slot_state_file_io_supported(true));
+
+    server_prompt_cache_state entry;
+    entry.prompt.tokens.push_back(9);
+    entry.data = {
+        /*.main =*/ { 1, 2, 3 },
+        /*.drft =*/ { 4, 5 },
+        /*.mtp  =*/ { 6, 7, 8 },
+    };
+    const server_prompt_data expected = entry.data;
+    int target_calls = 0;
+    int draft_calls = 0;
+    int mtp_calls = 0;
+    bool fail_draft = true;
+
+    auto restore = [&]() {
+        return server_prompt_cache_restore_data(
+            entry.data,
+            [&](const std::vector<uint8_t> & state) {
+                target_calls++;
+                return state == expected.main;
+            },
+            [&](const std::vector<uint8_t> & state) {
+                draft_calls++;
+                return state == expected.drft && !fail_draft;
+            },
+            [&](const std::vector<uint8_t> & state) {
+                mtp_calls++;
+                return state == expected.mtp;
+            });
+    };
+
+    assert_equals(false, restore());
+    assert_equals(size_t(1), entry.prompt.tokens.size());
+    assert_equals(llama_token(9), entry.prompt.tokens[0]);
+    assert_equals(true, entry.data.main == expected.main);
+    assert_equals(true, entry.data.drft == expected.drft);
+    assert_equals(true, entry.data.mtp == expected.mtp);
+    assert_equals(1, target_calls);
+    assert_equals(1, draft_calls);
+    assert_equals(0, mtp_calls);
+
+    fail_draft = false;
+    assert_equals(true, restore());
+    assert_equals(size_t(1), entry.prompt.tokens.size());
+    assert_equals(llama_token(9), entry.prompt.tokens[0]);
+    assert_equals(true, entry.data.main == expected.main);
+    assert_equals(true, entry.data.drft == expected.drft);
+    assert_equals(true, entry.data.mtp == expected.mtp);
+    assert_equals(2, target_calls);
+    assert_equals(2, draft_calls);
+    assert_equals(1, mtp_calls);
 }
 
 static void test_speculative_failed_batch_helpers() {
@@ -231,19 +302,104 @@ static void test_speculative_failed_batch_helpers() {
 
     for (const auto & test : cases) {
         std::array<server_speculative_replay_state, 5> states;
+        std::array<std::vector<uint8_t>, 5> mtp_states;
         for (auto & state : states) {
             state.arm_mtp_gpu_snapshots();
         }
         for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
+            mtp_states[slot_id] = { uint8_t(slot_id + 1) };
             if (server_failed_batch_slot_is_affected(
                         test.replay_slot_id, test.include_batch_slots, tokens, int32_t(slot_id))) {
                 states[slot_id].reset();
+                const bool cleared = server_clear_mtp_slot_state([&](const std::vector<uint8_t> & data) {
+                    mtp_states[slot_id] = data;
+                    return true;
+                });
+                assert_equals(true, cleared);
             }
         }
         for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
             assert_equals(test.affected[slot_id], !states[slot_id].mtp_gpu_snapshots_armed());
+            assert_equals(test.affected[slot_id], mtp_states[slot_id].empty());
         }
     }
+
+    std::vector<uint8_t> parent_state = { 1, 2, 3, 4 };
+    std::vector<uint8_t> child_state  = { 9 };
+    bool copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = parent_state;
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(true, copied);
+    assert_equals(true, parent_state == child_state);
+
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = { 8, 8 };
+            return false;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(false, copied);
+    assert_equals(true, child_state.empty());
+
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data.clear();
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            child_state = data;
+            return true;
+        });
+    assert_equals(true, copied);
+    assert_equals(true, child_state.empty());
+
+    int restore_calls = 0;
+    child_state = { 9 };
+    copied = server_copy_mtp_slot_state(
+        [&](std::vector<uint8_t> & data) {
+            data = parent_state;
+            return true;
+        },
+        [&](const std::vector<uint8_t> & data) {
+            restore_calls++;
+            child_state = data;
+            return data.empty();
+        });
+    assert_equals(false, copied);
+    assert_equals(3, restore_calls);
+    assert_equals(true, child_state.empty());
+    const bool cleared = server_clear_mtp_slot_state([&](const std::vector<uint8_t> &) {
+        return false;
+    });
+    assert_equals(false, cleared);
+
+    common_prompt_checkpoint checkpoint;
+    checkpoint.data_tgt  = { 1 };
+    checkpoint.data_dft  = { 2 };
+    checkpoint.data_spec = { 3 };
+    checkpoint.data_mtp  = { 4, 5 };
+    assert_equals(size_t(5), checkpoint.size());
+    checkpoint.clear_dft();
+    assert_equals(size_t(1), checkpoint.size());
+    assert_equals(true, checkpoint.data_mtp.empty());
+
+    assert_equals(false, server_batch_range_has_slot(tokens, 1, 1, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 1, 3));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 2, 1, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 2, 1));
+    assert_equals(true,  server_batch_range_has_slot(tokens, 1, 2, 3));
+    assert_equals(false, server_batch_range_has_slot(tokens, 0, 2, 4));
 
     struct retry_case {
         int32_t n_batch;
@@ -7353,6 +7509,7 @@ int main(int argc, char ** argv) {
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
         test_speculative_replay_state_transitions();
+        test_server_slot_state_lifecycle_helpers();
         test_speculative_failed_batch_helpers();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';

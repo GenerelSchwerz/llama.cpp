@@ -69,6 +69,7 @@ enum llama_vocab_pre_type {
 
 struct LLM_KV;
 struct llama_model_loader;
+struct llama_vocab_test_access;
 
 struct llama_vocab {
     struct token_data {
@@ -198,6 +199,12 @@ struct llama_vocab {
     void print_info() const;
 
 private:
+    friend struct llama_vocab_test_access;
+
     struct impl;
     std::unique_ptr<impl> pimpl;
+};
+
+struct llama_vocab_test_access {
+    static void add_dummy_token(llama_vocab & vocab);
 };

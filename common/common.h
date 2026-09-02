@@ -1198,6 +1198,9 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // (optional) MTP hidden-state boundary
+    std::vector<uint8_t> data_mtp;
+
     size_t size() const;
 
     bool empty() const;

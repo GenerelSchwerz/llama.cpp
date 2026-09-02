@@ -2618,6 +2618,85 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
     return result;
 }
 
+struct ggml_cuda_moe_host_staging_runtime_capability {
+    ggml_cuda_mmid_consumer consumer = GGML_CUDA_MMID_CONSUMER_UNSUPPORTED;
+    ggml_cuda_mmid_mapping mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    int64_t materialized_experts = 0;
+};
+
+static bool ggml_cuda_moe_host_staging_capability(
+        const ggml_tensor * dst,
+        const ggml_cuda_moe_graph_capability_witness & witness,
+        int64_t n_unique,
+        ggml_cuda_moe_host_staging_runtime_capability * runtime) {
+    if (dst == nullptr || dst->src[0] == nullptr || dst->src[1] == nullptr || runtime == nullptr || n_unique <= 0 ||
+            witness.tensor != dst->src[0] || witness.strategy != GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED ||
+            witness.consumer == GGML_CUDA_MMID_CONSUMER_UNSUPPORTED ||
+            (witness.materialized_mapping != GGML_CUDA_MMID_MAPPING_DIRECT &&
+                witness.materialized_mapping != GGML_CUDA_MMID_MAPPING_SOURCE_MAP)) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const auto & info = ggml_cuda_info();
+    const int device = ggml_cuda_get_device();
+    if (device < 0 || device >= info.device_count || src0->ne[2] <= 0 || n_unique > src0->ne[2]) {
+        return false;
+    }
+
+    ggml_cuda_mmid_capability_query native;
+    native.source_type = src0->type;
+    native.input_type = src1->type;
+    native.output_type = dst->type;
+    memcpy(native.source_ne, src0->ne, sizeof(native.source_ne));
+    memcpy(native.source_nb, src0->nb, sizeof(native.source_nb));
+    native.n_tokens = src1->ne[2];
+    native.n_experts = src0->ne[2];
+    native.cc = info.devices[device].cc;
+    native.warp_size = info.devices[device].warp_size;
+    native.smpbo = info.devices[device].smpbo;
+    native.phase = native.n_tokens == 1 ? GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
+    native.mapping = GGML_CUDA_MMID_MAPPING_DIRECT;
+    native.use_mmq = ggml_cuda_moe_use_mmq(src0, native.n_tokens);
+    if (witness.n_rows > 1 && !ggml_cuda_mmid_can_use_compact_mmvq(native, witness.n_slots)) {
+        native.mapping = GGML_CUDA_MMID_MAPPING_SOURCE_MAP;
+    }
+    const auto native_capability = ggml_cuda_mmid_get_capability(native);
+    if (native_capability.reason != GGML_CUDA_MMID_CAPABILITY_OK ||
+            native_capability.selection != witness.consumer || witness.phase != native.phase ||
+            witness.mapping != native.mapping || witness.n_tokens != native.n_tokens ||
+            witness.n_experts != native.n_experts || witness.use_mmq != static_cast<uint32_t>(native.use_mmq)) {
+        return false;
+    }
+
+    ggml_cuda_mmid_capability_query materialized = native;
+    materialized.phase = static_cast<ggml_cuda_mmid_phase>(witness.materialized_phase);
+    materialized.mapping = static_cast<ggml_cuda_mmid_mapping>(witness.materialized_mapping);
+    materialized.preferred_consumer = static_cast<ggml_cuda_mmid_consumer>(witness.consumer);
+    materialized.independent_rows = witness.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+    const auto expected_phase = materialized.independent_rows ? GGML_CUDA_MMID_PHASE_DECODE : native.phase;
+    if (materialized.phase != expected_phase) {
+        return false;
+    }
+    if (materialized.mapping == GGML_CUDA_MMID_MAPPING_DIRECT) {
+        if (materialized.source_nb[2] > SIZE_MAX / static_cast<size_t>(n_unique)) {
+            return false;
+        }
+        materialized.n_experts = n_unique;
+        materialized.source_ne[2] = n_unique;
+        materialized.source_nb[3] = materialized.source_nb[2] * static_cast<size_t>(n_unique);
+    }
+    const auto capability = ggml_cuda_mmid_get_capability(materialized);
+    if (capability.reason != GGML_CUDA_MMID_CAPABILITY_OK || capability.selection != witness.consumer) {
+        return false;
+    }
+    runtime->consumer = capability.selection;
+    runtime->mapping = materialized.mapping;
+    runtime->materialized_experts = materialized.mapping == GGML_CUDA_MMID_MAPPING_DIRECT ? n_unique : src0->ne[2];
+    return true;
+}
+
 static void ggml_cuda_moe_record_legacy_op(
         ggml_cuda_moe_grouped_context * owner,
         bool is_decode,
@@ -2881,6 +2960,230 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
     ggml_cuda_moe_record_legacy_op(owner,
         telemetry_is_decode, true, false, overflow, (uint64_t) n_unique, (uint64_t) ggml_nbytes(ids),
         0, 0, 0, 0, 0, 0, (uint64_t) (ggml_time_us() - op_start_us), ids_cache_hit);
+}
+
+static bool ggml_cuda_mul_mat_id_grouped_host_staged(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor * dst,
+        ggml_cuda_moe_graph_group_dispatch * group,
+        const ggml_cuda_moe_graph_binding & binding) {
+    auto * owner = ctx.moe_grouped_context;
+    auto lease = owner != nullptr ?
+        owner->acquire_grouped_host_staging(group, binding, dst, ctx.stream()) :
+        ggml_cuda_moe_grouped_host_staging_lease{};
+    ggml_cuda_moe_cache * cache = lease.get();
+    if (!lease || cache == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * src0 = dst->src[0];
+    ggml_tensor * ids = dst->src[2];
+    if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || src0->ne[2] <= 0 ||
+            ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+            ids->ne[0] > SIZE_MAX / static_cast<size_t>(ids->ne[1])) {
+        return false;
+    }
+    const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
+    if (n_ids == 0 || n_ids > SIZE_MAX / sizeof(int32_t)) {
+        return false;
+    }
+
+    std::vector<char> ids_host_storage;
+    const ggml_cuda_moe_ids_host ids_host = ggml_cuda_moe_read_ids(ctx, ids, src0->name, ids_host_storage);
+    if (ids_host.bytes == nullptr) {
+        return false;
+    }
+    const int64_t n_experts = src0->ne[2];
+    std::vector<int32_t> expert_to_pos(static_cast<size_t>(n_experts), -1);
+    std::vector<int32_t> unique_experts;
+    unique_experts.reserve(std::min<int64_t>(n_experts, static_cast<int64_t>(n_ids)));
+    std::vector<int32_t> ids_values;
+    ids_values.reserve(n_ids);
+    for (int64_t i1 = 0; i1 < ids->ne[1]; ++i1) {
+        for (int64_t i0 = 0; i0 < ids->ne[0]; ++i0) {
+            int32_t expert = -1;
+            memcpy(&expert, ids_host.bytes->data() + i1 * ids_host.nb1 + i0 * ids_host.nb0, sizeof(expert));
+            if (expert < 0 || expert >= n_experts) {
+                return false;
+            }
+            ids_values.push_back(expert);
+            if (expert_to_pos[expert] < 0) {
+                expert_to_pos[expert] = static_cast<int32_t>(unique_experts.size());
+                unique_experts.push_back(expert);
+            }
+        }
+    }
+    if (unique_experts.empty() || unique_experts.size() > static_cast<size_t>(INT32_MAX)) {
+        return false;
+    }
+
+    ggml_cuda_moe_host_staging_runtime_capability runtime;
+    if (!ggml_cuda_moe_host_staging_capability(dst, lease.capability(), unique_experts.size(), &runtime)) {
+        return false;
+    }
+
+    const size_t expert_stride = src0->nb[2];
+    const int64_t row_remainder = src0->ne[0] % MATRIX_ROW_PADDING;
+    const size_t source_padding = ggml_is_quantized(src0->type) && row_remainder != 0 ?
+        ggml_row_size(src0->type, MATRIX_ROW_PADDING - row_remainder) : 0;
+    if (expert_stride == 0 || unique_experts.size() > (SIZE_MAX - source_padding) / expert_stride) {
+        return false;
+    }
+    const size_t staged_expert_bytes = unique_experts.size() * expert_stride;
+    ggml_cuda_pool_alloc<char> scratch_experts(ctx.pool(), staged_expert_bytes + source_padding);
+    std::vector<const void *> host_sources;
+    host_sources.reserve(unique_experts.size());
+    const char * source = static_cast<const char *>(src0->data);
+    for (int32_t expert : unique_experts) {
+        host_sources.push_back(source + static_cast<size_t>(expert) * expert_stride);
+    }
+
+    const bool use_mmq = ggml_cuda_moe_use_mmq(src0, dst->src[1]->ne[2]);
+    const auto required_consumer = runtime.consumer;
+    const auto stage_full_source = [&]() {
+        if (!ggml_cuda_moe_cache_copy_to_staging(
+                cache, host_sources.data(), static_cast<int>(host_sources.size()),
+                expert_stride, scratch_experts.get(), ctx.stream())) {
+            return false;
+        }
+        return source_padding == 0 || cudaMemsetAsync(
+            scratch_experts.get() + staged_expert_bytes, 0, source_padding, ctx.stream()) == cudaSuccess;
+    };
+
+    bool dispatched = false;
+    bool split_staged = false;
+    if (runtime.mapping == GGML_CUDA_MMID_MAPPING_DIRECT) {
+        if (runtime.materialized_experts != static_cast<int64_t>(unique_experts.size())) {
+            return false;
+        }
+        if (!stage_full_source()) {
+            return false;
+        }
+        std::vector<int32_t> remapped_ids;
+        remapped_ids.reserve(n_ids);
+        for (int32_t expert : ids_values) {
+            remapped_ids.push_back(expert_to_pos[expert]);
+        }
+        ggml_cuda_pool_alloc<int32_t> scratch_ids(ctx.pool(), n_ids);
+        if (cudaMemcpyAsync(
+                scratch_ids.get(), remapped_ids.data(), n_ids * sizeof(int32_t),
+                cudaMemcpyHostToDevice, ctx.stream()) != cudaSuccess) {
+            return false;
+        }
+
+        ggml_tensor source_view = *src0;
+        source_view.ne[2] = unique_experts.size();
+        source_view.nb[3] = source_view.nb[2] * unique_experts.size();
+        source_view.data = scratch_experts.get();
+        ggml_tensor ids_view = *ids;
+        ids_view.data = scratch_ids.get();
+        ids_view.nb[0] = sizeof(int32_t);
+        ids_view.nb[1] = static_cast<size_t>(ids->ne[0]) * sizeof(int32_t);
+        ids_view.nb[2] = n_ids * sizeof(int32_t);
+        ids_view.nb[3] = ids_view.nb[2];
+
+        ggml_tensor * original_source = dst->src[0];
+        ggml_tensor * original_ids = dst->src[2];
+        dst->src[0] = &source_view;
+        dst->src[2] = &ids_view;
+        dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, nullptr, required_consumer);
+        dst->src[0] = original_source;
+        dst->src[2] = original_ids;
+    } else if (runtime.mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP) {
+        if (runtime.materialized_experts != n_experts) {
+            return false;
+        }
+        const int n_slots = ggml_cuda_moe_cache_n_slots(cache);
+        if (n_slots <= 0) {
+            return false;
+        }
+        std::vector<int> split_slots(unique_experts.size(), -1);
+        std::vector<int32_t> wait_classes;
+        ggml_cuda_pool_alloc<uint32_t> stage_ready(ctx.pool());
+        int stage_ready_capacity = 0;
+        if (unique_experts.size() > static_cast<size_t>(n_slots) && ggml_cuda_moe_cache_can_overlap_staging(cache)) {
+            const size_t waves = 1 + (unique_experts.size() - 1) / static_cast<size_t>(n_slots);
+            if (waves >= static_cast<size_t>(INT32_MAX)) {
+                return false;
+            }
+            stage_ready_capacity = 1 + static_cast<int>(waves);
+            wait_classes.resize(unique_experts.size());
+            stage_ready.alloc(stage_ready_capacity);
+        }
+        int n_resident = 0;
+        int n_wait_classes = 1;
+        if (unique_experts.size() > static_cast<size_t>(n_slots) &&
+                src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4) {
+            const int min_resident = n_slots / 6 + (n_slots % 6 != 0);
+            split_staged = ggml_cuda_moe_cache_prepare_split_staging(
+                cache, host_sources.data(), static_cast<int>(unique_experts.size()), expert_stride, source_padding, min_resident,
+                split_slots.data(), wait_classes.empty() ? nullptr : wait_classes.data(), &n_resident,
+                scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, ctx.stream());
+        }
+
+        std::vector<int32_t> expert_source(static_cast<size_t>(n_experts), -1);
+        if (split_staged) {
+            int n_misses = 0;
+            std::vector<int32_t> expert_wait_class;
+            if (!wait_classes.empty()) {
+                expert_wait_class.assign(static_cast<size_t>(n_experts), -1);
+            }
+            for (size_t i = 0; i < unique_experts.size(); ++i) {
+                const int32_t expert = unique_experts[i];
+                expert_source[expert] = split_slots[i] >= 0 ? split_slots[i] : n_slots + n_misses++;
+                if (!expert_wait_class.empty()) {
+                    expert_wait_class[expert] = wait_classes[i];
+                }
+            }
+            if (n_resident <= 0 || n_misses <= 0 || n_resident + n_misses != static_cast<int>(unique_experts.size())) {
+                (void) ggml_cuda_moe_cache_release_split_slots(
+                    cache, split_slots.data(), static_cast<int>(split_slots.size()), ctx.stream());
+                return false;
+            }
+
+            ggml_tensor source_view = *src0;
+            source_view.data = ggml_cuda_moe_cache_slot_ptr(cache, 0);
+            const ggml_cuda_mul_mat_id_host_route host_route = {
+                ids_host.bytes->data(), ids_host.nb0, ids_host.nb1, expert_source.data(),
+                scratch_experts.get(), n_slots, n_misses,
+                expert_wait_class.empty() ? nullptr : expert_wait_class.data(), n_wait_classes, stage_ready.get(),
+            };
+            ggml_tensor * original_source = dst->src[0];
+            dst->src[0] = &source_view;
+            dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route, required_consumer);
+            dst->src[0] = original_source;
+            const bool staging_finished = stage_ready.get() == nullptr ||
+                ggml_cuda_moe_cache_finish_split_staging(cache, ctx.stream());
+            const bool slots_released = ggml_cuda_moe_cache_release_split_slots(
+                cache, split_slots.data(), static_cast<int>(split_slots.size()), ctx.stream());
+            dispatched = dispatched && staging_finished && slots_released;
+        } else {
+            if (!stage_full_source()) {
+                return false;
+            }
+            for (size_t i = 0; i < unique_experts.size(); ++i) {
+                expert_source[unique_experts[i]] = i;
+            }
+            ggml_tensor source_view = *src0;
+            source_view.data = scratch_experts.get();
+            const ggml_cuda_mul_mat_id_host_route host_route = {
+                ids_host.bytes->data(), ids_host.nb0, ids_host.nb1, expert_source.data(),
+            };
+            ggml_tensor * original_source = dst->src[0];
+            dst->src[0] = &source_view;
+            dispatched = ggml_cuda_mul_mat_id_impl(ctx, dst, use_mmq, &host_route, required_consumer);
+            dst->src[0] = original_source;
+        }
+    }
+
+    if (!split_staged && !ggml_cuda_moe_cache_mark_used(cache, ctx.stream())) {
+        return false;
+    }
+    if (!dispatched) {
+        return false;
+    }
+    owner->record_host_staged_op(split_staged);
+    return true;
 }
 
 // Cached path for mul_mat_id when experts live in CUDA_MoE_Cached (CPU pinned)
@@ -3328,6 +3631,25 @@ static bool ggml_cuda_mul_mat_id(
 
     ggml_cuda_moe_shadow_probe(ctx, execution, dst, src0, dst->src[2]);
 
+    if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ARMED) {
+        const auto result = ctx.moe_grouped_context->prepare_host_staged_group(group, binding, dst, ctx.stream());
+        if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
+            return false;
+        }
+        if (ggml_cuda_moe_take_host_staged_evaluator_failure_for_test(ctx.moe_grouped_context)) {
+            return false;
+        }
+    }
+    if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ACTIVE) {
+        if (!ggml_cuda_mul_mat_id_grouped_host_staged(ctx, dst, group, binding)) {
+            return false;
+        }
+        if (binding.role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT &&
+                !ctx.moe_grouped_context->finish_host_staged_group(group, binding, dst, ctx.stream())) {
+            return false;
+        }
+        return true;
+    }
     if (group != nullptr && group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED) {
         const auto result = ctx.moe_grouped_context->prepare_graph_group(group, binding, dst, ctx.stream());
         if (result != GGML_CUDA_MOE_GROUPED_DECODE_READY) {
@@ -6098,8 +6420,79 @@ static bool ggml_cuda_graph_has_complete_moe_capture(const ggml_cuda_graph * gra
 }
 #endif
 
+static bool ggml_cuda_required_grouped_certificate_valid(const ggml_cgraph * cgraph) {
+    if (cgraph == nullptr) {
+        return false;
+    }
+    const auto & certificate = cgraph->execution_certificate;
+    if (certificate.magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
+            certificate.abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
+            certificate.struct_size != sizeof(certificate) ||
+            certificate.flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED ||
+            certificate.n_rows == 0 || certificate.n_sequences == 0 || certificate.n_sequences > certificate.n_rows ||
+            certificate.owner_namespace == 0 || certificate.owner_generation == 0 ||
+            certificate.source_graph_uid == 0 || certificate.split_graph_uid == 0 ||
+            certificate.source_graph_uid == certificate.split_graph_uid || certificate.split_graph_uid != cgraph->uid) {
+        return false;
+    }
+    for (uint64_t reserved : certificate.reserved) {
+        if (reserved != 0) {
+            return false;
+        }
+    }
+    const bool draft = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+        certificate.n_rows == certificate.n_sequences;
+    const bool draft_sequential = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        certificate.n_sequences <= certificate.n_rows;
+    const bool mtp = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+        certificate.n_rows == certificate.n_sequences;
+    const bool mtp_sequential = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        certificate.n_sequences <= certificate.n_rows;
+    const bool target_verification = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
+        certificate.n_sequences < certificate.n_rows;
+    return draft || draft_sequential || mtp || mtp_sequential || target_verification;
+}
+
+static bool ggml_cuda_graph_has_cached_buffer_mmid(const ggml_cgraph * cgraph) {
+    if (cgraph == nullptr) {
+        return false;
+    }
+    for (int32_t node_index = 0; node_index < cgraph->n_nodes; ++node_index) {
+        const ggml_tensor * node = cgraph->nodes[node_index];
+        const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
+        if (source != nullptr && source->buffer != nullptr &&
+                ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    const bool required_requested = cgraph != nullptr &&
+        (cgraph->execution_certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    const auto required_failure = [&](const char * reason) {
+        GGML_LOG_ERROR("moe-cache: required grouped execution failed: %s\n", reason);
+        if (cuda_ctx->moe_grouped_context != nullptr) {
+            cuda_ctx->moe_grouped_context->record_required_grouped_failure();
+        }
+        return GGML_STATUS_FAILED;
+    };
+    if (required_requested && !ggml_cuda_required_grouped_certificate_valid(cgraph)) {
+        return required_failure("invalid split certificate");
+    }
+
+    const bool required_here = required_requested && ggml_cuda_graph_has_cached_buffer_mmid(cgraph);
+    if (required_here && cuda_ctx->moe_grouped_context == nullptr) {
+        return required_failure("grouped cache context unavailable");
+    }
 
     ggml_cuda_set_device(cuda_ctx->device);
 
@@ -6122,9 +6515,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
     ggml_cuda_moe_graph_property_hint moe_property_hint = GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN;
     ggml_cuda_moe_graph_execution moe_execution;
-#ifdef USE_CUDA_GRAPH
     std::shared_ptr<ggml_cuda_moe_graph_plan> prepared_plan;
-#endif
     uint64_t coverage_epoch = 0;
     uint64_t coverage_mmid_fingerprint = 0;
     const void * coverage_nodes = nullptr;
@@ -6164,11 +6555,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             coverage_mmid_count, coverage_mmid_fingerprint);
         if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
             ggml_cuda_graph_invalidate_moe_capture(graph);
-            return GGML_STATUS_FAILED;
+            return required_here ? required_failure("plan preparation failed") : GGML_STATUS_FAILED;
         }
-#ifdef USE_CUDA_GRAPH
         prepared_plan = *plan;
-#endif
+    }
+    if (required_here) {
+        if (prepared_plan == nullptr || !ggml_cuda_moe_required_grouped_plan_ready(*prepared_plan, moe_execution)) {
+            ggml_cuda_graph_invalidate_moe_capture(graph);
+            return required_failure("grouped plan unavailable");
+        }
+        const auto & diagnostics = prepared_plan->coverage_diagnostics();
+        if (coverage_epoch == 0 || coverage_nodes != cgraph->nodes || coverage_mmid_fingerprint == 0 ||
+                diagnostics.cached_mmid == 0 || coverage_mmid_count != diagnostics.cached_mmid ||
+                diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] != diagnostics.cached_mmid) {
+            ggml_cuda_graph_invalidate_moe_capture(graph);
+            return required_failure("incomplete cached MMID coverage");
+        }
     }
     const bool moe_dispatch = moe_execution.requires_dispatch();
     ggml_cuda_moe_graph_dispatch_mode moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
@@ -6231,6 +6633,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         force_moe_direct();
     }
 #endif
+    if (required_here && !moe_execution.allows_graph_capture()) {
+        force_moe_direct();
+    }
     const bool prefill_resident_witnesses = moe_execution.has_prefill_resident_witnesses();
     if (!retain_grouped_capture && (graph_has_cached_mmid || prefill_resident_witnesses) &&
             moe_execution.outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
@@ -6239,11 +6644,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (moe_dispatch) {
         if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
             force_moe_direct();
-            return GGML_STATUS_FAILED;
+            return required_here ? required_failure("stream resolution failed") : GGML_STATUS_FAILED;
         }
         const auto outcome = moe_execution.outcome();
         if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && !moe_execution.has_coherent_grouped_streams()) {
             force_moe_direct();
+            if (required_here) {
+                return required_failure("incoherent grouped streams");
+            }
         } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
             if (use_cuda_graph && !cuda_graph_update_required) {
                 if (graph == nullptr || graph->moe_resource_fingerprint == 0) {
@@ -6257,9 +6665,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                         moe_execution, cuda_ctx->stream(), &moe_resource_fingerprint,
                         use_cuda_graph ? &moe_resource_leases : nullptr)) {
                     force_moe_direct();
+                    if (required_here) {
+                        return required_failure("grouped resource validation failed");
+                    }
                 } else if (graph != nullptr && graph->moe_resource_fingerprint != 0 &&
                         graph->moe_resource_fingerprint != moe_resource_fingerprint) {
                     force_moe_direct();
+                    if (required_here) {
+                        return required_failure("grouped resource fingerprint changed");
+                    }
                 } else if (use_cuda_graph) {
                     try {
                         moe_resource_witnesses.reserve(moe_resource_leases.size());
@@ -6281,7 +6695,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
         if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
             force_moe_direct();
-            return GGML_STATUS_FAILED;
+            return required_here ? required_failure("grouped dispatch admission failed") : GGML_STATUS_FAILED;
         }
         if ((moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE ||
                 moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY) &&
@@ -6290,9 +6704,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY ? &graph->moe_resource_witnesses : nullptr)) {
             if (!cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
                 force_moe_direct();
-                return GGML_STATUS_FAILED;
+                return required_here ? required_failure("capture activation cleanup failed") : GGML_STATUS_FAILED;
             }
             force_moe_direct();
+            if (required_here) {
+                return required_failure("capture activation failed");
+            }
             moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
             if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
                 force_moe_direct();
@@ -6324,7 +6741,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const bool dispatch_finished = !moe_dispatch || cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution);
     if (!graph_evaluated || !dispatch_finished) {
         force_moe_direct();
-        return GGML_STATUS_FAILED;
+        return required_here ? required_failure(
+            !graph_evaluated ? "grouped evaluator failed" : "grouped finalization failed") : GGML_STATUS_FAILED;
     }
 
     return GGML_STATUS_SUCCESS;
@@ -7521,6 +7939,12 @@ static bool ggml_backend_cuda_flash_attn_causal_prefix_supported(ggml_backend_de
 #endif
 }
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static bool ggml_backend_cuda_required_grouped_execution_supported(ggml_backend_t backend) {
+    return backend != nullptr && ggml_backend_is_cuda(backend);
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7544,6 +7968,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_moe_candidate_replace_v2;
     }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    if (strcmp(name, GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME) == 0) {
+        return (void *)ggml_backend_cuda_required_grouped_execution_supported;
+    }
+#endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }

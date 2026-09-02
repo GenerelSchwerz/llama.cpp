@@ -17,6 +17,45 @@
 
 struct llama_model;
 class llama_batch_allocr;
+struct llama_vocab;
+
+struct llama_speculative_execution_policy {
+    uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+    uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    uint32_t flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+    bool preserve_intent = false;
+    bool fail_closed = false;
+};
+
+struct llama_speculative_grouped_intent_test_access {
+    static uint32_t classify_batch(const llama_batch & batch);
+    static bool matches_ubatch(const llama_ubatch & ubatch, uint32_t row_semantics);
+    static bool matches_ubatch(
+        llama_context_type context_type, const llama_ubatch & ubatch, uint32_t row_semantics);
+    static bool backend_supported(ggml_backend_t backend);
+    static uint32_t flags(uint32_t cache_slots, bool backend_supported);
+    static llama_speculative_execution_policy policy(
+        const llama_batch & batch, uint32_t cache_slots, bool backend_supported);
+    static llama_speculative_execution_policy policy(
+        llama_context_type context_type, const llama_batch & batch, uint32_t cache_slots, bool backend_supported);
+    static bool policy_after_batch_init(
+        const llama_batch & batch,
+        const llama_vocab & vocab,
+        uint32_t cache_slots,
+        bool backend_supported,
+        llama_speculative_execution_policy & policy);
+    static bool policy_after_batch_init(
+        llama_context_type context_type,
+        const llama_batch & batch,
+        const llama_vocab & vocab,
+        uint32_t cache_slots,
+        bool backend_supported,
+        llama_speculative_execution_policy & policy,
+        bool output_all = false);
+};
+
+using llama_mtp_execution_policy = llama_speculative_execution_policy;
+using llama_mtp_grouped_intent_test_access = llama_speculative_grouped_intent_test_access;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -166,10 +205,11 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+             const struct llama_graph_execution_intent * execution_intent = nullptr);
 
     int encode(const llama_batch & batch_inp);
-    int decode(const llama_batch & batch_inp);
+    int decode(const llama_batch & batch_inp, const llama_decode_execution_intent * intent = nullptr);
 
     //
     // state save/load
@@ -273,7 +313,11 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched, const llama_ubatch * ubatch = nullptr);
+    ggml_status graph_compute(
+            ggml_cgraph * gf,
+                    bool   batched,
+     const llama_ubatch * ubatch = nullptr,
+     const struct llama_graph_execution_intent * execution_intent = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
@@ -405,6 +449,7 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
     std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v2_t>> moe_candidate_replace_fns;
+    bool moe_required_grouped_execution_supported = false;
     uint64_t graph_execution_owner_namespace = 0;
     uint64_t graph_execution_owner_generation = 1;
     bool moe_candidate_refresh_pending = true;

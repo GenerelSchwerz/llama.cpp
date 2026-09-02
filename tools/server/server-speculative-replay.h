@@ -3,8 +3,22 @@
 #include "common.h"
 #include "sampling.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vector>
+
+template <class TokenRange>
+bool server_batch_range_has_slot(
+        const TokenRange & tokens, size_t offset, size_t count, int32_t slot_id) {
+    GGML_ASSERT(offset <= tokens.size() && count <= tokens.size() - offset);
+    for (size_t index = offset; index < offset + count; ++index) {
+        if (tokens[index].id_slot == slot_id) {
+            return true;
+        }
+    }
+    return false;
+}
 
 template <class TokenRange>
 bool server_failed_batch_slot_is_affected(
@@ -15,12 +29,7 @@ bool server_failed_batch_slot_is_affected(
     if (!include_batch_slots) {
         return false;
     }
-    for (const auto & token : tokens) {
-        if (token.id_slot == slot_id) {
-            return true;
-        }
-    }
-    return false;
+    return server_batch_range_has_slot(tokens, 0, tokens.size(), slot_id);
 }
 
 inline int32_t server_atomic_batch_retry_size(int32_t n_batch, int32_t span) {
@@ -31,6 +40,34 @@ inline int32_t server_atomic_batch_retry_size(int32_t n_batch, int32_t span) {
 
 inline bool server_atomic_batch_decode_is_retryable(int32_t decode_result) {
     return decode_result == 1;
+}
+
+template <class SetState>
+bool server_restore_mtp_slot_state(const std::vector<uint8_t> & data, SetState && set_state) {
+    const std::vector<uint8_t> empty;
+    if (!set_state(empty)) {
+        return false;
+    }
+    if (data.empty() || set_state(data)) {
+        return true;
+    }
+    set_state(empty);
+    return false;
+}
+
+template <class SetState>
+bool server_clear_mtp_slot_state(SetState && set_state) {
+    return server_restore_mtp_slot_state(std::vector<uint8_t>(), std::forward<SetState>(set_state));
+}
+
+template <class GetState, class SetState>
+bool server_copy_mtp_slot_state(GetState && get_state, SetState && set_state) {
+    std::vector<uint8_t> data;
+    if (!get_state(data)) {
+        server_clear_mtp_slot_state(std::forward<SetState>(set_state));
+        return false;
+    }
+    return server_restore_mtp_slot_state(data, std::forward<SetState>(set_state));
 }
 
 // Owns replay state for one speculative batch.
@@ -121,3 +158,13 @@ private:
     common_sampler_ptr accepted_sampler;
     uint32_t n_accepted = 0;
 };
+
+template <class PromptClear>
+bool server_clear_pending_mtp_gpu_replay_on_release(
+        const server_speculative_replay_state & state, PromptClear && prompt_clear) {
+    if (!state.mtp_gpu_replay_pending()) {
+        return false;
+    }
+    prompt_clear();
+    return true;
+}

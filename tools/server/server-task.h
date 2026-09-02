@@ -11,6 +11,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 
+struct common_speculative;
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
@@ -28,6 +29,10 @@ enum server_task_type {
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
+
+inline bool server_slot_state_file_io_supported(bool speculative_decoding) {
+    return !speculative_decoding;
+}
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
 enum task_response_type {
@@ -588,11 +593,21 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> mtp;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + mtp.size();
     }
 };
+
+template <class RestoreMain, class RestoreDraft, class RestoreMtp>
+bool server_prompt_cache_restore_data(
+        const server_prompt_data & data,
+        RestoreMain && restore_main,
+        RestoreDraft && restore_draft,
+        RestoreMtp && restore_mtp) {
+    return restore_main(data.main) && restore_draft(data.drft) && restore_mtp(data.mtp);
+}
 
 struct server_prompt_cache_state {
     server_prompt prompt;
@@ -627,9 +642,19 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    server_prompt_cache_state * alloc(
+            const server_prompt & prompt,
+            size_t state_size_main,
+            size_t state_size_drft,
+            std::vector<uint8_t> state_mtp);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    bool load(
+            server_prompt & prompt,
+            const server_tokens & tokens_new,
+            llama_context * ctx_tgt,
+            llama_context * ctx_dft,
+            common_speculative * spec,
+            int32_t id_slot);
 
     void update();
 };

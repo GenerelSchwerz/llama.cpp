@@ -403,7 +403,8 @@ extern "C" {
     };
 
     enum ggml_graph_execution_certificate_flag {
-        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE = 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE             = 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED = 1u << 0,
     };
 
     // Callers initialize all fields except source_graph_uid and split_graph_uid, which must be zero.

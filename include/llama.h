@@ -271,6 +271,27 @@ extern "C" {
         int8_t       *  logits;   // TODO: rename this to "output"
     } llama_batch;
 
+#define LLAMA_DECODE_EXECUTION_INTENT_MAGIC   0x4c444931u
+#define LLAMA_DECODE_EXECUTION_INTENT_VERSION 1u
+
+    enum llama_decode_execution_intent_type {
+        LLAMA_DECODE_EXECUTION_INTENT_TARGET_VERIFICATION = 1,
+    };
+
+    enum llama_decode_execution_intent_flag {
+        LLAMA_DECODE_EXECUTION_INTENT_FLAG_NONE = 0,
+    };
+
+    typedef struct llama_decode_execution_intent {
+        uint32_t magic;
+        uint32_t abi_version;
+        uint32_t struct_size;
+        uint32_t type;
+        uint32_t flags;
+        uint32_t verification_span;
+        uint64_t reserved[4];
+    } llama_decode_execution_intent;
+
     enum llama_model_kv_override_type {
         LLAMA_KV_OVERRIDE_TYPE_INT,
         LLAMA_KV_OVERRIDE_TYPE_FLOAT,
@@ -998,6 +1019,12 @@ extern "C" {
     LLAMA_API int32_t llama_decode(
             struct llama_context * ctx,
               struct llama_batch   batch);
+
+    // A null intent has the same behavior as llama_decode().
+    LLAMA_API int32_t llama_decode_ext(
+            struct llama_context *                  ctx,
+              struct llama_batch                    batch,
+        const struct llama_decode_execution_intent * intent);
 
     // Set the number of threads used for decoding
     // n_threads is the number of threads used for generation (single token)

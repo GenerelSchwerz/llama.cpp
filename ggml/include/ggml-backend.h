@@ -208,6 +208,7 @@ extern "C" {
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION 1u
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME "ggml_backend_moe_candidate_replace_v2"
+#define GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME "ggml_backend_required_grouped_execution_supported"
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC 0x4d4f4532u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION 2u
 
@@ -363,6 +364,7 @@ extern "C" {
     };
 
     typedef int32_t (*ggml_backend_moe_candidate_replace_v2_t)(ggml_backend_t backend, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+    typedef bool (*ggml_backend_required_grouped_execution_supported_t)(ggml_backend_t backend);
 
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);

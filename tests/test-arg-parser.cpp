@@ -668,10 +668,13 @@ static void test_mtp_state_boundaries() {
     std::vector<uint8_t> state;
     const std::vector<uint8_t> malformed = { 0x01, 0x02, 0x03 };
 
-    assert(!common_speculative_get_mtp_state(nullptr, 0, state));
-    assert(state.empty());
-    assert(common_speculative_set_mtp_state(nullptr, 0, {}));
-    assert(!common_speculative_set_mtp_state(nullptr, 0, malformed));
+    if (common_speculative_has_mtp_state(nullptr) ||
+            !common_speculative_get_mtp_state(nullptr, 0, state) ||
+            !state.empty() ||
+            !common_speculative_set_mtp_state(nullptr, 0, {}) ||
+            common_speculative_set_mtp_state(nullptr, 0, malformed)) {
+        throw std::runtime_error("invalid optional MTP state behavior");
+    }
 }
 
 int main(void) {

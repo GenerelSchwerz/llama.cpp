@@ -2,6 +2,7 @@
 
 #include "build-info.h"
 #include "server-chat.h"
+#include "server-speculative-replay.h"
 #include "chat.h"
 #include "common.h"
 #include "json-schema-to-grammar.h"
@@ -1708,7 +1709,11 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+server_prompt_cache_state * server_prompt_cache::alloc(
+        const server_prompt & prompt,
+        size_t state_size_tgt,
+        size_t state_size_dft,
+        std::vector<uint8_t> state_mtp) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1725,7 +1730,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         checkpoints_size += ckpt.size();
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+    const size_t state_size_new = state_size_tgt + state_size_dft + state_mtp.size() + checkpoints_size;
 
     // skip over-limit entries to avoid disturbing the cache
     if (limit_size > 0 && state_size_new > limit_size) {
@@ -1784,13 +1789,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.mtp  =*/ std::move(state_mtp),
         },
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(
+        server_prompt & prompt,
+        const server_tokens & tokens_new,
+        llama_context * ctx_tgt,
+        llama_context * ctx_dft,
+        common_speculative * spec,
+        int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1825,38 +1837,41 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
+        const bool restored = server_prompt_cache_restore_data(
+            it_best->data,
+            [&](const std::vector<uint8_t> & data) {
+                const size_t size = data.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_ERR("failed to restore state with size %zu\n", size);
+                    return false;
+                }
+                return true;
+            },
+            [&](const std::vector<uint8_t> & data) {
+                if (data.empty()) {
+                    return true;
+                }
                 GGML_ASSERT(ctx_dft);
-
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
                     SRV_WRN("failed to restore state with size %zu\n", size);
-
                     return false;
                 }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
+                return true;
+            },
+            [&](const std::vector<uint8_t> & data) {
+                if (!server_restore_mtp_slot_state(data, [&](const std::vector<uint8_t> & state) {
+                        return common_speculative_set_mtp_state(spec, id_slot, state);
+                    })) {
+                    SRV_ERR("failed to restore MTP prompt state for slot %d\n", id_slot);
+                    return false;
+                }
+                return true;
+            });
+        if (!restored) {
+            return false;
         }
 
         prompt = std::move(it_best->prompt);

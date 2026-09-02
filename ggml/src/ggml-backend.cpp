@@ -1664,7 +1664,7 @@ static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_gra
             certificate->magic != GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC ||
             certificate->abi_version != GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION ||
             certificate->struct_size != sizeof(*certificate) ||
-            certificate->flags != GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE ||
+            (certificate->flags & ~GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0 ||
             certificate->domain < GGML_GRAPH_EXECUTION_DOMAIN_MAIN ||
             certificate->domain > GGML_GRAPH_EXECUTION_DOMAIN_MTP ||
             certificate->row_semantics < GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
@@ -1707,13 +1707,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(
         struct ggml_graph_execution_certificate certificate) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    const bool required_grouped =
+        (certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    const auto fail = [&](enum ggml_status status) {
+        if (required_grouped) {
+            for (int i = 0; i < sched->n_backends; ++i) {
+                ggml_backend_synchronize(sched->backends[i]);
+            }
+        }
+        return status;
+    };
 
     if (certificate.magic == GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC) {
         if (source_graph_uid == 0) {
+            if (required_grouped) {
+                GGML_LOG_ERROR("%s: required grouped execution has no source graph UID\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
             certificate = {};
         }
         for (int split_id = 0; split_id < sched->n_splits; ++split_id) {
             if (splits[split_id].graph.uid == 0) {
+                if (required_grouped) {
+                    GGML_LOG_ERROR("%s: required grouped execution split %d has no graph UID\n", __func__, split_id);
+                    return GGML_STATUS_FAILED;
+                }
                 certificate = {};
                 break;
             }
@@ -1868,7 +1886,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(
             enum ggml_status ec = ggml_backend_sched_dispatch_split(
                 split_backend, &split->graph, source_graph_uid, certificate);
             if (ec != GGML_STATUS_SUCCESS) {
-                return ec;
+                return fail(ec);
             }
         } else {
             split->graph.execution_certificate = {};
@@ -2122,7 +2140,18 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
         const struct ggml_graph_execution_certificate * certificate) {
     GGML_ASSERT(sched);
     struct ggml_graph_execution_certificate certificate_value = {};
-    if (ggml_backend_sched_execution_certificate_valid(certificate)) {
+    const bool certificate_valid = ggml_backend_sched_execution_certificate_valid(certificate);
+    const bool required_grouped = certificate != nullptr &&
+        (certificate->flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;
+    if (required_grouped && !certificate_valid) {
+        GGML_LOG_ERROR("%s: invalid required grouped execution certificate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (required_grouped && sched->callback_eval != nullptr) {
+        GGML_LOG_ERROR("%s: required grouped execution does not support callback evaluation\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (certificate_valid) {
         certificate_value = *certificate;
     }
 
@@ -2137,6 +2166,10 @@ enum ggml_status ggml_backend_sched_graph_compute_async_ext(
     }
 
     if (graph != sched->source_graph || graph->uid != sched->source_graph_uid) {
+        if (required_grouped) {
+            GGML_LOG_ERROR("%s: required grouped execution certificate does not match the source graph\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
         certificate_value = {};
     }
 

@@ -3128,19 +3128,33 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
     }
 }
 
-bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
-    data.clear();
+bool common_speculative_has_mtp_state(const common_speculative * spec) {
     if (spec == nullptr) {
         return false;
     }
 
-    for (auto & impl : spec->impls) {
-        if (impl->get_mtp_replay_state(seq_id, data)) {
+    for (const auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
             return true;
         }
     }
 
     return false;
+}
+
+bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
+    if (spec == nullptr) {
+        return true;
+    }
+
+    for (auto & impl : spec->impls) {
+        if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            return impl->get_mtp_replay_state(seq_id, data);
+        }
+    }
+
+    return true;
 }
 
 bool common_speculative_set_mtp_state(

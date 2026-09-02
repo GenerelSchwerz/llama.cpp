@@ -3870,6 +3870,12 @@ uint32_t llama_vocab::n_tokens() const {
     return (uint32_t) pimpl->id_to_token.size();
 }
 
+void llama_vocab_test_access::add_dummy_token(llama_vocab & vocab) {
+    GGML_ASSERT(vocab.pimpl->id_to_token.empty());
+    vocab.pimpl->id_to_token.push_back({"<test>", 0.0f, LLAMA_TOKEN_ATTR_NORMAL});
+    vocab.pimpl->token_to_id.emplace("<test>", 0);
+}
+
 uint32_t llama_vocab::n_token_types() const {
     return (uint32_t) pimpl->n_token_types;
 }

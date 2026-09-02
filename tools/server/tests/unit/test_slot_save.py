@@ -17,6 +17,20 @@ def create_server():
     server.temperature = 0.0
 
 
+def test_slot_save_restore_rejected_with_speculative_decoding():
+    global server
+    server.spec_type = "ngram-simple"
+    server.start()
+
+    for action in ["save", "restore"]:
+        res = server.make_request("POST", f"/slots/0?action={action}", data={
+            "filename": "slot_speculative.bin",
+        })
+        assert res.status_code == 501
+        assert res.body["error"]["type"] == "not_supported_error"
+        assert res.body["error"]["message"] == "Slot save and restore are not supported with speculative decoding"
+
+
 def test_slot_save_restore():
     global server
     server.start()

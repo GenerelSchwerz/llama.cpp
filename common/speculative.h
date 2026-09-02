@@ -94,6 +94,8 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 
+bool common_speculative_has_mtp_state(const common_speculative * spec);
+// Empty data is a valid result when no MTP implementation is active.
 bool common_speculative_get_mtp_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 bool common_speculative_set_mtp_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
 

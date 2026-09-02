@@ -1151,6 +1151,8 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
 
 ### POST `/slots/{id_slot}?action=save`: Save the prompt cache of the specified slot to a file.
 
+Slot save and restore are not supported while speculative decoding is enabled.
+
 *Options:*
 
 `filename`: Name of the file to save the slot's prompt cache. The file will be saved in the directory specified by the `--slot-save-path` server parameter.

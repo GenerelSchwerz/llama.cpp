@@ -19,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -48,6 +49,22 @@ static uint64_t graph_execution_next_owner_namespace() {
     return result;
 }
 
+static bool backend_supports_required_grouped_execution(ggml_backend_t backend) {
+    if (backend == nullptr) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto * fn = reg != nullptr ? reinterpret_cast<ggml_backend_required_grouped_execution_supported_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_REQUIRED_GROUPED_EXECUTION_SUPPORTED_PROC_NAME)) : nullptr;
+    return fn != nullptr && fn(backend);
+}
+
+static uint32_t required_grouped_execution_flags(uint32_t cache_slots, bool backend_supported) {
+    return cache_slots > 0 && backend_supported ?
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED : GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+}
+
 static bool ubatch_has_independent_rows(const llama_ubatch & ubatch) {
     if (ubatch.n_tokens == 0 || ubatch.n_seq_tokens != 1 ||
             ubatch.n_seqs != ubatch.n_tokens || ubatch.n_seqs_unq != ubatch.n_tokens ||
@@ -75,6 +92,349 @@ static bool ubatch_has_independent_rows(const llama_ubatch & ubatch) {
     }
 
     return true;
+}
+
+struct llama_graph_execution_intent {
+    uint32_t domain = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+    uint32_t row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    uint32_t verification_span = 0;
+};
+
+static bool verification_position_matches(llama_pos first, uint32_t offset, llama_pos current) {
+    if (offset > (uint64_t) std::numeric_limits<llama_pos>::max() ||
+            first > std::numeric_limits<llama_pos>::max() - (llama_pos) offset) {
+        return false;
+    }
+    return current == first + (llama_pos) offset;
+}
+
+static bool batch_has_independent_rows(const llama_batch & batch) {
+    if (batch.n_tokens <= 0 || batch.pos == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+    for (int32_t row = 0; row < batch.n_tokens; ++row) {
+        if (batch.n_seq_id[row] != 1 || batch.seq_id[row] == nullptr || batch.seq_id[row][0] < 0 ||
+                batch.seq_id[row][0] >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        for (int32_t previous = 0; previous < row; ++previous) {
+            if (batch.seq_id[previous][0] == batch.seq_id[row][0]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool batch_has_sequential_spans(const llama_batch & batch) {
+    if (batch.n_tokens <= 0 || batch.pos == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+        return false;
+    }
+    std::array<uint8_t, LLAMA_MAX_SEQ> seen = {};
+    llama_seq_id current_seq = -1;
+    llama_pos current_pos = 0;
+    for (int32_t row = 0; row < batch.n_tokens; ++row) {
+        if (batch.n_seq_id[row] != 1 || batch.seq_id[row] == nullptr) {
+            return false;
+        }
+        const llama_seq_id seq_id = batch.seq_id[row][0];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        if (seq_id != current_seq) {
+            if (seen[seq_id]) {
+                return false;
+            }
+            seen[seq_id] = 1;
+            current_seq = seq_id;
+        } else if (!verification_position_matches(current_pos, 1, batch.pos[row])) {
+            return false;
+        }
+        current_pos = batch.pos[row];
+    }
+    return true;
+}
+
+static uint32_t speculative_batch_row_semantics(const llama_batch & batch) {
+    if (batch_has_independent_rows(batch)) {
+        return GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+    }
+    if (batch_has_sequential_spans(batch)) {
+        return GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+    }
+    return GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+}
+
+static uint32_t speculative_execution_domain(llama_context_type context_type) {
+    switch (context_type) {
+        case LLAMA_CONTEXT_TYPE_DRAFT: return GGML_GRAPH_EXECUTION_DOMAIN_DRAFT;
+        case LLAMA_CONTEXT_TYPE_MTP:   return GGML_GRAPH_EXECUTION_DOMAIN_MTP;
+        case LLAMA_CONTEXT_TYPE_DEFAULT: break;
+    }
+    return GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
+}
+
+static llama_speculative_execution_policy speculative_execution_policy_for(
+        llama_context_type context_type,
+        const llama_batch & batch,
+        uint32_t cache_slots,
+        bool backend_supported) {
+    llama_speculative_execution_policy result;
+    result.domain = speculative_execution_domain(context_type);
+    if (result.domain == GGML_GRAPH_EXECUTION_DOMAIN_INVALID) {
+        return result;
+    }
+    result.flags = required_grouped_execution_flags(cache_slots, backend_supported);
+    if (cache_slots == 0) {
+        return result;
+    }
+    result.row_semantics = speculative_batch_row_semantics(batch);
+    if (result.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID) {
+        result.fail_closed = result.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
+        return result;
+    }
+    result.preserve_intent = true;
+    return result;
+}
+
+static bool batch_init_with_speculative_execution_policy(
+        llama_batch_allocr & balloc,
+        llama_context_type context_type,
+        const llama_batch & batch,
+        const llama_vocab & vocab,
+        const llama_memory_i * memory,
+        uint32_t n_embd,
+        uint32_t n_seq_max,
+        bool output_all,
+        uint32_t cache_slots,
+        bool backend_supported,
+        llama_speculative_execution_policy * policy) {
+    if (!balloc.init(batch, vocab, memory, n_embd, n_seq_max, output_all)) {
+        return false;
+    }
+    if (policy != nullptr) {
+        *policy = speculative_execution_policy_for(
+            context_type, balloc.get_batch(), cache_slots, backend_supported);
+    }
+    return true;
+}
+
+static bool target_verification_intent_valid(
+        const llama_decode_execution_intent * intent,
+        const llama_batch & batch,
+        llama_graph_execution_intent & execution) {
+    if (intent == nullptr || intent->magic != LLAMA_DECODE_EXECUTION_INTENT_MAGIC ||
+            intent->abi_version != LLAMA_DECODE_EXECUTION_INTENT_VERSION ||
+            intent->struct_size != sizeof(*intent) || intent->type != LLAMA_DECODE_EXECUTION_INTENT_TARGET_VERIFICATION ||
+            intent->flags != LLAMA_DECODE_EXECUTION_INTENT_FLAG_NONE || intent->verification_span <= 1 ||
+            batch.n_tokens <= 0 || batch.n_tokens % intent->verification_span != 0 ||
+            batch.token == nullptr || batch.embd != nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
+            batch.seq_id == nullptr || batch.logits == nullptr) {
+        return false;
+    }
+    for (uint64_t value : intent->reserved) {
+        if (value != 0) {
+            return false;
+        }
+    }
+
+    const uint32_t n_sequences = batch.n_tokens / intent->verification_span;
+    for (uint32_t sequence = 0; sequence < n_sequences; ++sequence) {
+        const uint32_t first = sequence * intent->verification_span;
+        if (batch.n_seq_id[first] != 1 || batch.seq_id[first] == nullptr) {
+            return false;
+        }
+        const llama_seq_id seq_id = batch.seq_id[first][0];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        const llama_pos pos = batch.pos[first];
+        for (uint32_t previous = 0; previous < sequence; ++previous) {
+            const uint32_t previous_first = previous * intent->verification_span;
+            if (batch.seq_id[previous_first][0] == seq_id) {
+                return false;
+            }
+        }
+        for (uint32_t offset = 0; offset < intent->verification_span; ++offset) {
+            const uint32_t row = first + offset;
+            if (batch.n_seq_id[row] != 1 || batch.seq_id[row] == nullptr ||
+                    batch.seq_id[row][0] != seq_id || !verification_position_matches(pos, offset, batch.pos[row]) ||
+                    batch.logits[row] == 0) {
+                return false;
+            }
+        }
+    }
+
+    execution.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+    execution.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+    execution.verification_span = intent->verification_span;
+    return true;
+}
+
+static bool ubatch_has_target_verification_spans(const llama_ubatch & ubatch, uint32_t span) {
+    if (span <= 1 || ubatch.n_tokens == 0 || ubatch.n_tokens % span != 0 || ubatch.token == nullptr ||
+            ubatch.embd != nullptr || ubatch.pos == nullptr || ubatch.output == nullptr || ubatch.n_seq_id == nullptr ||
+            ubatch.seq_id == nullptr || ubatch.seq_id_unq == nullptr || ubatch.n_seq_tokens != span ||
+            ubatch.n_seqs != ubatch.n_tokens / span || ubatch.n_seqs_unq != ubatch.n_seqs) {
+        return false;
+    }
+    for (uint32_t sequence = 0; sequence < ubatch.n_seqs; ++sequence) {
+        const uint32_t first = sequence * span;
+        if (ubatch.n_seq_id[first] != 1 || ubatch.seq_id[first] == nullptr ||
+                ubatch.seq_id[first][0] != ubatch.seq_id_unq[sequence]) {
+            return false;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[first][0];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+            return false;
+        }
+        const llama_pos pos = ubatch.pos[first];
+        for (uint32_t previous = 0; previous < sequence; ++previous) {
+            if (ubatch.seq_id_unq[previous] == seq_id) {
+                return false;
+            }
+        }
+        for (uint32_t offset = 0; offset < span; ++offset) {
+            const uint32_t row = first + offset;
+            if (ubatch.n_seq_id[row] != 1 || ubatch.seq_id[row] == nullptr || ubatch.seq_id[row][0] != seq_id ||
+                    !verification_position_matches(pos, offset, ubatch.pos[row]) || !ubatch.output[row]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool ubatch_has_speculative_independent_rows(const llama_ubatch & ubatch) {
+    return ubatch_has_independent_rows(ubatch) && ubatch.n_seqs == ubatch.n_tokens &&
+        ubatch.n_seqs_unq == ubatch.n_tokens && ubatch.n_seq_tokens == 1;
+}
+
+static bool ubatch_has_speculative_sequential_spans(const llama_ubatch & ubatch) {
+    if (ubatch.n_tokens == 0 || ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr ||
+            ubatch.seq_id_unq == nullptr || ubatch.n_seqs_unq == 0 || ubatch.n_seqs_unq > ubatch.n_tokens) {
+        return false;
+    }
+    std::array<uint8_t, LLAMA_MAX_SEQ> listed = {};
+    for (uint32_t sequence = 0; sequence < ubatch.n_seqs_unq; ++sequence) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[sequence];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || listed[seq_id]) {
+            return false;
+        }
+        listed[seq_id] = 1;
+    }
+    std::array<uint8_t, LLAMA_MAX_SEQ> seen = {};
+    llama_seq_id current_seq = -1;
+    llama_pos current_pos = 0;
+    uint32_t n_spans = 0;
+    for (uint32_t row = 0; row < ubatch.n_tokens; ++row) {
+        if (ubatch.n_seq_id[row] != 1 || ubatch.seq_id[row] == nullptr) {
+            return false;
+        }
+        const llama_seq_id seq_id = ubatch.seq_id[row][0];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || !listed[seq_id]) {
+            return false;
+        }
+        if (seq_id != current_seq) {
+            if (seen[seq_id]) {
+                return false;
+            }
+            seen[seq_id] = 1;
+            current_seq = seq_id;
+            ++n_spans;
+        } else if (!verification_position_matches(current_pos, 1, ubatch.pos[row])) {
+            return false;
+        }
+        current_pos = ubatch.pos[row];
+    }
+    return n_spans == ubatch.n_seqs_unq;
+}
+
+static bool ubatch_matches_graph_execution_intent(
+        llama_context_type context_type,
+                  uint32_t cache_slots,
+      const llama_ubatch & ubatch,
+      const llama_graph_execution_intent & execution_intent) {
+    if (execution_intent.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+        return context_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+            execution_intent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
+            ubatch_has_target_verification_spans(ubatch, execution_intent.verification_span);
+    }
+    if (execution_intent.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
+            execution_intent.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP) {
+        return execution_intent.domain == speculative_execution_domain(context_type) && cache_slots > 0 &&
+            ((execution_intent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+                ubatch_has_speculative_independent_rows(ubatch)) ||
+             (execution_intent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+                ubatch_has_speculative_sequential_spans(ubatch)));
+    }
+    return false;
+}
+
+uint32_t llama_speculative_grouped_intent_test_access::classify_batch(const llama_batch & batch) {
+    return speculative_batch_row_semantics(batch);
+}
+
+bool llama_speculative_grouped_intent_test_access::matches_ubatch(
+        const llama_ubatch & ubatch,
+        uint32_t row_semantics) {
+    return matches_ubatch(LLAMA_CONTEXT_TYPE_MTP, ubatch, row_semantics);
+}
+
+bool llama_speculative_grouped_intent_test_access::matches_ubatch(
+        llama_context_type context_type,
+        const llama_ubatch & ubatch,
+        uint32_t row_semantics) {
+    llama_graph_execution_intent execution_intent;
+    execution_intent.domain = speculative_execution_domain(context_type);
+    execution_intent.row_semantics = row_semantics;
+    return ubatch_matches_graph_execution_intent(context_type, 1, ubatch, execution_intent);
+}
+
+bool llama_speculative_grouped_intent_test_access::backend_supported(ggml_backend_t backend) {
+    return backend_supports_required_grouped_execution(backend);
+}
+
+uint32_t llama_speculative_grouped_intent_test_access::flags(uint32_t cache_slots, bool backend_supported) {
+    return required_grouped_execution_flags(cache_slots, backend_supported);
+}
+
+llama_speculative_execution_policy llama_speculative_grouped_intent_test_access::policy(
+        const llama_batch & batch,
+        uint32_t cache_slots,
+        bool backend_supported) {
+    return policy(LLAMA_CONTEXT_TYPE_MTP, batch, cache_slots, backend_supported);
+}
+
+llama_speculative_execution_policy llama_speculative_grouped_intent_test_access::policy(
+        llama_context_type context_type,
+        const llama_batch & batch,
+        uint32_t cache_slots,
+        bool backend_supported) {
+    return speculative_execution_policy_for(context_type, batch, cache_slots, backend_supported);
+}
+
+bool llama_speculative_grouped_intent_test_access::policy_after_batch_init(
+        const llama_batch & batch,
+        const llama_vocab & vocab,
+        uint32_t cache_slots,
+        bool backend_supported,
+        llama_speculative_execution_policy & policy) {
+    return policy_after_batch_init(
+        LLAMA_CONTEXT_TYPE_MTP, batch, vocab, cache_slots, backend_supported, policy);
+}
+
+bool llama_speculative_grouped_intent_test_access::policy_after_batch_init(
+        llama_context_type context_type,
+        const llama_batch & batch,
+        const llama_vocab & vocab,
+        uint32_t cache_slots,
+        bool backend_supported,
+        llama_speculative_execution_policy & policy,
+        bool output_all) {
+    llama_batch_allocr balloc(1);
+    return batch_init_with_speculative_execution_policy(
+        balloc, context_type, batch, vocab, nullptr, 1, 4, output_all, cache_slots, backend_supported, &policy);
 }
 
 struct llm_fused_op_probe {
@@ -651,6 +1011,7 @@ llama_context::llama_context(
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg) {
+                const bool required_grouped_supported = backend_supports_required_grouped_execution(backend.get());
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
@@ -660,6 +1021,8 @@ llama_context::llama_context(
                         reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME);
                 if (moe_candidate_replace_fn) {
                     moe_candidate_replace_fns.emplace_back(backend.get(), moe_candidate_replace_fn);
+                    moe_required_grouped_execution_supported =
+                        moe_required_grouped_execution_supported || required_grouped_supported;
                 }
             }
         }
@@ -2025,7 +2388,12 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+        llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+        ggml_status & ret,
+        const llama_graph_execution_intent * execution_intent) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -2087,7 +2455,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, &ubatch, execution_intent);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2116,9 +2484,27 @@ int llama_context::encode(const llama_batch & batch_inp) {
     const int64_t n_vocab = model.vocab.n_tokens();
 
     // note: during encode, we always pass the full sequence starting from pos = 0
-    if (!balloc->init(batch_inp, model.vocab, nullptr, n_embd, cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true)) {
+    llama_graph_execution_intent execution_intent;
+    llama_speculative_execution_policy speculative_policy;
+    llama_speculative_execution_policy * speculative_policy_out =
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT ? &speculative_policy : nullptr;
+    if (!batch_init_with_speculative_execution_policy(
+            *balloc, cparams.ctx_type, batch_inp, model.vocab, nullptr, n_embd,
+            cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max, true,
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported, speculative_policy_out)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    if (speculative_policy_out != nullptr) {
+        if (speculative_policy.fail_closed) {
+            LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE batch structure\n", __func__);
+            return -2;
+        }
+        if (speculative_policy.preserve_intent) {
+            execution_intent.domain = speculative_policy.domain;
+            execution_intent.row_semantics = speculative_policy.row_semantics;
+        }
     }
 
     const uint32_t n_tokens = balloc->get_n_tokens();
@@ -2168,7 +2554,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
     cparams.causal_attn = false;
 
     ggml_status status;
-    const auto * res = process_ubatch(ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status);
+    const auto * res = process_ubatch(
+        ubatch, LLM_GRAPH_TYPE_ENCODER, nullptr, status,
+        speculative_policy.preserve_intent ? &execution_intent : nullptr);
 
     cparams.causal_attn = causal_attn_org;
 
@@ -2340,10 +2728,19 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, const llama_decode_execution_intent * intent) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+
+    llama_graph_execution_intent execution_intent;
+    bool has_execution_intent = false;
+    if (intent != nullptr && (cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            !target_verification_intent_valid(intent, batch_inp, execution_intent))) {
+        LLAMA_LOG_ERROR("%s: invalid target verification execution intent\n", __func__);
+        return -1;
+    }
+    has_execution_intent = intent != nullptr;
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -2399,9 +2796,27 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    llama_speculative_execution_policy speculative_policy;
+    llama_speculative_execution_policy * speculative_policy_out = !has_execution_intent &&
+        (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) ?
+            &speculative_policy : nullptr;
+    if (!batch_init_with_speculative_execution_policy(
+            *balloc, cparams.ctx_type, batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all,
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported, speculative_policy_out)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
+    }
+
+    if (speculative_policy_out != nullptr) {
+        if (speculative_policy.fail_closed) {
+            LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE batch structure\n", __func__);
+            return -2;
+        }
+        if (speculative_policy.preserve_intent) {
+            execution_intent.domain = speculative_policy.domain;
+            execution_intent.row_semantics = speculative_policy.row_semantics;
+            has_execution_intent = true;
+        }
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
@@ -2531,6 +2946,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        if (has_execution_intent && !ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), ubatch, execution_intent)) {
+            LLAMA_LOG_ERROR("%s: ubatch does not match the validated execution intent\n", __func__);
+            return -2;
+        }
 
         // count the outputs in this ubatch
         {
@@ -2550,7 +2970,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch(
+            ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status,
+            has_execution_intent ? &execution_intent : nullptr);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3219,7 +3641,8 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched,
-    const llama_ubatch * ubatch) {
+    const llama_ubatch * ubatch,
+    const llama_graph_execution_intent * execution_intent) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3241,7 +3664,51 @@ ggml_status llama_context::graph_compute(
     }
 
     ggml_status status;
-    if (ubatch != nullptr && ubatch_has_independent_rows(*ubatch)) {
+    if (ubatch != nullptr && execution_intent != nullptr &&
+            execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN) {
+        if (!ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
+            LLAMA_LOG_ERROR("%s: target verification ubatch does not match the validated intent\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        ggml_graph_execution_certificate certificate = {};
+        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+        certificate.struct_size = sizeof(certificate);
+        certificate.flags = required_grouped_execution_flags(
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+        certificate.owner_namespace = graph_execution_owner_namespace;
+        certificate.owner_generation = graph_execution_owner_generation;
+        certificate.n_rows = ubatch->n_tokens;
+        certificate.n_sequences = ubatch->n_seqs_unq;
+        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    } else if (ubatch != nullptr && execution_intent != nullptr &&
+            (execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT ||
+             execution_intent->domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP)) {
+        if (!ubatch_matches_graph_execution_intent(
+                cparams.ctx_type, model.moe_expert_cache_slots(), *ubatch, *execution_intent)) {
+            LLAMA_LOG_ERROR("%s: speculative ubatch does not match the validated grouped intent\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
+        ggml_graph_execution_certificate certificate = {};
+        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+        certificate.struct_size = sizeof(certificate);
+        certificate.flags = required_grouped_execution_flags(
+            model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+        certificate.domain = execution_intent->domain;
+        certificate.row_semantics = execution_intent->row_semantics;
+        certificate.owner_namespace = graph_execution_owner_namespace;
+        certificate.owner_generation = graph_execution_owner_generation;
+        certificate.n_rows = ubatch->n_tokens;
+        certificate.n_sequences = ubatch->n_seqs_unq;
+        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    } else if (execution_intent != nullptr) {
+        LLAMA_LOG_ERROR("%s: unsupported graph execution intent\n", __func__);
+        return GGML_STATUS_FAILED;
+    } else if (ubatch != nullptr && ubatch_has_independent_rows(*ubatch)) {
         ggml_graph_execution_certificate certificate = {};
         certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
         certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
@@ -3256,8 +3723,18 @@ ggml_status llama_context::graph_compute(
             case LLAMA_CONTEXT_TYPE_DRAFT  : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT; break;
             case LLAMA_CONTEXT_TYPE_MTP    : certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;   break;
         }
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            certificate.flags = required_grouped_execution_flags(
+                model.moe_expert_cache_slots(), moe_required_grouped_execution_supported);
+        }
         status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     } else {
+        if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&
+                required_grouped_execution_flags(model.moe_expert_cache_slots(), moe_required_grouped_execution_supported) !=
+                    GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
+            LLAMA_LOG_ERROR("%s: unsupported speculative grouped MoE execution shape\n", __func__);
+            return GGML_STATUS_FAILED;
+        }
         status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     }
     if (status != GGML_STATUS_SUCCESS) {
@@ -4983,7 +5460,19 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
+    const int ret = ctx->decode(batch, nullptr);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_decode_ext(
+        llama_context * ctx,
+          llama_batch   batch,
+    const llama_decode_execution_intent * intent) {
+    const int ret = ctx->decode(batch, intent);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

@@ -19,8 +19,10 @@
 #include "../ggml/src/ggml-cuda/mmid.cuh"
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-impl.h"
+#include "../src/llama-batch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-model.h"
+#include "../src/llama-vocab.h"
 
 #include "ggml-alloc.h"
 #include "ggml-cuda.h"
@@ -65,6 +67,205 @@
         std::exit(1); \
     } \
 } while (0)
+
+struct mtp_batch_fixture {
+    std::vector<float> embd;
+    std::vector<llama_pos> pos;
+    std::vector<int32_t> n_seq_id;
+    std::vector<llama_seq_id> seq_id_data;
+    std::vector<llama_seq_id *> seq_id;
+    std::vector<int8_t> output;
+
+    void add(llama_seq_id sequence, llama_pos position) {
+        embd.push_back((float) embd.size());
+        pos.push_back(position);
+        n_seq_id.push_back(1);
+        seq_id_data.push_back(sequence);
+        output.push_back(1);
+    }
+
+    void add_span(llama_seq_id sequence, llama_pos first, uint32_t n_rows) {
+        for (uint32_t row = 0; row < n_rows; ++row) {
+            add(sequence, first + (llama_pos) row);
+        }
+    }
+
+    llama_batch batch() {
+        seq_id.resize(seq_id_data.size());
+        for (size_t row = 0; row < seq_id.size(); ++row) {
+            seq_id[row] = &seq_id_data[row];
+        }
+        llama_batch result = {};
+        result.n_tokens = (int32_t) pos.size();
+        result.embd = embd.data();
+        result.pos = pos.data();
+        result.n_seq_id = n_seq_id.data();
+        result.seq_id = seq_id.data();
+        result.logits = output.data();
+        return result;
+    }
+};
+
+static void check_speculative_sequential_splits(
+        mtp_batch_fixture & fixture,
+        llama_context_type context_type,
+        uint32_t n_ubatch,
+        bool equal,
+        uint32_t expected_ubatches) {
+    llama_vocab vocab;
+    llama_batch batch = fixture.batch();
+    const uint32_t row_semantics = llama_speculative_grouped_intent_test_access::classify_batch(batch);
+    CHECK(row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL);
+
+    llama_batch_allocr balloc(1);
+    CHECK(balloc.init(batch, vocab, nullptr, 1, 4, false));
+    uint32_t n_rows = 0;
+    uint32_t n_ubatches = 0;
+    while (true) {
+        llama_ubatch ubatch = equal ? balloc.split_equal(n_ubatch, true, 0) : balloc.split_simple(n_ubatch);
+        if (ubatch.n_tokens == 0) {
+            break;
+        }
+        CHECK(llama_speculative_grouped_intent_test_access::matches_ubatch(
+            context_type, ubatch, row_semantics));
+        n_rows += ubatch.n_tokens;
+        ++n_ubatches;
+    }
+    CHECK(n_rows == (uint32_t) batch.n_tokens && n_ubatches == expected_ubatches);
+}
+
+static void test_speculative_grouped_intent_splits() {
+    mtp_batch_fixture catch_up;
+    catch_up.add_span(0, 40, 3);
+    catch_up.add_span(1, 70, 1);
+    catch_up.add_span(2, 15, 2);
+    for (llama_context_type context_type : {LLAMA_CONTEXT_TYPE_DRAFT, LLAMA_CONTEXT_TYPE_MTP}) {
+        check_speculative_sequential_splits(catch_up, context_type, 4, false, 2);
+        check_speculative_sequential_splits(catch_up, context_type, 4, true, 3);
+    }
+
+    mtp_batch_fixture chain_head;
+    for (llama_seq_id sequence = 0; sequence < 4; ++sequence) {
+        chain_head.add_span(sequence, 100 + 10 * sequence, 3);
+    }
+    for (llama_context_type context_type : {LLAMA_CONTEXT_TYPE_DRAFT, LLAMA_CONTEXT_TYPE_MTP}) {
+        check_speculative_sequential_splits(chain_head, context_type, 5, false, 3);
+        check_speculative_sequential_splits(chain_head, context_type, 8, true, 2);
+    }
+
+    mtp_batch_fixture interleaved;
+    interleaved.add(0, 10);
+    interleaved.add(1, 20);
+    interleaved.add(0, 11);
+    CHECK(llama_speculative_grouped_intent_test_access::classify_batch(interleaved.batch()) ==
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID);
+
+    mtp_batch_fixture discontinuous;
+    discontinuous.add(0, 10);
+    discontinuous.add(0, 12);
+    CHECK(llama_speculative_grouped_intent_test_access::classify_batch(discontinuous.batch()) ==
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID);
+    fprintf(stderr, "test-moe-cache: speculative intent split lifecycle OK\n");
+}
+
+static void test_speculative_required_grouped_backend_capability(int device) {
+    ggml_backend_ptr cuda_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr cpu_backend(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+    CHECK(cuda_backend != nullptr && cpu_backend != nullptr);
+    const bool cuda_supported = llama_mtp_grouped_intent_test_access::backend_supported(cuda_backend.get());
+    const bool cpu_supported = llama_mtp_grouped_intent_test_access::backend_supported(cpu_backend.get());
+    CHECK(cuda_supported && !cpu_supported);
+    CHECK(llama_mtp_grouped_intent_test_access::flags(12, cuda_supported) ==
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    CHECK(llama_mtp_grouped_intent_test_access::flags(12, cpu_supported) ==
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+    CHECK(llama_mtp_grouped_intent_test_access::flags(0, true) ==
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+
+    std::array<llama_token, 2> implicit_tokens = {0, 0};
+    llama_batch implicit_batch = llama_batch_get_one(implicit_tokens.data(), 2);
+    CHECK(llama_mtp_grouped_intent_test_access::classify_batch(implicit_batch) ==
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID);
+
+    llama_vocab implicit_vocab;
+    llama_vocab_test_access::add_dummy_token(implicit_vocab);
+    llama_mtp_execution_policy implicit_sequential;
+    CHECK(llama_mtp_grouped_intent_test_access::policy_after_batch_init(
+        implicit_batch, implicit_vocab, 12, cuda_supported, implicit_sequential));
+    CHECK(implicit_sequential.preserve_intent && !implicit_sequential.fail_closed &&
+        implicit_sequential.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        implicit_sequential.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+
+    implicit_batch.n_tokens = 1;
+    llama_mtp_execution_policy implicit_independent;
+    CHECK(llama_mtp_grouped_intent_test_access::policy_after_batch_init(
+        implicit_batch, implicit_vocab, 12, cuda_supported, implicit_independent));
+    CHECK(implicit_independent.preserve_intent && !implicit_independent.fail_closed &&
+        implicit_independent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+        implicit_independent.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+
+    implicit_batch.n_tokens = 2;
+    llama_speculative_execution_policy draft_decoder;
+    CHECK(llama_speculative_grouped_intent_test_access::policy_after_batch_init(
+        LLAMA_CONTEXT_TYPE_DRAFT, implicit_batch, implicit_vocab, 12, cuda_supported, draft_decoder));
+    CHECK(draft_decoder.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        draft_decoder.preserve_intent && !draft_decoder.fail_closed &&
+        draft_decoder.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        draft_decoder.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+
+    std::array<float, 3> encoder_embd = {};
+    llama_batch encoder_batch = {};
+    encoder_batch.n_tokens = (int32_t) encoder_embd.size();
+    encoder_batch.embd = encoder_embd.data();
+    llama_speculative_execution_policy draft_encoder;
+    CHECK(llama_speculative_grouped_intent_test_access::policy_after_batch_init(
+        LLAMA_CONTEXT_TYPE_DRAFT, encoder_batch, implicit_vocab, 12, cuda_supported, draft_encoder, true));
+    CHECK(draft_encoder.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        draft_encoder.preserve_intent && !draft_encoder.fail_closed &&
+        draft_encoder.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        draft_encoder.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+
+    mtp_batch_fixture sequential;
+    sequential.add_span(0, 10, 2);
+    sequential.add_span(1, 20, 2);
+    const auto legacy_sequential = llama_mtp_grouped_intent_test_access::policy(
+        sequential.batch(), 12, cpu_supported);
+    CHECK(legacy_sequential.preserve_intent && !legacy_sequential.fail_closed &&
+        legacy_sequential.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        legacy_sequential.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+    const auto draft_legacy_sequential = llama_speculative_grouped_intent_test_access::policy(
+        LLAMA_CONTEXT_TYPE_DRAFT, sequential.batch(), 12, cpu_supported);
+    CHECK(draft_legacy_sequential.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        draft_legacy_sequential.preserve_intent && !draft_legacy_sequential.fail_closed &&
+        draft_legacy_sequential.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+        draft_legacy_sequential.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+
+    mtp_batch_fixture malformed;
+    malformed.add(0, 10);
+    malformed.add(1, 20);
+    malformed.add(0, 11);
+    const auto legacy_malformed = llama_mtp_grouped_intent_test_access::policy(
+        malformed.batch(), 12, cpu_supported);
+    CHECK(!legacy_malformed.preserve_intent && !legacy_malformed.fail_closed &&
+        legacy_malformed.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID &&
+        legacy_malformed.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+    const auto required_malformed = llama_mtp_grouped_intent_test_access::policy(
+        malformed.batch(), 12, cuda_supported);
+    CHECK(!required_malformed.preserve_intent && required_malformed.fail_closed &&
+        required_malformed.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID &&
+        required_malformed.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    const auto draft_legacy_malformed = llama_speculative_grouped_intent_test_access::policy(
+        LLAMA_CONTEXT_TYPE_DRAFT, malformed.batch(), 12, cpu_supported);
+    CHECK(draft_legacy_malformed.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        !draft_legacy_malformed.preserve_intent && !draft_legacy_malformed.fail_closed &&
+        draft_legacy_malformed.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+    const auto draft_required_malformed = llama_speculative_grouped_intent_test_access::policy(
+        LLAMA_CONTEXT_TYPE_DRAFT, malformed.batch(), 12, cuda_supported);
+    CHECK(draft_required_malformed.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+        !draft_required_malformed.preserve_intent && draft_required_malformed.fail_closed &&
+        draft_required_malformed.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    fprintf(stderr, "test-moe-cache: speculative required-grouped backend capability OK\n");
+}
 
 struct ggml_cuda_moe_grouped_context_test_access {
     static bool admission_closed(const ggml_cuda_moe_grouped_context & context) {
@@ -161,6 +362,10 @@ struct ggml_cuda_moe_grouped_context_test_access {
 
     static void poison_split_staging(ggml_cuda_moe_grouped_context & context, uint32_t calls) {
         context.poison_split_staging_for_test(calls);
+    }
+
+    static void fail_host_staged_evaluator(ggml_cuda_moe_grouped_context & context) {
+        context.fail_host_staged_evaluator_for_test();
     }
 
     static uint32_t split_staging_poison_calls(const ggml_cuda_moe_grouped_context & context) {
@@ -320,9 +525,12 @@ struct scheduler_certificate_probe {
 
     std::array<ggml_backend_t, 2> backends = {};
     std::array<enum ggml_status (*)(ggml_backend_t, ggml_cgraph *), 2> delegates = {};
-    std::array<record, 16> records = {};
+    std::array<void (*)(ggml_backend_t), 2> synchronize_delegates = {};
+    std::array<uint32_t, 2> synchronize_calls = {};
+    std::array<record, 24> records = {};
     uint32_t n_backends = 0;
     uint32_t calls = 0;
+    uint32_t fail_backend = UINT32_MAX;
 };
 
 static scheduler_certificate_probe * scheduler_certificate_probe_current = nullptr;
@@ -340,7 +548,24 @@ static enum ggml_status scheduler_certificate_graph_compute(ggml_backend_t backe
     probe.records[probe.calls].graph_uid = graph->uid;
     probe.records[probe.calls].backend_index = backend_index;
     ++probe.calls;
+    if (probe.fail_backend == backend_index) {
+        return GGML_STATUS_FAILED;
+    }
     return probe.delegates[backend_index](backend, graph);
+}
+
+static void scheduler_certificate_synchronize(ggml_backend_t backend) {
+    CHECK(scheduler_certificate_probe_current != nullptr);
+    auto & probe = *scheduler_certificate_probe_current;
+    uint32_t backend_index = 0;
+    while (backend_index < probe.n_backends && probe.backends[backend_index] != backend) {
+        ++backend_index;
+    }
+    CHECK(backend_index < probe.n_backends);
+    ++probe.synchronize_calls[backend_index];
+    if (probe.synchronize_delegates[backend_index] != nullptr) {
+        probe.synchronize_delegates[backend_index](backend);
+    }
 }
 
 static bool scheduler_certificate_eval_callback(ggml_tensor *, bool, void *) {
@@ -585,7 +810,8 @@ static void candidate_stamp_execution(
         uint32_t row_semantics,
         uint32_t n_rows,
         uint32_t n_sequences,
-        uint64_t source_graph_uid = 0) {
+        uint64_t source_graph_uid = 0,
+        uint32_t flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE) {
     CHECK(graph != nullptr);
     if (source_graph_uid == 0) {
         source_graph_uid = ggml_graph_next_uid();
@@ -596,6 +822,7 @@ static void candidate_stamp_execution(
     graph->execution_certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
     graph->execution_certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
     graph->execution_certificate.struct_size = sizeof(graph->execution_certificate);
+    graph->execution_certificate.flags = flags;
     graph->execution_certificate.domain = domain;
     graph->execution_certificate.row_semantics = row_semantics;
     graph->execution_certificate.n_rows = n_rows;
@@ -1629,11 +1856,14 @@ static void test_scheduler_execution_certificate() {
     scheduler_certificate_probe probe;
     probe.backends = {first_backend.get(), second_backend.get()};
     probe.delegates = {first_backend->iface.graph_compute, second_backend->iface.graph_compute};
+    probe.synchronize_delegates = {first_backend->iface.synchronize, second_backend->iface.synchronize};
     probe.n_backends = probe.backends.size();
     CHECK(probe.delegates[0] != nullptr && probe.delegates[1] != nullptr && scheduler_certificate_probe_current == nullptr);
     scheduler_certificate_probe_current = &probe;
     first_backend->iface.graph_compute = scheduler_certificate_graph_compute;
     second_backend->iface.graph_compute = scheduler_certificate_graph_compute;
+    first_backend->iface.synchronize = scheduler_certificate_synchronize;
+    second_backend->iface.synchronize = scheduler_certificate_synchronize;
 
     ggml_init_params params = {};
     params.mem_size = 24 * ggml_tensor_overhead() + ggml_graph_overhead_custom(16, false);
@@ -1715,8 +1945,52 @@ static void test_scheduler_execution_certificate() {
     CHECK(ggml_backend_sched_graph_compute(sched.get(), graph) == GGML_STATUS_SUCCESS);
     check_uncertified(10, false);
 
+    certificate.flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_SUCCESS);
+    CHECK(probe.calls == 14);
+    for (uint32_t record = 12; record < 14; ++record) {
+        CHECK(probe.records[record].certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED &&
+            probe.records[record].certificate.source_graph_uid == graph->uid &&
+            probe.records[record].certificate.split_graph_uid == probe.records[record].graph_uid);
+    }
+
+    ggml_backend_sched_set_eval_callback(sched.get(), scheduler_certificate_eval_callback, nullptr);
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_FAILED);
+    CHECK(probe.calls == 14);
+    ggml_backend_sched_set_eval_callback(sched.get(), nullptr, nullptr);
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), &callback_view, &certificate) == GGML_STATUS_FAILED);
+    CHECK(probe.calls == 14);
+    certificate.abi_version++;
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_FAILED);
+    CHECK(probe.calls == 14);
+    certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+
+    const auto synchronize_before = probe.synchronize_calls;
+    probe.fail_backend = probe.records[13].backend_index;
+    CHECK(ggml_backend_sched_graph_compute_async_ext(sched.get(), graph, &certificate) == GGML_STATUS_FAILED);
+    CHECK(probe.calls == 16 && probe.records[14].backend_index != probe.fail_backend &&
+        probe.records[15].backend_index == probe.fail_backend);
+    for (uint32_t backend_index = 0; backend_index < probe.n_backends; ++backend_index) {
+        CHECK(probe.synchronize_calls[backend_index] == synchronize_before[backend_index] + 1);
+    }
+    probe.fail_backend = UINT32_MAX;
+
+    certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT;
+    certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), graph, &certificate) == GGML_STATUS_SUCCESS);
+    CHECK(probe.calls == 18);
+    for (uint32_t record = 16; record < 18; ++record) {
+        CHECK(probe.records[record].certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT &&
+            probe.records[record].certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+            probe.records[record].certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED &&
+            probe.records[record].certificate.source_graph_uid == graph->uid &&
+            probe.records[record].certificate.split_graph_uid == probe.records[record].graph_uid);
+    }
+
     first_backend->iface.graph_compute = probe.delegates[0];
     second_backend->iface.graph_compute = probe.delegates[1];
+    first_backend->iface.synchronize = probe.synchronize_delegates[0];
+    second_backend->iface.synchronize = probe.synchronize_delegates[1];
     scheduler_certificate_probe_current = nullptr;
 }
 
@@ -1850,9 +2124,86 @@ static void test_graph_execution_certificate_policy() {
             GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, 2);
         check_execution_legacy(isolated, 1220 + domain);
     }
+    for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+        candidate_stamp_execution(isolated.graph, domain,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 2, 2, 0,
+            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        const auto required_coverage = candidate_certify_graph(registry, isolated.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(registry.prepare_graph_execution(
+            isolated.graph, 1225 + domain, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            required_coverage.epoch, required_coverage.nodes, required_coverage.mmid_count,
+            required_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(plan != nullptr && ggml_cuda_moe_required_grouped_plan_ready(*plan, execution) &&
+            execution.allows_graph_capture());
+        const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(*plan, 0, 0);
+        CHECK(capability.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
+            capability.device == 0 &&
+            capability.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT &&
+            capability.materialized_phase == GGML_CUDA_MMID_PHASE_DECODE);
+    }
+    const auto check_required_sequential_direct = [&](graph_case & current, uint32_t domain, uint64_t graph_uid,
+                                                       uint32_t n_rows, uint32_t n_sequences) {
+        candidate_stamp_execution(current.graph, domain,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, n_rows, n_sequences, 0,
+            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        const auto required_coverage = candidate_certify_graph(registry, current.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(registry.prepare_graph_execution(
+            current.graph, graph_uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            required_coverage.epoch, required_coverage.nodes, required_coverage.mmid_count,
+            required_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(plan != nullptr && ggml_cuda_moe_required_grouped_plan_ready(*plan, execution) &&
+            execution.allows_graph_capture());
+        const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(*plan, 0, 0);
+        ggml_cuda_mmid_capability_query native;
+        native.source_type = static_cast<ggml_type>(capability.source_type);
+        native.input_type = static_cast<ggml_type>(capability.input_type);
+        native.output_type = static_cast<ggml_type>(capability.output_type);
+        memcpy(native.source_ne, capability.source_ne, sizeof(native.source_ne));
+        memcpy(native.source_nb, capability.source_nb, sizeof(native.source_nb));
+        native.n_tokens = capability.n_tokens;
+        native.n_experts = capability.n_experts;
+        native.cc = capability.cc;
+        native.warp_size = capability.warp_size;
+        native.smpbo = capability.smpbo;
+        native.phase = static_cast<ggml_cuda_mmid_phase>(capability.phase);
+        native.mapping = static_cast<ggml_cuda_mmid_mapping>(capability.mapping);
+        native.use_mmq = capability.use_mmq != 0;
+        const auto native_capability = ggml_cuda_mmid_get_capability(native);
+        CHECK(capability.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
+            capability.device == 0 &&
+            capability.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT &&
+            capability.phase == GGML_CUDA_MMID_PHASE_PREFILL && capability.materialized_phase == capability.phase &&
+            capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_DIRECT &&
+            native_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            native_capability.selection == capability.consumer);
+    };
+    check_required_sequential_direct(isolated, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 1228, 2, 1);
+    check_required_sequential_direct(isolated, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, 1229, 2, 1);
     candidate_stamp_execution(isolated.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, 2, 2);
     check_execution_legacy(isolated, 1230);
+    candidate_stamp_execution(isolated.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, 2, 1, 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    {
+        const auto required_coverage = candidate_certify_graph(registry, isolated.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+        ggml_cuda_moe_graph_execution execution;
+        CHECK(registry.prepare_graph_execution(
+            isolated.graph, 1231, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+            required_coverage.epoch, required_coverage.nodes, required_coverage.mmid_count,
+            required_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(plan != nullptr && ggml_cuda_moe_required_grouped_plan_ready(*plan, execution) &&
+            execution.allows_graph_capture());
+        const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(*plan, 0, 0);
+        CHECK(capability.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
+            capability.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT &&
+            capability.materialized_phase == GGML_CUDA_MMID_PHASE_PREFILL);
+    }
     candidate_stamp_execution(isolated.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, 2, 2);
     {
@@ -1863,14 +2214,47 @@ static void test_graph_execution_certificate_policy() {
         CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_prefill_reason(plan, 0));
     }
 
+    auto np4_like = make_graph(2, 6);
+    check_required_sequential_direct(np4_like, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 1238, 6, 4);
+    check_required_sequential_direct(np4_like, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, 1239, 6, 4);
+
     auto too_many_routes = make_graph(4, 4);
     candidate_stamp_execution(too_many_routes.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 4, 4);
     check_execution_legacy(too_many_routes, 1240);
+    for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+        for (uint32_t row_semantics : {
+                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT,
+                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL}) {
+            const uint32_t n_sequences = row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ? 4 : 1;
+            candidate_stamp_execution(too_many_routes.graph, domain, row_semantics, 4, n_sequences, 0,
+                GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+            const auto required_coverage = candidate_certify_graph(registry, too_many_routes.graph);
+            std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+            ggml_cuda_moe_graph_execution execution;
+            CHECK(registry.prepare_graph_execution(
+                too_many_routes.graph, 1241 + 4 * domain + row_semantics,
+                GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
+                required_coverage.epoch, required_coverage.nodes, required_coverage.mmid_count,
+                required_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+            CHECK(plan != nullptr && ggml_cuda_moe_required_grouped_plan_ready(*plan, execution) &&
+                !execution.allows_graph_capture());
+            const auto capability = ggml_cuda_moe_grouped_context_test_access::graph_bank_capability(*plan, 0, 0);
+            const uint32_t phase = row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ?
+                GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
+            CHECK(capability.row_semantics == row_semantics && capability.device == 0 &&
+                capability.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_HOST_STAGED &&
+                capability.phase == GGML_CUDA_MMID_PHASE_PREFILL && capability.materialized_phase == phase &&
+                capability.consumer != GGML_CUDA_MMID_CONSUMER_UNSUPPORTED &&
+                (capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_DIRECT ||
+                    capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_SOURCE_MAP));
+        }
+    }
 
     auto stable = make_graph(2, 3);
-    candidate_stamp_execution(stable.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
-        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 3, 3);
+    candidate_stamp_execution(stable.graph, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 3, 3, 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
     const auto coverage = candidate_certify_graph(registry, stable.graph);
     std::shared_ptr<ggml_cuda_moe_graph_plan> stable_plan;
     ggml_cuda_moe_graph_execution prepared;
@@ -6814,9 +7198,12 @@ static void test_active_grouped_same_key_row_transitions(int device, uint32_t n_
         n_slots);
 }
 
-static void test_active_grouped_cache12_route_limit_transition(int device) {
+static void test_active_grouped_speculative_route_limit_transition(
+        int device, uint32_t n_slots, uint32_t domain) {
+    CHECK(domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT || domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
+    const bool sequential_fits = 2 * 8 <= n_slots;
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
     ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
     CHECK(reference_backend != nullptr && candidate_backend != nullptr);
@@ -6835,17 +7222,23 @@ static void test_active_grouped_cache12_route_limit_transition(int device) {
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
     initialize_active_grouped_dispatch_graphs({&reference_b1, &candidate_b1});
     initialize_active_grouped_dispatch_graphs({&reference_b2, &candidate_b2});
-    const auto disabled = candidate_snapshot(12, nullptr, 0);
+    const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
         GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     register_active_grouped_dispatch(
-        candidate_backend.get(), candidate_b1, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+        candidate_backend.get(), candidate_b1, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, n_slots);
     CHECK(candidate_b2.banks == candidate_b1.banks && candidate_b2.down == candidate_b1.down);
 
     ggml_tensor * shared_first_node = candidate_b1.graph->nodes[0];
     CHECK(shared_first_node != nullptr && shared_first_node->op != GGML_OP_MUL_MAT_ID);
     candidate_insert_graph_node(candidate_b2.graph, 0, shared_first_node);
     CHECK(candidate_b2.graph->nodes[0] == candidate_b1.graph->nodes[0]);
+    candidate_stamp_execution(candidate_b1.graph, domain,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 1, 1, 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    candidate_stamp_execution(candidate_b2.graph, domain,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, 2, 1, 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
     auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
     CHECK(context != nullptr);
 
@@ -6891,9 +7284,14 @@ static void test_active_grouped_cache12_route_limit_transition(int device) {
     (void) candidate_certify_graph(*context, candidate_b2.graph);
     run_checked(reference_b2, candidate_b2, 2);
     CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
-        active_grouped_legacy_op_count(candidate_backend.get(), false) == candidate_b1.banks.size());
-    if (capture_available) {
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
+    CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b2.graph, &state));
+    if (sequential_fits && capture_available) {
+        run_checked(reference_b2, candidate_b2, 0);
+        run_checked(reference_b2, candidate_b2, 1);
         CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate_b2.graph, &state));
+        CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete && state.moe_resource_fingerprint != 0);
+    } else {
         CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete && state.moe_resource_fingerprint == 0);
     }
 
@@ -6917,19 +7315,98 @@ static void test_active_grouped_cache12_route_limit_transition(int device) {
     CHECK(active_grouped_legacy_op_count(reference_backend.get(), true) +
         active_grouped_legacy_op_count(reference_backend.get(), false) == executed_passes * candidate_b1.banks.size());
     CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
-        active_grouped_legacy_op_count(candidate_backend.get(), false) == candidate_b1.banks.size());
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
-    const uint32_t grouped_passes = executed_passes - 1;
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
-    CHECK(telemetry.plan_calls == grouped_passes);
-    CHECK(telemetry.plan_compiles == 2 && telemetry.plan_reuses == grouped_passes - telemetry.plan_compiles);
-    CHECK(telemetry.calls == grouped_passes && telemetry.ready == grouped_passes && telemetry.completed == grouped_passes);
-    CHECK(telemetry.admitted_banks == grouped_passes * candidate_b1.banks.size());
+    CHECK(telemetry.plan_calls == executed_passes);
+    CHECK(telemetry.plan_compiles == 3 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles);
+    CHECK(telemetry.calls == executed_passes && telemetry.ready == executed_passes && telemetry.completed == executed_passes);
+    CHECK(telemetry.admitted_banks == executed_passes * candidate_b1.banks.size());
+    CHECK(telemetry.host_staged_calls == (sequential_fits ? 0 : 1) &&
+        telemetry.host_staged_ops == (sequential_fits ? 0 : candidate_b1.banks.size()) &&
+        telemetry.host_staged_split_ops <= telemetry.host_staged_ops &&
+        telemetry.strategy_switches == (sequential_fits ? 0 : 2) &&
+        telemetry.required_unsupported == 0);
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    if (domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT) {
+        const uint64_t legacy_before = active_grouped_legacy_op_count(candidate_backend.get());
+        candidate_b1.graph->execution_certificate.n_sequences = 0;
+        CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate_b1.graph) == GGML_STATUS_FAILED);
+        CHECK(active_grouped_legacy_op_count(candidate_backend.get()) == legacy_before);
+        const auto failure = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(failure.calls == 0 && failure.ready == 0 && failure.completed == 0 &&
+            failure.required_unsupported >= 1 && failure.fallback == 0 && failure.rollback == 0);
+        candidate_b1.graph->execution_certificate.n_sequences = 1;
+    }
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, capture_available ?
-        "test-moe-cache: shared-bank cache12 K8 B1/B2-legacy/B1 capture transition OK\n" :
-        "test-moe-cache: shared-bank cache12 K8 B1/B2-legacy/B1 direct transition OK (CUDA graphs unavailable)\n");
+        "test-moe-cache: cache%u domain%u independent/sequential/independent capture transition OK\n" :
+        "test-moe-cache: cache%u domain%u independent/sequential/independent direct transition OK (CUDA graphs unavailable)\n",
+        n_slots, domain);
+}
+
+static void test_active_grouped_host_staged_failure_cleanup(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+
+    auto reference = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(device), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
+    auto candidate = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 128, 8);
+    initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MTP,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, 2, 1, 0,
+        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    CHECK(context != nullptr);
+    const auto coverage = candidate_certify_graph(*context, candidate.graph);
+    CHECK(coverage.epoch != 0 && coverage.mmid_count == candidate.banks.size());
+
+    set_active_grouped_dispatch_logits({&reference, &candidate}, 2);
+    const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+    std::vector<float> sentinel(ggml_nelements(candidate.output), -12288.0f);
+    ggml_backend_tensor_set(candidate.output, sentinel.data(), 0, ggml_nbytes(candidate.output));
+    ggml_cuda_moe_candidate_group_key key;
+    CHECK(context->find_down_group_key(candidate.down, &key));
+    ggml_cuda_moe_grouped_context_test_access::fail_host_staged_evaluator(*context);
+    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate.graph) == GGML_STATUS_FAILED);
+    ggml_backend_synchronize(candidate_backend.get());
+    std::vector<float> failed_output(sentinel.size());
+    ggml_backend_tensor_get(candidate.output, failed_output.data(), 0, ggml_nbytes(candidate.output));
+    CHECK(failed_output == sentinel && !ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
+    const auto failed = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(failed.registered == 1 && failed.covered == 1 && failed.plan_calls == 1 &&
+        failed.calls == 1 && failed.ready == 1 && failed.completed == 0 &&
+        failed.host_staged_calls == 1 && failed.host_staged_ops == 0 &&
+        failed.finish_error >= 1 && failed.required_unsupported >= 1);
+
+    const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+    check_active_grouped_exact_output(expected, actual);
+    ggml_cuda_moe_grouped_acquisition acquisition;
+    ggml_cuda_moe_grouped_resource_info info;
+    CHECK(context->acquire_group_resources(key, &acquisition) &&
+        context->get_group_resources(acquisition, &info) && !info.transaction_active);
+    ggml_cuda_graph_capture_state_for_test state = {};
+    CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &state));
+    CHECK(state.graph == 0 && state.instance == 0 && state.moe_resource_fingerprint == 0);
+    const auto recovered = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(recovered.registered == 1 && recovered.covered == 1 && recovered.plan_calls == 1 &&
+        recovered.calls == 1 && recovered.ready == 1 && recovered.completed == 1 &&
+        recovered.host_staged_calls == 1 && recovered.host_staged_ops == candidate.banks.size() &&
+        recovered.required_unsupported == 0 && recovered.prepare_error == 0 && recovered.finish_error == 0);
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: required host-staged evaluator cleanup OK\n");
 }
 
 static void test_active_grouped_legacy_phase_telemetry(int device) {
@@ -7078,6 +7555,15 @@ static void test_active_grouped_stream_coherence_fallback(int device) {
 
     set_active_grouped_dispatch_logits({&reference, &candidate}, 2);
     const auto fallback_expected = run_graph(reference_backend.get(), reference);
+    auto required_certificate = certificate;
+    required_certificate.flags = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
+    required_certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;
+    CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), candidate.graph, &required_certificate) == GGML_STATUS_FAILED);
+    CHECK(active_grouped_legacy_op_count(candidate_backend.get()) == legacy_before);
+    const auto required_failure = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(required_failure.registered == 1 && required_failure.covered == 1 && required_failure.plan_calls == 1 &&
+        required_failure.calls == 0 && required_failure.ready == 0 && required_failure.completed == 0 &&
+        required_failure.required_unsupported >= 1);
     CHECK(ggml_backend_sched_graph_compute_ext(sched.get(), candidate.graph, &certificate) == GGML_STATUS_SUCCESS);
     std::vector<float> fallback_actual(ggml_nelements(candidate.output));
     ggml_backend_tensor_get(candidate.output, fallback_actual.data(), 0, ggml_nbytes(candidate.output));
@@ -7141,7 +7627,11 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_q4k_eviction_refill(device);
     test_active_grouped_same_key_row_transitions(device, 48);
     test_active_grouped_same_key_row_transitions(device, 138);
-    test_active_grouped_cache12_route_limit_transition(device);
+    for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+        test_active_grouped_speculative_route_limit_transition(device, 12, domain);
+        test_active_grouped_speculative_route_limit_transition(device, 48, domain);
+    }
+    test_active_grouped_host_staged_failure_cleanup(device);
     test_active_grouped_legacy_phase_telemetry(device);
     test_active_grouped_stream_coherence_fallback(device);
 }
@@ -7473,6 +7963,12 @@ static void test_active_grouped_dispatch_types_case(
         ggml_cuda_moe_grouped_acquisition resource;
         ggml_cuda_moe_grouped_transaction held;
         CHECK(context->find_down_group_key(first.down, &key));
+        const uint64_t original_graph_uid = first.graph->uid;
+        const auto original_certificate = first.graph->execution_certificate;
+        candidate_stamp_execution(first.graph, GGML_GRAPH_EXECUTION_DOMAIN_MTP,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, first.n_rows, first.n_rows, 0,
+            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        CHECK(candidate_certify_graph(*context, first.graph).epoch != 0);
         CHECK(context->acquire_group_resources(key, &resource));
         CHECK(context->begin_group_transaction(resource, &held));
         std::atomic<bool> replacement_started{false};
@@ -7499,6 +7995,8 @@ static void test_active_grouped_dispatch_types_case(
         std::vector<float> preserved_output(ggml_nelements(first.output));
         ggml_backend_tensor_get(first.output, preserved_output.data(), 0, ggml_nbytes(first.output));
         CHECK(preserved_output == first_output);
+        first.graph->uid = original_graph_uid;
+        first.graph->execution_certificate = original_certificate;
         const auto restored_input = cached_fusion_test_data(first.input, 131);
         ggml_backend_tensor_set(first.input, restored_input.data(), 0, restored_input.size());
         CHECK(context->end_group_transaction(held));
@@ -7514,6 +8012,7 @@ static void test_active_grouped_dispatch_types_case(
         CHECK(replacement_telemetry.ready_min == 1 && replacement_telemetry.ready_max == 1);
         CHECK(replacement_telemetry.completed_min == 1 && replacement_telemetry.completed_max == 1);
         CHECK(replacement_telemetry.h2d_banks == 4 * first.banks.size());
+        CHECK(replacement_telemetry.required_unsupported >= 1);
 
         CHECK(run_active_grouped_dispatch(first_backend.get(), first, 4, false) == first_output);
         const auto disabled_snapshot = candidate_snapshot(n_slots, nullptr, 0);
@@ -10317,6 +10816,14 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
         b4_direct.selection == GGML_CUDA_MMID_CONSUMER_MMVQ &&
         b4_mapped.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
         b4_mapped.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
+    const auto b112_direct = native_mmid_capability(
+        device, direct_weights.gate_up, 112, GGML_CUDA_MMID_MAPPING_DIRECT);
+    const auto b112_mapped = native_mmid_capability(
+        device, direct_weights.gate_up, 112, GGML_CUDA_MMID_MAPPING_SOURCE_MAP);
+    CHECK(b112_direct.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        b112_direct.selection == GGML_CUDA_MMID_CONSUMER_MMQ &&
+        b112_mapped.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        b112_mapped.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
 
     for (uint32_t n_slots : {12u, 48u}) {
         ggml_backend_cuda_moe_set_cache_slots(n_slots);
@@ -10339,6 +10846,14 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
         run_gemma_q4_parity_case(
             direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
             n_slots == 12 ? "cache12 B4" : "cache48 B4", 4, 24);
+        if (n_slots == 48) {
+            run_gemma_q4_parity_case(
+                direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+                "cache48 B112 sparse", 112, 96);
+            run_gemma_q4_parity_case(
+                direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+                "cache48 B136 sparse fixup", 136, 96);
+        }
     }
     ggml_backend_cuda_moe_set_cache_slots(old_slots);
     fprintf(stderr, "test-moe-cache: opt-in Gemma Q4_0 cached CUDA parity diagnostic OK\n");
@@ -11503,6 +12018,9 @@ int main(int argc, char ** argv) {
     if (grouped_multirow_only) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
+        test_speculative_grouped_intent_splits();
+        test_graph_execution_certificate_policy();
+        test_speculative_required_grouped_backend_capability(dev);
         test_active_grouped_multirow_graph_modes(dev);
         return 0;
     }
@@ -11528,6 +12046,7 @@ int main(int argc, char ** argv) {
         test_active_grouped_legacy_phase_telemetry(dev);
         return 0;
     }
+    test_speculative_grouped_intent_splits();
     test_candidate_graph_coverage_ledger();
     test_candidate_graph_inventory_reuse();
     test_mmid_capabilities();
@@ -11546,6 +12065,7 @@ int main(int argc, char ** argv) {
 
     int dev = 0;
     CUDA_OK(cudaGetDevice(&dev));
+    test_speculative_required_grouped_backend_capability(dev);
     if (grouped_bench) {
         test_grouped_decode(dev);
         test_grouped_decode_benchmark(dev);
