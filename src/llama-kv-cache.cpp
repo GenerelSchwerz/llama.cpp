@@ -1351,6 +1351,18 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
+uint32_t llama_kv_cache::get_n_shift() const {
+    // a cell past the live extent is empty, and is roped when it is written, so the shift can skip it
+    // with several streams the per-stream extents are not contiguous in the cache, so shift all of it
+    if (n_stream > 1) {
+        return get_size();
+    }
+
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    return std::min(get_size(), std::max(n_pad_cur, GGML_PAD(v_cells[0].used_max_p1(), n_pad_cur)));
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     uint32_t result = 0;
 
@@ -1690,11 +1702,14 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
 
     int32_t * data = (int32_t *) dst->data;
 
+    // the graph ropes only the first get_n_shift() cells of each stream
+    const uint32_t n_shift = (uint32_t) dst->ne[0] / n_stream;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[s];
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            data[s*cells.size() + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
+        for (uint32_t i = 0; i < n_shift; ++i) {
+            data[s*n_shift + i] = cells.is_empty(i) ? 0 : cells.get_shift(i);
         }
     }
 }
@@ -2320,7 +2335,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     auto inp = std::make_unique<llm_graph_input_k_shift>(this);
 
-    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
+    const uint32_t n_shift = get_n_shift();
+
+    inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) n_shift*n_stream);
     ggml_set_input(inp->k_shift);
 
     inp->k_rot = build_input_k_rot(ctx);
@@ -2348,7 +2365,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
         ggml_tensor * k =
             ggml_view_3d(ctx, layer.k,
-                n_rot, n_head_kv, get_size()*n_stream,
+                n_rot, n_head_kv, n_shift*n_stream,
                 ggml_row_size(layer.k->type, n_embd_head_k),
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
