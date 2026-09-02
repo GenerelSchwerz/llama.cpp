@@ -2,9 +2,9 @@
 
 > **Maintained fork.** This branch carries extra features on top of upstream
 > llama.cpp. What our fork adds for users - new flags and their defaults, plus
-> the optimizations that run with no flag - is documented in
-> [docs/llama-dev-guide.md](docs/llama-dev-guide.md). The rest of this README is
-> upstream's, unchanged.
+> the optimizations that run with no flag - is documented under
+> [docs/fork/](docs/fork/README.md). Fork-specific docs live there; the rest of
+> this README is upstream's, unchanged.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 

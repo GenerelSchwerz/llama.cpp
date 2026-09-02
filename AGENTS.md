@@ -245,6 +245,7 @@ General documentations:
 - [Existing issues](https://github.com/ggml-org/llama.cpp/issues) and [Existing PRs](https://github.com/ggml-org/llama.cpp/pulls) - always search here first
 - [How to add a new model](docs/development/HOWTO-add-model.md)
 - [PR template](.github/pull_request_template.md)
+- [Fork feature guide](docs/fork/README.md) - user-facing flags and optimizations this fork adds over upstream. `docs/fork/` is where all fork-specific docs go; keep upstream docs in `docs/`. When a change adds or renames a user-facing flag, env var, or default, update this guide.
 
 Server:
 - [Build documentation](docs/build.md)

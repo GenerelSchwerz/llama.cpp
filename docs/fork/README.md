@@ -1,5 +1,8 @@
 # llama/dev fork - user guide to the extra features
 
+`docs/fork/` is the home for docs specific to this maintained fork. Upstream docs
+stay in `docs/`; fork-only material goes here.
+
 This page lists everything the `llama/dev` branch adds on top of upstream
 `master` that a user can see or set. It covers new command-line flags (what they
 do, when to use them, how to use them), the optimizations that run on their own
@@ -303,7 +306,7 @@ shorter. Off by default. Works together with `--phase-aware-workspace`.
 
 These give the draft context its own settings instead of always inheriting the
 target's, and add a memory cap for the MTP recurrent path. See
-[docs/speculative.md](speculative.md) for the full speculative feature set.
+[docs/speculative.md](../speculative.md) for the full speculative feature set.
 
 ### `--spec-draft-ubatch-size N` (`--ubatch-size-draft`, `-ubd`)
 
@@ -337,7 +340,7 @@ deeper partial-acceptance path.
 more memory than you want to spend. Capped replay cannot be combined with
 Eagle3, DFlash, or DSpark. The server rejects an unsupported device layout at
 startup rather than falling back. Details:
-[docs/speculative.md#capped-mtp-recurrent-planes](speculative.md#capped-mtp-recurrent-planes).
+[docs/speculative.md#capped-mtp-recurrent-planes](../speculative.md#capped-mtp-recurrent-planes).
 
 ### Shared target / MTP workspaces (no flag)
 
