@@ -10317,6 +10317,14 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
         b4_direct.selection == GGML_CUDA_MMID_CONSUMER_MMVQ &&
         b4_mapped.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
         b4_mapped.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
+    const auto b112_direct = native_mmid_capability(
+        device, direct_weights.gate_up, 112, GGML_CUDA_MMID_MAPPING_DIRECT);
+    const auto b112_mapped = native_mmid_capability(
+        device, direct_weights.gate_up, 112, GGML_CUDA_MMID_MAPPING_SOURCE_MAP);
+    CHECK(b112_direct.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        b112_direct.selection == GGML_CUDA_MMID_CONSUMER_MMQ &&
+        b112_mapped.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        b112_mapped.selection == GGML_CUDA_MMID_CONSUMER_MMQ);
 
     for (uint32_t n_slots : {12u, 48u}) {
         ggml_backend_cuda_moe_set_cache_slots(n_slots);
@@ -10339,6 +10347,14 @@ static void test_gemma_q4_cached_cuda_parity(int device) {
         run_gemma_q4_parity_case(
             direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
             n_slots == 12 ? "cache12 B4" : "cache48 B4", 4, 24);
+        if (n_slots == 48) {
+            run_gemma_q4_parity_case(
+                direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+                "cache48 B112 sparse", 112, 96);
+            run_gemma_q4_parity_case(
+                direct_backend.get(), direct_weights, cached_backend.get(), cached_weights,
+                "cache48 B136 sparse fixup", 136, 96);
+        }
     }
     ggml_backend_cuda_moe_set_cache_slots(old_slots);
     fprintf(stderr, "test-moe-cache: opt-in Gemma Q4_0 cached CUDA parity diagnostic OK\n");
