@@ -1002,6 +1002,17 @@ static void test_speculative_limits(size_t seed) {
             GGML_ASSERT(get_mtp_state(spec.get(), seq_id) == canonical_pending[seq_id]);
         }
 
+        GGML_ASSERT(llama_memory_seq_rm(draft_mem, 0, -1, -1));
+        GGML_ASSERT(llama_state_seq_set_data_ext(
+                draft_retained.get(), proposal_state[0].data(), proposal_state[0].size(),
+                0, LLAMA_STATE_SEQ_FLAGS_NONE) == proposal_state[0].size());
+        GGML_ASSERT(common_speculative_set_mtp_state(spec.get(), 0, pending_initial[0]));
+        GGML_ASSERT(common_speculative_retain_draft_state(spec.get(), 0));
+        GGML_ASSERT(common_speculative_has_deferred_accept(spec.get(), 0));
+        GGML_ASSERT(common_speculative_set_mtp_state(spec.get(), 0, {}));
+        GGML_ASSERT(!common_speculative_has_deferred_accept(spec.get(), 0));
+        GGML_ASSERT(llama_memory_seq_rm(draft_mem, 0, -1, -1));
+
         llama_batch_free(verify);
     }
 }

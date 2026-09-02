@@ -589,8 +589,9 @@ struct server_slot {
                 prompt_clear();
             });
 
-            // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child() && !cleared_pending_replay) {
+            // do not keep context of child slots or an unfinished retained draft
+            if (!cleared_pending_replay &&
+                    ((task && task->is_child()) || common_speculative_has_deferred_accept(spec, id))) {
                 prompt_clear();
             }
 
