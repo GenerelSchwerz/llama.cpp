@@ -6126,6 +6126,11 @@ static void test_active_grouped_multirow_graph_modes_case(
     uint64_t captured_semantic_key = 0;
     uint64_t captured_resource_fingerprint = 0;
     const uint64_t n_routes = n_used * n_rows;
+    const bool f3_skipped = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+        expected_consumer == GGML_CUDA_MMID_CONSUMER_MMVQ &&
+        candidate.banks[0]->type == candidate.banks[1]->type &&
+        ggml_are_same_shape(candidate.banks[0], candidate.banks[1]) &&
+        ggml_are_same_stride(candidate.banks[0], candidate.banks[1]);
     bool capture_available = false;
     bool transition_executed = false;
     uint32_t executed_passes = 0;
@@ -6139,7 +6144,7 @@ static void test_active_grouped_multirow_graph_modes_case(
         }
         const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
         const uint64_t clock_pass = transition_executed ? pass - 1 : pass + 1;
-        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes * clock_pass, false);
+        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes * clock_pass, f3_skipped);
         ++executed_passes;
         check_active_grouped_exact_output(expected, actual);
         if (pass == 0) {
@@ -6208,7 +6213,7 @@ static void test_active_grouped_multirow_graph_modes_case(
     if (transition_executed && !capture_available) {
         set_active_grouped_dispatch_logits({&reference, &candidate}, 1);
         const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes, false);
+        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes, f3_skipped);
         ++executed_passes;
         check_active_grouped_exact_output(expected, actual);
     }
@@ -6242,7 +6247,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             (void) candidate_certify_graph(*context, candidate.graph);
             for (uint32_t pass = 0; pass < 2; ++pass) {
                 expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-                actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+                actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, f3_skipped);
                 check_active_grouped_exact_output(expected, actual);
             }
             ggml_cuda_graph_capture_state_for_test state;
@@ -6290,7 +6295,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
         (void) candidate_certify_graph(*context, candidate.graph);
         expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-        actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+        actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, f3_skipped);
         check_active_grouped_exact_output(expected, actual);
         CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
         CHECK(invalidated_graph.graph == 0 && invalidated_graph.instance == 0 &&
@@ -6464,16 +6469,21 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
         std::vector<float> up;
         std::vector<float> output;
     };
-    const auto run_graph = [&](ggml_backend_t backend, active_grouped_dispatch_graph & graph, uint64_t expected_clock) {
+    const auto run_graph = [&](ggml_backend_t backend, active_grouped_dispatch_graph & graph,
+                               uint64_t expected_clock, bool f3_skipped) {
         active_values values;
-        values.output = run_active_grouped_dispatch(backend, graph, expected_clock, false);
-        values.gate = active_grouped_tensor_values(graph.gate_output);
-        values.up = active_grouped_tensor_values(graph.up_output);
+        values.output = run_active_grouped_dispatch(backend, graph, expected_clock, f3_skipped);
+        if (!f3_skipped) {
+            values.gate = active_grouped_tensor_values(graph.gate_output);
+            values.up = active_grouped_tensor_values(graph.up_output);
+        }
         return values;
     };
     const auto check_values = [](const active_values & expected, const active_values & actual) {
-        check_active_grouped_exact_output(expected.gate, actual.gate);
-        check_active_grouped_exact_output(expected.up, actual.up);
+        if (!expected.gate.empty() && !actual.gate.empty()) {
+            check_active_grouped_exact_output(expected.gate, actual.gate);
+            check_active_grouped_exact_output(expected.up, actual.up);
+        }
         check_active_grouped_exact_output(expected.output, actual.output);
     };
     ggml_cuda_moe_candidate_group_key group_key;
@@ -6497,9 +6507,16 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
         ++total_passes;
         set_active_grouped_dispatch_routes(
             std::vector<active_grouped_dispatch_graph *>(graphs.begin(), graphs.end()), routes);
-        const auto direct = run_graph(direct_backend.get(), *graphs[0], 0);
-        const auto legacy = run_graph(legacy_backend.get(), *graphs[1], 0);
-        const auto grouped = run_graph(grouped_backend.get(), *graphs[2], host.clock);
+        const auto direct_capability = native_mmid_capability(
+            device, graphs[0]->banks[0], graphs[0]->n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
+        const bool direct_f3_skipped = direct_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            direct_capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+        const bool grouped_f3_skipped = graphs[2]->n_rows == primary_rows ?
+            primary_native.selection == GGML_CUDA_MMID_CONSUMER_MMVQ :
+            b5_native.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+        const auto direct = run_graph(direct_backend.get(), *graphs[0], 0, direct_f3_skipped);
+        const auto legacy = run_graph(legacy_backend.get(), *graphs[1], 0, false);
+        const auto grouped = run_graph(grouped_backend.get(), *graphs[2], host.clock, grouped_f3_skipped);
         check_values(direct, legacy);
         check_values(direct, grouped);
         for (auto * graph : graphs) {
@@ -7276,7 +7293,10 @@ static void test_active_grouped_dispatch_types_case(
     std::vector<float> reference_output;
     std::vector<float> first_output;
     std::vector<float> second_output;
-    const bool f3_skipped = n_rows == 1 && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+    const auto gate_capability = native_mmid_capability(0, first.banks[0], n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
+    const bool f3_skipped = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
+        gate_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+        gate_capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ &&
         first.banks[0]->type == first.banks[1]->type && ggml_are_same_shape(first.banks[0], first.banks[1]) &&
         ggml_are_same_stride(first.banks[0], first.banks[1]);
     for (int pass = 0; pass < 4; ++pass) {
