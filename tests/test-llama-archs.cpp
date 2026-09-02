@@ -889,6 +889,7 @@ static void test_speculative_limits(size_t seed) {
 
         GGML_ASSERT(result_short.size() == 1);
         GGML_ASSERT(result_long.size() == 2);
+        GGML_ASSERT(!common_speculative_retain_draft_state(spec.get(), 1));
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 1, 0, -1));
     }
@@ -904,6 +905,104 @@ static void test_speculative_limits(size_t seed) {
 
         GGML_ASSERT(result.empty());
         GGML_ASSERT(llama_memory_seq_rm(llama_get_memory(draft.get()), 0, 0, -1));
+    }
+
+    {
+        llama_context_ptr target_retained = make_phase_workspace_context(
+                model.get(), LLAMA_CONTEXT_TYPE_DEFAULT, nullptr, n_seq);
+        llama_context_ptr draft_retained = make_phase_workspace_context(
+                model.get(), LLAMA_CONTEXT_TYPE_MTP, nullptr, n_seq);
+        GGML_ASSERT(target_retained && draft_retained);
+        GGML_ASSERT(llama_get_ctx_other(draft_retained.get()) == nullptr);
+
+        common_params_speculative params;
+        params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        params.draft.n_max = 1;
+        params.draft.n_min = 0;
+        params.draft.p_min = 0.0f;
+        params.draft.ctx_tgt = target_retained.get();
+        params.draft.ctx_dft = draft_retained.get();
+        common_speculative_ptr spec(common_speculative_init(params, n_seq));
+        GGML_ASSERT(spec);
+
+        llama_tokens proposals[2];
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            common_speculative_get_draft_params(spec.get(), seq_id) = {
+                true, 1, 0, 2 + seq_id, &prompt_none, &proposals[seq_id],
+            };
+        }
+        common_speculative_draft(spec.get());
+        GGML_ASSERT(proposals[0].size() == 1 && proposals[1].size() == 1);
+
+        auto get_seq_state = [](llama_context * ctx, llama_seq_id seq_id) {
+            const size_t size = llama_state_seq_get_size_ext(ctx, seq_id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            GGML_ASSERT(size > 0);
+            std::vector<uint8_t> data(size);
+            GGML_ASSERT(llama_state_seq_get_data_ext(
+                    ctx, data.data(), data.size(), seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == size);
+            return data;
+        };
+        auto get_mtp_state = [](common_speculative * spec, llama_seq_id seq_id) {
+            std::vector<uint8_t> data;
+            GGML_ASSERT(common_speculative_get_mtp_state(spec, seq_id, data));
+            return data;
+        };
+
+        std::vector<uint8_t> proposal_state[2];
+        std::vector<uint8_t> pending_initial[2];
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            proposal_state[seq_id] = get_seq_state(draft_retained.get(), seq_id);
+            pending_initial[seq_id] = get_mtp_state(spec.get(), seq_id);
+        }
+
+        llama_batch verify = llama_batch_init(4, 0, 1);
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            common_batch_add(verify, 2 + seq_id, 0, { seq_id }, true);
+            common_batch_add(verify, proposals[seq_id][0], 1, { seq_id }, true);
+        }
+        GGML_ASSERT(llama_decode(target_retained.get(), verify) == 0);
+        llama_synchronize(target_retained.get());
+
+        auto * draft_mem = llama_get_memory(draft_retained.get());
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            GGML_ASSERT(llama_memory_seq_rm(draft_mem, seq_id, -1, -1));
+            GGML_ASSERT(common_speculative_set_mtp_state(spec.get(), seq_id, pending_initial[seq_id]));
+        }
+        GGML_ASSERT(common_speculative_process(spec.get(), verify));
+        common_speculative_accept(spec.get(), 0, 0);
+        common_speculative_accept(spec.get(), 1, 1);
+        GGML_ASSERT(llama_memory_seq_rm(draft_mem, 0, 1, -1));
+        GGML_ASSERT(llama_memory_seq_rm(draft_mem, 1, 2, -1));
+
+        std::vector<uint8_t> canonical_state[2];
+        std::vector<uint8_t> canonical_pending[2];
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            canonical_state[seq_id] = get_seq_state(draft_retained.get(), seq_id);
+            canonical_pending[seq_id] = get_mtp_state(spec.get(), seq_id);
+
+            GGML_ASSERT(llama_memory_seq_rm(draft_mem, seq_id, -1, -1));
+            GGML_ASSERT(llama_state_seq_set_data_ext(
+                    draft_retained.get(), proposal_state[seq_id].data(), proposal_state[seq_id].size(),
+                    seq_id, LLAMA_STATE_SEQ_FLAGS_NONE) == proposal_state[seq_id].size());
+            GGML_ASSERT(common_speculative_set_mtp_state(spec.get(), seq_id, pending_initial[seq_id]));
+            GGML_ASSERT(common_speculative_retain_draft_state(spec.get(), seq_id));
+        }
+
+        GGML_ASSERT(common_speculative_process(spec.get(), verify));
+        common_speculative_accept(spec.get(), 0, 0);
+        common_speculative_accept(spec.get(), 1, 1);
+        GGML_ASSERT(common_speculative_has_deferred_accept(spec.get(), 0));
+        GGML_ASSERT(common_speculative_has_deferred_accept(spec.get(), 1));
+        GGML_ASSERT(common_speculative_finish_accept(spec.get(), 0, 0));
+        GGML_ASSERT(common_speculative_finish_accept(spec.get(), 1, 1));
+
+        for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
+            GGML_ASSERT(!common_speculative_has_deferred_accept(spec.get(), seq_id));
+            GGML_ASSERT(get_seq_state(draft_retained.get(), seq_id) == canonical_state[seq_id]);
+            GGML_ASSERT(get_mtp_state(spec.get(), seq_id) == canonical_pending[seq_id]);
+        }
+
+        llama_batch_free(verify);
     }
 }
 

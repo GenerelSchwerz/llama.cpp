@@ -3244,10 +3244,19 @@ private:
 
             slot.stats.n_draft_tokens += draft.size();
 
-            // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
+            const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
+            auto can_rewind_directly = [](common_context_seq_rm_type type, llama_context * ctx, size_t n_tokens) {
+                return type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                        (type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_tokens <= llama_n_rs_seq(ctx));
+            };
+            const bool retain_draft_state = !capped_mtp && draft.size() == 1 &&
+                    can_rewind_directly(ctx_tgt_seq_rm_type, ctx_tgt, draft.size()) &&
+                    can_rewind_directly(ctx_dft_seq_rm_type, ctx_dft, draft.size()) &&
+                    common_speculative_retain_draft_state(spec.get(), slot.id);
+
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-            if (ctx_dft) {
+            if (ctx_dft && !retain_draft_state) {
                 if (use_ckpt_dft) {
                     ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
@@ -3258,7 +3267,6 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
                 if (capped_mtp) {
                     slot.spec_replay.arm_mtp_gpu_snapshots();
                 }
@@ -4078,9 +4086,6 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
-        // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
-        //       for now, always re-evaluate for simplicity
-        //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
             try {
@@ -4370,7 +4375,19 @@ private:
                         SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                     }
 
-                    common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                    const uint16_t n_accepted = accepted.size() - 1;
+                    common_speculative_accept(spec.get(), slot.id, n_accepted);
+
+                    if (common_speculative_has_deferred_accept(spec.get(), slot.id)) {
+                        bool finish_ok = false;
+                        queue_tasks.yield_to_queue([&]() {
+                            finish_ok = common_speculative_finish_accept(spec.get(), slot.id, n_accepted);
+                        });
+                        if (!finish_ok) {
+                            slot.prompt_clear();
+                            throw std::runtime_error("failed to finish speculative draft state");
+                        }
+                    }
 
                     slot.spec_draft = std::move(accepted);
                     slot.spec_replay.discard_mtp_gpu_snapshot_arm();
