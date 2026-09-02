@@ -94,8 +94,14 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t
 bool common_speculative_retain_draft_state(common_speculative * spec, llama_seq_id seq_id);
 
 // complete any deferred draft-context update after acceptance
+struct common_speculative_finish_accept_params {
+    llama_seq_id seq_id;
+    uint16_t n_accepted;
+};
+
 bool common_speculative_has_deferred_accept(const common_speculative * spec, llama_seq_id seq_id);
 bool common_speculative_finish_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted);
+bool common_speculative_finish_accept(common_speculative * spec, const std::vector<common_speculative_finish_accept_params> & params);
 
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);

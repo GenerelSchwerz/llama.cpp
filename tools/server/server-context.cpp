@@ -4255,6 +4255,14 @@ private:
             slot.print_timings_tg();
         });
 
+        struct speculative_completion {
+            server_slot * slot;
+            size_t n_draft;
+        };
+        std::vector<speculative_completion> speculative_completions;
+        std::vector<common_speculative_finish_accept_params> deferred_accepts;
+        std::vector<server_slot *> deferred_slots;
+
         // speculative decoding - main model sample and accept
         iterate_post_decode([&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
@@ -4380,20 +4388,74 @@ private:
                     common_speculative_accept(spec.get(), slot.id, n_accepted);
 
                     if (common_speculative_has_deferred_accept(spec.get(), slot.id)) {
-                        bool finish_ok = false;
-                        queue_tasks.yield_to_queue([&]() {
-                            finish_ok = common_speculative_finish_accept(spec.get(), slot.id, n_accepted);
-                        });
-                        if (!finish_ok) {
-                            slot.prompt_clear();
-                            throw std::runtime_error("failed to finish speculative draft state");
-                        }
+                        deferred_accepts.push_back({ slot.id, n_accepted });
+                        deferred_slots.push_back(&slot);
                     }
 
                     slot.spec_draft = std::move(accepted);
                     slot.spec_replay.discard_mtp_gpu_snapshot_arm();
                 }
             }
+
+            speculative_completions.push_back({ &slot, n_draft });
+        });
+
+        if (!deferred_accepts.empty()) {
+            bool finish_ok = false;
+            std::exception_ptr finish_exception;
+            auto clear_deferred_slots = [&]() {
+                for (server_slot * slot : deferred_slots) {
+                    slot->prompt_clear();
+                }
+            };
+            try {
+                queue_tasks.yield_to_queue([&]() {
+                    finish_ok = common_speculative_finish_accept(spec.get(), deferred_accepts);
+                });
+            } catch (...) {
+                finish_exception = std::current_exception();
+            }
+
+            if (!finish_ok || finish_exception) {
+                clear_deferred_slots();
+
+                if (batch.replay_slot != nullptr || batch.mtp_sparse_snapshots) {
+                    if (finish_exception) {
+                        std::rethrow_exception(finish_exception);
+                    }
+                    throw std::runtime_error("failed to finish speculative draft state");
+                }
+
+                std::string reason = "failed to finish speculative draft state";
+                if (finish_exception) {
+                    try {
+                        std::rethrow_exception(finish_exception);
+                    } catch (const std::exception & e) {
+                        reason = e.what();
+                    } catch (...) {
+                    }
+                }
+
+                for (server_slot * slot : deferred_slots) {
+                    SLT_ERR(*slot, "got exception: %s\n", reason.c_str());
+                    send_error(*slot, "got exception: " + reason, ERROR_TYPE_SERVER);
+                    slot->release();
+                }
+                speculative_completions.erase(std::remove_if(
+                        speculative_completions.begin(), speculative_completions.end(), [&](const auto & completion) {
+                            return std::find(deferred_slots.begin(), deferred_slots.end(), completion.slot) != deferred_slots.end();
+                        }), speculative_completions.end());
+            }
+        }
+
+        iterate_post_decode([&](server_slot & slot) {
+            const auto it = std::find_if(speculative_completions.begin(), speculative_completions.end(), [&](const auto & completion) {
+                return completion.slot == &slot;
+            });
+            if (it == speculative_completions.end()) {
+                return;
+            }
+            const size_t n_draft = it->n_draft;
 
             const auto ids = std::move(slot.spec_draft);
 

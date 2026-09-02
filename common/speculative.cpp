@@ -175,6 +175,14 @@ struct common_speculative_impl {
     virtual bool retain_draft_state(llama_seq_id /*seq_id*/, const common_speculative_draft_params & /*dparams*/) { return false; }
     virtual bool has_deferred_accept(llama_seq_id /*seq_id*/) const { return false; }
     virtual bool finish_accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) { return true; }
+    virtual bool finish_accept(const std::vector<common_speculative_finish_accept_params> & params) {
+        for (const auto & p : params) {
+            if (!finish_accept(p.seq_id, p.n_accepted)) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -1900,44 +1908,100 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool finish_accept(llama_seq_id seq_id, uint16_t n_accepted) override {
-        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
-            return false;
-        }
+        return finish_accept(std::vector<common_speculative_finish_accept_params> { { seq_id, n_accepted } });
+    }
 
-        auto & state = retained[seq_id];
-        if (!state.active) {
-            return true;
-        }
+    bool finish_accept(const std::vector<common_speculative_finish_accept_params> & accept_params) override {
+        std::vector<bool> seen(n_seq, false);
+        std::vector<const common_speculative_finish_accept_params *> active;
+        size_t n_rows = 0;
 
-        const bool valid = state.verified && n_accepted <= 1 && verify_h_rows[seq_id] == 2 &&
-                verify_h[seq_id].size() == (size_t) 2 * n_embd &&
-                (int64_t) state.pos + 1 <= std::numeric_limits<llama_pos>::max();
-        if (!valid) {
-            state = {};
-            return false;
-        }
+        auto clear = [&]() {
+            for (const auto * p : active) {
+                retained[p->seq_id] = {};
+            }
+        };
 
-        auto * ctx_dft = params.ctx_dft;
-        if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, state.pos + 1, -1)) {
-            state = {};
-            return false;
-        }
+        bool params_valid = true;
+        for (const auto & p : accept_params) {
+            if (p.seq_id < 0 || p.seq_id >= (llama_seq_id) n_seq) {
+                params_valid = false;
+                continue;
+            }
+            if (seen[p.seq_id]) {
+                params_valid = false;
+                continue;
+            }
+            seen[p.seq_id] = true;
 
-        if (n_accepted == 1) {
-            common_batch_clear(batch);
-            common_batch_add(batch, state.draft, state.pos + 1, { seq_id }, false);
-            std::memcpy(batch.embd, verify_h[seq_id].data(), (size_t) n_embd * sizeof(float));
-
-            const int32_t ret = llama_decode(ctx_dft, batch);
-            if (ret != 0) {
-                state = {};
-                return false;
+            if (retained[p.seq_id].active) {
+                active.push_back(&p);
             }
         }
 
-        const llama_pos expected = state.pos + n_accepted;
-        state = {};
-        return llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id) == expected;
+        if (!params_valid) {
+            clear();
+            return false;
+        }
+
+        for (const auto * p : active) {
+            auto & state = retained[p->seq_id];
+            const bool valid = state.verified && p->n_accepted <= 1 && verify_h_rows[p->seq_id] == 2 &&
+                    verify_h[p->seq_id].size() == (size_t) 2 * n_embd &&
+                    (int64_t) state.pos + 1 <= std::numeric_limits<llama_pos>::max();
+            if (!valid) {
+                clear();
+                return false;
+            }
+            n_rows += p->n_accepted;
+        }
+
+        auto * ctx_dft = params.ctx_dft;
+        if (n_rows > llama_n_batch(ctx_dft)) {
+            clear();
+            return false;
+        }
+
+        try {
+            auto * mem_dft = llama_get_memory(ctx_dft);
+            for (const auto * p : active) {
+                const auto & state = retained[p->seq_id];
+                if (!llama_memory_seq_rm(mem_dft, p->seq_id, state.pos + 1, -1)) {
+                    clear();
+                    return false;
+                }
+            }
+
+            common_batch_clear(batch);
+            for (const auto * p : active) {
+                if (p->n_accepted == 0) {
+                    continue;
+                }
+
+                const auto & state = retained[p->seq_id];
+                const int32_t i_row = batch.n_tokens;
+                common_batch_add(batch, state.draft, state.pos + 1, { p->seq_id }, false);
+                std::memcpy(batch.embd + (size_t) i_row * n_embd,
+                        verify_h[p->seq_id].data(), (size_t) n_embd * sizeof(float));
+            }
+
+            if (batch.n_tokens > 0 && llama_decode(ctx_dft, batch) != 0) {
+                clear();
+                return false;
+            }
+
+            bool result = true;
+            for (const auto * p : active) {
+                const auto & state = retained[p->seq_id];
+                const llama_pos expected = state.pos + p->n_accepted;
+                result = result && llama_memory_seq_pos_max(llama_get_memory(ctx_dft), p->seq_id) == expected;
+            }
+            clear();
+            return result;
+        } catch (...) {
+            clear();
+            throw;
+        }
     }
 
     bool has_deferred_accept(llama_seq_id seq_id) const override {
@@ -3252,12 +3316,41 @@ bool common_speculative_retain_draft_state(common_speculative * spec, llama_seq_
 }
 
 bool common_speculative_finish_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
-    if (spec == nullptr || seq_id < 0 || seq_id >= (llama_seq_id) spec->impl_last.size()) {
+    return common_speculative_finish_accept(spec, std::vector<common_speculative_finish_accept_params> { { seq_id, n_accepted } });
+}
+
+bool common_speculative_finish_accept(common_speculative * spec, const std::vector<common_speculative_finish_accept_params> & params) {
+    if (spec == nullptr) {
         return false;
     }
 
-    common_speculative_impl * impl = spec->impl_last[seq_id];
-    return impl == nullptr || impl->finish_accept(seq_id, n_accepted);
+    std::vector<std::pair<common_speculative_impl *, std::vector<common_speculative_finish_accept_params>>> grouped;
+    for (const auto & p : params) {
+        if (p.seq_id < 0 || p.seq_id >= (llama_seq_id) spec->impl_last.size()) {
+            return false;
+        }
+
+        common_speculative_impl * impl = spec->impl_last[p.seq_id];
+        if (impl == nullptr) {
+            continue;
+        }
+
+        auto it = std::find_if(grouped.begin(), grouped.end(), [&](const auto & group) {
+            return group.first == impl;
+        });
+        if (it == grouped.end()) {
+            grouped.push_back({ impl, {} });
+            it = grouped.end() - 1;
+        }
+        it->second.push_back(p);
+    }
+
+    for (auto & group : grouped) {
+        if (!group.first->finish_accept(group.second)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool common_speculative_has_deferred_accept(const common_speculative * spec, llama_seq_id seq_id) {
