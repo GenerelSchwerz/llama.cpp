@@ -398,10 +398,11 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 }
 
 // with offload_kqv=false the cache lives in host memory
-// n_seq_max > 1 gives the cache one stream per sequence
+// n_seq_max > 1 gives the cache one stream per sequence, attn_split gives the heads their own share
 struct kv_config {
-    bool     offload_kqv = true;
-    uint32_t n_seq_max   = 1;
+    bool               offload_kqv = true;
+    uint32_t           n_seq_max   = 1;
+    std::vector<float> attn_split;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -414,6 +415,11 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    std::vector<float> attn_split = kvc.attn_split;
+    if (!attn_split.empty()) {
+        attn_split.resize(llama_max_devices(), 0.0f);
+        model_params.attn_split = attn_split.data();
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
@@ -1369,6 +1375,19 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         kv_config kvc_host_streams = kvc_host;
         kvc_host_streams.n_seq_max = 2;
         dev_configs.emplace_back(devices_meta, "Meta -nkvo -np 2", LLAMA_SPLIT_MODE_TENSOR, kvc_host_streams);
+
+        // the same, with all attention heads on the first device
+        if (devices_meta.size() > 1) {
+            kv_config kvc_attn = kvc_host;
+            kvc_attn.attn_split.assign(devices_meta.size(), 0.0f);
+            kvc_attn.attn_split[0] = 1.0f;
+            dev_configs.emplace_back(devices_meta, "Meta -nkvo -as", LLAMA_SPLIT_MODE_TENSOR, kvc_attn);
+
+            // a custom head split must also hold across streams
+            kv_config kvc_attn_streams = kvc_attn;
+            kvc_attn_streams.n_seq_max = 2;
+            dev_configs.emplace_back(devices_meta, "Meta -nkvo -as -np 2", LLAMA_SPLIT_MODE_TENSOR, kvc_attn_streams);
+        }
 
         for (const device_config & dc : dev_configs) {
             max_device_label_length = std::max(max_device_label_length, dc.label.length());
