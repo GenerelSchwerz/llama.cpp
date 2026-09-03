@@ -4270,13 +4270,6 @@ void ggml_backend_cuda_context::certify_moe_graph(ggml_cgraph * cgraph) {
     }
 
     const uint64_t key = ggml_cuda_graph_get_key(cgraph);
-    for (auto & entry : cuda_graphs) {
-        ggml_cuda_graph * graph = entry.second.get();
-        if (entry.first == key || ggml_cuda_moe_graph_spans_overlap(
-                graph->moe_coverage_nodes, graph->moe_coverage_n_nodes, cgraph->nodes, cgraph->n_nodes)) {
-            ggml_cuda_moe_clear_graph_coverage(graph);
-        }
-    }
     uint32_t coverage_mmid_count = 0;
     uint64_t coverage_mmid_fingerprint = 0;
     const uint64_t coverage_epoch = moe_grouped_context->certify_graph_coverage(
@@ -6651,6 +6644,7 @@ static bool ggml_cuda_graph_has_cached_buffer_mmid(const ggml_cgraph * cgraph) {
         const ggml_tensor * node = cgraph->nodes[node_index];
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
         if (source != nullptr && source->buffer != nullptr &&
+                !ggml_is_empty(node) &&
                 ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
             return true;
         }
@@ -6724,7 +6718,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (cuda_ctx->moe_grouped_context != nullptr) {
         std::shared_ptr<ggml_cuda_moe_graph_plan> local_plan;
         std::shared_ptr<ggml_cuda_moe_graph_plan> * plan = &local_plan;
-        if (graph->moe_coverage_nodes != cgraph->nodes || graph->moe_coverage_n_nodes != cgraph->n_nodes) {
+        bool recover_coverage = graph->moe_coverage_nodes != cgraph->nodes ||
+            graph->moe_coverage_n_nodes != cgraph->n_nodes;
+#ifdef USE_CUDA_GRAPH
+        recover_coverage = recover_coverage || graph_properties_changed;
+#endif
+        if (recover_coverage) {
             cuda_ctx->recover_moe_graph(cgraph, graph);
         }
         if (graph->moe_coverage_epoch != 0 && graph->moe_coverage_nodes == cgraph->nodes &&
