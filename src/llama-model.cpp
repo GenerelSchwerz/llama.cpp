@@ -2261,6 +2261,55 @@ static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama
     }
 }
 
+// Measure the host-to-device bandwidth of a device, in bytes per microsecond. Returns 0 when it
+// cannot be measured.
+static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev) {
+    const size_t n_bytes = 16u*1024*1024;
+    const int    n_reps  = 3;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return 0.0;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return 0.0;
+    }
+
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, n_bytes);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        return 0.0;
+    }
+
+    // the cache is delivered from a pinned buffer where the backend has one, so measure from there
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    ggml_backend_buffer_ptr host_buf { host_buft ? ggml_backend_buft_alloc_buffer(host_buft, n_bytes) : nullptr };
+    std::vector<uint8_t> host_fallback;
+    void * src = host_buf ? ggml_backend_buffer_get_base(host_buf.get()) : nullptr;
+    if (!src) {
+        host_fallback.resize(n_bytes);
+        src = host_fallback.data();
+    }
+    memset(src, 0, n_bytes);
+
+    ggml_backend_tensor_set(dst, src, 0, n_bytes);
+
+    const int64_t t_start = ggml_time_us();
+    for (int i = 0; i < n_reps; i++) {
+        ggml_backend_tensor_set(dst, src, 0, n_bytes);
+    }
+    const int64_t t_us = ggml_time_us() - t_start;
+
+    return t_us > 0 ? (double) n_bytes*n_reps/t_us : 0.0;
+}
+
 // Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
 // memory. Taking them in layer order fills the device that owns the first layers and leaves the
 // free memory of the others unused, so take them per owning device instead.
@@ -2315,18 +2364,47 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
         devs_ils[it - devs.begin()].push_back(il);
     }
 
-    for (size_t i = 0; ret.size() < n_layers; i++) {
-        bool any = false;
-        for (size_t d = 0; d < devs.size() && ret.size() < n_layers; d++) {
-            const std::vector<uint32_t> & ils = devs_ils[d];
-            if (i < ils.size()) {
-                ret.insert(ils[i]);
-                any = true;
+    // A device-resident layer saves the transfer it would cost, which is worth most on the slowest
+    // link, so spend the budget there first. Devices of similar speed stay one group and keep the
+    // round-robin, so their memory use stays even.
+    std::vector<double> bw(devs.size(), 1.0);
+    if (devs.size() > 1) {
+        std::vector<double> measured(devs.size());
+        for (size_t d = 0; d < devs.size(); d++) {
+            measured[d] = llama_dev_h2d_bandwidth(devs[d]);
+        }
+        if (std::all_of(measured.begin(), measured.end(), [](double b) { return b > 0.0; })) {
+            bw = measured;
+            for (size_t d = 0; d < devs.size(); d++) {
+                LLAMA_LOG_INFO("%s: %s: host-to-device %.1f GB/s\n", __func__,
+                        ggml_backend_dev_name(devs[d]), bw[d]/1000.0);
             }
         }
-        if (!any) {
-            break;
+    }
+
+    std::vector<size_t> order(devs.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return bw[a] < bw[b]; });
+
+    for (size_t first = 0; first < order.size() && ret.size() < n_layers; ) {
+        size_t last = first + 1;
+        while (last < order.size() && bw[order[last]] <= bw[order[first]]*1.15) {
+            last++;
         }
+        for (size_t i = 0; ret.size() < n_layers; i++) {
+            bool any = false;
+            for (size_t d = first; d < last && ret.size() < n_layers; d++) {
+                const std::vector<uint32_t> & ils = devs_ils[order[d]];
+                if (i < ils.size()) {
+                    ret.insert(ils[i]);
+                    any = true;
+                }
+            }
+            if (!any) {
+                break;
+            }
+        }
+        first = last;
     }
 
     return ret;
@@ -2339,7 +2417,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     placement.recurrent_offload = cparams.offload_kqv || cparams.recurrent_state_offload;
     // Resolved here rather than per cache, so that a cache built from several sub-caches shares one
     // budget instead of giving each of them the full count. An offloaded cache is device-resident
-    // already, so it needs no set.
+    // already, so it needs no set and must not pay for measuring the links.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
         placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
                 params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
