@@ -1034,6 +1034,19 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
+// Name a copy of an input "<backend>#<source>#<copy>". The name field has a fixed size, so cut the
+// backend label rather than the source name - the source name is what identifies the copy.
+static void ggml_backend_sched_name_copy(
+        struct ggml_tensor * copy, const char * backend_name, const struct ggml_tensor * src, int c) {
+    const int n_tail = snprintf(NULL, 0, "#%s#%d", src->name, c);
+    const int n_max  = GGML_MAX_NAME - 1 - n_tail;
+    int n_head = (int) strlen(backend_name);
+    if (n_head > n_max) {
+        n_head = n_max > 0 ? n_max : 0;
+    }
+    ggml_format_name(copy, "%.*s#%s#%d", n_head, backend_name, src->name, c);
+}
+
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
@@ -1392,7 +1405,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 tensor_copy = src; // use the original tensor as the current copy
                             } else {
                                 tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                ggml_backend_sched_name_copy(tensor_copy, ggml_backend_name(backend), src, c);
                             }
                             ggml_set_input(tensor_copy);
                             ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -1413,7 +1426,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                            ggml_backend_sched_name_copy(tensor_copy, ggml_backend_name(backend), src, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
