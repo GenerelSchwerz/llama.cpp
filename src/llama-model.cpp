@@ -2423,10 +2423,9 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
     llama_memory_i * res;
-    llama_memory_placement_options placement = {
-        cparams.kv_cpu_pinned,
-        cparams.offload_kqv || cparams.recurrent_state_offload,
-    };
+    llama_memory_placement_options placement;
+    placement.cpu_pinned        = cparams.kv_cpu_pinned;
+    placement.recurrent_offload = cparams.offload_kqv || cparams.recurrent_state_offload;
     // Resolved here rather than per cache, so that a cache built from several sub-caches shares one
     // budget instead of giving each of them the full count. An offloaded cache is device-resident
     // already, so it needs no set and must not pay for measuring the links.
