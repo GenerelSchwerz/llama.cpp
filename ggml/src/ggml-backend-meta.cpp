@@ -1609,6 +1609,33 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // A fused QKV puts Kcur and Vcur in a strided view, which a host-resident cache reads back here.
+    // The rows split, so the chunk splice below cannot express the read. Each device's part of a row
+    // is contiguous: ne[1] rows, from the device's own stride to the view's.
+    const bool strided_rows =
+        !ggml_is_contiguous(tensor) &&
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+        split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        offset == 0 && size == ggml_nbytes(tensor);
+
+    if (strided_rows) {
+        size_t offset_data = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t nbytes = ggml_row_size(tensor->type, split_state.ne[j]);
+            if (nbytes == 0) {
+                continue;
+            }
+            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data, 0, nbytes,
+                tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            offset_data += nbytes;
+        }
+        GGML_ASSERT(offset_data == ggml_row_size(tensor->type, tensor->ne[0]));
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
