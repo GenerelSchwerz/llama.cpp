@@ -380,8 +380,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
-    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
-    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+    static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d+");
+    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d+");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
@@ -396,9 +396,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ssm_alpha       ("blk\\.\\d*\\.ssm_alpha.weight");
     static const std::regex pattern_ssm_beta        ("blk\\.\\d*\\.ssm_beta.weight");
     static const std::regex pattern_ssm_beta_alpha  ("blk\\.\\d*\\.ssm_ba.weight");
-    static const std::regex pattern_r_cache         ("cache_r_l\\d*");
-    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d*");
-    static const std::regex pattern_s_cache         ("cache_s_l\\d*");
+    static const std::regex pattern_r_cache         ("cache_r_l\\d+");
+    static const std::regex pattern_ple_r_cache     ("cache_ple_r_l\\d+");
+    static const std::regex pattern_s_cache         ("cache_s_l\\d+");
     static const std::regex pattern_ssm_conv1d      ("blk\\.\\d*\\.ssm_conv1d.weight");
     static const std::regex pattern_ssm_out_weight  ("blk\\.\\d*\\.ssm_out.weight");
 
@@ -468,7 +468,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
+    // A host-resident cache reaches attention as a scheduler copy, permuted, with the heads on an
+    // axis of their own. The split follows the cache, so record that axis and its unit - one head.
+    struct host_cache_copy {
+        bool valid = false;
+        ggml_backend_meta_split_axis axis = GGML_BACKEND_SPLIT_AXIS_0;
+        int64_t unit = 1; // cache elements per element of axis
+    };
+
+    const host_cache_copy cache_copy = [&]() -> host_cache_copy {
+        if (is_dsv4 || !std::regex_match(tensor_name, pattern_kv_cache)) {
+            return {};
+        }
+        // [head_dim, n_kv, n_head_kv, n_stream]
+        const uint32_t il       = std::stoul(tensor_name.substr(tensor_name.find("_l", 6) + 2));
+        const int64_t  head_dim = tensor_name[6] == 'k' ? hparams.n_embd_head_k(il) : hparams.n_embd_head_v(il);
+        if (hparams.n_head_kv(il) > 1 && tensor->ne[0] == head_dim &&
+                tensor->ne[2] == (int64_t) hparams.n_head_kv(il)) {
+            return {true, GGML_BACKEND_SPLIT_AXIS_2, head_dim};
+        }
+        return {};
+    }();
+
     auto get_tensor_config = [&]() -> tensor_config {
+        // a graph tensor only reaches here as a scheduler copy, and only a copy of a host-resident
+        // cache is split - everything else the graph copies in keeps the mirrored fallback
+        if (!cache_copy.valid && ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
         if (is_dsv4) {
             if (std::regex_match(tensor_name, pattern_kv_cache) ||
                     std::regex_match(tensor_name, pattern_dsv4_state)) {
@@ -592,7 +619,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
     };
 
-    auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
+    // ne_axis is the extent of the split axis as the cache sees it, which for a host-resident
+    // cache copy is not the extent of the axis the copy is split on
+    auto get_split_segments = [&](int axis, uint32_t il, int64_t ne_axis) -> std::vector<std::pair<int64_t, uint32_t>> {
         if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE ||
                 ud->model->arch == LLM_ARCH_QWEN4EXP) {
             const int64_t head_k_dim = hparams.ssm_d_state;
@@ -640,7 +669,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
             }
-            return {{tensor->ne[axis], 1}};
+            return {{ne_axis, 1}};
         }
 
         if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
@@ -656,14 +685,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (tensor->ne[axis] == 2*n_ff) {
                 return {{n_ff, 2}};
             }
-            return {{tensor->ne[axis], 1}};
+            return {{ne_axis, 1}};
         }
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             const int64_t n_ff_exp = hparams.n_ff_exp(il);
             GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
             return {{n_ff_exp, 2}};
         }
-        return {{tensor->ne[axis], 1}};
+        return {{ne_axis, 1}};
     };
 
     auto get_split_granularity = [&](int64_t blck_size, uint32_t il, const std::vector<std::pair<int64_t, uint32_t>> & segments) -> std::vector<int64_t> {
@@ -786,6 +815,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     tensor_config tc = get_tensor_config();
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
+        // a host-resident cache copy is split on the axis its heads arrive on, in whole heads,
+        // so the segments and the granularity of the cache are rescaled to that unit
+        const bool    unfolded  = cache_copy.valid && split_state.axis == GGML_BACKEND_SPLIT_AXIS_0;
+        const int64_t unit      = unfolded ? cache_copy.unit : 1;
+        const int64_t ne_axis   = unfolded ? tensor->ne[cache_copy.axis]*unit : tensor->ne[split_state.axis];
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
@@ -796,12 +830,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
         }
-        const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
+        const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il, ne_axis);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
+        if (unfolded) {
+            split_state.axis = cache_copy.axis;
+        }
         for (size_t is = 0; is < segments.size(); is++) {
-            const int64_t  ne_s = segments[is].first;
+            GGML_ASSERT(segments[is].first % unit == 0);
+            GGML_ASSERT(granularity[is]    % unit == 0);
+            const int64_t  ne_s = segments[is].first / unit;
             const uint32_t nr_s = segments[is].second;
-            const int64_t  g_s  = granularity[is];
+            const int64_t  g_s  = granularity[is] / unit;
             int64_t low = 0;
             size_t j = 0;
             for (; j < ud->n_devices - 1; j++) {
