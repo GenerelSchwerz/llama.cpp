@@ -246,6 +246,27 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-ubatch-size", "-1"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
 
+    params = common_params();
+    params.n_moe_expert_cache_slots = 40;
+    assert(params.speculative.draft.n_moe_expert_cache_slots == -1);
+    assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 40);
+
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-moe-expert-cache-size", "0"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.n_moe_expert_cache_slots == 40);
+    assert(params.speculative.draft.n_moe_expert_cache_slots == 0);
+    params.speculative.draft.mparams.path = "draft.gguf";
+    assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 0);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-moe-expert-cache-size", "12"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.speculative.draft.n_moe_expert_cache_slots == 12);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-moe-expert-cache-size", "-1"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
     struct mtp_parse_case {
         std::vector<std::string> args;
         bool valid;
