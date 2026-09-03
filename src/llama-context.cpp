@@ -145,10 +145,8 @@ llama_context::llama_context(
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
 
-    // A linear-attention op packs the state it writes back together with its output, so a split of
-    // that state does not line up with the split the cache expects. That only matters once the
-    // state has to pass through host memory, where it is laid out globally rather than per device.
-    // Keep it on its device instead; next to the attention cache it is small.
+    // A linear-attention op packs the state it writes back together with its output, so that split
+    // does not line up with the one a host-resident state expects. Keep the state on its device.
     if (!cparams.recurrent_state_offload && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch))) {
         LLAMA_LOG_INFO("%s: split mode tensor: keeping the recurrent state device-resident\n", __func__);

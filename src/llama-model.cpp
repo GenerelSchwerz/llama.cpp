@@ -470,10 +470,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         return {axis, tensor_axis_0, il, rotation};
     };
 
-    // An attention cache lives in host memory when it is not offloaded, so it reaches attention as
-    // a scheduler copy rather than as the cache itself. The cache folds all heads into one flat
-    // axis, the copy arrives permuted, with the heads on an axis of their own. The split follows
-    // the cache either way, so record the axis and the unit - one head - the copy is split in.
+    // A host-resident cache reaches attention as a scheduler copy, permuted, with the heads on an
+    // axis of their own. The split follows the cache, so record that axis and its unit - one head.
     struct host_cache_copy {
         bool valid = false;
         ggml_backend_meta_split_axis axis = GGML_BACKEND_SPLIT_AXIS_0;
@@ -831,10 +829,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
         const float * tensor_split = ud->model->tensor_split();
 
-        // Tensor parallelism splits attention by head, and the share a device gets decides both how much
-        // of the cache it receives and how much attention work it does. Neither has to follow the memory
-        // split, so an attention split of its own can follow the host link or the speed of each device.
-        // Only the heads move - a linear-attention layer is a different mechanism and keeps tensor_split.
+        // The share of the attention heads decides how much cache a device gets and how much attention
+        // work it does, neither of which has to follow the memory split. A linear-attention layer is a
+        // different mechanism and keeps tensor_split.
         if (ud->model->attn_split() != nullptr && !hparams.is_recr(tc.il) &&
                 (std::regex_match(tensor_name, pattern_kv_cache) ||
                  (tensor_name.substr(0, 4) == "blk." && tensor_name.find(".attn_") != std::string::npos))) {
@@ -2374,10 +2371,9 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
         devs_ils[it - devs.begin()].push_back(il);
     }
 
-    // A device-resident layer saves the transfer it would otherwise cost, so it is worth the most
-    // on the slowest link. Slots differ by several times in a mixed setup, so rank the devices by
-    // what a transfer costs on each and spend the budget on the slowest first. Devices of similar
-    // speed stay one group, so the budget still spreads over them and their memory use stays even.
+    // A device-resident layer saves the transfer it would cost, which is worth most on the slowest
+    // link, so spend the budget there first. Devices of similar speed stay one group and keep the
+    // round-robin, so their memory use stays even.
     std::vector<double> bw(devs.size(), 1.0);
     if (devs.size() > 1) {
         std::vector<double> measured(devs.size());

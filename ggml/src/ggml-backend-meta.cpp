@@ -485,10 +485,8 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
-// The scheduler names a tensor it copies in from another backend "<backend>#<name>#<copy>", where
-// <name> is the graph name of the source plus the suffixes ggml appends for views. The name is cut
-// to GGML_MAX_NAME, so what follows the source can be missing or half there. Undo what is left, so
-// that the copy can be recognised under the name the graph gave it.
+// A scheduler copy is named "<backend>#<source>#<copy>", where <source> also carries the suffixes
+// ggml appends for views. Recover the graph name the copy was made from.
 static std::string ggml_backend_meta_copy_source_name(const char * name) {
     std::string ret = name;
     const size_t first = ret.find('#');
@@ -855,11 +853,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        // A tensor the scheduler copied in from another backend is a leaf in the compute buffer,
-        // so it never reached the device callback and fell through to MIRRORED. A host-resident
-        // KV cache arrives this way, and mirroring it while the queries stay split by head makes
-        // each device attend the wrong heads. Ask the callback; it still answers MIRRORED for
-        // names it does not know.
+        // A host-resident KV cache reaches the graph as a copied-in leaf of the compute buffer.
+        // Mirroring it while the queries stay split by head makes each device attend the wrong
+        // heads, so ask the callback; it still answers MIRRORED for names it does not know.
         const bool copied_in_leaf =
             ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
             tensor->op == GGML_OP_NONE && (tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0;
@@ -1459,10 +1455,9 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
-    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, 1].
-    // The heads are the split axis but they are interleaved inside each cell, so the chunk splice
-    // below cannot express the write. Each device's heads are one contiguous run per cell, which
-    // is a strided copy: ne[1] cells, from the full cell stride to the device's own.
+    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, 1]. The
+    // heads split, but interleaved per cell, so the chunk splice below cannot express the write.
+    // Each device's heads are one contiguous run per cell: ne[1] cells, from one stride to another.
     const bool strided_head_split =
         !ggml_is_contiguous(tensor) &&
         split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
