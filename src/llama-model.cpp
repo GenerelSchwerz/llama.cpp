@@ -779,12 +779,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 return {granularity_q};
             }
 
-            const int64_t granularity_kv = granularity_q / n_gqa;
+            const int64_t n_head_gran    = granularity_q / n_embd_q; // KV heads per granule
+            const int64_t granularity_kv = n_head_gran * hparams.n_embd_head_k(il);
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
-                return {granularity_kv};
+                // the V side can have a head size of its own, the split still lands on head boundaries
+                const bool is_v = tensor_name.compare(0, 8, "cache_v_") == 0 ||
+                    tensor_name.find(".attn_v.") != std::string::npos;
+                return {is_v ? n_head_gran * hparams.n_embd_head_v(il) : granularity_kv};
             }
             if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias)) {
                 GGML_ASSERT(segments.size() == 2);
