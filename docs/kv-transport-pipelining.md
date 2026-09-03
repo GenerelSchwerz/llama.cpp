@@ -58,19 +58,28 @@ Getting either of these wrong costs the entire gain while still producing correc
 
 RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F, `Qwen3.8-27B-UD-IQ2_M.gguf`, `-ngl 99 -sm none -mg 0 -t 3 -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512`, host residency `-nkvo --kv-cpu-pinned --recurrent-state-offload`, everything under `taskset -c 0,2,4`.
 
-`llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order (`docs/repro/r4-kv-pipeline-ab.sh`, `docs/repro/r4-kv-pipeline-context-sweep.sh`), with no cap on the ring:
+`llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order (`docs/repro/r4-kv-pipeline-ab.sh`), at `--kv-pipeline-budget 512`, both passes shown:
 
-| depth | ordered | pipelined | gain | peak device memory |
-|---:|---|---|---:|---:|
-| 4,096 | 31.3066, 31.2334 | 36.6107, 36.4701 | **+17.0%** | +28 MiB |
-| 16,384 | 19.4344, 19.4828 | 31.0981, 31.0931 | **+59.8%** | +86 to +104 MiB |
-| 32,768 | 12.9453, 12.9400 | 15.4571, 15.4516 | **+19.4%** | +206 MiB |
+| depth | ordered | pipelined | gain |
+|---:|---|---|---:|
+| 4,096 | 29.9802, 29.9776 | 34.8016, 34.8047 | **+16.1%** |
+| 16,384 | 19.0116, 19.0093 | 29.7780, 29.7879 | **+56.6%** |
+| 32,768 | 12.7237, 12.7237 | 15.2873, 15.2864 | **+20.1%** |
 
-> These rows were taken before the budget existed, so they are the uncapped numbers. The 32,768 ring is 204 MiB and the default cap is 128 MiB, so that row does not reproduce on the current default: it needs `-kvpb 512`, which `llama-bench` did not take until now. The scripts pass it, and the row is due a re-measurement on the current head.
+The 32,768 ring is 204 MiB at the full context, over the 128 MiB default, so that row needs `-kvpb 512`. `llama-bench` takes the option and the scripts pass it.
 
 > These also need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have them: the repro scripts probed `--help`, found nothing, and quietly dropped both. The same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the pipeline buys +6.7% instead of +60%, because a host-resident recurrent state costs more than the transport can win back. `llama-bench` takes them again, and the scripts now fail rather than drop an option the build does not have.
 
-`llama-server`, one request, `temperature 0, top_k 1, seed 1234`:
+`llama-server`, one request, `temperature 0, top_k 1, seed 1234`, the four 18,432-prefill tasks of the exactness gate at `-c 32768`:
+
+| task | prompt | ordered | pipelined | gain |
+|---|---:|---:|---:|---:|
+| prose | 14,821 | 19.775 | 30.012 | **+51.8%** |
+| dialogue | 15,984 | 19.155 | 29.767 | **+55.4%** |
+| records | 29,603 | 13.553 | 16.396 | **+21.0%** |
+| code | 29,670 | 13.504 | 16.362 | **+21.2%** |
+
+The breakdown below was taken on an earlier head, at prompts of 19,246 and 48,042 against `-c 32768` and `-c 65536`:
 
 | prompt | `-c` | ordered | pipelined | gain | copy ms | compute ms | ceiling | share |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -88,7 +97,7 @@ Pinning is worth as much as the pipeline and is off by default. Behind a 13,128-
 | `--kv-cpu-pinned` | 21.582 | 32.252 |
 | unpinned | 14.945 | 22.709 |
 
-Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason.
+Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason. The exactness gate measures the same on every one of its four 18,432-prefill tasks: 30.012 against 27.037 on prose, 29.767 against 26.584 on dialogue, 16.396 against 15.934 on records, 16.362 against 15.857 on code.
 
 ### The link is the ceiling, so the lever is bytes
 
@@ -111,12 +120,12 @@ Halving the traffic is worth +5.6% on the pipelined path at 19,246 and +56.6% at
 
 | Context | ordered | pipelined | gain | peak device memory | delta | ring |
 |---|---:|---:|---:|---|---:|---:|
-| 4,096 | 31.66 | 37.01 | **+16.9%** | 10,169 -> 10,197 MiB | +28 MiB | 27 MiB |
-| 16,384 | 19.64 | 31.43 | **+60.1%** | 10,159 -> 10,263 MiB | +104 MiB | 107 MiB |
-| 32,768 | 12.99 | 15.49 | **+19.2%** | 10,161 -> 10,367 MiB | +206 MiB | 213 MiB |
-| 65,536 | 7.74 | 8.74 | **+12.9%** | 10,163 -> 10,573 MiB | +410 MiB | 428 MiB |
-| 131,072 | 4.29 | 4.68 | **+9.1%** | 10,537 -> 11,355 MiB | +818 MiB | 855 MiB |
-| 262,144 | 2.25 | 2.24 | **declined** | 11,329 -> 11,391 MiB | +62 MiB | not allocated |
+| 4,096 | 29.90 | 34.72 | **+16.1%** | 10,121 -> 10,149 MiB | +28 MiB | 27 MiB |
+| 16,384 | 18.98 | 29.72 | **+56.6%** | 10,111 -> 10,215 MiB | +104 MiB | 107 MiB |
+| 32,768 | 12.70 | 15.26 | **+20.1%** | 10,113 -> 10,319 MiB | +206 MiB | 213 MiB |
+| 65,536 | 7.63 | 8.66 | **+13.4%** | 10,115 -> 10,525 MiB | +410 MiB | 428 MiB |
+
+The two deepest arms were taken on an earlier head and are not re-measured here: +9.1% at 131,072 for +818 MiB of ring, and at 262,144 the ring is declined and the two arms are the same.
 
 Two curves run in opposite directions here, and both matter.
 
@@ -176,6 +185,8 @@ Do not compare these numbers against runs on other models, prompts, cache settin
 ## Validation
 
 The gates, and what was run for them:
+
+All four gates below were re-run on the current head, on an RTX 4070 with a CUDA build.
 
 1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
 
