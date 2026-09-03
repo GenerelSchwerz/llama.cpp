@@ -325,29 +325,23 @@ extern "C" {
 
     // Pipelined delivery of host-resident split inputs.
     //
-    // Without it, a split that reads a host-resident input pays copy + compute in series:
-    // the transfer is issued on the consumer's own stream immediately before the kernels
-    // that read it. With it, the scheduler keeps a ring of `depth` staging slots outside
-    // the graph allocator's reach and issues the stable prefix of a later split's inputs on
-    // a separate transfer stream while the current split computes, so the transfer retires
-    // underneath the kernels.
+    // Without it a split that reads a host-resident input pays copy + compute in series: the transfer is issued on the consumer's own stream right before the kernels that read it.
+    // With it the scheduler keeps a ring of staging slots outside the graph allocator's reach and issues the stable prefix of a later split on a separate transfer stream, so the transfer retires under the kernels of the split before it.
     //
-    // Only persistent host inputs marked with GGML_TENSOR_FLAG_TRANSPORT are eligible. Their
-    // stable prefix must be current before each evaluation. The producer must be the CPU or the
-    // same backend stream that consumes the late region.
+    // Only persistent host inputs marked with GGML_TENSOR_FLAG_TRANSPORT are eligible, and their stable prefix must be current before each evaluation.
+    // The producer must be the CPU or the same backend stream that consumes the late region.
     //
-    // `depth` is how many splits ahead deliveries run; 0 disables pipelining. The ring holds a
-    // couple of slots more than that, so that recycling a slot never has to wait for a reader
-    // that is still running. Requires a destination backend with asynchronous transfers and
-    // events; where that is missing the setting is ignored. Costs roughly (depth + 2) *
-    // (largest staged split) of device memory. Must be called before the first graph is
-    // allocated. Returns false after graph allocation starts.
+    // `depth` is how many splits ahead deliveries run, 0 disables pipelining.
+    // The ring holds a couple of slots more than that, so recycling a slot never waits for a reader that is still running.
+    // Needs a destination backend with asynchronous transfers and events, otherwise the setting is ignored.
+    // Costs roughly (depth + 2) * (largest staged split) of device memory.
+    // Must be called before the first graph is allocated, and returns false after that.
+    // The ring is optional: if the graph cannot be allocated next to it, the scheduler releases the ring and keeps the ordered path.
     GGML_API bool                 ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth);
 
-    // Hard cap on the staging ring, in bytes. A host-resident cache exists to keep device memory
-    // free, so the ring is capped outright and not merely against what happens to be free: past
-    // the cap the scheduler declines and keeps the ordered path. 0 removes the cap. Default 128 MiB.
-    // Returns false after graph allocation starts. Configuration is immutable then.
+    // Hard cap on the staging ring, in bytes, default 128 MiB and 0 removes the cap.
+    // A host-resident cache exists to keep device memory free, so the ring is capped outright rather than against what happens to be free: past the cap the scheduler declines and keeps the ordered path.
+    // Must be called before the first graph is allocated, and returns false after that.
     GGML_API bool                 ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched, size_t bytes);
 
     // Number of staged deliveries and staged bytes issued since the scheduler was created.

@@ -238,10 +238,8 @@ public:
                          bool   is_reserve,
             const slot_info   * sinfo = nullptr) const;
 
-    // Tell the backend scheduler which part of each layer's persistent K/V storage this ubatch
-    // will not write, so a host-resident cache can be delivered to the accelerator ahead of the
-    // attention that reads it. Must be refreshed for every ubatch, including when the graph is
-    // reused, because the write position moves while the graph does not.
+    // Tell the backend scheduler which part of each layer's persistent K/V storage this ubatch will not write, so a host-resident cache can be delivered to the accelerator ahead of the attention that reads it.
+    // Must be refreshed for every ubatch, including when the graph is reused, because the write position moves while the graph does not.
     void update_stable_prefixes(const slot_info & sinfo) const;
     void clear_stable_prefixes() const;
 

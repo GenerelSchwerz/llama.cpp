@@ -421,14 +421,11 @@ extern "C" {
         // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
 
-        uint32_t kv_pipeline_depth;   // how many splits ahead the scheduler delivers a host-resident KV cache to the
-                                      // accelerator, so that the transfer runs while the previous split computes.
-                                      // 0 keeps the ordered path, where a decode token pays the transfer and the
-                                      // attention kernels in series. Costs (kv_pipeline_depth + 2) * (largest staged
-                                      // split) of device memory.
-        uint32_t kv_pipeline_budget_mib; // hard cap on that device memory, in MiB. Past it the scheduler declines and
-                                      // keeps the ordered path, so a host-resident cache never quietly trades the
-                                      // device memory it exists to save. 0 removes the cap.
+        uint32_t kv_pipeline_depth;      // how many splits ahead the scheduler delivers a host-resident KV cache, so that the transfer runs while the previous split computes
+                                         // 0 keeps the ordered path, where a decode token pays the transfer and the attention kernels in series
+                                         // costs (kv_pipeline_depth + 2) * (largest staged split) of device memory
+        uint32_t kv_pipeline_budget_mib; // hard cap on that device memory, in MiB, past which the scheduler keeps the ordered path
+                                         // a host-resident cache never quietly trades back the device memory it exists to save, 0 removes the cap
     };
 
     struct llama_model_tensor_override {
