@@ -1213,8 +1213,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
         return;
     }
 
-    // before the graph is built and allocated, so that the scheduler's delivery plan and the
-    // deliveries it then issues are decided against the same write position
+    // before the graph is built and allocated, so the scheduler's delivery plan and the deliveries it then issues are decided against the same write position
     update_stable_prefixes(sinfo);
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -1650,9 +1649,8 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 }
 
 void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
-    // Rows written by this ubatch, in the flattened [n_embd_gqa, kv_size*n_stream] body: every
-    // byte below the lowest of them keeps whatever the previous ubatch left there for the whole
-    // graph, so a delivery of that region may be issued before the split that reads it.
+    // Rows written by this ubatch, in the flattened [n_embd_gqa, kv_size*n_stream] body.
+    // Every byte below the lowest of them keeps whatever the previous ubatch left there for the whole graph, so a delivery of that region may be issued before the split that reads it.
     uint64_t min_row = UINT64_MAX;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const uint64_t offs = (uint64_t) sinfo.strm[s]*get_size();
@@ -1671,8 +1669,7 @@ void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
             ggml_set_stable_prefix(layer.k, min_row*layer.k->nb[1]);
         }
         if (layer.v) {
-            // the transposed V cache scatters each ubatch across the whole tensor, so there is
-            // no leading region that this ubatch leaves alone
+            // the transposed V cache scatters each ubatch across the whole tensor, so there is no leading region that this ubatch leaves alone
             ggml_set_stable_prefix(layer.v, v_trans ? 0 : min_row*layer.v->nb[1]);
         }
     }

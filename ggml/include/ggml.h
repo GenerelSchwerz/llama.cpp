@@ -711,10 +711,9 @@ extern "C" {
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
-    // declare that the first nbytes bytes of tensor->data cannot change while a graph that
-    // reads this tensor is being evaluated. nbytes is clamped to ggml_nbytes(tensor).
-    // set it on the tensor that owns the storage, not on a view of it, and keep it current:
-    // it must describe the graph that is about to run, including when that graph is reused.
+    // declare that the first nbytes bytes of tensor->data cannot change while a graph that reads this tensor is being evaluated
+    // nbytes is clamped to ggml_nbytes(tensor), and it must be set on the tensor that owns the storage, not on a view of it
+    // it must describe the graph that is about to run, including when that graph is reused
     GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);
     GGML_API size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor);
 

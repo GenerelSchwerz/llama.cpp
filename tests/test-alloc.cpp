@@ -19,6 +19,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 
 struct dummy_backend_context {
     size_t max_buffer_size        = 64;
+    size_t capacity               = SIZE_MAX; // what the device can hold at one time
     size_t alignment              = 8;
     bool   fail_alloc             = false;
     bool   unique_alloc_addresses = false;
@@ -34,8 +35,7 @@ struct dummy_backend_context {
     size_t set_tensor_async_bytes = 0;
     size_t alloc_size_pad = 0;
 
-    // what the backend was asked to hold and to move, so that a test can check the entries a
-    // transport ring lays out and the bytes it delivers into them
+    // what the backend was asked to hold and to move, so a test can check the entries a transport ring lays out and the bytes it delivers into them
     struct tensor_binding {
         const ggml_tensor *   tensor;
         ggml_backend_buffer_t buffer;
@@ -80,7 +80,7 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
-    if (ctx->fail_alloc) {
+    if (ctx->fail_alloc || size > ctx->capacity - ctx->allocated_total()) {
         return nullptr;
     }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
@@ -1374,8 +1374,7 @@ static void test_transport_prefix_and_configuration() {
     GGML_ASSERT(cuda.context->transfer_backend_count == 0);
 }
 
-// The ring must hold what the backend allocates for an entry, deliver every byte of it exactly
-// once, and never wait on an event it has not recorded.
+// The ring must hold what the backend allocates for an entry, deliver every byte of it exactly once, and never wait on an event it has not recorded.
 static void test_transport_entry_allocation() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
@@ -1510,6 +1509,46 @@ static void test_transport_fallback_keeps_allocator_plan() {
     const size_t ordered   = transport_fallback_buffer_size(0);
     const size_t pipelined = transport_fallback_buffer_size(1);
     GGML_ASSERT(ordered > 0 && pipelined == ordered);
+}
+
+static size_t transport_scale_buffer_size(int depth, size_t nbytes, size_t capacity, int64_t * deliveries, int * transfers) {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    cuda.context->capacity = capacity;
+
+    auto graph = make_transport_graph(cpu, nbytes);
+    ggml_set_stable_prefix(graph.source, nbytes);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), depth));
+    ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
+
+    if (deliveries) {
+        transport_stats(sched.get(), deliveries, nullptr, nullptr);
+    }
+    if (transfers) {
+        *transfers = cuda.context->transfer_backend_count;
+    }
+    return ggml_backend_sched_get_buffer_size(sched.get(), cuda.handle.get());
+}
+
+// the ring is optional, so a device that cannot hold it next to the graph keeps the graph
+static void test_transport_releases_ring_for_graph() {
+    const size_t nbytes  = 256;
+    const size_t ring    = 3*nbytes; // depth 1 plus the margin, one entry per slot
+    const size_t ordered = transport_scale_buffer_size(0, nbytes, SIZE_MAX, nullptr, nullptr);
+    GGML_ASSERT(ordered > 0);
+
+    int64_t deliveries = -1;
+    int transfers = -1;
+    const size_t pipelined = transport_scale_buffer_size(1, nbytes, std::max(ordered, ring), &deliveries, &transfers);
+    GGML_ASSERT(pipelined == ordered);
+    GGML_ASSERT(deliveries == 0);
+    GGML_ASSERT(transfers == 0);
 }
 
 static void set_test_env(const char * name, const char * value) {
@@ -1807,6 +1846,7 @@ int main() {
     run("test_transport_entry_allocation", test_transport_entry_allocation);
     run("test_transport_empty_graph", test_transport_empty_graph);
     run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
+    run("test_transport_releases_ring_for_graph", test_transport_releases_ring_for_graph);
     run("test_transport_environment_is_fallback", test_transport_environment_is_fallback);
     run("test_transport_depth_zero", test_transport_depth_zero);
     run("test_transport_budget_recovers", test_transport_budget_recovers);

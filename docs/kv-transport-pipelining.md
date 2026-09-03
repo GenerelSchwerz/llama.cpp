@@ -1,72 +1,34 @@
 # Pipelined delivery of a host-resident KV cache
 
-With `--no-kv-offload` (optionally with `--kv-cpu-pinned`), the attention history
-lives in host RAM and has to reach the accelerator on every decode token. The
-backend scheduler used to issue that transfer on the consumer's own stream, right
-before the kernels that read it, so a token cost `copy + compute` in series.
+With `--no-kv-offload` (optionally with `--kv-cpu-pinned`), the attention history lives in host RAM and has to reach the accelerator on every decode token. The backend scheduler used to issue that transfer on the consumer's own stream, right before the kernels that read it, so a token cost `copy + compute` in series.
 
-The transfer and
-the attention arithmetic are the same as before, but the transfer is issued one
-split ahead, on a stream of its own, so the copy engine retires it underneath the
-kernels of the split before it.
+The transfer and the attention arithmetic are the same as before, but the transfer is issued one split ahead, on a stream of its own, so the copy engine retires it underneath the kernels of the split before it.
 
-`--kv-pipeline-depth N` controls it. It is on by default at `N = 1` and only has
-an effect where a host-resident cache produces the deliveries; `0` restores the
-ordered path exactly.
+`--kv-pipeline-depth N` controls it. It is on by default at `N = 1` and only has an effect where a host-resident cache produces the deliveries; `0` restores the ordered path exactly.
 
-The staging it needs is bounded by `--kv-pipeline-budget` (default 128 MiB), so
-that a cache which lives on the host to keep device memory free never quietly
-spends that memory back. Past the cap the scheduler declines and the ordered path
-runs, at no cost. See [The budget](#the-budget).
+The staging it needs is bounded by `--kv-pipeline-budget` (default 128 MiB), so that a cache which lives on the host to keep device memory free never quietly spends that memory back. Past the cap the scheduler declines and the ordered path runs, at no cost. See [The budget](#the-budget).
 
 ## What it changes, and what it must not
 
-R4 pipelines *deliveries*, not attention. Every byte and every attention
-operation is the same as on the ordered path; only the point at which the
-transfer is issued moves. Greedy server output is byte-identical, and that is a
-gate, not an aspiration -- see [Validation](#validation).
+R4 pipelines *deliveries*, not attention. Every byte and every attention operation is the same as on the ordered path; only the point at which the transfer is issued moves. Greedy server output is byte-identical, and that is a gate, not an aspiration -- see [Validation](#validation).
 
 Three pieces make it work.
 
 ### 1. A stable prefix, so there is something safe to send early
 
-The KV window a split reads is not stable for the whole graph: the same graph
-writes this ubatch's rows into it, and on a host-resident cache that write is a
-CPU split that runs *between* the attention of one layer and the attention of the
-next. Delivering the whole window ahead of that split would send rows that have
-not been written yet.
+The KV window a split reads is not stable for the whole graph: the same graph writes this ubatch's rows into it, and on a host-resident cache that write is a CPU split that runs *between* the attention of one layer and the attention of the next. Delivering the whole window ahead of that split would send rows that have not been written yet.
 
-What *is* stable is everything below the lowest row this ubatch writes, which at
-decode depth is essentially the whole window. `ggml_tensor::stable_prefix` records
-that, in bytes, on the tensor that owns the storage; a view inherits the part of
-it that its own byte window covers. `llama_kv_cache::update_stable_prefixes()`
-sets it from the slot info in `apply_ubatch()` -- before the graph is built and
-allocated, so the scheduler's plan and the deliveries it then issues are decided
-against the same write position -- and `build_graph_shift()` clears it, because a
-shift rewrites the body in place.
+What *is* stable is everything below the lowest row this ubatch writes, which at decode depth is essentially the whole window. `ggml_tensor::stable_prefix` records that, in bytes, on the tensor that owns the storage; a view inherits the part of it that its own byte window covers. `llama_kv_cache::update_stable_prefixes()` sets it from the slot info in `apply_ubatch()` -- before the graph is built and allocated, so the scheduler's plan and the deliveries it then issues are decided against the same write position -- and `build_graph_shift()` clears it, because a shift rewrites the body in place.
 
-The scheduler delivers `[0, stable_prefix)` early on the transfer stream and the
-remainder at the split, once every earlier split of the graph has run. At 18k
-tokens of context that split is about 620 MiB early against 1-5 MiB late.
+The scheduler delivers `[0, stable_prefix)` early on the transfer stream and the remainder at the split, once every earlier split of the graph has run. At 18k tokens of context that split is about 620 MiB early against 1-5 MiB late.
 
-The prefix is a hint about *this* graph. It has to be refreshed for every ubatch
-even when the graph is reused, which is why it is set from `apply_ubatch()` and
-not from graph construction. Where it cannot be established -- a transposed V
-cache, whose ubatch writes are scattered across the whole tensor -- it stays 0 and
-the input keeps the ordered path.
+The prefix is a hint about *this* graph. It has to be refreshed for every ubatch even when the graph is reused, which is why it is set from `apply_ubatch()` and not from graph construction. Where it cannot be established -- a transposed V cache, whose ubatch writes are scattered across the whole tensor -- it stays 0 and the input keeps the ordered path.
 
 ### 2. A ring the graph allocator cannot reach
 
-`ggml-alloc` is free to recycle a graph-owned input copy once its last graph-level
-consumer is done, and a look-ahead transfer is still in flight outside that
-lifetime. Writing split `k + 1`'s delivery into the scheduler's own input copies
-corrupts the split still reading them; that is the defect class the earlier
-cross-layer prefetch experiment hit (+1.38%, and not exact).
+`ggml-alloc` is free to recycle a graph-owned input copy once its last graph-level consumer is done, and a look-ahead transfer is still in flight outside that lifetime. Writing split `k + 1`'s delivery into the scheduler's own input copies corrupts the split still reading them; that is the defect class the earlier cross-layer prefetch experiment hit (+1.38%, and not exact).
 
-So the scheduler allocates its own ring and points the staged input copies at it
-before the graph is allocated. A tensor that already has `data` is left alone by
-`ggml_gallocr_init_tensor`, so the ring sits outside the allocator's reuse
-analysis rather than competing with it.
+So the scheduler allocates its own ring and points the staged input copies at it before the graph is allocated. A tensor that already has `data` is left alone by `ggml_gallocr_init_tensor`, so the ring sits outside the allocator's reuse analysis rather than competing with it.
 
 Each slot has one ownership cycle:
 
@@ -74,57 +36,29 @@ Each slot has one ownership cycle:
 2. it records the slot's `ready` event, which the consumer stream waits for before launching the split that reads the slot;
 3. the consumer records `release` once every kernel that reads the slot has been enqueued, and the transfer stream waits for that before overwriting the slot for a later split.
 
-Membership in the ring is decided once, when the ring is laid out, and execution
-goes by the recorded answer. How much of a staged input can go early moves with
-every ubatch; *which* input copies live in the ring must not, because their
-addresses were handed out at allocation time.
+Membership in the ring is decided once, when the ring is laid out, and execution goes by the recorded answer. How much of a staged input can go early moves with every ubatch; *which* input copies live in the ring must not, because their addresses were handed out at allocation time.
 
 Two things disqualify an input that otherwise looks eligible:
 
-- **A reader further down the graph.** The scheduler creates one input copy per
-  (tensor, backend), not per split, so a later split can be pointed at the same
-  copy without appearing to consume it -- and by then the ring may have recycled
-  the slot. The plan scans the splits after the owner for such a reader and puts
-  those inputs back on the ordered path. Attention does not produce this shape,
-  but nothing in the scheduler forbids it.
-- **No room on the device.** A slot holds one split's whole delivery, so the ring
-  grows with the context: 27 MiB at 4k, 213 MiB at 32k, 1.7 GiB at 256k. The ring
-  is allocated after the graph allocator has reserved its buffers, so it must not
-  take the room those buffers may still have to grow into; it declines unless it
-  can leave `GGML_SCHED_TRANSPORT_HEADROOM` (512 MiB) free, says so once, and
-  stays on the ordered path.
+- **A reader further down the graph.** The scheduler creates one input copy per (tensor, backend), not per split, so a later split can be pointed at the same copy without appearing to consume it -- and by then the ring may have recycled the slot. The plan scans the splits after the owner for such a reader and puts those inputs back on the ordered path. Attention does not produce this shape, but nothing in the scheduler forbids it.
+- **No room on the device.** A slot holds one split's whole delivery, so the ring grows with the context: 27 MiB at 4k, 213 MiB at 32k, 1.7 GiB at 256k. The ring is allocated after the graph allocator has reserved its buffers, so it must not take the room those buffers may still have to grow into; it declines unless it can leave `GGML_SCHED_TRANSPORT_HEADROOM` (512 MiB) free, says so once, and stays on the ordered path.
 
 ### 3. A look-ahead that stays clear of the ring's tail
 
-A delivery running `L` splits ahead recycles the slot of the split `L - n_slots`
-back. With `n_slots == L + 1` the ring is exactly full, so every delivery has to
-recycle the split that was enqueued a moment ago and is still running -- the
-ordered path with extra steps. The ring therefore keeps
-`GGML_SCHED_TRANSPORT_MARGIN` (2) slots behind the look-ahead, and
-`--kv-pipeline-depth N` allocates `N + 2` slots.
+A delivery running `L` splits ahead recycles the slot of the split `L - n_slots` back. With `n_slots == L + 1` the ring is exactly full, so every delivery has to recycle the split that was enqueued a moment ago and is still running -- the ordered path with extra steps. The ring therefore keeps `GGML_SCHED_TRANSPORT_MARGIN` (2) slots behind the look-ahead, and `--kv-pipeline-depth N` allocates `N + 2` slots.
 
 Two details matter as much as the margin:
 
-- **Deliveries are issued after a split is enqueued, never before.** Issuing them
-  first means the host can block on slot recycling while holding back work the
-  consumer could already be running.
-- **Slot recycling is ordered stream to stream, not through the host.** A host
-  wait empties the transfer queue for as long as it blocks.
+- **Deliveries are issued after a split is enqueued, never before.** Issuing them first means the host can block on slot recycling while holding back work the consumer could already be running.
+- **Slot recycling is ordered stream to stream, not through the host.** A host wait empties the transfer queue for as long as it blocks.
 
-Getting either of these wrong costs the entire gain while still producing correct
-output, which is the failure mode worth knowing about: on this configuration the
-first attempt measured `+0.5%` and looked like "the copy simply does not overlap".
+Getting either of these wrong costs the entire gain while still producing correct output, which is the failure mode worth knowing about: on this configuration the first attempt measured `+0.5%` and looked like "the copy simply does not overlap".
 
 ## Measurements
 
-RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F,
-`Qwen3.8-27B-UD-IQ2_M.gguf`, `-ngl 99 -sm none -mg 0 -t 3 -fa on -ctk q8_0
--ctv q8_0 -b 512 -ub 512`, host residency `-nkvo --kv-cpu-pinned
---recurrent-state-offload`, everything under `taskset -c 0,2,4`.
+RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F, `Qwen3.8-27B-UD-IQ2_M.gguf`, `-ngl 99 -sm none -mg 0 -t 3 -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512`, host residency `-nkvo --kv-cpu-pinned --recurrent-state-offload`, everything under `taskset -c 0,2,4`.
 
-`llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order
-(`docs/repro/r4-kv-pipeline-ab.sh`, `docs/repro/r4-kv-pipeline-context-sweep.sh`),
-with no cap on the ring:
+`llama-bench`, `--no-warmup`, A/B/A/B with reversed arm order (`docs/repro/r4-kv-pipeline-ab.sh`, `docs/repro/r4-kv-pipeline-context-sweep.sh`), with no cap on the ring:
 
 | depth | ordered | pipelined | gain | peak device memory |
 |---:|---|---|---:|---:|
@@ -132,18 +66,9 @@ with no cap on the ring:
 | 16,384 | 19.4344, 19.4828 | 31.0981, 31.0931 | **+59.8%** | +86 to +104 MiB |
 | 32,768 | 12.9453, 12.9400 | 15.4571, 15.4516 | **+19.4%** | +206 MiB |
 
-> These rows were taken before the budget existed, so they are the uncapped
-> numbers. The 32,768 ring is 204 MiB and the default cap is 128 MiB, so that row
-> does not reproduce on the current default: it needs `-kvpb 512`, which
-> `llama-bench` did not take until now. The scripts pass it, and the row is due a
-> re-measurement on the current head.
+> These rows were taken before the budget existed, so they are the uncapped numbers. The 32,768 ring is 204 MiB and the default cap is 128 MiB, so that row does not reproduce on the current default: it needs `-kvpb 512`, which `llama-bench` did not take until now. The scripts pass it, and the row is due a re-measurement on the current head.
 
-> These also need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have
-> them: the repro scripts probed `--help`, found nothing, and quietly dropped
-> both. The same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the
-> pipeline buys +6.7% instead of +60%, because a host-resident recurrent state
-> costs more than the transport can win back. `llama-bench` takes them again, and
-> the scripts now fail rather than drop an option the build does not have.
+> These also need `-kvcp 1 -rso 1`, and for a while `llama-bench` did not have them: the repro scripts probed `--help`, found nothing, and quietly dropped both. The same commit then measures 19.43 -> 9.02 t/s ordered at 16,384 and the pipeline buys +6.7% instead of +60%, because a host-resident recurrent state costs more than the transport can win back. `llama-bench` takes them again, and the scripts now fail rather than drop an option the build does not have.
 
 `llama-server`, one request, `temperature 0, top_k 1, seed 1234`:
 
@@ -152,32 +77,22 @@ with no cap on the ring:
 | 19,246 | 32,768 | 17.785 | 29.833 | **+67.7%** | 28.3 | 25.7 | 31.30 | 95.3% |
 | 48,042 | 65,536 | 9.790 | 11.313 | **+15.6%** | 76.4 | 25.4 | 11.86 | 95.4% |
 
-`copy` and `compute` are read off `GGML_SCHED_TRANSPORT_DEBUG=2` on each arm, not
-fitted: the ordered arm reports what it spends blocked in `ggml_backend_tensor_copy`
-and what it spends waiting for the consumer. The ceiling is `max(copy, compute)`
-plus the per-token work outside the split loop, which is on both arms.
+`copy` and `compute` are read off `GGML_SCHED_TRANSPORT_DEBUG=2` on each arm, not fitted: the ordered arm reports what it spends blocked in `ggml_backend_tensor_copy` and what it spends waiting for the consumer. The ceiling is `max(copy, compute)` plus the per-token work outside the split loop, which is on both arms.
 
-**The pipeline is within 5% of that ceiling at both depths.** What is left is not
-a scheduling problem, and the section on the residual below says what it is.
+**The pipeline is within 5% of that ceiling at both depths.** What is left is not a scheduling problem, and the section on the residual below says what it is.
 
-Pinning is worth as much as the pipeline and is off by default. Behind a
-13,128-token prompt:
+Pinning is worth as much as the pipeline and is off by default. Behind a 13,128-token prompt:
 
 | | ordered | pipelined |
 |---|---:|---:|
 | `--kv-cpu-pinned` | 21.582 | 32.252 |
 | unpinned | 14.945 | 22.709 |
 
-Look-ahead deeper than one split is worse at every depth measured. At 19,246:
-29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default
-for that reason.
+Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason.
 
 ### The link is the ceiling, so the lever is bytes
 
-644 MiB in 28.3 ms is 22.0 GB/s, and `nvidia-smi` reports the card at gen4 x16.
-That is about 88% of what the link delivers in practice, so there is no room left
-in the transport itself. What is left is to send less. `-ctk q4_0 -ctv q4_0`
-halves the cache and therefore the traffic:
+644 MiB in 28.3 ms is 22.0 GB/s, and `nvidia-smi` reports the card at gen4 x16. That is about 88% of what the link delivers in practice, so there is no room left in the transport itself. What is left is to send less. `-ctk q4_0 -ctv q4_0` halves the cache and therefore the traffic:
 
 | prompt | KV | ordered | pipelined | delivered |
 |---:|---|---:|---:|---:|
@@ -186,21 +101,13 @@ halves the cache and therefore the traffic:
 | 48,042 | q8_0 | 9.790 | 11.313 | 1602.5 MiB |
 | 48,042 | q4_0 | 14.146 | 17.717 | 850.6 MiB |
 
-Halving the traffic is worth +5.6% on the pipelined path at 19,246 and +56.6% at
-48,042. The difference is the crossover: at 19,246 the pipeline has already
-brought the copy down to the compute floor, and the consumer wait is 27.31 ms at
-q8_0 against 27.26 ms at q4_0, the same number. Removing bytes there removes work
-nothing was waiting for. At 48,042 the copy still dominates and every byte
-removed is a byte off the token.
+Halving the traffic is worth +5.6% on the pipelined path at 19,246 and +56.6% at 48,042. The difference is the crossover: at 19,246 the pipeline has already brought the copy down to the compute floor, and the consumer wait is 27.31 ms at q8_0 against 27.26 ms at q4_0, the same number. Removing bytes there removes work nothing was waiting for. At 48,042 the copy still dominates and every byte removed is a byte off the token.
 
-**Whether to spend a quantisation step on the cache is a depth question, and the
-two compound.** At 48,042, q4_0 with the pipeline is 17.717 against 9.790 for
-q8_0 without it.
+**Whether to spend a quantisation step on the cache is a depth question, and the two compound.** At 48,042, q4_0 with the pipeline is 17.717 against 9.790 for q8_0 without it.
 
 ### Across context depth, with device memory
 
-`docs/repro/r4-kv-pipeline-context-sweep.sh`, A/B/A/B, peak device memory sampled
-with `nvidia-smi` across each arm. Both passes agreed to the digits shown.
+`docs/repro/r4-kv-pipeline-context-sweep.sh`, A/B/A/B, peak device memory sampled with `nvidia-smi` across each arm. Both passes agreed to the digits shown.
 
 | Context | ordered | pipelined | gain | peak device memory | delta | ring |
 |---|---:|---:|---:|---|---:|---:|
@@ -213,70 +120,35 @@ with `nvidia-smi` across each arm. Both passes agreed to the digits shown.
 
 Two curves run in opposite directions here, and both matter.
 
-**The gain narrows with depth.** A token is copy plus compute; as the context
-grows the copy grows with it while the compute per staged split does not, so the
-share of the token that can hide a transfer shrinks. At 16,384 compute still
-covers most of the copy; by 131,072 it covers a tenth of it. That is arithmetic,
-not an implementation limit, and no amount of look-ahead changes it.
+**The gain narrows with depth.** A token is copy plus compute; as the context grows the copy grows with it while the compute per staged split does not, so the share of the token that can hide a transfer shrinks. At 16,384 compute still covers most of the copy; by 131,072 it covers a tenth of it. That is arithmetic, not an implementation limit, and no amount of look-ahead changes it.
 
-**The ring's cost does not narrow.** It is `(depth + 2)` slots of one staged
-split, and a staged split is K and V of one attention layer over the whole
-context: it doubles every time the context doubles. At 131,072 it claims 818 MiB
-of an 11,902 MiB card to buy 9.1%.
+**The ring's cost does not narrow.** It is `(depth + 2)` slots of one staged split, and a staged split is K and V of one attention layer over the whole context: it doubles every time the context doubles. At 131,072 it claims 818 MiB of an 11,902 MiB card to buy 9.1%.
 
-At 262,144 the ring would need 1.7 GiB against 573 MiB free, so it declines and
-the run stays on the ordered path -- 2.25 against 2.24 t/s, inside the spread of
-the ordered arm's own two passes, and 62 MiB of device memory for the transfer
-backend's context. Declining is the intended outcome, not a failure: the +62 MiB
-and the unchanged throughput are what "the guard did its job" looks like.
+At 262,144 the ring would need 1.7 GiB against 573 MiB free, so it declines and the run stays on the ordered path -- 2.25 against 2.24 t/s, inside the spread of the ordered arm's own two passes, and 62 MiB of device memory for the transfer backend's context. Declining is the intended outcome, not a failure: the +62 MiB and the unchanged throughput are what "the guard did its job" looks like.
 
-**The ring beats `--kv-gpu-layers` per MiB, and the two barely add up.** Measured
-behind a 19,246-token prompt at `-c 32768`, where a device-resident layer costs
-about 68 MiB and the ring costs about 205 MiB:
+**The ring beats `--kv-gpu-layers` per MiB, and the two barely add up.** Measured behind a 19,246-token prompt at `-c 32768`, where a device-resident layer costs about 68 MiB and the ring costs about 205 MiB:
 
 | | no `--kv-gpu-layers` | `--kv-gpu-layers 4` | `--kv-gpu-layers 8` |
 |---|---:|---:|---:|
 | ordered | 17.785 | 20.334 | |
 | pipelined | 29.843 | 30.263 | 30.640 |
 
-Four device-resident layers are worth +14.3% on the ordered path and +1.4% on the
-pipelined one. The reason they stop paying is the point of the section above: the
-pipeline has already moved the bottleneck down to the compute floor, so removing
-a quarter of the traffic removes something that was no longer being waited for.
-Whether this still holds where the copy dominates by a wide margin has not been
-measured.
+Four device-resident layers are worth +14.3% on the ordered path and +1.4% on the pipelined one. The reason they stop paying is the point of the section above: the pipeline has already moved the bottleneck down to the compute floor, so removing a quarter of the traffic removes something that was no longer being waited for. Whether this still holds where the copy dominates by a wide margin has not been measured.
 
 ### The budget
 
-The table above is what the feature costs uncapped, and it is the reason it is
-capped. A host-resident KV cache exists to keep device memory free; a transport
-that speeds it up by spending hundreds of MiB of that memory is working against
-the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an
-absolute cap on the ring, not a fraction of what happens to be free:
+The table above is what the feature costs uncapped, and it is the reason it is capped. A host-resident KV cache exists to keep device memory free; a transport that speeds it up by spending hundreds of MiB of that memory is working against the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an absolute cap on the ring, not a fraction of what happens to be free:
 
 - Under the cap the ring is allocated and the deliveries pipeline.
-- Over it the scheduler declines and keeps the ordered path for that graph.
-  Later graphs are evaluated again, so a smaller live window can use the ring.
-- Declining costs nothing in steady state. Both the ring and the transfer
-  backend's device context are released.
+- Over it the scheduler declines and keeps the ordered path for that graph. Later graphs are evaluated again, so a smaller live window can use the ring.
+- Declining costs nothing in steady state. Both the ring and the transfer backend's device context are released.
+- The budget and the headroom check are decided before the graph is allocated, so they can still leave the graph short. If graph reservation fails, the rings are released and the reservation is retried once on the ordered path, and that scheduler keeps the ordered path from then on. An optional ring never turns a graph that fits into an allocation failure.
 
-**The cap is applied to what the current graph needs, not to what the full
-context would need.** A run whose window stays small keeps the ring whatever
-`-n_ctx` says, which is the common case and the reason it is done this way: a
-staged input is a view of the cache tensor, so the full-context figure is there
-for the asking, but enforcing it would refuse the ring for every large `-c` even
-when the window never gets near it. The warning reports both numbers so that
-`--kv-pipeline-budget` can be sized against the one that matters.
+**The cap is applied to what the current graph needs, not to what the full context would need.** A run whose window stays small keeps the ring whatever `-n_ctx` says, which is the common case and the reason it is done this way: a staged input is a view of the cache tensor, so the full-context figure is there for the asking, but enforcing it would refuse the ring for every large `-c` even when the window never gets near it. The warning reports both numbers so that `--kv-pipeline-budget` can be sized against the one that matters.
 
-The cost of deciding per graph is that a context which grows past the budget
-allocates a ring for the small early windows and gives it back once it outgrows
-them. That transient is bounded by the budget itself, which is the memory the
-user already authorised, so it is a property of the cap rather than a defect in
-it.
+The cost of deciding per graph is that a context which grows past the budget allocates a ring for the small early windows and gives it back once it outgrows them. That transient is bounded by the budget itself, which is the memory the user already authorised, so it is a property of the cap rather than a defect in it.
 
-At 32,768 the ring is 204 MiB at the full context, over the 128 MiB default.
-`--kv-pipeline-budget 512` buys 20.350 -> 31.463 t/s behind an 18,432-token
-prompt.
+At 32,768 the ring is 204 MiB at the full context, over the 128 MiB default. `--kv-pipeline-budget 512` buys 20.350 -> 31.463 t/s behind an 18,432-token prompt.
 
 ### Where the rest of the token goes
 
@@ -291,126 +163,50 @@ Per decode graph, `GGML_SCHED_TRANSPORT_DEBUG=2`, behind a 19,246-token prompt:
 | bytes delivered early / late | 0 / 0 MiB | 644.0 / 2.3 MiB |
 | bytes left on the ordered path | 28.3 MiB | 0.4 MiB |
 
-The blocking host-to-device copy is all but gone and the consumer wait is
-unchanged, which is the shape a working overlap has: the transfer left the host's
-critical path without being added to the consumer's. 644 MiB in the 28.3 ms the
-ordered arm reports for the same bytes is 22.0 GB/s, which is what this link
-does; the transfer cannot be made faster, only hidden.
+The blocking host-to-device copy is all but gone and the consumer wait is unchanged, which is the shape a working overlap has: the transfer left the host's critical path without being added to the consumer's. 644 MiB in the 28.3 ms the ordered arm reports for the same bytes is 22.0 GB/s, which is what this link does; the transfer cannot be made faster, only hidden.
 
-The 3.57 ms that remains moves 0.4 MiB, and `GGML_SCHED_TRANSPORT_DEBUG=3` shows
-that almost all of it is one copy: `attn_inp_k_rot`, 256 KiB, 18 us on the
-ordered path and 3.4 ms behind one split of look-ahead. The 32 KV store copies
-cost 353 us between them.
+The 3.57 ms that remains moves 0.4 MiB, and `GGML_SCHED_TRANSPORT_DEBUG=3` shows that almost all of it is one copy: `attn_inp_k_rot`, 256 KiB, 18 us on the ordered path and 3.4 ms behind one split of look-ahead. The 32 KV store copies cost 353 us between them.
 
-It looks like latency and is not. A blocking copy shares the device's copy engine
-with the deliveries and waits for what is already queued there: two staged splits
-at 22.0 GB/s is 3.6 ms, which is the number. Two things were tried and neither
-helped. Issuing the delivery in pieces so the blocking copy can interleave does
-nothing -- the engine is FIFO across streams, `attn_inp_k_rot` stays at 3.4 ms at
-every piece size, and small pieces cost throughput (29.80 t/s whole, 28.73 at
-4 MiB, 22.01 at 1 MiB). Putting the copy on the consumer's own stream so the host
-never blocks moves the time rather than removing it: the ordered copy falls from
-3.57 ms to 0.16 ms, the consumer wait rises from 27.31 ms to 31.05 ms, and
-throughput does not move (29.808 against 29.834).
+It looks like latency and is not. A blocking copy shares the device's copy engine with the deliveries and waits for what is already queued there: two staged splits at 22.0 GB/s is 3.6 ms, which is the number. Two things were tried and neither helped. Issuing the delivery in pieces so the blocking copy can interleave does nothing -- the engine is FIFO across streams, `attn_inp_k_rot` stays at 3.4 ms at every piece size, and small pieces cost throughput (29.80 t/s whole, 28.73 at 4 MiB, 22.01 at 1 MiB). Putting the copy on the consumer's own stream so the host never blocks moves the time rather than removing it: the ordered copy falls from 3.57 ms to 0.16 ms, the consumer wait rises from 27.31 ms to 31.05 ms, and throughput does not move (29.808 against 29.834).
 
-So this is not spare time. Those 256 KiB cross the same saturated link as the
-644 MiB of deliveries, and the link is the ceiling.
+So this is not spare time. Those 256 KiB cross the same saturated link as the 644 MiB of deliveries, and the link is the ceiling.
 
-Do not compare these numbers against runs on other models, prompts, cache
-settings, hardware, or commits.
+Do not compare these numbers against runs on other models, prompts, cache settings, hardware, or commits.
 
 ## Validation
 
 The gates, and what was run for them:
 
-1. **Byte-identical greedy server output against the control.** Four fixed tasks
-   at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token
-   prompt, hashed and compared against a build of the parent commit. Identical at
-   `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh` compares
-   every requested depth with the first and fails on a hash difference.
-   Two things keep the tasks independent of each other, and both were needed.
-   Every task carries a nonce derived from its own name and length, so no two
-   share a prefix the server could restore, and the harness fails a task whose
-   `prompt_n` says one was reused anyway. Each request also sets
-   `cache_prompt: false`, so a task never inherits what the previous one left in
-   the cache.
+1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
 
-   The second is what made `records@18432` a gate rather than a coin flip. Its
-   prompt is about 29.6k tokens against a 32,768 context, and the task before it
-   is about the same size, so the two do not both fit and placement depended on
-   what was still resident. Two otherwise identical `N = 0` runs of it produced
-   different hashes. Asked on its own with the cache off it is perfectly stable:
-   the same hash three times running, at `-c 32768` and at `-c 65536`. With the
-   flag set, two independent `N = 0` passes agree on all eight tasks, and
-   `N = 0`, `N = 1` and `N = 4` agree on all eight.
-2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.**
-   `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output.
+   The second is what made `records@18432` a gate rather than a coin flip. Its prompt is about 29.6k tokens against a 32,768 context, and the task before it is about the same size, so the two do not both fit and placement depended on what was still resident. Two otherwise identical `N = 0` runs of it produced different hashes. Asked on its own with the cache off it is perfectly stable: the same hash three times running, at `-c 32768` and at `-c 65536`. With the flag set, two independent `N = 0` passes agree on all eight tasks, and `N = 0`, `N = 1` and `N = 4` agree on all eight.
+2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.** `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output.
 3. **Device allocation high-water reported.** Above.
-4. **Telemetry showing the deliveries actually converted.**
-   `GGML_SCHED_TRANSPORT_DEBUG=1` reports the plan (staged splits, bytes per
-   graph, how much of it goes early, and the source buffer type); `=2` adds the
-   per-graph host-time breakdown above, as the mean over each 128 graphs, with
-   depth stops and the number of recycle waits enqueued; `=3` names the tensors
-   still on the ordered path. `ggml_backend_sched_get_transport_pipeline_stats()`
-   exposes deliveries and early and late byte counts to callers.
+4. **Telemetry showing the deliveries actually converted.** `GGML_SCHED_TRANSPORT_DEBUG=1` reports the plan (staged splits, bytes per graph, how much of it goes early, and the source buffer type); `=2` adds the per-graph host-time breakdown above, as the mean over each 128 graphs, with depth stops and the number of recycle waits enqueued; `=3` names the tensors still on the ordered path. `ggml_backend_sched_get_transport_pipeline_stats()` exposes deliveries and early and late byte counts to callers.
 
-A device-resident KV run is unaffected, and was measured to confirm it: 38.5612
-t/s at depth 0 against 38.5240 at depth 1, `tg128 @ d4096`, with the
-transport never enabled because the scheduler is given a depth of 0.
+A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 t/s at depth 0 against 38.5240 at depth 1, `tg128 @ d4096`, with the transport never enabled because the scheduler is given a depth of 0.
 
 ## Scope and limits
 
-- Only persistent host inputs marked with `GGML_TENSOR_FLAG_TRANSPORT` are
-  candidates. The stable prefix remains a per-evaluation value. Unmarked inputs,
-  weights, user inputs, transposed V, and copies with later readers stay ordered.
-- CUDA is the only enabled backend. Meta, SYCL, WebGPU, and other backends stay
-  ordered until their event behavior and transport path are validated.
-- The ring costs `(depth + 2) x (largest staged split)` of device memory, and a
-  staged split is both K and V of one attention layer over the whole context. That
-  is linear in context length, and it is what bounds the feature at depth rather
-  than anything about the transfer itself.
-- **One ring per accelerator.** A layer-split model pipelines on every device
-  that qualifies; a device with no room within the budget falls back to the
-  ordered path on its own without disabling the others.
-- **Tensor parallelism keeps the ordered path.** See
-  [Tensor parallelism](#tensor-parallelism).
-- The scheduler must be configured with the device's own default buffer type. A
-  scheduler built on a split or host buffer type keeps the ordered path.
+- Only persistent host inputs marked with `GGML_TENSOR_FLAG_TRANSPORT` are candidates. The stable prefix remains a per-evaluation value. Unmarked inputs, weights, user inputs, transposed V, and copies with later readers stay ordered.
+- CUDA is the only enabled backend. Meta, SYCL, WebGPU, and other backends stay ordered until their event behavior and transport path are validated.
+- The ring costs `(depth + 2) x (largest staged split)` of device memory, and a staged split is both K and V of one attention layer over the whole context. That is linear in context length, and it is what bounds the feature at depth rather than anything about the transfer itself.
+- **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others.
+- **Tensor parallelism keeps the ordered path.** See [Tensor parallelism](#tensor-parallelism).
+- The scheduler must be configured with the device's own default buffer type. A scheduler built on a split or host buffer type keeps the ordered path.
 - `GGML_KV_PIPELINE_DEPTH` and `GGML_KV_PIPELINE_BUDGET_MIB` provide scheduler defaults. Explicit scheduler settings and command-line options take precedence.
 
 ## Tensor parallelism
 
-`-sm tensor` is not pipelined. The scheduler explicitly excludes meta devices.
-A host-resident cache needs a validated strided head-split write before this can
-be enabled.
+`-sm tensor` is not pipelined. The scheduler explicitly excludes meta devices. A host-resident cache needs a validated strided head-split write before this can be enabled.
 
-Both sit behind a correctness problem that is not this feature's:
-**`-sm tensor` together with `--no-kv-offload` currently produces wrong output.**
-On one build and one prompt, `-sm layer --no-kv-offload` and `-sm tensor` with a
-device-resident cache agree exactly, while `-sm tensor --no-kv-offload` differs.
-It does not crash or warn; it generates fluent, different text.
+Both sit behind a correctness problem that is not this feature's: **`-sm tensor` together with `--no-kv-offload` currently produces wrong output.** On one build and one prompt, `-sm layer --no-kv-offload` and `-sm tensor` with a device-resident cache agree exactly, while `-sm tensor --no-kv-offload` differs. It does not crash or warn; it generates fluent, different text.
 
-The cause is the GQA head mapping. Tensor parallelism splits attention by head,
-but a host-resident cache is one undivided tensor, so the scheduler's copy of it
-is classified `MIRRORED` and the whole window goes to every device. With 24 query
-heads split 12/12 and 4 KV heads mirrored, the kernel derives the GQA ratio from
-the tensors it is handed -- 12/4 = 3 rather than 6 -- and the second device's
-queries, renumbered from 0, read the first device's keys. With an uneven split the
-same fault surfaces as a crash instead:
-`GGML_ASSERT(Q->ne[2] % K->ne[2] == 0)`, because 24 heads split 13/11 is not
-divisible by 4.
+The cause is the GQA head mapping. Tensor parallelism splits attention by head, but a host-resident cache is one undivided tensor, so the scheduler's copy of it is classified `MIRRORED` and the whole window goes to every device. With 24 query heads split 12/12 and 4 KV heads mirrored, the kernel derives the GQA ratio from the tensors it is handed -- 12/4 = 3 rather than 6 -- and the second device's queries, renumbered from 0, read the first device's keys. With an uneven split the same fault surfaces as a crash instead: `GGML_ASSERT(Q->ne[2] % K->ne[2] == 0)`, because 24 heads split 13/11 is not divisible by 4.
 
-Head-splitting the copy rather than mirroring it fixes it. That was prototyped
-and reproduced the layer-split output byte for byte, and needs four coordinated
-changes: classify the scheduler's copy at all (it is a leaf in a compute buffer,
-so it never reaches the device's split-state callback), use the head axis for the
-permuted `[head_dim, n_kv, n_head_kv, 1]` shape rather than the cache tensor's own
-axis, express the granularity in heads aligned to the query split divided by the
-GQA ratio, and add a strided write because the heads are interleaved within each
-row rather than laid out end to end.
+Head-splitting the copy rather than mirroring it fixes it. That was prototyped and reproduced the layer-split output byte for byte, and needs four coordinated changes: classify the scheduler's copy at all (it is a leaf in a compute buffer, so it never reaches the device's split-state callback), use the head axis for the permuted `[head_dim, n_kv, n_head_kv, 1]` shape rather than the cache tensor's own axis, express the granularity in heads aligned to the query split divided by the GQA ratio, and add a strided write because the heads are interleaved within each row rather than laid out end to end.
 
 ## Future work
 
-- Fix `-sm tensor` with `--no-kv-offload` (above). Until then it should not be
-  used: it is wrong rather than slow.
+- Fix `-sm tensor` with `--no-kv-offload` (above). Until then it should not be used: it is wrong rather than slow.
 - Add the strided head-split delivery above, validate it, and then measure it.
