@@ -2328,7 +2328,7 @@ static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev) {
 // Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
 // memory. Taking them in layer order fills the device that owns the first layers and leaves the
 // free memory of the others unused, so take them per owning device instead.
-static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & model, uint32_t n_layers) {
+static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & model, uint32_t n_layers, bool is_mtp) {
     std::set<uint32_t> ret;
     if (n_layers == 0) {
         return ret;
@@ -2352,7 +2352,11 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
     std::vector<ggml_backend_dev_t>    devs;
     std::vector<std::vector<uint32_t>> devs_ils;
 
-    for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        // a nextn layer is cached by the MTP context, the rest of the model by the main one
+        if (hparams.n_layer_nextn > 0 && (il >= hparams.n_layer()) != is_mtp) {
+            continue;
+        }
         // a recurrent layer keeps its state elsewhere, so it must not take from the budget
         if (!hparams.has_kv(il) || hparams.is_recr(il)) {
             continue;
@@ -2427,7 +2431,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // budget instead of giving each of them the full count. An offloaded cache is device-resident
     // already, so it needs no set and must not pay for measuring the links.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-        placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers);
+        placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
+                params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
         if (placement.gpu_resident_ils.empty()) {
             LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
         } else {
