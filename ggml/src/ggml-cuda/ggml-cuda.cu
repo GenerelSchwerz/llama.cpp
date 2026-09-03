@@ -4232,8 +4232,25 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
-static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+static uint64_t ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
+    if (cgraph->n_nodes <= 0) {
+        return 0;
+    }
+
+    uint64_t key = (uint64_t) (uintptr_t) cgraph->nodes[0];
+
+    auto mix = [&key](uint64_t v) {
+        key = (key ^ v) * 0x100000001b3ull;
+    };
+
+    mix(cgraph->n_nodes);
+
+    for (int d = 0; d < GGML_MAX_DIMS; d++) {
+        mix(cgraph->nodes[0]->ne[d]);
+        mix(cgraph->nodes[cgraph->n_nodes - 1]->ne[d]);
+    }
+
+    return key;
 }
 
 static void ggml_cuda_moe_clear_graph_coverage(ggml_cuda_graph * graph) {
@@ -4252,7 +4269,7 @@ void ggml_backend_cuda_context::certify_moe_graph(ggml_cgraph * cgraph) {
         return;
     }
 
-    const void * key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t key = ggml_cuda_graph_get_key(cgraph);
     for (auto & entry : cuda_graphs) {
         ggml_cuda_graph * graph = entry.second.get();
         if (entry.first == key || ggml_cuda_moe_graph_spans_overlap(
@@ -4362,7 +4379,7 @@ static ggml_cuda_graph::node_properties ggml_cuda_graph_node_properties(const gg
 static ggml_cuda_graph_property_probe ggml_cuda_graph_probe_properties(
         ggml_backend_cuda_context * cuda_ctx,
         ggml_cgraph * cgraph) {
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     const uint64_t execution_semantic_key = ggml_cuda_moe_execution_semantic_key(cgraph);
 
@@ -4389,7 +4406,7 @@ static ggml_cuda_graph_property_probe ggml_cuda_graph_probe_properties(
 }
 
 static void ggml_cuda_graph_commit_properties(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     graph->uid = cgraph->uid;
     graph->execution_semantic_key = ggml_cuda_moe_execution_semantic_key(cgraph);
@@ -4399,7 +4416,7 @@ static void ggml_cuda_graph_commit_properties(ggml_backend_cuda_context * cuda_c
     }
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -4441,7 +4458,7 @@ bool ggml_cuda_graph_capture_state_query_for_test(
         return false;
     }
     auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
-    const auto graph = context->cuda_graphs.find(cgraph->nodes[0]);
+    const auto graph = context->cuda_graphs.find(ggml_cuda_graph_get_key(const_cast<ggml_cgraph *>(cgraph)));
     if (graph == context->cuda_graphs.end() || graph->second == nullptr) {
         return false;
     }
@@ -6310,7 +6327,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(
         ggml_cgraph * cgraph,
         const bool use_cuda_graph,
         const bool cuda_graph_update_required,
-        const void * graph_key,
+        uint64_t graph_key,
         ggml_cuda_moe_graph_execution * moe_execution) {
     bool graph_evaluated_or_captured = false;
 
@@ -6541,7 +6558,7 @@ static bool ggml_cuda_graph_evaluate_and_capture(
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
@@ -6672,7 +6689,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     bool graph_properties_changed   = false;
     bool graph_property_uid_match   = false;
 #endif
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = nullptr;
 #ifdef USE_CUDA_GRAPH
     graph = cuda_ctx->cuda_graph(graph_key);
@@ -6967,7 +6984,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
+    const uint64_t graph_key = ggml_cuda_graph_get_key(cgraph);
     const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 #else
     const bool use_cuda_graph = false;
