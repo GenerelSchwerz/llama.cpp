@@ -2800,6 +2800,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
+        if (params_spec.n_moe_expert_cache_slots >= 0) {
+            result.n_moe_expert_cache_slots = params_spec.n_moe_expert_cache_slots;
+        }
 
         if (params_spec.cpuparams.n_threads > 0) {
             result.cpuparams.n_threads       = params_spec.cpuparams.n_threads;

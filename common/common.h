@@ -339,6 +339,7 @@ struct common_params_speculative_draft {
     llama_context * ctx_dft = nullptr;
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
+    int32_t n_moe_expert_cache_slots = -1; // MoE expert cache slots for the draft model (-1 = inherit target)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
