@@ -396,9 +396,14 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+// with offload_kqv=false the cache lives in host memory
+struct kv_config {
+    bool offload_kqv = true;
+};
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const kv_config & kvc = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -411,6 +416,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.offload_kqv = kvc.offload_kqv;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1295,9 +1301,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        kv_config                       kvc;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, kv_config kvc = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), kvc(std::move(kvc)) {}
     };
 
     std::vector<device_config> dev_configs;
@@ -1319,6 +1326,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         }
 
         dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+
+        // a host-resident cache reaches attention as a scheduler copy that is split by head
+        kv_config kvc_host;
+        kvc_host.offload_kqv = false;
+        dev_configs.emplace_back(devices_meta, "Meta -nkvo", LLAMA_SPLIT_MODE_TENSOR, kvc_host);
+
+        for (const device_config & dc : dev_configs) {
+            max_device_label_length = std::max(max_device_label_length, dc.label.length());
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -1390,7 +1406,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, dc.kvc);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
@@ -1412,7 +1428,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode, dc.kvc);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
