@@ -1749,7 +1749,7 @@ static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
     const bool target_speculative = required && certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
         certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE &&
         certificate.n_sequences < result.n_rows;
-    result.grouped_eligible = result.certificate_valid && certificate.n_rows == result.n_rows &&
+    result.grouped_eligible = result.certificate_valid && result.n_rows <= certificate.n_rows &&
         result.n_rows >= 1 && n_slots > 0 && n_slots <= INT32_MAX &&
         ((main_independent && result.n_routes <= n_slots) || draft_independent || draft_sequential ||
             mtp_independent || mtp_sequential || target_speculative);
@@ -3928,18 +3928,37 @@ struct ggml_cuda_moe_grouped_context::impl {
     };
 
     struct graph_coverage_record {
-        const void * nodes = nullptr;
         uint64_t epoch = 0;
+    };
+
+    struct graph_coverage_key {
+        const void * nodes = nullptr;
         uint64_t mmid_fingerprint = 0;
         int32_t n_nodes = 0;
         uint32_t mmid_count = 0;
+
+        bool operator==(const graph_coverage_key & other) const {
+            return nodes == other.nodes && mmid_fingerprint == other.mmid_fingerprint && n_nodes == other.n_nodes &&
+                mmid_count == other.mmid_count;
+        }
+    };
+
+    struct graph_coverage_key_hash {
+        size_t operator()(const graph_coverage_key & key) const {
+            uint64_t result = UINT64_C(1469598103934665603);
+            moe_candidate_hash_value(result, reinterpret_cast<uintptr_t>(key.nodes));
+            moe_candidate_hash_value(result, key.mmid_fingerprint);
+            moe_candidate_hash_value(result, key.n_nodes);
+            moe_candidate_hash_value(result, key.mmid_count);
+            return static_cast<size_t>(result);
+        }
     };
 
     using legacy_record_map = std::unordered_map<const ggml_tensor *, std::unique_ptr<legacy_record>>;
     using legacy_record_list = std::vector<std::unique_ptr<legacy_record>>;
     using terminal_legacy_records = std::array<std::unique_ptr<legacy_record>, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS>;
     using resource_slots = std::vector<std::shared_ptr<grouped_resource>>;
-    using graph_coverage_map = std::unordered_map<const void *, graph_coverage_record>;
+    using graph_coverage_map = std::unordered_map<graph_coverage_key, graph_coverage_record, graph_coverage_key_hash>;
 
     ggml_backend_dev_t owner;
     int device;
@@ -5248,11 +5267,21 @@ static void moe_candidate_graph_mmid_fingerprint_add(
         int32_t node_index,
         const ggml_tensor * node,
         const ggml_tensor * source) {
-    const uintptr_t node_address = reinterpret_cast<uintptr_t>(node);
-    const uintptr_t source_address = reinterpret_cast<uintptr_t>(source);
     moe_candidate_hash_value(fingerprint, node_index);
-    moe_candidate_hash_value(fingerprint, node_address);
-    moe_candidate_hash_value(fingerprint, source_address);
+    const ggml_tensor * tensors[] = {
+        node, source, node != nullptr ? node->src[1] : nullptr, node != nullptr ? node->src[2] : nullptr,
+    };
+    for (const ggml_tensor * tensor : tensors) {
+        moe_candidate_hash_value(fingerprint, reinterpret_cast<uintptr_t>(tensor));
+        if (tensor == nullptr) {
+            continue;
+        }
+        moe_candidate_hash_value(fingerprint, tensor->type);
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            moe_candidate_hash_value(fingerprint, tensor->ne[dim]);
+            moe_candidate_hash_value(fingerprint, tensor->nb[dim]);
+        }
+    }
 }
 
 static uint64_t moe_candidate_graph_mmid_fingerprint_finish(uint64_t fingerprint, uint32_t count) {
@@ -5273,6 +5302,7 @@ static bool moe_candidate_graph_mmid_inventory(
         const ggml_tensor * node = cgraph->nodes[node_index];
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
         if (source == nullptr || source->buffer == nullptr ||
+                ggml_is_empty(node) ||
                 !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
             continue;
         }
@@ -5306,25 +5336,20 @@ uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(
     if (!moe_candidate_graph_mmid_inventory(cgraph, &mmid_count, &mmid_fingerprint)) {
         return 0;
     }
+    const impl::graph_coverage_key key = {
+        cgraph->nodes, mmid_fingerprint, cgraph->n_nodes, mmid_count,
+    };
 
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->draining) {
         return 0;
     }
-    const void * key = cgraph->nodes[0];
-    for (auto it = impl_->graph_coverages.begin(); it != impl_->graph_coverages.end();) {
-        const auto & record = it->second;
-        if (it->first == key || ggml_cuda_moe_graph_spans_overlap(
-                record.nodes, record.n_nodes, cgraph->nodes, cgraph->n_nodes)) {
-            it = impl_->graph_coverages.erase(it);
-        } else {
-            ++it;
-        }
-    }
     if (impl_->next_graph_coverage_epoch == UINT64_MAX) {
         return 0;
     }
-    if (impl_->graph_coverages.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
+    const auto existing = impl_->graph_coverages.find(key);
+    if (existing == impl_->graph_coverages.end() &&
+            impl_->graph_coverages.size() >= GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
         const auto oldest = std::min_element(
             impl_->graph_coverages.begin(), impl_->graph_coverages.end(),
             [](const auto & first, const auto & second) { return first.second.epoch < second.second.epoch; });
@@ -5333,8 +5358,7 @@ uint64_t ggml_cuda_moe_grouped_context::certify_graph_coverage(
 
     const uint64_t epoch = impl_->next_graph_coverage_epoch + 1;
     try {
-        impl_->graph_coverages.emplace(
-            key, impl::graph_coverage_record{cgraph->nodes, epoch, mmid_fingerprint, cgraph->n_nodes, mmid_count});
+        impl_->graph_coverages.insert_or_assign(key, impl::graph_coverage_record{epoch});
     } catch (...) {
         return 0;
     }
@@ -5372,17 +5396,24 @@ bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
     if (impl_->draining) {
         return false;
     }
-    const auto it = impl_->graph_coverages.find(cgraph->nodes[0]);
-    if (it == impl_->graph_coverages.end() || it->second.nodes != cgraph->nodes ||
-            it->second.n_nodes != cgraph->n_nodes || it->second.epoch == 0) {
+    uint32_t mmid_count = 0;
+    uint64_t mmid_fingerprint = 0;
+    if (!moe_candidate_graph_mmid_inventory(cgraph, &mmid_count, &mmid_fingerprint)) {
+        return false;
+    }
+    const impl::graph_coverage_key key = {
+        cgraph->nodes, mmid_fingerprint, cgraph->n_nodes, mmid_count,
+    };
+    const auto it = impl_->graph_coverages.find(key);
+    if (it == impl_->graph_coverages.end() || it->second.epoch == 0) {
         return false;
     }
     *coverage_epoch = it->second.epoch;
     if (coverage_mmid_count != nullptr) {
-        *coverage_mmid_count = it->second.mmid_count;
+        *coverage_mmid_count = mmid_count;
     }
     if (coverage_mmid_fingerprint != nullptr) {
-        *coverage_mmid_fingerprint = it->second.mmid_fingerprint;
+        *coverage_mmid_fingerprint = mmid_fingerprint;
     }
     return true;
 }
@@ -6654,6 +6685,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), node_index);
         const ggml_tensor * source = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[0] : nullptr;
         if (source == nullptr || source->buffer == nullptr ||
+                ggml_is_empty(node) ||
                 !ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer))) {
             continue;
         }
@@ -6931,7 +6963,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             continue;
         }
         const auto * reverse = moe_candidate_active_reverse(impl_->table, node->src[0]);
-        if (reverse == nullptr) {
+        if (reverse == nullptr || ggml_is_empty(node)) {
             continue;
         }
         const auto & entry = *reverse;
