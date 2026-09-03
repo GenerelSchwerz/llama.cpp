@@ -5,6 +5,7 @@
 
 #include <map>
 #include <memory>
+#include <set>
 #include <functional>
 
 struct llama_ubatch;
@@ -16,8 +17,12 @@ class llama_io_read_i;
 
 struct llama_memory_placement_options {
     bool cpu_pinned = false;
-    uint32_t gpu_resident_layers = 0;
     bool recurrent_offload = false;
+
+    // layers whose attention KV stays device-resident while the rest of the cache is in host
+    // memory, resolved once for the whole model so that a cache built from several sub-caches
+    // shares one budget instead of giving each of them the full count
+    std::set<uint32_t> gpu_resident_ils;
 };
 
 struct llama_memory_params {
@@ -120,10 +125,6 @@ struct llama_memory_i {
 
     virtual bool recurrent_sparse_snapshots_supported() const { return false; }
     virtual bool recurrent_set_sparse_snapshot_mode(bool, int32_t) { return false; }
-
-    virtual bool get_supports_partial_kv() const {
-        return false;
-    }
 
     //
     // ops
