@@ -1202,7 +1202,8 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
     CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, {0, 0}));
 
-    ggml_tensor * ungated_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
+    const int64_t ungated_up_ne[] = {64, 32, 4};
+    ggml_tensor * ungated_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, ungated_up_ne);
     ggml_tensor * ungated_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
     ggml_tensor * chunk_gate_up = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, gate_up_ne);
     ggml_tensor * chunk_down = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
@@ -1254,13 +1255,14 @@ static void test_candidate_graph_coverage_ledger() {
     }};
     const auto v2_snapshot = candidate_snapshot_v2(12, v2_groups.data(), v2_groups.size(), v2_tensors.data(), v2_tensors.size());
     CHECK(registry.replace(&v2_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(registry.state().n_groups == 1 && registry.state().n_weights == 2);
+    CHECK(registry.state().n_groups == 2 && registry.state().n_weights == 4);
 
     const candidate_route v2_route = candidate_top_k_route(fixture, 4, 2);
-    std::array<ggml_tensor *, 11> v2_readers = {{
+    std::array<ggml_tensor *, 12> v2_readers = {{
         candidate_mmid(fixture, gate_up, v2_route.ids),
         candidate_mmid(fixture, down, v2_route.ids),
         candidate_mmid(fixture, ungated_up, v2_route.ids),
+        candidate_mmid(fixture, ungated_down, v2_route.ids),
         candidate_mmid(fixture, chunk_gate_up, v2_route.ids),
         candidate_mmid(fixture, lora_gate_up, v2_route.ids),
         candidate_mmid(fixture, override_gate_up, v2_route.ids),
@@ -1281,8 +1283,8 @@ static void test_candidate_graph_coverage_ledger() {
     const auto & v2_diagnostics = plan.coverage_diagnostics();
     CHECK(v2_diagnostics.manifest_version == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION);
     CHECK(v2_diagnostics.cached_mmid == v2_readers.size());
-    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 2);
-    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == 2);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 4);
+    CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == 1);
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_ACTIVE_LORA] == 1);
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_TENSOR_OVERRIDE] == 1);
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_INCOMPLETE] == 1);
@@ -1290,10 +1292,10 @@ static void test_candidate_graph_coverage_ledger() {
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_EXCLUDED] == 1);
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_UNCLASSIFIED] == 1);
     CHECK(v2_diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 1);
-    CHECK(v2_diagnostics.first_domain[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY);
+    CHECK(v2_diagnostics.first_domain[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK);
     CHECK(v2_diagnostics.first_rejection[GGML_CUDA_MOE_GRAPH_COVERAGE_UNSUPPORTED_DESCRIPTOR] ==
         GGML_CUDA_MOE_CANDIDATE_REJECT_UNSUPPORTED_TYPE);
-    CHECK(execution.size() == 1 && !execution.find(v2_readers[1], nullptr));
+    CHECK(execution.size() == 2 && !execution.find(v2_readers[1], nullptr));
     CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
 
     auto incomplete_snapshot = v2_snapshot;
@@ -1327,7 +1329,7 @@ static void test_candidate_graph_coverage_ledger() {
     const auto dormant_snapshot = candidate_snapshot_v2(
         12, dormant_groups.data(), dormant_groups.size(), dormant_tensors.data(), dormant_tensors.size());
     CHECK(registry.replace(&dormant_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(registry.state().n_groups == 0 && registry.state().n_weights == 0);
+    CHECK(registry.state().n_groups == 1 && registry.state().n_weights == 2);
     std::array<ggml_tensor *, 4> dormant_readers = {{
         candidate_mmid(fixture, ungated_up, v2_route.ids),
         candidate_mmid(fixture, ungated_down, v2_route.ids),
@@ -1343,9 +1345,10 @@ static void test_candidate_graph_coverage_ledger() {
         dormant_graph, 907, &plan, &execution, dormant_coverage.epoch, dormant_coverage.nodes,
         dormant_coverage.mmid_count, dormant_coverage.mmid_fingerprint);
     CHECK(plan.coverage_diagnostics().cached_mmid == dormant_readers.size());
-    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == dormant_readers.size());
-    CHECK(execution.size() == 0 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
-    CHECK(execution.requires_dispatch() && execution.rejects_cached_mmid(dormant_readers[0]));
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] == 2);
+    CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_DORMANT_LAYOUT] == 2);
+    CHECK(execution.size() == 1 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
+    CHECK(execution.requires_dispatch() && execution.rejects_cached_mmid(dormant_readers[2]));
     CHECK(!registry.begin_graph_dispatch(&execution, GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT));
     ggml_cuda_moe_graph_execution dormant_reused;
     CHECK(!registry.bind_graph_plan(
@@ -1370,7 +1373,7 @@ static void test_candidate_graph_coverage_ledger() {
     const auto mixed_dormant_snapshot = candidate_snapshot_v2(
         12, mixed_dormant_groups.data(), mixed_dormant_groups.size(), mixed_dormant_tensors.data(), mixed_dormant_tensors.size());
     CHECK(registry.replace(&mixed_dormant_snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(registry.state().n_groups == 1 && registry.state().n_weights == 2);
+    CHECK(registry.state().n_groups == 2 && registry.state().n_weights == 4);
     ggml_tensor * mixed_active_gate_up = candidate_mmid(fixture, gate_up, v2_route.ids);
     ggml_tensor * mixed_active_down = candidate_mmid(fixture, down, v2_route.ids);
     ggml_cgraph * mixed_dormant_graph = candidate_graph(fixture, {
@@ -1381,11 +1384,11 @@ static void test_candidate_graph_coverage_ledger() {
     registry.compile_graph_plan(
         mixed_dormant_graph, 908, &plan, &execution, mixed_dormant_coverage.epoch, mixed_dormant_coverage.nodes,
         mixed_dormant_coverage.mmid_count, mixed_dormant_coverage.mmid_fingerprint);
-    CHECK(execution.size() == 1 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
+    CHECK(execution.size() == 2 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR);
     CHECK(!execution.find(mixed_active_gate_up, nullptr) && !execution.find(mixed_active_down, nullptr));
-    CHECK(execution.rejects_cached_mmid(dormant_readers[0]));
+    CHECK(execution.rejects_cached_mmid(dormant_readers[2]));
     CHECK(!registry.begin_graph_dispatch(&execution, GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT));
-    fprintf(stderr, "test-moe-cache: dormant cached MMID coverage ledger OK\n");
+    fprintf(stderr, "test-moe-cache: inactive cached MMID coverage ledger OK\n");
 }
 
 static void test_candidate_graph_inventory_reuse() {
@@ -4880,6 +4883,9 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         uint32_t n_ff = 0,
         bool mapped_host_biases = false) {
     CHECK(n_rows >= 1 && n_used >= 1 && n_used <= n_experts);
+    CHECK(layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ||
+        layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ||
+        layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED);
     const uint32_t ff_dim = n_ff != 0 ? n_ff : n_dim;
     CHECK(!concurrent_stream_fixture ||
         (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_rows == 1 && n_used == 1));
@@ -4931,13 +4937,17 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
         gate_up = add_bank(types[0], n_dim, 2 * ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT,
             "test_active_gate_up_weight");
-    } else {
+    } else if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE) {
         gate = add_bank(types[0], n_dim, ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
             "test_active_gate_weight");
         up = add_bank(types[1], n_dim, ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
             "test_active_up_weight");
+    } else {
+        up = add_bank(types[0], n_dim, ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
+            "test_active_up_weight");
     }
-    result.down = add_bank(types[layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 1 : 2], ff_dim,
+    const uint32_t down_type = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 2 : 1;
+    result.down = add_bank(types[down_type], ff_dim,
         n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
         "test_active_down_weight");
     ggml_tensor * gate_bias = nullptr;
@@ -4956,8 +4966,10 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
             gate_up_bias = add_bias(2 * ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS,
                 "test_active_gate_up_bias");
-        } else {
+        } else if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE) {
             gate_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, "test_active_gate_bias");
+            up_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
+        } else {
             up_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
         }
         down_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, "test_active_down_bias");
@@ -5006,7 +5018,7 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         }
         hidden = ggml_dup(result.nodes.get(), hidden);
         hidden = ggml_glu(result.nodes.get(), hidden, GGML_GLU_OP_SWIGLU, false);
-    } else {
+    } else if (gate != nullptr) {
         result.gate_output = ggml_mul_mat_id(result.nodes.get(), gate, mmid_input, result.ids);
         result.up_output = ggml_mul_mat_id(result.nodes.get(), up, mmid_input, result.ids);
         result.readers.push_back(result.gate_output);
@@ -5028,6 +5040,14 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
             up_input = ggml_mul(result.nodes.get(), result.up_output, result.up_scale_rows);
         }
         hidden = ggml_glu_split(result.nodes.get(), gate_input, up_input, GGML_GLU_OP_SWIGLU);
+    } else {
+        result.up_output = ggml_mul_mat_id(result.nodes.get(), up, mmid_input, result.ids);
+        result.readers.push_back(result.up_output);
+        ggml_tensor * up_input = result.up_output;
+        if (up_bias != nullptr) {
+            up_input = ggml_add_id(result.nodes.get(), up_input, up_bias, result.ids);
+        }
+        hidden = ggml_sqr(result.nodes.get(), up_input);
     }
     result.down_output = ggml_mul_mat_id(result.nodes.get(), result.down, hidden, result.ids);
     result.readers.push_back(result.down_output);
@@ -7154,6 +7174,8 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_multirow_graph_modes_case(device, 4);
     test_active_grouped_multirow_graph_modes_case(
         device, 4, 8, 2, 12, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
+    test_active_grouped_multirow_graph_modes_case(
+        device, 4, 8, 2, 12, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED);
     test_active_grouped_multirow_graph_modes_case(device, 4, 128, 8, 48, true);
     test_active_grouped_q4k_eviction_refill(device);
     test_active_grouped_same_key_row_transitions(device, 48);
