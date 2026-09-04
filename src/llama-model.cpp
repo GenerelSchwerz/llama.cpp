@@ -2359,7 +2359,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            placement);
                 } else {
                     // only "full" layers own an indexer, so the shared layers need no indexer cache
                     llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return hparams.is_indexer_full(il); };
@@ -2378,7 +2379,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             hparams.swa_type,
                             nullptr,
                             filter_lid,
-                            nullptr);
+                            nullptr,
+                            specialized_placement);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
