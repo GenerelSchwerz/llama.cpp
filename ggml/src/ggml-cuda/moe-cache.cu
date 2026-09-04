@@ -9800,7 +9800,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     can_use_stream_mem_ops =
         cuDeviceGet(&cu_device, device) == CUDA_SUCCESS &&
         cuDeviceGetAttribute(
-            &stream_mem_ops_attribute, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS, cu_device) == CUDA_SUCCESS &&
+            &stream_mem_ops_attribute, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, cu_device) == CUDA_SUCCESS &&
         stream_mem_ops_attribute != 0;
 #endif
     uint32_t * stream_mem_probe = nullptr;
@@ -10643,9 +10643,16 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
             attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
             attributes.flags = overlap ? cudaMemcpyFlagPreferOverlapWithCompute : cudaMemcpyFlagDefault;
             size_t attributes_index = 0;
+#if CUDART_VERSION < 13000
+            size_t fail_index = SIZE_MAX;
+            CUDA_CHECK(cudaMemcpyBatchAsync(
+                batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
+                &attributes, &attributes_index, 1, &fail_index, cache->copy_stream));
+#else
             CUDA_CHECK(cudaMemcpyBatchAsync(
                 batch_dsts.data(), batch_srcs.data(), batch_sizes.data(), batch_srcs.size(),
                 &attributes, &attributes_index, 1, cache->copy_stream));
+#endif
         }
 #endif
         if (wave + 1 == n_waves && trailing_padding > 0) {
