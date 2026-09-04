@@ -32,6 +32,9 @@ layout(push_constant) uniform Parameters {
     uint neq1, rq3;
     float scale;
     uint K;
+    uint trailing_snapshots;
+    int selected_token;
+    uint reserve_input;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -113,8 +116,15 @@ void main() {
         s_shard[r] = FLOAT_TYPE(data_state[state_in_base + col * S_V + r * LANES_PER_COLUMN + lane]);
     }
 
+    if (K > 1u && reserve_input != 0u) {
+        const uint slot_base = s_off + (K - 1u) * state_size_per_snap + state_out_base;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        }
+    }
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-    // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
+    // Slots not selected by the snapshot parameters are caller-owned.
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
 
@@ -171,8 +181,10 @@ void main() {
         attn_off += S_V * H;
 
         if (K > 1u) {
-            const int target_slot = int(n_tokens) - 1 - int(t);
-            if (target_slot >= 0 && target_slot < int(K)) {
+            const bool selected = selected_token >= 0;
+            const uint target_slot = selected ? 0u : n_tokens - 1u - t;
+            const uint snapshot_slots = selected ? 1u : trailing_snapshots;
+            if ((!selected || t == uint(selected_token)) && target_slot < snapshot_slots) {
                 const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                     data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];

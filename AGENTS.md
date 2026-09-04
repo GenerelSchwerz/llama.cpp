@@ -2,7 +2,7 @@
 
 ## Fork Automation Policy
 
-This checkout targets the maintained fork `GenerelSchwerz/llama.cpp`. With explicit approval from the repository owner for each action, agents may write commit messages, commit, push, create or edit pull requests, and post pull-request comments only in this fork.
+This checkout targets the maintained fork `GenerelSchwerz/llama.cpp`. With explicit approval from the repository owner for each action, agents may write commit messages, commit, push, create or edit pull requests, and post pull-request comments only in this fork. This exception also applies to all related skills.
 
 For this fork, this section overrides only the restrictions on agent-written commit messages, pull-request text, and GitHub submission actions in `CONTRIBUTING.md` and the upstream-only restrictions later in this file. All requirements about understanding, reviewing, testing, disclosure, scope, and maintainability still apply.
 
