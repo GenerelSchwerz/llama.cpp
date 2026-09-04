@@ -1726,24 +1726,44 @@ static bool ggml_backend_sched_transport_enabled(ggml_backend_sched_t sched) {
     return false;
 }
 
+// How a staged input's delivery breaks into ranges.
+// A window over one stream is one range and is delivered flat, exactly as ggml_nbytes(input) describes it.
+// A window over several streams is one range per stream: the streams sit a fixed stride apart in both the source and the copy, which carries the source's layout, and the cells between one stream's window and the next are never read by this graph.
+struct ggml_backend_sched_ranges {
+    int64_t n;      // ranges to deliver
+    size_t  stride; // bytes from one range to the next, in the source and in the copy alike
+    size_t  used;   // bytes of a range this graph reads
+    size_t  early;  // leading bytes of a range that may go before the split that reads it
+};
+
 // The annotation lives on the tensor that owns the storage, and a split input is normally a view of it.
-// ggml keeps view_src pointing at the root tensor and view_offs absolute, so the byte window a delivery reads is [view_offs, view_offs + nbytes) of the root, and the stable part of it is whatever that window shares with the root's stable prefix.
-// This holds whatever the view's shape and strides are, because the delivery is a flat copy of ggml_nbytes(input) bytes.
-static size_t ggml_backend_sched_input_stable_prefix(const struct ggml_tensor * input) {
+// The prefix is per stream, so a range can use it only when the view starts on a stream boundary; anything else keeps the ordered path rather than guessing where the streams fall.
+static void ggml_backend_sched_input_ranges(const struct ggml_tensor * input, struct ggml_backend_sched_ranges * out) {
     const struct ggml_tensor * base = input->view_src ? input->view_src : input;
+
+    out->n      = 1;
+    out->stride = 0;
+    out->used   = ggml_nbytes(input);
+    out->early  = 0;
+
     if (base->stable_prefix == 0) {
-        return 0;
+        return;
     }
 
+    // dimensions below the stream have to cover their rows without a gap for a range to be a byte range
+    const size_t rows = (size_t) input->ne[2]*input->nb[2];
     const size_t offs = input->view_src ? input->view_offs : 0;
-    if (base->stable_prefix <= offs) {
-        return 0;
+    if (input->nb[3] < rows || (offs != 0 && (input->nb[3] == 0 || offs % input->nb[3] != 0))) {
+        return;
     }
 
-    const size_t avail = base->stable_prefix - offs;
-    const size_t bytes = ggml_nbytes(input);
+    if (input->ne[3] > 1) {
+        out->n      = input->ne[3];
+        out->stride = input->nb[3];
+        out->used   = rows;
+    }
 
-    return avail < bytes ? avail : bytes;
+    out->early = base->stable_prefix < out->used ? base->stable_prefix : out->used;
 }
 
 // Whether a split input belongs in its backend's ring.
@@ -2291,8 +2311,10 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                     struct ggml_tensor * input = split->inputs[j];
                     ggml_backend_buffer_t buf = input->view_src ? input->view_src->buffer : input->buffer;
                     src_buft = ggml_backend_buft_name(buf->buft);
-                    total += ggml_nbytes(input);
-                    early += ggml_backend_sched_input_stable_prefix(input);
+                    struct ggml_backend_sched_ranges rg;
+                    ggml_backend_sched_input_ranges(input, &rg);
+                    total += rg.used*rg.n;
+                    early += rg.early*rg.n;
                 }
             }
             GGML_LOG_INFO("%s: %s: %d/%d splits staged, %zu KiB per graph, %zu KiB of it early, source %s\n",
@@ -2343,19 +2365,23 @@ static void ggml_backend_sched_transport_prefetch(ggml_backend_sched_t sched, in
 
             // how much of this input is stable is a property of the ubatch about to run, not of the plan
             // it can be less than when the ring was laid out, and then only the remainder moves and the rest waits for the split, exactly as before
-            const size_t prefix = ggml_backend_sched_input_stable_prefix(input);
-            if (prefix == 0) {
+            struct ggml_backend_sched_ranges rg;
+            ggml_backend_sched_input_ranges(input, &rg);
+            if (rg.early == 0) {
                 continue;
             }
 
             struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
             GGML_ASSERT(input->data != NULL && input_cpy->data != NULL);
             const int64_t t0 = tr->debug >= 2 ? ggml_time_us() : 0;
-            ggml_backend_tensor_set_async(r->transfer, input_cpy, input->data, 0, prefix);
+            for (int64_t r_i = 0; r_i < rg.n; r_i++) {
+                const size_t at = r_i*rg.stride;
+                ggml_backend_tensor_set_async(r->transfer, input_cpy, (const char *) input->data + at, at, rg.early);
+            }
             if (tr->debug >= 2) {
                 tr->t_issue_us += ggml_time_us() - t0;
             }
-            tr->n_bytes_early += prefix;
+            tr->n_bytes_early += rg.early*rg.n;
         }
 
         // record the handover here rather than when the split runs: the transfer stream is FIFO, and by then the deliveries for the splits after this one are already queued behind it
@@ -2500,12 +2526,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 // whatever prefix was stable went out on the transfer stream earlier
                 // the rest is what an earlier split of this graph may still have written, and it is only safe to read now that every earlier split has run
                 // it goes on the consumer's own stream, where it is already ordered ahead of the kernels and behind the reader of whatever occupied this slot before
-                const size_t prefix = ggml_backend_sched_input_stable_prefix(input);
-                const size_t nbytes = ggml_nbytes(input);
-                if (nbytes > prefix) {
-                    ggml_backend_tensor_set_async(split_backend, input_cpy,
-                            (const char *) input->data + prefix, prefix, nbytes - prefix);
-                    tr->n_bytes_late += nbytes - prefix;
+                struct ggml_backend_sched_ranges rg;
+                ggml_backend_sched_input_ranges(input, &rg);
+                if (rg.used > rg.early) {
+                    for (int64_t r_i = 0; r_i < rg.n; r_i++) {
+                        const size_t at = r_i*rg.stride + rg.early;
+                        ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                (const char *) input->data + at, at, rg.used - rg.early);
+                    }
+                    tr->n_bytes_late += (rg.used - rg.early)*rg.n;
                 }
                 continue;
             }

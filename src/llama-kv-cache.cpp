@@ -1649,13 +1649,13 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 }
 
 void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
-    // Rows written by this ubatch, in the flattened [n_embd_gqa, kv_size*n_stream] body.
+    // Rows written by this ubatch, counted within a stream rather than across the [n_embd_gqa, kv_size*n_stream] body.
     // Every byte below the lowest of them keeps whatever the previous ubatch left there for the whole graph, so a delivery of that region may be issued before the split that reads it.
+    // Streams sit end to end, so a row counted across the body would let the lowest stream cap every stream above it; per stream, each one keeps its own leading rows.
     uint64_t min_row = UINT64_MAX;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-        const uint64_t offs = (uint64_t) sinfo.strm[s]*get_size();
         for (const uint32_t idx : sinfo.idxs[s]) {
-            min_row = std::min(min_row, offs + idx);
+            min_row = std::min(min_row, (uint64_t) idx);
         }
     }
 

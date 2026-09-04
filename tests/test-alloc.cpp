@@ -1464,6 +1464,82 @@ static void test_transport_entry_allocation() {
     }
 }
 
+// A window over several streams sits a fixed stride apart in one tensor, with cells between one
+// stream's window and the next that the graph never reads. The delivery has to cover each stream's
+// window from its own offset and leave those cells alone.
+static void test_transport_multi_stream_ranges() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+
+    const int64_t n_stream = 4;
+    const int64_t n_row    = 8;    // rows of a stream the graph reads
+    const int64_t kv_size  = 12;   // rows a stream holds, so 4 rows of every stream stay unread
+    const int64_t n_embd   = 4;
+
+    auto ctx = make_context();
+    ggml_tensor * store = ggml_new_tensor_3d(ctx.ctx, GGML_TYPE_F32, n_embd, kv_size, n_stream);
+    store->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+
+    // the same shape a host-resident KV window has: heads split across dims 0 and 1, rows on 2, streams on 3
+    ggml_tensor * window = ggml_view_4d(ctx.ctx, store, n_embd/2, 2, n_row, n_stream,
+            (size_t) (n_embd/2)*sizeof(float), store->nb[1], store->nb[2], 0);
+    ggml_tensor * output = ggml_cont(ctx.ctx, window);
+    ggml_build_forward_expand(ctx.graph, output);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, ggml_nbytes(store)));
+    store->buffer = buffer.get();
+    store->data   = ggml_backend_buffer_get_base(buffer.get());
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 1u << 20));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, cuda.handle.get());
+
+    // half of every stream's window is stable, so each stream splits into an early and a late range
+    const size_t row_bytes  = (size_t) n_embd*sizeof(float);
+    const size_t used_bytes = (size_t) n_row*row_bytes;
+    ggml_set_stable_prefix(store, used_bytes/2);
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), ctx.graph) == GGML_STATUS_SUCCESS);
+
+    std::vector<dummy_backend_context::tensor_delivery> parts = cuda.context->deliveries;
+    GGML_ASSERT(!parts.empty());
+    std::sort(parts.begin(), parts.end(),
+            [](const dummy_backend_context::tensor_delivery & a, const dummy_backend_context::tensor_delivery & b) {
+                return a.offset < b.offset;
+            });
+
+    // every stream's window is covered exactly once, from its own source offset, and the unread cells never move
+    const size_t stride = (size_t) window->nb[3];
+    size_t total = 0;
+    for (const auto & d : parts) {
+        GGML_ASSERT(d.offset/stride < (size_t) n_stream);
+        GGML_ASSERT(d.offset%stride + d.size <= used_bytes);
+        GGML_ASSERT(d.src == (const char *) window->data + d.offset);
+        total += d.size;
+    }
+    GGML_ASSERT(total == (size_t) n_stream*used_bytes);
+
+    for (int64_t st = 0; st < n_stream; st++) {
+        size_t covered = 0;
+        for (const auto & d : parts) {
+            if (d.offset/stride == (size_t) st) {
+                GGML_ASSERT(d.offset%stride == covered);
+                covered += d.size;
+            }
+        }
+        GGML_ASSERT(covered == used_bytes);
+    }
+
+    int64_t early = 0, late = 0;
+    transport_stats(sched.get(), NULL, &early, &late);
+    GGML_ASSERT(early == (int64_t) ((size_t) n_stream*used_bytes/2));
+    GGML_ASSERT(late  == (int64_t) ((size_t) n_stream*used_bytes/2));
+}
+
 static void test_transport_empty_graph() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
@@ -1844,6 +1920,7 @@ int main() {
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
     run("test_transport_prefix_and_configuration", test_transport_prefix_and_configuration);
     run("test_transport_entry_allocation", test_transport_entry_allocation);
+    run("test_transport_multi_stream_ranges", test_transport_multi_stream_ranges);
     run("test_transport_empty_graph", test_transport_empty_graph);
     run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
     run("test_transport_releases_ring_for_graph", test_transport_releases_ring_for_graph);

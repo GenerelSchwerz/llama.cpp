@@ -702,7 +702,8 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // leading bytes that stay unchanged during the current graph evaluation
+        // leading bytes of each stream that stay unchanged during the current graph evaluation
+        // a tensor whose last dimension indexes streams repeats this prefix once per stream, so the value is per stream and not from the start of the tensor
         union {
             size_t stable_prefix;
             char padding[8];
