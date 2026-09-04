@@ -897,6 +897,15 @@ static uint32_t moe_candidate_required_base_roles(uint32_t layout) {
     }
 }
 
+static uint32_t moe_candidate_required_base_bank_count(uint32_t layout) {
+    switch (layout) {
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE:      return 3;
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP: return 2;
+        case GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED:       return 2;
+        default:                                               return 0;
+    }
+}
+
 static bool moe_candidate_routed_base(const ggml_backend_moe_candidate_tensor_v2 & record) {
     return record.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE &&
         record.role >= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT &&
@@ -1118,6 +1127,11 @@ static uint32_t moe_candidate_expected_base_role(uint32_t layout, uint32_t bank_
             bank_index == 2 ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT :
             GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
     }
+    if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED) {
+        return bank_index == 0 ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT :
+            bank_index == 1 ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT :
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
+    }
     return GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID;
 }
 
@@ -1159,8 +1173,7 @@ static bool moe_candidate_structural_group(
         uint32_t * n_original_direct_aux = nullptr,
         uint32_t * n_original_direct_bias = nullptr) {
     const uint32_t required_roles = moe_candidate_required_base_roles(group.layout);
-    const uint32_t required_banks = group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 2u :
-        group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3u : 0u;
+    const uint32_t required_banks = moe_candidate_required_base_bank_count(group.layout);
     if (required_banks == 0 || group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY || group.flags != 0) {
         return false;
     }
@@ -2319,9 +2332,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
         }
     }
     const uint32_t required_base_roles = moe_candidate_required_base_roles(input.layout);
-    if ((input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
-            input.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) ||
-            base_roles != required_base_roles) {
+    if (required_base_roles == 0 || base_roles != required_base_roles) {
         return GGML_CUDA_MOE_CANDIDATE_REJECT_INVALID_LAYOUT;
     }
 
@@ -2352,11 +2363,16 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_group(
                 down->ne[0] != gate->ne[1] || down->ne[1] != gate->ne[0] || down->ne[2] != gate->ne[2]) {
             return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
         }
-    } else {
+    } else if (input.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
         const ggml_tensor * gate_up = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT];
         uint64_t doubled_down = 0;
         if (!moe_candidate_mul(down->ne[0], 2, doubled_down) || gate_up->ne[0] != down->ne[1] ||
                 static_cast<uint64_t>(gate_up->ne[1]) != doubled_down || gate_up->ne[2] != down->ne[2]) {
+            return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
+        }
+    } else {
+        const ggml_tensor * up = weights[GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT];
+        if (down->ne[0] != up->ne[1] || down->ne[1] != up->ne[0] || down->ne[2] != up->ne[2]) {
             return GGML_CUDA_MOE_CANDIDATE_REJECT_INCOMPATIBLE_SHAPE;
         }
     }
@@ -2572,8 +2588,7 @@ static ggml_cuda_moe_candidate_rejection moe_candidate_build_v2(
         if (group_rejections[group_index] != GGML_CUDA_MOE_CANDIDATE_REJECT_NONE || snapshot_dormant ||
                 group.flags != GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_NONE ||
                 group.domain != GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY ||
-                (group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE &&
-                 group.layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP)) {
+                moe_candidate_required_base_bank_count(group.layout) == 0) {
             continue;
         }
 
@@ -4687,8 +4702,7 @@ struct ggml_cuda_moe_grouped_context::impl {
 
     static bool decode_eligible(const grouped_snapshot & snapshot, int device, uint32_t * n_experts) {
         const uint32_t expected_roles = moe_candidate_required_base_roles(snapshot.layout);
-        const uint32_t expected_banks = snapshot.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 2u :
-            snapshot.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3u : 0u;
+        const uint32_t expected_banks = moe_candidate_required_base_bank_count(snapshot.layout);
         if (device < 0 || device >= ggml_cuda_info().device_count || expected_banks == 0 ||
                 snapshot.n_slots == 0 || snapshot.n_slots > INT32_MAX ||
                 snapshot.banks.size() < 2 || snapshot.banks.size() > 3) {
@@ -6899,8 +6913,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         const auto & group = impl_->table.groups[group_index];
         auto & observation = observations[group_index];
         observation.required_roles = moe_candidate_required_base_roles(group.layout);
-        observation.n_banks = group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ? 2u :
-            group.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3u : 0u;
+        observation.n_banks = moe_candidate_required_base_bank_count(group.layout);
         if (observation.n_banks == 0) {
             continue;
         }
@@ -7467,10 +7480,7 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
         return geometry_invalid;
     }
 
-    const uint32_t required_roles = record.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
-        (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT) | (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
-        (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) | (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
-            (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+    const uint32_t required_roles = moe_candidate_required_base_roles(record.layout);
     std::array<uint32_t, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> bank_readers = {};
     ggml_cuda_moe_ids_signature ids_signature;
     bool source_invalid = false;
@@ -7807,10 +7817,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         uint32_t first_node_index = static_cast<uint32_t>(n_nodes);
         for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
                 role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
-            const bool required = record.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
-                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
-                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ||
-                    role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+            const bool required = (moe_candidate_required_base_roles(record.layout) & (1u << role)) != 0;
             if (required) {
                 const uint32_t role_slot = role - GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
                 first_node_index = std::min(first_node_index, record.node_indices[role_slot]);
@@ -7833,10 +7840,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         uint32_t seen_roles = 0;
         for (uint32_t role = GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT;
                 role <= GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT; ++role) {
-            const bool required = record.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
-                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
-                (role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT || role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ||
-                    role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+            const bool required = (moe_candidate_required_base_roles(record.layout) & (1u << role)) != 0;
             if (!required) {
                 continue;
             }
@@ -7869,10 +7873,7 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
             }
             seen_roles |= 1u << role;
         }
-        const uint32_t expected_roles = record.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ?
-            (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT) | (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) :
-            (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT) | (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT) |
-                (1u << GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
+        const uint32_t expected_roles = moe_candidate_required_base_roles(record.layout);
         if (!has_ids || seen_roles != expected_roles) {
             return false;
         }
