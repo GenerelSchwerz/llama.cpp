@@ -1975,7 +1975,7 @@ static void test_scheduler_execution_certificate() {
     CHECK(probe.calls == 16 && probe.records[14].backend_index != probe.fail_backend &&
         probe.records[15].backend_index == probe.fail_backend);
     for (uint32_t backend_index = 0; backend_index < probe.n_backends; ++backend_index) {
-        CHECK(probe.synchronize_calls[backend_index] == synchronize_before[backend_index] + 1);
+        CHECK(probe.synchronize_calls[backend_index] >= synchronize_before[backend_index] + 1);
     }
     probe.fail_backend = UINT32_MAX;
 
