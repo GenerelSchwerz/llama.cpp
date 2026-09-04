@@ -636,6 +636,14 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch, &sparse_snapshot_ch_supported);
         recurrent_sparse_snapshot_ops_supported = sparse_snapshot_ar_supported && sparse_snapshot_ch_supported;
         cparams.auto_fgdn = false;
+    } else if (cparams.n_rs_seq > 0 && model.graph_supports_recurrent_sparse_snapshots()) {
+        bool sparse_snapshot_ar_supported = false;
+        bool sparse_snapshot_ch_supported = false;
+        bool fused_gdn_ar = cparams.fused_gdn_ar;
+        bool fused_gdn_ch = cparams.fused_gdn_ch;
+        resolve(llm_fused_op_gdn_ar_probe, fused_gdn_ar, &sparse_snapshot_ar_supported);
+        resolve(llm_fused_op_gdn_ch_probe, fused_gdn_ch, &sparse_snapshot_ch_supported);
+        recurrent_sparse_snapshot_ops_supported = sparse_snapshot_ar_supported && sparse_snapshot_ch_supported;
     }
 
     if (cparams.auto_flid) {
