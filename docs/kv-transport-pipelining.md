@@ -127,6 +127,26 @@ Halving the traffic is worth +5.6% on the pipelined path at 19,246 and +56.6% at
 
 The two deepest arms were taken on an earlier head and are not re-measured here: +9.1% at 131,072 for +818 MiB of ring, and at 262,144 the ring is declined and the two arms are the same.
 
+**Every row above 20,556 rows of window is measured with the budget raised**, at `-kvpb 0` or `-kvpb 512`. They are what the ring costs and buys if you pay for it, not what a default run does: at the default 128 MiB the ring declines past 20,556 rows and those depths stay on the ordered path. See [The budget](#the-budget).
+
+A finer sweep of the same configuration, `-kvpb 0` throughout so nothing declines, locates the peak between 16k and 24k:
+
+| rows | ordered | pipelined | gain | ring | gain per MiB |
+|---:|---:|---:|---:|---:|---:|
+| 2,048 | 32.76 | 35.42 | +8.1% | 13 MiB | 0.62 |
+| 4,096 | 29.76 | 34.51 | +16.0% | 26 MiB | 0.62 |
+| 8,192 | 25.02 | 32.71 | +30.8% | 51 MiB | 0.60 |
+| 12,288 | 21.53 | 31.04 | +44.2% | 77 MiB | 0.57 |
+| **16,384** | 18.90 | 29.44 | **+55.8%** | 102 MiB | **0.55** |
+| 24,576 | 15.18 | 18.84 | +24.1% | 153 MiB | 0.16 |
+| 32,768 | 12.65 | 15.19 | +20.1% | 204 MiB | 0.099 |
+| 49,152 | 9.51 | 10.99 | +15.6% | 306 MiB | 0.051 |
+| 65,536 | 7.63 | 8.66 | +13.6% | 408 MiB | 0.033 |
+| 98,304 | 5.45 | 6.06 | +11.1% | 612 MiB | 0.018 |
+| 131,072 | 4.26 | 4.66 | +9.5% | 816 MiB | 0.012 |
+
+The gain per MiB is flat below the peak and falls off as `1/rows^2` above it, because the gain decays as `compute/copy` while the ring grows linearly. There is no depth at which the pipeline becomes slower -- only one past which the memory buys more elsewhere.
+
 Two curves run in opposite directions here, and both matter.
 
 **The gain narrows with depth.** A token is copy plus compute; as the context grows the copy grows with it while the compute per staged split does not, so the share of the token that can hide a transfer shrinks. At 16,384 compute still covers most of the copy; by 131,072 it covers a tenth of it. That is arithmetic, not an implementation limit, and no amount of look-ahead changes it.
@@ -158,6 +178,19 @@ The table above is what the feature costs uncapped, and it is the reason it is c
 The cost of deciding per graph is that a context which grows past the budget allocates a ring for the small early windows and gives it back once it outgrows them. That transient is bounded by the budget itself, which is the memory the user already authorised, so it is a property of the cap rather than a defect in it.
 
 At 32,768 the ring is 204 MiB at the full context, over the 128 MiB default. `--kv-pipeline-budget 512` buys 20.350 -> 31.463 t/s behind an 18,432-token prompt.
+
+#### Why 128 MiB
+
+The best the ring can do is hide the smaller of copy and compute behind the larger, so its value peaks where the two are equal. Writing `b` for the bytes one attention layer holds per row of window, the copy is `n_attn * b * rows / BW` and the peak is at
+
+```
+rows*  = compute * BW / (n_attn * b)
+ring*  = n_slots * b * rows*  =  (n_slots / n_attn) * compute * BW
+```
+
+**`b` cancels.** The ring size at the peak does not depend on the cache type or on `n_embd_k_gqa`; it is set by the share of the traffic the ring holds, the compute a graph has to hide behind it, and the link. On this configuration -- 3 slots against 16 staged attention layers, 25.7 ms of consumer wait, 22.0 GB/s -- that is `0.1875 * 25.7e-3 * 22e9`, or **101 MiB against the 102 MiB measured at the +55.8% peak**.
+
+So the default is a size, not a depth, and it is the right kind of quantity to fix: a cache quantised to q4_0 doubles `rows*` and halves `b`, leaving the same budget. What does move it is `n_slots / n_attn` -- a model with 64 attention layers wants about a quarter of it -- and the compute and link of the machine. 128 MiB is a compromise across that spread with a little margin over this configuration's optimum, and `--kv-pipeline-budget` is there for the configurations it does not suit.
 
 ### Where the rest of the token goes
 
