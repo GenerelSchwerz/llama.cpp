@@ -164,6 +164,23 @@ At 262,144 the ring would need 1.7 GiB against 573 MiB free, so it declines and 
 
 Four device-resident layers are worth +14.3% on the ordered path and +1.4% on the pipelined one. The reason they stop paying is the point of the section above: the pipeline has already moved the bottleneck down to the compute floor, so removing a quarter of the traffic removes something that was no longer being waited for. Whether this still holds where the copy dominates by a wide margin has not been measured.
 
+### Parallel sequences
+
+`llama-batched-bench`, 2,048 prompt tokens per sequence, `-c 32768 -np 8`, generation t/s:
+
+| `-npl` | unified ordered | unified pipelined | streams ordered | streams pipelined |
+|---:|---:|---:|---:|---:|
+| 1 | 32.69 | 35.35 | 32.59 | 35.31 |
+| 2 | 51.69 | 58.63 | 48.68 | 61.56 |
+| 4 | 72.43 | 86.52 | 62.39 | 89.59 |
+| 8 | 83.90 | 105.16 | 70.92 | 113.55 |
+
+The 8-slot row is measured with each arm run on its own. Taken as the last step of a sweep that has already run 1, 2 and 4 slots in the same process, the unified ring is refused for headroom and that arm falls back to 83.88 - the guard reacting to what the process has already allocated, not to the configuration.
+
+A cache split into streams delivers a window per stream, so it moves more than a unified one for the same work, and before the per-stream delivery it could send almost none of it early: 6.6% at 8 slots, because the prefix stopped at the lowest stream's head. Both caches now pipeline, and which of them to use is a question about how the context is shared between sequences rather than about the transport.
+
+**Concurrent slots cannot be gated on output the way one sequence can.** Their batching varies between runs, so the same build at the same depth gives different greedy output - three runs at `N = 0` produced three different hashes. `test_transport_multi_stream_ranges` stands in for that gate.
+
 ### The budget
 
 The table above is what the feature costs uncapped, and it is the reason it is capped. A host-resident KV cache exists to keep device memory free; a transport that speeds it up by spending hundreds of MiB of that memory is working against the thing it is accelerating. `--kv-pipeline-budget` (default 128 MiB) is an absolute cap on the ring, not a fraction of what happens to be free:
@@ -189,6 +206,20 @@ ring*  = n_slots * b * rows*  =  (n_slots / n_attn) * compute * BW
 ```
 
 **`b` cancels.** The ring size at the peak does not depend on the cache type or on `n_embd_k_gqa`; it is set by the share of the traffic the ring holds, the compute a graph has to hide behind it, and the link. On this configuration -- 3 slots against 16 staged attention layers, 25.7 ms of consumer wait, 22.0 GB/s -- that is `0.1875 * 25.7e-3 * 22e9`, or **101 MiB against the 102 MiB measured at the +55.8% peak**.
+
+The same sweep at `-ctk q4_0 -ctv q4_0` measures that cancellation rather than deriving it. Halving the bytes per row moves the whole curve to twice the window, and leaves the ring at the peak where it was:
+
+| q8_0 rows | gain | q4_0 rows | gain |
+|---:|---:|---:|---:|
+| 2,048 | +8.1% | 4,096 | +8.9% |
+| 4,096 | +16.0% | 8,192 | +16.4% |
+| 8,192 | +30.8% | 16,384 | +30.9% |
+| 12,288 | +44.1% | 24,576 | +43.2% |
+| **16,384** | **+56.0%** | **32,768** | **+53.9%** |
+| 24,576 | +24.0% | 49,152 | +26.4% |
+| 32,768 | +20.1% | 65,536 | +22.4% |
+
+The peak moves from 16,384 rows to 32,768, and the ring at it is 102 MiB against 108 MiB.
 
 So the default is a size, not a depth, and it is the right kind of quantity to fix: a cache quantised to q4_0 doubles `rows*` and halves `b`, leaving the same budget. What does move it is `n_slots / n_attn` -- a model with 64 attention layers wants about a quarter of it -- and the compute and link of the machine. 128 MiB is a compromise across that spread with a little margin over this configuration's optimum, and `--kv-pipeline-budget` is there for the configurations it does not suit.
 
@@ -235,6 +266,8 @@ A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 
 - Only persistent host inputs marked with `GGML_TENSOR_FLAG_TRANSPORT` are candidates. The stable prefix remains a per-evaluation value. Unmarked inputs, weights, user inputs, transposed V, and copies with later readers stay ordered.
 - CUDA is the only enabled backend. Meta, SYCL, WebGPU, and other backends stay ordered until their event behavior and transport path are validated.
 - The ring costs `(depth + 2) x (largest staged split)` of device memory, and a staged split is both K and V of one attention layer over the whole context. That is linear in context length, and it is what bounds the feature at depth rather than anything about the transfer itself.
+- **A cap is per graph, not per sequence.** `--kv-pipeline-budget` bounds the window one graph delivers, which is `n_kv * n_stream` over every sequence in the ubatch, so it cannot be applied to one sequence of a batch and not another.
+- **A multi-stream window is delivered one range per stream**, keyed on the last dimension. A window whose streams are not on that dimension keeps the single flat range, which is correct but not accelerated.
 - **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others.
 - **Tensor parallelism keeps the ordered path.** See [Tensor parallelism](#tensor-parallelism).
 - The scheduler must be configured with the device's own default buffer type. A scheduler built on a split or host buffer type keeps the ordered path.
