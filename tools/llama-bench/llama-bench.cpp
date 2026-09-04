@@ -357,6 +357,11 @@ struct cmd_params {
     std::vector<llama_lazy_mode>     lazy_mode;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
+    std::vector<bool>                kv_cpu_pinned;
+    std::vector<bool>                recurrent_state_offload;
+    std::vector<bool>                phase_aware_workspace;
+    std::vector<bool>                live_context_workspace;
+    std::vector<int>                 kv_gpu_layers;
     std::vector<llama_flash_attn_type> flash_attn;
     std::vector<std::vector<ggml_backend_dev_t>> devices;
     std::vector<std::vector<float>>  tensor_split;
@@ -402,6 +407,11 @@ static const cmd_params cmd_params_defaults = {
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
+    /* kv_cpu_pinned        */ { false },
+    /* recurrent_state_offload */ { false },
+    /* phase_aware_workspace */ { false },
+    /* live_context_workspace */ { false },
+    /* kv_gpu_layers        */ { 0 },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
     /* devices              */ { {} },
     /* tensor_split         */ { std::vector<float>(llama_max_devices(), 0.0f) },
@@ -472,6 +482,11 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -sm, --split-mode <none|layer|row|tensor>         (default: %s)\n", join(transform_to_str(cmd_params_defaults.split_mode, split_mode_str), ",").c_str());
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
+    printf("  -kvcp, --kv-cpu-pinned <0|1>                      (default: %s)\n", join(cmd_params_defaults.kv_cpu_pinned, ",").c_str());
+    printf("  -rso, --recurrent-state-offload <0|1>             (default: %s)\n", join(cmd_params_defaults.recurrent_state_offload, ",").c_str());
+    printf("  -paw, --phase-aware-workspace <0|1>               (default: %s)\n", join(cmd_params_defaults.phase_aware_workspace, ",").c_str());
+    printf("  -lcw, --live-context-workspace <0|1>              (default: %s)\n", join(cmd_params_defaults.live_context_workspace, ",").c_str());
+    printf("  -kvgl, --kv-gpu-layers <n>                        (default: %s)\n", join(cmd_params_defaults.kv_gpu_layers, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
     printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
@@ -841,6 +856,41 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.no_kv_offload.insert(params.no_kv_offload.end(), p.begin(), p.end());
+            } else if (arg == "-kvcp" || arg == "--kv-cpu-pinned") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.kv_cpu_pinned.insert(params.kv_cpu_pinned.end(), p.begin(), p.end());
+            } else if (arg == "-rso" || arg == "--recurrent-state-offload") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.recurrent_state_offload.insert(params.recurrent_state_offload.end(), p.begin(), p.end());
+            } else if (arg == "-paw" || arg == "--phase-aware-workspace") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.phase_aware_workspace.insert(params.phase_aware_workspace.end(), p.begin(), p.end());
+            } else if (arg == "-lcw" || arg == "--live-context-workspace") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = string_split<bool>(argv[i], split_delim);
+                params.live_context_workspace.insert(params.live_context_workspace.end(), p.begin(), p.end());
+            } else if (arg == "-kvgl" || arg == "--kv-gpu-layers") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                auto p = parse_int_range(argv[i]);
+                params.kv_gpu_layers.insert(params.kv_gpu_layers.end(), p.begin(), p.end());
             } else if (arg == "--numa") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1188,6 +1238,21 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.no_kv_offload.empty()) {
         params.no_kv_offload = cmd_params_defaults.no_kv_offload;
     }
+    if (params.kv_cpu_pinned.empty()) {
+        params.kv_cpu_pinned = cmd_params_defaults.kv_cpu_pinned;
+    }
+    if (params.recurrent_state_offload.empty()) {
+        params.recurrent_state_offload = cmd_params_defaults.recurrent_state_offload;
+    }
+    if (params.phase_aware_workspace.empty()) {
+        params.phase_aware_workspace = cmd_params_defaults.phase_aware_workspace;
+    }
+    if (params.live_context_workspace.empty()) {
+        params.live_context_workspace = cmd_params_defaults.live_context_workspace;
+    }
+    if (params.kv_gpu_layers.empty()) {
+        params.kv_gpu_layers = cmd_params_defaults.kv_gpu_layers;
+    }
     if (params.flash_attn.empty()) {
         params.flash_attn = cmd_params_defaults.flash_attn;
     }
@@ -1251,6 +1316,11 @@ struct cmd_params_instance {
     llama_lazy_mode    lazy_mode;
     int                main_gpu;
     bool               no_kv_offload;
+    bool               kv_cpu_pinned;
+    bool               recurrent_state_offload;
+    bool               phase_aware_workspace;
+    bool               live_context_workspace;
+    int                kv_gpu_layers;
     llama_flash_attn_type flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float> tensor_split;
@@ -1332,6 +1402,11 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
+        cparams.kv_cpu_pinned   = kv_cpu_pinned;
+        cparams.recurrent_state_offload = recurrent_state_offload;
+        cparams.phase_aware_workspace = phase_aware_workspace;
+        cparams.live_context_workspace = live_context_workspace;
+        cparams.kv_gpu_layers   = (uint32_t) std::max(0, kv_gpu_layers);
         cparams.flash_attn_type = flash_attn;
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
@@ -1366,6 +1441,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
     for (const auto & tk : params.type_k)
     for (const auto & tv : params.type_v)
     for (const auto & nkvo : params.no_kv_offload)
+    for (const auto & kvcp : params.kv_cpu_pinned)
+    for (const auto & rso : params.recurrent_state_offload)
+    for (const auto & paw : params.phase_aware_workspace)
+    for (const auto & lcw : params.live_context_workspace)
+    for (const auto & kvgl : params.kv_gpu_layers)
     for (const auto & fa : params.flash_attn)
     for (const auto & nt : params.n_threads)
     for (const auto & cm : params.cpu_mask)
@@ -1396,6 +1476,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ kvcp,
+                /* .recurrent_state_offload = */ rso,
+                /* .phase_aware_workspace = */ paw,
+                /* .live_context_workspace = */ lcw,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1433,6 +1518,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ kvcp,
+                /* .recurrent_state_offload = */ rso,
+                /* .phase_aware_workspace = */ paw,
+                /* .live_context_workspace = */ lcw,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1470,6 +1560,11 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .lazy_mode             = */ lzm,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
+                /* .kv_cpu_pinned         = */ kvcp,
+                /* .recurrent_state_offload = */ rso,
+                /* .phase_aware_workspace = */ paw,
+                /* .live_context_workspace = */ lcw,
+                /* .kv_gpu_layers         = */ kvgl,
                 /* .flash_attn            = */ fa,
                 /* .devices               = */ devs,
                 /* .tensor_split          = */ ts,
@@ -1512,6 +1607,11 @@ struct test {
     llama_lazy_mode          lazy_mode;
     int                      main_gpu;
     bool                     no_kv_offload;
+    bool                     kv_cpu_pinned;
+    bool                     recurrent_state_offload;
+    bool                     phase_aware_workspace;
+    bool                     live_context_workspace;
+    int                      kv_gpu_layers;
     llama_flash_attn_type    flash_attn;
     std::vector<ggml_backend_dev_t> devices;
     std::vector<float>       tensor_split;
@@ -1552,6 +1652,11 @@ struct test {
         lazy_mode      = inst.lazy_mode;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
+        kv_cpu_pinned  = inst.kv_cpu_pinned;
+        recurrent_state_offload = inst.recurrent_state_offload;
+        phase_aware_workspace = inst.phase_aware_workspace;
+        live_context_workspace = inst.live_context_workspace;
+        kv_gpu_layers  = inst.kv_gpu_layers;
         flash_attn     = inst.flash_attn;
         devices        = inst.devices;
         tensor_split   = inst.tensor_split;
@@ -1616,7 +1721,8 @@ struct test {
             "model_filename", "model_type",     "model_size",    "model_n_params", "n_batch",
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
-            "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
+            "main_gpu",       "no_kv_offload",  "kv_cpu_pinned", "recurrent_state_offload", "phase_aware_workspace",
+            "live_context_workspace",           "kv_gpu_layers", "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "lazy_mode",
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
@@ -1633,11 +1739,14 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "kv_gpu_layers") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "kv_cpu_pinned" ||
+            field == "recurrent_state_offload" || field == "phase_aware_workspace" ||
+            field == "live_context_workspace") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1708,6 +1817,11 @@ struct test {
                                             split_mode_str(split_mode),
                                             std::to_string(main_gpu),
                                             std::to_string(no_kv_offload),
+                                            std::to_string(kv_cpu_pinned),
+                                            std::to_string(recurrent_state_offload),
+                                            std::to_string(phase_aware_workspace),
+                                            std::to_string(live_context_workspace),
+                                            std::to_string(kv_gpu_layers),
                                             std::to_string((int) flash_attn),
                                             devices_to_string(devices),
                                             tensor_split_str,
@@ -1910,6 +2024,21 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "kv_cpu_pinned") {
+            return 4;
+        }
+        if (field == "recurrent_state_offload") {
+            return 4;
+        }
+        if (field == "phase_aware_workspace") {
+            return 4;
+        }
+        if (field == "live_context_workspace") {
+            return 4;
+        }
+        if (field == "kv_gpu_layers") {
+            return 4;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -1931,6 +2060,21 @@ struct markdown_printer : public printer {
         }
         if (field == "no_kv_offload") {
             return "nkvo";
+        }
+        if (field == "kv_cpu_pinned") {
+            return "kvcp";
+        }
+        if (field == "recurrent_state_offload") {
+            return "rso";
+        }
+        if (field == "phase_aware_workspace") {
+            return "paw";
+        }
+        if (field == "live_context_workspace") {
+            return "lcw";
+        }
+        if (field == "kv_gpu_layers") {
+            return "kvgl";
         }
         if (field == "flash_attn") {
             return "fa";
@@ -2012,6 +2156,21 @@ struct markdown_printer : public printer {
         }
         if (params.no_kv_offload.size() > 1 || params.no_kv_offload != cmd_params_defaults.no_kv_offload) {
             fields.emplace_back("no_kv_offload");
+        }
+        if (params.kv_cpu_pinned.size() > 1 || params.kv_cpu_pinned != cmd_params_defaults.kv_cpu_pinned) {
+            fields.emplace_back("kv_cpu_pinned");
+        }
+        if (params.recurrent_state_offload.size() > 1 || params.recurrent_state_offload != cmd_params_defaults.recurrent_state_offload) {
+            fields.emplace_back("recurrent_state_offload");
+        }
+        if (params.phase_aware_workspace.size() > 1 || params.phase_aware_workspace != cmd_params_defaults.phase_aware_workspace) {
+            fields.emplace_back("phase_aware_workspace");
+        }
+        if (params.live_context_workspace.size() > 1 || params.live_context_workspace != cmd_params_defaults.live_context_workspace) {
+            fields.emplace_back("live_context_workspace");
+        }
+        if (params.kv_gpu_layers.size() > 1 || params.kv_gpu_layers != cmd_params_defaults.kv_gpu_layers) {
+            fields.emplace_back("kv_gpu_layers");
         }
         if (params.flash_attn.size() > 1 || params.flash_attn != cmd_params_defaults.flash_attn) {
             fields.emplace_back("flash_attn");
