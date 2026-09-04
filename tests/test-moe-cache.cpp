@@ -1125,11 +1125,9 @@ struct candidate_graph_holder_context {
         ggml_cuda_moe_graph_span span;
         CHECK(graph != nullptr && ggml_cuda_moe_graph_span_bounds(graph->nodes, graph->n_nodes, &span));
         const void * key = graph->nodes[0];
-        for (auto & entry : holders) {
-            if (entry.first == key || ggml_cuda_moe_graph_spans_overlap(
-                    entry.second->nodes, entry.second->n_nodes, graph->nodes, graph->n_nodes)) {
-                entry.second->reset();
-            }
+        auto existing = holders.find(key);
+        if (existing != holders.end()) {
+            existing->second->reset();
         }
         uint32_t mmid_count = 0;
         uint64_t mmid_fingerprint = 0;
@@ -1320,19 +1318,22 @@ static void candidate_test_graph_holder_coverage(
     auto & disjoint_holder = holder_context.holder(disjoint->nodes[0]);
     const uint64_t disjoint_epoch = disjoint_holder.epoch;
     const auto disjoint_plan = disjoint_holder.plan;
+    const uint64_t retained_suffix_epoch = suffix_holder.epoch;
     const auto stale_suffix_plan = suffix_holder.plan;
 
     holder_context.certify(parent);
-    CHECK(suffix_holder.epoch == 0 && suffix_holder.plan == nullptr);
+    CHECK(suffix_holder.epoch == retained_suffix_epoch && suffix_holder.plan == stale_suffix_plan);
     CHECK(disjoint_holder.epoch == disjoint_epoch && disjoint_holder.plan == disjoint_plan);
     CHECK(stale_suffix_plan != nullptr);
-    CHECK(!holder_context.recover(&suffix, suffix_holder));
+    holder_context.evict(suffix_key);
     for (uint64_t uid = 105; uid < 107; ++uid) {
         auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
         CHECK(candidate_prepare_graph_holder(
             holder_context, &suffix, uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, execution.get()) ==
-            GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-        CHECK(execution->find(separate_down, nullptr) && suffix_holder.plan == nullptr);
+            (uid == 105 ? GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED : GGML_CUDA_MOE_GRAPH_PREPARE_REUSED));
+        const auto & recovered_suffix = holder_context.holder(suffix_key);
+        CHECK(execution->find(separate_down, nullptr) && recovered_suffix.epoch == retained_suffix_epoch &&
+            recovered_suffix.plan != nullptr);
     }
 }
 
@@ -2176,16 +2177,20 @@ static void test_graph_execution_certificate_policy() {
         native.mapping = static_cast<ggml_cuda_mmid_mapping>(capability.mapping);
         native.use_mmq = capability.use_mmq != 0;
         const auto native_capability = ggml_cuda_mmid_get_capability(native);
+        const uint32_t expected_phase = current.route.ids->ne[1] == 1 ?
+            GGML_CUDA_MMID_PHASE_DECODE : GGML_CUDA_MMID_PHASE_PREFILL;
         CHECK(capability.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
             capability.device == 0 &&
             capability.strategy == GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT &&
-            capability.phase == GGML_CUDA_MMID_PHASE_PREFILL && capability.materialized_phase == capability.phase &&
+            capability.phase == expected_phase && capability.materialized_phase == capability.phase &&
             capability.materialized_mapping == GGML_CUDA_MMID_MAPPING_DIRECT &&
             native_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
             native_capability.selection == capability.consumer);
     };
     check_required_sequential_direct(isolated, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 1228, 2, 1);
     check_required_sequential_direct(isolated, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, 1229, 2, 1);
+    auto subrow = make_graph(2, 1);
+    check_required_sequential_direct(subrow, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 1230, 2, 1);
     candidate_stamp_execution(isolated.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, 2, 2);
     check_execution_legacy(isolated, 1230);
