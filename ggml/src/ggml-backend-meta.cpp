@@ -1455,29 +1455,32 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
 
-    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, 1]. The
-    // heads split, but interleaved per cell, so the chunk splice below cannot express the write.
+    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, n_stream].
+    // The heads split, but interleaved per cell, so the chunk splice below cannot express the write.
     // Each device's heads are one contiguous run per cell: ne[1] cells, from one stride to another.
     const bool strided_head_split =
         !ggml_is_contiguous(tensor) &&
         split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
         split_state.n_segments == 1 && split_state.nr[0] == 1 &&
-        tensor->ne[3] == 1 && tensor->nb[1] > tensor->nb[2] &&
+        tensor->nb[1] > tensor->nb[2] &&
         offset == 0 && size == ggml_nbytes(tensor);
 
     if (strided_head_split) {
-        size_t offset_data = 0;
-        for (size_t j = 0; j < n_bufs; j++) {
-            ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
-            const size_t nbytes = split_state.ne[j] * tensor->nb[2];
-            if (nbytes == 0) {
-                continue;
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+            size_t offset_data = i3 * tensor->nb[3];
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t nbytes = split_state.ne[j] * tensor->nb[2];
+                if (nbytes == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                    i3 * simple_tensor->nb[3], nbytes,
+                    tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                offset_data += nbytes;
             }
-            ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data, 0, nbytes,
-                tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
-            offset_data += nbytes;
+            GGML_ASSERT(offset_data == i3 * tensor->nb[3] + (size_t) tensor->ne[2] * tensor->nb[2]);
         }
-        GGML_ASSERT(offset_data == (size_t) tensor->ne[2] * tensor->nb[2]);
         return;
     }
 
