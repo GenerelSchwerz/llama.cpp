@@ -6178,7 +6178,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
     if (decode == nullptr) {
         return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
     }
-    *decode = {};
+    *decode = ggml_cuda_moe_grouped_decode_acquisition{};
     if (compute_stream == nullptr || impl_->device < 0 || key.n_banks == 0 ||
             key.n_banks > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
         return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
