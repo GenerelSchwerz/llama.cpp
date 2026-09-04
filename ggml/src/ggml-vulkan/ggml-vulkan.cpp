@@ -1931,7 +1931,11 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+    uint32_t trailing_snapshots;
+    int32_t selected_token;
+    uint32_t reserve_input;
 };
+static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
 struct vk_op_ssm_scan_push_constants {
     uint32_t nb02, nb03, nb12, nb13;
@@ -10966,7 +10970,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         return t->nb[0] == ggml_type_size(t->type) &&
                t->nb[2] == ggml_row_size(t->type, t->ne[0]) &&
                t->nb[1] == t->nb[2] * t->ne[2] &&
-               t->nb[3] == t->nb[1] * t->ne[1];
+               (t->ne[3] == 1 || t->nb[3] == t->nb[1] * t->ne[1]);
     };
     const bool k_quant = k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_F32;
     const bool v_quant = v->type != GGML_TYPE_F16 && v->type != GGML_TYPE_BF16 && v->type != GGML_TYPE_F32;
@@ -12993,6 +12997,9 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+    const int32_t trailing_snapshots = ggml_get_op_params_i32(dst, 1);
+    const int32_t selected_token = ggml_get_op_params_i32(dst, 2);
+    const uint32_t reserve_input = ggml_get_op_params_i32(dst, 3) != 0;
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
@@ -13000,7 +13007,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         sb1, sb2, sb3,
         neq1, rq3,
         scale,
-        K
+        K,
+        (uint32_t) trailing_snapshots,
+        selected_token,
+        reserve_input,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -19094,7 +19104,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_GATED_DELTA_NET:
             {
-                if (!ggml_gated_delta_net_has_default_snapshot_params(op) ||
+                if (!ggml_gated_delta_net_validate(op) ||
                     !ggml_are_same_stride(op->src[0], op->src[1])) {
                     return false;
                 }
@@ -19106,6 +19116,67 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     if (op->src[i] == nullptr || op->src[i]->type != GGML_TYPE_F32) {
                         return false;
                     }
+                }
+                for (int i = 0; i < 6; ++i) {
+                    if (ggml_nbytes(op->src[i]) / sizeof(float) > std::numeric_limits<uint32_t>::max()) {
+                        return false;
+                    }
+                    for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                        if (op->src[i]->ne[dim] > (int64_t) std::numeric_limits<uint32_t>::max() ||
+                            op->src[i]->nb[dim] / sizeof(float) > std::numeric_limits<uint32_t>::max()) {
+                            return false;
+                        }
+                    }
+                }
+                if (ggml_nbytes(op) / sizeof(float) > std::numeric_limits<uint32_t>::max()) {
+                    return false;
+                }
+                for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                    if (op->ne[dim] > (int64_t) std::numeric_limits<uint32_t>::max() ||
+                        op->nb[dim] / sizeof(float) > std::numeric_limits<uint32_t>::max()) {
+                        return false;
+                    }
+                }
+                const uint64_t max_u32 = std::numeric_limits<uint32_t>::max();
+                const uint64_t S_v64 = op->src[2]->ne[0];
+                const uint64_t H = op->src[2]->ne[1];
+                const uint64_t n_tokens = op->src[2]->ne[2];
+                const uint64_t n_seqs = op->src[2]->ne[3];
+                const uint64_t K = (uint32_t) ggml_get_op_params_i32(op, 0);
+                const auto checked_mul = [](uint64_t a, uint64_t b, uint64_t & result) {
+                    if (b != 0 && a > std::numeric_limits<uint64_t>::max() / b) {
+                        return false;
+                    }
+                    result = a * b;
+                    return true;
+                };
+                const auto checked_add = [](uint64_t a, uint64_t b, uint64_t & result) {
+                    if (a > std::numeric_limits<uint64_t>::max() - b) {
+                        return false;
+                    }
+                    result = a + b;
+                    return true;
+                };
+                uint64_t state_size;
+                uint64_t state_size_per_snap;
+                uint64_t attention_elems;
+                uint64_t snapshot_elems;
+                uint64_t output_elems;
+                if (!checked_mul(S_v64, S_v64, state_size) ||
+                    !checked_mul(state_size, H, state_size_per_snap) ||
+                    !checked_mul(state_size_per_snap, n_seqs, state_size_per_snap) ||
+                    !checked_mul(S_v64, H, attention_elems) ||
+                    !checked_mul(attention_elems, n_tokens, attention_elems) ||
+                    !checked_mul(attention_elems, n_seqs, attention_elems) ||
+                    !checked_mul(state_size_per_snap, K, snapshot_elems) ||
+                    attention_elems > max_u32 || state_size_per_snap > max_u32 ||
+                    !checked_add(attention_elems, snapshot_elems, output_elems) ||
+                    output_elems > max_u32) {
+                    return false;
+                }
+                if (op->src[2]->ne[1] > (int64_t) device->properties.limits.maxComputeWorkGroupCount[0] ||
+                    op->src[2]->ne[3] > (int64_t) device->properties.limits.maxComputeWorkGroupCount[1]) {
+                    return false;
                 }
                 return op->type == GGML_TYPE_F32;
             }
