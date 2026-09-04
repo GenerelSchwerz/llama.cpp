@@ -6636,9 +6636,9 @@ static void test_active_grouped_multirow_graph_modes_case(
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
     CHECK(executed_passes == (capture_available ? 4u : transition_executed ? 2u : 1u));
-    const uint64_t transition_plan_compiles = transition_executed ? 2 : 1;
-    CHECK(telemetry.plan_calls == executed_passes && telemetry.plan_compiles == transition_plan_compiles &&
-        telemetry.plan_reuses == executed_passes - transition_plan_compiles);
+    const uint64_t expected_plan_compiles = 1;
+    CHECK(telemetry.plan_calls == executed_passes && telemetry.plan_compiles == expected_plan_compiles &&
+        telemetry.plan_reuses == executed_passes - expected_plan_compiles);
     CHECK(telemetry.calls == executed_passes && telemetry.ready == executed_passes && telemetry.completed == executed_passes);
     CHECK(telemetry.ready_min == executed_passes && telemetry.ready_max == executed_passes);
     CHECK(telemetry.completed_min == executed_passes && telemetry.completed_max == executed_passes);
@@ -6696,8 +6696,9 @@ static void test_active_grouped_multirow_graph_modes_case(
         (void) run_cached_mmid_path_test(
             candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
         CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
-        CHECK(invalidated_graph.graph == 0 && invalidated_graph.instance == 0 &&
-            !invalidated_graph.warmup_complete && invalidated_graph.moe_resource_fingerprint == 0);
+        CHECK(invalidated_graph.graph == captured_graph && invalidated_graph.instance == captured_instance &&
+            invalidated_graph.warmup_complete && invalidated_graph.execution_semantic_key == captured_semantic_key &&
+            invalidated_graph.moe_resource_fingerprint == captured_resource_fingerprint);
 
         recapture_main();
         candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
@@ -7199,9 +7200,10 @@ static void test_active_grouped_same_key_row_transitions(int device, uint32_t n_
             run_checked(n_rows, direct_variant);
             check_resource_identity();
             CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), graph, &state));
-            CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete &&
-                state.execution_semantic_key == semantic_key && state.moe_resource_fingerprint == 0);
             if (n_rows == 4) {
+                CHECK(state.graph == captured_graph && state.instance == captured_instance && state.warmup_complete &&
+                    state.execution_semantic_key == semantic_keys[3] &&
+                    state.moe_resource_fingerprint == b4_resource_fingerprint);
                 run_checked(4, direct_variant);
                 CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), graph, &state));
                 CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
@@ -7214,6 +7216,9 @@ static void test_active_grouped_same_key_row_transitions(int device, uint32_t n_
                 CHECK(state.graph == captured_graph && state.instance == captured_instance && state.warmup_complete &&
                     state.execution_semantic_key == semantic_keys[3] &&
                     state.moe_resource_fingerprint == b4_resource_fingerprint);
+            } else {
+                CHECK(state.graph == 0 && state.instance == 0 && !state.warmup_complete &&
+                    state.execution_semantic_key == semantic_key && state.moe_resource_fingerprint == 0);
             }
             previous_semantic_key = semantic_key;
         }
@@ -7226,7 +7231,7 @@ static void test_active_grouped_same_key_row_transitions(int device, uint32_t n_
         active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1 && telemetry.plan_calls == executed_passes &&
-        telemetry.plan_compiles == 5 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles &&
+        telemetry.plan_compiles == 4 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles &&
         telemetry.calls == executed_passes &&
         telemetry.ready == executed_passes && telemetry.completed == executed_passes &&
         telemetry.admitted_banks == executed_passes * candidate_b1.banks.size());
@@ -7361,7 +7366,7 @@ static void test_active_grouped_speculative_route_limit_transition(
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
     CHECK(telemetry.plan_calls == executed_passes);
-    CHECK(telemetry.plan_compiles == 3 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles);
+    CHECK(telemetry.plan_compiles == 2 && telemetry.plan_reuses == executed_passes - telemetry.plan_compiles);
     CHECK(telemetry.calls == executed_passes && telemetry.ready == executed_passes && telemetry.completed == executed_passes);
     CHECK(telemetry.admitted_banks == executed_passes * candidate_b1.banks.size());
     CHECK(telemetry.host_staged_calls == (sequential_fits ? 0 : 1) &&
