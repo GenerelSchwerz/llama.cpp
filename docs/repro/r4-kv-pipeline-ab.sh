@@ -10,9 +10,8 @@ PIN="${LLAMA_KV_TASKSET:-0,2,4}"
 BUDGET="${LLAMA_KV_BUDGET:-512}"
 LOCK=/tmp/beellama-single-gpu.lock
 
-# An unpinned host cache and a host-resident recurrent state both cost more than the transport can
-# win back, and without a budget the ring is declined at the larger contexts, so a build without
-# these options does not measure what the doc reports. Fail rather than measure something else.
+# An unpinned host cache and a host-resident recurrent state both cost more than the transport can win back, and without a budget the ring is declined at the larger contexts, so a build without these options does not measure what the doc reports.
+# Fail rather than measure something else.
 if ! HELP="$("$BUILD/bin/llama-bench" --help 2>&1)"; then
   echo "cannot run $BUILD/bin/llama-bench:" >&2
   echo "$HELP" >&2

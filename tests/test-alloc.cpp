@@ -1464,9 +1464,8 @@ static void test_transport_entry_allocation() {
     }
 }
 
-// A window over several streams sits a fixed stride apart in one tensor, with cells between one
-// stream's window and the next that the graph never reads. The delivery has to cover each stream's
-// window from its own offset and leave those cells alone.
+// A window over several streams sits a fixed stride apart in one tensor, with cells between one stream's window and the next that the graph never reads.
+// The delivery has to cover each stream's window from its own offset and leave those cells alone.
 static void test_transport_multi_stream_ranges() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
