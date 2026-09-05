@@ -28,8 +28,9 @@ set -u -o pipefail
 MODEL=""
 BUILD=""
 OUT="$PWD/fattn-turing-model-results"
-CTX=1024
-CTK="q8_0"
+CTX=0
+DEEP=0
+CTK="q4_0"
 NGL=999
 NPREDICT=128
 REPS=3
@@ -43,8 +44,10 @@ Options:
   -m, --model FILE   GGUF model (required).
   --build DIR        llama.cpp build directory (default: ./build, then ./build-turing).
   --out DIR          Results directory.
-  -c, --ctx N        Context size (default 1024; keep it <= 1024 for GQA-2 models).
-  --cache-type T     KV cache type: q8_0 (default) or q4_0.
+  -c, --ctx N        Context size (default: chosen to keep the route engaged).
+  --cache-type T     KV cache type: q4_0 (default) or q8_0.
+  --deep             Measure in the long-context regime (n_kv >= 16384) instead
+                     of the short one. q4_0 and a GQA>4 model only.
   --ngl N            Layers on GPU (default 999 = all).
   -n N               Tokens to generate in the correctness run (default 128).
   -r N               llama-bench repetitions (default 3).
@@ -67,6 +70,7 @@ while [ $# -gt 0 ]; do
         -r)           REPS="$2"; shift 2 ;;
         --gpu)        DEVICE_ENV="$2"; shift 2 ;;
         --ab)         DO_AB=1; shift ;;
+        --deep)       DEEP=1; shift ;;
         --force)      FORCE=1; shift ;;
         -h|--help)    usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -110,7 +114,8 @@ nvidia-smi --query-gpu=compute_cap --format=csv,noheader | grep -q '7\.5' \
 info "build      : $BUILD"
 info "model      : $MODEL"
 info "kv cache   : $CTK"
-info "context    : $CTX"
+[ "$CTX" -eq 0 ] && info "context    : auto (picked to keep the route engaged)" \
+                 || info "context    : $CTX"
 
 # ------------------------------------------------------- 1. model geometry --
 
@@ -123,7 +128,7 @@ PROMPT="Explain in three sentences why the sky looks blue during the day and red
 # separate, deliberately tiny run; the readable text comes from a clean one.
 info "reading the model geometry"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
-"$CLI" -m "$MODEL" -c "$CTX" -ngl "$NGL" -fa on \
+"$CLI" -m "$MODEL" -c 512 -ngl "$NGL" -fa on \
     -ctk "$CTK" -ctv "$CTK" -n 1 -p "hi" --seed 1 -st -v \
     > "$OUT/geometry.log" 2>&1 \
     || { tail -20 "$OUT/geometry.log"; die "the model would not load; see $OUT/geometry.log"; }
@@ -148,27 +153,29 @@ info "gqa ratio     : ${GQA:-?}"
 
 # Mirror of ggml_cuda_fattn_native_supported() and _profitable() in fattn.cu.
 # Device-resident cache assumed, which is what -ngl 999 gives.
-ROUTE="no"; ROUTE_WHY=""; KV_HINT=""
+# ROUTE_MAX_KV is the top of the short window, ROUTE_DEEP_MIN the bottom of the
+# long one; 0 means that window does not exist for this combination.
+ROUTE="no"; ROUTE_WHY=""; ROUTE_MAX_KV=0; ROUTE_DEEP_MIN=0
 if [ "$D_K" != "$D_V" ]; then
     ROUTE_WHY="K and V head dims differ; the route needs them equal"
 elif [ "$D_K" = "512" ]; then
     if [ "${GQA:-0}" -gt 4 ]; then
-        ROUTE="yes"; ROUTE_WHY="D=512 row, any KV length"; KV_HINT="any context"
+        ROUTE="yes"; ROUTE_WHY="D=512 row, any KV length"; ROUTE_MAX_KV=1000000
     else
         ROUTE_WHY="D=512 needs a GQA ratio above 4, this model has ${GQA:-?}"
     fi
 elif [ "$D_K" = "256" ]; then
     if [ "${GQA:-0}" = "2" ]; then
         ROUTE="yes"; ROUTE_WHY="D=256 GQA-2 row, prefill batches above 16 tokens"
-        KV_HINT="context <= 1024 (beyond that this row falls back)"
+        ROUTE_MAX_KV=1024
     elif [ "${GQA:-0}" = "8" ]; then
         ROUTE_WHY="D=256 with GQA 8 is deliberately excluded (open memory-safety question)"
     elif [ "${GQA:-0}" -gt 4 ]; then
         ROUTE="yes"; ROUTE_WHY="D=256 GQA-$GQA row, prefill batches above 4 tokens"
         if [ "$CTK" = "q4_0" ]; then
-            KV_HINT="context <= 1024, or >= 16384"
+            ROUTE_MAX_KV=1024; ROUTE_DEEP_MIN=16384
         else
-            KV_HINT="context <= 512"
+            ROUTE_MAX_KV=512
         fi
     else
         ROUTE_WHY="D=256 needs a GQA ratio of 2 or above 4, this model has ${GQA:-?}"
@@ -180,7 +187,35 @@ fi
 echo
 if [ "$ROUTE" = "yes" ]; then
     good "this model CAN take the native route: $ROUTE_WHY"
-    [ -n "$KV_HINT" ] && info "keep it engaged with: $KV_HINT"
+
+    # The route is only taken inside a KV-length window, so pick a context and
+    # bench depths that sit inside it. Measuring outside it times the unchanged
+    # F16 path and looks like "no speedup".
+    PP=512
+    if [ "$DEEP" = 1 ]; then
+        if [ "$ROUTE_DEEP_MIN" -eq 0 ]; then
+            die "--deep needs the long window, which this model and cache type do not have (try --cache-type q4_0)"
+        fi
+        BENCH_DEPTHS="16384"
+        [ "$CTX" -eq 0 ] && CTX=$((16384 + 4096))
+        info "long-context regime: the route is active from n_kv >= $ROUTE_DEEP_MIN"
+    else
+        if [ "$ROUTE_MAX_KV" -ge 1024 ]; then
+            BENCH_DEPTHS="0,512"
+            [ "$CTX" -eq 0 ] && CTX=1024
+        else
+            # q8_0 at GQA>4 only reaches n_kv <= 512, so pp512 at depth 0 is all
+            # that fits.
+            BENCH_DEPTHS="0"
+            [ "$CTX" -eq 0 ] && CTX=512
+            info "this cache type only reaches n_kv <= $ROUTE_MAX_KV; q4_0 has a wider window"
+        fi
+        info "short-context regime: the route is active up to n_kv = $ROUTE_MAX_KV"
+        if [ "$ROUTE_DEEP_MIN" -gt 0 ]; then
+            info "there is also a long-context window from n_kv >= $ROUTE_DEEP_MIN: use --deep"
+        fi
+    fi
+    info "using context $CTX, benching at depth(s) $BENCH_DEPTHS"
     info "note: token generation (batch of 1) never takes the route; only prefill does"
 else
     badp "this model can NOT take the native route"
@@ -191,6 +226,7 @@ else
     info "Gemma 3, any size - or pass --force to measure anyway."
     [ "$FORCE" = 1 ] || exit 1
     warnp "--force given, continuing on a model the route cannot reach"
+    PP=512; BENCH_DEPTHS="0"; [ "$CTX" -eq 0 ] && CTX=1024
 fi
 
 # ----------------------------------------------------------- 2. is it sane --
@@ -244,16 +280,13 @@ step "3/4  Throughput"
 
 # pp exercises the route (large prefill batch), tg cannot (batch of 1), so tg
 # doubles as a control: it should not move between the two builds.
-PP=512
 TG=64
-DEPTHS="0"
-[ "$CTX" -ge 1024 ] && DEPTHS="0 512"
 
 run_bench() {
     local bin="$1" tag="$2"
     info "running llama-bench ($tag) - a few minutes"
     local args=(-m "$MODEL" -ngl "$NGL" -fa 1 -ctk "$CTK" -ctv "$CTK" -r "$REPS" -o json
-                -p "$PP" -n "$TG" -d "$(echo $DEPTHS | tr ' ' ',')")
+                -p "$PP" -n "$TG" -d "$BENCH_DEPTHS")
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}" \
         "$bin" "${args[@]}" > "$OUT/bench-$tag.json" 2> "$OUT/bench-$tag.log"
     return $?
