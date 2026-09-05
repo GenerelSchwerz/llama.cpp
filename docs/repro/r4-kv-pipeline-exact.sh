@@ -1,6 +1,6 @@
 #!/bin/bash
-# R4 gate 1: greedy server output must be byte-identical to the ordered path, across several
-# prefill corpora and prefill lengths. The script compares every requested depth with the first.
+# R4 gate 1: greedy server output must be byte-identical to the ordered path, across several prefill corpora and prefill lengths.
+# The script compares every requested depth with the first.
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-exact.sh [pipeline-depth ...]
 #   LLAMA_KV_LENGTHS=2048,18432,65536 selects the prefill lengths (default 2048,18432).

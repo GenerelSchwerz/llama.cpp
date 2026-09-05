@@ -1,7 +1,6 @@
 #!/bin/bash
-# R4 across context depth: throughput and device allocation high-water, ordered against
-# pipelined, on the same binary. The ring holds one split's whole delivery per slot, so its
-# cost grows with the context; this is what measures where that stops being affordable.
+# R4 across context depth: throughput and device allocation high-water, ordered against pipelined, on the same binary.
+# The ring holds one split's whole delivery per slot, so its cost grows with the context; this is what measures where that stops being affordable.
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-context-sweep.sh [depth ...]
 set -euo pipefail
@@ -12,9 +11,8 @@ NGEN="${LLAMA_KV_NGEN:-64}"
 BUDGET="${LLAMA_KV_BUDGET:-512}"
 LOCK=/tmp/beellama-single-gpu.lock
 
-# An unpinned host cache and a host-resident recurrent state both cost more than the transport can
-# win back, and without a budget the ring is declined at the larger contexts, so a build without
-# these options does not measure what the doc reports. Fail rather than measure something else.
+# An unpinned host cache and a host-resident recurrent state both cost more than the transport can win back, and without a budget the ring is declined at the larger contexts, so a build without these options does not measure what the doc reports.
+# Fail rather than measure something else.
 if ! HELP="$("$BUILD/bin/llama-bench" --help 2>&1)"; then
   echo "cannot run $BUILD/bin/llama-bench:" >&2
   echo "$HELP" >&2

@@ -7,8 +7,7 @@ LENGTHS = [int(x) for x in sys.argv[2].split(",")]   # approximate prefill token
 RESULTS_PATH = sys.argv[3]
 RESULTS = []
 
-# Four corpora with different token statistics, so that the deliveries being pipelined are not
-# always the same shape of content: prose, source code, structured records, and dialogue.
+# Four corpora with different token statistics, so that the deliveries being pipelined are not always the same shape of content: prose, source code, structured records, and dialogue.
 CORPORA = {
     "prose": ("A B-tree index stores keys in sorted order across a shallow, balanced tree. "
               "Range queries descend once to the first qualifying leaf and then walk the leaf "
@@ -43,17 +42,14 @@ def filler(name, target_tokens):
     return unit * reps
 
 def nonce(name, length):
-    # The server restores a cached prefix from an earlier task, and a restored window is not
-    # numerically the same as a freshly prefilled one, so two tasks that share a long prefix stop
-    # measuring the code under test. This makes every task's prefix unique, and it is derived from
-    # the task rather than drawn at random so that a control run produces comparable hashes.
+    # The server restores a cached prefix from an earlier task, and a restored window is not numerically the same as a freshly prefilled one, so two tasks that share a long prefix stop measuring the code under test.
+    # This makes every task's prefix unique, and it is derived from the task rather than drawn at random so that a control run produces comparable hashes.
     h = hashlib.sha256(f"{name}/{length}".encode()).hexdigest()[:32]
     return f"Session {h}. Ignore this line.\n\n"
 
 def ask(label, prompt, ntok, want_prefill):
-    # cache_prompt=False forces a full prefill. Without it a task inherits whatever the previous
-    # one left in the cache, and two tasks whose prompts do not both fit make placement depend on
-    # that: records@18432 then gives different answers across otherwise identical runs.
+    # cache_prompt=False forces a full prefill.
+    # Without it a task inherits whatever the previous one left in the cache, and two tasks whose prompts do not both fit make placement depend on that: records@18432 then gives different answers across otherwise identical runs.
     body = json.dumps({"model": "m", "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": ntok, "temperature": 0, "top_k": 1, "seed": 1234,
                        "cache_prompt": False}).encode()
@@ -69,8 +65,7 @@ def ask(label, prompt, ntok, want_prefill):
     # reasoning models put most of the generation in reasoning_content; hash both
     text = (m.get("reasoning_content") or "") + "\x00" + (m.get("content") or "")
     t = d.get("timings", {})
-    # a reused prefix shows up as a prompt_n far below the prompt actually sent; the hash it
-    # produces is not comparable to a fresh prefill, so say so rather than reporting it silently
+    # a reused prefix shows up as a prompt_n far below the prompt actually sent; the hash it produces is not comparable to a fresh prefill, so say so rather than reporting it silently
     prompt_n = t.get("prompt_n") or 0
     reused = prompt_n < want_prefill // 2
     digest = hashlib.sha256(text.encode()).hexdigest()[:16]
