@@ -149,7 +149,8 @@ llama_context::llama_context(
     // does not line up with the one a host-resident state expects. Keep the state on its device.
     if (!cparams.recurrent_state_offload && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR &&
             (llm_arch_is_recurrent(model.arch) || llm_arch_is_hybrid(model.arch))) {
-        LLAMA_LOG_INFO("%s: split mode tensor: keeping the recurrent state device-resident\n", __func__);
+        LLAMA_LOG_WARN("%s: split mode tensor cannot keep the recurrent state in host memory - "
+                       "overriding --no-recurrent-state-offload, which needs more VRAM\n", __func__);
         cparams.recurrent_state_offload = true;
     }
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
