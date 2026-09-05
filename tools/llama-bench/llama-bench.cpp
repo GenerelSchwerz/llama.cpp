@@ -872,6 +872,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         break;
                     }
                 }
+                if (invalid_param) {
+                    break;
+                }
                 params.kv_pipeline_depth.insert(params.kv_pipeline_depth.end(), p.begin(), p.end());
             } else if (arg == "-kvpb" || arg == "--kv-pipeline-budget") {
                 if (++i >= argc) {
@@ -884,6 +887,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         invalid_param = true;
                         break;
                     }
+                }
+                if (invalid_param) {
+                    break;
                 }
                 params.kv_pipeline_budget_mib.insert(params.kv_pipeline_budget_mib.end(), p.begin(), p.end());
             } else if (arg == "-rso" || arg == "--recurrent-state-offload") {
