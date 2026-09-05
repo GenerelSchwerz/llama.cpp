@@ -193,12 +193,15 @@ The table above is what the feature costs uncapped, and it is the reason it is c
 
 - Under the cap the ring is allocated and the deliveries pipeline.
 - Over it the scheduler declines and keeps the ordered path for that graph. Later graphs are evaluated again, so a smaller live window can use the ring.
-- Declining costs nothing in steady state. Both the ring and the transfer backend's device context are released.
+- Declining costs nothing in steady state. Both the ring and the transfer backend's device context are released, and a graph that stages nothing at all releases them the same way.
+- The value is in MiB, `0` removes the cap, and 65536 is the largest accepted: a slot holds one attention layer's K or V, so a cap past that is a typo rather than a budget.
 - The budget and the headroom check are decided before the graph is allocated, so they can still leave the graph short. If graph reservation fails, the rings are released and the reservation is retried once on the ordered path, and that scheduler keeps the ordered path from then on. An optional ring never turns a graph that fits into an allocation failure.
 
 **The cap is applied to what the current graph needs, not to what the full context would need.** A run whose window stays small keeps the ring whatever `-n_ctx` says, which is the common case and the reason it is done this way: a staged input is a view of the cache tensor, so the full-context figure is there for the asking, but enforcing it would refuse the ring for every large `-c` even when the window never gets near it. The warning reports both numbers so that `--kv-pipeline-budget` can be sized against the one that matters.
 
 The cost of deciding per graph is that a context which grows past the budget allocates a ring for the small early windows and gives it back once it outgrows them. That transient is bounded by the budget itself, which is the memory the user already authorised, so it is a property of the cap rather than a defect in it.
+
+A window wider than the ring holds has to free the ring and allocate it again, which blocks the host on the device, and a prefill widens the window on nearly every ubatch. So a slot is allocated in powers of two, up to what the full context needs and never past the budget or the headroom check. The decision to decline still goes by what the graph needs, so the cap falls where it did; only the allocation is coarse.
 
 At 32,768 the ring is 204 MiB at the full context, over the 128 MiB default. `--kv-pipeline-budget 512` buys 20.350 -> 31.463 t/s behind an 18,432-token prompt.
 
