@@ -47,43 +47,11 @@ static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_type(ggml_ty
 #undef FATTN_MMA_QUANT_TYPE_MATCH
 }
 
-// Sentinel V type meaning "the V cache type is not a template argument; it
-// arrives as the runtime kernel parameter type_V_rt".
-//
-// This is what keeps the pair matrix linear instead of quadratic. With V
-// compile-time, n native types cost n^2 instantiations of the entire attention
-// body. With V runtime, they cost n: one body per K type, carrying a switch over
-// the n V loaders at the tile-load site. The switch runs once per K/V tile, not
-// per element, so it is not on the per-element path the packed loaders optimize.
-static constexpr ggml_type GGML_CUDA_FATTN_QUANT_V_RUNTIME = (ggml_type) (GGML_TYPE_COUNT + 1);
-
-// True when the V loader must be chosen at runtime rather than instantiated.
-static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_v_runtime(ggml_type type_V) {
-    return type_V == GGML_CUDA_FATTN_QUANT_V_RUNTIME;
-}
-
-// Ordered K/V pair policy.
-//
-// K and V are independent template parameters of the kernel and reach the tile
-// loader through separate calls, so any ordered pair of native types is
-// expressible, and the route compiles all of them that the F16-casting path
-// would accept. Mixed pairs are only reachable in a GGML_CUDA_FA_ALL_QUANTS
-// build, because ggml_cuda_get_best_fattn_kernel() declines K->type != V->type
-// otherwise; that is also the build in which the runtime-V kernels exist.
-//
-// Instantiating per pair would cost n^2 explicit cases. Sharing one runtime-V
-// kernel per K type across the mixed pairs makes coverage linear: five types
-// cost ten kernels per tile shape, not twenty-five.
+// Only symmetric K/V pairs take the native route. The profitability gate in
+// fattn.cu never selects K->type != V->type, so a mixed-pair kernel would be
+// dead code.
 static constexpr __host__ __device__ bool ggml_cuda_fattn_mma_quant_pair(ggml_type type_K, ggml_type type_V) {
-    if (!ggml_cuda_fattn_mma_quant_type(type_K) || !ggml_cuda_fattn_mma_quant_type(type_V)) {
-        return false;
-    }
-#ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (type_K != type_V) {
-        return false;
-    }
-#endif // GGML_CUDA_FA_ALL_QUANTS
-    return true;
+    return type_K == type_V && ggml_cuda_fattn_mma_quant_type(type_K);
 }
 
 // Load quantized rows directly into the half2 shared-memory tile consumed by

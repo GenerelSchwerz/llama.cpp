@@ -18,13 +18,6 @@
 #define FATTN_MMA_QUANT_TIER_EXTRA(...)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
-// Mixed K/V types require GGML_CUDA_FA_ALL_QUANTS.
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-#define FATTN_MMA_QUANT_MIXED_PAIRS(...) __VA_ARGS__
-#else
-#define FATTN_MMA_QUANT_MIXED_PAIRS(...)
-#endif // GGML_CUDA_FA_ALL_QUANTS
-
 // Expand the types compiled by this build.
 #define FATTN_MMA_QUANT_TYPES_ENTRY(type, stem, tier, F) FATTN_MMA_QUANT_TIER_##tier(F(type))
 #define FATTN_MMA_QUANT_TYPES(F) FATTN_MMA_QUANT_TYPE_LIST(FATTN_MMA_QUANT_TYPES_ENTRY, F)
