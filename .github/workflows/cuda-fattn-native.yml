@@ -40,7 +40,7 @@ concurrency:
 
 jobs:
   compile-matrix:
-    name: Compile ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }}
+    name: Compile ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}
     runs-on: ubuntu-24.04
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
     # Give the all-quants arm room, but stay inside GitHub's 6 h ceiling so a
@@ -52,14 +52,23 @@ jobs:
         include:
           - all_quants: 'OFF'
             fa: 'ON'
+            arch: '89-real'
             slug: allq-off
           - all_quants: 'ON'
             fa: 'ON'
+            arch: '89-real'
             slug: allq-on
+          # Turing takes the narrow tile shapes and a different MMA config table,
+          # so its kernel bodies are a separate compile.
+          - all_quants: 'OFF'
+            fa: 'ON'
+            arch: '75-real'
+            slug: turing
           # The route must also compile out cleanly where FlashAttention itself
           # is disabled, which is the one build with no native kernels at all.
           - all_quants: 'OFF'
             fa: 'OFF'
+            arch: '89-real'
             slug: fa-off
     steps:
       - name: Clone
@@ -80,10 +89,10 @@ jobs:
           max-size: 5G
 
       - name: Configure
-        # One real architecture on purpose. The point of this job is the source
-        # inventory and the coupling between the switches, and both are
-        # architecture independent; compiling the default architecture list would
-        # multiply the nvcc work for no extra coverage.
+        # One real architecture per arm on purpose. Compiling the default
+        # architecture list would multiply the nvcc work for no extra coverage:
+        # the inventory is architecture independent, and the one architecture
+        # that changes the kernel bodies, Turing, has its own arm.
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -91,7 +100,7 @@ jobs:
             -DGGML_CUDA=ON \
             -DGGML_CUDA_FA=${{ matrix.fa }} \
             -DGGML_CUDA_FA_ALL_QUANTS=${{ matrix.all_quants }} \
-            -DCMAKE_CUDA_ARCHITECTURES=89-real \
+            -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
             -DLLAMA_BUILD_TOOLS=OFF \
@@ -118,7 +127,7 @@ jobs:
         run: |
           LIB=$(find build -name 'libggml-cuda.so' -print -quit)
           {
-            echo "### ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }}"
+            echo "### ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}"
             echo
             echo "libggml-cuda.so: $(stat -c %s "$LIB") bytes"
             echo

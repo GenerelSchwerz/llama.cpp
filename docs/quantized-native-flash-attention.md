@@ -29,8 +29,9 @@ The measured gain is the traffic, not the allocation: prefill at depth is up to
 `ggml_cuda_fattn_native_supported()` in `ggml/src/ggml-cuda/fattn.cu` decides
 whether a kernel exists, and returns the tile shape it uses. Common to every row:
 
-- an NVIDIA Ampere or Ada device (`sm_80` to `sm_89`), which is what was measured;
-  Hopper and newer keep the standard path until someone measures them;
+- an NVIDIA Turing, Ampere or Ada device (`sm_75` to `sm_89`); Hopper and newer
+  keep the standard path until someone measures them. Ampere and Ada are
+  measured, Turing is not: see **Turing** below;
 - `logit_softcap == 0`;
 - the same native cache type for K and V;
 - the GQA optimizations apply (mask present, no ALiBi, padded K/V, aligned strides);
@@ -38,16 +39,21 @@ whether a kernel exists, and returns the tile shape it uses. Common to every row
 
 The rows themselves:
 
-| Head dim | GQA ratio | Query batch | Cache types | Tile |
-|---|---|---|---|---|
-| 256 | 2 | > 16 | `q4_0`, `q8_0` | 32x2 |
-| 256 | > 4, not 8 | > 4 | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0` | 8x8 |
-| 512 | > 4 | > 4 | `q4_0`, `q8_0` | 8x8 |
+| Head dim | GQA ratio | Query batch | Cache types | Tile (sm_80+) | Tile (Turing) |
+|---|---|---|---|---|---|
+| 256 | 2 | > 16 | `q4_0`, `q8_0` | 32x2 | 16x2 |
+| 256 | > 4, not 8 | > 4 | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0` | 8x8 | 4x8 |
+| 512 | > 4 | > 4 | `q4_0`, `q8_0` | 8x8 | 4x8 |
 
 Each tile shape is the one the generic `switch_ncols1`/`switch_ncols2` would pick
 inside those bounds, written out so that the compiled kernel set is exactly the
 selectable set. `fattn-mma-quant-decl.cuh` declares the same rows and nothing
 else, so a disagreement between the two is a link error.
+
+The two tile columns are the same rows at different widths: `switch_ncols1` caps
+`ncols1 * ncols2` at 32 on Turing, so each row loses half its columns there. A
+build carries both shapes and picks between them at dispatch, because one build
+serves whichever card it runs on.
 
 GQA 8 at D=256 is excluded on purpose: PR 55 records an open correctness and
 memory-safety question for that geometry under graph and workspace reuse. It
@@ -82,10 +88,11 @@ The cache-type inventory lives in exactly one place,
 
 The tiers mirror `ggml_cuda_fattn_kv_type_supported()`: a default build only
 ever sees `q4_0` and `q8_0` caches, so native kernels for the other types would
-be dead code there. The extra tier only adds the D=256 8x8 row, because that is
-the only row those types can reach.
+be dead code there. The extra tier only adds the D=256 GQA-wide row, because that
+is the only row those types can reach.
 
-That gives 6 kernels in a default build and 9 with `GGML_CUDA_FA_ALL_QUANTS`.
+That gives 12 kernels in a default build and 18 with `GGML_CUDA_FA_ALL_QUANTS`:
+six and nine type-and-geometry combinations, each at both tile widths.
 `scripts/fattn-native-inventory.py` reads the built library back and fails on a
 missing, unexpected or duplicated one, and on any mixed K/V or logit-softcap
 kernel, neither of which the route can select.
@@ -120,28 +127,32 @@ it costs evidence:
   measurement plus a `test-backend-ops` case asserting the route it takes. The
   tile loaders assert alignment against the quant block size, and those
   assertions are what currently confine the head geometry.
-- **A new device family** is a separate measured change. The predicate names
-  Ampere and Ada because that is what was measured.
+- **A new device family** is a separate measured change. Ampere and Ada are
+  measured; Turing compiles and follows the same table but has no numbers yet.
 - **A non-zero `logit_softcap`** stays on the standard path on purpose:
   compiling the softcap specialization would double the generated kernels for a
   dispatch that cannot reach them.
 
 ## Build cost
 
-Measured on one machine, `sm_86;sm_89`, CUDA 13.3, Release. The base is the
-commit this work branched from, `01b141fc`.
+Measured on one machine, `sm_86;sm_89`, CUDA 13.3, Release, with the Ampere and
+Ada tile widths only. The base is the commit this work branched from,
+`01b141fc`.
 
 | Build | `libggml-cuda.so` | Delta vs base | Native kernels |
 |---|---:|---:|---:|
 | base, default | 122,779,344 B | | 0 |
 | base, all-quants | 182,828,488 B | | 0 |
-| this branch, default | 125,252,112 B | +2,472,768 B (+2.01%) | 6 |
-| this branch, all-quants | 186,695,944 B | +3,867,456 B (+2.12%) | 9 |
+| Ampere/Ada widths, default | 125,252,112 B | +2,472,768 B (+2.01%) | 6 |
+| Ampere/Ada widths, all-quants | 186,695,944 B | +3,867,456 B (+2.12%) | 9 |
 
-The route table is what makes that small. Compiling every tile shape at D=64,
-128 and 256, every mixed K/V pair and D=512 for all five types instead costs
-98 kernels in a default build and 485 with all-quants, for +29.04% and +130.23%
-over the same base, and all but 6 and 9 of them are unreachable.
+Adding the Turing widths doubles the kernel count to 12 and 18, since every row
+gains one shape. The library has not been re-measured with them.
+
+The route table is what makes both numbers small. Compiling every tile shape at
+D=64, 128 and 256, every mixed K/V pair and D=512 for all five types instead
+costs 98 kernels in a default build and 485 with all-quants, for +29.04% and
++130.23% over the same base, and all but 12 and 18 of them are unreachable.
 
 ## Validation
 
@@ -162,9 +173,22 @@ counter. A default build runs 6 native and 3 fallback cases, an all-quants build
 9 and 6. The CI job asserts those counts, so a run that selects nothing fails
 instead of passing vacuously.
 
-Kernel inventory (`scripts/fattn-native-inventory.py`): 6 cases in a default
-build, 9 with `GGML_CUDA_FA_ALL_QUANTS`, exactly the declared set and nothing
+Kernel inventory (`scripts/fattn-native-inventory.py`): 12 cases in a default
+build, 18 with `GGML_CUDA_FA_ALL_QUANTS`, exactly the declared set and nothing
 else. Regenerating the instance files reproduces the committed ones.
+
+### Turing
+
+Not measured. `sm_75` compiles and links, and the route table gives it the same
+rows at the narrower tile widths, but no Turing card has run the equivalence
+cases or a throughput comparison. Treat the route there as untested.
+
+One thing does carry over from the Ampere result: the D=256 regression on Ampere
+comes from the native loaders forcing `nstages = 0`, which costs a two-stage
+cp.async pipeline the F16 path would have used. Turing has no cp.async, so its
+F16 path already runs at `nstages = 0` and the native route gives up nothing.
+The Ada thresholds in `ggml_cuda_fattn_native_profitable()` still apply there
+unchanged, so a Turing run selects the same rows a measurement would compare.
 
 ### Throughput
 
