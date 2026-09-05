@@ -220,6 +220,10 @@ public:
 
     bool empty() const { return tokens.empty(); }
 
+    // true if the token list holds real media chunks
+    // note: this differs from has_mtmd, which only means an mmproj is loaded
+    bool has_media_chunks() const { return !map_idx_to_media.empty(); }
+
     void clear() {
         map_idx_to_media.clear();
         tokens.clear();

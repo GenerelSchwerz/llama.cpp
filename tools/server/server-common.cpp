@@ -629,7 +629,7 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
+    GGML_ASSERT(!has_media_chunks()); // only allow this on text-only tokens
     tokens[pos] = id;
 }
 
