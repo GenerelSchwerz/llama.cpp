@@ -2663,8 +2663,26 @@ uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph) {
 namespace {
 
 static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
-static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS = 128;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
+static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS_PER_SM = 4;
+
+static uint32_t moe_grouped_transfer_blocks(
+        int device,
+        size_t words_per_miss,
+        size_t auxiliary_values_per_miss,
+        uint32_t n_routes) {
+    const size_t values_per_miss = std::max(words_per_miss, auxiliary_values_per_miss);
+    const size_t blocks_per_miss = values_per_miss / MOE_GROUPED_TRANSFER_THREADS +
+        (values_per_miss % MOE_GROUPED_TRANSFER_THREADS != 0);
+    const size_t blocks_needed = blocks_per_miss > SIZE_MAX / n_routes ? SIZE_MAX : blocks_per_miss * n_routes;
+    const auto & info = ggml_cuda_info();
+    const size_t device_blocks = info.devices[device].nsm > 0 ?
+        static_cast<size_t>(info.devices[device].nsm) * MOE_GROUPED_TRANSFER_BLOCKS_PER_SM : blocks_needed;
+    const size_t grid_limit = info.devices[device].max_grid_size[0] > 0 ?
+        static_cast<size_t>(info.devices[device].max_grid_size[0]) : static_cast<size_t>(UINT32_MAX);
+    return static_cast<uint32_t>(std::max<size_t>(
+        1, std::min({blocks_needed, device_blocks, grid_limit, static_cast<size_t>(UINT32_MAX)})));
+}
 
 enum moe_grouped_plan_status : uint32_t {
     MOE_GROUPED_PLAN_BUILDING = 0,
@@ -6311,13 +6329,15 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         CUDA_CHECK(cudaGetLastError());
         auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
         uint64_t * transfer_counters = debug != nullptr ? debug->device_transfers.load(std::memory_order_acquire) : nullptr;
+        const uint32_t transfer_blocks = moe_grouped_transfer_blocks(
+            impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, n_routes);
         if (transfer_counters != nullptr) {
-            moe_grouped_gather_decode<true><<<MOE_GROUPED_TRANSFER_BLOCKS, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+            moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters);
         } else {
-            moe_grouped_gather_decode<false><<<MOE_GROUPED_TRANSFER_BLOCKS, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+            moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr);
