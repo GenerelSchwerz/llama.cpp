@@ -24,6 +24,8 @@ The scheduler delivers `[0, stable_prefix)` early on the transfer stream and the
 
 The prefix is a hint about *this* graph. It has to be refreshed for every ubatch even when the graph is reused, which is why it is set from `apply_ubatch()` and not from graph construction. Where it cannot be established -- a transposed V cache, whose ubatch writes are scattered across the whole tensor -- it stays 0 and the input keeps the ordered path.
 
+It also says nothing about the *next* graph. A delivery is still reading the host cache after the call that issued it has returned, and the next ubatch writes wherever its own slots fall, which can be below the window the previous graph is still delivering. The scheduler therefore waits for the transfer stream and for the consumer once at the top of each evaluation, before any split of the new graph can write the cache. The ordered path gets the same guarantee from its blocking copy, which pays for it once per split rather than once per graph.
+
 ### 2. A ring the graph allocator cannot reach
 
 `ggml-alloc` is free to recycle a graph-owned input copy once its last graph-level consumer is done, and a look-ahead transfer is still in flight outside that lifetime. Writing split `k + 1`'s delivery into the scheduler's own input copies corrupts the split still reading them; that is the defect class the earlier cross-layer prefetch experiment hit (+1.38%, and not exact).
@@ -62,9 +64,11 @@ RTX 4070 (11,902 MiB usable, sm_89), driver 610.57.04 / CUDA 13.3, i5-13400F, `Q
 
 | depth | ordered | pipelined | gain |
 |---:|---|---|---:|
-| 4,096 | 29.9802, 29.9776 | 34.8016, 34.8047 | **+16.1%** |
-| 16,384 | 19.0116, 19.0093 | 29.7780, 29.7879 | **+56.6%** |
-| 32,768 | 12.7237, 12.7237 | 15.2873, 15.2864 | **+20.1%** |
+| 4,096 | 29.9557, 29.9585 | 34.7899, 34.8016 | **+16.2%** |
+| 16,384 | 18.9675, 18.9793 | 29.7606, 29.7697 | **+56.9%** |
+| 32,768 | 12.7079, 12.7093 | 15.2760, 15.2630 | **+20.2%** |
+
+Re-measured on the current head as gate 2, and within 0.3% of the same table taken before the graph-boundary wait was added.
 
 The 32,768 ring is 204 MiB at the full context, over the 128 MiB default, so that row needs `-kvpb 512`. `llama-bench` takes the option and the scripts pass it.
 
@@ -74,10 +78,12 @@ The 32,768 ring is 204 MiB at the full context, over the 128 MiB default, so tha
 
 | task | prompt | ordered | pipelined | gain |
 |---|---:|---:|---:|---:|
-| prose | 14,821 | 19.775 | 30.012 | **+51.8%** |
-| dialogue | 15,984 | 19.155 | 29.767 | **+55.4%** |
-| records | 29,603 | 13.553 | 16.396 | **+21.0%** |
-| code | 29,670 | 13.504 | 16.362 | **+21.2%** |
+| prose | 14,821 | 19.738 | 29.955 | **+51.8%** |
+| dialogue | 15,984 | 19.136 | 29.699 | **+55.2%** |
+| records | 29,603 | 13.531 | 16.406 | **+21.2%** |
+| code | 29,670 | 13.484 | 16.340 | **+21.2%** |
+
+Re-measured on the current head as gate 1, and within 0.3% of the same table on the commit before the graph-boundary wait was added, which is the change that could have cost it.
 
 The breakdown below was taken on an earlier head, at prompts of 19,246 and 48,042 against `-c 32768` and `-c 65536`:
 
@@ -97,7 +103,7 @@ Pinning is worth as much as the pipeline and is off by default. Behind a 13,128-
 | `--kv-cpu-pinned` | 21.582 | 32.252 |
 | unpinned | 14.945 | 22.709 |
 
-Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason. The exactness gate measures the same on every one of its four 18,432-prefill tasks: 30.012 against 27.037 on prose, 29.767 against 26.584 on dialogue, 16.396 against 15.934 on records, 16.362 against 15.857 on code.
+Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason. The exactness gate measures the same on every one of its four 18,432-prefill tasks: 29.955 against 27.031 on prose, 29.699 against 26.626 on dialogue, 16.406 against 15.926 on records, 16.340 against 15.864 on code.
 
 ### The link is the ceiling, so the lever is bytes
 
@@ -145,7 +151,7 @@ A finer sweep of the same configuration, `-kvpb 0` throughout so nothing decline
 | 98,304 | 5.45 | 6.06 | +11.1% | 612 MiB | 0.018 |
 | 131,072 | 4.26 | 4.66 | +9.5% | 816 MiB | 0.012 |
 
-The gain per MiB is flat below the peak and falls off as `1/rows^2` above it, because the gain decays as `compute/copy` while the ring grows linearly. There is no depth at which the pipeline becomes slower -- only one past which the memory buys more elsewhere.
+The gain per MiB is flat below the peak and falls off as `1/rows^2` above it, because the gain decays as `compute/copy` while the ring grows linearly. No depth measured here makes the pipeline slower -- only one past which the memory buys more elsewhere. That is one model on one link, not a general claim.
 
 Two curves run in opposite directions here, and both matter.
 
@@ -166,20 +172,20 @@ Four device-resident layers are worth +14.3% on the ordered path and +1.4% on th
 
 ### Parallel sequences
 
-`llama-batched-bench`, 2,048 prompt tokens per sequence, `-c 32768 -np 8`, generation t/s:
+`llama-batched-bench`, 2,048 prompt tokens per sequence, `-c 32768 -np 8`, generation t/s. Every cell is its own process, because the headroom guard reacts to what a process has already allocated rather than to the configuration: taken as the last step of a sweep that has already run 1, 2 and 4 slots, the 8-slot unified ring is refused and that arm reads 83.88 instead. Three passes, spread at most 0.05 t/s:
 
 | `-npl` | unified ordered | unified pipelined | streams ordered | streams pipelined |
 |---:|---:|---:|---:|---:|
-| 1 | 32.69 | 35.35 | 32.59 | 35.31 |
-| 2 | 51.69 | 58.63 | 48.68 | 61.56 |
-| 4 | 72.43 | 86.52 | 62.39 | 89.59 |
-| 8 | 83.90 | 105.16 | 70.92 | 113.55 |
+| 1 | 32.62 | 35.34 | 32.62 | 35.36 |
+| 2 | 51.51 | 58.48 | 34.09 | 58.45 |
+| 4 | 72.04 | 86.24 | 49.44 | 85.45 |
+| 8 | 83.95 | 105.22 | 70.92 | 105.63 |
 
-The 8-slot row is measured with each arm run on its own. Taken as the last step of a sweep that has already run 1, 2 and 4 slots in the same process, the unified ring is refused for headroom and that arm falls back to 83.88 - the guard reacting to what the process has already allocated, not to the configuration.
+A cache split into streams delivers a window per stream, so it moves more than a unified one for the same work, and before the per-stream delivery it could send almost none of it early: 6.6% at 8 slots, because the prefix stopped at the lowest stream's head. Both caches now pipeline to the same throughput, and which of them to use is a question about how the context is shared between sequences rather than about the transport. The ordered arm is the one that separates them: a non-unified cache scales much worse without the pipeline, so the pipeline is worth more there.
 
-A cache split into streams delivers a window per stream, so it moves more than a unified one for the same work, and before the per-stream delivery it could send almost none of it early: 6.6% at 8 slots, because the prefix stopped at the lowest stream's head. Both caches now pipeline, and which of them to use is a question about how the context is shared between sequences rather than about the transport.
+**The streams-pipelined column is lower than it was before the multi-stream span was fixed**, and the earlier numbers were wrong rather than better. The delivery sized one stream's range from `ne[2]*nb[2]`, which is one KV cell rather than the window, so it moved a fraction of the bytes and the attention read whatever the ring slot held before. Measured on the same machine, the predecessor reports 61.04, 90.81 and 108.23 at 2, 4 and 8 slots against 58.45, 85.45 and 105.63 here; the difference is the cost of copying the right amount.
 
-**Concurrent slots cannot be gated on output the way one sequence can.** Their batching varies between runs, so the same build at the same depth gives different greedy output - three runs at `N = 0` produced three different hashes. `test_transport_multi_stream_ranges` stands in for that gate.
+**Concurrent slots can be gated on output, with a harness that fixes the batching.** The server cannot: its batching varies between runs, so the same build at the same depth gives different greedy output, and three runs at `N = 0` produced three different hashes. `llama-parallel` seeds its client schedule, so the batches repeat, and `docs/repro/r4-kv-pipeline-parallel-exact.sh` compares the transcripts of 8 concurrent sequences over a non-unified cache. Its clients ask different questions, which is what makes it a gate: with one prompt shared by every sequence the streams hold the same bytes and a cross-stream read is invisible. The predecessor above fails it at `N = 1` on the first sequence.
 
 ### The budget
 
@@ -242,7 +248,7 @@ The 3.57 ms that remains moves 0.4 MiB, and `GGML_SCHED_TRANSPORT_DEBUG=3` shows
 
 It looks like latency and is not. A blocking copy shares the device's copy engine with the deliveries and waits for what is already queued there: two staged splits at 22.0 GB/s is 3.6 ms, which is the number. Two things were tried and neither helped. Issuing the delivery in pieces so the blocking copy can interleave does nothing -- the engine is FIFO across streams, `attn_inp_k_rot` stays at 3.4 ms at every piece size, and small pieces cost throughput (29.80 t/s whole, 28.73 at 4 MiB, 22.01 at 1 MiB). Putting the copy on the consumer's own stream so the host never blocks moves the time rather than removing it: the ordered copy falls from 3.57 ms to 0.16 ms, the consumer wait rises from 27.31 ms to 31.05 ms, and throughput does not move (29.808 against 29.834).
 
-So this is not spare time. Those 256 KiB cross the same saturated link as the 644 MiB of deliveries, and the link is the ceiling.
+So this is not spare time. Those 256 KiB cross the same saturated link as the 644 MiB of deliveries, and on this configuration the link is the ceiling. A faster link, or a slower device behind it, moves that ceiling somewhere else.
 
 Do not compare these numbers against runs on other models, prompts, cache settings, hardware, or commits.
 
@@ -250,14 +256,15 @@ Do not compare these numbers against runs on other models, prompts, cache settin
 
 The gates, and what was run for them:
 
-All four gates below were re-run on the current head, on an RTX 4070 with a CUDA build.
+Gates 1, 2, 3 and 5 and `test-alloc` were run on the current head, on an RTX 4070 with a CUDA build, gate 5 also over both devices with `-sm layer`. The `llama-server` table and the parallel table under [Measurements](#measurements) are from those runs; the breakdowns marked as taken on an earlier head still are.
 
-1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
+1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`, re-run on the current head. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
 
    The second is what made `records@18432` a gate rather than a coin flip. Its prompt is about 29.6k tokens against a 32,768 context, and the task before it is about the same size, so the two do not both fit and placement depended on what was still resident. Two otherwise identical `N = 0` runs of it produced different hashes. Asked on its own with the cache off it is perfectly stable: the same hash three times running, at `-c 32768` and at `-c 65536`. With the flag set, two independent `N = 0` passes agree on all eight tasks, and `N = 0`, `N = 1` and `N = 4` agree on all eight.
-2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.** `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output.
+2. **A/B/A/B at 4,096 / 16,384 / 32,768 with reversed arm order.** `docs/repro/r4-kv-pipeline-ab.sh`; the table above is its output, re-run on the current head.
 3. **Device allocation high-water reported.** Above.
 4. **Telemetry showing the deliveries actually converted.** `GGML_SCHED_TRANSPORT_DEBUG=1` reports the plan (staged splits, bytes per graph, how much of it goes early, and the source buffer type); `=2` adds the per-graph host-time breakdown above, as the mean over each 128 graphs, with depth stops and the number of recycle waits enqueued; `=3` names the tensors still on the ordered path. `ggml_backend_sched_get_transport_pipeline_stats()` exposes deliveries and early and late byte counts to callers.
+5. **Byte-identical greedy output of concurrent sequences over a cache split into streams.** `docs/repro/r4-kv-pipeline-parallel-exact.sh` runs 8 concurrent sequences of 16 through `llama-parallel`, which seeds its client schedule so the batches repeat, and compares every depth's transcripts with the first. Identical at `N = 0`, `N = 1` and `N = 4` with `-sm none`, and at `N = 0` and `N = 1` with `-sm layer` over both devices, which is the case where each device carries its own ring. Gate 1 covers one sequence per ubatch, where a delivery is one range; this covers a ubatch spanning several streams, where it is one range per stream. Run against the commit before the multi-stream span fix it fails at `N = 1`, which is what makes it a gate rather than a smoke test.
 
 A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 t/s at depth 0 against 38.5240 at depth 1, `tg128 @ d4096`, with the transport never enabled because the scheduler is given a depth of 0.
 
