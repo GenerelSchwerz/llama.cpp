@@ -1209,6 +1209,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // a cache that shares cells keeps no stable prefix of its own: the layers it aliases get one from the cache that owns the cells, and the layers it does not stay on the ordered path
     if (other) {
         return;
     }
