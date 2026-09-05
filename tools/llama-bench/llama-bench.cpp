@@ -883,7 +883,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = parse_int_range(argv[i]);
                 for (int budget : p) {
-                    if (budget < 0) {
+                    if (budget < 0 || budget > 65536) {
                         invalid_param = true;
                         break;
                     }

@@ -871,8 +871,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         if (cparams.kv_pipeline_depth > 14) {
             throw std::invalid_argument("kv_pipeline_depth must be between 0 and 14");
         }
-        if (cparams.kv_pipeline_budget_mib > std::numeric_limits<size_t>::max()/mib) {
-            throw std::invalid_argument("kv_pipeline_budget_mib is too large for this platform");
+        // a slot holds one attention layer's K or V, so a cap of 64 GiB is already uncapped: past it the value is a typo, not a budget
+        constexpr uint64_t max_budget_mib = std::min<uint64_t>(65536, std::numeric_limits<size_t>::max()/mib);
+        if (cparams.kv_pipeline_budget_mib > max_budget_mib) {
+            throw std::invalid_argument("kv_pipeline_budget_mib must be between 0 and 65536 MiB");
         }
 
         sched.reset(ggml_backend_sched_new(
