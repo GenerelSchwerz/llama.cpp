@@ -3389,15 +3389,21 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt));
+
                                 // cache reuse shifts KV cells around, which cannot cross a media chunk.
                                 // with an mmproj loaded it still works as long as both prompts stay text-only.
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_media_chunks() &&
-                                    !input_tokens.has_media_chunks();
+                                const bool has_media = slot.prompt.tokens.has_media_chunks() || input_tokens.has_media_chunks();
 
-                                if (!can_cache_reuse && n_cache_reuse > 0) {
-                                    SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                const bool can_cache_reuse = can_shift && !has_media;
+
+                                if (n_cache_reuse > 0) {
+                                    if (!can_shift) {
+                                        SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    } else if (has_media) {
+                                        // expected on every request that carries media, so keep it out of the log
+                                        SLT_DBG(slot, "cache reuse is disabled while the prompt has media - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    }
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
