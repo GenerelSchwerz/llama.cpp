@@ -1867,7 +1867,8 @@ static void ggml_backend_sched_transport_assign_addresses(ggml_backend_sched_t s
     }
 }
 
-// Freeing the ring goes through the backend that allocated it, so the consumer is alive here and has to be waited for: kernels of an async compute may still be reading the slots.
+// The consumer is waited for through the slots' own release events, never through sched->backends[backend_id].
+// The scheduler does not own its backends and llama_context declares its scheduler before them, so on the teardown path they are already gone; the buffer and the events go through the buffer type and the device, which are not.
 static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport_ring * r = &sched->transport.rings[backend_id];
 
@@ -1879,7 +1880,12 @@ static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, i
     if (r->transfer) {
         ggml_backend_synchronize(r->transfer);
     }
-    ggml_backend_synchronize(sched->backends[backend_id]);
+    // release is recorded past every kernel that reads the slot, so reaching it means those kernels are done
+    for (int i = 0; i < GGML_SCHED_MAX_TRANSPORT_SLOTS; i++) {
+        if (r->slots[i].release_armed && r->slots[i].release) {
+            ggml_backend_event_synchronize(r->slots[i].release);
+        }
+    }
 
     ggml_backend_buffer_free(r->buffer);
     r->buffer    = NULL;
