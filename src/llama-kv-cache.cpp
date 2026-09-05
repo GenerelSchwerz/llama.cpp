@@ -299,6 +299,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
+            if (placement.gpu_resident_done) {
+                placement.gpu_resident_done->insert(il);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);

@@ -23,6 +23,11 @@ struct llama_memory_placement_options {
     // memory, resolved once for the whole model so that a cache built from several sub-caches
     // shares one budget instead of giving each of them the full count
     std::set<uint32_t> gpu_resident_ils;
+
+    // the layers a cache did keep device-resident, which can be fewer than the set above: a cache
+    // filter can drop a picked layer, and a model without a standard attention cache takes none.
+    // Shared by the sub-caches of one model, so the count is over the whole model.
+    std::shared_ptr<std::set<uint32_t>> gpu_resident_done;
 };
 
 struct llama_memory_params {

@@ -2232,6 +2232,35 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// The layers whose attention KV a hybrid cache of this model owns. A null filter means the model is
+// not hybrid and every layer with a KV state belongs to the attention cache.
+static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama_model & model, bool is_mtp) {
+    const llama_hparams & hparams = model.hparams;
+    if (is_mtp) {
+        // an MTP head caches the nextn layers with a plain attention cache, not the hybrid wrapper
+        return nullptr;
+    }
+    switch (model.arch) {
+        case LLM_ARCH_FALCON_H1:
+            return [](uint32_t) { return true; };
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+            return [&hparams](uint32_t il) {
+                return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
+            };
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_MINIMAX_01:
+            return [&hparams](uint32_t il) {
+                return il < hparams.n_layer() && !hparams.is_recr(il);
+            };
+        default:
+            return nullptr;
+    }
+}
+
 // Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
 // memory. Taking them in layer order fills the device that owns the first layers and leaves the
 // free memory of the others unused, so take them per owning device instead.
@@ -2259,13 +2288,18 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
     std::vector<ggml_backend_dev_t>    devs;
     std::vector<std::vector<uint32_t>> devs_ils;
 
+    // a layer the attention cache does not own must not take from the budget, so ask the same filter
+    const llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(model, is_mtp);
+
     for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
         // a nextn layer is cached by the MTP context, the rest of the model by the main one
         if (hparams.n_layer_nextn > 0 && (il >= hparams.n_layer()) != is_mtp) {
             continue;
         }
-        // a recurrent layer keeps its state elsewhere, so it must not take from the budget
-        if (!hparams.has_kv(il) || hparams.is_recr(il)) {
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        if (filter_attn ? !filter_attn(il) : hparams.is_recr(il)) {
             continue;
         }
         auto * dev = model.dev_layer(il);
@@ -2307,16 +2341,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     // budget instead of giving each of them the full count. An offloaded cache is device-resident
     // already, so it needs no set.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-        placement.gpu_resident_ils = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
+        placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
                 params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
-        if (placement.gpu_resident_ils.empty()) {
-            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
-        } else {
-            LLAMA_LOG_INFO("%s: partial GPU KV residency: %zu of %u requested attention layers device-resident\n",
-                    __func__, placement.gpu_resident_ils.size(), cparams.kv_gpu_layers);
-        }
-        // the attention compute follows the cache, so report back what the cache got
-        cparams.kv_gpu_layers = (uint32_t) placement.gpu_resident_ils.size();
+        placement.gpu_resident_done = std::make_shared<std::set<uint32_t>>();
     }
 
     switch (arch) {
@@ -2612,26 +2639,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
-                    llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
+                    llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(*this, false);
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
-                        filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
-                        filter_attn = [&](uint32_t il) {
-                            return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
-                        };
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
-                        };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
@@ -2815,6 +2835,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // Report what the caches did rather than what was picked: a cache filter can drop a picked
+    // layer, and a model without a standard attention cache keeps none. The attention compute
+    // follows the cache, so cparams must carry the count the caches reached.
+    if (placement.gpu_resident_done) {
+        const uint32_t n_resident = (uint32_t) placement.gpu_resident_done->size();
+        if (n_resident == 0) {
+            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested attention layers device-resident\n",
+                    __func__, n_resident, cparams.kv_gpu_layers);
+        }
+        cparams.kv_gpu_layers = n_resident;
     }
 
     return res;
