@@ -2483,6 +2483,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const bool staged = tr->n_staged > 0 && tr->plan_n_splits == sched->n_splits &&
                         tr->plan_n_inputs == n_inputs_now;
 
+    // A staged delivery reads its host source long after the call that issued it returned, and the previous graph can leave some of those reads in flight.
+    // Within a graph the stable prefix keeps the host off what is still being read, but the next graph writes wherever its own ubatch lands, so wait for the previous one here.
+    // This is what the ordered path gets from its blocking copy, once per graph rather than once per split.
+    for (int i = 0; i < sched->n_backends; i++) {
+        if (tr->rings[i].transfer == NULL) {
+            continue;
+        }
+        ggml_backend_synchronize(tr->rings[i].transfer);
+        ggml_backend_synchronize(sched->backends[i]);
+    }
+
     // Prime every ring before the first consumer runs.
     // From here on deliveries are issued only after a split has been enqueued, never before, so recycling a slot can never hold back work the consumer could already be running.
     // The cursors start over on every evaluation because the plan outlives the graph it was made for.
