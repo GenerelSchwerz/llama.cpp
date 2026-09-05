@@ -37,10 +37,13 @@ SOURCE_FATTN_MMA_CASE = "DECL_FATTN_MMA_F16_CASE({head_size_kq}, {head_size_v}, 
 
 # The quantized-native route table: (head size, ncols1, ncols2) per K type.
 # It is the same table as ggml_cuda_fattn_native_supported() in fattn.cu and
-# fattn-mma-quant-decl.cuh; the D=256 32x2 and D=512 rows only exist for Q4_0
-# and Q8_0. Nothing outside this table is reachable, so nothing else is built.
-FATTN_MMA_QUANT_ROUTES = [(256, 8, 8)]
-FATTN_MMA_QUANT_ROUTES_Q4_0_Q8_0 = FATTN_MMA_QUANT_ROUTES + [(256, 32, 2), (512, 8, 8)]
+# fattn-mma-quant-decl.cuh; the D=256 GQA 2 and D=512 rows only exist for Q4_0
+# and Q8_0. Each row has a wide shape for Ampere and newer and a Turing shape
+# with half the columns. Nothing outside this table is reachable, so nothing
+# else is built.
+FATTN_MMA_QUANT_ROUTES = [(256, 8, 8), (256, 4, 8)]
+FATTN_MMA_QUANT_ROUTES_Q4_0_Q8_0 = FATTN_MMA_QUANT_ROUTES + [
+    (256, 32, 2), (256, 16, 2), (512, 8, 8), (512, 4, 8)]
 
 FATTN_MMA_QUANT_MANIFEST = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), os.pardir, "fattn-mma-quant-types.h")

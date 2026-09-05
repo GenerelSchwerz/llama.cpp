@@ -15,9 +15,14 @@
 
 #ifdef FATTN_MMA_QUANT_AVAILABLE
 
+// Every row has two shapes: the wide one for Ampere and newer, and the Turing
+// one that switch_ncols1() caps at 32 columns. A build serves whichever card it
+// runs on, so both are declared.
+
 // D=256 with a GQA ratio above 4, the only row that covers the extra tier.
 #define DECL_FATTN_MMA_QUANT_CASE_D256_GQA_WIDE(type_K, stem, tier, args) \
-    FATTN_MMA_QUANT_TIER_##tier(extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 8, 8);)
+    FATTN_MMA_QUANT_TIER_##tier(extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 8, 8);) \
+    FATTN_MMA_QUANT_TIER_##tier(extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 4, 8);)
 
 FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D256_GQA_WIDE, ())
 
@@ -25,7 +30,11 @@ FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D256_GQA_WIDE, ())
 // need no tier gate.
 extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 256, 256, 32, 2);
 extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0, 256, 256, 32, 2);
+extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 256, 256, 16, 2);
+extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0, 256, 256, 16, 2);
 extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 512, 512,  8, 8);
 extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0, 512, 512,  8, 8);
+extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q4_0, 512, 512,  4, 8);
+extern DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q8_0, 512, 512,  4, 8);
 
 #endif // FATTN_MMA_QUANT_AVAILABLE

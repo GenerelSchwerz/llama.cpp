@@ -255,24 +255,37 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// One row of the quantized-native route table at both its widths: 64/ncols2
+// columns for Ampere and newer, 32/ncols2 for Turing. Those are the two widths
+// switch_ncols1() ends with.
+template <ggml_type type, int D, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_quant_shape(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1) {
+    if (ncols1 == 64/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
+        return;
+    }
+    ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 32/ncols2, ncols2, type, type>(ctx, dst);
+}
+
 // Launch one row of the quantized-native route table. The rows here are the
 // same ones fattn-mma-quant-decl.cuh declares and
 // ggml_cuda_fattn_native_supported() selects.
 template <ggml_type type>
 static void ggml_cuda_flash_attn_ext_mma_quant_case(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
-    if (dst->src[0]->ne[0] == 256 && ncols1 == 8 && ncols2 == 8) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 8, 8, type, type>(ctx, dst);
+    if (dst->src[0]->ne[0] == 256 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 8>(ctx, dst, ncols1);
         return;
     }
 
     // The other two rows exist for Q4_0 and Q8_0 only.
     if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
         if (dst->src[0]->ne[0] == 512) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<512, 512, 8, 8, type, type>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
             return;
         }
-        ggml_cuda_flash_attn_ext_mma_f16_case<256, 256, 32, 2, type, type>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 2>(ctx, dst, ncols1);
         return;
     }
 
@@ -403,7 +416,12 @@ enum best_fattn_kernel {
 // Each shape is what ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1/2() would
 // pick inside those bounds. It is written out here rather than taken from those
 // switches so that the compiled kernel set is exactly the set this function can
-// select; fattn-mma-quant-decl.cuh declares the same three rows.
+// select; fattn-mma-quant-decl.cuh declares the same rows.
+//
+// Turing takes the same rows with half the columns: 16x2, 4x8 and 4x8. That is
+// the Turing escape in switch_ncols1(), which caps ncols1*ncols2 at 32 there.
+// The escape fires exactly when Ampere is not the compiled target, so
+// ampere_mma_available() is what picks between the two shapes.
 //
 // The loaders themselves have no such restriction. The boundary is inherited
 // from ggml_cuda_fattn_native_profitable() below: only measured rows get a
@@ -422,9 +440,9 @@ static bool ggml_cuda_fattn_native_supported(
         return tensor->type != GGML_TYPE_Q5_1 || (((uintptr_t) tensor->data | tensor->nb[1]) & 7) == 0;
     };
 
-    // Ampere and Ada only. Hopper and newer keep the standard path until they
-    // have their own measurements.
-    const bool device_ok = ampere_mma_available(cc) && cc < GGML_CUDA_CC_HOPPER;
+    // Turing up to Ada. Hopper and newer keep the standard path until they have
+    // their own measurements.
+    const bool device_ok = turing_mma_available(cc) && cc < GGML_CUDA_CC_HOPPER;
 
     if (!device_ok || logit_softcap != 0.0f || !gqa_opt_applies ||
             !ggml_cuda_fattn_mma_quant_pair(K->type, V->type) ||
@@ -434,12 +452,13 @@ static bool ggml_cuda_fattn_native_supported(
     }
 
     const bool default_tier = K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0;
+    const bool wide_tile    = ampere_mma_available(cc);
 
     if (Q->ne[0] == 512) {
         if (!default_tier || gqa_ratio <= 4 || Q->ne[1] <= 4) {
             return false;
         }
-        *ncols1 = 8;
+        *ncols1 = wide_tile ? 8 : 4;
         *ncols2 = 8;
         return true;
     }
@@ -452,7 +471,7 @@ static bool ggml_cuda_fattn_native_supported(
         if (!default_tier || Q->ne[1] <= 16) {
             return false;
         }
-        *ncols1 = 32;
+        *ncols1 = wide_tile ? 32 : 16;
         *ncols2 = 2;
         return true;
     }
@@ -460,7 +479,7 @@ static bool ggml_cuda_fattn_native_supported(
     if (gqa_ratio <= 4 || Q->ne[1] <= 4) {
         return false;
     }
-    *ncols1 = 8;
+    *ncols1 = wide_tile ? 8 : 4;
     *ncols2 = 8;
     return true;
 }
@@ -472,6 +491,10 @@ static bool ggml_cuda_fattn_native_supported(
 // D=256 rows there give up a two-stage cp.async pipeline that the native
 // loaders cannot use, and lose up to 14%. They stay enabled, and staging the
 // quantized tiles is the follow-up that would remove the tradeoff.
+//
+// Turing has no cp.async at all, so the F16-casting path already runs there
+// with nstages == 0 and the native route gives up nothing. Nothing on Turing is
+// measured yet, so it keeps the Ada thresholds rather than a wider set.
 static bool ggml_cuda_fattn_native_profitable(const ggml_tensor * dst, const int gqa_ratio) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
