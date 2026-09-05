@@ -2378,10 +2378,7 @@ static void ggml_backend_sched_transport_prefetch(ggml_backend_sched_t sched, in
             struct ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
             GGML_ASSERT(input->data != NULL && input_cpy->data != NULL);
             const int64_t t0 = tr->debug >= 2 ? ggml_time_us() : 0;
-            for (int64_t r_i = 0; r_i < rg.n; r_i++) {
-                const size_t at = r_i*rg.stride;
-                ggml_backend_tensor_set_async(r->transfer, input_cpy, (const char *) input->data + at, at, rg.early);
-            }
+            ggml_backend_tensor_set_2d_async(r->transfer, input_cpy, input->data, 0, rg.early, rg.n, rg.stride, rg.stride);
             if (tr->debug >= 2) {
                 tr->t_issue_us += ggml_time_us() - t0;
             }
@@ -2544,11 +2541,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 struct ggml_backend_sched_ranges rg;
                 ggml_backend_sched_input_ranges(input, &rg);
                 if (rg.used > rg.early) {
-                    for (int64_t r_i = 0; r_i < rg.n; r_i++) {
-                        const size_t at = r_i*rg.stride + rg.early;
-                        ggml_backend_tensor_set_async(split_backend, input_cpy,
-                                (const char *) input->data + at, at, rg.used - rg.early);
-                    }
+                    ggml_backend_tensor_set_2d_async(split_backend, input_cpy, (const char *) input->data + rg.early,
+                            rg.early, rg.used - rg.early, rg.n, rg.stride, rg.stride);
                     tr->n_bytes_late += (rg.used - rg.early)*rg.n;
                 }
                 continue;
