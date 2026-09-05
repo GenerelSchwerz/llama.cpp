@@ -105,6 +105,19 @@ extern "C" {
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 
     //
+    // Backend (sched)
+    //
+
+    // The scheduler names a copy of a graph input "<backend>#<source>#<copy>". <source> is the name of the
+    // tensor the copy was made from and carries any suffix that ggml appends for a view. Only <source>
+    // identifies the copy, so the backend label is cut when the name does not fit.
+    GGML_API void ggml_backend_sched_name_copy(
+        struct ggml_tensor * copy, const char * backend_name, const struct ggml_tensor * src, int c);
+
+    // write the <source> part of a name written by ggml_backend_sched_name_copy into buf
+    GGML_API void ggml_backend_sched_copy_source_name(const char * name, char * buf, size_t buf_size);
+
+    //
     // Backend (stream)
     //
 

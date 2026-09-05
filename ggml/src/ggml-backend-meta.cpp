@@ -485,28 +485,6 @@ static struct ggml_tensor * ggml_backend_meta_buffer_simple_tensor(const struct 
     return it->second[index];
 }
 
-// A scheduler copy is named "<backend>#<source>#<copy>", where <source> also carries the suffixes
-// ggml appends for views. Recover the graph name the copy was made from.
-static std::string ggml_backend_meta_copy_source_name(const char * name) {
-    std::string ret = name;
-    const size_t first = ret.find('#');
-    if (first == std::string::npos) {
-        return ret;
-    }
-    ret.erase(0, first + 1);
-    // ggml writes a view suffix as " (...)", a graph name has no spaces
-    const size_t suffix = ret.find(" (");
-    if (suffix != std::string::npos) {
-        ret.erase(suffix);
-        return ret;
-    }
-    const size_t copy = ret.rfind('#');
-    if (copy != std::string::npos && ret.find_first_not_of("0123456789", copy + 1) == std::string::npos) {
-        ret.erase(copy);
-    }
-    return ret;
-}
-
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const struct ggml_tensor * tensor, bool assume_sync);
 
 static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
@@ -869,7 +847,9 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             ggml_tensor tensor_named;
             if (copied_in_leaf) {
                 tensor_named = *tensor;
-                ggml_set_name(&tensor_named, ggml_backend_meta_copy_source_name(tensor->name).c_str());
+                char source_name[GGML_MAX_NAME];
+                ggml_backend_sched_copy_source_name(tensor->name, source_name, sizeof(source_name));
+                ggml_set_name(&tensor_named, source_name);
                 tensor_query = &tensor_named;
             }
             ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor_query, dev_ctx->get_split_state_ud);
@@ -1458,6 +1438,7 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, n_stream].
     // The heads split, but interleaved per cell, so the chunk splice below cannot express the write.
     // Each device's heads are one contiguous run per cell: ne[1] cells, from one stride to another.
+    // A backend without a native 2d copy (CPU, Metal) pays one transfer per cell here, CUDA does not.
     const bool strided_head_split =
         !ggml_is_contiguous(tensor) &&
         split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
@@ -1616,6 +1597,7 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     // A fused QKV puts Kcur and Vcur in a strided view, which a host-resident cache reads back here.
     // The rows split, so the chunk splice below cannot express the read. Each device's part of a row
     // is contiguous: ne[1] rows, from the device's own stride to the view's.
+    // A backend without a native 2d copy (CPU, Metal) pays one transfer per row here, CUDA does not.
     const bool strided_rows =
         !ggml_is_contiguous(tensor) &&
         split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
@@ -2277,14 +2259,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    continue;
+                // a host-resident KV cache ends a split with a view of itself, that view needs no split state
+                // but it is still the last node and must close the last subgraph
+                const bool host_view = node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
+                    ggml_backend_buffer_is_host(node->view_src->buffer);
+                bool new_subgraph = i + 1 == cgraph->n_nodes;
+                if (!host_view) {
+                    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                        max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
+                        new_subgraph = true;
+                    }
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
-                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
-                }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
