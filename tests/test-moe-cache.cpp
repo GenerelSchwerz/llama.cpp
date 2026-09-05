@@ -45,6 +45,11 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+
+static bool grouped_frequency_enabled() {
+    const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
+    return value == nullptr || strcmp(value, "0") != 0;
+}
 #include <vector>
 
 #ifdef __linux__
@@ -6805,15 +6810,31 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
         std::vector<int32_t> slot_expert;
         std::vector<int32_t> expert_slot;
         std::vector<uint64_t> last_used;
+        std::vector<uint32_t> frequency;
+        std::vector<uint64_t> frequency_epoch;
         uint64_t clock = 0;
+        uint64_t step = 0;
     } host = {
         std::vector<int32_t>(n_slots, -1),
         std::vector<int32_t>(n_experts, -1),
         std::vector<uint64_t>(n_slots, 0),
+        std::vector<uint32_t>(n_experts, 0),
+        std::vector<uint64_t>(n_experts, 0),
+        0,
         0,
     };
     const auto plan_routes = [&](const std::vector<int32_t> & routes) {
         CHECK(!routes.empty() && routes.size() <= n_slots && routes.size() % n_used == 0);
+        const uint64_t current_epoch = host.step >> 4;
+        const auto effective_frequency = [&](int32_t expert) {
+            if (!grouped_frequency_enabled()) {
+                return uint32_t(0);
+            }
+            CHECK(expert >= 0 && static_cast<uint32_t>(expert) < n_experts);
+            CHECK(host.frequency_epoch[expert] <= current_epoch);
+            const uint64_t elapsed = current_epoch - host.frequency_epoch[expert];
+            return elapsed < 32 ? host.frequency[expert] >> elapsed : 0;
+        };
         std::vector<int32_t> unique;
         for (uint32_t route = 0; route < routes.size(); ++route) {
             CHECK(routes[route] >= 0 && static_cast<uint32_t>(routes[route]) < n_experts);
@@ -6838,13 +6859,17 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
                 continue;
             }
             uint64_t best_age = UINT64_MAX;
+            uint32_t best_frequency = UINT32_MAX;
             uint32_t best_slot = UINT32_MAX;
             for (uint32_t slot = 0; slot < n_slots; ++slot) {
                 if (reserved[slot]) {
                     continue;
                 }
+                const uint32_t frequency = host.slot_expert[slot] < 0 ? 0 : effective_frequency(host.slot_expert[slot]);
                 const uint64_t age = host.slot_expert[slot] < 0 ? 0 : host.last_used[slot];
-                if (age < best_age || (age == best_age && slot < best_slot)) {
+                if (frequency < best_frequency ||
+                        (frequency == best_frequency && (age < best_age || (age == best_age && slot < best_slot)))) {
+                    best_frequency = frequency;
                     best_age = age;
                     best_slot = slot;
                 }
@@ -6868,9 +6893,14 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
             host.expert_slot[expert] = slot;
         }
         for (uint32_t unique_index = 0; unique_index < unique.size(); ++unique_index) {
+            const int32_t expert = unique[unique_index];
+            const uint32_t frequency = effective_frequency(expert);
+            host.frequency[expert] = frequency != UINT32_MAX ? frequency + 1 : frequency;
+            host.frequency_epoch[expert] = current_epoch;
             host.last_used[unique_slots[unique_index]] = host.clock + unique_index + 1;
         }
         host.clock += routes.size();
+        ++host.step;
         return misses;
     };
 
@@ -7006,14 +7036,15 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
     run_step({&direct_primary, &legacy_primary, &grouped_primary}, wave_a, 0, primary_capture);
     run_step({&direct_primary, &legacy_primary, &grouped_primary}, wave_b, 64, primary_capture);
     run_step({&direct_primary, &legacy_primary, &grouped_primary}, wave_c, 64, primary_capture);
-    run_step({&direct_b5, &legacy_b5, &grouped_b5}, b5_a, 40, b5_capture);
+    run_step({&direct_b5, &legacy_b5, &grouped_b5}, b5_a, grouped_frequency_enabled() && primary_rows == 8 ? 0 : 40, b5_capture);
     run_step({&direct_b5, &legacy_b5, &grouped_b5}, b5_a, 0, b5_capture);
     run_step({&direct_b5, &legacy_b5, &grouped_b5}, b5_a, 0, b5_capture);
     run_step({&direct_primary, &legacy_primary, &grouped_primary}, wave_a,
-        primary_rows == 8 ? 24 : 88, primary_capture);
-    run_step({&direct_primary, &legacy_primary, &grouped_primary}, mixed, mixed_half, primary_capture);
+        grouped_frequency_enabled() ? (primary_rows == 8 ? 0 : 84) : (primary_rows == 8 ? 24 : 88), primary_capture);
+    run_step({&direct_primary, &legacy_primary, &grouped_primary}, mixed,
+        grouped_frequency_enabled() && primary_rows != 8 ? 60 : mixed_half, primary_capture);
     run_step({&direct_primary, &legacy_primary, &grouped_primary}, mixed, 0, primary_capture);
-    CHECK(total_passes == 11 && total_misses == (primary_rows == 8 ? 288 : 448));
+    CHECK(total_passes == 11 && total_misses == (grouped_frequency_enabled() ? (primary_rows == 8 ? 224 : 440) : (primary_rows == 8 ? 288 : 448)));
     CHECK(host.clock == 8 * primary_routes + 3 * b5_rows * n_used);
 
     CHECK(ggml_cuda_moe_grouped_context_for_test(direct_backend.get()) == nullptr);
@@ -7879,8 +7910,9 @@ static void test_active_grouped_dispatch_types_case(
         active_grouped_legacy_op_count(first_backend.get(), false) == 0);
     CHECK(active_grouped_legacy_op_count(second_backend.get(), true) == 0 &&
         active_grouped_legacy_op_count(second_backend.get(), false) == 0);
-    check_active_grouped_debug_telemetry(first_backend.get(), first, auxiliary_proof ? 8 : 0, auxiliary_proof ? 9 : 5);
-    check_active_grouped_debug_telemetry(second_backend.get(), second, auxiliary_proof ? 8 : 0, auxiliary_proof ? 9 : 5);
+    const uint64_t expected_misses = auxiliary_proof ? (grouped_frequency_enabled() ? 7 : 8) : 0;
+    check_active_grouped_debug_telemetry(first_backend.get(), first, expected_misses, auxiliary_proof ? 9 : 5);
+    check_active_grouped_debug_telemetry(second_backend.get(), second, expected_misses, auxiliary_proof ? 9 : 5);
     if (test_owner_concurrency) {
         std::array<std::vector<float>, 2> concurrent_outputs;
         std::thread first_decode([&]() {
@@ -8863,7 +8895,7 @@ static void test_active_grouped_nvfp4_scales() {
             }
             if (pass == 5) {
                 check_active_grouped_scale_shadows(*context, key, candidate, replacement_experts, scale_pointers);
-                for (int32_t expert : first_experts) {
+                for (int32_t expert : grouped_frequency_enabled() ? middle_experts : first_experts) {
                     CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(*context, key, expert) == -1);
                 }
             }
