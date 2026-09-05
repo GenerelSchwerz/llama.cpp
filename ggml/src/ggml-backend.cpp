@@ -1867,9 +1867,8 @@ static void ggml_backend_sched_transport_assign_addresses(ggml_backend_sched_t s
     }
 }
 
-// sync_consumers must be false once the scheduler's backends may already be gone, which is the case on the teardown path.
-// llama_context and other owners outlive the scheduler only by declaration order, and the backends it points at are not the scheduler's to keep alive.
-static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, int backend_id, bool sync_consumers) {
+// Freeing the ring goes through the backend that allocated it, so the consumer is alive here and has to be waited for: kernels of an async compute may still be reading the slots.
+static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport_ring * r = &sched->transport.rings[backend_id];
 
     if (r->buffer == NULL) {
@@ -1880,9 +1879,7 @@ static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, i
     if (r->transfer) {
         ggml_backend_synchronize(r->transfer);
     }
-    if (sync_consumers) {
-        ggml_backend_synchronize(sched->backends[backend_id]);
-    }
+    ggml_backend_synchronize(sched->backends[backend_id]);
 
     ggml_backend_buffer_free(r->buffer);
     r->buffer    = NULL;
@@ -1893,10 +1890,10 @@ static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, i
     }
 }
 
-static void ggml_backend_sched_transport_release_ring(ggml_backend_sched_t sched, int backend_id, bool sync_consumers) {
+static void ggml_backend_sched_transport_release_ring(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport_ring * r = &sched->transport.rings[backend_id];
 
-    ggml_backend_sched_transport_free_ring(sched, backend_id, sync_consumers);
+    ggml_backend_sched_transport_free_ring(sched, backend_id);
 
     for (int i = 0; i < GGML_SCHED_MAX_TRANSPORT_SLOTS; i++) {
         ggml_backend_event_free(r->slots[i].ready);
@@ -1917,7 +1914,7 @@ static void ggml_backend_sched_transport_release_ring(ggml_backend_sched_t sched
 static void ggml_backend_sched_transport_decline_backend(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport * tr = &sched->transport;
 
-    ggml_backend_sched_transport_release_ring(sched, backend_id, true);
+    ggml_backend_sched_transport_release_ring(sched, backend_id);
 
     if (tr->split_order == NULL || tr->split_input_ofs == NULL || tr->input_staged == NULL) {
         return;
@@ -2245,7 +2242,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         }
 
         if (r->buffer == NULL || r->slot_size < slot_size[bid]) {
-            ggml_backend_sched_transport_free_ring(sched, bid, true);
+            ggml_backend_sched_transport_free_ring(sched, bid);
 
             ggml_backend_buffer_type_t buft = sched->bufts[bid];
 
@@ -2923,7 +2920,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
 static void ggml_backend_sched_transport_teardown(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
-        ggml_backend_sched_transport_release_ring(sched, i, false);
+        ggml_backend_sched_transport_release_ring(sched, i);
     }
     sched->transport.n_staged = 0;
 }
