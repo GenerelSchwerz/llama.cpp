@@ -2739,8 +2739,13 @@ uint64_t ggml_cuda_moe_execution_semantic_key(const ggml_cgraph * cgraph) {
 namespace {
 
 static constexpr uint32_t MOE_GROUPED_PLAN_THREADS = 128;
+static constexpr uint32_t MOE_GROUPED_FREQUENCY_EPOCH_SHIFT = 4;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_THREADS = 256;
 static constexpr uint32_t MOE_GROUPED_TRANSFER_BLOCKS_PER_SM = 4;
+
+static uint32_t moe_grouped_plan_threads(uint32_t n_slots) {
+    return n_slots <= WARP_SIZE ? WARP_SIZE : n_slots <= 2 * WARP_SIZE ? 2 * WARP_SIZE : MOE_GROUPED_PLAN_THREADS;
+}
 
 static uint32_t moe_grouped_transfer_blocks(
         int device,
@@ -2773,6 +2778,7 @@ struct moe_grouped_decode_plan {
     uint32_t n_unique;
     uint32_t n_misses;
     uint64_t next_clock;
+    uint64_t frequency_epoch;
 };
 
 enum moe_grouped_plan_array_index : uint32_t {
@@ -2827,16 +2833,45 @@ struct moe_grouped_device_auxiliary {
     size_t n_values;
 };
 
-static __device__ void moe_grouped_warp_min(unsigned long long & age, uint32_t & slot) {
+static __device__ uint32_t moe_grouped_effective_frequency(
+        uint32_t frequency,
+        uint64_t stored_epoch,
+        uint64_t current_epoch) {
+    if (stored_epoch > current_epoch) {
+        return UINT32_MAX;
+    }
+    const uint64_t elapsed = current_epoch - stored_epoch;
+    return elapsed < 32 ? frequency >> elapsed : 0;
+}
+
+static __device__ void moe_grouped_warp_min(uint32_t & frequency, unsigned long long & age, uint32_t & slot) {
 #pragma unroll
     for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        const uint32_t other_frequency = __shfl_xor_sync(0xffffffff, frequency, offset, WARP_SIZE);
         const unsigned long long other_age = __shfl_xor_sync(0xffffffff, age, offset, WARP_SIZE);
         const uint32_t other_slot = __shfl_xor_sync(0xffffffff, slot, offset, WARP_SIZE);
-        if (other_age < age || (other_age == age && other_slot < slot)) {
+        if (other_frequency < frequency ||
+                (other_frequency == frequency && (other_age < age || (other_age == age && other_slot < slot)))) {
+            frequency = other_frequency;
             age = other_age;
             slot = other_slot;
         }
     }
+}
+
+static __device__ uint32_t moe_grouped_warp_min_slot(uint32_t frequency, unsigned long long age) {
+    uint32_t min_frequency = frequency;
+#pragma unroll
+    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        min_frequency = min(min_frequency, __shfl_xor_sync(0xffffffff, min_frequency, offset, WARP_SIZE));
+    }
+    unsigned long long min_age = frequency == min_frequency ? age : UINT64_MAX;
+#pragma unroll
+    for (uint32_t offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        min_age = min(min_age, __shfl_xor_sync(0xffffffff, min_age, offset, WARP_SIZE));
+    }
+    const uint32_t candidates = __ballot_sync(0xffffffff, frequency == min_frequency && age == min_age);
+    return candidates != 0 ? __ffs(candidates) - 1 : UINT32_MAX;
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -2879,6 +2914,10 @@ static __global__ void moe_grouped_plan_decode(
         int32_t * slot_for_expert,
         int32_t * expert_for_slot,
         uint64_t * last_used,
+        uint32_t * expert_frequency,
+        uint64_t * expert_frequency_epoch,
+        uint64_t * device_step,
+        bool frequency_aware,
         uint64_t host_clock_begin,
         uint64_t host_clock_end,
         uint64_t * device_clock,
@@ -2888,6 +2927,7 @@ static __global__ void moe_grouped_plan_decode(
     }
 
     __shared__ int32_t warp_route_experts[WARP_SIZE];
+    __shared__ uint32_t warp_frequencies[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ unsigned long long warp_ages[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t warp_slots[MOE_GROUPED_PLAN_THREADS / WARP_SIZE];
     __shared__ uint32_t selected_slot;
@@ -2925,11 +2965,21 @@ static __global__ void moe_grouped_plan_decode(
         __syncthreads();
 
         for (uint32_t unique = thread; unique < plan->n_unique; unique += blockDim.x) {
+            const int32_t expert = unique_experts[unique];
             const int32_t slot = unique_slots[unique];
-            if (slot < 0 || (uint32_t) slot >= n_slots) {
+            if (expert < 0 || (uint32_t) expert >= n_experts || slot < 0 || (uint32_t) slot >= n_slots) {
+                moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+            }
+            const uint64_t stored_epoch = expert_frequency_epoch[expert];
+            if (stored_epoch > plan->frequency_epoch) {
                 moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
             }
             last_used[slot] = plan->next_clock - plan->n_unique + unique + 1;
+            const uint32_t frequency = moe_grouped_effective_frequency(
+                expert_frequency[expert], stored_epoch, plan->frequency_epoch);
+            const uint32_t updated_frequency = frequency != UINT32_MAX ? frequency + 1 : frequency;
+            expert_frequency[expert] = updated_frequency;
+            expert_frequency_epoch[expert] = plan->frequency_epoch;
         }
     }
     __syncthreads();
@@ -2939,6 +2989,11 @@ static __global__ void moe_grouped_plan_decode(
         plan->n_routes = n_routes;
         plan->n_unique = 0;
         plan->n_misses = 0;
+        const unsigned long long step = atomicAdd(reinterpret_cast<unsigned long long *>(device_step), 1ULL);
+        if (step == UINT64_MAX) {
+            moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+        }
+        plan->frequency_epoch = step >> MOE_GROUPED_FREQUENCY_EPOCH_SHIFT;
         clock_begin = host_clock_begin;
         clock_end = host_clock_end;
         if (device_clock != nullptr) {
@@ -2960,6 +3015,8 @@ static __global__ void moe_grouped_plan_decode(
         }
     }
     __syncthreads();
+
+    const uint64_t frequency_epoch = plan->frequency_epoch;
 
     if (n_routes == 0 || n_routes > plan_capacity || top_k == 0 || row_stride < top_k ||
             n_routes % top_k != 0 || n_experts == 0 || n_experts > INT32_MAX ||
@@ -2993,9 +3050,8 @@ static __global__ void moe_grouped_plan_decode(
     __syncthreads();
 
     for (uint32_t route = thread; route < n_routes; route += blockDim.x) {
-        const uint32_t row = route / top_k;
-        const uint32_t column = route % top_k;
-        const int32_t expert = ids[row * row_stride + column];
+        const uint32_t input_index = warp_fast ? route : (route / top_k) * row_stride + route % top_k;
+        const int32_t expert = ids[input_index];
         if (expert < 0 || (uint32_t) expert >= n_experts) {
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_ROUTE);
         }
@@ -3014,6 +3070,9 @@ static __global__ void moe_grouped_plan_decode(
             const uint32_t lane = thread;
             const bool active = lane < n_routes;
             const int32_t expert = active ? warp_route_experts[lane] : -1;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            const uint32_t first_lane = __ffs(__match_any_sync(0xffffffff, expert)) - 1;
+#else
             uint32_t first_lane = lane;
             for (uint32_t source = 0; source < n_routes; ++source) {
                 const int32_t other = __shfl_sync(0xffffffff, expert, source, WARP_SIZE);
@@ -3021,6 +3080,7 @@ static __global__ void moe_grouped_plan_decode(
                     first_lane = source;
                 }
             }
+#endif
             const bool first = active && first_lane == lane;
             const uint32_t first_mask = __ballot_sync(0xffffffff, first);
             const uint32_t unique = __popc(first_mask & moe_grouped_lane_mask_lt(first_lane));
@@ -3114,30 +3174,49 @@ static __global__ void moe_grouped_plan_decode(
     const uint32_t lane = thread % WARP_SIZE;
     const uint32_t warp = thread / WARP_SIZE;
     for (uint32_t miss = 0; miss < plan->n_misses; ++miss) {
+        uint32_t frequency = UINT32_MAX;
         unsigned long long age = UINT64_MAX;
         uint32_t slot = UINT32_MAX;
         for (uint32_t candidate = thread; candidate < n_slots; candidate += blockDim.x) {
             if (route_storage[candidate] == 0) {
                 const int32_t resident = expert_for_slot[candidate];
-                const unsigned long long candidate_age = resident < 0 ? 0 : last_used[candidate];
-                if (candidate_age < age || (candidate_age == age && candidate < slot)) {
+                const unsigned long long candidate_age = last_used[candidate];
+                const uint64_t stored_epoch = resident < 0 ? 0 : expert_frequency_epoch[resident];
+                if (stored_epoch > frequency_epoch) {
+                    moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
+                }
+                const uint32_t candidate_frequency = !frequency_aware || resident < 0 ? 0 : moe_grouped_effective_frequency(
+                    expert_frequency[resident], stored_epoch, frequency_epoch);
+                if (candidate_frequency < frequency ||
+                        (candidate_frequency == frequency && (candidate_age < age ||
+                            (candidate_age == age && candidate < slot)))) {
+                    frequency = candidate_frequency;
                     age = candidate_age;
                     slot = candidate;
                 }
             }
         }
-        moe_grouped_warp_min(age, slot);
-        if (lane == 0) {
-            warp_ages[warp] = age;
-            warp_slots[warp] = slot;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            age = lane < blockDim.x / WARP_SIZE ? warp_ages[lane] : UINT64_MAX;
-            slot = lane < blockDim.x / WARP_SIZE ? warp_slots[lane] : UINT32_MAX;
-            moe_grouped_warp_min(age, slot);
+        if (blockDim.x == WARP_SIZE) {
+            const uint32_t candidate_slot = moe_grouped_warp_min_slot(frequency, age);
             if (lane == 0) {
-                selected_slot = slot;
+                selected_slot = candidate_slot;
+            }
+        } else {
+            moe_grouped_warp_min(frequency, age, slot);
+            if (lane == 0) {
+                warp_frequencies[warp] = frequency;
+                warp_ages[warp] = age;
+                warp_slots[warp] = slot;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                frequency = lane < blockDim.x / WARP_SIZE ? warp_frequencies[lane] : UINT32_MAX;
+                age = lane < blockDim.x / WARP_SIZE ? warp_ages[lane] : UINT64_MAX;
+                slot = lane < blockDim.x / WARP_SIZE ? warp_slots[lane] : UINT32_MAX;
+                moe_grouped_warp_min(frequency, age, slot);
+                if (lane == 0) {
+                    selected_slot = slot;
+                }
             }
         }
         __syncthreads();
@@ -3800,7 +3879,12 @@ static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cud
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
 struct ggml_cuda_moe_grouped_context::impl {
-    explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {}
+    explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
+        const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
+        frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+    }
+
+    bool frequency_aware = true;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -3875,6 +3959,15 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (last_used != nullptr) {
                 (void) cudaFree(last_used);
             }
+            if (expert_frequency != nullptr) {
+                (void) cudaFree(expert_frequency);
+            }
+            if (expert_frequency_epoch != nullptr) {
+                (void) cudaFree(expert_frequency_epoch);
+            }
+            if (device_step != nullptr) {
+                (void) cudaFree(device_step);
+            }
             if (device_clock != nullptr) {
                 (void) cudaFree(device_clock);
             }
@@ -3905,6 +3998,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         int32_t * slot_for_expert = nullptr;
         int32_t * expert_for_slot = nullptr;
         uint64_t * last_used = nullptr;
+        uint32_t * expert_frequency = nullptr;
+        uint64_t * expert_frequency_epoch = nullptr;
+        uint64_t * device_step = nullptr;
         uint64_t * device_clock = nullptr;
         moe_grouped_decode_plan * plan = nullptr;
         size_t plan_bytes = 0;
@@ -4916,6 +5012,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (!moe_grouped_cuda_success(cudaMalloc(&result->slot_for_expert, n_experts * sizeof(int32_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->expert_for_slot, snapshot.n_slots * sizeof(int32_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->last_used, snapshot.n_slots * sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->expert_frequency, n_experts * sizeof(uint32_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->expert_frequency_epoch, n_experts * sizeof(uint64_t))) ||
+                !moe_grouped_cuda_success(cudaMalloc(&result->device_step, sizeof(uint64_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->device_clock, sizeof(uint64_t))) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->plan, result->plan_bytes)) ||
                 !moe_grouped_cuda_success(cudaMalloc(&result->device_banks, snapshot.banks.size() * sizeof(moe_grouped_device_bank))) ||
@@ -4960,6 +5059,11 @@ struct ggml_cuda_moe_grouped_context::impl {
                     result->expert_for_slot, 0xff, snapshot.n_slots * sizeof(int32_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(
                     result->last_used, 0, snapshot.n_slots * sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    result->expert_frequency, 0, n_experts * sizeof(uint32_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    result->expert_frequency_epoch, 0, n_experts * sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(result->device_step, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->device_clock, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(result->plan, 0, result->plan_bytes, compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemcpyAsync(
@@ -5026,6 +5130,11 @@ struct ggml_cuda_moe_grouped_context::impl {
                     device_resource.expert_for_slot, 0xff, resource.snapshot.n_slots * sizeof(int32_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(
                     device_resource.last_used, 0, resource.snapshot.n_slots * sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.expert_frequency, 0, device_resource.n_experts * sizeof(uint32_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.expert_frequency_epoch, 0, device_resource.n_experts * sizeof(uint64_t), compute_stream)) ||
+                !moe_grouped_cuda_success(cudaMemsetAsync(device_resource.device_step, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(device_resource.device_clock, 0, sizeof(uint64_t), compute_stream)) ||
                 !moe_grouped_cuda_success(cudaMemsetAsync(
                     device_resource.plan, 0, device_resource.plan_bytes, compute_stream)) ||
@@ -5033,7 +5142,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             return false;
         }
         device_resource.clock_bound = 0;
-        // Captured planners keep using the same device_clock pointer after a logical reset.
+        // Captured planners keep using the same device counters after a logical reset.
         device_resource.has_completion = true;
         device_resource.completion_stream = compute_stream;
         resource.legacy_dirty = false;
@@ -6598,10 +6707,12 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             }
         }
 
-        moe_grouped_plan_decode<<<1, MOE_GROUPED_PLAN_THREADS, 0, compute_stream>>>(
+        const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
+        moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
-            device.slot_for_expert, device.expert_for_slot, device.last_used, clock_begin, clock_end,
+            device.slot_for_expert, device.expert_for_slot, device.last_used,
+            device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
         CUDA_CHECK(cudaGetLastError());
         auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
@@ -8057,6 +8168,7 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         const auto & device = *resource->device;
         size_t plan_bytes = 0;
         if (device.slot_for_expert == nullptr || device.expert_for_slot == nullptr || device.last_used == nullptr ||
+                device.expert_frequency == nullptr || device.expert_frequency_epoch == nullptr || device.device_step == nullptr ||
                 device.device_clock == nullptr || device.plan == nullptr || device.device_banks == nullptr ||
                 device.completion == nullptr || device.bank_data.size() != resource->snapshot.banks.size() ||
                 !moe_grouped_plan_size(resource->snapshot.n_slots, device.n_experts, &plan_bytes) ||
@@ -8115,6 +8227,9 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         moe_grouped_resource_fingerprint_add(result, device.slot_for_expert);
         moe_grouped_resource_fingerprint_add(result, device.expert_for_slot);
         moe_grouped_resource_fingerprint_add(result, device.last_used);
+        moe_grouped_resource_fingerprint_add(result, device.expert_frequency);
+        moe_grouped_resource_fingerprint_add(result, device.expert_frequency_epoch);
+        moe_grouped_resource_fingerprint_add(result, device.device_step);
         moe_grouped_resource_fingerprint_add(result, device.device_clock);
         moe_grouped_resource_fingerprint_add(result, device.plan);
         moe_grouped_resource_fingerprint_add(result, device.plan_bytes);
