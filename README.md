@@ -6,7 +6,9 @@ This section documents the user-visible and public API additions carried by this
 
 ### CUDA MoE expert cache
 
-The expert cache keeps a configurable number of routed MoE expert slabs in GPU memory and pages cold slabs from host memory with LRU eviction. It is opt-in and CUDA-only.
+The expert cache keeps a configurable number of routed MoE expert slabs in GPU memory and pages cold slabs from host memory. It is opt-in and CUDA-only. Grouped decode uses frequency-aware eviction with LRU tie-breaking by default; prefill and the legacy cache retain their existing policies.
+
+Frequency history ages by one halving every 16 grouped planning steps, so previously hot experts do not stay protected indefinitely. This changes cache replacement, not expert routing, tensor values, or compute kernels. It uses small per-expert counters rather than extra expert slots. Set `GGML_CUDA_MOE_FREQUENCY=0` before starting the process to use LRU replacement in grouped decode; omit it or set `1` to restore the default. The setting is fixed when the CUDA grouped context is created, including for captured graphs.
 
 | Public control | Default and disable behavior | Effect |
 | --- | --- | --- |
