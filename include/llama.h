@@ -746,6 +746,7 @@ extern "C" {
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
+    // NOTE: with data == true, call llama_synchronize() first if a decode may still be running - a decode can still be reading the buffers
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);
