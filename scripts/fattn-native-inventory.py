@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """Report and check the compiled quantized-native MMA FlashAttention inventory.
 
-The native route's build switches are coupled in a way that no runtime test
-observes: GGML_CUDA_FA_ALL_QUANTS decides which cache types get kernels at all
-and whether the mixed-pair (runtime-V) kernels are compiled, and an inventory
-mistake shows up as kernels that exist but are unreachable, or as hundreds of
-kernels landing in one translation unit. Both compile and pass.
+The route's build switches are coupled in a way that no runtime test observes.
+GGML_CUDA_FA_ALL_QUANTS decides which cache types get kernels at all, and an
+extern-macro mistake can instantiate a whole attention body per tile shape in
+one translation unit. Both compile and pass every runtime test.
 
-So this reads the built library back and checks it against the single-source
-type manifest, ggml/src/ggml-cuda/fattn-mma-quant-types.h:
-
-  * every default-tier type has symmetric kernels;
-  * extra-tier types have them exactly when the build set GGML_CUDA_FA_ALL_QUANTS;
-  * runtime-V kernels exist exactly when the build set GGML_CUDA_FA_ALL_QUANTS,
-    because a build without it declines K != V before the route is asked;
-  * every runtime-V geometry also has its symmetric kernel;
-  * no type outside the manifest has native kernels.
+So this reads the built library back and compares it against the exact set of
+cases the generated instance files declare, filtered by the manifest tiers in
+ggml/src/ggml-cuda/fattn-mma-quant-types.h. Missing, unexpected and duplicate
+kernels all fail, as does any mixed K/V kernel or any non-zero logit softcap
+specialization, neither of which the route can reach.
 
 Usage:
     scripts/fattn-native-inventory.py build/bin/libggml-cuda.so [--all-quants]
@@ -25,6 +20,8 @@ Exit status is non-zero when an invariant fails.
 """
 
 import argparse
+import collections
+import glob
 import json
 import os
 import re
@@ -32,7 +29,9 @@ import subprocess
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_MANIFEST = os.path.join(REPO_ROOT, "ggml", "src", "ggml-cuda", "fattn-mma-quant-types.h")
+CUDA_DIR = os.path.join(REPO_ROOT, "ggml", "src", "ggml-cuda")
+DEFAULT_MANIFEST = os.path.join(CUDA_DIR, "fattn-mma-quant-types.h")
+INSTANCE_GLOB = os.path.join(CUDA_DIR, "template-instances", "fattn-mma-quant-instance-*.cu")
 
 ENTRY_RE = re.compile(
     r"^\s*ENTRY\(\s*(GGML_TYPE_\w+)\s*,\s*(\w+)\s*,\s*(DEFAULT|EXTRA)\s*,\s*ARGS\s*\)")
@@ -41,15 +40,15 @@ ENTRY_RE = re.compile(
 # enum names have to be resolved to numbers. ggml.h is the source for that.
 GGML_TYPE_ENUM_RE = re.compile(r"^\s*GGML_TYPE_(\w+)\s*=\s*(\d+)\s*,")
 
-# One kernel template, two roles: a symmetric pair instantiates V as itself, a
-# mixed pair instantiates V as the runtime sentinel and selects the V loader
-# inside the kernel. The sentinel's value is read from the source rather than
-# hard-coded, because it is defined relative to GGML_TYPE_COUNT.
+CASE_RE = re.compile(
+    r"^\s*DECL_FATTN_MMA_QUANT_CASE\(\s*(GGML_TYPE_\w+)\s*,"
+    r"\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)")
+
+# <DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, compact_causal_prefix, type_K, type_V>
 KERNEL_RE = re.compile(
-    r"flash_attn_ext_f16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*\w+,\s*\w+,\s*\w+,"
+    r"flash_attn_ext_f16<\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),"
+    r"\s*(\w+),\s*(\w+),\s*(\w+),"
     r"\s*\(ggml_type\)(\d+),\s*\(ggml_type\)(\d+)\s*>")
-V_RUNTIME_SENTINEL_RE = re.compile(
-    r"GGML_CUDA_FATTN_QUANT_V_RUNTIME\s*=\s*\(ggml_type\)\s*\(GGML_TYPE_COUNT\s*\+\s*(\d+)\)")
 
 
 def read_manifest(path):
@@ -77,12 +76,31 @@ def read_ggml_type_values():
     return values
 
 
-def read_v_runtime_sentinel(type_values):
-    header = os.path.join(REPO_ROOT, "ggml", "src", "ggml-cuda", "fattn-mma-quant.cuh")
-    m = V_RUNTIME_SENTINEL_RE.search(open(header).read())
-    if not m:
-        sys.exit(f"{header}: GGML_CUDA_FATTN_QUANT_V_RUNTIME not found")
-    return type_values["GGML_TYPE_COUNT"] + int(m.group(1))
+def read_expected_cases(all_quants):
+    """The cases the generated instance files declare for this build.
+
+    Reading the sources rather than restating the route table keeps this script
+    from becoming a second copy of it: what it checks is that the library holds
+    exactly what the build was told to instantiate.
+    """
+    cases = set()
+    files = sorted(glob.glob(INSTANCE_GLOB))
+    if not files:
+        sys.exit(f"{INSTANCE_GLOB}: no generated instance files found")
+    for path in files:
+        guarded = False
+        with open(path) as f:
+            for line in f:
+                if line.startswith("#ifdef GGML_CUDA_FA_ALL_QUANTS"):
+                    guarded = True
+                elif line.startswith("#endif"):
+                    guarded = False
+                m = CASE_RE.match(line)
+                if m and (all_quants or not guarded):
+                    cases.add((m.group(1),) + tuple(int(m.group(i)) for i in range(2, 6)))
+    if not cases:
+        sys.exit(f"{INSTANCE_GLOB}: no DECL_FATTN_MMA_QUANT_CASE entries found")
+    return cases
 
 
 def read_symbols(library):
@@ -118,61 +136,66 @@ def main():
             sys.exit(f"{args.manifest}: {name} is not a ggml_type enumerator")
     value_to_name = {type_values[n]: n for n in tiers}
 
-    v_runtime = read_v_runtime_sentinel(type_values)
+    expected = read_expected_cases(args.all_quants)
     symbols, source = read_symbols(args.library)
 
-    symmetric_geometries = {}
-    runtime_v_geometries = {}
-    foreign = set()
+    failures = []
+    found = collections.Counter()   # case -> distinct kernel symbols
+    variants = {}                   # case -> the bool triples seen
+    mixed = set()
+    softcap = set()
+    duplicates = collections.Counter()
+
+    seen_symbols = collections.Counter()
     for m in KERNEL_RE.finditer(symbols):
         geometry = tuple(int(m.group(i)) for i in range(1, 5))
-        k, v = int(m.group(5)), int(m.group(6))
-        if v == v_runtime:
-            name = value_to_name.get(k)
-            if name is None:
-                foreign.add(k)  # a runtime V loader for a type the manifest does not name
-            else:
-                runtime_v_geometries.setdefault(name, set()).add(geometry)
-        elif k == v and k in value_to_name:
-            symmetric_geometries.setdefault(value_to_name[k], set()).add(geometry)
+        bools = (m.group(5), m.group(6), m.group(7))
+        k, v = int(m.group(8)), int(m.group(9))
+        if k not in value_to_name and v not in value_to_name:
+            continue  # an F16/BF16 kernel, not this route's
+        if k != v:
+            mixed.add((geometry, k, v))
+            continue
+        case = (value_to_name[k],) + geometry
+        seen_symbols[(case, bools)] += 1
+        if bools[0] != "false":
+            softcap.add(case)
+        variants.setdefault(case, set()).add(bools)
 
-    symmetric = {name: len(geometries) for name, geometries in symmetric_geometries.items()}
-    runtime_v = {name: len(geometries) for name, geometries in runtime_v_geometries.items()}
+    for (case, bools), count in seen_symbols.items():
+        found[case] += 1
+        if count > 1:
+            duplicates[(case, bools)] = count
 
-    want_symmetric = {n: (t == "DEFAULT" or args.all_quants) for n, t in tiers.items()}
-    # Mixed pairs are only reachable with GGML_CUDA_FA_ALL_QUANTS, so that is
-    # also the only build that compiles a runtime-V kernel.
-    want_runtime_v = {n: (want_symmetric[n] and args.all_quants) for n in tiers}
+    missing    = sorted(expected - set(found))
+    unexpected = sorted(set(found) - expected)
 
     print(f"library      : {args.library}")
     print(f"size         : {os.path.getsize(args.library)} bytes")
     print(f"symbol source: {source}")
     print(f"all-quants   : {'ON' if args.all_quants else 'OFF'}")
     print()
-    print(f"{'type':<16}{'tier':<10}{'symmetric':>18}{'runtime-V':>18}")
+    print(f"{'type':<16}{'tier':<10}{'DKQ':>6}{'DV':>6}{'ncols1':>8}{'ncols2':>8}{'symbols':>9}")
+    for case in sorted(expected):
+        print("{:<16}{:<10}{:>6}{:>6}{:>8}{:>8}{:>9}".format(
+            case[0], tiers[case[0]], case[1], case[2], case[3], case[4], found.get(case, 0)))
 
-    failures = []
-    for name, tier in tiers.items():
-        sym, rt = symmetric.get(name, 0), runtime_v.get(name, 0)
-        sym_want = "some" if want_symmetric[name] else "0"
-        rt_want  = "some" if want_runtime_v[name] else "0"
-        print("{:<16}{:<10}{:>18}{:>18}".format(
-            name, tier, "{} (want {})".format(sym, sym_want), "{} (want {})".format(rt, rt_want)))
-        if want_symmetric[name] and sym == 0:
-            failures.append(f"{name} ({tier}) is expected in this build but has no symmetric kernels")
-        if not want_symmetric[name] and sym:
-            failures.append(f"{name} ({tier}) must not be compiled in this build, "
-                            f"found {sym} symmetric kernels")
-        if want_runtime_v[name] and rt == 0:
-            failures.append(f"{name} is expected in this build but has no runtime-V kernels")
-        if not runtime_v_geometries.get(name, set()) <= symmetric_geometries.get(name, set()):
-            failures.append(f"{name} has a runtime-V geometry without its symmetric kernel")
-        if not want_runtime_v[name] and rt:
-            failures.append(f"{name} must not have runtime-V kernels in this build, found {rt}")
+    for case in missing:
+        failures.append(f"declared but not compiled: {case}")
+    for case in unexpected:
+        failures.append(f"compiled but not declared: {case}")
+    for (case, bools), count in sorted(duplicates.items()):
+        failures.append(f"duplicate instantiation ({count}x): {case} {bools}")
+    for geometry, k, v in sorted(mixed):
+        failures.append(f"mixed K/V kernel, which the route cannot select: {geometry} K={k} V={v}")
+    for case in sorted(softcap):
+        failures.append(f"logit softcap specialization, which the route cannot select: {case}")
 
-    if foreign:
-        failures.append("runtime-V kernels for types outside the manifest: "
-                        + ", ".join(str(v) for v in sorted(foreign)))
+    # Every case must carry the same kernel variants, otherwise one of them lost
+    # or gained a compact-causal-mask specialization.
+    shapes = {frozenset(v) for v in variants.values()}
+    if len(shapes) > 1:
+        failures.append(f"kernel variants differ between cases: {sorted(map(sorted, shapes))}")
 
     if args.json:
         with open(args.json, "w") as f:
@@ -180,8 +203,8 @@ def main():
                 "library": args.library,
                 "size_bytes": os.path.getsize(args.library),
                 "all_quants": args.all_quants,
-                "symmetric": symmetric,
-                "runtime_v": runtime_v,
+                "expected": sorted(expected),
+                "found": {str(k): v for k, v in sorted(found.items())},
                 "tiers": tiers,
             }, f, indent=2, sort_keys=True)
 
@@ -190,7 +213,7 @@ def main():
         for f in failures:
             print("FAIL: " + f)
         return 1
-    print("OK: compiled inventory matches the manifest")
+    print(f"OK: {len(expected)} declared cases, all compiled, nothing else")
     return 0
 
 
