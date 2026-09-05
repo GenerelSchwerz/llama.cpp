@@ -1750,8 +1750,9 @@ static void ggml_backend_sched_input_ranges(const struct ggml_tensor * input, st
         return;
     }
 
-    // dimensions below the stream have to cover their rows without a gap for a range to be a byte range
-    const size_t rows = (size_t) input->ne[2]*input->nb[2];
+    // a range is one stream's byte span, which is what the tensor covers below dimension 3
+    // taking that span from ggml_nbytes keeps it right whatever order the dimensions below the stream are permuted into: attention reads a KV window with its rows on dimension 1
+    const size_t rows = ggml_nbytes(input) - (size_t) (input->ne[3] - 1)*input->nb[3];
     const size_t offs = input->view_src ? input->view_offs : 0;
     if (input->nb[3] < rows || (offs != 0 && (input->nb[3] == 0 || offs % input->nb[3] != 0))) {
         return;

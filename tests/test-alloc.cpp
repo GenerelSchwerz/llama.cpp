@@ -1483,6 +1483,8 @@ static void test_transport_multi_stream_ranges() {
     // the same shape a host-resident KV window has: heads split across dims 0 and 1, rows on 2, streams on 3
     ggml_tensor * window = ggml_view_4d(ctx.ctx, store, n_embd/2, 2, n_row, n_stream,
             (size_t) (n_embd/2)*sizeof(float), store->nb[1], store->nb[2], 0);
+    // attention permutes it before reading it, which puts the rows on 1 and the heads on 2
+    window = ggml_permute(ctx.ctx, window, 0, 2, 1, 3);
     ggml_tensor * output = ggml_cont(ctx.ctx, window);
     ggml_build_forward_expand(ctx.graph, output);
 
