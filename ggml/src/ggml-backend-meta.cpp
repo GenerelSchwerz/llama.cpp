@@ -831,10 +831,28 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
         }
-        if (ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE && tensor->view_src == nullptr) {
+        // A host-resident KV cache reaches the graph as a copied-in leaf of the compute buffer.
+        // Mirroring it while the queries stay split by head makes each device attend the wrong
+        // heads, so ask the callback; it still answers MIRRORED for names it does not know.
+        const bool copied_in_leaf =
+            ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            tensor->op == GGML_OP_NONE && (tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0;
+
+        if ((ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || copied_in_leaf) &&
+                tensor->view_src == nullptr) {
             ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
             const ggml_backend_meta_device_context * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
-            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor, dev_ctx->get_split_state_ud);
+            // the callback classifies by name, so offer a copy under the name it was copied from
+            const ggml_tensor * tensor_query = tensor;
+            ggml_tensor tensor_named;
+            if (copied_in_leaf) {
+                tensor_named = *tensor;
+                char source_name[GGML_MAX_NAME];
+                ggml_backend_sched_copy_source_name(tensor->name, source_name, sizeof(source_name));
+                ggml_set_name(&tensor_named, source_name);
+                tensor_query = &tensor_named;
+            }
+            ggml_backend_meta_split_state ret = dev_ctx->get_split_state(tensor_query, dev_ctx->get_split_state_ud);
             if (ret.axis >= 0 && ret.axis < GGML_MAX_DIMS) {
                 const int64_t granularity = ret.axis == GGML_BACKEND_SPLIT_AXIS_0 ? ggml_blck_size(tensor->type) : 1;
                 int64_t ne_sum = 0;
@@ -1416,6 +1434,37 @@ static void ggml_backend_meta_buffer_memset_tensor(
 static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // A host-resident attention cache reaches this permuted, as [head_dim, n_kv, n_head_kv, n_stream].
+    // The heads split, but interleaved per cell, so the chunk splice below cannot express the write.
+    // Each device's heads are one contiguous run per cell: ne[1] cells, from one stride to another.
+    // A backend without a native 2d copy (CPU, Metal) pays one transfer per cell here, CUDA does not.
+    const bool strided_head_split =
+        !ggml_is_contiguous(tensor) &&
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+        split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        tensor->nb[1] > tensor->nb[2] &&
+        offset == 0 && size == ggml_nbytes(tensor);
+
+    if (strided_head_split) {
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+            size_t offset_data = i3 * tensor->nb[3];
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t nbytes = split_state.ne[j] * tensor->nb[2];
+                if (nbytes == 0) {
+                    continue;
+                }
+                ggml_backend_tensor_set_2d(simple_tensor, (const char *) data + offset_data,
+                    i3 * simple_tensor->nb[3], nbytes,
+                    tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+                offset_data += nbytes;
+            }
+            GGML_ASSERT(offset_data == i3 * tensor->nb[3] + (size_t) tensor->ne[2] * tensor->nb[2]);
+        }
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -1544,6 +1593,34 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // A fused QKV puts Kcur and Vcur in a strided view, which a host-resident cache reads back here.
+    // The rows split, so the chunk splice below cannot express the read. Each device's part of a row
+    // is contiguous: ne[1] rows, from the device's own stride to the view's.
+    // A backend without a native 2d copy (CPU, Metal) pays one transfer per row here, CUDA does not.
+    const bool strided_rows =
+        !ggml_is_contiguous(tensor) &&
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_0 &&
+        split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        offset == 0 && size == ggml_nbytes(tensor);
+
+    if (strided_rows) {
+        size_t offset_data = 0;
+        for (size_t j = 0; j < n_bufs; j++) {
+            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+            const size_t nbytes = ggml_row_size(tensor->type, split_state.ne[j]);
+            if (nbytes == 0) {
+                continue;
+            }
+            ggml_backend_tensor_get_2d(simple_tensor, (char *) data + offset_data, 0, nbytes,
+                tensor->ne[1], simple_tensor->nb[1], tensor->nb[1]);
+            offset_data += nbytes;
+        }
+        GGML_ASSERT(offset_data == ggml_row_size(tensor->type, tensor->ne[0]));
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
@@ -2182,14 +2259,18 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             int i_start = 0;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
-                if (node->view_src != nullptr && node->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(node->view_src->buffer)) {
-                    continue;
+                // a host-resident KV cache ends a split with a view of itself, that view needs no split state
+                // but it is still the last node and must close the last subgraph
+                const bool host_view = node->view_src != nullptr && node->view_src->op == GGML_OP_NONE &&
+                    ggml_backend_buffer_is_host(node->view_src->buffer);
+                bool new_subgraph = i + 1 == cgraph->n_nodes;
+                if (!host_view) {
+                    const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+                    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                        max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
+                        new_subgraph = true;
+                    }
                 }
-                const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
-                if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                    max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
-                }
-                const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
                 if (!new_subgraph) {
                     continue;
                 }
