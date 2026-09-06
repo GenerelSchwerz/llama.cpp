@@ -1374,6 +1374,9 @@ struct cmd_params_instance {
         cparams.type_k          = type_k;
         cparams.type_v          = type_v;
         cparams.offload_kqv     = !no_kv_offload;
+        // the benchmark decodes with llama_batch_get_one, which marks only the last token as an
+        // output, so reserving logits for a whole batch just inflates the compute buffer
+        cparams.n_outputs_max   = 1;
         cparams.kv_gpu_layers   = kv_gpu_layers;
         cparams.kv_cpu_pinned   = kv_cpu_pinned;
         cparams.recurrent_state_offload = recurrent_state_offload;
