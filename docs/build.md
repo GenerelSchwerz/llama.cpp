@@ -302,7 +302,7 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_PEER_MAX_BATCH_SIZE | Positive integer       | 128     | Maximum batch size for which to enable peer access between multiple GPUs. Peer access requires either Linux or NVLink. When using NVLink enabling peer access for larger batch sizes is potentially beneficial.                                                                                                                                                                  |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile support for all KV cache quantization type (combinations) for the FlashAttention CUDA kernels. More fine-grained control over KV cache size but compilation takes much longer.                                                                                                                                                                                           |
 
-The MMA FlashAttention kernels can also read a quantized K/V cache in place instead of casting the visible window to F16, which removes that transient copy. See [quantized-native-flash-attention.md](quantized-native-flash-attention.md); the runtime option is `--flash-attn-native-quants` and `GGML_CUDA_FA_ALL_QUANTS` also widens which cache types it covers.
+For a few measured geometries the MMA FlashAttention kernels read the quantized K/V cache in place instead of casting the visible window to F16, which removes that transient copy. There is no option: the backend picks that route where it is faster. `GGML_CUDA_FA_ALL_QUANTS` widens which cache types it covers. See [quantized-native-flash-attention.md](quantized-native-flash-attention.md).
 
 ## MUSA
 

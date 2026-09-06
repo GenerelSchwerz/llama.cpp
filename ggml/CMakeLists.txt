@@ -297,9 +297,9 @@ include(GNUInstallDirs)
 
 # The extra-tier quantized-native MMA cache types, read from their single
 # source: ggml/src/ggml-cuda/fattn-mma-quant-types.h. The route predicate, the
-# extern declarations, the instance generator and the backend-ops coverage read
-# the same manifest, so the build cannot exclude a stem the generator no longer
-# emits, or keep compiling one that moved into the default tier.
+# extern declarations and the instance generator read the same manifest, so the
+# build cannot exclude a stem the generator no longer emits, or keep compiling
+# one that moved into the default tier.
 #
 # Returns the file-name stems, which is what the generated instance file names
 # carry. A manifest that parses to nothing is a configure error, not an empty

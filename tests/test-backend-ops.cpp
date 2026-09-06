@@ -7843,7 +7843,7 @@ struct test_flash_attn_ext : public test_case {
     const int expected_native;
     const bool native_equivalence;
     const bool compact_equivalence;
-    ggml_tensor * route_out = nullptr;
+    int64_t native_count_before = 0;
     ggml_tensor * native_k = nullptr;
     ggml_tensor * native_v = nullptr;
     ggml_tensor * native_k_ref = nullptr;
@@ -7888,14 +7888,25 @@ struct test_flash_attn_ext : public test_case {
         return 5e-4;
     }
 
+    // Quantized-native FlashAttention launches the CUDA backend has made so far,
+    // or -1 where no CUDA backend reports it. Route selection is otherwise only
+    // observable through allocation size or throughput, which are incidental.
+    static int64_t native_count() {
+        static auto fn = [] {
+            ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+            return reg ? (int64_t (*)(void)) ggml_backend_reg_get_proc_address(
+                    reg, "ggml_backend_cuda_fattn_native_count") : nullptr;
+        }();
+        return fn ? fn() : -1;
+    }
+
     double max_err(ggml_backend_t backend) override {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-        if (!native_equivalence || expected_native < 0 ||
+        if (!native_equivalence || expected_native < 0 || native_count_before < 0 ||
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
             return test_case::max_err(backend);
         }
-        GGML_ASSERT(route_out && route_out->buffer);
-        const bool native = ggml_backend_buffer_get_alloc_size(route_out->buffer, route_out) == ggml_nbytes(route_out);
+        const bool native = native_count() > native_count_before;
         if (native != bool(expected_native)) {
             fprintf(stderr, "unexpected CUDA FlashAttention route: expected native=%d, got native=%d\n", expected_native, int(native));
             return -1.0;
@@ -7992,7 +8003,6 @@ struct test_flash_attn_ext : public test_case {
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_prec (out, prec);
         if (native_equivalence) {
-            route_out = out;
             native_k = k;
             native_v = v;
             native_k_ref = ggml_new_tensor(ctx, GGML_TYPE_F16, GGML_MAX_DIMS, k->ne);
@@ -8056,6 +8066,7 @@ struct test_flash_attn_ext : public test_case {
         if (native_equivalence) {
             init_native_ref(native_k, native_k_ref);
             init_native_ref(native_v, native_v_ref);
+            native_count_before = native_count();
         }
     }
 
@@ -10789,6 +10800,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     add_native_equivalence(GGML_TYPE_Q5_0, 256, 8, { 2, 1}, 1024, 65, 0);
     add_native_equivalence(GGML_TYPE_Q4_1, 512, 1, {16, 1},  512, 65, 0);
     add_native_equivalence(GGML_TYPE_Q5_1, 512, 1, {16, 1},  512, 65, 0);
+    // D=256 with GQA 8 has an open memory-safety question and must stay on the
+    // standard path even where the KV length would otherwise qualify.
+    add_native_equivalence(GGML_TYPE_Q8_0, 256, 4, { 8, 1},  512, 65, 0);
 
     for (int hsk : { 40, 64, 72, 80, 96, 128, 192, 256, 320, 512, 576 }) {
         for (int hsv : { 40, 64, 72, 80, 96, 128, 192, 256, 512 }) {
@@ -11290,6 +11304,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
     for (int kv : { 4096, 8192, 16384, }) {
         for (int hs : { 64, 128, }) {
             for (int nr : { 1, 4, }) {

@@ -10,20 +10,24 @@
     ENTRY(GGML_TYPE_Q4_1, q4_1, EXTRA,   ARGS)  \
     ENTRY(GGML_TYPE_Q4_0, q4_0, DEFAULT, ARGS)
 
+// The route is CUDA only. HIP and MUSA do not build the generated instances,
+// so nothing may name the kernels there either.
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#define FATTN_MMA_QUANT_AVAILABLE
+#endif
+
 // Select the types compiled by this build.
+#ifdef FATTN_MMA_QUANT_AVAILABLE
 #define FATTN_MMA_QUANT_TIER_DEFAULT(...) __VA_ARGS__
 #ifdef GGML_CUDA_FA_ALL_QUANTS
 #define FATTN_MMA_QUANT_TIER_EXTRA(...) __VA_ARGS__
 #else
 #define FATTN_MMA_QUANT_TIER_EXTRA(...)
 #endif // GGML_CUDA_FA_ALL_QUANTS
-
-// Mixed K/V types require GGML_CUDA_FA_ALL_QUANTS.
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-#define FATTN_MMA_QUANT_MIXED_PAIRS(...) __VA_ARGS__
 #else
-#define FATTN_MMA_QUANT_MIXED_PAIRS(...)
-#endif // GGML_CUDA_FA_ALL_QUANTS
+#define FATTN_MMA_QUANT_TIER_DEFAULT(...)
+#define FATTN_MMA_QUANT_TIER_EXTRA(...)
+#endif // FATTN_MMA_QUANT_AVAILABLE
 
 // Expand the types compiled by this build.
 #define FATTN_MMA_QUANT_TYPES_ENTRY(type, stem, tier, F) FATTN_MMA_QUANT_TIER_##tier(F(type))

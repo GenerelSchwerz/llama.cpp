@@ -5667,6 +5667,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_trim_transient_pools") == 0) {
         return (void *)ggml_backend_cuda_trim_transient_pools;
     }
+    if (strcmp(name, "ggml_backend_cuda_fattn_native_count") == 0) {
+        return (void *)ggml_backend_cuda_fattn_native_count;
+    }
     return nullptr;
 }
 
