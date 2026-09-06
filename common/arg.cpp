@@ -2936,6 +2936,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_TENSOR_SPLIT"));
     add_opt(common_arg(
+        {"-as", "--attn-split"}, "N0,N1,N2,...",
+        "fraction of the attention heads to give each GPU under --split-mode tensor, comma-separated, "
+        "e.g. 3,1. Only the heads move, the rest of the model still follows --tensor-split. Each share is "
+        "rounded down to whole heads, so a ratio the head count cannot express is not matched exactly. "
+        "Useful when the GPUs differ in host bandwidth or in speed (default: follow --tensor-split)",
+        [](common_params & params, const std::string & value) {
+            const std::regex regex{ R"([,/]+)" };
+            std::sregex_token_iterator it{ value.begin(), value.end(), regex, -1 };
+            std::vector<std::string> split_arg{ it, {} };
+            if (split_arg.size() > llama_max_devices()) {
+                throw std::invalid_argument(
+                    string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
+                );
+            }
+            float sum = 0.0f;
+            for (size_t i = 0; i < llama_max_devices(); ++i) {
+                float share = 0.0f;
+                if (i < split_arg.size()) {
+                    size_t n_read = 0;
+                    try {
+                        share = std::stof(split_arg[i], &n_read);
+                    } catch (const std::exception &) {
+                        n_read = 0;
+                    }
+                    if (n_read != split_arg[i].size() || !std::isfinite(share) || share < 0.0f) {
+                        throw std::invalid_argument(
+                            string_format("invalid attention split share '%s'", split_arg[i].c_str())
+                        );
+                    }
+                }
+                params.attn_split[i] = share;
+                sum += share;
+            }
+            if (sum <= 0.0f) {
+                throw std::invalid_argument("the attention split shares must add up to more than zero");
+            }
+        }
+    ).set_env("LLAMA_ARG_ATTN_SPLIT"));
+    add_opt(common_arg(
         {"-mg", "--main-gpu"}, "INDEX",
         string_format("the GPU to use for the model (with split-mode = none), or for intermediate results and KV (with split-mode = row) (default: %d)", params.main_gpu),
         [](common_params & params, int value) {

@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <map>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -68,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-sched-copy-name]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -396,9 +397,17 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
     return true;
 }
 
+// with offload_kqv=false the cache lives in host memory
+// n_seq_max > 1 gives the cache one stream per sequence, attn_split gives the heads their own share
+struct kv_config {
+    bool               offload_kqv = true;
+    uint32_t           n_seq_max   = 1;
+    std::vector<float> attn_split;
+};
+
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, const kv_config & kvc = {}) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -406,11 +415,18 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
     model_params.split_mode = split_mode;
+    std::vector<float> attn_split = kvc.attn_split;
+    if (!attn_split.empty()) {
+        attn_split.resize(llama_max_devices(), 0.0f);
+        model_params.attn_split = attn_split.data();
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.offload_kqv = kvc.offload_kqv;
+    ctx_params.n_seq_max   = kvc.n_seq_max;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1050,15 +1066,44 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
+// the meta backend recovers the source of a scheduler copy from its name, so both sides must agree
+static void test_sched_copy_name() {
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+    ggml_tensor * src  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+    ggml_tensor * copy = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 1);
+
+    auto check = [&](const char * name, const char * backend_name, const char * expected) {
+        char buf[GGML_MAX_NAME];
+        ggml_set_name(src, name);
+        ggml_backend_sched_name_copy(copy, backend_name, src, 0);
+        ggml_backend_sched_copy_source_name(copy->name, buf, sizeof(buf));
+        GGML_ASSERT(strcmp(buf, expected) == 0);
+    };
+
+    check("cache_k_l0", "CUDA0", "cache_k_l0");
+    check("cache_k_l0 (view)", "CUDA0", "cache_k_l0");
+    // the backend label is cut when the name does not fit, the source name survives
+    check("cache_k_l31", "Meta(CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,CUDA7)", "cache_k_l31");
+}
+
+// the tokens are spread over n_seq sequences, each of which starts at position 0
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false, uint32_t n_seq = 1) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+    GGML_ASSERT(n_seq >= 1 && n_tokens % n_seq == 0);
+    const uint32_t n_tokens_seq = n_tokens / n_seq;
+    llama_batch batch = llama_batch_init(n_ctx, 0, n_seq);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        common_batch_add(batch, tokens[pos], pos % n_tokens_seq, {llama_seq_id(pos / n_tokens_seq)}, true);
     }
     batch.n_tokens = n_tokens;
     if (encode) {
@@ -1295,9 +1340,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         std::vector<ggml_backend_dev_t> devs;
         std::string                     label;
         llama_split_mode                split_mode;
+        kv_config                       kvc;
 
-        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode)
-            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode) {}
+        device_config(std::vector<ggml_backend_dev_t> devs, std::string name, llama_split_mode split_mode, kv_config kvc = {})
+            : devs(std::move(devs)), label(std::move(name)), split_mode(split_mode), kvc(std::move(kvc)) {}
     };
 
     std::vector<device_config> dev_configs;
@@ -1319,6 +1365,33 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         }
 
         dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+
+        // a host-resident cache reaches attention as a scheduler copy that is split by head
+        kv_config kvc_host;
+        kvc_host.offload_kqv = false;
+        dev_configs.emplace_back(devices_meta, "Meta -nkvo", LLAMA_SPLIT_MODE_TENSOR, kvc_host);
+
+        // with more than one stream that copy is 4d, one stride per stream
+        kv_config kvc_host_streams = kvc_host;
+        kvc_host_streams.n_seq_max = 2;
+        dev_configs.emplace_back(devices_meta, "Meta -nkvo -np 2", LLAMA_SPLIT_MODE_TENSOR, kvc_host_streams);
+
+        // the same, with all attention heads on the first device
+        if (devices_meta.size() > 1) {
+            kv_config kvc_attn = kvc_host;
+            kvc_attn.attn_split.assign(devices_meta.size(), 0.0f);
+            kvc_attn.attn_split[0] = 1.0f;
+            dev_configs.emplace_back(devices_meta, "Meta -nkvo -as", LLAMA_SPLIT_MODE_TENSOR, kvc_attn);
+
+            // a custom head split must also hold across streams
+            kv_config kvc_attn_streams = kvc_attn;
+            kvc_attn_streams.n_seq_max = 2;
+            dev_configs.emplace_back(devices_meta, "Meta -nkvo -as -np 2", LLAMA_SPLIT_MODE_TENSOR, kvc_attn_streams);
+        }
+
+        for (const device_config & dc : dev_configs) {
+            max_device_label_length = std::max(max_device_label_length, dc.label.length());
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -1350,7 +1423,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-            continue; // FIXME: ISWA KV cache initialization needs more fixture params
+            // FIXME: ISWA KV cache initialization needs more fixture params
+            // this arch also loses accuracy with a host-resident cache under split mode tensor
+            // (perplexity 235.03 versus 227.23), the other ISWA archs are clean
+            continue;
         }
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
@@ -1370,7 +1446,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
             std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_cpu;
-            std::vector<float> logits_cpu;
+            std::map<uint32_t, std::vector<float>> logits_cpu_per_n_seq;
             for (device_config & dc : dev_configs) {
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
                 printf(template_row_cfg.c_str(),
@@ -1383,15 +1459,21 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
 
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
+                // an encoder-decoder model needs its own batch layout, so it stays on one sequence
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) ||
+                    (encode && dc.kvc.n_seq_max > 1);
                 if (!skip) {
-                    if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
-                        logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
-                    }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
-                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
+                        // the reference runs the same batch layout, one sequence per stream
+                        std::vector<float> & logits_cpu = logits_cpu_per_n_seq[dc.kvc.n_seq_max];
+                        if (logits_cpu.empty()) {
+                            kv_config kvc_cpu;
+                            kvc_cpu.n_seq_max = dc.kvc.n_seq_max;
+                            model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode, kvc_cpu);
+                            logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode, dc.kvc.n_seq_max);
+                        }
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode, dc.kvc);
+                        logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode, dc.kvc.n_seq_max);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
@@ -1412,9 +1494,9 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode, dc.kvc);
                         const std::vector<float> logits_roundtrip = get_logits(
-                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
+                            model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode, dc.kvc.n_seq_max);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
@@ -1449,6 +1531,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool test_copy_name = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1502,6 +1585,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-sched-copy-name") == 0) {
+            test_copy_name = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1517,6 +1604,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
             test_live_context_workspace_unsupported(seed);
+            return 0;
+        }
+        if (test_copy_name) {
+            test_sched_copy_name();
             return 0;
         }
         if (!out.empty()) {
