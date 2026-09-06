@@ -1050,6 +1050,119 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
+static size_t host_context_bytes(const llama_context * ctx) {
+    size_t ret = 0;
+    for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+        if (ggml_backend_buft_is_host(buft)) {
+            ret += data.context;
+        }
+    }
+    return ret;
+}
+
+// An MTP context owns only the nextn layers, which sit above the layers of the main context. A
+// budget that only looks at the main context's layers leaves the whole MTP cache in host memory.
+static void test_mtp_kv_residency(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        printf("test_mtp_kv_residency: skipped, GPU device required\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.n_gpu_layers = 99;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { gpu, nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    size_t host_bytes[2] = {0, 0};
+    for (uint32_t kv_gpu_layers : {0u, 1u}) {
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = 32;
+        ctx_params.n_batch = 32;
+        ctx_params.n_ubatch = 32;
+        ctx_params.n_seq_max = 1;
+        ctx_params.n_outputs_max = 1;
+        ctx_params.n_threads = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        ctx_params.offload_kqv = false;
+        ctx_params.kv_gpu_layers = kv_gpu_layers;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+        GGML_ASSERT(ctx);
+        host_bytes[kv_gpu_layers] = host_context_bytes(ctx.get());
+    }
+    GGML_ASSERT(host_bytes[0] > 0);
+    GGML_ASSERT(host_bytes[1] < host_bytes[0]);
+    printf("test_mtp_kv_residency: OK\n");
+}
+
+// The picked set must follow the ownership filter of the attention cache and the reported count must
+// be what the caches did place: Falcon H1 marks every layer recurrent yet caches all of them, Nemotron
+// H caches only the non-recurrent layers without an FFN, and a recurrent model caches none.
+static void test_kv_residency_ownership(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        printf("test_kv_residency_ownership: skipped, GPU device required\n");
+        return;
+    }
+
+    auto resident_layers = [&](llm_arch arch, bool moe, uint32_t requested) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        model_params.n_gpu_layers = 99;
+        ggml_backend_dev_t devices[] = { gpu, nullptr };
+        model_params.devices = devices;
+
+        size_t tensor_seed = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+        GGML_ASSERT(model);
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = 32;
+        ctx_params.n_batch = 32;
+        ctx_params.n_ubatch = 32;
+        ctx_params.n_seq_max = 1;
+        ctx_params.n_outputs_max = 1;
+        ctx_params.n_threads = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.offload_kqv = false;
+        ctx_params.kv_gpu_layers = requested;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+        GGML_ASSERT(ctx);
+        return ctx->get_cparams().kv_gpu_layers;
+    };
+
+    // every layer is recurrent, but the attention cache owns all of them
+    GGML_ASSERT(resident_layers(LLM_ARCH_FALCON_H1, false, 1) == 1);
+    // the attention cache owns only layer 0, so the second requested layer cannot be placed
+    GGML_ASSERT(resident_layers(LLM_ARCH_NEMOTRON_H, false, 2) == 1);
+    // a recurrent model builds no attention cache at all
+    GGML_ASSERT(resident_layers(LLM_ARCH_MAMBA, false, 1) == 0);
+    printf("test_kv_residency_ownership: OK\n");
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1522,6 +1635,8 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }
+        test_mtp_kv_residency(seed);
+        test_kv_residency_ownership(seed);
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
