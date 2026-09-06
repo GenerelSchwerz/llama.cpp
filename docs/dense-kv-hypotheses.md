@@ -178,37 +178,48 @@ separate the transport effect from the ordinary batching effect.
 **Kills it.** If the compute buffer growth forces `--kv-gpu-layers` down by more than the
 prefill gain is worth, or if prompt processing is already compute-bound at `ub = 512`.
 
-**Measured: rejected.** Both kill conditions hold on the reference config. Same machine and
-model as H5, `-b 8192`, `-rso 1`, 2 reps, pp t/s:
+**Measured: rejected, but only on the size of the prize.** Same machine and model as H5,
+`-b 8192`, `-rso 1`, 2 reps, 32768 token prompt, after fixing the reserve described below:
 
-| ub | prompt | host KV | device KV | CUDA0 compute buffer |
+| ub | host KV | device KV | transport penalty | CUDA0 compute buffer |
 |---|---|---|---|---|
-|  512 |  4096 | 1154.78 | 1163.10 |  505 MiB |
-|  512 | 16384 | 1063.68 | 1088.98 |  505 MiB |
-|  512 | 32768 |  953.30 |  991.27 |  505 MiB |
-| 2048 |  4096 | 1139.49 | 1148.83 | 2054 MiB |
-| 2048 | 16384 | 1071.72 | out of memory | 2054 MiB |
-| 2048 | 32768 |  980.97 | out of memory | 2054 MiB |
-| 4096 | any   | out of memory | out of memory | - |
-| 8192 | any   | out of memory | out of memory | - |
+|  512 | 953.57 | 994.67 | 4.1% |  286 MiB |
+| 2048 | 980.75 | 996.42 | 1.6% |  568 MiB |
+| 4096 | 975.66 | 985.81 | 1.0% | 1056 MiB |
+| 8192 | out of memory | out of memory | - | 1952 MiB needed |
 
-First, the prize is small. The whole prompt transport, measured as host KV against device KV
-at `ub = 512`, is 0.7% of prompt time at 4k, 2.3% at 16k and 3.8% at 32k. Prompt processing
-is compute-bound at `ub = 512`, so `1/ubatch` is dividing a term that is already noise.
+The mechanism is real and behaves as claimed: raising `ub` does divide the prompt transport,
+and the host-versus-device penalty falls from 4.1% to 1.0%. What kills the item is that the
+whole penalty is 4.1% at 32k, so `1/ubatch` divides a term that is already small, and the
+gain plateaus: `512 -> 2048` is +2.9%, and `2048 -> 4096` is -0.5%, inside noise but
+certainly not more. Prompt processing is compute-bound well before the transport matters.
 
-Second, `ub 512 -> 2048` does behave as the mechanism says, recovering most of that: 953.30
-to 980.97 t/s at 32k, +2.9%. It costs 1549 MiB of compute buffer. At 32k one owned attention
-layer of q8_0 KV is 71 MiB, so that buffer is worth more than the entire 16-layer cache
-(1136 MiB). Spending it on `-kvgl` instead buys 12.71 -> 30.69 t/s of generation, +142%,
-against +2.9% of prompt. The exchange rate is not close.
+**Correction, and it invalidates the first version of this entry.** The first pass concluded
+that the compute buffer made large `ub` unaffordable, measuring 505 MiB at `ub 512` growing
+to 2054 MiB at `ub 2048`, and reported the growth as roughly 15x the `n_ff * ub * 4` term the
+mechanism above accounts for. That was an artifact of `llama-bench`, not a property of the
+model.
 
-Third, the compute buffer grows about 1.01 MiB per ubatch token here, roughly 15x the
-`n_ff * ub * 4` term the mechanism above accounts for, so `ub` 4096 and 8192 do not fit at
-all on a 12 GiB card with a 9.2 GiB model. Whatever dominates that growth, and not the mask,
-is what caps `ub` now.
+`llama_context` sets `n_outputs_max` to `n_batch` unless a tool asks for less, so the prompt
+reserve allocated logits for every token of a ubatch. On this 248320 token vocabulary that is
+0.947 MiB per ubatch token, which was essentially the entire number. `llama-server` sets
+`n_outputs_max` to its slot count and never paid it; `llama-bench` did not, and so
+overstated the cost of every large `ub` it was asked to sweep.
+
+With `llama-bench` asking for the one output it actually uses, the buffer at a 4096 token
+prompt goes from 505 to 132 MiB at `ub 512` and from 2054 to 568 MiB at `ub 2048`, throughput
+is unchanged, and `ub 4096` fits where it previously failed to allocate. The growth is then
+about 0.28 MiB per ubatch token, a small multiple of `n_ff * ub * 4` rather than 15x it, so
+the mechanism above was right about what scales and the correction was wrong.
+
+`ub 8192` still does not fit, needing 1952 MiB on top of a 9.6 GiB model on a 12 GiB card.
+
+The exchange rate against `-kvgl` still argues the same way, just less brutally: at 32k one
+owned attention layer of q8_0 KV is 71 MiB, so the 488 MiB that `ub 2048 -> 4096` costs is
+worth about 7 resident layers, and resident layers are worth far more than 1% of prompt.
 
 H19 was gated on this item concluding that large ubatches are the prefill answer. They are
-not, on this config.
+not, on this config, though the compute buffer is no longer the reason.
 
 ### H2. A unified cache amortizes one delivery over every slot in the batch
 
@@ -783,12 +794,21 @@ what stops them.
 3. **H11**. Until `--fit` knows about host-resident KV, none of the rest reaches a default
    configuration.
 4. **H7**, **H9**, **H12**. Contained, compounding, and they clear the way for H10.
-   H10 is now parked on H5, so judge these on their own split-count and byte savings.
+   *Sized and rejected.* A host-resident decode graph has 34 splits against a device-resident
+   one's 2, two per owned attention layer, exactly the structure these items target. The H5
+   fits price that structure: the intercepts are 26.78 ms device against 27.15 ms host, so all
+   32 extra splits and the staging round trips together cost 0.37 ms, about 11.6 us each.
+   That is 1.2% of a decode at 2k and 0.47% at 32k, shrinking as context grows. H12's padded
+   tail is 0.20 MiB per graph on the same basis, another 0.20 ms. Three risky changes for
+   under 1.3% combined, none of which touch the delivered bytes that H5 shows are the whole
+   cost. H10 is parked anyway.
 5. **H8**. The largest remaining VRAM item once H1 pushes `ub` up.
    H1 did not push `ub` up, so this loses its main motivation for the single-stream case. It
    keeps the multi-slot one, which H2 says is the case that matters.
 6. Everything else, gated on what the measurements above say.
 
-Standing correction from H1: the compute buffer, not the mask and not the FFN intermediate
-alone, is what caps `ub`. Whatever dominates that 1 MiB per ubatch token is the item worth
-opening before H8 or H19.
+Retracted: an earlier version of this list claimed the compute buffer was what capped `ub`,
+at about 1 MiB per ubatch token. That was `llama-bench` reserving logits for a whole batch,
+now fixed. After the fix the growth is about 0.28 MiB per ubatch token and is roughly the
+FFN intermediate, as H1's mechanism always said. Nothing needs opening before H8 or H19 on
+that account.
