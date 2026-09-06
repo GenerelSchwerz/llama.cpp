@@ -280,6 +280,7 @@ A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 
 - **A multi-stream window is delivered one range per stream**, keyed on the last dimension. A window whose streams are not on that dimension keeps the single flat range, which is correct but not accelerated.
 - **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others.
 - **Tensor parallelism keeps the ordered path.** See [Tensor parallelism](#tensor-parallelism).
+- **A host write to the cache waits for the delivery.** `llama_memory_clear(mem, true)` synchronizes the context before it clears the buffers, because a delivery the last decode issued can still be reading them. This was already needed without the transport: with a device-resident cache the same call cleared the buffers under the running graph, and `llama_decode` followed by that clear changed the logits of that decode on every trial.
 - The scheduler must be configured with the device's own default buffer type. A scheduler built on a split or host buffer type keeps the ordered path.
 - `GGML_KV_PIPELINE_DEPTH` and `GGML_KV_PIPELINE_BUDGET_MIB` provide scheduler defaults. Explicit scheduler settings and command-line options take precedence.
 

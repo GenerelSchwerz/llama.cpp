@@ -155,6 +155,11 @@ void llama_memory_recurrent::clear(bool data) {
     used = 0;
 
     if (data) {
+        // a decode can still be reading these buffers, and the memset would race it
+        if (lctx) {
+            llama_synchronize(lctx);
+        }
+
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -576,8 +581,10 @@ llama_memory_context_ptr llama_memory_recurrent::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_recurrent::init_update(llama_context * lctx, bool optimize) {
-    GGML_UNUSED(lctx);
     GGML_UNUSED(optimize);
+
+    // every decode prepares an update, and every memory type passes the context down, so this is set before anything can be in flight
+    this->lctx = lctx;
 
     return std::make_unique<llama_memory_recurrent_context>(LLAMA_MEMORY_STATUS_NO_UPDATE);
 }
