@@ -31,7 +31,8 @@ whether a kernel exists, and returns the tile shape it uses. Common to every row
 
 - an NVIDIA Turing, Ampere or Ada device (`sm_75` to `sm_89`); Hopper and newer
   keep the standard path until someone measures them. Ampere and Ada are
-  measured, Turing is not: see **Turing** below;
+  measured for throughput; Turing is verified correct but has no throughput
+  comparison yet: see **Turing** below;
 - `logit_softcap == 0`;
 - the same native cache type for K and V;
 - the GQA optimizations apply (mask present, no ALiBi, padded K/V, aligned strides);
@@ -128,7 +129,8 @@ it costs evidence:
   tile loaders assert alignment against the quant block size, and those
   assertions are what currently confine the head geometry.
 - **A new device family** is a separate measured change. Ampere and Ada are
-  measured; Turing compiles and follows the same table but has no numbers yet.
+  measured for throughput. Turing is verified correct on hardware but has no
+  route-on/route-off comparison, so nothing here claims it is faster there.
 - **A non-zero `logit_softcap`** stays on the standard path on purpose:
   compiling the softcap specialization would double the generated kernels for a
   dispatch that cannot reach them.
@@ -179,16 +181,29 @@ else. Regenerating the instance files reproduces the committed ones.
 
 ### Turing
 
-Not measured. `sm_75` compiles and links, and the route table gives it the same
-rows at the narrower tile widths, but no Turing card has run the equivalence
-cases or a throughput comparison. Treat the route there as untested.
+Correct, not yet compared. Quadro RTX 8000 (TU102, `sm_75`), default build.
 
-One thing does carry over from the Ampere result: the D=256 regression on Ampere
-comes from the native loaders forcing `nstages = 0`, which costs a two-stage
-cp.async pipeline the F16 path would have used. Turing has no cp.async, so its
-F16 path already runs at `nstages = 0` and the native route gives up nothing.
-The Ada thresholds in `ggml_cuda_fattn_native_profitable()` still apply there
-unchanged, so a Turing run selects the same rows a measurement would compare.
+`test-backend-ops -o NATIVE_QUANT_EQUIVALENCE` passes all nine cases of a
+default build: the six that must take the native route and the three that must
+stay on the F16 path, each asserted against the backend's native-launch counter.
+So the narrow tile widths produce the same results as the path they replace, and
+the dispatcher picks them on real Turing hardware.
+
+End to end, Qwen3.8-27B (D=256, GQA 6) with a `q4_0` cache takes the route and
+generates coherent text. Throughput measured 491-588 t/s at `pp512` and about
+28 t/s at `tg64`.
+
+Those are absolute numbers with no route-off build beside them, so they say the
+route works, not that it is faster. Turing keeps the Ada thresholds in
+`ggml_cuda_fattn_native_profitable()` for that reason.
+
+What the Ampere result does suggest: the D=256 regression there comes from the
+native loaders forcing `nstages = 0`, which costs a two-stage cp.async pipeline
+the F16 path would have used. Turing has no cp.async, so its F16 path already
+runs at `nstages = 0` and the native route gives up nothing. That predicts no
+regression rather than a gain, and it is reasoning, not measurement.
+
+`scripts/fattn-turing-model-test.sh --ab` produces the missing comparison.
 
 ### Throughput
 
