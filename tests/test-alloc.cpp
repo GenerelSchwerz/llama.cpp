@@ -1466,6 +1466,55 @@ static void test_transport_entry_allocation() {
     }
 }
 
+// Slot k starts at k*slot_size, so a slot size the budget caps must still be a multiple of the ring alignment, or every slot after the first binds its entries to a misaligned address.
+static void test_transport_slot_alignment() {
+    const size_t alignment = 256;
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, alignment, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, alignment, true);
+
+    const size_t used  = 3*alignment; // what this graph reads, already a whole number of entries
+    const size_t store = 16*alignment;
+
+    auto ctx = make_context();
+    ggml_tensor * source = ggml_new_tensor_1d(ctx.ctx, GGML_TYPE_F32, store/sizeof(float));
+    source->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_tensor * window = ggml_view_1d(ctx.ctx, source, used/sizeof(float), 0);
+    ggml_tensor * output = ggml_scale(ctx.ctx, window, 2.0f);
+    ggml_build_forward_expand(ctx.graph, output);
+
+    ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, store));
+    source->buffer = buffer.get();
+    source->data   = ggml_backend_buffer_get_base(buffer.get());
+    ggml_set_stable_prefix(source, used);
+
+    // the budget lands between the window and the next power of two, and is not a multiple of the alignment
+    const int n_slots = 3; // depth 1 plus the margin
+    const size_t budget = n_slots*used + alignment/8;
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), budget));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, cuda.handle.get());
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t deliveries = 0;
+    transport_stats(sched.get(), &deliveries, NULL, NULL);
+    GGML_ASSERT(deliveries == 1);
+
+    size_t ring_size = 0;
+    for (const auto & b : cuda.context->bindings) {
+        if (strncmp(b.tensor->name, "CUDA#", 5) == 0) {
+            ring_size = ggml_backend_buffer_get_size(b.buffer);
+        }
+    }
+    GGML_ASSERT(ring_size > 0);
+    GGML_ASSERT(ring_size % (n_slots*alignment) == 0);
+}
+
 // A window over several streams sits a fixed stride apart in one tensor, with cells between one stream's window and the next that the graph never reads.
 // The delivery has to cover each stream's window from its own offset and leave those cells alone.
 static void test_transport_multi_stream_ranges() {
@@ -1630,8 +1679,8 @@ static void test_transport_releases_ring_for_graph() {
     GGML_ASSERT(transfers == 0);
 }
 
-// a graph that stages nothing gives the staging back but keeps the transfer context: a context shift runs between decodes and must not rebuild a device context every time
-static void test_transport_keeps_context_over_idle_graph() {
+// a graph that stages nothing keeps the ring for a few graphs and the transfer context for good: a context shift runs between decodes and must not rebuild either every time
+static void test_transport_keeps_ring_over_idle_graph() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto first  = make_transport_graph(cpu, 64);
@@ -1649,15 +1698,26 @@ static void test_transport_keeps_context_over_idle_graph() {
     ggml_backend_sched_set_tensor_backend(sched.get(), first.output, cuda.handle.get());
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), first.ctx.graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), first.ctx.graph) == GGML_STATUS_SUCCESS);
-    const size_t staged_size = cuda.context->allocated_total();
+    const size_t n_staged_buffers = cuda.context->buffers.size();
     GGML_ASSERT(cuda.context->transfer_backend_count == 1);
     GGML_ASSERT(cuda.context->transfer_backend_inits == 1);
 
-    ggml_backend_sched_reset(sched.get());
-    ggml_backend_sched_set_tensor_backend(sched.get(), idle.output, cuda.handle.get());
-    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), idle.ctx.graph));
-    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), idle.ctx.graph) == GGML_STATUS_SUCCESS);
-    GGML_ASSERT(cuda.context->allocated_total() < staged_size);
+    auto run_idle = [&]() {
+        ggml_backend_sched_reset(sched.get());
+        ggml_backend_sched_set_tensor_backend(sched.get(), idle.output, cuda.handle.get());
+        GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), idle.ctx.graph));
+        GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), idle.ctx.graph) == GGML_STATUS_SUCCESS);
+    };
+
+    // one idle graph keeps the ring: freeing and allocating it again blocks the host on the device, which is what growing it in powers of two exists to avoid
+    run_idle();
+    GGML_ASSERT(cuda.context->buffers.size() == n_staged_buffers);
+
+    // a run of them gives it back: the ring is optional storage, so a scheduler that has left the staged path holds none
+    for (int i = 0; i < 16 && cuda.context->buffers.size() == n_staged_buffers; i++) {
+        run_idle();
+    }
+    GGML_ASSERT(cuda.context->buffers.size() < n_staged_buffers);
     GGML_ASSERT(cuda.context->transfer_backend_count == 1);
 
     ggml_backend_sched_reset(sched.get());
@@ -1995,11 +2055,12 @@ int main() {
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
     run("test_transport_prefix_and_configuration", test_transport_prefix_and_configuration);
     run("test_transport_entry_allocation", test_transport_entry_allocation);
+    run("test_transport_slot_alignment", test_transport_slot_alignment);
     run("test_transport_multi_stream_ranges", test_transport_multi_stream_ranges);
     run("test_transport_empty_graph", test_transport_empty_graph);
     run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
     run("test_transport_releases_ring_for_graph", test_transport_releases_ring_for_graph);
-    run("test_transport_keeps_context_over_idle_graph", test_transport_keeps_context_over_idle_graph);
+    run("test_transport_keeps_ring_over_idle_graph", test_transport_keeps_ring_over_idle_graph);
     run("test_transport_environment_is_fallback", test_transport_environment_is_fallback);
     run("test_transport_depth_zero", test_transport_depth_zero);
     run("test_transport_budget_recovers", test_transport_budget_recovers);

@@ -38,6 +38,11 @@
 
 #define LLAMA_TOKEN_NULL -1
 
+// bounds of llama_context_params::kv_pipeline_depth and ::kv_pipeline_budget_mib
+// a staging slot holds one attention layer's K or V, so a budget of 64 GiB is already uncapped: past it the value is a typo, not a budget
+#define LLAMA_KV_PIPELINE_DEPTH_MAX      14
+#define LLAMA_KV_PIPELINE_BUDGET_MIB_MAX 65536
+
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'

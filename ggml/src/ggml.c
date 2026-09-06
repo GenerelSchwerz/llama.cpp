@@ -1328,8 +1328,9 @@ size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
 
 void ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes) {
     GGML_ASSERT(tensor);
-    const size_t total = ggml_nbytes(tensor);
-    tensor->stable_prefix = nbytes < total ? nbytes : total;
+    // the count is per stream, so it is clamped to one, not to the whole body: a larger value would let a reader deliver bytes of the next stream early
+    const size_t stream = ggml_nbytes(tensor) - (size_t) (tensor->ne[3] - 1)*tensor->nb[3];
+    tensor->stable_prefix = nbytes < stream ? nbytes : stream;
 }
 
 size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor) {

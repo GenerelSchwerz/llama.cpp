@@ -2438,8 +2438,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       "host-resident cache, e.g. --no-kv-offload or --kv-cpu-pinned, and costs (N + 2) * (largest "
                       "staged split) of device memory (default: %d)", params.kv_pipeline_depth),
         [](common_params & params, int value) {
-            if (value < 0 || value > 14) {
-                throw std::invalid_argument("--kv-pipeline-depth must be between 0 and 14");
+            if (value < 0 || value > LLAMA_KV_PIPELINE_DEPTH_MAX) {
+                throw std::invalid_argument(string_format("--kv-pipeline-depth must be between 0 and %d", LLAMA_KV_PIPELINE_DEPTH_MAX));
             }
             params.kv_pipeline_depth = value;
         }
@@ -2450,12 +2450,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       "may use. A staging slot holds one attention layer's K or V over the whole context, so the "
                       "requirement grows with the context; past this cap the scheduler declines and keeps the "
                       "ordered path, so a host-resident cache never quietly trades away the device memory it exists "
-                      "to save. 0 removes the cap, 65536 is the largest accepted (default: %d)", params.kv_pipeline_budget_mib),
+                      "to save. 0 removes the cap, %d is the largest accepted (default: %d)",
+                      LLAMA_KV_PIPELINE_BUDGET_MIB_MAX, params.kv_pipeline_budget_mib),
         [](common_params & params, int value) {
             constexpr size_t mib = 1024u*1024u;
-            // a slot holds one attention layer's K or V, so a cap this large is already uncapped: past it the value is a typo, not a budget
-            if (value < 0 || value > 65536) {
-                throw std::invalid_argument("--kv-pipeline-budget must be between 0 and 65536 MiB");
+            if (value < 0 || value > LLAMA_KV_PIPELINE_BUDGET_MIB_MAX) {
+                throw std::invalid_argument(string_format("--kv-pipeline-budget must be between 0 and %d MiB", LLAMA_KV_PIPELINE_BUDGET_MIB_MAX));
             }
             if ((size_t) value > std::numeric_limits<size_t>::max()/mib) {
                 throw std::invalid_argument("--kv-pipeline-budget is out of range for this platform");

@@ -714,7 +714,7 @@ extern "C" {
 
     // declare that the first nbytes of every stream of tensor->data cannot change while a graph that reads this tensor is being evaluated
     // a stream is one index of the last dimension of the view a reader takes of this tensor, and consecutive streams sit that view's nb[3] apart, so a reader that takes the storage whole has a single stream and the region is then simply its first nbytes
-    // nbytes is clamped to ggml_nbytes(tensor), and it must be set on the tensor that owns the storage, not on a view of it
+    // nbytes is clamped to one stream of tensor, and it must be set on the tensor that owns the storage, not on a view of it
     // it must describe the graph that is about to run, including when that graph is reused
     // a backend may deliver a declared region before the point in the graph that reads it, so 0 declares nothing and is always correct
     GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);

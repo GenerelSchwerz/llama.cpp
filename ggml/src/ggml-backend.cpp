@@ -15,7 +15,6 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <inttypes.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -797,6 +796,12 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_TRANSPORT_BUDGET (128u*1024*1024)
 #endif
 
+// How many graphs in a row a ring may stage nothing before its buffer is given back.
+// A context shift or an encoder graph between two staged graphs is normal, and freeing the ring for one costs a device free plus the host block that allocating it again brings.
+#ifndef GGML_SCHED_TRANSPORT_IDLE_GRAPHS
+#define GGML_SCHED_TRANSPORT_IDLE_GRAPHS 4
+#endif
+
 // One staging slot of the transport ring.
 // A slot is owned by the transfer stream while it is filled and by the consumer stream while it is read, and the two events below are the handover in each direction.
 struct ggml_backend_sched_transport_slot {
@@ -821,6 +826,7 @@ struct ggml_backend_sched_transport_ring {
     int n_staged;    // staged splits on this backend in the current graph
     int consumed;    // of those, how many readers have been enqueued
     int scan_cursor; // how far the look-ahead has walked the split list for this ring
+    int idle_graphs; // graphs in a row that staged nothing here
 
     bool delivered;  // this ring issued deliveries and has not been waited for since
 
@@ -844,8 +850,13 @@ struct ggml_backend_sched_transport {
     int * split_order;
     int   plan_capacity;
     int   plan_n_splits;
-    int   plan_n_inputs;
+    uint64_t plan_gen;   // the split list this plan was built for
     int   n_staged;      // over all rings, so that execution can skip the machinery entirely
+
+    // which copies a plan may put in a ring, and the split that owns each of them
+    // scheduler-owned so that laying out a plan costs no allocation per graph
+    struct ggml_hash_set staged_set;
+    int *                staged_owner; // [staged_set.size]
 
     // which inputs the plan put in a ring, flattened over splits
     // membership is decided once, when the ring is laid out, and is what execution goes by: the amount that can go early moves with every ubatch, but which input copies live in the ring must not
@@ -917,6 +928,7 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_split * splits;
     int n_splits;
     int splits_capacity;
+    uint64_t splits_gen; // bumped on every split, so a plan can say which split list it was built for
 
     // pipeline parallelism support
     int n_copies;
@@ -1176,6 +1188,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
+    sched->splits_gen++;
     sched->is_reset = false;
 
     struct ggml_init_params params = {
@@ -1900,9 +1913,10 @@ static void ggml_backend_sched_transport_free_ring(ggml_backend_sched_t sched, i
     }
 
     ggml_backend_buffer_free(r->buffer);
-    r->buffer    = NULL;
-    r->slot_size = 0;
-    r->delivered = false;
+    r->buffer      = NULL;
+    r->slot_size   = 0;
+    r->delivered   = false;
+    r->idle_graphs = 0;
 
     for (int i = 0; i < GGML_SCHED_MAX_TRANSPORT_SLOTS; i++) {
         r->slots[i].release_armed = false;
@@ -1930,21 +1944,33 @@ static void ggml_backend_sched_transport_release_ring(ggml_backend_sched_t sched
     r->n_staged = 0;
 }
 
-// Give back the staging of every ring the current graph does not use.
-// The ring is optional storage, so a scheduler that leaves the staged path for a graph holds no device memory for it.
-// The transfer context and the events stay: a graph that stages nothing is a normal thing to meet between staged ones -- a context shift runs on the CPU backend alone -- and rebuilding a device context around each of them costs far more than holding it.
+// Count one graph that staged nothing on this ring, and give the staging back once there have been a few in a row.
+// The ring is optional storage, so a scheduler that has left the staged path holds no device memory for it.
+// It is not given back on the first idle graph: one between two staged ones is a normal thing to meet -- a context shift runs on the CPU backend alone -- and the ring is grown in powers of two exactly to keep allocating it again off the decode path.
+// The transfer context and the events stay for the same reason: rebuilding a device context costs far more than holding it.
+static void ggml_backend_sched_transport_ring_idle(ggml_backend_sched_t sched, int backend_id) {
+    struct ggml_backend_sched_transport_ring * r = &sched->transport.rings[backend_id];
+
+    if (r->buffer != NULL && ++r->idle_graphs > GGML_SCHED_TRANSPORT_IDLE_GRAPHS) {
+        ggml_backend_sched_transport_free_ring(sched, backend_id);
+    }
+}
+
 static void ggml_backend_sched_transport_release_idle(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         if (sched->transport.rings[i].n_staged == 0) {
-            ggml_backend_sched_transport_free_ring(sched, i);
+            ggml_backend_sched_transport_ring_idle(sched, i);
         }
     }
 }
 
+// Take this backend's splits out of the current plan and give its staging back.
+// The transfer context and the events stay: what made this graph decline -- a window past the budget, a device that is momentarily full -- can be gone by the next one.
 static void ggml_backend_sched_transport_decline_backend(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport * tr = &sched->transport;
 
-    ggml_backend_sched_transport_release_ring(sched, backend_id);
+    ggml_backend_sched_transport_free_ring(sched, backend_id);
+    tr->rings[backend_id].n_staged = 0;
 
     if (tr->split_order == NULL || tr->split_input_ofs == NULL || tr->input_staged == NULL) {
         return;
@@ -1961,6 +1987,14 @@ static void ggml_backend_sched_transport_decline_backend(ggml_backend_sched_t sc
     }
 }
 
+// Stop asking this backend for a ring, and give back the device context with it.
+// For the declines that will not go away on their own: a device that cannot give a second context, or that fails an allocation the headroom check approved.
+static void ggml_backend_sched_transport_disable_backend(ggml_backend_sched_t sched, int backend_id) {
+    ggml_backend_sched_transport_decline_backend(sched, backend_id);
+    ggml_backend_sched_transport_release_ring(sched, backend_id);
+    sched->transport.rings[backend_id].eligible = false;
+}
+
 // Give every ring back and stop asking for one.
 // The ring is optional, so it is the first thing to release when the device cannot hold it and the graph at the same time.
 // Returns whether any ring was holding memory.
@@ -1970,8 +2004,7 @@ static bool ggml_backend_sched_transport_decline_all(ggml_backend_sched_t sched)
     bool released = false;
     for (int i = 0; i < sched->n_backends; i++) {
         released |= tr->rings[i].buffer != NULL;
-        ggml_backend_sched_transport_decline_backend(sched, i);
-        tr->rings[i].eligible = false;
+        ggml_backend_sched_transport_disable_backend(sched, i);
     }
     tr->n_staged = 0;
 
@@ -2007,12 +2040,18 @@ static bool ggml_backend_sched_size_pad(size_t size, size_t alignment, size_t * 
 // How large a slot to allocate for a window that needs `need`, where `limit` is the most that may be spent on one.
 // The staged window widens on nearly every prefill ubatch, and a wider window than the ring holds frees the ring and allocates it again, which blocks the host on the device.
 // Powers of two make that happen a handful of times over a prompt instead of once per ubatch.
-static size_t ggml_backend_sched_transport_slot_alloc(size_t need, size_t limit) {
+// Slot k starts at k*slot_size, so the result must be a multiple of the alignment: `limit` comes from the budget and the free memory and is not one. `need` already is.
+static size_t ggml_backend_sched_transport_slot_alloc(size_t need, size_t limit, size_t alignment) {
+    GGML_ASSERT(alignment > 0 && need % alignment == 0);
+
     size_t size = 1;
     while (size < need && size <= SIZE_MAX/2) {
         size *= 2;
     }
-    return std::max(std::min(size, limit), need);
+    size = std::max(std::min(size, limit), need);
+    size -= size % alignment;
+
+    return std::max(size, need);
 }
 
 // The transfer backend and the slot events are created on demand, so a backend that never gets to stage anything -- no eligible inputs, or no room within the budget -- does not carry a second device context for nothing.
@@ -2063,7 +2102,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
 
     tr->n_staged = 0;
     tr->plan_n_splits = 0;
-    tr->plan_n_inputs = 0;
+    tr->plan_gen      = 0;
     for (int i = 0; i < sched->n_backends; i++) {
         tr->rings[i].n_staged    = 0;
         tr->rings[i].consumed    = 0;
@@ -2118,7 +2157,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
     }
     memset(tr->input_staged, 0, n_inputs_total);
     tr->plan_n_splits = sched->n_splits;
-    tr->plan_n_inputs = n_inputs_total;
+    tr->plan_gen      = sched->splits_gen;
 
     int n_candidates = 0;
     for (int i = 0; i < sched->n_splits; i++) {
@@ -2143,10 +2182,28 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
     // build one lookup table, then scan each graph node once
     size_t staged_hash_size = n_candidates;
     staged_hash_size += staged_hash_size/4 + 1;
-    struct ggml_hash_set staged_copies = ggml_hash_set_new(staged_hash_size);
-    int * staged_owner = (int *) malloc(staged_copies.size * sizeof(int));
-    GGML_ASSERT(staged_owner != NULL);
-    for (size_t i = 0; i < staged_copies.size; i++) {
+    if (tr->staged_set.size < staged_hash_size) {
+        struct ggml_hash_set set = ggml_hash_set_new(staged_hash_size);
+        int * owner = (int *) realloc(tr->staged_owner, set.size * sizeof(int));
+        if (owner == NULL) {
+            ggml_hash_set_free(&set);
+            GGML_LOG_WARN("%s: failed to allocate the transport plan, pipelining disabled for this graph\n", __func__);
+            for (int i = 0; i < sched->n_splits; i++) {
+                tr->split_order[i] = -1;
+            }
+            ggml_backend_sched_transport_release_idle(sched);
+            return;
+        }
+        ggml_hash_set_free(&tr->staged_set);
+        tr->staged_set   = set;
+        tr->staged_owner = owner;
+    } else {
+        ggml_hash_set_reset(&tr->staged_set);
+    }
+
+    struct ggml_hash_set * staged_copies = &tr->staged_set;
+    int * staged_owner = tr->staged_owner;
+    for (size_t i = 0; i < staged_copies->size; i++) {
         staged_owner[i] = -1;
     }
 
@@ -2157,7 +2214,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
-            const size_t id = ggml_hash_find_or_insert(&staged_copies, input_cpy);
+            const size_t id = ggml_hash_find_or_insert(staged_copies, input_cpy);
             if (staged_owner[id] == -1) {
                 staged_owner[id] = i;
             } else {
@@ -2171,8 +2228,8 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         for (int j = 0; j < graph->n_nodes; j++) {
             const struct ggml_tensor * node = graph->nodes[j];
             if (node->view_src != NULL) {
-                const size_t id = ggml_hash_find(&staged_copies, node->view_src);
-                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id)) {
+                const size_t id = ggml_hash_find(staged_copies, node->view_src);
+                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies->used, id)) {
                     staged_owner[id] = -2;
                 }
             }
@@ -2180,8 +2237,8 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                 if (node->src[k] == NULL) {
                     continue;
                 }
-                const size_t id = ggml_hash_find(&staged_copies, node->src[k]);
-                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id) && staged_owner[id] >= 0 && i > staged_owner[id]) {
+                const size_t id = ggml_hash_find(staged_copies, node->src[k]);
+                if (id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies->used, id) && staged_owner[id] >= 0 && i > staged_owner[id]) {
                     staged_owner[id] = -2;
                 }
             }
@@ -2195,15 +2252,13 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(split->inputs[j], split->backend_id, sched->cur_copy);
-            const size_t id = ggml_hash_find(&staged_copies, input_cpy);
-            GGML_ASSERT(id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies.used, id));
+            const size_t id = ggml_hash_find(staged_copies, input_cpy);
+            GGML_ASSERT(id != GGML_HASHSET_FULL && ggml_bitset_get(staged_copies->used, id));
             if (staged_owner[id] < 0) {
                 tr->input_staged[tr->split_input_ofs[i] + j] = 0;
             }
         }
     }
-    free(staged_owner);
-    ggml_hash_set_free(&staged_copies);
 
     // per-ring slot size and delivery order
     // the budget is applied to what this graph needs, so a run whose window stays small keeps the ring whatever -n_ctx says
@@ -2254,9 +2309,9 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             ggml_backend_sched_transport_decline_backend(sched, bid);
             continue;
         }
-        // a graph that stages nothing here gives the staging back, so a scheduler that leaves the staged path holds no device memory for it
+        // a graph that stages nothing here counts as idle, and the ring is given back once a few of them have gone by
         if (r->n_staged == 0) {
-            ggml_backend_sched_transport_free_ring(sched, bid);
+            ggml_backend_sched_transport_ring_idle(sched, bid);
             continue;
         }
 
@@ -2288,8 +2343,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
         if (!ggml_backend_sched_transport_ensure_backend(sched, bid)) {
             GGML_LOG_WARN("%s: failed to create a transfer context on %s, pipelining disabled there\n", __func__,
                     ggml_backend_name(sched->backends[bid]));
-            ggml_backend_sched_transport_decline_backend(sched, bid);
-            r->eligible = false;
+            ggml_backend_sched_transport_disable_backend(sched, bid);
             continue;
         }
 
@@ -2324,7 +2378,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             if (dev_free > GGML_SCHED_TRANSPORT_HEADROOM) {
                 slot_limit = std::min(slot_limit, (dev_free - GGML_SCHED_TRANSPORT_HEADROOM)/tr->n_slots);
             }
-            const size_t slot_alloc = ggml_backend_sched_transport_slot_alloc(slot_size[bid], slot_limit);
+            const size_t slot_alloc = ggml_backend_sched_transport_slot_alloc(slot_size[bid], slot_limit, r->alignment);
             const size_t alloc_size = slot_alloc*tr->n_slots;
 
             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
@@ -2334,8 +2388,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
                 GGML_LOG_WARN("%s: failed to allocate %zu MiB for the transport ring on %s, "
                         "pipelining disabled there\n", __func__, alloc_size >> 20,
                         ggml_backend_name(sched->backends[bid]));
-                ggml_backend_sched_transport_decline_backend(sched, bid);
-                r->eligible = false;
+                ggml_backend_sched_transport_disable_backend(sched, bid);
                 continue;
             }
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -2349,7 +2402,8 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             }
         }
 
-        tr->n_staged += r->n_staged;
+        r->idle_graphs = 0;
+        tr->n_staged  += r->n_staged;
     }
 
     if (tr->n_staged == 0) {
@@ -2538,19 +2592,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     struct ggml_backend_sched_transport * tr = &sched->transport;
     bool named_ordered_now = false;
     // a reused graph keeps the plan that was made for it, so the split list it describes must be the one about to run
-    int n_inputs_now = 0;
-    for (int i = 0; i < sched->n_splits; i++) {
-        n_inputs_now += splits[i].n_inputs;
-    }
-    const bool staged = tr->n_staged > 0 && tr->plan_n_splits == sched->n_splits &&
-                        tr->plan_n_inputs == n_inputs_now;
+    const bool staged = tr->n_staged > 0 && tr->plan_gen == sched->splits_gen;
 
     // A staged delivery reads its host source long after the call that issued it returned, and the previous graph can leave some of those reads in flight.
     // Within a graph the stable prefix keeps the host off what is still being read, but the next graph writes wherever its own ubatch lands, so wait for the previous one here.
     // This is what the ordered path gets from its blocking copy, once per graph rather than once per split.
     // It also costs the graph-level pipelining of n_copies > 1, which exists to keep the host from blocking here: a scheduler that wants that instead keeps the ordered path with depth 0.
+    // A ring that is about to stage has to wait even when it delivered nothing last graph: the previous graph may have left the consumer writing the host source, and the priming prefetch below reads it.
     for (int i = 0; i < sched->n_backends; i++) {
-        if (!tr->rings[i].delivered) {
+        if (!tr->rings[i].delivered && !(staged && tr->rings[i].n_staged > 0)) {
             continue;
         }
         if (tr->rings[i].transfer) {
@@ -3113,6 +3163,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->transport.split_order);
     free(sched->transport.split_input_ofs);
     free(sched->transport.input_staged);
+    free(sched->transport.staged_owner);
+    ggml_hash_set_free(&sched->transport.staged_set);
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);

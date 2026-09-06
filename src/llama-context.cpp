@@ -147,6 +147,12 @@ llama_context::llama_context(
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
     cparams.kv_pipeline_depth       = params.kv_pipeline_depth;
     cparams.kv_pipeline_budget_mib  = params.kv_pipeline_budget_mib;
+    if (cparams.kv_pipeline_depth > LLAMA_KV_PIPELINE_DEPTH_MAX) {
+        throw std::invalid_argument("kv_pipeline_depth must be <= " + std::to_string(LLAMA_KV_PIPELINE_DEPTH_MAX));
+    }
+    if (cparams.kv_pipeline_budget_mib > std::min<uint64_t>(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX, std::numeric_limits<size_t>::max()/(1024*1024))) {
+        throw std::invalid_argument("kv_pipeline_budget_mib must be <= " + std::to_string(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX));
+    }
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
@@ -868,15 +874,6 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
 
     auto create_sched = [&](bool pipeline_parallel) {
         constexpr size_t mib = 1024u*1024u;
-        if (cparams.kv_pipeline_depth > 14) {
-            throw std::invalid_argument("kv_pipeline_depth must be between 0 and 14");
-        }
-        // a slot holds one attention layer's K or V, so a cap of 64 GiB is already uncapped: past it the value is a typo, not a budget
-        constexpr uint64_t max_budget_mib = std::min<uint64_t>(65536, std::numeric_limits<size_t>::max()/mib);
-        if (cparams.kv_pipeline_budget_mib > max_budget_mib) {
-            throw std::invalid_argument("kv_pipeline_budget_mib must be between 0 and 65536 MiB");
-        }
-
         sched.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, pipeline_parallel, cparams.op_offload));
