@@ -1236,8 +1236,21 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     if (params.attn_split != nullptr) {
-        pimpl->attn_split_owned.assign(params.attn_split, params.attn_split + llama_max_devices());
-        this->params.attn_split = pimpl->attn_split_owned.data();
+        // the shares reach a cumulative division and a conversion to whole heads, so a negative, a
+        // non-finite or an all-zero set has no meaning here - fall back to the tensor split
+        float sum = 0.0f;
+        bool  ok  = true;
+        for (size_t i = 0; i < llama_max_devices(); i++) {
+            ok = ok && std::isfinite(params.attn_split[i]) && params.attn_split[i] >= 0.0f;
+            sum += params.attn_split[i];
+        }
+        if (!ok || !(sum > 0.0f)) {
+            LLAMA_LOG_WARN("%s: the attention split is not a set of non-negative shares; ignoring it\n", __func__);
+            this->params.attn_split = nullptr;
+        } else {
+            pimpl->attn_split_owned.assign(params.attn_split, params.attn_split + llama_max_devices());
+            this->params.attn_split = pimpl->attn_split_owned.data();
+        }
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
