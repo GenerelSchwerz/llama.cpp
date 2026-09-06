@@ -167,6 +167,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // the context that evaluates this cache; a cache that prepares no update of its own is told by its owner
+    void set_lctx(llama_context * lctx);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
@@ -238,6 +241,11 @@ public:
                          bool   is_reserve,
             const slot_info   * sinfo = nullptr) const;
 
+    // tell the scheduler which part of each layer's K/V storage this ubatch does not write, so a host-resident cache can be delivered ahead of the attention that reads it
+    // must be refreshed for every ubatch, including when the graph is reused, because the write position moves while the graph does not
+    void update_stable_prefixes(const slot_info & sinfo) const;
+    void clear_stable_prefixes() const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -304,6 +312,11 @@ private:
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
+
+    // the context that evaluates this cache, taken from the last update it prepared
+    // clear() writes the buffers, a delivery of them can still be in flight, and only the context can wait for it
+    // a cache belongs to one context: a cache that shares another's cells is still a separate object with its own buffers
+    llama_context * lctx = nullptr;
 
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;

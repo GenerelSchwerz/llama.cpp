@@ -649,11 +649,12 @@ extern "C" {
 
     // this tensor...
     enum ggml_tensor_flag {
-        GGML_TENSOR_FLAG_INPUT   =  1, // ...is an input for the GGML compute graph
-        GGML_TENSOR_FLAG_OUTPUT  =  2, // ...is an output for the GGML compute graph
-        GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
-        GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
-        GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_INPUT     =  1, // ...is an input for the GGML compute graph
+        GGML_TENSOR_FLAG_OUTPUT    =  2, // ...is an output for the GGML compute graph
+        GGML_TENSOR_FLAG_PARAM     =  4, // ...contains trainable parameters
+        GGML_TENSOR_FLAG_LOSS      =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
+        GGML_TENSOR_FLAG_COMPUTE   = 16, // ...must be computed
+        GGML_TENSOR_FLAG_TRANSPORT = 32, // ...is persistent host storage that can use split-input transport
     };
 
     enum ggml_tri_type {
@@ -702,10 +703,21 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        char padding[8];
+        // bytes at the start of every stream that stay unchanged for the current graph evaluation, 0 for none
+        union {
+            size_t stable_prefix;
+            char padding[8];
+        };
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
+
+    // declare that the first nbytes of every stream of tensor->data cannot change while a graph that reads this tensor runs
+    // a reader splits the storage into streams along the last dimension of its own view, so nbytes counts from the start of a stream, not of the tensor, and the caller must not pass more than one stream holds
+    // set it on the tensor that owns the storage, not on a view of it, and refresh it for the graph that is about to run, including when that graph is reused
+    // a backend may deliver a declared region before the point in the graph that reads it, so 0 declares nothing and is always correct
+    GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);
+    GGML_API size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor);
 
     // Abort callback
     // If not NULL, called before ggml computation

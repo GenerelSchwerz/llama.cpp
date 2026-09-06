@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -2434,6 +2435,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.kv_cpu_pinned = value;
         }
     ).set_env("LLAMA_ARG_KV_CPU_PINNED"));
+    add_opt(common_arg(
+        {"--kv-pipeline-depth"}, "N",
+        string_format("how many splits ahead the scheduler delivers a host-resident KV cache to the accelerator, so "
+                      "that the transfer runs while the previous split computes; 0 keeps the ordered path, where a "
+                      "decode token pays the transfer and the attention kernels in series. Only takes effect with a "
+                      "host-resident cache, e.g. --no-kv-offload or --kv-cpu-pinned, and costs (N + 2) * (largest "
+                      "staged split) of device memory (default: %d)", params.kv_pipeline_depth),
+        [](common_params & params, int value) {
+            if (value < 0 || value > LLAMA_KV_PIPELINE_DEPTH_MAX) {
+                throw std::invalid_argument(string_format("--kv-pipeline-depth must be between 0 and %d", LLAMA_KV_PIPELINE_DEPTH_MAX));
+            }
+            params.kv_pipeline_depth = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIPELINE_DEPTH"));
+    add_opt(common_arg(
+        {"--kv-pipeline-budget"}, "N",
+        string_format("hard cap, in MiB, on the device memory that pipelined delivery of a host-resident KV cache "
+                      "may use. A staging slot holds one attention layer's K or V over the whole context, so the "
+                      "requirement grows with the context; past this cap the scheduler declines and keeps the "
+                      "ordered path, so a host-resident cache never quietly trades away the device memory it exists "
+                      "to save. 0 removes the cap, %d is the largest accepted (default: %d)",
+                      LLAMA_KV_PIPELINE_BUDGET_MIB_MAX, params.kv_pipeline_budget_mib),
+        [](common_params & params, int value) {
+            constexpr size_t mib = 1024u*1024u;
+            if (value < 0 || value > LLAMA_KV_PIPELINE_BUDGET_MIB_MAX) {
+                throw std::invalid_argument(string_format("--kv-pipeline-budget must be between 0 and %d MiB", LLAMA_KV_PIPELINE_BUDGET_MIB_MAX));
+            }
+            if ((size_t) value > std::numeric_limits<size_t>::max()/mib) {
+                throw std::invalid_argument("--kv-pipeline-budget is out of range for this platform");
+            }
+            params.kv_pipeline_budget_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIPELINE_BUDGET"));
     add_opt(common_arg(
         {"--recurrent-state-offload"},
         {"--no-recurrent-state-offload"},

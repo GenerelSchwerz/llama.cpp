@@ -145,6 +145,14 @@ llama_context::llama_context(
     cparams.kv_cpu_pinned           = params.kv_cpu_pinned;
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.offload_attn_compute    = params.offload_kqv || (params.op_offload && params.kv_cpu_pinned);
+    cparams.kv_pipeline_depth       = params.kv_pipeline_depth;
+    cparams.kv_pipeline_budget_mib  = params.kv_pipeline_budget_mib;
+    if (cparams.kv_pipeline_depth > LLAMA_KV_PIPELINE_DEPTH_MAX) {
+        throw std::invalid_argument("kv_pipeline_depth must be <= " + std::to_string(LLAMA_KV_PIPELINE_DEPTH_MAX));
+    }
+    if (cparams.kv_pipeline_budget_mib > std::min<uint64_t>(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX, std::numeric_limits<size_t>::max()/(1024*1024))) {
+        throw std::invalid_argument("kv_pipeline_budget_mib must be <= " + std::to_string(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX));
+    }
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
@@ -874,10 +882,16 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     }
 
     auto create_sched = [&](bool pipeline_parallel) {
+        constexpr size_t mib = 1024u*1024u;
         sched.reset(ggml_backend_sched_new(
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, pipeline_parallel, cparams.op_offload));
         cparams.flash_attn_causal_prefix_supported = llama_sched_supports_flash_attn_causal_prefix(sched.get());
+        // the scheduler refuses a depth past its own bound, which a build can set lower than LLAMA_KV_PIPELINE_DEPTH_MAX
+        if (!ggml_backend_sched_set_transport_pipeline_budget(sched.get(), (size_t) cparams.kv_pipeline_budget_mib*mib) ||
+            !ggml_backend_sched_set_transport_pipeline_depth(sched.get(), cparams.kv_cpu_pinned || !cparams.offload_kqv ? (int) cparams.kv_pipeline_depth : 0)) {
+            throw std::invalid_argument("invalid KV transport pipeline configuration");
+        }
         if (sched_resizable) {
             sched_buffers_shared = sched_buffer_owner != nullptr && sched_buffer_owner->get_sched() != nullptr &&
                     ggml_backend_sched_set_resizable(sched.get(), sched_buffer_owner->get_sched());
@@ -4103,6 +4117,8 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_pipeline_depth           =*/ 1,
+        /*.kv_pipeline_budget_mib      =*/ 128,
     };
 
     return result;

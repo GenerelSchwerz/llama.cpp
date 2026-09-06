@@ -263,6 +263,14 @@ llama_kv_cache::llama_kv_cache(
                 layers.push_back(layer_share);
                 layers.back().il = il;
 
+                // this cache writes the shared tensors at its own slot, so their stable prefix would have two writers: keep them on the ordered path
+                if (layers.back().k) {
+                    layers.back().k->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+                if (layers.back().v) {
+                    layers.back().v->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+
                 continue;
             }
         }
@@ -313,6 +321,15 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+
+        if (ggml_backend_buft_is_host(buft)) {
+            if (k) {
+                k->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+            if (v && !v_trans) {
+                v->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+        }
 
         bool k_store_quantize = false;
         bool v_store_quantize = false;
@@ -468,6 +485,11 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
+        // a decode can still be delivering these buffers to the device, and the memset would race that read
+        if (lctx) {
+            llama_synchronize(lctx);
+        }
+
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -843,8 +865,15 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
     return get_size();
 }
 
+void llama_kv_cache::set_lctx(llama_context * lctx) {
+    this->lctx = lctx;
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
+
+    // every decode prepares an update, so this is set before a delivery can be in flight
+    set_lctx(lctx);
 
     bool do_shift = get_has_shift();
 
@@ -1199,9 +1228,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // a cache that shares cells sets no stable prefix: the layers it aliases lost the transport flag when it took them, and the rest are the owner's to describe
     if (other) {
         return;
     }
+
+    // before the graph is built and allocated, so the scheduler's delivery plan and the deliveries it then issues are decided against the same write position
+    update_stable_prefixes(sinfo);
 
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
@@ -1633,6 +1666,43 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     }
 
     return res;
+}
+
+void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
+    // the lowest row this ubatch writes, counted within a stream: everything below it keeps what the previous ubatch left there for the whole graph
+    // counting across the body instead would let the lowest stream cap every stream above it
+    uint64_t min_row = UINT64_MAX;
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (const uint32_t idx : sinfo.idxs[s]) {
+            min_row = std::min(min_row, (uint64_t) idx);
+        }
+    }
+
+    if (min_row == UINT64_MAX) {
+        clear_stable_prefixes();
+        return;
+    }
+
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            ggml_set_stable_prefix(layer.k, min_row*layer.k->nb[1]);
+        }
+        if (layer.v) {
+            // the transposed V cache scatters each ubatch across the whole tensor, so there is no leading region that this ubatch leaves alone
+            ggml_set_stable_prefix(layer.v, v_trans ? 0 : min_row*layer.v->nb[1]);
+        }
+    }
+}
+
+void llama_kv_cache::clear_stable_prefixes() const {
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            ggml_set_stable_prefix(layer.k, 0);
+        }
+        if (layer.v) {
+            ggml_set_stable_prefix(layer.v, 0);
+        }
+    }
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -2273,6 +2343,9 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_context * lctx) const {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     GGML_ASSERT(!other);
+
+    // this graph rewrites the whole body in place, so nothing in it may be delivered early
+    clear_stable_prefixes();
 
     auto * ctx = res->get_ctx();
     auto * gf  = res->get_gf();

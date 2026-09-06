@@ -38,6 +38,11 @@
 
 #define LLAMA_TOKEN_NULL -1
 
+// bounds of llama_context_params::kv_pipeline_depth and ::kv_pipeline_budget_mib
+// a staging slot holds one attention layer's K or V, so a budget of 64 GiB is already uncapped: past it the value is a typo, not a budget
+#define LLAMA_KV_PIPELINE_DEPTH_MAX      14
+#define LLAMA_KV_PIPELINE_BUDGET_MIB_MAX 65536
+
 #define LLAMA_FILE_MAGIC_GGLA 0x67676c61u // 'ggla'
 #define LLAMA_FILE_MAGIC_GGSN 0x6767736eu // 'ggsn'
 #define LLAMA_FILE_MAGIC_GGSQ 0x67677371u // 'ggsq'
@@ -420,6 +425,12 @@ extern "C" {
 
         // A source/target/parent context that can share results or llama_memory.
         struct llama_context * ctx_other;
+
+        uint32_t kv_pipeline_depth;      // how many splits ahead the scheduler delivers a host-resident KV cache, so that the transfer runs while the previous split computes
+                                         // 0 keeps the ordered path, where a decode token pays the transfer and the attention kernels in series
+                                         // costs (kv_pipeline_depth + 2) * (largest staged split) of device memory
+        uint32_t kv_pipeline_budget_mib; // hard cap on that device memory, in MiB, past which the scheduler keeps the ordered path
+                                         // a host-resident cache never quietly trades back the device memory it exists to save, 0 removes the cap
     };
 
     struct llama_model_tensor_override {
@@ -740,6 +751,7 @@ extern "C" {
 
     // Clear the memory contents
     // If data == true, the data buffers will also be cleared together with the metadata
+    // NOTE: with data == true this waits for a decode that is still running, which can still be reading the buffers
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);
