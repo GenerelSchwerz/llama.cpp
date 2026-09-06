@@ -95,6 +95,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <cuda/atomic>
+#endif
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
@@ -2496,6 +2500,23 @@ static ggml_cuda_moe_ids_cache_key ggml_cuda_moe_ids_cache_make_key(const ggml_t
     };
 }
 
+// The GPU publishes this aligned flag in mapped host memory.
+static uint32_t ggml_cuda_moe_ready_load(uint32_t * ready) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*ready).load(cuda::memory_order_acquire);
+#else
+    return __atomic_load_n(ready, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static void ggml_cuda_moe_ready_clear(uint32_t * ready) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*ready).store(0, cuda::memory_order_release);
+#else
+    __atomic_store_n(ready, 0, __ATOMIC_RELEASE);
+#endif
+}
+
 static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * ids) {
@@ -2537,7 +2558,7 @@ static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         entry.host_ready = (uint32_t *) (entry.host_ids + count);
         entry.device_ready = (uint32_t *) (entry.device_ids + count);
         entry.count = count;
-        __atomic_store_n(entry.host_ready, 0, __ATOMIC_RELEASE);
+        ggml_cuda_moe_ready_clear(entry.host_ready);
     }
     return {entry.device_ids, entry.device_ready};
 }
@@ -2615,7 +2636,7 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
             const int64_t spin_start_us = ggml_time_us();
             do {
                 for (int spin = 0; spin < 1024; ++spin) {
-                    if (__atomic_load_n(published->second.host_ready, __ATOMIC_ACQUIRE) != 0) {
+                    if (ggml_cuda_moe_ready_load(published->second.host_ready) != 0) {
                         ready = true;
                         break;
                     }
@@ -2638,7 +2659,7 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
             result.d2h_sync_count = 1;
         }
         if (can_use_published) {
-            __atomic_store_n(published->second.host_ready, 0, __ATOMIC_RELEASE);
+            ggml_cuda_moe_ready_clear(published->second.host_ready);
         }
         result.d2h_time_us = (uint64_t) (ggml_time_us() - start_us);
         result.bytes = target;
