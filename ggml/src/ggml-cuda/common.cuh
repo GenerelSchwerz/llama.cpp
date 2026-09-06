@@ -1427,6 +1427,7 @@ struct ggml_cuda_stream_context {
 };
 
 class ggml_cuda_moe_grouped_context;
+struct ggml_cuda_moe_ids_cache_state;
 
 struct ggml_backend_cuda_context {
     int device;
@@ -1434,6 +1435,7 @@ struct ggml_backend_cuda_context {
     cudaEvent_t copy_event = nullptr;
     std::once_flag moe_grouped_context_once;
     ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
+    std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
@@ -1497,10 +1499,7 @@ struct ggml_backend_cuda_context {
     }
 #endif // USE_CUDA_GRAPH
 
-    explicit ggml_backend_cuda_context(int device) :
-        device(device),
-        name(GGML_CUDA_NAME + std::to_string(device)) {
-    }
+    explicit ggml_backend_cuda_context(int device);
 
     ggml_cuda_stream_context concurrent_stream_context;
 
