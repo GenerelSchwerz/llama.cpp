@@ -765,32 +765,6 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
-ggml_backend_cuda_context::~ggml_backend_cuda_context() {
-    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
-    ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
-
-    cuda_graphs.clear();
-    delete moe_grouped_context;
-
-    if (copy_event != nullptr) {
-        CUDA_CHECK(cudaEventDestroy(copy_event));
-    }
-    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
-        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
-            if (streams[i][j] != nullptr) {
-                CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
-            }
-            if (cublas_handles[i][j] != nullptr) {
-                CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));
-            }
-            if (cublas_workspaces[i][j] != nullptr) {
-                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
-            }
-        }
-    }
-}
-
-
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
@@ -2292,8 +2266,9 @@ enum ggml_cuda_moe_ids_kind {
 };
 
 struct ggml_cuda_moe_ids_cache_state {
+    static constexpr size_t MAX_PUBLISHED = GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS;
+
     int device = -1;
-    int published_device = -1;
     bool pending = false;
     ggml_cuda_moe_ids_kind kind = GGML_CUDA_MOE_IDS_KIND_NONE;
     ggml_cuda_moe_ids_cache_key key = {};
@@ -2340,7 +2315,52 @@ struct ggml_cuda_moe_ids_cache_state {
     }
 };
 
-static thread_local ggml_cuda_moe_ids_cache_state ggml_cuda_moe_ids_cache;
+ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
+    device(device), name(GGML_CUDA_NAME + std::to_string(device)) {
+}
+
+ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+    ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+
+    cuda_graphs.clear();
+    delete moe_grouped_context;
+
+    if (copy_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(copy_event));
+    }
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+            if (streams[i][j] != nullptr) {
+                if (moe_ids_cache != nullptr) {
+                    CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
+                }
+                CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+            }
+            if (cublas_handles[i][j] != nullptr) {
+                CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));
+            }
+            if (cublas_workspaces[i][j] != nullptr) {
+                CUDA_CHECK(cudaFree(cublas_workspaces[i][j]));
+            }
+        }
+    }
+}
+
+static ggml_cuda_moe_ids_cache_state & ggml_cuda_moe_ids_cache_get(ggml_backend_cuda_context & ctx) {
+    if (ctx.moe_ids_cache == nullptr) {
+        ctx.moe_ids_cache = std::make_unique<ggml_cuda_moe_ids_cache_state>();
+    }
+    return *ctx.moe_ids_cache;
+}
+
+size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return 0;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    return ctx->moe_ids_cache != nullptr ? ctx->moe_ids_cache->published.size() : 0;
+}
 
 struct ggml_cuda_moe_ids_host {
     const std::vector<char> * bytes = nullptr;
@@ -2461,17 +2481,17 @@ static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         return {};
     }
 
-    const int device = ggml_cuda_get_device();
-    if (ggml_cuda_moe_ids_cache.published_device != device) {
-        ggml_cuda_moe_ids_cache.clear_published();
-        ggml_cuda_moe_ids_cache.published_device = device;
-    }
+    auto & ggml_cuda_moe_ids_cache = ggml_cuda_moe_ids_cache_get(ctx);
 
     const ggml_cuda_moe_ids_cache_state::published_key key{ids->data, ctx.stream()};
-    auto & entry = ggml_cuda_moe_ids_cache.published[key];
+    auto & published = ggml_cuda_moe_ids_cache.published;
+    if (published.find(key) == published.end() && published.size() >= ggml_cuda_moe_ids_cache_state::MAX_PUBLISHED) {
+        return {};
+    }
+    auto & entry = published[key];
     if (entry.host_ids && entry.count != count) {
-        CUDA_CHECK(cudaFreeHost(entry.host_ids));
-        entry = {};
+        // Captured graphs can still write to this allocation.
+        return {};
     }
     if (!entry.host_ids) {
         void * host = nullptr;
@@ -2505,10 +2525,7 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
         std::vector<char> & storage) {
     ggml_cuda_moe_ids_host result;
     const int device = ggml_cuda_get_device();
-    if (ggml_cuda_moe_ids_cache.published_device != device) {
-        ggml_cuda_moe_ids_cache.clear_published();
-        ggml_cuda_moe_ids_cache.published_device = device;
-    }
+    auto & ggml_cuda_moe_ids_cache = ggml_cuda_moe_ids_cache_get(ctx);
     const int layer = ggml_cuda_moe_layer_from_name(tensor_name);
     const ggml_cuda_moe_ids_cache_key key = ggml_cuda_moe_ids_cache_make_key(ids, layer);
     const ggml_cuda_moe_ids_kind kind = ggml_cuda_moe_ids_kind_from_name(tensor_name);

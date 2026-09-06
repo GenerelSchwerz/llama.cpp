@@ -919,6 +919,7 @@ private:
 };
 
 ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_backend_t backend);
+size_t ggml_cuda_moe_ids_cache_count_for_test(ggml_backend_t backend);
 
 struct ggml_cuda_graph_capture_state_for_test {
     uintptr_t graph = 0;
