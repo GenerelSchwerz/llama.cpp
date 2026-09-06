@@ -287,7 +287,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
+        const bool layer_offload = offload || placement.gpu_resident_ils.count(il) > 0;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (layer_offload) {
@@ -299,6 +299,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
+            if (placement.gpu_resident_done) {
+                placement.gpu_resident_done->insert(il);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -339,9 +342,8 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream, });
     }
 
-    if (!offload && placement.gpu_resident_layers > 0) {
-        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested owned attention layers device-resident\n",
-                __func__, n_gpu_resident, placement.gpu_resident_layers);
+    if (!offload && n_gpu_resident > 0) {
+        LLAMA_LOG_DEBUG("%s: %u attention layers device-resident\n", __func__, n_gpu_resident);
     }
 
     if (reuse) {
