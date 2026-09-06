@@ -2465,8 +2465,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-gpu-layers"}, "N",
         string_format("with --no-kv-offload, keep N independently owned attention KV layers device-resident. "
-                      "The layers are spent on the devices with the slowest host link first. A model whose "
-                      "cache cannot hold them keeps fewer, or none (default: %d)", params.kv_gpu_layers),
+                      "The layers are spent on the devices with the slowest host link first, while their free "
+                      "memory lasts. A model whose cache cannot hold them keeps fewer, or none (default: %d)",
+                      params.kv_gpu_layers),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("--kv-gpu-layers must not be negative");
