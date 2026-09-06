@@ -134,6 +134,11 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
 }
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
+    // the indexer builds no update graph, so it gets no context of its own, but clear() still has to wait for a decode that reads its buffers
+    if (mem_idx) {
+        mem_idx->set_lctx(lctx);
+    }
+
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 

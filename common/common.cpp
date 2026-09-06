@@ -1746,7 +1746,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.kv_cpu_pinned     = params.kv_cpu_pinned;
     cparams.kv_pipeline_depth = params.kv_pipeline_depth < 0 ? 0 : (uint32_t) params.kv_pipeline_depth;
-    cparams.kv_pipeline_budget_mib = params.kv_pipeline_budget_mib < 0 ? 0 : (uint32_t) params.kv_pipeline_budget_mib;
+    // 0 removes the cap, so a negative value must not fall through to it
+    if (params.kv_pipeline_budget_mib >= 0) {
+        cparams.kv_pipeline_budget_mib = (uint32_t) params.kv_pipeline_budget_mib;
+    }
     cparams.recurrent_state_offload = params.recurrent_state_offload;
     cparams.kv_gpu_layers     = (uint32_t) std::max(0, params.kv_gpu_layers);
     cparams.phase_aware_workspace = params.phase_aware_workspace;

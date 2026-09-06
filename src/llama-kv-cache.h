@@ -167,6 +167,9 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    // the context that evaluates this cache; a cache that prepares no update of its own is told by its owner
+    void set_lctx(llama_context * lctx);
+
     bool get_has_shift() const;
 
     ggml_type type_k() const;
