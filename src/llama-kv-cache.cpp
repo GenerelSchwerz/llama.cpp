@@ -478,6 +478,11 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
+        // a decode can still be delivering these buffers to the device, and the memset would race that read
+        if (lctx) {
+            llama_synchronize(lctx);
+        }
+
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -855,6 +860,9 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
+
+    // every decode prepares an update, and every memory type passes the context down to its caches, so this is set before anything can be in flight
+    this->lctx = lctx;
 
     bool do_shift = get_has_shift();
 

@@ -310,6 +310,10 @@ private:
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
 
+    // the context that evaluates this cache, taken from the last update it prepared
+    // clear() writes the buffers, a delivery of them can still be in flight, and only the context can wait for it
+    llama_context * lctx = nullptr;
+
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
