@@ -68,7 +68,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-meta-alloc-failure]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1050,6 +1050,115 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
+static size_t meta_alloc_n_devices = 2;
+
+static ggml_backend_meta_split_state meta_alloc_get_split_state(const ggml_tensor * tensor, void * userdata) {
+    ggml_backend_meta_split_state ss;
+    memset(&ss, 0, sizeof(ss));
+    ss.axis = GGML_BACKEND_SPLIT_AXIS_1;
+    int64_t low = 0;
+    for (size_t i = 0; i < meta_alloc_n_devices; i++) {
+        const int64_t high = tensor->ne[1]*(i + 1)/meta_alloc_n_devices;
+        ss.ne[i] = high - low;
+        low = high;
+    }
+    ss.nr[0] = 1;
+    ss.n_segments = 1;
+    return ss;
+    GGML_UNUSED(userdata);
+}
+
+static int meta_alloc_calls        = 0;
+static int meta_alloc_fail_from    = -1;
+static int meta_alloc_live_buffers = 0;
+static ggml_backend_buffer_t (*meta_alloc_buffer_orig)(ggml_backend_buffer_type_t, size_t) = nullptr;
+static void (*meta_alloc_free_buffer_orig)(ggml_backend_buffer_t) = nullptr;
+
+static void meta_alloc_count_free_buffer(ggml_backend_buffer_t buffer) {
+    meta_alloc_live_buffers--;
+    meta_alloc_free_buffer_orig(buffer);
+}
+
+static ggml_backend_buffer_t meta_alloc_test_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const bool fail = meta_alloc_fail_from >= 0 && meta_alloc_calls >= meta_alloc_fail_from;
+    meta_alloc_calls++;
+    if (fail) {
+        return nullptr;
+    }
+    ggml_backend_buffer_t buf = meta_alloc_buffer_orig(buft, size);
+    if (buf != nullptr && buf->iface.free_buffer != nullptr) {
+        meta_alloc_free_buffer_orig = buf->iface.free_buffer;
+        buf->iface.free_buffer      = meta_alloc_count_free_buffer;
+        meta_alloc_live_buffers++;
+    }
+    return buf;
+}
+
+// a meta buffer type must report an allocation failure instead of aborting, and must leave nothing behind
+static void test_meta_alloc_failure() {
+    ggml_backend_dev_t dev_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(dev_cpu != nullptr);
+
+    ggml_backend_dev_t devs[] = { dev_cpu, dev_cpu };
+    meta_alloc_n_devices = sizeof(devs)/sizeof(devs[0]);
+    ggml_backend_dev_t dev_meta = ggml_backend_meta_device(devs, meta_alloc_n_devices, meta_alloc_get_split_state, nullptr);
+    GGML_ASSERT(dev_meta != nullptr);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev_meta);
+
+    ggml_backend_buffer_type_t buft_cpu = ggml_backend_dev_buffer_type(dev_cpu);
+    meta_alloc_buffer_orig       = buft_cpu->iface.alloc_buffer;
+    buft_cpu->iface.alloc_buffer = meta_alloc_test_alloc_buffer;
+
+    // plain allocation, the second device fails
+    meta_alloc_calls     = 0;
+    meta_alloc_fail_from = 1;
+    GGML_ASSERT(ggml_backend_buft_alloc_buffer(buft, 1024) == nullptr);
+    GGML_ASSERT(meta_alloc_calls == 2);
+    GGML_ASSERT(meta_alloc_live_buffers == 0);
+
+    meta_alloc_fail_from = -1;
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, 1024);
+    GGML_ASSERT(buf != nullptr);
+    ggml_backend_buffer_free(buf);
+    GGML_ASSERT(meta_alloc_live_buffers == 0);
+
+    // allocation of a whole context, the second device fails
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    GGML_ASSERT(ctx);
+    std::vector<ggml_tensor *> tensors;
+    for (int i = 0; i < 2; i++) {
+        ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 32, 32);
+        ggml_set_name(t, ("t" + std::to_string(i)).c_str());
+        tensors.push_back(t);
+    }
+
+    meta_alloc_calls     = 0;
+    meta_alloc_fail_from = 1;
+    GGML_ASSERT(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) == nullptr);
+    GGML_ASSERT(meta_alloc_calls == 2);
+    GGML_ASSERT(meta_alloc_live_buffers == 0);
+    for (ggml_tensor * t : tensors) {
+        GGML_ASSERT(t->buffer == nullptr);
+        GGML_ASSERT(t->data   == nullptr);
+    }
+
+    meta_alloc_fail_from = -1;
+    ggml_backend_buffer_t buf_ctx = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+    GGML_ASSERT(buf_ctx != nullptr);
+    for (ggml_tensor * t : tensors) {
+        GGML_ASSERT(t->buffer == buf_ctx);
+    }
+    ggml_backend_buffer_free(buf_ctx);
+    GGML_ASSERT(meta_alloc_live_buffers == 0);
+
+    buft_cpu->iface.alloc_buffer = meta_alloc_buffer_orig;
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1449,6 +1558,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool test_meta_alloc = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1502,6 +1612,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-meta-alloc-failure") == 0) {
+            test_meta_alloc = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1517,6 +1631,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
             test_live_context_workspace_unsupported(seed);
+            return 0;
+        }
+        if (test_meta_alloc) {
+            test_meta_alloc_failure();
             return 0;
         }
         if (!out.empty()) {
