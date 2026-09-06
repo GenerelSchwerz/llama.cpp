@@ -11789,6 +11789,56 @@ static void test_grouped_decode_benchmark(int device) {
     }
 }
 
+static void test_moe_route_publication_lifetime() {
+    const int old_slots = ggml_backend_cuda_moe_get_cache_slots();
+    ggml_backend_cuda_moe_set_cache_slots(16);
+    constexpr int N_EXPERTS = 64;
+    constexpr int N_USED = 6;
+    constexpr int N_ROUTES = 2 * GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS;
+    ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+    ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead() * 32 + ggml_graph_overhead_custom(32, false), nullptr, true}));
+    CHECK(backend != nullptr && ctx != nullptr);
+    ggml_tensor * logits = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, N_EXPERTS, 1);
+    ggml_tensor * probs = ggml_soft_max(ctx.get(), logits);
+    ggml_tensor * ids = ggml_argsort_top_k(ctx.get(), probs, N_USED);
+    ggml_tensor * weights = ggml_get_rows(ctx.get(), ggml_reshape_3d(ctx.get(), probs, 1, N_EXPERTS, 1), ids);
+    ggml_tensor * storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, N_EXPERTS, N_ROUTES);
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
+    ggml_build_forward_expand(graph, weights);
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+    CHECK(buffer != nullptr);
+    std::array<float, N_EXPERTS> values;
+    float sum = 0.0f;
+    for (int i = 0; i < N_EXPERTS; ++i) {
+        values[i] = i * 0.01f;
+        sum += std::exp(values[i]);
+    }
+    ggml_backend_tensor_set(logits, values.data(), 0, sizeof(values));
+    for (int i = 0; i < N_ROUTES; ++i) {
+        ids->view_src->data = static_cast<char *>(storage->data) + i * storage->nb[1];
+        ids->data = ids->view_src->data;
+        CHECK(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend.get());
+        CHECK(ggml_cuda_moe_ids_cache_count_for_test(backend.get()) ==
+            static_cast<size_t>(std::min(i + 1, static_cast<int>(GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS))));
+        std::array<float, N_USED> actual;
+        ggml_backend_tensor_get(weights, actual.data(), 0, sizeof(actual));
+        for (int route = 0; route < N_USED; ++route) {
+            CHECK(std::abs(actual[route] - std::exp(values[N_EXPERTS - route - 1]) / sum) < 1e-6f);
+        }
+    }
+    ggml_backend_ptr other(ggml_backend_cuda_init(0));
+    CHECK(other != nullptr && ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 0);
+    CHECK(ggml_backend_graph_compute(other.get(), graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 1);
+    other.reset();
+    CHECK(ggml_cuda_moe_ids_cache_count_for_test(backend.get()) == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS);
+    CHECK(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+    backend.reset();
+    ggml_backend_cuda_moe_set_cache_slots(old_slots);
+    fprintf(stderr, "test-moe-cache: bounded route publication and backend ownership OK\n");
+}
+
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
@@ -11863,6 +11913,7 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    test_moe_route_publication_lifetime();
     test_cached_mmid_fusion_decline();
     test_cached_mmid_prefill_and_overflow();
     test_owner_legacy_cache(dev);
