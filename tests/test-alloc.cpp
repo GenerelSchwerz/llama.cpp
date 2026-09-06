@@ -30,6 +30,7 @@ struct dummy_backend_context {
     bool fail_backend_init = false;
     bool fail_event_init = false;
     int transfer_backend_count = 0;
+    int transfer_backend_inits = 0; // how often one was asked for, so a test can see a retry the count above hides
     int event_wait_count = 0;
     int set_tensor_async_count = 0;
     size_t set_tensor_async_bytes = 0;
@@ -209,6 +210,7 @@ static void dummy_backend_device_get_memory(ggml_backend_dev_t, size_t * free, s
 
 static ggml_backend_t dummy_backend_device_init(ggml_backend_dev_t dev, const char *) {
     dummy_backend_context * ctx = (dummy_backend_context *) dev->context;
+    ctx->transfer_backend_inits++;
     if (ctx->fail_backend_init) {
         return nullptr;
     }
@@ -1628,6 +1630,46 @@ static void test_transport_releases_ring_for_graph() {
     GGML_ASSERT(transfers == 0);
 }
 
+// a graph that stages nothing gives the staging back but keeps the transfer context: a context shift runs between decodes and must not rebuild a device context every time
+static void test_transport_keeps_context_over_idle_graph() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    auto first  = make_transport_graph(cpu, 64);
+    auto idle   = make_transport_graph(cpu, 64);
+    auto second = make_transport_graph(cpu, 64);
+    idle.source->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+    ggml_set_stable_prefix(first.source,  64);
+    ggml_set_stable_prefix(second.source, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+
+    ggml_backend_sched_set_tensor_backend(sched.get(), first.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), first.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), first.ctx.graph) == GGML_STATUS_SUCCESS);
+    const size_t staged_size = cuda.context->allocated_total();
+    GGML_ASSERT(cuda.context->transfer_backend_count == 1);
+    GGML_ASSERT(cuda.context->transfer_backend_inits == 1);
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), idle.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), idle.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), idle.ctx.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(cuda.context->allocated_total() < staged_size);
+    GGML_ASSERT(cuda.context->transfer_backend_count == 1);
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), second.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), second.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), second.ctx.graph) == GGML_STATUS_SUCCESS);
+    int64_t deliveries = 0;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 2);
+    GGML_ASSERT(cuda.context->transfer_backend_inits == 1);
+}
+
 static void set_test_env(const char * name, const char * value) {
 #ifdef _WIN32
     GGML_ASSERT(_putenv_s(name, value) == 0);
@@ -1788,8 +1830,40 @@ static void test_transport_partial_backend_failure() {
         GGML_ASSERT(deliveries == 1);
         GGML_ASSERT(cuda_fail.context->transfer_backend_count == 0);
         GGML_ASSERT(cuda_ok.context->transfer_backend_count == 1);
+        GGML_ASSERT(cuda_fail.context->transfer_backend_inits == 1);
     }
     GGML_ASSERT(cuda_ok.context->transfer_backend_count == 0);
+}
+
+// a device that cannot give a transfer context is not asked again: a retry per graph would build one and tear it down per token
+static void test_transport_stops_after_backend_failure() {
+    dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
+    dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
+    cuda.context->fail_event_init = true;
+    auto first  = make_transport_graph(cpu, 64);
+    auto second = make_transport_graph(cpu, 64);
+    ggml_set_stable_prefix(first.source,  64);
+    ggml_set_stable_prefix(second.source, 64);
+
+    ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
+
+    ggml_backend_sched_set_tensor_backend(sched.get(), first.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), first.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), first.ctx.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(cuda.context->transfer_backend_inits == 1);
+
+    ggml_backend_sched_reset(sched.get());
+    ggml_backend_sched_set_tensor_backend(sched.get(), second.output, cuda.handle.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), second.ctx.graph));
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), second.ctx.graph) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(cuda.context->transfer_backend_inits == 1);
+
+    int64_t deliveries = -1;
+    transport_stats(sched.get(), &deliveries, nullptr, nullptr);
+    GGML_ASSERT(deliveries == 0);
 }
 
 static void test_transport_excludes_meta() {
@@ -1925,10 +1999,12 @@ int main() {
     run("test_transport_empty_graph", test_transport_empty_graph);
     run("test_transport_fallback_keeps_allocator_plan", test_transport_fallback_keeps_allocator_plan);
     run("test_transport_releases_ring_for_graph", test_transport_releases_ring_for_graph);
+    run("test_transport_keeps_context_over_idle_graph", test_transport_keeps_context_over_idle_graph);
     run("test_transport_environment_is_fallback", test_transport_environment_is_fallback);
     run("test_transport_depth_zero", test_transport_depth_zero);
     run("test_transport_budget_recovers", test_transport_budget_recovers);
     run("test_transport_partial_backend_failure", test_transport_partial_backend_failure);
+    run("test_transport_stops_after_backend_failure", test_transport_stops_after_backend_failure);
     run("test_transport_excludes_meta", test_transport_excludes_meta);
     run("test_transport_requires_annotation", test_transport_requires_annotation);
     run("test_transport_excludes_non_cuda", test_transport_excludes_non_cuda);

@@ -1802,6 +1802,16 @@ static bool ggml_backend_sched_input_can_stage(
         return false;
     }
 
+    // the ordered path synchronizes the producer before it copies, the staged path never does: the early part goes on the transfer stream and the late part on the consumer's own
+    // both are ordered against the consumer alone, so a producer on another accelerator could still be writing the source when the delivery reads it
+    ggml_backend_t producer = ggml_backend_sched_get_tensor_backend(sched, input);
+    if (producer != NULL && producer != sched->backends[split->backend_id]) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(producer);
+        if (dev == NULL || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return false;
+        }
+    }
+
     return tensor_copy(input, split->backend_id, sched->cur_copy) != NULL;
 }
 
@@ -1920,12 +1930,13 @@ static void ggml_backend_sched_transport_release_ring(ggml_backend_sched_t sched
     r->n_staged = 0;
 }
 
-// Give back every ring the current graph does not use.
-// The ring is optional storage, so a scheduler that leaves the staged path -- for one graph or for good -- holds no device memory and no second device context for it.
+// Give back the staging of every ring the current graph does not use.
+// The ring is optional storage, so a scheduler that leaves the staged path for a graph holds no device memory for it.
+// The transfer context and the events stay: a graph that stages nothing is a normal thing to meet between staged ones -- a context shift runs on the CPU backend alone -- and rebuilding a device context around each of them costs far more than holding it.
 static void ggml_backend_sched_transport_release_idle(ggml_backend_sched_t sched) {
     for (int i = 0; i < sched->n_backends; i++) {
         if (sched->transport.rings[i].n_staged == 0) {
-            ggml_backend_sched_transport_release_ring(sched, i);
+            ggml_backend_sched_transport_free_ring(sched, i);
         }
     }
 }
@@ -2243,9 +2254,9 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             ggml_backend_sched_transport_decline_backend(sched, bid);
             continue;
         }
-        // a graph that stages nothing here gives the ring and the transfer context back, so a scheduler that leaves the staged path holds no device memory for it
+        // a graph that stages nothing here gives the staging back, so a scheduler that leaves the staged path holds no device memory for it
         if (r->n_staged == 0) {
-            ggml_backend_sched_transport_release_ring(sched, bid);
+            ggml_backend_sched_transport_free_ring(sched, bid);
             continue;
         }
 
@@ -2273,8 +2284,12 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             continue;
         }
 
+        // a device that cannot give a second context will not give one to the next graph either, so stop asking rather than rebuilding it per token
         if (!ggml_backend_sched_transport_ensure_backend(sched, bid)) {
+            GGML_LOG_WARN("%s: failed to create a transfer context on %s, pipelining disabled there\n", __func__,
+                    ggml_backend_name(sched->backends[bid]));
             ggml_backend_sched_transport_decline_backend(sched, bid);
+            r->eligible = false;
             continue;
         }
 
@@ -2314,10 +2329,13 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
 
             ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
             if (buffer == NULL) {
+                // the headroom check above already approved the size, so the device is out of memory for reasons this will not see coming
+                // retrying every graph would allocate and free a device context per token for nothing, so stop asking here too
                 GGML_LOG_WARN("%s: failed to allocate %zu MiB for the transport ring on %s, "
                         "pipelining disabled there\n", __func__, alloc_size >> 20,
                         ggml_backend_name(sched->backends[bid]));
                 ggml_backend_sched_transport_decline_backend(sched, bid);
+                r->eligible = false;
                 continue;
             }
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -2530,6 +2548,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // A staged delivery reads its host source long after the call that issued it returned, and the previous graph can leave some of those reads in flight.
     // Within a graph the stable prefix keeps the host off what is still being read, but the next graph writes wherever its own ubatch lands, so wait for the previous one here.
     // This is what the ordered path gets from its blocking copy, once per graph rather than once per split.
+    // It also costs the graph-level pipelining of n_copies > 1, which exists to keep the host from blocking here: a scheduler that wants that instead keeps the ordered path with depth 0.
     for (int i = 0; i < sched->n_backends; i++) {
         if (!tr->rings[i].delivered) {
             continue;
@@ -2957,7 +2976,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     int transport_depth;
     if (ggml_backend_sched_transport_depth_from_env(&transport_depth)) {
-        GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched, transport_depth));
+        const bool ok = ggml_backend_sched_set_transport_pipeline_depth(sched, transport_depth);
+        GGML_ASSERT(ok);
     }
 
     return sched;

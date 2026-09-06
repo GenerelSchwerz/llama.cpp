@@ -333,7 +333,7 @@ extern "C" {
     //
     // `depth` is how many splits ahead deliveries run, 0 disables pipelining.
     // The ring holds a couple of slots more than that, so recycling a slot never waits for a reader that is still running.
-    // Needs a destination backend with asynchronous transfers and events, otherwise the setting is ignored.
+    // Only the CUDA backend is accepted as the destination: the ring needs a second context on the same device that transfers asynchronously and orders with events, and CUDA is where that is measured. Every other backend ignores the setting and keeps the ordered path.
     // Costs roughly (depth + 2) * (largest staged split) of device memory.
     // Must be called before the first graph is allocated, and returns false after that.
     // The ring is optional: if the graph cannot be allocated next to it, the scheduler releases the ring and keeps the ordered path.
