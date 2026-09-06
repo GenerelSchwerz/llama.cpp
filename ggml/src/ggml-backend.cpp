@@ -2553,7 +2553,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!tr->rings[i].delivered) {
             continue;
         }
-        ggml_backend_synchronize(tr->rings[i].transfer);
+        if (tr->rings[i].transfer) {
+            ggml_backend_synchronize(tr->rings[i].transfer);
+        }
         ggml_backend_synchronize(sched->backends[i]);
         tr->rings[i].delivered = false;
     }
@@ -3014,6 +3016,18 @@ bool ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
     tr->n_slots = depth + GGML_SCHED_TRANSPORT_MARGIN;
 
     if (depth < 1) {
+        return true;
+    }
+
+    // n_copies > 1 overlaps the graphs through sched->events, and a staged delivery has to block the host on the previous graph: the two cancel out
+    if (sched->n_copies > 1) {
+        tr->depth   = 0;
+        tr->n_slots = GGML_SCHED_TRANSPORT_MARGIN;
+
+        if (tr->debug > 0) {
+            GGML_LOG_INFO("%s: pipeline parallelism is on, staying on the ordered path\n", __func__);
+        }
+
         return true;
     }
 
