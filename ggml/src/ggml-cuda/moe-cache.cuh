@@ -1184,8 +1184,8 @@ struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
     size_t slot_size_bytes,
     int    n_slots);
 
-// Global teardown: free all per-device caches. Safe to call repeatedly.
-void ggml_cuda_moe_cache_free_all(void);
+// Compatibility shim. Cache resources are owned by CUDA backend contexts.
+GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 
 #ifdef __cplusplus
 }
