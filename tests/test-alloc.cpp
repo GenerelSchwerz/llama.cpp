@@ -1738,29 +1738,40 @@ static void set_test_env(const char * name, const char * value) {
 #endif
 }
 
-static void restore_test_env(const char * name, bool had_value, const std::string & value) {
+// the scheduler reads these on construction, so a test that aborts in the middle must not leave them behind for the tests after it
+struct scoped_test_env {
+    const char * name;
+    bool         had_value;
+    std::string  value;
+
+    scoped_test_env(const char * name, const char * set_to) : name(name) {
+        const char * env = getenv(name);
+        had_value = env != nullptr;
+        value     = env ? env : "";
+        set_test_env(name, set_to);
+    }
+
+    ~scoped_test_env() {
 #ifdef _WIN32
-    GGML_ASSERT(_putenv_s(name, had_value ? value.c_str() : "") == 0);
+        _putenv_s(name, had_value ? value.c_str() : "");
 #else
-    GGML_ASSERT(had_value ? setenv(name, value.c_str(), 1) == 0 : unsetenv(name) == 0);
+        if (had_value) {
+            setenv(name, value.c_str(), 1);
+        } else {
+            unsetenv(name);
+        }
 #endif
-}
+    }
+};
 
 static void test_transport_environment_is_fallback() {
-    const char * depth_env = getenv("GGML_KV_PIPELINE_DEPTH");
-    const char * budget_env = getenv("GGML_KV_PIPELINE_BUDGET_MIB");
-    const bool had_depth = depth_env != nullptr;
-    const bool had_budget = budget_env != nullptr;
-    const std::string depth_old = depth_env ? depth_env : "";
-    const std::string budget_old = budget_env ? budget_env : "";
-
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
 
-    set_test_env("GGML_KV_PIPELINE_DEPTH", "4");
-    set_test_env("GGML_KV_PIPELINE_BUDGET_MIB", "8");
+    scoped_test_env depth_env("GGML_KV_PIPELINE_DEPTH", "4");
+    scoped_test_env budget_env("GGML_KV_PIPELINE_BUDGET_MIB", "8");
     {
         auto graph = make_transport_graph(cpu, 64);
         ggml_set_stable_prefix(graph.source, 64);
@@ -1792,10 +1803,11 @@ static void test_transport_environment_is_fallback() {
         ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
         GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
         GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
-    }
 
-    restore_test_env("GGML_KV_PIPELINE_DEPTH", had_depth, depth_old);
-    restore_test_env("GGML_KV_PIPELINE_BUDGET_MIB", had_budget, budget_old);
+        // a depth out of range is refused rather than clamped, so a caller cannot get a different one than it asked for
+        GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1000));
+        GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_depth(sched.get(), -1));
+    }
 }
 
 static void test_transport_depth_zero() {

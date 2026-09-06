@@ -703,7 +703,6 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
         // bytes at the start of every stream that stay unchanged for the current graph evaluation, 0 for none
-        // the count is from the start of a stream, not from the start of the tensor, so a reader that splits the storage into streams applies it to each of them
         union {
             size_t stable_prefix;
             char padding[8];
@@ -712,10 +711,9 @@ extern "C" {
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
-    // declare that the first nbytes of every stream of tensor->data cannot change while a graph that reads this tensor is being evaluated
-    // a stream is one index of the last dimension of the view a reader takes of this tensor, and consecutive streams sit that view's nb[3] apart, so a reader that takes the storage whole has a single stream and the region is then simply its first nbytes
-    // nbytes is clamped to one stream of tensor, and it must be set on the tensor that owns the storage, not on a view of it
-    // it must describe the graph that is about to run, including when that graph is reused
+    // declare that the first nbytes of every stream of tensor->data cannot change while a graph that reads this tensor runs
+    // a reader splits the storage into streams along the last dimension of its own view, so nbytes counts from the start of a stream, not of the tensor, and the caller must not pass more than one stream holds
+    // set it on the tensor that owns the storage, not on a view of it, and refresh it for the graph that is about to run, including when that graph is reused
     // a backend may deliver a declared region before the point in the graph that reads it, so 0 declares nothing and is always correct
     GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);
     GGML_API size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor);

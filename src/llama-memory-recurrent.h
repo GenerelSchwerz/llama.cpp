@@ -131,10 +131,6 @@ private:
     llama_recurrent_snapshot_mode next_snapshot_mode;
     bool sparse_metadata_active = false;
 
-    // the context that evaluates this memory, taken from the last update it prepared
-    // clear() writes the buffers, a decode can still be reading them, and only the context can wait for it
-    llama_context * lctx = nullptr;
-
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 

@@ -331,12 +331,12 @@ extern "C" {
     // Only persistent host inputs marked with GGML_TENSOR_FLAG_TRANSPORT are eligible, and their stable prefix must be current before each evaluation.
     // The producer must be the CPU or the same backend stream that consumes the late region.
     //
-    // `depth` is how many splits ahead deliveries run, 0 disables pipelining.
+    // `depth` is how many splits ahead deliveries run, 0 disables pipelining, and it must not be more than GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN (14 by default).
     // The ring holds a couple of slots more than that, so recycling a slot never waits for a reader that is still running.
     // Only the CUDA backend is accepted as the destination: the ring needs a second context on the same device that transfers asynchronously and orders with events, and CUDA is where that is measured. Every other backend ignores the setting and keeps the ordered path.
     // Costs roughly (depth + 2) * (largest staged split) of device memory.
-    // Must be called before the first graph is allocated, and returns false after that.
-    // The ring is optional: if the graph cannot be allocated next to it, the scheduler releases the ring and keeps the ordered path.
+    // Returns false for a depth out of range, and after the first graph is allocated.
+    // The ring is optional: if the graph cannot be allocated next to it, the scheduler releases the rings that were holding memory and stops asking for them.
     GGML_API bool                 ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth);
 
     // Hard cap on the staging ring, in bytes, default 128 MiB and 0 removes the cap.

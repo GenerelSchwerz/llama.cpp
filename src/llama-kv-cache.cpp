@@ -264,6 +264,14 @@ llama_kv_cache::llama_kv_cache(
                 layers.push_back(layer_share);
                 layers.back().il = il;
 
+                // this cache writes the shared tensors at its own slot, so their stable prefix would have two writers: keep them on the ordered path
+                if (layers.back().k) {
+                    layers.back().k->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+                if (layers.back().v) {
+                    layers.back().v->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+
                 continue;
             }
         }
@@ -865,7 +873,7 @@ void llama_kv_cache::set_lctx(llama_context * lctx) {
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
-    // every decode prepares an update, and every memory type passes the context down to its caches, so this is set before anything can be in flight
+    // every decode prepares an update, so this is set before a delivery can be in flight
     set_lctx(lctx);
 
     bool do_shift = get_has_shift();
@@ -1221,7 +1229,7 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
-    // a cache that shares cells keeps no stable prefix of its own: the layers it aliases get one from the cache that owns the cells, and the layers it does not stay on the ordered path
+    // a cache that shares cells sets no stable prefix: the layers it aliases lost the transport flag when it took them, and the rest are the owner's to describe
     if (other) {
         return;
     }
@@ -1662,9 +1670,8 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
 }
 
 void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
-    // Rows written by this ubatch, counted within a stream rather than across the [n_embd_gqa, kv_size*n_stream] body.
-    // Every byte below the lowest of them keeps whatever the previous ubatch left there for the whole graph, so a delivery of that region may be issued before the split that reads it.
-    // Streams sit end to end, so a row counted across the body would let the lowest stream cap every stream above it; per stream, each one keeps its own leading rows.
+    // the lowest row this ubatch writes, counted within a stream: everything below it keeps what the previous ubatch left there for the whole graph
+    // counting across the body instead would let the lowest stream cap every stream above it
     uint64_t min_row = UINT64_MAX;
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (const uint32_t idx : sinfo.idxs[s]) {

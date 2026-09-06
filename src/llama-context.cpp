@@ -878,6 +878,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
                 backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                 max_nodes, pipeline_parallel, cparams.op_offload));
         cparams.flash_attn_causal_prefix_supported = llama_sched_supports_flash_attn_causal_prefix(sched.get());
+        // the scheduler refuses a depth past its own bound, which a build can set lower than LLAMA_KV_PIPELINE_DEPTH_MAX
         if (!ggml_backend_sched_set_transport_pipeline_budget(sched.get(), (size_t) cparams.kv_pipeline_budget_mib*mib) ||
             !ggml_backend_sched_set_transport_pipeline_depth(sched.get(), cparams.kv_cpu_pinned || !cparams.offload_kqv ? (int) cparams.kv_pipeline_depth : 0)) {
             throw std::invalid_argument("invalid KV transport pipeline configuration");
