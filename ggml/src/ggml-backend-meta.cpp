@@ -1764,7 +1764,7 @@ struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struc
             }
         }
         if (meta_buf_ctx->bufs[i] == nullptr) {
-            // the loop above already pointed the tensors at the buffer that is freed here
+            // the tensors of ctx were pointed at meta_buf, which is freed here
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                 t->buffer = nullptr;
                 t->data   = nullptr;
