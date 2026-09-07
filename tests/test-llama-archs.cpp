@@ -1051,9 +1051,16 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
-// a tied model has no output.weight - its output projection must get the same split as output.weight
+// a tied model has no output.weight - its output projection is a copy of token_embd.weight and must get the same split.
+// the input table keeps that name too, it must never be split by vocab row
+struct tied_split_states {
+    ggml_backend_meta_split_state output;   // output.weight
+    ggml_backend_meta_split_state tied;     // the same projection, renamed like a tied model
+    ggml_backend_meta_split_state tok_embd; // the input table
+};
+
 static void test_tied_output_split(size_t seed) {
-    auto split_state_of = [&](llm_arch arch, bool moe, const char * name, size_t n_devices) {
+    auto split_states_of = [&](llm_arch arch, bool moe, size_t n_devices) {
         gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
         llama_model_params model_params = llama_model_default_params();
         model_params.progress_callback = silent_model_load_progress;
@@ -1063,27 +1070,36 @@ static void test_tied_output_split(size_t seed) {
         size_t tensor_seed = seed;
         llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
         GGML_ASSERT(model);
-        const ggml_tensor * tensor = model->get_tensor(name);
-        GGML_ASSERT(tensor != nullptr);
+        GGML_ASSERT(model->output   != nullptr);
+        GGML_ASSERT(model->tok_embd != nullptr);
+        GGML_ASSERT(model->output   != model->tok_embd);
 
         llama_meta_device_get_split_state_userdata ud = { n_devices, model.get() };
-        return llama_meta_device_get_split_state(tensor, &ud);
+        tied_split_states ret;
+        ret.output = llama_meta_device_get_split_state(model->output, &ud);
+        // a tied model gives both tensors the same name
+        ggml_set_name(model->output, "token_embd.weight");
+        ret.tied     = llama_meta_device_get_split_state(model->output,   &ud);
+        ret.tok_embd = llama_meta_device_get_split_state(model->tok_embd, &ud);
+        return ret;
     };
 
     const size_t n_devices = 2;
-    const ggml_backend_meta_split_state ss_tok_embd = split_state_of(LLM_ARCH_LLAMA, false, "token_embd.weight", n_devices);
-    const ggml_backend_meta_split_state ss_output   = split_state_of(LLM_ARCH_LLAMA, false, "output.weight",     n_devices);
-    GGML_ASSERT(ss_tok_embd.axis == GGML_BACKEND_SPLIT_AXIS_1);
-    GGML_ASSERT(ss_tok_embd.axis == ss_output.axis);
-    GGML_ASSERT(ss_tok_embd.n_segments == ss_output.n_segments);
+    const tied_split_states ss_llama = split_states_of(LLM_ARCH_LLAMA, false, n_devices);
+    GGML_ASSERT(ss_llama.output.axis == GGML_BACKEND_SPLIT_AXIS_1);
+    GGML_ASSERT(ss_llama.tied.axis == ss_llama.output.axis);
+    GGML_ASSERT(ss_llama.tied.n_segments == ss_llama.output.n_segments);
     for (size_t i = 0; i < n_devices; i++) {
-        GGML_ASSERT(ss_tok_embd.ne[i] == ss_output.ne[i]);
-        GGML_ASSERT(ss_tok_embd.ne[i] > 0);
+        GGML_ASSERT(ss_llama.tied.ne[i] == ss_llama.output.ne[i]);
+        GGML_ASSERT(ss_llama.tied.ne[i] > 0);
     }
+    GGML_ASSERT(ss_llama.tok_embd.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     // DeepSeek v4 mirrors its output projection, the tied copy must follow
-    const ggml_backend_meta_split_state ss_dsv4 = split_state_of(LLM_ARCH_DEEPSEEK4, true, "token_embd.weight", n_devices);
-    GGML_ASSERT(ss_dsv4.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    const tied_split_states ss_dsv4 = split_states_of(LLM_ARCH_DEEPSEEK4, true, n_devices);
+    GGML_ASSERT(ss_dsv4.output.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(ss_dsv4.tied.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(ss_dsv4.tok_embd.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 }
 
 static std::vector<float> get_logits(

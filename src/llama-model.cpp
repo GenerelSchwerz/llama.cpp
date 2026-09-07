@@ -414,9 +414,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_shexp_weight ("blk\\.\\d*\\.ffn_gate_shexp.weight");
     static const std::regex pattern_ffn_down_shexp_weight ("blk\\.\\d*\\.ffn_down_shexp.weight");
 
-    // a tied model has no output.weight - its output projection is a copy of token_embd.weight
-    // only that copy reaches the meta device, the table itself stays on the input device
-    static const std::regex pattern_output_weight("(output|token_embd)\\.weight");
+    static const std::regex pattern_output_weight("output\\.weight");
     static const std::regex pattern_output_bias  ("output\\.bias");
 
     struct tensor_config {
@@ -578,7 +576,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        // a tied model has no output.weight, its output projection is a copy of token_embd.weight.
+        // the input table carries that name as well, so tell the two apart by the tensor, not by the name
+        const bool is_output_weight = std::regex_match(tensor_name, pattern_output_weight) ||
+            (tensor == ud->model->output && tensor != ud->model->tok_embd);
+        if (is_output_weight) {
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }
