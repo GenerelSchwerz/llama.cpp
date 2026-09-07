@@ -1040,18 +1040,22 @@ void ggml_backend_sched_name_copy(
         struct ggml_tensor * copy, const char * backend_name, const struct ggml_tensor * src, int c) {
     const int n_tail = snprintf(NULL, 0, "#%s#%d", src->name, c);
     const int n_max  = GGML_MAX_NAME - 1 - n_tail;
+    GGML_ASSERT(n_max >= 0 && "source name too long to name a scheduler copy");
     int n_head = (int) strlen(backend_name);
     if (n_head > n_max) {
-        n_head = n_max > 0 ? n_max : 0;
+        n_head = n_max;
     }
     ggml_format_name(copy, "%.*s#%s#%d", n_head, backend_name, src->name, c);
 }
 
-void ggml_backend_sched_copy_source_name(const char * name, char * buf, size_t buf_size) {
+bool ggml_backend_sched_copy_source_name(const char * name, char * buf, size_t buf_size) {
     GGML_ASSERT(buf_size > 0);
 
     const char * first = strchr(name, '#');
-    const char * src   = first != NULL ? first + 1 : name;
+    if (first == NULL) {
+        return false;
+    }
+    const char * src = first + 1;
     size_t len = strlen(src);
 
     // ggml writes a view suffix as " (...)", a graph name has no spaces
@@ -1060,22 +1064,25 @@ void ggml_backend_sched_copy_source_name(const char * name, char * buf, size_t b
         len = suffix - src;
     } else {
         const char * copy = strrchr(src, '#');
-        if (copy != NULL) {
-            const char * digits = copy + 1;
-            while (*digits >= '0' && *digits <= '9') {
-                digits++;
-            }
-            if (*digits == '\0') {
-                len = copy - src;
-            }
+        if (copy == NULL) {
+            return false;
         }
+        const char * digits = copy + 1;
+        while (*digits >= '0' && *digits <= '9') {
+            digits++;
+        }
+        if (digits == copy + 1 || *digits != '\0') {
+            return false;
+        }
+        len = copy - src;
     }
 
     if (len > buf_size - 1) {
-        len = buf_size - 1;
+        return false;
     }
     memcpy(buf, src, len);
     buf[len] = '\0';
+    return true;
 }
 
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {

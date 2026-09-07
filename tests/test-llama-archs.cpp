@@ -1076,7 +1076,7 @@ static void test_sched_copy_name() {
         char buf[GGML_MAX_NAME];
         ggml_set_name(src, name);
         ggml_backend_sched_name_copy(copy, backend_name, src, 0);
-        ggml_backend_sched_copy_source_name(copy->name, buf, sizeof(buf));
+        GGML_ASSERT(ggml_backend_sched_copy_source_name(copy->name, buf, sizeof(buf)));
         GGML_ASSERT(strcmp(buf, expected) == 0);
     };
 
@@ -1084,6 +1084,13 @@ static void test_sched_copy_name() {
     check("cache_k_l0 (view)", "CUDA0", "cache_k_l0");
     // the backend label is cut when the name does not fit, the source name survives
     check("cache_k_l31", "Meta(CUDA0,CUDA1,CUDA2,CUDA3,CUDA4,CUDA5,CUDA6,CUDA7)", "cache_k_l31");
+
+    // a name that was not written by the scheduler is not a copy
+    char buf[GGML_MAX_NAME];
+    GGML_ASSERT(!ggml_backend_sched_copy_source_name("cache_k_l0", buf, sizeof(buf)));
+    GGML_ASSERT(!ggml_backend_sched_copy_source_name("CUDA0#cache_k_l0", buf, sizeof(buf)));
+    // a cut name lost its copy index, what is left of the source names another tensor
+    GGML_ASSERT(!ggml_backend_sched_copy_source_name("#cache_k_l3", buf, sizeof(buf)));
 }
 
 // the tokens are spread over n_seq sequences, each of which starts at position 0
@@ -1349,7 +1356,6 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
-                max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
                 // cpu-based devices cannot be used in tensor split mode
                 if (ggml_backend_dev_buffer_type(dev) != ggml_backend_cpu_buffer_type()) {
