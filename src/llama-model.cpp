@@ -828,12 +828,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const float * tensor_split = ud->model->tensor_split();
 
         // The share of the attention heads decides how much cache a device gets and how much attention
-        // work it does, neither of which has to follow the memory split. A linear-attention layer is a
-        // different mechanism and keeps tensor_split.
-        if (ud->model->attn_split() != nullptr && !hparams.is_recr(tc.il) &&
-                (std::regex_match(tensor_name, pattern_kv_cache) ||
-                 (tensor_name.substr(0, 4) == "blk." && tensor_name.find(".attn_") != std::string::npos))) {
-            tensor_split = ud->model->attn_split();
+        // work it does, neither of which has to follow the memory split. Only a split that counts heads
+        // follows it, and those are the ones measured against attn_output.weight - a linear-attention
+        // layer measures against ssm_out.weight and keeps tensor_split.
+        if (ud->model->attn_split() != nullptr) {
+            const std::string attn_out_name = "blk." + std::to_string(tc.il) + ".attn_output.weight";
+            const ggml_tensor * attn_out = ud->model->get_tensor(attn_out_name.c_str());
+            if (attn_out != nullptr && tc.tensor_axis_0 == attn_out) {
+                tensor_split = ud->model->attn_split();
+            }
         }
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
