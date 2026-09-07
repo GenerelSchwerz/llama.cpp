@@ -68,7 +68,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-kv-residency]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1562,6 +1562,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool test_kv_residency = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1615,6 +1616,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-kv-residency") == 0) {
+            test_kv_residency = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1632,11 +1637,14 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_unsupported(seed);
             return 0;
         }
+        if (test_kv_residency) {
+            test_mtp_kv_residency(seed);
+            test_kv_residency_ownership(seed);
+            return 0;
+        }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
         }
-        test_mtp_kv_residency(seed);
-        test_kv_residency_ownership(seed);
         return test_backends(arch, seed, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());

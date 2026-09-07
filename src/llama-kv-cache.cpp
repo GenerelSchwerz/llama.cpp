@@ -287,7 +287,11 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        const bool layer_offload = offload || placement.gpu_resident_ils.count(il) > 0;
+        // a layer picked for residency is claimed by the first cache that owns it, so that the
+        // sub-caches of one model share the budget instead of each spending it again
+        const bool layer_picked = placement.gpu_resident_ils.count(il) > 0 &&
+            (!placement.gpu_resident_done || placement.gpu_resident_done->count(il) == 0);
+        const bool layer_offload = offload || layer_picked;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (layer_offload) {
