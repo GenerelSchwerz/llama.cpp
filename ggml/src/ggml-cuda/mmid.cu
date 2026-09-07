@@ -5,6 +5,8 @@
 #include "mmq.cuh"
 #include "mmvq.cuh"
 
+#include <climits>
+
 ggml_cuda_mmid_source_capability ggml_cuda_mmid_source_capability_for(ggml_type type) {
     constexpr uint32_t scalar = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_SCALAR | GGML_CUDA_MMID_SOURCE_GENERIC;
     constexpr uint32_t quant = GGML_CUDA_MMID_SOURCE_ADVERTISED | GGML_CUDA_MMID_SOURCE_MMVQ | GGML_CUDA_MMID_SOURCE_MMQ |
@@ -157,6 +159,36 @@ bool ggml_cuda_mmid_can_use_compact_mmvq(
     compact.preferred_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ;
     const auto capability = ggml_cuda_mmid_get_capability(compact);
     return capability.reason == GGML_CUDA_MMID_CAPABILITY_OK && capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ;
+}
+
+bool ggml_cuda_mmid_direct_source_view_valid(
+        const ggml_tensor * source,
+        const ggml_cuda_mmid_direct_source_view & view,
+        ggml_cuda_mmid_consumer consumer) {
+    if (source == nullptr || view.source_type != source->type || view.logical_n_experts <= 0 ||
+            view.logical_n_experts > INT_MAX || view.physical_n_experts <= 0 || view.physical_n_experts > INT_MAX ||
+            view.physical_id_upper_bound <= 0 || view.physical_id_upper_bound > view.physical_n_experts ||
+            view.logical_n_experts > view.physical_n_experts || view.physical_n_experts != source->ne[2] ||
+            source->ne[3] != 1 || view.expert_stride == 0 || view.expert_stride != source->nb[2] ||
+            view.expert_stride > SIZE_MAX / (size_t) view.physical_n_experts ||
+            source->nb[3] != view.expert_stride * (size_t) view.physical_n_experts) {
+        return false;
+    }
+
+    const auto capability = ggml_cuda_mmid_source_capability_for(source->type);
+    switch (consumer) {
+        case GGML_CUDA_MMID_CONSUMER_MMVQ:
+            return (capability.flags & GGML_CUDA_MMID_SOURCE_MMVQ) != 0;
+        case GGML_CUDA_MMID_CONSUMER_MMVF:
+        case GGML_CUDA_MMID_CONSUMER_MMF:
+            return (capability.flags & GGML_CUDA_MMID_SOURCE_SCALAR) != 0;
+        case GGML_CUDA_MMID_CONSUMER_MMQ:
+            return (capability.flags & GGML_CUDA_MMID_SOURCE_MMQ) != 0;
+        case GGML_CUDA_MMID_CONSUMER_UNSUPPORTED:
+        case GGML_CUDA_MMID_CONSUMER_GENERIC:
+            return false;
+    }
+    return false;
 }
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
