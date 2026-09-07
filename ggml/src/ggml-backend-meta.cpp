@@ -834,9 +834,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         // A host-resident KV cache reaches the graph as a copied-in leaf of the compute buffer.
         // Mirroring it while the queries stay split by head makes each device attend the wrong
         // heads, so ask the callback; it still answers MIRRORED for names it does not know.
+        // The name tells a copy apart, the scheduler also flags one as an input when it keeps several.
+        char source_name[GGML_MAX_NAME];
         const bool copied_in_leaf =
             ggml_backend_buffer_get_usage(tensor->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-            tensor->op == GGML_OP_NONE && (tensor->flags & GGML_TENSOR_FLAG_INPUT) == 0;
+            tensor->op == GGML_OP_NONE &&
+            ggml_backend_sched_copy_source_name(tensor->name, source_name, sizeof(source_name));
 
         if ((ggml_backend_buffer_get_usage(tensor->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE || copied_in_leaf) &&
                 tensor->view_src == nullptr) {
@@ -847,8 +850,6 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             ggml_tensor tensor_named;
             if (copied_in_leaf) {
                 tensor_named = *tensor;
-                char source_name[GGML_MAX_NAME];
-                ggml_backend_sched_copy_source_name(tensor->name, source_name, sizeof(source_name));
                 ggml_set_name(&tensor_named, source_name);
                 tensor_query = &tensor_named;
             }
@@ -1334,6 +1335,32 @@ static void ggml_backend_meta_buffer_memset_tensor(
     const size_t n_bufs = ggml_backend_meta_buffer_n_bufs(buffer);
     const ggml_backend_meta_split_state split_state =
             ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
+
+    // a host-resident attention cache is permuted, its heads are one run per cell, see set_tensor
+    const bool strided_head_split =
+        !ggml_is_contiguous(tensor) &&
+        split_state.axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+        split_state.n_segments == 1 && split_state.nr[0] == 1 &&
+        tensor->nb[1] > tensor->nb[2] &&
+        offset == 0 && size == ggml_nbytes(tensor);
+
+    if (strided_head_split) {
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; i3++) {
+            for (size_t j = 0; j < n_bufs; j++) {
+                ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                const size_t nbytes = split_state.ne[j] * tensor->nb[2];
+                if (nbytes == 0) {
+                    continue;
+                }
+                for (int64_t i1 = 0; i1 < tensor->ne[1]; i1++) {
+                    ggml_backend_tensor_memset(simple_tensor, value,
+                        i3*simple_tensor->nb[3] + i1*simple_tensor->nb[1], nbytes);
+                }
+            }
+        }
+        return;
+    }
+
     GGML_ASSERT(ggml_is_contiguous(tensor) || split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
 
     if (split_state.n_segments != 1 || split_state.nr[0] != 1) {
