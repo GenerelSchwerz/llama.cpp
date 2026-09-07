@@ -403,10 +403,10 @@ static bool ggml_cuda_should_use_mmq_impl(enum ggml_type type, int cc, int64_t n
         return true;
     }
 
-    // gfx900 (Vega 10) lacks native dp4a, loses to dequant + hipBLAS
+    // gfx900 (Vega 10), gfx909, and gfx90c lack native dp4a, losing to dequant + hipBLAS
     // for dense matrices; keep MMQ only for MoE, where the
     // hipBLAS path is much slower.
-    if (cc == GGML_CUDA_CC_VEGA) {
+    if (cc == GGML_CUDA_CC_VEGA || GGML_CUDA_CC_IS_GCN_APU(cc)) {
         return n_experts > 0;
     }
 
