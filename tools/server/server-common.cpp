@@ -628,9 +628,10 @@ llama_tokens server_tokens::get_text_tokens() const {
     return res;
 }
 
-void server_tokens::set_token(llama_pos pos, llama_token id) {
-    GGML_ASSERT(!has_media_chunks()); // only allow this on text-only tokens
-    tokens[pos] = id;
+void server_tokens::set_token(size_t idx, llama_token id) {
+    // a media placeholder must stay in sync with the media map, so never write over one
+    GGML_ASSERT(tokens[idx] != LLAMA_TOKEN_NULL && id != LLAMA_TOKEN_NULL);
+    tokens[idx] = id;
 }
 
 void server_tokens::keep_first(size_t n) {

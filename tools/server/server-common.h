@@ -213,8 +213,8 @@ public:
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
 
-    // for compatibility with speculative decoding
-    void set_token(llama_pos pos, llama_token id);
+    // overwrite a text token, media placeholders are not writable
+    void set_token(size_t idx, llama_token id);
 
     size_t size() const { return tokens.size(); }
 

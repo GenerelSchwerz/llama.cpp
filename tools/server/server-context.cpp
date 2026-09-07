@@ -3389,27 +3389,34 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt));
+                                // the shift is applied to the draft context too, so both must support it
+                                const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                                       (!ctx_dft || llama_memory_can_shift(llama_get_memory(ctx_dft)));
 
-                                // cache reuse shifts KV cells around, which cannot cross a media chunk.
-                                // with an mmproj loaded it still works as long as both prompts stay text-only.
+                                // the loop below uses token indices as positions, which a media chunk breaks.
+                                // an mmproj alone is fine, only a real media chunk in either prompt is not
                                 const bool has_media = slot.prompt.tokens.has_media_chunks() || input_tokens.has_media_chunks();
 
-                                const bool can_cache_reuse = can_shift && !has_media;
+                                // the loop moves n_past past the alora cap applied above
+                                const bool has_alora = slot.alora_invocation_start > 0;
 
-                                if (n_cache_reuse > 0) {
+                                const bool can_cache_reuse = n_cache_reuse > 0 && can_shift && !has_media && !has_alora;
+
+                                if (n_cache_reuse > 0 && !can_cache_reuse) {
                                     if (!can_shift) {
                                         SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
-                                    } else if (has_media) {
-                                        // expected on every request that carries media, so keep it out of the log
-                                        SLT_DBG(slot, "cache reuse is disabled while the prompt has media - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    } else {
+                                        // expected on every request with media or an alora, so keep it out of the log
+                                        SLT_DBG(slot, "cache reuse is disabled for this prompt - ignoring n_cache_reuse = %d\n", n_cache_reuse);
                                     }
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
+                                if (can_cache_reuse) {
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
+
+                                    bool kv_shifted = false;
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
@@ -3434,6 +3441,8 @@ private:
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
+                                            kv_shifted |= kv_shift != 0;
+
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
                                                 n_past++;
@@ -3444,6 +3453,11 @@ private:
                                         } else {
                                             head_c += 1;
                                         }
+                                    }
+
+                                    if (kv_shifted) {
+                                        // the checkpoints were taken before the shift, they no longer match the cache
+                                        slot.prompt.checkpoints.clear();
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
