@@ -33,6 +33,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -2263,7 +2264,7 @@ static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama
 
 // Measure the host-to-device bandwidth of a device, in bytes per microsecond. Returns 0 when it
 // cannot be measured.
-static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev, bool cpu_pinned) {
+static double llama_dev_h2d_bandwidth_measure(ggml_backend_dev_t dev, bool cpu_pinned) {
     const size_t n_bytes = 16u*1024*1024;
     const int    n_reps  = 3;
 
@@ -2308,6 +2309,20 @@ static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev, bool cpu_pinned) {
     const int64_t t_us = ggml_time_us() - t_start;
 
     return t_us > 0 ? (double) n_bytes*n_reps/t_us : 0.0;
+}
+
+// the link does not change during a run, so every context reuses one measurement
+// rather than pushing its own 48 MB over the bus
+static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev, bool cpu_pinned) {
+    static std::mutex mutex;
+    static std::map<std::pair<ggml_backend_dev_t, bool>, double> measured;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = measured.find({dev, cpu_pinned});
+    if (it == measured.end()) {
+        it = measured.emplace(std::make_pair(dev, cpu_pinned), llama_dev_h2d_bandwidth_measure(dev, cpu_pinned)).first;
+    }
+    return it->second;
 }
 
 // Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
@@ -2388,18 +2403,45 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
     // Spending the whole budget on the slowest device can ask it for more than it has left, and the
     // cache has no fallback if its allocation fails. Bound each device by the memory it reports free,
     // minus a margin for the compute buffers that are allocated after this.
+    // A meta device reports the free memory of all the devices behind it, while a layer only takes
+    // its share from each of them, so bound those one by one instead of the sum.
+    struct dev_budget {
+        size_t free;  // bytes still unspent
+        double share; // part of a layer this device holds
+    };
     const uint32_t n_stream = cparams.kv_unified ? 1 : std::max((uint32_t) 1, cparams.n_seq_max);
     bool memory_bound = false;
-    std::vector<size_t> budget(devs.size(), 0);
+    std::vector<std::vector<dev_budget>> budget(devs.size());
     for (size_t d = 0; d < devs.size(); d++) {
-        size_t free = 0;
-        size_t total = 0;
-        ggml_backend_dev_memory(devs[d], &free, &total);
-        budget[d] = free - free/8;
+        std::vector<ggml_backend_dev_t> parts(1, devs[d]);
+        std::vector<double>             shares(1, 1.0);
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model.devices_meta.empty()) {
+            parts = model.devices_meta;
+            shares.assign(parts.size(), 1.0/parts.size());
+            const float * tensor_split = model.tensor_split();
+            double sum = 0.0;
+            for (size_t i = 0; tensor_split != nullptr && i < parts.size(); i++) {
+                sum += tensor_split[i];
+            }
+            if (sum > 0.0) {
+                for (size_t i = 0; i < parts.size(); i++) {
+                    shares[i] = tensor_split[i]/sum;
+                }
+            }
+        }
+        for (size_t i = 0; i < parts.size(); i++) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(parts[i], &free, &total);
+            budget[d].push_back({free - free/8, shares[i]});
+        }
     }
+    // An upper bound on one cache layer: a sub-cache can keep fewer cells than the context, no V at
+    // all, or a compressed state, but never more than this. A bound that errs high spends less of the
+    // budget than it could, one that errs low lets the allocation fail.
     auto layer_bytes = [&](uint32_t il) {
         return (ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
-                ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il))) * cparams.n_ctx_seq * n_stream;
+                ggml_row_size(params.type_v, hparams.n_embd_v_gqa_max())) * cparams.n_ctx_seq * n_stream;
     };
 
     std::vector<size_t> order(devs.size());
@@ -2421,11 +2463,17 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
                 }
                 any = true;
                 const size_t bytes = layer_bytes(ils[i]);
-                if (bytes > budget[dd]) {
+                bool fits = true;
+                for (const dev_budget & b : budget[dd]) {
+                    fits = fits && (size_t) (bytes*b.share) <= b.free;
+                }
+                if (!fits) {
                     memory_bound = true;
                     continue;
                 }
-                budget[dd] -= bytes;
+                for (dev_budget & b : budget[dd]) {
+                    b.free -= (size_t) (bytes*b.share);
+                }
                 ret.insert(ils[i]);
             }
             if (!any) {

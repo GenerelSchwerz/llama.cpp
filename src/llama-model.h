@@ -700,6 +700,9 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // the devices behind the meta device under split mode tensor, empty otherwise
+    std::vector<ggml_backend_dev_t> devices_meta;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
