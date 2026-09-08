@@ -30,6 +30,10 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11016,10 +11020,107 @@ static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
     return ptr;
 }
 
+#ifdef _WIN32
+// Windows WDDM pins have two limits: a per-allocation cap (a single tens-of-GiB
+// cudaMallocHost fails) and an aggregate quota near half of physical RAM. A
+// full-range VirtualAlloc + chunked cudaHostRegister (4 GiB pieces, well under
+// the per-allocation cap) yields one contiguous, fully pinned buffer that the
+// direct MMID source views can read. Every chunk must register or the whole
+// thing unwinds: a partially-pinned store crashes the kernels with illegal
+// memory access, so no partial successes are returned.
+static const size_t MOE_WIN_PIN_CHUNK = 4ULL << 30;
+
+static size_t g_moe_win_pin_chunk = 0; // resolved per-allocation by the ladder
+
+static void ggml_cuda_moe_cached_win_pinned_free(void * base, size_t size) {
+    const size_t chunk = g_moe_win_pin_chunk ? g_moe_win_pin_chunk : MOE_WIN_PIN_CHUNK;
+    for (size_t off = 0; off < size; off += chunk) {
+        cudaHostUnregister((char *) base + off);
+    }
+    VirtualFree(base, 0, MEM_RELEASE);
+}
+
+static void * ggml_cuda_moe_cached_win_pinned_malloc(size_t size) {
+    void * base = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (base == nullptr) {
+        GGML_LOG_DEBUG("%s: VirtualAlloc of %.2f MiB failed\n", __func__, size / 1024.0 / 1024.0);
+        return nullptr;
+    }
+
+    // The in-process WDDM pin ceiling depends on how much the CUDA context has
+    // already allocated, so probe downward from the preferred chunk size and
+    // use the largest size that still registers.
+    size_t chunk = MOE_WIN_PIN_CHUNK;
+    while (chunk >= (16ULL << 20)) {
+        // Touch the probe range first: cudaHostRegister needs resident pages.
+        unsigned char * p = (unsigned char *) base;
+        for (size_t off = 0; off < chunk && off < size; off += 4096) { p[off] = 0; }
+        cudaError_t e = cudaHostRegister(base, std::min(chunk, size), cudaHostRegisterDefault);
+        if (e == cudaSuccess) {
+            cudaHostUnregister(base);
+            break;
+        }
+        (void)cudaGetLastError();
+        chunk >>= 1;
+    }
+    if (chunk < (16ULL << 20)) {
+        GGML_LOG_DEBUG("%s: even a 16 MiB pin fails in this process - WDDM pin path exhausted\n", __func__);
+        VirtualFree(base, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    g_moe_win_pin_chunk = chunk;
+
+    size_t registered = 0;
+    while (registered < size) {
+        size_t n = std::min(chunk, size - registered);
+        // Touch the range first: cudaHostRegister needs resident committed pages.
+        unsigned char * p = (unsigned char *) base + registered;
+        for (size_t off = 0; off < n; off += 4096) { p[off] = 0; }
+
+        cudaError_t err = cudaHostRegister(p, n, cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            GGML_LOG_DEBUG("%s: cudaHostRegister of %.2f MiB at offset %.2f GiB failed: %s "
+                           "(aggregate pinned quota reached?)\n",
+                           __func__, n / 1024.0 / 1024.0, registered / 1024.0 / 1024.0 / 1024.0,
+                           cudaGetErrorString(err));
+            ggml_cuda_moe_cached_win_pinned_free(base, registered);
+            return nullptr;
+        }
+        registered += n;
+    }
+
+    GGML_LOG_INFO("moe-cache: Windows chunked pin engaged - %.2f GiB fully pinned in %zu MiB chunks\n",
+                  size / 1024.0 / 1024.0 / 1024.0, chunk >> 20);
+    return base;
+}
+#endif // _WIN32
+
+static void ggml_backend_cuda_moe_cached_win_pinned_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer != nullptr && buffer->context != nullptr) {
+        ggml_cuda_moe_cached_win_pinned_free(buffer->context, buffer->size);
+    }
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
 
-    void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    void * ptr = nullptr;
+    bool win_chunked = false;
+
+#ifdef _WIN32
+    // Windows: a failed tens-of-GiB cudaMallocHost appears to poison the WDDM
+    // pin path for the rest of the process (subsequent cudaHostRegister of
+    // even one 4 GiB chunk fails with out-of-memory). Go chunked-first and
+    // keep cudaMallocHost as the small-allocation fallback.
+    ptr = ggml_cuda_moe_cached_win_pinned_malloc(size);
+    win_chunked = ptr != nullptr;
+    if (ptr == nullptr) {
+        ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    }
+#else
+    ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+#endif
 
     if (ptr == nullptr) {
         // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
@@ -11029,7 +11130,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft             = buft;
-    buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_buffer_free_buffer;
+    buffer->iface.free_buffer = win_chunked ? ggml_backend_cuda_moe_cached_win_pinned_free_buffer
+                                            : ggml_backend_cuda_moe_cached_buffer_free_buffer;
     return buffer;
 }
 
