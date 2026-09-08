@@ -7218,6 +7218,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     if (decode_legacy_certificate) {
         GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
+        static std::once_flag fallback_notice_once;
+        std::call_once(fallback_notice_once, [legacy_groups]() {
+            GGML_LOG_INFO("moe-cache: grouped decode unavailable for %u group(s); "
+                          "using cached mul_mat_id fallback\n", legacy_groups);
+        });
     }
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
