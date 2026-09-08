@@ -214,6 +214,9 @@ static void dummy_backend_set_tensor_async(ggml_backend_t backend, ggml_tensor *
     ctx->set_tensor_async_count++;
     ctx->set_tensor_async_bytes += size;
     ctx->deliveries.push_back({ tensor, (const char *) data, offset, size });
+    if (ctx->real_memory) {
+        memcpy((char *) tensor->data + offset, data, size);
+    }
 }
 
 static void dummy_backend_synchronize(ggml_backend_t) {}
