@@ -704,9 +704,10 @@ extern "C" {
         void * extra; // extra things e.g. for ggml-cuda.cu
 
         // bytes at the start of every stream that stay unchanged for the current graph evaluation, 0 for none
+        // padding comes first so that ggml_new_tensor_impl zeroes the whole storage, whatever size_t is
         union {
+            char   padding[8];
             size_t stable_prefix;
-            char padding[8];
         };
     };
 

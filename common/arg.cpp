@@ -2438,10 +2438,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-pipeline-depth"}, "N",
         string_format("how many splits ahead the scheduler delivers a host-resident KV cache to the accelerator, so "
-                      "that the transfer runs while the previous split computes; 0 keeps the ordered path, where a "
-                      "decode token pays the transfer and the attention kernels in series. Only takes effect with a "
-                      "host-resident cache, e.g. --no-kv-offload or --kv-cpu-pinned, and costs (N + 2) * (largest "
-                      "staged split) of device memory (default: %d)", params.kv_pipeline_depth),
+                      "that the transfer runs while the previous split computes. 0 keeps the ordered path, where a "
+                      "decode token pays the transfer and the attention kernels in series; any other value turns the "
+                      "pipeline on, and 1 is the value that measures best. Only takes effect with a host-resident "
+                      "cache, e.g. --no-kv-offload or --kv-cpu-pinned, and costs (N + 2) * (largest staged split) of "
+                      "device memory (default: %d)", params.kv_pipeline_depth),
         [](common_params & params, int value) {
             if (value < 0 || value > LLAMA_KV_PIPELINE_DEPTH_MAX) {
                 throw std::invalid_argument(string_format("--kv-pipeline-depth must be between 0 and %d", LLAMA_KV_PIPELINE_DEPTH_MAX));

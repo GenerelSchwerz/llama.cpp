@@ -427,8 +427,8 @@ extern "C" {
         struct llama_context * ctx_other;
 
         uint32_t kv_pipeline_depth;      // how many splits ahead the scheduler delivers a host-resident KV cache, so that the transfer runs while the previous split computes
-                                         // 0 keeps the ordered path, where a decode token pays the transfer and the attention kernels in series
-                                         // costs (kv_pipeline_depth + 2) * (largest staged split) of device memory
+                                         // 0 is the default and keeps the ordered path, where a decode token pays the transfer and the attention kernels in series
+                                         // any other value turns the pipeline on; 1 measures best, and costs (kv_pipeline_depth + 2) * (largest staged split) of device memory
         uint32_t kv_pipeline_budget_mib; // hard cap on that device memory, in MiB, past which the scheduler keeps the ordered path
                                          // a host-resident cache never quietly trades back the device memory it exists to save, 0 removes the cap
     };

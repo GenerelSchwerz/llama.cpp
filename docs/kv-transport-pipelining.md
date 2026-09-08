@@ -4,7 +4,17 @@ With `--no-kv-offload` (optionally with `--kv-cpu-pinned`), the attention histor
 
 The transfer and the attention arithmetic are the same as before, but the transfer is issued one split ahead, on a stream of its own, so the copy engine retires it underneath the kernels of the split before it.
 
-`--kv-pipeline-depth N` controls it. It is on by default at `N = 1` and only has an effect where a host-resident cache produces the deliveries; `0` restores the ordered path exactly.
+`--kv-pipeline-depth N` controls it, and it is **off by default**. Any `N` above 0 turns it on, `N = 1` is the value that measures best, and `0` is the ordered path. It only has an effect where a host-resident cache produces the deliveries.
+
+## Turning it on
+
+```
+--no-kv-offload --kv-cpu-pinned --kv-pipeline-depth 1
+```
+
+`--kv-pipeline-depth` defaults to 0, so nothing about an existing run changes until it is set. The same value is `llama_context_params::kv_pipeline_depth`, `-kvpd` in `llama-bench`, and `LLAMA_ARG_KV_PIPELINE_DEPTH` in the environment; `GGML_KV_PIPELINE_DEPTH` sets the scheduler default under all of them.
+
+`N = 1` is the recommendation, not just the smallest value that works: every deeper look-ahead measured is slower, and the ring costs `(N + 2)` slots of device memory. `N = 0` is the default because the feature spends device memory on a cache that is on the host to save it, and because the measurements below are one model on one link. Turn it on, look at `GGML_SCHED_TRANSPORT_DEBUG=1`, and keep it if the deliveries convert.
 
 The staging it needs is bounded by `--kv-pipeline-budget` (default 128 MiB), so that a cache which lives on the host to keep device memory free never quietly spends that memory back. Past the cap the scheduler declines and the ordered path runs, at no cost. See [The budget](#the-budget).
 
@@ -103,7 +113,7 @@ Pinning is worth as much as the pipeline and is off by default. Behind a 13,128-
 | `--kv-cpu-pinned` | 21.582 | 32.252 |
 | unpinned | 14.945 | 22.709 |
 
-Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the default for that reason. The exactness gate measures the same on every one of its four 18,432-prefill tasks: 29.955 against 27.031 on prose, 29.699 against 26.626 on dialogue, 16.406 against 15.926 on records, 16.340 against 15.864 on code.
+Look-ahead deeper than one split is worse at every depth measured. At 19,246: 29.83 t/s at `N = 1`, 28.44 at `N = 2`, 25.93 at `N = 4`. `N = 1` is the value to turn it on with, for that reason. The exactness gate measures the same on every one of its four 18,432-prefill tasks: 29.955 against 27.031 on prose, 29.699 against 26.626 on dialogue, 16.406 against 15.926 on records, 16.340 against 15.864 on code.
 
 ### The link is the ceiling, so the lever is bytes
 
@@ -185,6 +195,18 @@ A cache split into streams delivers a window per stream, so it moves more than a
 
 **The streams-pipelined column is lower than it was before the multi-stream span was fixed**, and the earlier numbers were wrong rather than better. The delivery sized one stream's range from `ne[2]*nb[2]`, which is one KV cell rather than the window, so it moved a fraction of the bytes and the attention read whatever the ring slot held before. Measured on the same machine, the predecessor reports 61.04, 90.81 and 108.23 at 2, 4 and 8 slots against 58.45, 85.45 and 105.63 here; the difference is the cost of copying the right amount.
 
+**A slot holds the window, not the cache it is cut from.** A staged copy keeps its source's layout, and in a cache split into streams that layout steps a whole `kv_size` from one stream to the next while the graph reads only `n_kv` of it. Sizing the slot from that stride reserves every gap the delivery skips, so the ring grew with `n_stream` instead of with the window. The copy now packs the streams: one window padded to the ring's alignment, with `cudaMemcpy2DAsync` given the source stride and the packed stride separately. Nothing about the bytes delivered changes, only where they land.
+
+The ring is what the budget is applied to, so this decides whether there is a ring at all. `llama-batched-bench -npp 2048 -ntg 128 -npl 8` at `-c 32768 -no-kvu`, one process per cell, generation t/s:
+
+| budget | depth | ring slot | before | after |
+|---:|---:|---:|---:|---:|
+| 128 (default) | 0 | - | 71.09 | 70.99 |
+| 128 (default) | 1 | 8 MiB, then declined / 42.7 MiB | 70.90 | **106.19** |
+| 512 | 1 | 68 MiB / 64 MiB | 106.20 | 106.11 |
+
+At the default budget the unpacked ring needs 170 MiB for a window worth 42.7 MiB, so it is declined and the arm reads the ordered path's own throughput. Packed, the same run keeps the ring and gains **+49.6%** over the ordered path. Where the budget was already raised past what the gaps cost, both are the same speed and the packed ring is slightly smaller. A unified cache is one range per delivery and is not affected either way, which the single-sequence A/B confirms: 18.976 -> 29.779 packed against 18.988 -> 29.784 before, at 16,384.
+
 **Concurrent slots can be gated on output, with a harness that fixes the batching.** The server cannot: its batching varies between runs, so the same build at the same depth gives different greedy output, and three runs at `N = 0` produced three different hashes. `llama-parallel` seeds its client schedule, so the batches repeat, and `docs/repro/r4-kv-pipeline-parallel-exact.sh` compares the transcripts of 8 concurrent sequences over a non-unified cache. Its clients ask different questions, which is what makes it a gate: with one prompt shared by every sequence the streams hold the same bytes and a cross-stream read is invisible. The predecessor above fails it at `N = 1` on the first sequence.
 
 ### The budget
@@ -251,6 +273,8 @@ The 3.57 ms that remains moves 0.4 MiB, and `GGML_SCHED_TRANSPORT_DEBUG=3` shows
 
 It looks like latency and is not. A blocking copy shares the device's copy engine with the deliveries and waits for what is already queued there: two staged splits at 22.0 GB/s is 3.6 ms, which is the number. Two things were tried and neither helped. Issuing the delivery in pieces so the blocking copy can interleave does nothing -- the engine is FIFO across streams, `attn_inp_k_rot` stays at 3.4 ms at every piece size, and small pieces cost throughput (29.80 t/s whole, 28.73 at 4 MiB, 22.01 at 1 MiB). Putting the copy on the consumer's own stream so the host never blocks moves the time rather than removing it: the ordered copy falls from 3.57 ms to 0.16 ms, the consumer wait rises from 27.31 ms to 31.05 ms, and throughput does not move (29.808 against 29.834).
 
+The wait at the graph boundary does not show up here because it costs nothing to show. Timed separately at 16,384 over 128 graphs of steady-state decode, the consumer sync and the transfer sync are both 0.00 ms of a 31.55 ms graph: the host reaches the boundary well after the streams have. It is 1.39 ms per graph during prefill, where the window widens on nearly every ubatch, and nothing after that. Ordering the two streams with an event instead of blocking the host was measured against this and has nothing to win.
+
 So this is not spare time. Those 256 KiB cross the same saturated link as the 644 MiB of deliveries, and on this configuration the link is the ceiling. A faster link, or a slower device behind it, moves that ceiling somewhere else.
 
 Do not compare these numbers against runs on other models, prompts, cache settings, hardware, or commits.
@@ -260,6 +284,8 @@ Do not compare these numbers against runs on other models, prompts, cache settin
 The gates, and what was run for them:
 
 Gates 1, 2, 3 and 5 and `test-alloc` were run on the current head, on an RTX 4070 with a CUDA build, gate 5 also over both devices with `-sm layer`. The `llama-server` table and the parallel table under [Measurements](#measurements) are from those runs; the breakdowns marked as taken on an earlier head still are.
+
+Gate 5 and the A/B were re-run for the packed multi-stream ring, on both this head and the commit before it, and the two agree byte for byte: `9c13743e07b55934` at `N = 0`, `1` and `4` with `-sm none`, `7fc64d5ed9709861` at the same depths with `-sm layer`. Packing changes where a range lands in the slot and nothing about the bytes, so an unchanged hash is the result to expect; the gate is there because a stride mistake would not look like one.
 
 1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`, re-run on the current head. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
 
@@ -275,11 +301,11 @@ A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 
 
 - Only persistent host inputs marked with `GGML_TENSOR_FLAG_TRANSPORT` are candidates. The stable prefix remains a per-evaluation value. Unmarked inputs, weights, user inputs, transposed V, and copies with later readers stay ordered.
 - CUDA is the only enabled backend. Meta, SYCL, WebGPU, and other backends stay ordered until their event behavior and transport path are validated.
-- The ring costs `(depth + 2) x (largest staged split)` of device memory, and a staged split is both K and V of one attention layer over the whole context. That is linear in context length, and it is what bounds the feature at depth rather than anything about the transfer itself.
+- The ring costs `(depth + 2) x (largest staged split)` of device memory, and a staged split is both K and V of one attention layer over the window the graph reads. That is linear in context length, and it is what bounds the feature at depth rather than anything about the transfer itself.
 - **A cap is per graph, not per sequence.** `--kv-pipeline-budget` bounds the window one graph delivers, which is `n_kv * n_stream` over every sequence in the ubatch, so it cannot be applied to one sequence of a batch and not another.
-- **A multi-stream window is delivered one range per stream**, keyed on the last dimension. A window whose streams are not on that dimension keeps the single flat range, which is correct but not accelerated.
+- **A multi-stream window is delivered one range per stream**, keyed on the last dimension, and the copy packs those ranges so a slot holds the window rather than the whole cache. A window whose streams are not on that dimension keeps the single flat range, which is correct but not accelerated.
 - **A cache that shares cells with another one keeps the ordered path for the layers it shares.** [TAG_KV_CACHE_SHARE_CELLS] gives the borrowing cache the owner's K/V tensors, so their stable prefix would have two writers with two slot layouts. The borrower drops `GGML_TENSOR_FLAG_TRANSPORT` from the tensors it takes; the layers it allocates itself are unaffected.
-- **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others.
+- **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others. The exception is a graph that cannot be allocated next to the rings: there every device that was holding one gives it back for good, because the allocator does not say which of them it competed with.
 - **The producer of a staged input must be the CPU or the consumer itself.** Neither part of a staged delivery is ordered against a third device: the stable prefix goes on the transfer stream and the rest on the consumer's own stream, where the ordered path would have synchronized the producer first. An input a second accelerator writes keeps the ordered path.
 - **It turns graph-level pipeline parallelism off while it is delivering.** A graph that delivered has to block the host on its consumer before the next graph writes the host cache, because the host source of a delivery is read long after the call that issued it returned. That block is what `n_copies > 1` exists to avoid, so the two do not overlap: with `-sm layer` over several GPUs and `--kv-cpu-pinned`, `llama_context` enables both and the ring wins. Use `--kv-pipeline-depth 0` to keep the graph-level pipelining instead.
 - **Tensor parallelism keeps the ordered path.** See [Tensor parallelism](#tensor-parallelism).

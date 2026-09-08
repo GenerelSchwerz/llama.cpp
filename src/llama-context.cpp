@@ -4117,7 +4117,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
-        /*.kv_pipeline_depth           =*/ 1,
+        /*.kv_pipeline_depth           =*/ 0,
         /*.kv_pipeline_budget_mib      =*/ 128,
     };
 

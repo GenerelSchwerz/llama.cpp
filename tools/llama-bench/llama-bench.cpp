@@ -407,7 +407,7 @@ static const cmd_params cmd_params_defaults = {
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* kv_cpu_pinned        */ { false },
-    /* kv_pipeline_depth    */ { 1 },
+    /* kv_pipeline_depth    */ { 0 },
     /* kv_pipeline_budget_mib */ { 128 },
     /* recurrent_state_offload */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },

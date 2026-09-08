@@ -90,7 +90,8 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
-    if (ctx->fail_alloc || size > ctx->capacity - ctx->allocated_total()) {
+    const size_t allocated = ctx->allocated_total();
+    if (ctx->fail_alloc || size > ctx->capacity || allocated > ctx->capacity - size) {
         return nullptr;
     }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
@@ -1717,12 +1718,18 @@ static void test_transport_multi_stream_ranges() {
             });
 
     // every stream's window is covered exactly once, from its own source offset, and the unread cells never move
-    const size_t stride = (size_t) window->nb[3];
+    // the copy packs the streams, so it steps by one window padded to the ring's alignment rather than by a whole cache
+    const size_t stride     = (size_t) window->nb[3];
+    const size_t align      = 128;
+    const size_t stride_cpy = (used_bytes + align - 1)/align*align;
+    GGML_ASSERT(stride_cpy < stride);
+
     size_t total = 0;
     for (const auto & d : parts) {
-        GGML_ASSERT(d.offset/stride < (size_t) n_stream);
-        GGML_ASSERT(d.offset%stride + d.size <= used_bytes);
-        GGML_ASSERT(d.src == (const char *) window->data + d.offset);
+        const size_t src_offset = (size_t) (d.src - (const char *) window->data);
+        GGML_ASSERT(src_offset/stride < (size_t) n_stream);
+        GGML_ASSERT(src_offset%stride + d.size <= used_bytes);
+        GGML_ASSERT(d.offset == (src_offset/stride)*stride_cpy + src_offset%stride);
         total += d.size;
     }
     GGML_ASSERT(total == (size_t) n_stream*used_bytes);
@@ -1730,8 +1737,9 @@ static void test_transport_multi_stream_ranges() {
     for (int64_t st = 0; st < n_stream; st++) {
         size_t covered = 0;
         for (const auto & d : parts) {
-            if (d.offset/stride == (size_t) st) {
-                GGML_ASSERT(d.offset%stride == covered);
+            const size_t src_offset = (size_t) (d.src - (const char *) window->data);
+            if (src_offset/stride == (size_t) st) {
+                GGML_ASSERT(src_offset%stride == covered);
                 covered += d.size;
             }
         }
