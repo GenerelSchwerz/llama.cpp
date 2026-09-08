@@ -1855,6 +1855,7 @@ struct moe_candidate_route_proof {
     ggml_cuda_moe_ids_signature ids;
     ggml_cuda_moe_ids_signature root;
     ggml_cuda_moe_ids_signature source;
+    ggml_cuda_moe_ids_signature indices;
     uint32_t root_node_index = 0;
     uint32_t ids_node_index = 0;
 };
@@ -2115,6 +2116,31 @@ static bool moe_candidate_validate_route(
         const ggml_tensor * ids,
         int64_t n_experts,
         moe_candidate_route_proof & proof) {
+    if (moe_candidate_ids_valid(ids) && ids->op == GGML_OP_GET_ROWS) {
+        const ggml_tensor * table = ids->src[0];
+        const ggml_tensor * indices = ids->src[1];
+        if (n_experts <= 0 || ids->ne[0] > n_experts || ids->ne[2] != 1 || ids->ne[3] != 1 ||
+                (ids->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_is_contiguous(ids) ||
+                ids->view_src != nullptr || ids->view_offs != 0 ||
+                !moe_candidate_ids_valid(table) || table->op != GGML_OP_NONE || table->view_src != nullptr ||
+                table->view_offs != 0 || !ggml_is_contiguous(table) ||
+                ggml_backend_buffer_get_usage(table->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                table->ne[0] != ids->ne[0] || table->ne[2] != 1 || table->ne[3] != 1 ||
+                !moe_candidate_ids_valid(indices) || !ggml_is_contiguous(indices) ||
+                indices->ne[0] != ids->ne[1] || indices->ne[1] != 1 || indices->ne[2] != 1 || indices->ne[3] != 1) {
+            return false;
+        }
+        for (int i = 2; i < GGML_MAX_SRC; ++i) {
+            if (ids->src[i] != nullptr) {
+                return false;
+            }
+        }
+        proof.ids = moe_candidate_ids_signature(ids);
+        proof.root = proof.ids;
+        proof.source = moe_candidate_ids_signature(table);
+        proof.indices = moe_candidate_ids_signature(indices);
+        return true;
+    }
     if (!moe_candidate_ids_valid(ids) || ids->op != GGML_OP_VIEW || (ids->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 ||
             ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->nb[0] != sizeof(int32_t) ||
             ids->src[0] == nullptr || ids->view_src != ids->src[0] || ids->view_offs != 0) {
@@ -2158,7 +2184,7 @@ static bool moe_candidate_discover_route(
         moe_candidate_route_proof & proof) {
     if (!moe_candidate_graph_node_before(cgraph, proof.root.tensor, consumer_node_index, &proof.root_node_index) ||
             !moe_candidate_graph_node_before(cgraph, proof.ids.tensor, consumer_node_index, &proof.ids_node_index) ||
-            proof.root_node_index >= proof.ids_node_index) {
+            proof.root_node_index > proof.ids_node_index) {
         return false;
     }
     return true;
@@ -4113,6 +4139,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     size_t legacy_l2_budget_bytes = 0;
     size_t prefill_resident_auxiliary_budget = MOE_PREFILL_RESIDENT_AUX_BUDGET;
     std::atomic<bool> legacy_debug_mm{false};
+    std::atomic<uint64_t> fallback_notice_generation{0};
     bool legacy_policy_initialized = false;
     bool fail_borrowed_cache_init_after_probe_for_test = false;
     std::atomic<uint32_t> split_staging_poison_calls_for_test{0};
@@ -7219,6 +7246,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
                 observation.ids = route.ids;
                 observation.route_root = route.root;
                 observation.route_source = route.source;
+                observation.route_indices = route.indices;
                 if (!moe_candidate_discover_route(cgraph, node_index, route)) {
                     observation.route_invalid = true;
                     if (route.root_node_index >= static_cast<uint32_t>(n_nodes) || route.ids_node_index >= static_cast<uint32_t>(n_nodes) ||
@@ -7442,6 +7470,7 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.ids = observation.ids;
             record.ids_root = observation.route_root;
             record.ids_source = observation.route_source;
+            record.ids_indices = observation.route_indices;
             record.ids_root_node_index = observation.route_root_node_index;
             record.ids_node_index = observation.route_ids_node_index;
         }
@@ -7503,6 +7532,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     if (decode_legacy_certificate) {
         GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
+        if (impl_->fallback_notice_generation.exchange(
+                plan->registry_generation_, std::memory_order_relaxed) != plan->registry_generation_) {
+            GGML_LOG_INFO("moe-cache: device %d grouped decode unavailable for %u group(s); "
+                          "using cached mul_mat_id fallback\n", impl_->device, legacy_groups);
+        }
     }
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
@@ -7699,11 +7733,12 @@ bool ggml_cuda_moe_grouped_context::graph_group_witness_matches(
                         !moe_candidate_ids_equal(current_route.ids, record.ids) ||
                         !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
                         !moe_candidate_ids_equal(current_route.source, record.ids_source) ||
+                        !moe_candidate_ids_equal(current_route.indices, record.ids_indices) ||
                         record.ids_root_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
                         record.ids_node_index >= static_cast<uint32_t>(cgraph->n_nodes) ||
                         ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
                         ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
-                        record.ids_root_node_index >= record.ids_node_index || record.ids_node_index >= reader.node_index) {
+                        record.ids_root_node_index > record.ids_node_index || record.ids_node_index >= reader.node_index) {
                     route_invalid = true;
                 }
                 ids_signature = current_ids;
@@ -7957,13 +7992,14 @@ bool ggml_cuda_moe_grouped_context::bind_graph_plan(
         moe_candidate_route_proof current_route;
         const auto * route_bank = moe_candidate_base_slot_bank(group, 0);
         if (route_bank == nullptr || record.ids_root_node_index >= static_cast<uint32_t>(n_nodes) ||
-                record.ids_node_index >= static_cast<uint32_t>(n_nodes) || record.ids_root_node_index >= record.ids_node_index ||
+                record.ids_node_index >= static_cast<uint32_t>(n_nodes) || record.ids_root_node_index > record.ids_node_index ||
                 record.ids_node_index >= first_node_index ||
                 ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_root_node_index) != record.ids_root.tensor ||
                 ggml_graph_node(const_cast<ggml_cgraph *>(cgraph), record.ids_node_index) != record.ids.tensor ||
                 !moe_candidate_validate_route(record.ids.tensor, route_bank->ne[2], current_route) ||
                 !moe_candidate_ids_equal(current_route.ids, record.ids) || !moe_candidate_ids_equal(current_route.root, record.ids_root) ||
-                !moe_candidate_ids_equal(current_route.source, record.ids_source)) {
+                !moe_candidate_ids_equal(current_route.source, record.ids_source) ||
+                !moe_candidate_ids_equal(current_route.indices, record.ids_indices)) {
             return false;
         }
         ggml_cuda_moe_ids_signature ids_signature;
