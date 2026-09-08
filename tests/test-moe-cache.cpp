@@ -10824,6 +10824,7 @@ struct grouped_decode_fixture {
     ggml_backend_buffer_t ids_buffer = nullptr;
     ggml_context * ctx = nullptr;
     void * source_storage = nullptr;
+    size_t source_storage_size = 0;
     uint32_t n_experts = N_EXPERTS;
     size_t source_offset = 0;
 
@@ -10837,7 +10838,9 @@ struct grouped_decode_fixture {
         if (pinned) {
             source_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_moe_cached_buffer_type(), source_bytes);
         } else {
-            CHECK(posix_memalign(&source_storage, 64, source_bytes) == 0);
+            source_storage = ggml_aligned_malloc(source_bytes);
+            source_storage_size = source_bytes;
+            CHECK(source_storage != nullptr);
             source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(source_storage, source_bytes);
         }
         ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 4096);
@@ -10853,7 +10856,9 @@ struct grouped_decode_fixture {
         ggml_free(ctx);
         ggml_backend_buffer_free(ids_buffer);
         ggml_backend_buffer_free(source_buffer);
-        free(source_storage);
+        if (source_storage != nullptr) {
+            ggml_aligned_free(source_storage, source_storage_size);
+        }
         ggml_backend_free(backend);
     }
 
