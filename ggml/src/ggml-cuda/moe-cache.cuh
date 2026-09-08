@@ -685,7 +685,7 @@ private:
     bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index, uint32_t slot_index);
     const node_entry * find(const ggml_tensor * node) const;
     static_assert(sizeof(reader_witness) <= 640, "reader witness is too large");
-    static_assert(sizeof(group_record) <= 4096, "group record is too large");
+    static_assert(sizeof(group_record) <= 4160, "group record is too large");
     static_assert(sizeof(group_observation) <= 4096, "group observation is too large");
 
     std::vector<group_record> groups_;

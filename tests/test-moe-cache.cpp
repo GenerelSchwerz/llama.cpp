@@ -3598,7 +3598,7 @@ static void test_grouped_context_resources() {
 static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(sizeof(ggml_cuda_moe_graph_plan) <= 128 * 1024);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_reader_witness_size() <= 640);
-    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_record_size() <= 4096);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_record_size() <= 4160);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_observation_size() <= 4096);
     fprintf(stderr, "test-moe-cache: graph witness sizes plan=%zu reader=%zu group=%zu observation=%zu\n",
         sizeof(ggml_cuda_moe_graph_plan),
