@@ -14,9 +14,11 @@ The same option works with `--mmap`. Use `-lv 4` to see allocation diagnostics. 
 
 The environment spelling is `LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB`. The old `--moe-expert-cache-l2-pinned-mb` and `LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB` spellings are deprecated aliases with the new semantics, including rejection of zero. Supplying both names, including a CLI/environment combination, is an error. A CLI value overrides the environment value for the same spelling.
 
-The loader reserves conservative staging headroom before selecting a fixed prefix of source storage for in-place registration. Sources keep their original backing, without a retained duplicate of all weights. A prefix can cover only part of a bank; complete registered experts use their CUDA aliases and other experts use staging. Read-only mmap registration is capability-checked and falls back to staging without changing file protections. Set `GGML_CUDA_MOE_HOST_REGISTER=0` to force staging-only validation.
+The loader reserves conservative staging headroom before selecting a fixed prefix of source storage for in-place registration. It uses batches of up to 16 misses, reducing the batch size when the budget cannot hold that many copies of the one-miss staging minimum. Extra staging reduces the registered-source allowance under the same cap; the minimum accepted budget is unchanged. Sources keep their original backing, without a retained duplicate of all weights. A prefix can cover only part of a bank; complete registered experts use their CUDA aliases and other experts use staging. Read-only mmap registration is capability-checked and falls back to staging without changing file protections. Set `GGML_CUDA_MOE_HOST_REGISTER=0` to force staging-only validation.
 
-Grouped decode retains the GPU slot planner. A pinned control copy supplies miss IDs to captured host callbacks; each callback copies one missing expert across all needed banks into stable pinned storage, followed by the fused GPU gather. Callbacks and gathers run in stream order, so staging is not overwritten before use. Fully mapped groups keep the original callback-free gather. Existing prefill and unsupported-routing fallback paths remain in place.
+Grouped decode retains the GPU slot planner. A pinned control copy supplies miss IDs to captured host callbacks; each callback copies a batch of missing experts across all needed banks into stable pinned storage, followed by the fused GPU gather. Larger route sets use multiple batches, including a partial final batch. Callbacks and gathers run in stream order, so staging is not overwritten before use. Fully mapped groups keep the original callback-free gather. Existing prefill and unsupported-routing fallback paths remain in place.
+
+`-DGGML_CUDA_MOE_STREAMING_COPY=ON` enables an optional x86-64 host-copy optimization at build time. It defaults to `OFF`. It uses SSE2 streaming stores for staging copies of at least 256 KiB whose destination is 16-byte aligned and whose size is a multiple of 64 bytes. A store fence completes those writes before callback readiness is published. Other copies and non-x86-64 hosts retain `memcpy`. This option does not add allocations, threads, or CUDA APIs, and does not change the pin cap or source prefix. Performance depends on the CPU, memory system, and copy sizes; enabling it is not a universal speedup.
 
 Allocations and registered ranges are charged in 64 KiB blocks under a shared model budget. Contexts share the cap, but own separate staging resources. Additional contexts or graph resources can fail if the remaining budget is insufficient; they do not silently expand it. The load log reports conservative staging headroom, successful source registration, and cap/source/staging/pending/peak-reserved bytes. These counters describe cache-owned CUDA requests, not an OS measurement of locked physical memory.
 
@@ -26,7 +28,7 @@ CUDA 12.8 is the current validation target, per the revised implementation reque
 
 ### Validation and limitations
 
-Windows, multiple physical GPUs, and CUDA 11 runtime behavior are not certified by the Linux single-GPU tests. The first implementation uses one staging tile per group and a fixed source prefix, not adaptive hot-expert selection or overlapped multi-lease copying. Host callbacks still execute on cache-hit steps for groups that require staging, so throughput must be measured independently of correctness and capacity.
+Windows, multiple physical GPUs, and CUDA 11 runtime behavior are not certified by the Linux single-GPU tests. Each group uses one reusable staging batch and a fixed source prefix, not adaptive hot-expert selection or overlapped multi-lease copying. Host callbacks still execute on cache-hit steps for groups that require staging, so throughput must be measured independently of correctness and capacity. The pin cap is not a total-RAM limit: non-mmap source backing still requires RAM or swap even where it is not registered.
 
 Linux validation used an RTX 5070 Ti, driver 610.57.04, CUDA 12.8, GCC 14.3.1, Release, architecture `120a-real`, and `GGML_CUDA_NCCL=OFF`. The linked backend runtime and cuBLAS were version 12; the system NCCL library was excluded because it would also load CUDA 13.
 
@@ -41,6 +43,41 @@ Linux validation used an RTX 5070 Ti, driver 610.57.04, CUDA 12.8, GCC 14.3.1, R
 - `test-arg-parser` passed on both CUDA and CPU-only builds, including CLI/environment precedence and deprecated-alias conflicts.
 - Small-model and Qwen3.6-35B-A3B-Q4_K_M server tests completed with both mmap and non-mmap loading. The default model-fit dry run was enabled, exercising zero-allocation model ownership. Cache pool sizes still need manual tuning because fit does not account for them.
 - A Qwen3.6-35B-A3B-NVFP4-Q8-NVFP4 server comparison completed with full pinning and a 512 MiB cap. All eight 64-token outputs matched exactly; bounded peak reservation was 491.4375 MiB and sampled process GPU memory was 5702-5704 MiB. Warm-request median generation was 91.73 tokens/s with full pinning and 22.18 tokens/s bounded, with a wide 20.71-32.35 bounded range. This used the same server geometry and prompt as the Q4_K_M comparison below, except for `n_predict=64`.
+
+### Batched staging update
+
+The batching change passed the full `test-moe-cache` suite, bounded-pinning LRU tests, Compute Sanitizer memcheck (zero errors), and 880/880 CUDA `MUL_MAT_ID` backend tests. Existing fixtures now check captured callback counts with one-, three-, and sixteen-miss budgets, partial final batches, mixed registered/staged sources, and dense/NVFP4 copies. The injected batched callback failure during graph replay still stopped execution with the expected CUDA error.
+
+An Nsight Systems comparison on the same Linux CUDA 12.8 system used Qwen3.8-Flash-Next-UD-Q3_K_XL, 80 GPU slots, a 28610 MiB host-pin cap, context 12288, batch 4096, ubatch 512, 12 threads, Q8_0 KV, non-mmap loading, lazy PLE, and `LLAMA_ATTN_ROT_DISABLE=1`. Both profiles used the same 158-token chat prompt and produced the same 1024-token output, including identical content and reasoning hashes.
+
+| Measurement | One miss per callback | Batched callbacks |
+| --- | ---: | ---: |
+| Generation tokens/s | 25.00 | 27.97 |
+| Decode callbacks | 245520 | 25575 |
+| GPU-idle time in intervals containing callbacks | 15.251 s | 11.783 s |
+| Cache-owned peak pin reservation | 28551.3125 MiB | 27711.625 MiB |
+
+This is one before/after profiled pair, not a repeated benchmark or a Windows result. The observed throughput improvement was 11.9%; callbacks fell by 89.6%. The batched run reserved 1748 MiB of conservative staging headroom, registered 26862 MiB of sources, and allocated 849.625 MiB of staging/control. The smaller source prefix caused 25 groups to require staging instead of 24. All 48 groups completed 49104 grouped calls with zero fallback or errors and unchanged transfer counts/bytes.
+
+The run used a hard job memory limit, no job swap, disabled core dumps/backtraces, and an independent 800 MiB system-available-RAM watchdog. Minimum sampled available RAM was 2219 MiB, peak job memory was 58134 MiB, and peak device memory was 14305 MiB. There were no job OOM, memory-limit, or watchdog events. These test safeguards are not implemented by the pin-budget flag.
+
+The Qwen3.6 measurements below are the original one-miss staging results, not measurements of the batching update.
+
+### Optional streaming-copy update
+
+The opt-in streaming-copy build passed the full `test-moe-cache` suite, bounded-pinning LRU tests, Compute Sanitizer memcheck (zero errors), the injected captured-callback failure test, and 880/880 CUDA `MUL_MAT_ID` cases. The disabled build passed the bounded-pinning suite. An existing Q4_K fixture now exercises copies above the 256 KiB threshold. MSVC 14.51 compiled the extracted helper with the option both enabled and disabled using `/W4 /WX`; both executables passed 208 byte-copy and guard-byte cases under Wine. This does not validate a Windows CUDA build or WDDM execution.
+
+A fresh profiled pair used the Flash Next geometry above, identical requests, and verified the loaded CUDA library hashes. The baseline was the saved batched backend without streaming stores. Both runs produced identical content and reasoning, made 25575 decode callbacks, and retained the same 27711.625 MiB cache-owned peak pin reservation.
+
+| Measurement | Batched baseline | Streaming copy enabled |
+| --- | ---: | ---: |
+| Generation tokens/s | 28.11 | 29.22 |
+| Callback execution time | 8.945 s | 6.304 s |
+| GPU-idle time in intervals containing callbacks | 11.698 s | 8.503 s |
+| Prompt evaluation | 3.336 s | 7.343 s |
+| Whole HTTP request | 39.744 s | 42.427 s |
+
+Callback execution fell by 29.5% and observed decode throughput rose by 3.9%, but the whole request was 6.8% slower. No staging callbacks ran during prefill; that window had similar GPU busy time and more sampled file reads in the enabled run. Other decode idle time also increased. This single pair does not isolate the cause of those changes or establish a repeatable end-to-end gain. Both runs had zero job swap, OOM, memory-limit, or watchdog events; minimum sampled available RAM exceeded 2149 MiB and peak sampled GPU memory was 14305 MiB. The build option remains off by default.
 
 ### Qwen3.6 Q4_K_M comparison
 

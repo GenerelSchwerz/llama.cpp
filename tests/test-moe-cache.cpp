@@ -6118,7 +6118,8 @@ static void test_active_grouped_multirow_graph_modes_case(
         ggml_type type = GGML_TYPE_Q4_0,
         ggml_cuda_mmid_consumer expected_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ,
         ggml_cuda_mmid_mapping expected_mapping = GGML_CUDA_MMID_MAPPING_DIRECT,
-        ggml_backend_buffer_type_t candidate_buft = nullptr) {
+        ggml_backend_buffer_type_t candidate_buft = nullptr,
+        size_t expected_host_nodes = 0) {
     CHECK(n_rows >= 2 && n_slots > 0 && n_used <= n_slots / n_rows);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
@@ -6218,6 +6219,20 @@ static void test_active_grouped_multirow_graph_modes_case(
             captured_semantic_key = candidate_graph.execution_semantic_key;
             captured_resource_fingerprint = candidate_graph.moe_resource_fingerprint;
             CHECK(captured_semantic_key != 0 && captured_resource_fingerprint != 0);
+            if (expected_host_nodes != 0) {
+                size_t node_count = 0;
+                auto graph = reinterpret_cast<cudaGraph_t>(captured_graph);
+                CUDA_OK(cudaGraphGetNodes(graph, nullptr, &node_count));
+                std::vector<cudaGraphNode_t> nodes(node_count);
+                CUDA_OK(cudaGraphGetNodes(graph, nodes.data(), &node_count));
+                size_t host_nodes = 0;
+                for (auto node : nodes) {
+                    cudaGraphNodeType type;
+                    CUDA_OK(cudaGraphNodeGetType(node, &type));
+                    host_nodes += type == cudaGraphNodeTypeHost;
+                }
+                CHECK(host_nodes == expected_host_nodes);
+            }
         } else {
             CHECK(candidate_graph.graph == captured_graph && candidate_graph.instance == captured_instance &&
                 candidate_graph.warmup_complete && candidate_graph.moe_resource_fingerprint != 0 &&
@@ -7791,6 +7806,7 @@ static void test_active_grouped_dispatch_case(
 static void test_bounded_host_pinning_fault() {
     auto * buft = ggml_backend_cuda_moe_bounded_buffer_type(1024 * 1024);
     CHECK(buft != nullptr);
+    CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, 65536));
     ggml_backend_ptr backend(ggml_backend_cuda_init(0));
     CHECK(backend != nullptr);
     auto graph = build_active_grouped_dispatch_graph(backend.get(), buft, GGML_TYPE_Q4_0,
@@ -7822,11 +7838,15 @@ static void test_bounded_host_pinning() {
     size_t used = SIZE_MAX;
     size_t peak = SIZE_MAX;
     CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak == 0);
-    for (uint32_t rows : {2, 4}) {
-        test_active_grouped_multirow_graph_modes_case(0, rows, 8, 2, 12, false,
-            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
-            GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft);
-        CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
+    for (uint32_t batch_size : {1, 3, 16}) {
+        CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, limit / batch_size));
+        for (uint32_t rows : {2, 4}) {
+            test_active_grouped_multirow_graph_modes_case(0, rows, 8, 2, 12, false,
+                GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
+                GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft,
+                1 + (rows * 2 - 1) / std::min<uint32_t>(batch_size, 12));
+            CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
+        }
     }
     for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (const auto layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
@@ -7834,7 +7854,9 @@ static void test_bounded_host_pinning() {
             CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak > 0 && peak <= limit);
         }
     }
-    CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, limit - 256 * 1024));
+    test_active_grouped_dispatch_types_case({GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K},
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3, false, false, false, 1, 2048, false, buft);
+    CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, (limit - 256 * 1024) / 3));
     test_active_grouped_multirow_graph_modes_case(0, 2, 8, 2, 12, false,
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
         GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft);
@@ -11280,6 +11302,7 @@ static void test_bounded_host_pinning_limits(int device) {
     size_t failed_peak = SIZE_MAX;
     CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &failed_used, &failed_peak) && failed_used == 0 && failed_peak == 65536);
     CHECK(ggml_cuda_moe_grouped_context_test_access::probe_host_allocation(buft, 65536, false));
+    CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, 65536));
     for (const auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
         for (const auto layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
             test_grouped_decode_type(device, type, layout, true, 4, false, buft);

@@ -53,6 +53,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(GGML_CUDA_MOE_STREAMING_COPY) && (defined(__x86_64__) || defined(_M_X64)) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <emmintrin.h>
+#endif
+
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
@@ -70,6 +74,7 @@ struct moe_host_budget {
     size_t source_limit = 0;
     size_t source_used = 0;
     size_t staging_pinned = 0;
+    uint32_t staging_misses = 1;
     std::atomic<int64_t> fail_stage_after{-1};
 
     void retain() { references.fetch_add(1, std::memory_order_relaxed); }
@@ -2914,6 +2919,7 @@ struct moe_grouped_host_stage {
     uint32_t * status = nullptr;
     uint32_t capacity = 0;
     uint32_t n_experts = 0;
+    uint32_t batch_size = 1;
     std::vector<moe_grouped_host_stage_bank> banks;
 };
 
@@ -2923,6 +2929,27 @@ struct moe_grouped_host_stage_tile {
 };
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void moe_grouped_host_copy(char * destination, const char * source, size_t bytes) {
+#if defined(GGML_CUDA_MOE_STREAMING_COPY) && (defined(__x86_64__) || defined(_M_X64))
+    // The GPU consumes these writes; do not retain large staging copies in CPU caches.
+    if (bytes >= 256 * 1024 && bytes % 64 == 0 && (uintptr_t) destination % 16 == 0) {
+        for (size_t i = 0; i < bytes; i += 64) {
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i));
+            const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 16));
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 32));
+            const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 48));
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i), a);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 16), b);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 32), c);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 48), d);
+        }
+        _mm_sfence();
+        return;
+    }
+#endif
+    memcpy(destination, source, bytes);
+}
+
 static void CUDART_CB moe_grouped_stage_callback(void * data) {
     const auto & tile = *static_cast<moe_grouped_host_stage_tile *>(data);
     auto & stage = *tile.stage;
@@ -2935,15 +2962,16 @@ static void CUDART_CB moe_grouped_stage_callback(void * data) {
     if (stage.plan->status != MOE_GROUPED_PLAN_READY || stage.plan->n_misses > stage.capacity) {
         return;
     }
-    if (tile.miss < stage.plan->n_misses) {
-        const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss];
-        const int32_t slot = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[tile.miss];
+    const uint32_t count = tile.miss < stage.plan->n_misses ? std::min(stage.batch_size, stage.plan->n_misses - tile.miss) : 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
+        const int32_t slot = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[tile.miss + i];
         if (expert < 0 || (uint32_t) expert >= stage.n_experts || slot < 0 || (uint32_t) slot >= stage.capacity) {
             return;
         }
         for (const auto & bank : stage.banks) {
             if ((uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
-                memcpy(bank.destination, bank.source + (size_t) expert * bank.stride, bank.stride);
+                moe_grouped_host_copy(bank.destination + (size_t) i * bank.stride, bank.source + (size_t) expert * bank.stride, bank.stride);
             }
         }
     }
@@ -3426,7 +3454,7 @@ static __global__ void moe_grouped_gather_decode(
             if constexpr (bounded) {
                 const bool direct = (uint32_t) expert >= descriptor.direct_first && (uint32_t) expert < descriptor.direct_last;
                 source_data = direct ? descriptor.direct_source + (size_t) (expert - descriptor.direct_first) * descriptor.expert_stride :
-                    descriptor.source + (descriptor.staged ? 0 : (size_t) expert * descriptor.expert_stride);
+                    descriptor.source + (descriptor.staged ? (size_t) (miss - first_miss) : (size_t) expert) * descriptor.expert_stride;
             } else {
                 source_data = descriptor.source + (size_t) expert * descriptor.expert_stride;
             }
@@ -3455,7 +3483,7 @@ static __global__ void moe_grouped_gather_decode(
             if constexpr (bounded) {
                 const bool direct = (uint32_t) expert >= descriptor.direct_first && (uint32_t) expert < descriptor.direct_last;
                 source = direct ? descriptor.direct_source + (size_t) (expert - descriptor.direct_first) * descriptor.n_values :
-                    descriptor.source + (descriptor.staged ? 0 : (size_t) expert * descriptor.n_values);
+                    descriptor.source + (descriptor.staged ? (size_t) (miss - first_miss) : (size_t) expert) * descriptor.n_values;
             } else {
                 source = descriptor.source + (size_t) expert * descriptor.n_values;
             }
@@ -5034,18 +5062,20 @@ struct ggml_cuda_moe_grouped_context::impl {
                 return nullptr;
             }
             const size_t control_bytes = (result->plan_bytes + sizeof(uint32_t) + 15) / 16 * 16;
-            if (stage_bytes > SIZE_MAX - control_bytes) {
+            const uint32_t batch_size = std::min(host_budget->staging_misses, snapshot.n_slots);
+            if (stage_bytes > (SIZE_MAX - control_bytes) / batch_size) {
                 return nullptr;
             }
             result->host_stage = std::make_unique<moe_grouped_host_stage>();
             auto & stage = *result->host_stage;
-            if (!stage.allocation.allocate(host_budget, control_bytes + stage_bytes)) {
+            if (!stage.allocation.allocate(host_budget, control_bytes + stage_bytes * batch_size)) {
                 return nullptr;
             }
             stage.plan = static_cast<moe_grouped_decode_plan *>(stage.allocation.data);
             stage.status = reinterpret_cast<uint32_t *>(static_cast<char *>(stage.allocation.data) + result->plan_bytes);
             stage.capacity = snapshot.n_slots;
             stage.n_experts = n_experts;
+            stage.batch_size = batch_size;
             size_t offset = control_bytes;
             for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
                 if (device_banks[i].staged) {
@@ -5053,7 +5083,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                     stage.banks.push_back({static_cast<const char *>(snapshot.banks[i].source_data),
                         static_cast<char *>(stage.allocation.data) + offset, device_banks[i].expert_stride,
                         device_banks[i].direct_first, device_banks[i].direct_last});
-                    offset += device_banks[i].expert_stride;
+                    offset += device_banks[i].expert_stride * batch_size;
                 }
             }
             for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
@@ -5063,12 +5093,12 @@ struct ggml_cuda_moe_grouped_context::impl {
                     stage.banks.push_back({static_cast<const char *>(snapshot.slot_auxiliaries[i].source_data),
                         static_cast<char *>(stage.allocation.data) + offset, bytes,
                         device_auxiliaries[i].direct_first, device_auxiliaries[i].direct_last});
-                    offset += bytes;
+                    offset += bytes * batch_size;
                 }
             }
-            result->host_tiles.resize(snapshot.n_slots);
-            for (uint32_t i = 0; i < snapshot.n_slots; ++i) {
-                result->host_tiles[i] = {&stage, i};
+            result->host_tiles.resize(1 + (snapshot.n_slots - 1) / batch_size);
+            for (uint32_t i = 0; i < result->host_tiles.size(); ++i) {
+                result->host_tiles[i] = {&stage, i * batch_size};
             }
         }
         if (result->words_per_miss > SIZE_MAX / snapshot.n_slots ||
@@ -6771,19 +6801,19 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             const auto * status = reinterpret_cast<const uint32_t *>(
                 static_cast<const char *>(stage.allocation.device_data) + device.plan_bytes);
             const uint32_t tile_blocks = moe_grouped_transfer_blocks(
-                impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, 1);
-            for (uint32_t miss = 0; miss < n_routes; ++miss) {
-                CUDA_CHECK(cudaLaunchHostFunc(compute_stream, moe_grouped_stage_callback, &device.host_tiles[miss]));
+                impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, std::min(stage.batch_size, n_routes));
+            for (uint32_t miss = 0; miss < n_routes; miss += stage.batch_size) {
+                CUDA_CHECK(cudaLaunchHostFunc(compute_stream, moe_grouped_stage_callback, &device.host_tiles[miss / stage.batch_size]));
                 if (transfer_counters != nullptr) {
                     moe_grouped_gather_decode<true, true><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters, miss, 1, status);
+                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters, miss, stage.batch_size, status);
                 } else {
                     moe_grouped_gather_decode<false, true><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr, miss, 1, status);
+                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr, miss, stage.batch_size, status);
                 }
             }
         } else
@@ -11501,7 +11531,11 @@ bool ggml_backend_cuda_moe_reserve_host_staging(ggml_backend_buffer_type_t buft,
         GGML_LOG_ERROR("MoE host pin budget needs at least %zu staging bytes; configured %zu\n", bytes, budget->limit);
         return false;
     }
-    budget->source_limit = budget->limit - bytes;
+    // Keep the one-miss minimum; use spare capacity to reduce captured host handoffs.
+    budget->staging_misses = bytes == 0 ? 1 : static_cast<uint32_t>(std::min<size_t>(16, budget->limit / bytes));
+    const size_t headroom = bytes * budget->staging_misses;
+    budget->source_limit = budget->limit - headroom;
+    GGML_LOG_INFO("MoE host staging: batch=%u headroom=%zu bytes\n", budget->staging_misses, headroom);
     return true;
 }
 
