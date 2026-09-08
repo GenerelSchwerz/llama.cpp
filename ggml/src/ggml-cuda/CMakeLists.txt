@@ -139,6 +139,10 @@ if (CUDAToolkit_FOUND)
         set_property(SOURCE moe-cache.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_MOE_STREAMING_COPY)
     endif()
 
+    if (GGML_CUDA_MOE_PARALLEL_COPY)
+        set_property(SOURCE moe-cache.cu APPEND PROPERTY COMPILE_DEFINITIONS GGML_CUDA_MOE_PARALLEL_COPY)
+    endif()
+
     if (GGML_CUDA_FORCE_MMQ)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()

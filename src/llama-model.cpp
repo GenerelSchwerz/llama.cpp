@@ -1878,7 +1878,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
         for (const auto & entry : staging) {
-            if (!ggml_backend_cuda_moe_reserve_host_staging(entry.first, entry.second)) {
+            if (!ggml_backend_cuda_moe_reserve_host_staging_batch(entry.first, entry.second, hparams.n_expert_used_max())) {
                 throw std::runtime_error("MoE host pin budget is below the model staging minimum");
             }
             LLAMA_LOG_INFO("%s: MoE host pin cap %.2f MiB, minimum staging %.2f MiB\n", __func__,

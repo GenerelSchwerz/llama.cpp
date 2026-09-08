@@ -7838,13 +7838,15 @@ static void test_bounded_host_pinning() {
     size_t used = SIZE_MAX;
     size_t peak = SIZE_MAX;
     CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak == 0);
-    for (uint32_t batch_size : {1, 3, 16}) {
-        CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, limit / batch_size));
+    CHECK(!ggml_backend_cuda_moe_reserve_host_staging_batch(buft, 65536, 0));
+    for (uint32_t batch_size : {1, 3, 10, 16}) {
+        CHECK(ggml_backend_cuda_moe_reserve_host_staging_batch(buft, 65536, batch_size));
+        const uint32_t chunk = std::min<uint32_t>(batch_size, 12);
         for (uint32_t rows : {2, 4}) {
             test_active_grouped_multirow_graph_modes_case(0, rows, 8, 2, 12, false,
                 GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
                 GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft,
-                1 + (rows * 2 - 1) / std::min<uint32_t>(batch_size, 12));
+                1 + (rows * 2 - 1) / chunk);
             CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
         }
     }
@@ -7855,7 +7857,7 @@ static void test_bounded_host_pinning() {
         }
     }
     test_active_grouped_dispatch_types_case({GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K},
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3, false, false, false, 1, 2048, false, buft);
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3, false, true, false, 1, 2048, false, buft);
     CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, (limit - 256 * 1024) / 3));
     test_active_grouped_multirow_graph_modes_case(0, 2, 8, 2, 12, false,
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,

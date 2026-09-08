@@ -53,6 +53,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+#include <system_error>
+#include <thread>
+#endif
+
 #if defined(GGML_CUDA_MOE_STREAMING_COPY) && (defined(__x86_64__) || defined(_M_X64)) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 #include <emmintrin.h>
 #endif
@@ -63,6 +68,88 @@
 #endif
 
 namespace {
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+struct moe_host_copy_worker {
+    std::mutex mutex;
+    std::condition_variable ready_cv;
+    std::condition_variable done_cv;
+    std::once_flag start_once;
+    std::thread thread;
+    void (*function)(void *) = nullptr;
+    void * data = nullptr;
+    bool stopping = false;
+    bool busy = false;
+    bool ready = false;
+    bool done = false;
+    uint64_t submitted = 0;
+
+    ~moe_host_copy_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(!busy);
+            stopping = true;
+        }
+        ready_cv.notify_one();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    bool start() {
+        std::call_once(start_once, [this]() {
+            try {
+                std::lock_guard<std::mutex> lock(mutex);
+                thread = std::thread([this]() {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    for (;;) {
+                        ready_cv.wait(lock, [this]() { return stopping || ready; });
+                        if (stopping) {
+                            return;
+                        }
+                        ready = false;
+                        auto task = function;
+                        void * task_data = data;
+                        lock.unlock();
+                        task(task_data);
+                        lock.lock();
+                        done = true;
+                        done_cv.notify_one();
+                    }
+                });
+            } catch (const std::exception &) {
+                // Keep serial copying if the helper cannot start.
+            }
+        });
+        return thread.joinable();
+    }
+
+    bool try_submit(void (*task)(void *), void * task_data) {
+        std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || !thread.joinable() || busy || stopping) {
+            return false;
+        }
+        busy = true;
+        done = false;
+        function = task;
+        data = task_data;
+        ready = true;
+        ++submitted;
+        ready_cv.notify_one();
+        return true;
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        GGML_ASSERT(busy);
+        done_cv.wait(lock, [this]() { return done; });
+        // The submitting callback owns the job until it observes completion.
+        busy = false;
+        function = nullptr;
+        data = nullptr;
+    }
+};
+#endif
 
 struct moe_host_budget {
     ggml_backend_buffer_type buft = {};
@@ -76,6 +163,16 @@ struct moe_host_budget {
     size_t staging_pinned = 0;
     uint32_t staging_misses = 1;
     std::atomic<int64_t> fail_stage_after{-1};
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    moe_host_copy_worker copy_worker;
+
+    ~moe_host_budget() {
+        if (copy_worker.thread.joinable()) {
+            GGML_LOG_INFO("MoE host copy helper: jobs=%llu\n", (unsigned long long) copy_worker.submitted);
+        }
+    }
+#endif
 
     void retain() { references.fetch_add(1, std::memory_order_relaxed); }
     void release() {
@@ -2921,6 +3018,9 @@ struct moe_grouped_host_stage {
     uint32_t n_experts = 0;
     uint32_t batch_size = 1;
     std::vector<moe_grouped_host_stage_bank> banks;
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    moe_host_copy_worker * copy_worker = nullptr;
+#endif
 };
 
 struct moe_grouped_host_stage_tile {
@@ -2934,6 +3034,9 @@ static void moe_grouped_host_copy(char * destination, const char * source, size_
     // The GPU consumes these writes; do not retain large staging copies in CPU caches.
     if (bytes >= 256 * 1024 && bytes % 64 == 0 && (uintptr_t) destination % 16 == 0) {
         for (size_t i = 0; i < bytes; i += 64) {
+            if (bytes - i > 1024) {
+                _mm_prefetch(source + i + 1024, _MM_HINT_T0);
+            }
             const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i));
             const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 16));
             const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 32));
@@ -2950,6 +3053,37 @@ static void moe_grouped_host_copy(char * destination, const char * source, size_
     memcpy(destination, source, bytes);
 }
 
+static bool moe_grouped_stage_copy(const moe_grouped_host_stage_tile & tile, uint32_t first, uint32_t last) {
+    auto & stage = *tile.stage;
+    for (uint32_t i = first; i < last; ++i) {
+        const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
+        const int32_t slot = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[tile.miss + i];
+        if (expert < 0 || (uint32_t) expert >= stage.n_experts || slot < 0 || (uint32_t) slot >= stage.capacity) {
+            return false;
+        }
+        for (const auto & bank : stage.banks) {
+            if ((uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
+                moe_grouped_host_copy(bank.destination + (size_t) i * bank.stride, bank.source + (size_t) expert * bank.stride, bank.stride);
+            }
+        }
+    }
+    return true;
+}
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+struct moe_grouped_host_copy_job {
+    const moe_grouped_host_stage_tile * tile;
+    uint32_t first;
+    uint32_t last;
+    bool success = false;
+};
+
+static void moe_grouped_host_copy_task(void * data) {
+    auto & job = *static_cast<moe_grouped_host_copy_job *>(data);
+    job.success = moe_grouped_stage_copy(*job.tile, job.first, job.last);
+}
+#endif
+
 static void CUDART_CB moe_grouped_stage_callback(void * data) {
     const auto & tile = *static_cast<moe_grouped_host_stage_tile *>(data);
     auto & stage = *tile.stage;
@@ -2963,19 +3097,32 @@ static void CUDART_CB moe_grouped_stage_callback(void * data) {
         return;
     }
     const uint32_t count = tile.miss < stage.plan->n_misses ? std::min(stage.batch_size, stage.plan->n_misses - tile.miss) : 0;
-    for (uint32_t i = 0; i < count; ++i) {
-        const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
-        const int32_t slot = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[tile.miss + i];
-        if (expert < 0 || (uint32_t) expert >= stage.n_experts || slot < 0 || (uint32_t) slot >= stage.capacity) {
-            return;
-        }
-        for (const auto & bank : stage.banks) {
-            if ((uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
-                moe_grouped_host_copy(bank.destination + (size_t) i * bank.stride, bank.source + (size_t) expert * bank.stride, bank.stride);
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    if (stage.copy_worker != nullptr && count >= 2) {
+        const uint32_t split = count / 2;
+        size_t bytes[2] = {};
+        for (uint32_t i = 0; i < count; ++i) {
+            const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
+            for (const auto & bank : stage.banks) {
+                if (expert < 0 || (uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
+                    bytes[i < split ? 0 : 1] += bank.stride;
+                }
             }
         }
+        moe_grouped_host_copy_job job{&tile, split, count};
+        if (std::min(bytes[0], bytes[1]) >= 512 * 1024 && stage.copy_worker->try_submit(moe_grouped_host_copy_task, &job)) {
+            const bool success = moe_grouped_stage_copy(tile, 0, split);
+            stage.copy_worker->wait();
+            if (success && job.success) {
+                *stage.status = MOE_GROUPED_PLAN_READY;
+            }
+            return;
+        }
     }
-    *stage.status = MOE_GROUPED_PLAN_READY;
+#endif
+    if (moe_grouped_stage_copy(tile, 0, count)) {
+        *stage.status = MOE_GROUPED_PLAN_READY;
+    }
 }
 #endif
 
@@ -5071,6 +5218,11 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (!stage.allocation.allocate(host_budget, control_bytes + stage_bytes * batch_size)) {
                 return nullptr;
             }
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+            if (ggml_cuda_info().device_count == 1 && host_budget->copy_worker.start()) {
+                stage.copy_worker = &host_budget->copy_worker;
+            }
+#endif
             stage.plan = static_cast<moe_grouped_decode_plan *>(stage.allocation.data);
             stage.status = reinterpret_cast<uint32_t *>(static_cast<char *>(stage.allocation.data) + result->plan_bytes);
             stage.capacity = snapshot.n_slots;
@@ -11522,8 +11674,13 @@ bool ggml_backend_cuda_moe_host_pinned_stats(ggml_backend_buffer_type_t buft, si
 
 extern "C"
 bool ggml_backend_cuda_moe_reserve_host_staging(ggml_backend_buffer_type_t buft, size_t bytes) {
+    return ggml_backend_cuda_moe_reserve_host_staging_batch(buft, bytes, 16);
+}
+
+extern "C"
+bool ggml_backend_cuda_moe_reserve_host_staging_batch(ggml_backend_buffer_type_t buft, size_t bytes, uint32_t max_misses) {
     auto * budget = moe_host_budget_for(buft);
-    if (budget == nullptr) {
+    if (budget == nullptr || max_misses == 0) {
         return false;
     }
     std::lock_guard<std::mutex> lock(budget->mutex);
@@ -11532,7 +11689,7 @@ bool ggml_backend_cuda_moe_reserve_host_staging(ggml_backend_buffer_type_t buft,
         return false;
     }
     // Keep the one-miss minimum; use spare capacity to reduce captured host handoffs.
-    budget->staging_misses = bytes == 0 ? 1 : static_cast<uint32_t>(std::min<size_t>(16, budget->limit / bytes));
+    budget->staging_misses = bytes == 0 ? 1 : static_cast<uint32_t>(std::min<size_t>({16, max_misses, budget->limit / bytes}));
     const size_t headroom = bytes * budget->staging_misses;
     budget->source_limit = budget->limit - headroom;
     GGML_LOG_INFO("MoE host staging: batch=%u headroom=%zu bytes\n", budget->staging_misses, headroom);
