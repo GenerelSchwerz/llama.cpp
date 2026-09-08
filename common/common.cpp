@@ -1415,7 +1415,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl->context.reset(lctx);
 
 #ifdef GGML_USE_CUDA
-    ggml_backend_cuda_moe_set_l2_pinned_cache_size(params.moe_expert_cache_l2_pinned_size);
     ggml_backend_cuda_moe_set_debug_mm(params.experimental_logs);
 #endif
 
@@ -1702,6 +1701,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_expert_cache_host_pinned_size = params.moe_expert_cache_host_pinned_size;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

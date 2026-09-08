@@ -875,6 +875,8 @@ private:
     friend bool ggml_cuda_moe_take_split_staging_poison_for_test(ggml_cuda_moe_grouped_context * context);
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
+    static bool probe_host_allocation_for_test(ggml_backend_buffer_type_t buft, size_t bytes, bool fail);
+    static bool fail_host_staging_after_for_test(ggml_backend_buffer_type_t buft, int64_t callbacks);
     bool admission_closed_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;

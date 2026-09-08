@@ -54,6 +54,12 @@ static bool grouped_frequency_enabled() {
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <io.h>
 #endif
 
 #define CHECK(cond) do { \
@@ -72,6 +78,14 @@ static bool grouped_frequency_enabled() {
 } while (0)
 
 struct ggml_cuda_moe_grouped_context_test_access {
+    static bool probe_host_allocation(ggml_backend_buffer_type_t buft, size_t bytes, bool fail) {
+        return ggml_cuda_moe_grouped_context::probe_host_allocation_for_test(buft, bytes, fail);
+    }
+
+    static bool fail_host_staging_after(ggml_backend_buffer_type_t buft, int64_t callbacks) {
+        return ggml_cuda_moe_grouped_context::fail_host_staging_after_for_test(buft, callbacks);
+    }
+
     static bool admission_closed(const ggml_cuda_moe_grouped_context & context) {
         return context.admission_closed_for_test();
     }
@@ -6103,7 +6117,8 @@ static void test_active_grouped_multirow_graph_modes_case(
         uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP,
         ggml_type type = GGML_TYPE_Q4_0,
         ggml_cuda_mmid_consumer expected_consumer = GGML_CUDA_MMID_CONSUMER_MMVQ,
-        ggml_cuda_mmid_mapping expected_mapping = GGML_CUDA_MMID_MAPPING_DIRECT) {
+        ggml_cuda_mmid_mapping expected_mapping = GGML_CUDA_MMID_MAPPING_DIRECT,
+        ggml_backend_buffer_type_t candidate_buft = nullptr) {
     CHECK(n_rows >= 2 && n_slots > 0 && n_used <= n_slots / n_rows);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
@@ -6114,9 +6129,12 @@ static void test_active_grouped_multirow_graph_modes_case(
         reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type,
         layout, false, n_rows, n_experts, n_used, 256);
     auto candidate = build_active_grouped_dispatch_graph(
-        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type,
+        candidate_backend.get(), candidate_buft != nullptr ? candidate_buft : ggml_backend_cuda_moe_cached_buffer_type(), type,
         layout, false, n_rows, n_experts, n_used, 256);
     initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+    if (candidate_buft != nullptr) {
+        ggml_backend_cuda_moe_pin_sources(candidate.weight_buffer.get(), false);
+    }
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
         GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -7257,6 +7275,41 @@ static void check_active_grouped_bias_shadows(
     }
 }
 
+struct test_read_only_mapping {
+    FILE * file = nullptr;
+    void * base = nullptr;
+    size_t length = 0;
+#ifdef _WIN32
+    HANDLE mapping = nullptr;
+#endif
+
+    test_read_only_mapping(const void * data, size_t size) : length(size + 64) {
+        file = tmpfile();
+        CHECK(file != nullptr);
+        const std::array<uint8_t, 64> prefix = {};
+        CHECK(fwrite(prefix.data(), 1, prefix.size(), file) == prefix.size());
+        CHECK(fwrite(data, 1, size, file) == size && fflush(file) == 0);
+#ifdef _WIN32
+        mapping = CreateFileMapping(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(file))), nullptr, PAGE_READONLY, 0, 0, nullptr);
+        CHECK(mapping != nullptr);
+        base = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, length);
+        CHECK(base != nullptr);
+#else
+        base = mmap(nullptr, length, PROT_READ, MAP_SHARED, fileno(file), 0);
+        CHECK(base != MAP_FAILED);
+#endif
+    }
+
+    ~test_read_only_mapping() {
+#ifdef _WIN32
+        CHECK(UnmapViewOfFile(base) && CloseHandle(mapping));
+#else
+        CHECK(munmap(base, length) == 0);
+#endif
+        CHECK(fclose(file) == 0);
+    }
+};
+
 static void test_active_grouped_dispatch_types_case(
         const std::array<ggml_type, 3> & types,
         uint32_t layout,
@@ -7266,7 +7319,10 @@ static void test_active_grouped_dispatch_types_case(
         bool original_direct_biases = false,
         uint32_t n_rows = 1,
         uint32_t n_ff = 0,
-        bool auxiliary_proof = false) {
+        bool auxiliary_proof = false,
+        ggml_backend_buffer_type_t candidate_buft = nullptr,
+        bool register_sources = false,
+        bool read_only_mmap = false) {
     CHECK(!auxiliary_proof || (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_slots == 3 &&
         test_owner_concurrency && original_direct_biases && n_rows == 1 && n_ff != 0));
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
@@ -7275,16 +7331,37 @@ static void test_active_grouped_dispatch_types_case(
     ggml_backend_ptr first_backend(ggml_backend_cuda_init(0));
     ggml_backend_ptr second_backend(ggml_backend_cuda_init(0));
     CHECK(reference_backend != nullptr && first_backend != nullptr && second_backend != nullptr);
+    if (candidate_buft == nullptr) {
+        candidate_buft = ggml_backend_cuda_moe_cached_buffer_type();
+    }
+    std::unique_ptr<test_read_only_mapping> mapping;
     auto reference = build_active_grouped_dispatch_graph_types(
         reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
         false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     auto first = build_active_grouped_dispatch_graph_types(
-        first_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
+        first_backend.get(), candidate_buft, types, layout, original_direct_down_scale,
         false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     auto second = build_active_grouped_dispatch_graph_types(
-        second_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), types, layout, original_direct_down_scale,
+        second_backend.get(), candidate_buft, types, layout, original_direct_down_scale,
         false, n_rows, 8, 2, 256, nullptr, false, original_direct_biases, n_ff, auxiliary_proof);
     initialize_active_grouped_dispatch_graphs({&reference, &first, &second});
+    if (read_only_mmap) {
+        const auto * old_base = static_cast<const char *>(ggml_backend_buffer_get_base(first.weight_buffer.get()));
+        const size_t bytes = ggml_backend_buffer_get_size(first.weight_buffer.get());
+        mapping = std::make_unique<test_read_only_mapping>(old_base, bytes);
+        auto * base = static_cast<char *>(mapping->base) + 64;
+        ggml_backend_buffer_ptr replacement(ggml_backend_cuda_moe_bounded_buffer_from_host_ptr(candidate_buft, base, bytes));
+        CHECK(replacement != nullptr);
+        for (auto * tensor = ggml_get_first_tensor(first.weights.get()); tensor != nullptr; tensor = ggml_get_next_tensor(first.weights.get(), tensor)) {
+            tensor->data = base + (static_cast<const char *>(tensor->data) - old_base);
+            tensor->buffer = replacement.get();
+        }
+        first.weight_buffer = std::move(replacement);
+    }
+    if (register_sources) {
+        ggml_backend_cuda_moe_pin_sources(first.weight_buffer.get(), read_only_mmap);
+        ggml_backend_cuda_moe_pin_sources(second.weight_buffer.get(), false);
+    }
     const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots, original_direct_down_scale);
@@ -7709,6 +7786,69 @@ static void test_active_grouped_dispatch_case(
         bool test_owner_concurrency = false) {
     test_active_grouped_dispatch_types_case(
         {type, type, type}, layout, n_slots, original_direct_down_scale, test_owner_concurrency);
+}
+
+static void test_bounded_host_pinning_fault() {
+    auto * buft = ggml_backend_cuda_moe_bounded_buffer_type(1024 * 1024);
+    CHECK(buft != nullptr);
+    ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+    CHECK(backend != nullptr);
+    auto graph = build_active_grouped_dispatch_graph(backend.get(), buft, GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false);
+    auto reference = build_active_grouped_dispatch_graph(backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false);
+    initialize_active_grouped_dispatch_graphs({&reference, &graph});
+    register_active_grouped_dispatch(backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 3);
+    ggml_backend_cuda_moe_bounded_buffer_type_free(buft);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(ggml_backend_graph_compute(backend.get(), graph.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend.get());
+    }
+    ggml_cuda_graph_capture_state_for_test capture;
+    CHECK(ggml_cuda_graph_capture_state_query_for_test(backend.get(), graph.graph, &capture));
+    CHECK(capture.capture_available && capture.warmup_complete && capture.graph != 0 && capture.instance != 0);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::fail_host_staging_after(buft, 0));
+    set_active_grouped_dispatch_logits({&graph}, 1);
+    fprintf(stderr, "test-moe-cache: injecting host-stage failure during graph replay\n");
+    (void) ggml_backend_graph_compute(backend.get(), graph.graph);
+    ggml_backend_synchronize(backend.get());
+    CHECK(false && "host-stage failure did not stop graph execution");
+}
+
+static void test_bounded_host_pinning() {
+    constexpr size_t limit = 8 * 1024 * 1024;
+    auto * buft = ggml_backend_cuda_moe_bounded_buffer_type(limit);
+    CHECK(buft != nullptr && ggml_backend_buft_is_cuda_moe_cached(buft) && !ggml_backend_buft_is_host(buft));
+    size_t used = SIZE_MAX;
+    size_t peak = SIZE_MAX;
+    CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak == 0);
+    for (uint32_t rows : {2, 4}) {
+        test_active_grouped_multirow_graph_modes_case(0, rows, 8, 2, 12, false,
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
+            GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft);
+        CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
+    }
+    for (const auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (const auto layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
+            test_active_grouped_dispatch_types_case({type, type, type}, layout, 3, false, true, false, 1, 0, false, buft);
+            CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak > 0 && peak <= limit);
+        }
+    }
+    CHECK(ggml_backend_cuda_moe_reserve_host_staging(buft, limit - 256 * 1024));
+    test_active_grouped_multirow_graph_modes_case(0, 2, 8, 2, 12, false,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0,
+        GGML_CUDA_MMID_CONSUMER_MMVQ, GGML_CUDA_MMID_MAPPING_DIRECT, buft);
+    for (bool mapped : {false, true}) {
+        test_active_grouped_dispatch_types_case({GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q4_0},
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 3, false, true, false, 1, 0, false, buft, true, mapped);
+        CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
+    }
+    ggml_backend_buffer_ptr retained(ggml_backend_buft_alloc_buffer(buft, 4096));
+    CHECK(retained != nullptr && retained->buft == buft);
+    ggml_backend_cuda_moe_bounded_buffer_type_free(buft);
+    CHECK(ggml_backend_cuda_moe_host_pinned_stats(retained->buft, &used, &peak) && used == 0 && peak <= limit);
+    retained.reset();
+    fprintf(stderr, "test-moe-cache: bounded host staging, owner lifetime and concurrent contexts OK\n");
 }
 
 static void test_active_grouped_materialization_eligibility() {
@@ -10664,7 +10804,6 @@ struct grouped_decode_fixture {
     ggml_backend_buffer_t source_buffer = nullptr;
     ggml_backend_buffer_t ids_buffer = nullptr;
     ggml_context * ctx = nullptr;
-    void * source_storage = nullptr;
     uint32_t n_experts = N_EXPERTS;
     size_t source_offset = 0;
 
@@ -10672,14 +10811,18 @@ struct grouped_decode_fixture {
             int device,
             bool pinned = true,
             size_t source_bytes = SOURCE_BYTES,
-            uint32_t n_experts = N_EXPERTS) : n_experts(n_experts) {
+            uint32_t n_experts = N_EXPERTS,
+            ggml_backend_buffer_type_t source_buft = nullptr) : n_experts(n_experts) {
         backend = ggml_backend_cuda_init(device);
         CHECK(backend != nullptr);
-        if (pinned) {
+        if (source_buft != nullptr) {
+            source_buffer = ggml_backend_buft_alloc_buffer(source_buft, source_bytes);
+        } else if (pinned) {
             source_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_moe_cached_buffer_type(), source_bytes);
         } else {
-            CHECK(posix_memalign(&source_storage, 64, source_bytes) == 0);
-            source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(source_storage, source_bytes);
+            source_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), source_bytes);
+            CHECK(source_buffer != nullptr);
+            source_buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
         }
         ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 4096);
         CHECK(source_buffer != nullptr && ids_buffer != nullptr);
@@ -10694,7 +10837,6 @@ struct grouped_decode_fixture {
         ggml_free(ctx);
         ggml_backend_buffer_free(ids_buffer);
         ggml_backend_buffer_free(source_buffer);
-        free(source_storage);
         ggml_backend_free(backend);
     }
 
@@ -10955,8 +11097,10 @@ static void test_grouped_decode_type(
         uint32_t layout,
         bool pinned = true,
         uint32_t n_slots = grouped_decode_fixture::N_SLOTS,
-        bool auxiliary_scale = false) {
-    grouped_decode_fixture fixture(device, pinned);
+        bool auxiliary_scale = false,
+        ggml_backend_buffer_type_t source_buft = nullptr,
+        bool allocation_fails = false) {
+    grouped_decode_fixture fixture(device, pinned, grouped_decode_fixture::SOURCE_BYTES, grouped_decode_fixture::N_EXPERTS, source_buft);
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
     std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
@@ -11013,6 +11157,13 @@ static void test_grouped_decode_type(
 
     const int32_t first_ids[] = {3, 1, 3, 6};
     CUDA_OK(cudaMemcpyAsync(ids->data, first_ids, sizeof(first_ids), cudaMemcpyHostToDevice, stream));
+    if (allocation_fails) {
+        CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_ERROR);
+        CUDA_OK(cudaStreamSynchronize(stream));
+        CUDA_OK(cudaStreamDestroy(wrong_stream));
+        CUDA_OK(cudaStreamDestroy(stream));
+        return;
+    }
     if (!pinned) {
         CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
         CUDA_OK(cudaStreamSynchronize(stream));
@@ -11091,6 +11242,54 @@ static void test_grouped_decode_type(
     CUDA_OK(cudaStreamSynchronize(stream));
     CUDA_OK(cudaStreamDestroy(wrong_stream));
     CUDA_OK(cudaStreamDestroy(stream));
+}
+
+static void test_bounded_host_pinning_limits(int device) {
+    for (const size_t limit : {size_t{0}, size_t{65535}, size_t{65536}}) {
+        auto * buft = ggml_backend_cuda_moe_bounded_buffer_type(limit);
+        CHECK(buft != nullptr);
+        CHECK(!ggml_backend_cuda_moe_reserve_host_staging(buft, SIZE_MAX));
+        test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+            true, 4, false, buft, limit < 65536);
+        size_t used = SIZE_MAX;
+        size_t peak = SIZE_MAX;
+        CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= limit);
+        CHECK(peak == (limit < 65536 ? 0 : 65536));
+        ggml_backend_cuda_moe_bounded_buffer_type_free(buft);
+    }
+    auto * buft = ggml_backend_cuda_moe_bounded_buffer_type(1024 * 1024);
+    CHECK(buft != nullptr);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::probe_host_allocation(buft, SIZE_MAX, false));
+    const char * old_no_pinned = getenv("GGML_CUDA_NO_PINNED");
+    const std::string old_no_pinned_value = old_no_pinned != nullptr ? old_no_pinned : "";
+#ifdef _WIN32
+    CHECK(_putenv_s("GGML_CUDA_NO_PINNED", "1") == 0);
+#else
+    CHECK(setenv("GGML_CUDA_NO_PINNED", "1", 1) == 0);
+#endif
+    CHECK(ggml_backend_cuda_moe_bounded_buffer_type(65536) == nullptr);
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::probe_host_allocation(buft, 65536, false));
+#ifdef _WIN32
+    CHECK(_putenv_s("GGML_CUDA_NO_PINNED", old_no_pinned_value.c_str()) == 0);
+#else
+    CHECK(old_no_pinned != nullptr ? setenv("GGML_CUDA_NO_PINNED", old_no_pinned_value.c_str(), 1) == 0 :
+        unsetenv("GGML_CUDA_NO_PINNED") == 0);
+#endif
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::probe_host_allocation(buft, 65536, true));
+    size_t failed_used = SIZE_MAX;
+    size_t failed_peak = SIZE_MAX;
+    CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &failed_used, &failed_peak) && failed_used == 0 && failed_peak == 65536);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::probe_host_allocation(buft, 65536, false));
+    for (const auto type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
+        for (const auto layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
+            test_grouped_decode_type(device, type, layout, true, 4, false, buft);
+        }
+    }
+    size_t used = SIZE_MAX;
+    size_t peak = SIZE_MAX;
+    CHECK(ggml_backend_cuda_moe_host_pinned_stats(buft, &used, &peak) && used == 0 && peak <= 1024 * 1024);
+    ggml_backend_cuda_moe_bounded_buffer_type_free(buft);
+    fprintf(stderr, "test-moe-cache: host pin budget boundaries and dense/quantized slab copies OK\n");
 }
 
 static void test_grouped_decode_independent_rows(int device) {
@@ -11840,6 +12039,17 @@ static void test_moe_route_publication_lifetime() {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--host-pinning-fault") == 0) {
+        test_bounded_host_pinning_fault();
+        return 1;
+    }
+    if (argc == 2 && strcmp(argv[1], "--host-pinning-only") == 0) {
+        test_bounded_host_pinning();
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_bounded_host_pinning_limits(dev);
+        return 0;
+    }
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;
@@ -11925,6 +12135,8 @@ int main(int argc, char ** argv) {
     test_grouped_graph_replay_lifecycle(dev);
     test_active_grouped_multirow_graph_modes(dev);
     test_active_grouped_dispatch();
+    test_bounded_host_pinning();
+    test_bounded_host_pinning_limits(dev);
 
     // Toy parameters. Small enough to run in a few ms on any CUDA device,
     // large enough that LRU has work to do.

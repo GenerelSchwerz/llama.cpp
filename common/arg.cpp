@@ -2878,13 +2878,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
-        {"--moe-expert-cache-l2-pinned-mb"}, "N",
-        "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
+        {"--moe-expert-cache-host-pinned-mb"}, "N",
+        "MoE expert cache: model-wide host pin budget in MiB, including staged GPU misses. "
+        "Omitted preserves full pinning; 0 rejects staging. Requires --moe-expert-cache-size.",
         [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value");
+            if (value < 0 || (size_t) value > SIZE_MAX / (1024 * 1024)) {
+                throw std::invalid_argument("invalid host pin budget");
             }
-            params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
+            if (params.moe_expert_cache_legacy_pin_option) {
+                throw std::invalid_argument("use only one of --moe-expert-cache-host-pinned-mb and --moe-expert-cache-l2-pinned-mb (including environment variables)");
+            }
+            params.moe_expert_cache_host_pin_option = true;
+            params.moe_expert_cache_host_pinned_size = (size_t) value * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-l2-pinned-mb"}, "N",
+        "DEPRECATED alias for --moe-expert-cache-host-pinned-mb. The budget now covers sources and staging in all load modes; 0 rejects staging.",
+        [](common_params & params, int value) {
+            if (value < 0 || (size_t) value > SIZE_MAX / (1024 * 1024)) {
+                throw std::invalid_argument("invalid host pin budget");
+            }
+            if (params.moe_expert_cache_host_pin_option) {
+                throw std::invalid_argument("use only one of --moe-expert-cache-host-pinned-mb and --moe-expert-cache-l2-pinned-mb (including environment variables)");
+            }
+            params.moe_expert_cache_legacy_pin_option = true;
+            params.moe_expert_cache_host_pinned_size = (size_t) value * 1024 * 1024;
+            LOG_WRN("--moe-expert-cache-l2-pinned-mb is deprecated; use --moe-expert-cache-host-pinned-mb. This caps source pins and staging in all load modes; 0 cannot provide GPU staging.\n");
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

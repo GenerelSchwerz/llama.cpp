@@ -331,13 +331,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         std::vector<llama_model_tensor_buft_override> effective_overrides;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
 #ifdef GGML_USE_CUDA
+        std::unique_ptr<ggml_backend_buffer_type, decltype(&ggml_backend_cuda_moe_bounded_buffer_type_free)> bounded_buft(
+            nullptr, ggml_backend_cuda_moe_bounded_buffer_type_free);
+        if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
+            if (params.moe_expert_cache_host_pinned_size == 0) {
+                throw std::runtime_error("a zero MoE host pin budget cannot provide GPU staging");
+            }
+            if (params.moe_expert_cache_slots <= 0) {
+                throw std::runtime_error("host pin budget requires a positive MoE expert cache size");
+            }
+            bounded_buft.reset(ggml_backend_cuda_moe_bounded_buffer_type(params.moe_expert_cache_host_pinned_size));
+            if (!bounded_buft) {
+                throw std::runtime_error("unable to create MoE host pin budget (check GGML_CUDA_NO_PINNED)");
+            }
+        }
         if (params.moe_expert_cache_slots > 0) {
+            ggml_backend_buffer_type_t cache_buft = bounded_buft ? bounded_buft.get() : ggml_backend_cuda_moe_cached_buffer_type();
             ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, ggml_backend_cuda_moe_cached_buffer_type()});
+            effective_overrides.push_back({MOE_EXPS_PATTERN, cache_buft});
 
             bool had_user_overrides = false;
             if (params.tensor_buft_overrides) {
@@ -353,6 +368,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
         }
+#else
+        if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
+            throw std::runtime_error("MoE host pin budget requires the CUDA backend");
+        }
 #endif
 
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
@@ -362,6 +381,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+#ifdef GGML_USE_CUDA
+        model_ptr->own_moe_host_budget(bounded_buft.release());
+#endif
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {
