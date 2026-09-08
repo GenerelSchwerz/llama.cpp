@@ -519,9 +519,10 @@ static bool ggml_cuda_fattn_native_profitable(const ggml_tensor * dst, const int
         return k_host ? K->type == GGML_TYPE_Q8_0 : K->ne[1] <= 1024;
     }
 
-    // D=256 with GQA 8 stays on the standard path: PR 55 records an open
-    // correctness and memory-safety question for it that the equivalence
-    // matrix does not yet cover.
+    // D=256 with GQA 8 stays on the standard path: PR 55 records one measured
+    // Q8_0 case there with an open correctness and memory-safety question. The
+    // guard keys on that undiagnosed case, not on the kernel - GQA 6 and 16 pick
+    // the same 8x8 instance and keep the route.
     if (gqa_ratio == 8) {
         return false;
     }

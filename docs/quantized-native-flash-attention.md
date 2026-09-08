@@ -43,7 +43,7 @@ The rows themselves:
 | Head dim | GQA ratio | Query batch | Cache types | Tile (sm_80+) | Tile (Turing) |
 |---|---|---|---|---|---|
 | 256 | 2 | > 16 | `q4_0`, `q8_0` | 32x2 | 16x2 |
-| 256 | > 4, not 8 | > 4 | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0` | 8x8 | 4x8 |
+| 256 | > 4 | > 4 | `q4_0`, `q4_1`, `q5_0`, `q5_1`, `q8_0` | 8x8 | 4x8 |
 | 512 | > 4 | > 4 | `q4_0`, `q8_0` | 8x8 | 4x8 |
 
 Each tile shape is the one the generic `switch_ncols1`/`switch_ncols2` would pick
@@ -56,19 +56,21 @@ The two tile columns are the same rows at different widths: `switch_ncols1` caps
 build carries both shapes and picks between them at dispatch, because one build
 serves whichever card it runs on.
 
-GQA 8 at D=256 is excluded on purpose: PR 55 records an open correctness and
-memory-safety question for that geometry under graph and workspace reuse. It
-needs dedicated numerical, graph-replay, shape-transition and Compute Sanitizer
-coverage before it can be enabled.
-
 `ggml_cuda_fattn_native_profitable()` then narrows those rows by KV length and by
 where the cache lives:
 
 | Row | Host-resident K/V | Device-resident K/V |
 |---|---|---|
 | D=256, GQA 2 | `q8_0` | `n_kv <= 1024` |
-| D=256, GQA > 4 | `q8_0` | `q4_0`: `n_kv <= 1024` or `>= 16384`; `q5_0`: `n_kv >= 16384`; rest: `n_kv <= 512` |
+| D=256, GQA > 4 (not 8) | `q8_0` | `q4_0`: `n_kv <= 1024` or `>= 16384`; `q5_0`: `n_kv >= 16384`; rest: `n_kv <= 512` |
 | D=512 | never | always |
+
+GQA 8 at D=256 is declined there on purpose, for every cache type. PR 55 records
+one measured `q8_0` case at that geometry with an open correctness and
+memory-safety question under graph and workspace reuse. The decline follows that
+undiagnosed case rather than a property of the kernel: GQA 6 and 16 select the
+same 8x8 instance and keep the route. Closing it needs dedicated numerical,
+graph-replay, shape-transition and Compute Sanitizer coverage.
 
 Anything else keeps the standard path. In particular the dispatcher checks the
 vector conditions first, so single-token quantized decode still takes the
