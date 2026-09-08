@@ -5,6 +5,8 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <vector>
@@ -19,12 +21,20 @@ struct dummy_backend_context {
     size_t alignment              = 8;
     bool   fail_alloc             = false;
     bool   unique_alloc_addresses = false;
+    bool   real_memory            = false; // back the buffers with memory, so a test can look at the bytes a copy moved
     int    graph_compute_count    = 0;
 
-    ggml_backend_buffer_i              buffer_interface;
-    std::vector<ggml_backend_buffer_t> buffers;
-    std::vector<void *>                buffer_bases;
-    uintptr_t                          next_base = (uintptr_t) alloc_base;
+    ggml_backend_buffer_i                  buffer_interface;
+    std::vector<ggml_backend_buffer_t>     buffers;
+    std::vector<void *>                    buffer_bases;
+    std::vector<std::vector<uint8_t>>      buffer_data;
+    uintptr_t                              next_base = (uintptr_t) alloc_base;
+
+    int buffer_index(ggml_backend_buffer_t buffer) const {
+        auto i = std::find(buffers.begin(), buffers.end(), buffer);
+        GGML_ASSERT(i != buffers.end());
+        return (int) (i - buffers.begin());
+    }
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -49,7 +59,13 @@ static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     ctx->next_base += std::max<size_t>(size, 4096);
-    ctx->buffer_bases.push_back((void *) ctx->next_base);
+    if (ctx->real_memory) {
+        ctx->buffer_data.emplace_back(size);
+        ctx->buffer_bases.push_back(ctx->buffer_data.back().data());
+    } else {
+        ctx->buffer_data.emplace_back();
+        ctx->buffer_bases.push_back((void *) ctx->next_base);
+    }
     return buffer;
 }
 
@@ -72,33 +88,52 @@ static bool dummy_backend_buffer_type_is_host(ggml_backend_buffer_type_t) {
 static void dummy_backend_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
 
-    auto i = std::find(ctx->buffers.begin(), ctx->buffers.end(), buffer);
-    GGML_ASSERT(i != ctx->buffers.end());
-    ctx->buffer_bases.erase(ctx->buffer_bases.begin() + (i - ctx->buffers.begin()));
-    ctx->buffers.erase(i);
+    const int i = ctx->buffer_index(buffer);
+    ctx->buffer_bases.erase(ctx->buffer_bases.begin() + i);
+    ctx->buffer_data.erase(ctx->buffer_data.begin() + i);
+    ctx->buffers.erase(ctx->buffers.begin() + i);
 }
 
 static void * dummy_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
     dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
-    if (!ctx->unique_alloc_addresses) {
+    if (!ctx->unique_alloc_addresses && !ctx->real_memory) {
         return alloc_base;
     }
-    auto i = std::find(ctx->buffers.begin(), ctx->buffers.end(), buffer);
-    GGML_ASSERT(i != ctx->buffers.end());
-    return ctx->buffer_bases[i - ctx->buffers.begin()];
+    return ctx->buffer_bases[ctx->buffer_index(buffer)];
 }
 
 static ggml_status dummy_backend_buffer_init_tensor(ggml_backend_buffer_t, ggml_tensor *) {
     return GGML_STATUS_SUCCESS;
 }
 
-static void dummy_backend_buffer_memset_tensor(ggml_backend_buffer_t, ggml_tensor *, uint8_t, size_t, size_t) {}
+static void dummy_backend_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
+    if (ctx->real_memory) {
+        memset((char *) tensor->data + offset, value, size);
+    }
+}
 
-static void dummy_backend_buffer_set_tensor(ggml_backend_buffer_t, ggml_tensor *, const void *, size_t, size_t) {}
+static void dummy_backend_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
+    if (ctx->real_memory) {
+        memcpy((char *) tensor->data + offset, data, size);
+    }
+}
 
-static void dummy_backend_buffer_get_tensor(ggml_backend_buffer_t, const ggml_tensor *, void *, size_t, size_t) {}
+static void dummy_backend_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
+    if (ctx->real_memory) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+    }
+}
 
-static void dummy_backend_buffer_clear(ggml_backend_buffer_t, uint8_t) {}
+static void dummy_backend_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    dummy_backend_context * ctx = (dummy_backend_context *) buffer->context;
+    if (ctx->real_memory) {
+        std::vector<uint8_t> & data = ctx->buffer_data[ctx->buffer_index(buffer)];
+        std::fill(data.begin(), data.end(), value);
+    }
+}
 
 // dummy backend for gallocr and scheduler allocation tests
 
@@ -131,12 +166,14 @@ static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_b
     return device->context == buft->context;
 }
 
-static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false) {
+static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, bool unique_alloc_addresses = false,
+        bool real_memory = false) {
     dummy_backend b{};
     b.context                         = std::make_unique<dummy_backend_context>();
     b.context->alignment              = alignment;
     b.context->max_buffer_size        = max_buffer_size;
     b.context->unique_alloc_addresses = unique_alloc_addresses;
+    b.context->real_memory            = real_memory;
 
     b.context->buffer_interface.free_buffer   = dummy_backend_buffer_free_buffer;
     b.context->buffer_interface.get_base      = dummy_backend_buffer_get_base;
@@ -1157,6 +1194,87 @@ static bool graph_reuses_allocation(bool add_alloc_dep) {
     return x[1]->data == x[2]->data;
 }
 
+// A split input that is a window over a cache split into streams is one range per stream.
+// The ordered copy has to move each stream's range and leave the cells between one range and the next as it found them.
+static void test_ordered_multi_stream_ranges() {
+    dummy_backend host = dummy_backend_init(SIZE_MAX, 8, /*unique_alloc_addresses*/ false, /*real_memory*/ true);
+    dummy_backend dev  = dummy_backend_init(SIZE_MAX, 8, /*unique_alloc_addresses*/ false, /*real_memory*/ true);
+
+    const int64_t n_stream = 4;
+    const int64_t n_row    = 8;  // rows of a stream the graph reads
+    const int64_t kv_size  = 12; // rows a stream holds, so 4 rows of every stream stay unread
+    const int64_t n_embd   = 4;
+
+    auto ctx = make_context();
+    ggml_tensor * store = ggml_new_tensor_3d(ctx.ctx, GGML_TYPE_F32, n_embd, kv_size, n_stream);
+
+    // the shape a host-resident KV window has once attention has permuted it: heads on 0 and 2, rows on 1, streams on 3
+    ggml_tensor * window = ggml_view_4d(ctx.ctx, store, n_embd/2, 2, n_row, n_stream,
+            (size_t) (n_embd/2)*sizeof(float), store->nb[1], store->nb[2], 0);
+    window = ggml_permute(ctx.ctx, window, 0, 2, 1, 3);
+    ggml_tensor * output = ggml_cont(ctx.ctx, window);
+    ggml_build_forward_expand(ctx.graph, output);
+
+    ggml_backend_buffer_ptr store_buf(ggml_backend_buft_alloc_buffer(&host.buffer_type, ggml_nbytes(store)));
+    store->buffer = store_buf.get();
+    store->data   = ggml_backend_buffer_get_base(store_buf.get());
+
+    // a long period, so a range that lands at the wrong offset does not read as a match, and never the sentinel below
+    uint8_t * src = (uint8_t *) store->data;
+    for (size_t i = 0; i < ggml_nbytes(store); i++) {
+        src[i] = (uint8_t) (1 + i%251);
+    }
+
+    ggml_backend_t backends[] = { dev.handle.get(), host.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &dev.buffer_type, &host.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
+    ggml_backend_sched_set_tensor_backend(sched.get(), output, dev.handle.get());
+
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), ctx.graph));
+
+    // the graph computes nothing on the dummy backend, so every byte the copy did not write is still the sentinel
+    const uint8_t sentinel = 0xFF; // outside the range the source is filled with
+    for (std::vector<uint8_t> & buf : dev.context->buffer_data) {
+        std::fill(buf.begin(), buf.end(), sentinel);
+    }
+
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), ctx.graph) == GGML_STATUS_SUCCESS);
+
+    const size_t stride = (size_t) window->nb[3];
+    const size_t used   = ggml_nbytes(window) - (size_t) (n_stream - 1)*stride;
+    GGML_ASSERT(used < stride); // otherwise the window has no gaps and the test proves nothing
+
+    std::vector<uint8_t> * written = nullptr;
+    size_t moved = 0;
+    for (std::vector<uint8_t> & buf : dev.context->buffer_data) {
+        const size_t n = std::count_if(buf.begin(), buf.end(), [&](uint8_t b) { return b != sentinel; });
+        if (n > 0) {
+            GGML_ASSERT(written == NULL && "the copy is split over several buffers");
+            written = &buf;
+            moved   = n;
+        }
+    }
+    GGML_ASSERT(written != NULL && "the copy wrote nothing");
+    GGML_ASSERT(moved == (size_t) n_stream*used && "the copy moved cells the graph does not read");
+
+    std::vector<uint8_t> & dst = *written;
+    size_t base = 0;
+    while (dst[base] == sentinel) {
+        base++;
+    }
+    GGML_ASSERT(base + (size_t) (n_stream - 1)*stride + used <= dst.size());
+
+    for (int64_t st = 0; st < n_stream; st++) {
+        // the stream's range arrives whole, from its own offset in the source
+        GGML_ASSERT(memcmp(&dst[base + st*stride], (const uint8_t *) window->data + st*stride, used) == 0);
+
+        // the cells between this range and the next keep what was there before
+        for (size_t i = used; st + 1 < n_stream && i < stride; i++) {
+            GGML_ASSERT(dst[base + st*stride + i] == sentinel);
+        }
+    }
+}
+
 static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(graph_reuses_allocation(false));
     GGML_ASSERT(!graph_reuses_allocation(true));
@@ -1193,6 +1311,7 @@ int main() {
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
+    run("test_ordered_multi_stream_ranges", test_ordered_multi_stream_ranges);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     return 0;
 }
