@@ -265,6 +265,7 @@ static void ggml_cuda_flash_attn_ext_mma_quant_shape(
         ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
         return;
     }
+    GGML_ASSERT(ncols1 == 32/ncols2); // the row has no other compiled width
     ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 32/ncols2, ncols2, type, type>(ctx, dst);
 }
 
@@ -274,17 +275,21 @@ static void ggml_cuda_flash_attn_ext_mma_quant_shape(
 template <ggml_type type>
 static void ggml_cuda_flash_attn_ext_mma_quant_case(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
-    if (dst->src[0]->ne[0] == 256 && ncols2 == 8) {
+    const int64_t D = dst->src[0]->ne[0];
+
+    if (D == 256 && ncols2 == 8) {
         ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 8>(ctx, dst, ncols1);
         return;
     }
 
     // The other two rows exist for Q4_0 and Q8_0 only.
     if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
-        if (dst->src[0]->ne[0] == 512) {
+        if (D == 512) {
+            GGML_ASSERT(ncols2 == 8);
             ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
             return;
         }
+        GGML_ASSERT(D == 256 && ncols2 == 2);
         ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 2>(ctx, dst, ncols1);
         return;
     }

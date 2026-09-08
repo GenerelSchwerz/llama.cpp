@@ -13,11 +13,6 @@ static __device__ __forceinline__ half2 fattn_mma_q5_centered_half2(const uint32
 }
 #endif
 
-template <int nthreads, int ncols1, int ncols2>
-struct fattn_quant_load_width<GGML_TYPE_Q5_0, nthreads, ncols1, ncols2> {
-    static constexpr int value = ncols1 == 32 && ncols2 == 2 ? 32 : 16;
-};
-
 template <>
 struct fattn_quant_incremental_rows<GGML_TYPE_Q5_0> {
     static constexpr bool value = true;
