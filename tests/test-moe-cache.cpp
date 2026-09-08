@@ -3677,6 +3677,7 @@ static void test_grouped_graph_preflight(bool benchmark) {
     ggml_cgraph * external_graph = candidate_graph(fixture, {external_gate_up_node, external_down_node});
     registry.compile_graph_plan(external_graph, 46, &plan, &execution);
     CHECK(plan.size() == 1 && execution.size() == 1 && !execution.find(external_gate_up_node, nullptr));
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
 
     ggml_tensor * copied_ids = fixture.tensor(GGML_TYPE_I32, 2, ids_ne);
     copied_ids->op = GGML_OP_CPY;
