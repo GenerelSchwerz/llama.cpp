@@ -3916,6 +3916,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     size_t legacy_l2_budget_bytes = 0;
     size_t prefill_resident_auxiliary_budget = MOE_PREFILL_RESIDENT_AUX_BUDGET;
     std::atomic<bool> legacy_debug_mm{false};
+    std::atomic<uint64_t> fallback_notice_generation{0};
     bool legacy_policy_initialized = false;
     bool fail_borrowed_cache_init_after_probe_for_test = false;
     std::atomic<uint32_t> split_staging_poison_calls_for_test{0};
@@ -7218,11 +7219,11 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
     if (decode_legacy_certificate) {
         GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
-        static std::once_flag fallback_notice_once;
-        std::call_once(fallback_notice_once, [legacy_groups]() {
-            GGML_LOG_INFO("moe-cache: grouped decode unavailable for %u group(s); "
-                          "using cached mul_mat_id fallback\n", legacy_groups);
-        });
+        if (impl_->fallback_notice_generation.exchange(
+                plan->registry_generation_, std::memory_order_relaxed) != plan->registry_generation_) {
+            GGML_LOG_INFO("moe-cache: device %d grouped decode unavailable for %u group(s); "
+                          "using cached mul_mat_id fallback\n", impl_->device, legacy_groups);
+        }
     }
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
