@@ -407,16 +407,15 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
-# MoE expert cache test (CUDA only). Built when CUDA is enabled and the
-# backend is statically linked so the cache symbols are visible to the test.
-# When GGML_BACKEND_DL=ON the test is skipped — that path is week-2 work.
+# This test uses internal symbols that are not exported from Windows DLLs.
 #
 # The test is a plain .cpp (no device kernels, only host-side cudaMalloc /
 # cudaMemcpyAsync calls), so it does not require enable_language(CUDA) in
 # this directory scope. CUDA headers + libcudart come in via CUDA::cudart.
-if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda)
+if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     find_package(CUDAToolkit REQUIRED)
     add_executable(test-moe-cache test-moe-cache.cpp)
+    target_compile_features(test-moe-cache PRIVATE cxx_std_17)
     target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-cache COMMAND test-moe-cache)
