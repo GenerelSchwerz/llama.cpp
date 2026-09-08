@@ -59,11 +59,17 @@ jobs:
             arch: '89-real'
             slug: allq-on
           # Turing takes the narrow tile shapes and a different MMA config table,
-          # so its kernel bodies are a separate compile.
+          # so its kernel bodies are a separate compile. The tile loader asserts
+          # and the per-type load widths are functions of that table, so the
+          # extra tier needs its own Turing compile too.
           - all_quants: 'OFF'
             fa: 'ON'
             arch: '75-real'
             slug: turing
+          - all_quants: 'ON'
+            fa: 'ON'
+            arch: '75-real'
+            slug: turing-allq
           # The route must also compile out cleanly where FlashAttention itself
           # is disabled, which is the one build with no native kernels at all.
           - all_quants: 'OFF'
@@ -92,7 +98,7 @@ jobs:
         # One real architecture per arm on purpose. Compiling the default
         # architecture list would multiply the nvcc work for no extra coverage:
         # the inventory is architecture independent, and the one architecture
-        # that changes the kernel bodies, Turing, has its own arm.
+        # that changes the kernel bodies, Turing, has its own arms.
         run: |
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -187,6 +193,7 @@ jobs:
         # stay on the F16-casting path. The harness exits 0 when it runs no
         # tests at all, so the counts are asserted here.
         run: |
+          set -o pipefail
           ./build-test/bin/test-backend-ops -b CUDA0 -o NATIVE_QUANT_EQUIVALENCE | tee focused.log
           sed -i 's/\x1b\[[0-9;]*m//g' focused.log
           native=$(grep -c 'expected_native=1).*OK$' focused.log)
