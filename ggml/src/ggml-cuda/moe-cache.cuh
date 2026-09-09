@@ -600,6 +600,7 @@ private:
         ggml_cuda_moe_ids_signature ids;
         ggml_cuda_moe_ids_signature route_root;
         ggml_cuda_moe_ids_signature route_source;
+        ggml_cuda_moe_ids_signature route_indices;
         reader_witness readers[MAX_GROUP_READERS];
         uint32_t bank_readers[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
         const ggml_tensor * nodes[4];
@@ -643,6 +644,7 @@ private:
         ggml_cuda_moe_ids_signature ids;
         ggml_cuda_moe_ids_signature ids_root;
         ggml_cuda_moe_ids_signature ids_source;
+        ggml_cuda_moe_ids_signature ids_indices;
         uint32_t layout;
         uint32_t n_banks;
         uint32_t ids_root_node_index;
@@ -683,7 +685,7 @@ private:
     bool insert(const ggml_tensor * node, uint32_t group_record, uint32_t role, uint32_t bank_index, uint32_t slot_index);
     const node_entry * find(const ggml_tensor * node) const;
     static_assert(sizeof(reader_witness) <= 640, "reader witness is too large");
-    static_assert(sizeof(group_record) <= 4096, "group record is too large");
+    static_assert(sizeof(group_record) <= 4160, "group record is too large");
     static_assert(sizeof(group_observation) <= 4096, "group observation is too large");
 
     std::vector<group_record> groups_;

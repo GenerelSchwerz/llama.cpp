@@ -3598,7 +3598,7 @@ static void test_grouped_context_resources() {
 static void test_grouped_graph_preflight(bool benchmark) {
     CHECK(sizeof(ggml_cuda_moe_graph_plan) <= 128 * 1024);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_reader_witness_size() <= 640);
-    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_record_size() <= 4096);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_record_size() <= 4160);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_observation_size() <= 4096);
     fprintf(stderr, "test-moe-cache: graph witness sizes plan=%zu reader=%zu group=%zu observation=%zu\n",
         sizeof(ggml_cuda_moe_graph_plan),
@@ -5224,6 +5224,10 @@ static ggml_backend_buffer_type_t file_mmap_cached_buffer_type() {
 #endif
 
 struct active_grouped_dispatch_graph {
+    ggml_context_ptr lookup_weights;
+    ggml_backend_buffer_ptr lookup_buffer;
+    ggml_tensor * lookup_table = nullptr;
+    ggml_tensor * token_ids = nullptr;
     ggml_context_ptr weights;
     ggml_context_ptr nodes;
     ggml_backend_buffer_ptr weight_buffer;
@@ -5275,7 +5279,8 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         bool concurrent_stream_fixture = false,
         bool original_direct_biases = false,
         uint32_t n_ff = 0,
-        bool mapped_host_biases = false) {
+        bool mapped_host_biases = false,
+        bool lookup_route = false) {
     CHECK(n_rows >= 1 && n_used >= 1 && n_used <= n_experts);
     CHECK(layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ||
         layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ||
@@ -5401,7 +5406,19 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         concurrent_branch = ggml_sqr(result.nodes.get(), result.concurrent_root);
         mmid_input = result.concurrent_root;
     }
-    result.ids = ggml_argsort_top_k(result.nodes.get(), result.logits, n_used);
+    if (lookup_route) {
+        CHECK(shared_banks == nullptr && !concurrent_stream_fixture);
+        result.lookup_weights.reset(ggml_init(weight_params));
+        result.lookup_table = ggml_new_tensor_2d(result.lookup_weights.get(), GGML_TYPE_I32, n_used, 16);
+        result.lookup_buffer.reset(ggml_backend_alloc_ctx_tensors(result.lookup_weights.get(), backend));
+        CHECK(result.lookup_buffer != nullptr);
+        ggml_backend_buffer_set_usage(result.lookup_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        result.token_ids = ggml_new_tensor_1d(result.nodes.get(), GGML_TYPE_I32, n_rows);
+        ggml_set_input(result.token_ids);
+        result.ids = ggml_get_rows(result.nodes.get(), result.lookup_table, result.token_ids);
+    } else {
+        result.ids = ggml_argsort_top_k(result.nodes.get(), result.logits, n_used);
+    }
     ggml_set_name(result.ids, "test.active.ids");
     ggml_tensor * hidden = nullptr;
     if (gate_up != nullptr) {
@@ -6447,6 +6464,7 @@ static ggml_cuda_mmid_capability native_mmid_capability(
         const ggml_tensor * weight,
         int64_t n_rows,
         ggml_cuda_mmid_mapping mapping);
+static void test_mmid_direct_source_view(int device);
 
 static void check_active_grouped_capabilities(
         ggml_cuda_moe_grouped_context & context,
@@ -6479,6 +6497,147 @@ static void check_active_grouped_capabilities(
             capability.grouped_nb[2] == capability.source_nb[2] &&
             capability.grouped_nb[3] == capability.grouped_nb[2] * n_slots);
     }
+}
+
+static void test_active_grouped_lookup_routes(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {
+        for (uint32_t rows : {1u, 4u}) {
+            ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+            ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+            const auto build = [&](ggml_backend_t backend) {
+                return build_active_grouped_dispatch_graph_types(backend, ggml_backend_cuda_moe_cached_buffer_type(),
+                    {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}, layout,
+                    false, false, rows, 8, 2, 256, nullptr, false, false, 0, false, true);
+            };
+            auto reference = build(reference_backend.get());
+            auto candidate = build(candidate_backend.get());
+            initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+            std::vector<int32_t> table(32);
+            for (size_t i = 0; i < table.size(); ++i) {
+                table[i] = (i + i / 2) % 8;
+            }
+            for (auto * graph : {&reference, &candidate}) {
+                ggml_backend_tensor_set(graph->lookup_table, table.data(), 0, ggml_nbytes(graph->lookup_table));
+            }
+            const auto disabled = candidate_snapshot(12, nullptr, 0);
+            CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+                GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+            register_active_grouped_dispatch(candidate_backend.get(), candidate, layout, 12);
+            auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+            CHECK(context != nullptr);
+            (void) candidate_certify_graph(*context, candidate.graph);
+            for (uint32_t pass = 0; pass < 4; ++pass) {
+                std::vector<int32_t> tokens(rows);
+                std::vector<float> input(ggml_nelements(candidate.input));
+                for (uint32_t row = 0; row < rows; ++row) {
+                    tokens[row] = (row * 3 + pass) % 16;
+                }
+                for (size_t i = 0; i < input.size(); ++i) {
+                    input[i] = 0.01f * (int(i % 31) - 15 + int(pass));
+                }
+                for (auto * graph : {&reference, &candidate}) {
+                    ggml_backend_tensor_set(graph->token_ids, tokens.data(), 0, ggml_nbytes(graph->token_ids));
+                    ggml_backend_tensor_set(graph->input, input.data(), 0, ggml_nbytes(graph->input));
+                }
+                const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0);
+                const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, rows * 2 * (pass + 1),
+                    layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE);
+                check_active_grouped_exact_output(expected, actual);
+                std::vector<int32_t> ids(rows * 2);
+                ggml_backend_tensor_get(candidate.ids, ids.data(), 0, ggml_nbytes(candidate.ids));
+                for (uint32_t row = 0; row < rows; ++row) {
+                    CHECK(ids[2 * row] == table[2 * tokens[row]] && ids[2 * row + 1] == table[2 * tokens[row] + 1]);
+                }
+            }
+            const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+            CHECK(telemetry.calls == 4 && telemetry.completed == 4 && telemetry.fallback == 0 && telemetry.rollback == 0);
+            CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+            CHECK(telemetry.plan_compiles == 1 && telemetry.plan_reuses == 3);
+            const auto coverage = candidate_certify_graph(*context, candidate.graph);
+            ggml_cuda_moe_graph_plan plan;
+            auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+            context->compile_graph_plan(candidate.graph, 1, &plan, execution.get(),
+                coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+            CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+            const auto bind = [&]() {
+                const bool unknown = context->bind_graph_plan(candidate.graph, 1, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN,
+                    plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+                const bool unchanged = context->bind_graph_plan(candidate.graph, 1, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED,
+                    plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+                CHECK(unknown == unchanged);
+                return unknown;
+            };
+            const auto reject_route = [&]() {
+                CHECK(!bind());
+                ggml_cuda_moe_graph_plan invalid_plan;
+                context->compile_graph_plan(candidate.graph, 2, &invalid_plan, execution.get());
+                CHECK(execution->outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+            };
+            CHECK(bind());
+            const size_t stride = candidate.lookup_table->nb[1];
+            candidate.lookup_table->nb[1] += sizeof(int32_t);
+            reject_route();
+            candidate.lookup_table->nb[1] = stride;
+            CHECK(bind());
+            candidate.ids->src[1] = reference.token_ids;
+            CHECK(!bind());
+            candidate.ids->src[1] = candidate.token_ids;
+            CHECK(bind());
+            void * token_data = candidate.token_ids->data;
+            candidate.token_ids->data = reference.token_ids->data;
+            CHECK(!bind());
+            candidate.token_ids->data = token_data;
+            CHECK(bind());
+            candidate.ids->view_src = candidate.lookup_table;
+            reject_route();
+            candidate.ids->view_src = nullptr;
+            CHECK(bind());
+            ggml_backend_buffer_set_usage(candidate.lookup_buffer.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+            reject_route();
+            ggml_backend_buffer_set_usage(candidate.lookup_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            CHECK(bind());
+            for (ggml_tensor * tensor : {candidate.lookup_table, candidate.token_ids}) {
+                tensor->type = GGML_TYPE_F32;
+                reject_route();
+                tensor->type = GGML_TYPE_I32;
+                CHECK(bind());
+                const int64_t width = tensor->ne[0];
+                tensor->ne[0]++;
+                reject_route();
+                tensor->ne[0] = width;
+                CHECK(bind());
+            }
+            const size_t index_stride = candidate.token_ids->nb[0];
+            candidate.token_ids->nb[0] *= 2;
+            if (rows > 1) {
+                reject_route();
+            } else {
+                CHECK(!bind());
+            }
+            candidate.token_ids->nb[0] = index_stride;
+            CHECK(bind());
+            CHECK(candidate.graph->nodes[0] == candidate.ids);
+            std::swap(candidate.graph->nodes[0], candidate.graph->nodes[1]);
+            reject_route();
+            std::swap(candidate.graph->nodes[0], candidate.graph->nodes[1]);
+            CHECK(bind());
+            candidate.ids->src[0] = reference.lookup_table;
+            CHECK(!bind());
+            ggml_cuda_moe_graph_plan rebound_plan;
+            context->compile_graph_plan(candidate.graph, 1, &rebound_plan, execution.get(),
+                coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+            CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+            CHECK(context->bind_graph_plan(candidate.graph, 1, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN,
+                rebound_plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint));
+            candidate.ids->src[0] = candidate.lookup_table;
+            CHECK(bind());
+            fprintf(stderr, "test-moe-cache: lookup route layout=%u rows=%u exact output and binding checks OK\n", layout, rows);
+        }
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
 }
 
 static void test_active_grouped_multirow_graph_modes_case(
@@ -7696,6 +7855,7 @@ static void test_active_grouped_stream_coherence_fallback(int device) {
 }
 
 static void test_active_grouped_multirow_graph_modes(int device) {
+    test_active_grouped_lookup_routes(device);
     test_active_grouped_multirow_graph_modes_case(device, 2);
     test_active_grouped_multirow_graph_modes_case(device, 3);
     test_active_grouped_multirow_graph_modes_case(device, 4);
@@ -7714,6 +7874,7 @@ static void test_active_grouped_multirow_graph_modes(int device) {
     test_active_grouped_host_staged_failure_cleanup(device);
     test_active_grouped_legacy_phase_telemetry(device);
     test_active_grouped_stream_coherence_fallback(device);
+    test_mmid_direct_source_view(device);
 }
 
 static void check_active_grouped_bias_shadows(
@@ -9641,8 +9802,8 @@ static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
         ggml_type weight_type,
         int64_t n_out,
         int64_t n_used,
-        int64_t n_tokens) {
-    constexpr int64_t N_EXPERTS = 8;
+        int64_t n_tokens,
+        int64_t n_experts = 8) {
     constexpr int64_t N_IN = 256;
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 8,
@@ -9660,7 +9821,7 @@ static cached_mmid_path_test_graph build_cached_mmid_path_test_graph(
     result.nodes.reset(ggml_init(node_params));
     CHECK(result.weights != nullptr && result.nodes != nullptr);
 
-    const int64_t weight_ne[] = {N_IN, n_out, N_EXPERTS};
+    const int64_t weight_ne[] = {N_IN, n_out, n_experts};
     ggml_tensor * weight = ggml_new_tensor(result.weights.get(), weight_type, 3, weight_ne);
     ggml_set_name(weight, "test.paths.ffn_up_exps.weight");
     const int64_t input_ne[] = {N_IN, 1, n_tokens};
@@ -10811,6 +10972,225 @@ static ggml_cuda_mmid_capability native_mmid_capability(
     return ggml_cuda_mmid_get_capability(query);
 }
 
+struct direct_source_view_test_state {
+    bool descriptor_rejected = false;
+    bool quant_mmvq_rejected = false;
+    bool bf16_mmq_rejected = false;
+    bool generic_rejected = false;
+};
+
+static void test_mmid_direct_source_view_case(
+        int device,
+        ggml_type type,
+        int64_t n_tokens,
+        ggml_cuda_mmid_consumer expected_consumer,
+        direct_source_view_test_state * state) {
+    constexpr int64_t logical_experts = 8;
+    constexpr int64_t physical_experts = 24;
+    constexpr int64_t n_used = 2;
+    constexpr int64_t n_out = 256;
+    constexpr int64_t physical_begin = physical_experts - logical_experts;
+    const std::array<const char *, 3> role_names = {
+        "test.direct_view.ffn_gate_exps.weight",
+        "test.direct_view.ffn_up_exps.weight",
+        "test.direct_view.ffn_down_exps.weight",
+    };
+
+    ggml_backend_ptr baseline_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr physical_backend(ggml_backend_cuda_init(device));
+    CHECK(baseline_backend != nullptr && physical_backend != nullptr);
+    std::array<cached_mmid_path_test_graph, 3> baseline;
+    std::array<cached_mmid_path_test_graph, 3> physical;
+    for (size_t role = 0; role < role_names.size(); ++role) {
+        baseline[role] = build_cached_mmid_path_test_graph(
+            baseline_backend.get(), ggml_backend_cuda_buffer_type(device), type, n_out, n_used, n_tokens, logical_experts);
+        physical[role] = build_cached_mmid_path_test_graph(
+            physical_backend.get(), ggml_backend_cuda_buffer_type(device), type, n_out, n_used, n_tokens, physical_experts);
+        ggml_set_name(baseline[role].leaves[0], role_names[role]);
+        ggml_set_name(physical[role].leaves[0], role_names[role]);
+    }
+
+    std::vector<int32_t> baseline_ids(n_tokens * n_used);
+    std::vector<int32_t> physical_ids(n_tokens * n_used);
+    for (int64_t token = 0; token < n_tokens; ++token) {
+        for (int64_t route = 0; route < n_used; ++route) {
+            const int32_t expert = (3 * token + 5 * route) % logical_experts;
+            baseline_ids[token * n_used + route] = expert;
+            physical_ids[token * n_used + route] = physical_begin + expert;
+        }
+    }
+
+    std::array<std::vector<float>, 3> expected;
+    std::array<std::vector<float>, 3> actual;
+    for (size_t role = 0; role < role_names.size(); ++role) {
+        ggml_tensor * baseline_weight = baseline[role].leaves[0];
+        ggml_tensor * physical_weight = physical[role].leaves[0];
+        CHECK(baseline_weight->nb[2] == physical_weight->nb[2] && baseline_weight->ne[2] == logical_experts &&
+            physical_weight->ne[2] == physical_experts);
+        auto baseline_bytes = cached_fusion_test_data(baseline_weight, 1201 + role);
+        auto physical_bytes = cached_fusion_test_data(physical_weight, 1301 + role);
+        for (int64_t expert = 0; expert < logical_experts; ++expert) {
+            const size_t source_offset = expert * baseline_weight->nb[2];
+            const size_t physical_offset = (physical_begin + expert) * physical_weight->nb[2];
+            memcpy(physical_bytes.data() + physical_offset, baseline_bytes.data() + source_offset, baseline_weight->nb[2]);
+            CHECK(memcmp(
+                physical_bytes.data() + physical_offset,
+                baseline_bytes.data() + source_offset,
+                baseline_weight->nb[2]) == 0);
+        }
+        ggml_backend_tensor_set(baseline_weight, baseline_bytes.data(), 0, baseline_bytes.size());
+        ggml_backend_tensor_set(physical_weight, physical_bytes.data(), 0, physical_bytes.size());
+
+        const auto input = cached_fusion_test_data(baseline[role].leaves[1], 1401 + role);
+        CHECK(input.size() == ggml_nbytes(physical[role].leaves[1]));
+        ggml_backend_tensor_set(baseline[role].leaves[1], input.data(), 0, input.size());
+        ggml_backend_tensor_set(physical[role].leaves[1], input.data(), 0, input.size());
+        ggml_backend_tensor_set(baseline[role].ids, baseline_ids.data(), 0, ggml_nbytes(baseline[role].ids));
+        ggml_backend_tensor_set(physical[role].ids, physical_ids.data(), 0, ggml_nbytes(physical[role].ids));
+
+        const auto baseline_capability = native_mmid_capability(
+            device, baseline_weight, n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        ggml_tensor logical_physical_weight = *physical_weight;
+        logical_physical_weight.ne[2] = logical_experts;
+        logical_physical_weight.nb[3] = logical_physical_weight.nb[2] * logical_experts;
+        const auto logical_physical_capability = native_mmid_capability(
+            device, &logical_physical_weight, n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        CHECK(baseline_capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            baseline_capability.selection == expected_consumer &&
+            logical_physical_capability.reason == baseline_capability.reason &&
+            logical_physical_capability.selection == baseline_capability.selection);
+
+        const ggml_cuda_mmid_direct_source_view view = {
+            physical_weight->type,
+            logical_experts,
+            physical_experts,
+            physical_experts,
+            physical_weight->nb[2],
+        };
+        CHECK(ggml_cuda_mmid_direct_source_view_valid(physical_weight, view, expected_consumer));
+
+        const std::vector<float> baseline_sentinel(ggml_nelements(baseline[role].output), -17001.25f);
+        const std::vector<float> physical_sentinel(ggml_nelements(physical[role].output), -18001.5f);
+        ggml_backend_tensor_set(
+            baseline[role].output, baseline_sentinel.data(), 0, ggml_nbytes(baseline[role].output));
+        ggml_backend_tensor_set(
+            physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
+        CHECK(ggml_backend_graph_compute(baseline_backend.get(), baseline[role].graph) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_cuda_mmid_direct_source_view_compute_for_test(
+            physical_backend.get(), physical[role].output, &view, expected_consumer));
+        ggml_backend_synchronize(baseline_backend.get());
+        ggml_backend_synchronize(physical_backend.get());
+        expected[role] = active_grouped_tensor_values(baseline[role].output);
+        actual[role] = active_grouped_tensor_values(physical[role].output);
+        CHECK(expected[role] != baseline_sentinel && actual[role] != physical_sentinel &&
+            expected[role].size() == actual[role].size());
+        double squared_expected = 0.0;
+        for (size_t value = 0; value < expected[role].size(); ++value) {
+            CHECK(std::isfinite(expected[role][value]) && std::isfinite(actual[role][value]));
+            squared_expected += static_cast<double>(expected[role][value]) * expected[role][value];
+        }
+        CHECK(squared_expected > 0.0 && memcmp(
+            expected[role].data(), actual[role].data(), expected[role].size() * sizeof(float)) == 0);
+
+        const auto reject = [&](ggml_cuda_mmid_direct_source_view rejected, ggml_cuda_mmid_consumer consumer) {
+            ggml_backend_tensor_set(
+                physical[role].output, physical_sentinel.data(), 0, ggml_nbytes(physical[role].output));
+            CHECK(!ggml_cuda_mmid_direct_source_view_compute_for_test(
+                physical_backend.get(), physical[role].output, &rejected, consumer));
+            ggml_backend_synchronize(physical_backend.get());
+            CHECK(active_grouped_tensor_values(physical[role].output) == physical_sentinel);
+        };
+        if (!state->descriptor_rejected) {
+            auto rejected = view;
+            rejected.logical_n_experts = 0;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.logical_n_experts = static_cast<int64_t>(INT_MAX) + 1;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.expert_stride += ggml_type_size(type);
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.source_type = GGML_TYPE_COUNT;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            rejected.physical_n_experts -= 1;
+            reject(rejected, expected_consumer);
+            rejected = view;
+            // The grouped remapper certifies this exclusive device-ID bound.
+            rejected.physical_id_upper_bound = physical_experts + 1;
+            reject(rejected, expected_consumer);
+            state->descriptor_rejected = true;
+        }
+        if (!state->quant_mmvq_rejected && ggml_is_quantized(type) && n_tokens == 16 &&
+                expected_consumer == GGML_CUDA_MMID_CONSUMER_MMQ) {
+            CHECK(ggml_cuda_mmid_direct_source_view_valid(
+                physical_weight, view, GGML_CUDA_MMID_CONSUMER_MMVQ));
+            reject(view, GGML_CUDA_MMID_CONSUMER_MMVQ);
+            state->quant_mmvq_rejected = true;
+        }
+        if (!state->bf16_mmq_rejected && type == GGML_TYPE_BF16 && expected_consumer == GGML_CUDA_MMID_CONSUMER_MMF) {
+            reject(view, GGML_CUDA_MMID_CONSUMER_MMQ);
+            state->bf16_mmq_rejected = true;
+        }
+        if (!state->generic_rejected) {
+            reject(view, GGML_CUDA_MMID_CONSUMER_GENERIC);
+            state->generic_rejected = true;
+        }
+    }
+
+    CHECK(memcmp(expected[2].data(), actual[2].data(), expected[2].size() * sizeof(float)) == 0);
+}
+
+static void test_mmid_direct_source_view(int device) {
+    struct test_case {
+        ggml_type type;
+        int64_t n_tokens;
+        ggml_cuda_mmid_consumer consumer;
+    };
+    const std::array<test_case, 10> cases = {{
+        {GGML_TYPE_Q4_0, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_Q4_0, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_Q4_K, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_Q4_K, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_NVFP4, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_NVFP4, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_MXFP4, 4, GGML_CUDA_MMID_CONSUMER_MMVQ},
+        {GGML_TYPE_MXFP4, 16, GGML_CUDA_MMID_CONSUMER_MMQ},
+        {GGML_TYPE_BF16, 4, GGML_CUDA_MMID_CONSUMER_MMF},
+        {GGML_TYPE_BF16, 16, GGML_CUDA_MMID_CONSUMER_MMF},
+    }};
+    cudaDeviceProp properties;
+    CUDA_OK(cudaGetDeviceProperties(&properties, device));
+    const bool require_cc12 = properties.major == 12;
+    direct_source_view_test_state state;
+    for (const auto & current : cases) {
+        ggml_backend_ptr query_backend(ggml_backend_cuda_init(device));
+        CHECK(query_backend != nullptr);
+        auto query_graph = build_cached_mmid_path_test_graph(
+            query_backend.get(), ggml_backend_cuda_buffer_type(device), current.type, 256, 2, current.n_tokens, 8);
+        const auto capability = native_mmid_capability(
+            device, query_graph.leaves[0], current.n_tokens, GGML_CUDA_MMID_MAPPING_DIRECT);
+        const bool supported = capability.reason == GGML_CUDA_MMID_CAPABILITY_OK &&
+            capability.selection == current.consumer;
+        if (require_cc12) {
+            CHECK(supported);
+        }
+        if (!supported) {
+            fprintf(stderr, "test-moe-cache: skipping direct MMID view type=%s B%lld consumer=%u on CC%d%d\n",
+                ggml_type_name(current.type), (long long) current.n_tokens, static_cast<unsigned>(current.consumer),
+                properties.major, properties.minor);
+            continue;
+        }
+        test_mmid_direct_source_view_case(
+            device, current.type, current.n_tokens, current.consumer, &state);
+    }
+    if (require_cc12) {
+        CHECK(state.descriptor_rejected && state.quant_mmvq_rejected && state.bf16_mmq_rejected && state.generic_rejected);
+    }
+    fprintf(stderr, "test-moe-cache: direct MMID logical/physical source extent witness OK\n");
+}
+
 static std::array<std::vector<float>, 3> run_gemma_q4_graph(
         ggml_backend_t backend,
         gemma_q4_parity_graphs & graphs) {
@@ -10953,6 +11333,7 @@ struct grouped_decode_fixture {
     ggml_backend_buffer_t ids_buffer = nullptr;
     ggml_context * ctx = nullptr;
     void * source_storage = nullptr;
+    size_t source_storage_size = 0;
     uint32_t n_experts = N_EXPERTS;
     size_t source_offset = 0;
 
@@ -10966,7 +11347,9 @@ struct grouped_decode_fixture {
         if (pinned) {
             source_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_moe_cached_buffer_type(), source_bytes);
         } else {
-            CHECK(posix_memalign(&source_storage, 64, source_bytes) == 0);
+            source_storage = ggml_aligned_malloc(source_bytes);
+            source_storage_size = source_bytes;
+            CHECK(source_storage != nullptr);
             source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(source_storage, source_bytes);
         }
         ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 4096);
@@ -10982,7 +11365,9 @@ struct grouped_decode_fixture {
         ggml_free(ctx);
         ggml_backend_buffer_free(ids_buffer);
         ggml_backend_buffer_free(source_buffer);
-        free(source_storage);
+        if (source_storage != nullptr) {
+            ggml_aligned_free(source_storage, source_storage_size);
+        }
         ggml_backend_free(backend);
     }
 
@@ -12147,6 +12532,12 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_gemma_q4_cached_cuda_parity(dev);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--grouped-lookup-only") == 0) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_lookup_routes(dev);
         return 0;
     }
     if (grouped_multirow_only) {
