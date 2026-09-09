@@ -157,6 +157,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--decode-overlap` | experimental: overlap backend-sampled decode or the first MTP draft step with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
 
 
 ### Server-specific params
@@ -458,6 +459,14 @@ docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:se
 # or, with CUDA:
 docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
 ```
+
+### Experimental decode overlap
+
+`--decode-overlap` queues at most one additional decode batch while the CPU processes the previous results. Without speculative decoding, it supports parallel requests on one CUDA GPU with greedy or stochastic backend sampling. Supported sampling includes temperature, dynamic temperature, top-k, top-p, min-p, static logit bias, and `ignore_eos`. Each queued batch contains one token per eligible sequence and must fit in one microbatch. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Initial support covers owned ordinary KV caches, standard sliding-window KV caches, and ordinary hybrid KV/recurrent memory, with compatible graph inputs and all compute operations on the same GPU. The request sampler applies model-declared token suppression and EOS suppression on the GPU. Recurrent models reserve one extra state snapshot for rollback. Borrowed caches, other sliding-window types, indexed/specialized attention, standalone recurrent inputs, sparse selected-token snapshots, and custom inputs use normal decode until separately validated.
+
+Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and history-dependent or unsupported sampling use the normal path. A batch containing an incompatible request uses normal decode. New prompt admission discards queued positions before rebuilding the batch; overlap can resume once the batch qualifies. Stops and cancellation drain and discard the affected slot's extra queued position and restore its saved sampler RNG state before releasing it. The CPU prepares inputs in two pinned buffers and uploads them on the compute stream, then queues the next decode before waiting for the preceding tokens. Graph rebuilds and allocation changes still synchronize. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
+
+With `--spec-type draft-mtp`, overlap queues the first forward pass of the next draft after target sampling, acceptance, and rollback finish. The GPU can execute that pass while the CPU formats and streams the accepted tokens. The next draft consumes the queued outputs; target sampling and verification remain unchanged. This path supports a single MTP head on one CUDA GPU with an independent draft cache that permits one-token rollback, including shared compute workspace and capped MTP replay state. It does not require backend sampling or GPU token embeddings. Multiple MTP heads, shared target/draft KV, probability output, LoRA, multimodal input, and parent/child requests use ordinary MTP. Stops, cancellation, prompt admission, and state changes drain and remove the queued draft positions before reuse. The log reports queued, reused, and discarded MTP steps. Parallel MTP with `--kv-unified` currently has a separate verification-layout failure even with overlap disabled; use separate per-sequence caches for this configuration.
 
 ## Using with CURL
 

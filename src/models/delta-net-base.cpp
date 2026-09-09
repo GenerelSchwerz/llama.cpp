@@ -621,6 +621,16 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
     };
 
+    if (!sparse) {
+        // Short batches need the input state for rollback before their first token.
+        for (int64_t slot = n_seq_tokens; slot < K; ++slot) {
+            ggml_tensor * dst = ggml_view_2d(ctx0, ssm_states_all,
+                D, n_seqs, ssm_states_all->nb[1],
+                ((size_t) slot * mem_size + kv_head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, s, dst));
+        }
+    }
+
     if (sparse && selected < 0) {
         const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1);
         copy_snapshots(0, n_trailing);
