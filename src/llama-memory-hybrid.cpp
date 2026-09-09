@@ -158,6 +158,15 @@ void llama_memory_hybrid::clear(bool data) {
     mem_recr->clear(data);
 }
 
+bool llama_memory_hybrid::can_decode_sampled() const {
+    return mem_attn->can_decode_sampled() && mem_recr->can_decode_sampled();
+}
+
+void llama_memory_hybrid::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    mem_attn->seq_set_last_token(seq_id, pos, token);
+    mem_recr->seq_set_last_token(seq_id, pos, token);
+}
+
 bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // Try removing from the recurrent cache first since it may fail. If it does
     // fail, the cache will not have been mutated.

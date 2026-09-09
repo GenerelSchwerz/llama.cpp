@@ -62,6 +62,8 @@ public:
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool get_can_shift() const override;
+    bool can_decode_sampled() const override;
+    void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) override;
 
     bool recurrent_sparse_snapshots_supported() const override;
     bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;

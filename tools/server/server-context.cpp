@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -43,6 +44,33 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_decode_overlap_sampling(const common_params_sampling & params) {
+    if (params.mirostat != 0 || params.adaptive_target >= 0.0f ||
+            params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
+            params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f || params.typ_p != 1.0f ||
+            params.top_n_sigma > 0.0f || params.n_probs != 0 ||
+            !common_grammar_value(params.grammar).empty() || params.reasoning_budget_tokens >= 0 || params.reasoning_control) {
+        return false;
+    }
+    for (const auto sampler : params.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_DRY:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_XTC:
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -124,6 +152,7 @@ struct server_batch {
         llama_pos pos;
         bool output;
         bool is_prompt; // for stats tracking
+        int32_t output_index = -1;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -254,6 +283,16 @@ struct server_slot {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
     bool moe_cache_enabled = false;
+
+    llama_sampler * decode_overlap_sampler = nullptr;
+    llama_sampler_ptr decode_overlap_checkpoint;
+    bool decode_overlap_enabled = false;
+    llama_pos decode_overlap_pos = -1;
+    llama_token decode_overlap_token = LLAMA_TOKEN_NULL;
+    int32_t decode_overlap_output_index = -1;
+    int64_t decode_overlap_task_id = -1;
+    uint64_t decode_overlap_queued = 0;
+    uint64_t decode_overlap_discarded = 0;
 
     common_memory mem;
 
@@ -427,6 +466,11 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        decode_overlap_sampler = nullptr;
+        decode_overlap_checkpoint.reset();
+        decode_overlap_enabled = false;
+        decode_overlap_queued = 0;
+        decode_overlap_discarded = 0;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -575,9 +619,28 @@ struct server_slot {
         prompt.tokens.insert(spec_draft);
     }
 
+    void discard_decode_overlap() {
+        if (decode_overlap_pos < 0) {
+            return;
+        }
+        llama_synchronize(ctx_tgt);
+        mem.seq_rm(id, decode_overlap_pos, -1);
+        llama_sampler_copy(decode_overlap_checkpoint.get(), decode_overlap_sampler);
+        decode_overlap_pos = -1;
+        decode_overlap_token = LLAMA_TOKEN_NULL;
+        decode_overlap_output_index = -1;
+        decode_overlap_task_id = -1;
+        ++decode_overlap_discarded;
+    }
+
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            discard_decode_overlap();
+            if (decode_overlap_queued > 0) {
+                SLT_INF(*this, "decode overlap: queued = %" PRIu64 ", discarded = %" PRIu64 "\n", decode_overlap_queued, decode_overlap_discarded);
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1908,11 +1971,23 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            const bool use_decode_overlap = params_base.decode_overlap && !spec && !mctx &&
+                    slot.lora.empty() &&
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
+                    !task.is_parent() && !task.is_child() && server_decode_overlap_sampling(task.params.sampling);
+
             // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
+            if (use_decode_overlap) {
+                slot.decode_overlap_sampler = common_sampler_get(slot.smpl.get());
+                slot.decode_overlap_enabled = llama_set_sampler(ctx_tgt, slot.id, slot.decode_overlap_sampler);
+                SLT_INF(slot, "decode overlap: %s\n", slot.decode_overlap_enabled ? "backend sampling enabled, device input checked after prefill" : "backend unavailable");
+            } else if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            if (params_base.decode_overlap && !use_decode_overlap) {
+                SLT_INF(slot, "%s", "decode overlap: unsupported request or context, using normal decode\n");
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -3067,6 +3142,17 @@ private:
     }
 
     void pre_decode() {
+        // A new admission or incompatible slot needs a fresh batch before queued work can resume.
+        const bool reset_overlap = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.is_processing() && (slot.decode_overlap_pos < 0 ||
+                    slot.decode_overlap_task_id != slot.task->id || slot.prompt.n_tokens() + 1 >= slot.n_ctx);
+        });
+        if (reset_overlap) {
+            for (auto & slot : slots) {
+                slot.discard_decode_overlap();
+            }
+        }
+
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3987,6 +4073,29 @@ private:
 
         int ret = 0;
         bool snapshot_mode_restored = true;
+        bool consume_decode_overlap = !sparse_snapshots && !spec && !batch.has_embd;
+        for (int32_t i = off; i < off + batch_view.n_tokens && consume_decode_overlap; ++i) {
+            const auto & token = batch.tokens[i];
+            const auto & slot = slots.at(token.id_slot);
+            consume_decode_overlap = !token.is_prompt && token.output && slot.task &&
+                    slot.decode_overlap_task_id == slot.task->id && slot.decode_overlap_pos == token.pos &&
+                    slot.decode_overlap_token == token.token;
+        }
+        if (consume_decode_overlap) {
+            for (int32_t i = off; i < off + batch_view.n_tokens; ++i) {
+                auto & token = batch.tokens[i];
+                auto & slot = slots.at(token.id_slot);
+                token.output_index = slot.decode_overlap_output_index;
+                slot.decode_overlap_pos = -1;
+                slot.decode_overlap_token = LLAMA_TOKEN_NULL;
+                slot.decode_overlap_output_index = -1;
+                slot.decode_overlap_task_id = -1;
+            }
+        } else {
+            for (auto & slot : slots) {
+                slot.discard_decode_overlap();
+            }
+        }
         queue_tasks.yield_to_queue([&]() {
             bool snapshot_mode_enabled = false;
             if (sparse_snapshots && !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token)) {
@@ -4005,8 +4114,9 @@ private:
                     execution_intent.verification_span = batch.speculative_verification_span;
                     execution_intent_ptr = &execution_intent;
                 }
-                ret = llama_decode_ext(ctx_tgt, batch_view, execution_intent_ptr);
-                if (ret == 0 && (has_output || sparse_snapshots)) {
+                ret = consume_decode_overlap ? 0 : llama_decode_ext(ctx_tgt, batch_view, execution_intent_ptr);
+                const bool defer_output = params_base.decode_overlap && !spec && !mctx && !sparse_snapshots;
+                if (ret == 0 && (has_output || sparse_snapshots) && !defer_output) {
                     llama_synchronize(ctx_tgt);
                 }
             } catch (...) {
@@ -4174,6 +4284,62 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        std::vector<server_slot *> overlap_slots;
+        std::vector<llama_sampled_decode_item> overlap_items;
+        std::vector<llama_token> overlap_tokens(slots.size(), LLAMA_TOKEN_NULL);
+        bool queue_overlap = params_base.decode_overlap && !spec && !mctx && !batch.has_embd &&
+                off == 0 && n_batch_tokens == batch.size();
+        int32_t n_outputs = 0;
+        for (int32_t i = off; i < off + n_batch_tokens; ++i) {
+            n_outputs += batch.tokens[i].output;
+        }
+        iterate_post_decode([&](server_slot & slot) {
+            if (!is_inside_view(slot.i_batch)) {
+                return;
+            }
+            if (!slot.decode_overlap_enabled ||
+                    (slot.state != SLOT_STATE_GENERATING && slot.state != SLOT_STATE_DONE_PROMPT) ||
+                    slot.prompt.tokens.pos_next() + 2 >= slot.n_ctx ||
+                    (slot.n_predict_max >= 0 && slot.stats.n_gen + 1 >= (uint64_t) slot.n_predict_max)) {
+                queue_overlap = false;
+                return;
+            }
+            overlap_slots.push_back(&slot);
+            overlap_items.push_back({slot.id, slot.prompt.tokens.pos_next()});
+        });
+        queue_overlap &= !overlap_items.empty() && overlap_items.size() == (size_t) n_outputs;
+        if (queue_overlap) {
+            for (auto * slot : overlap_slots) {
+                if (!slot->decode_overlap_checkpoint) {
+                    slot->decode_overlap_checkpoint.reset(llama_sampler_clone(slot->decode_overlap_sampler));
+                } else {
+                    llama_sampler_copy(slot->decode_overlap_sampler, slot->decode_overlap_checkpoint.get());
+                }
+            }
+            std::vector<llama_token> previous(overlap_items.size());
+            const int ret = llama_decode_sampled_batch_async(ctx_tgt, overlap_items.data(), overlap_items.size(), previous.data());
+            if (ret == 0) {
+                SRV_DBG("decode overlap: queued batch, n_seqs = %zu\n", overlap_items.size());
+                for (size_t i = 0; i < overlap_items.size(); ++i) {
+                    auto & slot = *overlap_slots[i];
+                    overlap_tokens[slot.id] = previous[i];
+                    slot.decode_overlap_pos = overlap_items[i].pos;
+                    slot.decode_overlap_token = previous[i];
+                    slot.decode_overlap_output_index = i;
+                    slot.decode_overlap_task_id = slot.task->id;
+                    ++slot.decode_overlap_queued;
+                }
+            } else if (ret != 1) {
+                llama_synchronize(ctx_tgt);
+                for (const auto & item : overlap_items) {
+                    auto & slot = slots.at(item.seq_id);
+                    slot.mem.seq_rm(item.seq_id, item.pos, -1);
+                    llama_sampler_copy(slot.decode_overlap_checkpoint.get(), slot.decode_overlap_sampler);
+                }
+                throw std::runtime_error("failed to queue decode overlap batch");
+            }
+        }
+
         iterate_post_decode([&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4219,21 +4385,27 @@ private:
                 return; // sample using speculative decoding
             }
 
-            // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
+            const int tok_idx = batch.tokens[slot.i_batch].output_index >= 0
+                    ? batch.tokens[slot.i_batch].output_index : slot.i_batch - off;
 
-            llama_token id;
+            llama_token id = overlap_tokens[slot.id];
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                if (id == LLAMA_TOKEN_NULL && slot.decode_overlap_sampler) {
+                    id = llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx);
+                }
+                if (id == LLAMA_TOKEN_NULL) {
+                    slot.decode_overlap_enabled = false;
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
             }
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+            // The preceding output is ready; a queued decode can still be running.
             const int64_t t_now = ggml_time_us();
+
+            common_sampler_accept(slot.smpl.get(), id, true);
 
             slot.stats.n_gen += 1;
 

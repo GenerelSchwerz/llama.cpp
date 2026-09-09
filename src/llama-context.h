@@ -122,6 +122,9 @@ struct llama_context {
 
     void synchronize();
 
+    int32_t decode_sampled(llama_seq_id seq_id, llama_pos pos, llama_token * previous = nullptr);
+    int32_t decode_sampled(const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -326,6 +329,9 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    void place_sampled_inputs(llm_graph_result * res);
+    void finish_compute(int64_t n_tokens, int64_t elapsed_us);
+    void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch);
     void reset_sched_workspace();
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
@@ -437,6 +443,27 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    ggml_context_ptr sampled_input_ctx;
+    ggml_backend_buffer_ptr sampled_input_buf;
+    ggml_tensor * sampled_input = nullptr;
+    std::vector<ggml_tensor *> sampled_input_rows;
+    std::vector<ggml_tensor *> sampled_input_by_seq;
+    std::vector<std::pair<llama_seq_id, llama_pos>> sampled_output_positions;
+    ggml_backend_t sampled_input_backend = nullptr;
+    bool use_sampled_input = false;
+    bool use_sampled_input_async = false;
+    uint64_t compute_sync_generation = 0;
+    bool sampled_inputs_device = false;
+    struct sampled_input_staging {
+        ggml_backend_buffer_ptr buffer;
+        ggml_backend_event_ptr uploaded;
+        bool in_flight = false;
+    };
+    sampled_input_staging sampled_staging[2];
+    uint32_t sampled_staging_next = 0;
+    ggml_backend_buffer_ptr sampled_output_host;
+    ggml_backend_event_ptr sampled_output_ready;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
