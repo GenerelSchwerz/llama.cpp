@@ -20,6 +20,27 @@ LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_con
 LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
         struct llama_context * ctx, bool enabled, int32_t selected_token);
 
+// Queue one decode using the previous backend-sampled token as device input.
+// Requires synchronized output and supported backend sampling. On success, normal output access refers to the new decode.
+// Stochastic sampling requires n_outputs_max_per_seq = 1. Discarding a queued position also requires restoring the sampler state saved before this call.
+// Returns 0 if queued, 1 if unsupported without changing memory, or a negative value on decode failure.
+LLAMA_API int32_t llama_decode_sampled(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+// Queue the next decode before waiting for the preceding sampled token, returned in previous.
+// Uses the same return codes as llama_decode_sampled. On success, only previous is ready; the new decode can still be running.
+LLAMA_API int32_t llama_decode_sampled_async(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos, llama_token * previous);
+
+struct llama_sampled_decode_item {
+    llama_seq_id seq_id;
+    llama_pos pos;
+};
+
+// Queue one token per sequence from the preceding output at (seq_id, pos - 1).
+// Items may select a subset of the preceding batch. previous follows item order.
+// Return codes and completion rules match llama_decode_sampled_async.
+LLAMA_API int32_t llama_decode_sampled_batch_async(
+        struct llama_context * ctx, const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

@@ -16,6 +16,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cmath>
@@ -1394,6 +1395,7 @@ void llm_graph_result::reset() {
     params = {};
 
     inputs.clear();
+    inp_token_tensors.clear();
     fused_nodes.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
@@ -1409,8 +1411,18 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+bool llm_graph_result::can_decode_sampled() const {
+    return !inp_token_tensors.empty() && std::all_of(inputs.begin(), inputs.end(), [](const llm_graph_input_ptr & input) {
+        return input->can_decode_sampled();
+    });
+}
+
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, bool skip_token_upload) {
     for (auto & input : inputs) {
+        if (skip_token_upload && dynamic_cast<llm_graph_input_embd *>(input.get())) {
+            GGML_ASSERT(ubatch->token && !ubatch->embd);
+            continue;
+        }
         input->set_input(ubatch);
     }
 }
@@ -1492,6 +1504,11 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 }
 
 llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
+    if (auto * embd = dynamic_cast<llm_graph_input_embd *>(input.get())) {
+        if (embd->tokens) {
+            inp_token_tensors.push_back(embd->tokens);
+        }
+    }
     inputs.emplace_back(std::move(input));
     return inputs.back().get();
 }

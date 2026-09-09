@@ -8,6 +8,8 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
+#include "llama-kv-cache.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1335,31 +1337,29 @@ void llama_context::synchronize() {
     ggml_backend_sched_synchronize(sched.get());
     workspace_in_flight = false;
 
-    // FIXME: if multiple single tokens are evaluated without a synchronization,
-    // the stats will be added to the prompt evaluation stats
-    // this should only happen when using batch size 1 to evaluate a batch
+    finish_compute(n_queued_tokens, ggml_time_us() - t_compute_start_us);
+    n_queued_tokens = 0;
+    t_compute_start_us = 0;
+    ++compute_sync_generation;
+}
 
-    // add the evaluation to the stats
-    if (n_queued_tokens == 1) {
+void llama_context::finish_compute(int64_t n_tokens, int64_t elapsed_us) {
+    if (n_tokens == 1) {
         if (!cparams.no_perf) {
-            t_eval_us += ggml_time_us() - t_compute_start_us;
+            t_eval_us += elapsed_us;
         }
         n_eval++;
-    } else if (n_queued_tokens > 1) {
+    } else if (n_tokens > 1) {
         if (!cparams.no_perf) {
-            t_p_eval_us += ggml_time_us() - t_compute_start_us;
+            t_p_eval_us += elapsed_us;
         }
-        n_p_eval += n_queued_tokens;
+        n_p_eval += n_tokens;
     }
 
-    // get a more accurate load time, upon first eval
-    if (n_queued_tokens > 0 && !has_evaluated_once) {
+    if (n_tokens > 0 && !has_evaluated_once) {
         t_load_us = ggml_time_us() - t_start_us;
         has_evaluated_once = true;
     }
-
-    n_queued_tokens = 0;
-    t_compute_start_us = 0;
 }
 
 uint64_t llama_context::trim_transient_memory() {
@@ -2034,6 +2034,91 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+void llama_context::place_sampled_inputs(llm_graph_result * res) {
+    if (!use_sampled_input) {
+        return;
+    }
+    for (auto * tokens : res->get_inp_token_tensors()) {
+        ggml_backend_sched_set_tensor_backend(sched.get(), tokens, sampled_input_backend);
+    }
+    if (!use_sampled_input_async) {
+        return;
+    }
+    for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+        if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), tensor, sampled_input_backend);
+        }
+    }
+}
+
+void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch) {
+    auto & stage = sampled_staging[sampled_staging_next];
+    sampled_staging_next = (sampled_staging_next + 1) % 2;
+    if (stage.in_flight) {
+        ggml_backend_event_synchronize(stage.uploaded.get());
+        stage.in_flight = false;
+    }
+
+    struct input_storage {
+        ggml_tensor * tensor;
+        ggml_backend_buffer_t buffer;
+        void * data;
+        size_t offset;
+    };
+    std::vector<input_storage> inputs;
+    size_t size = 0;
+    const auto & token_tensors = res->get_inp_token_tensors();
+    for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+        if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->buffer ||
+                std::find(token_tensors.begin(), token_tensors.end(), tensor) != token_tensors.end()) {
+            continue;
+        }
+        GGML_ASSERT(!tensor->view_src && tensor->buffer && tensor->data);
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == sampled_input_backend);
+        inputs.push_back({tensor, tensor->buffer, tensor->data, size});
+        size += GGML_PAD(ggml_nbytes(tensor), 64);
+    }
+
+    if (!stage.buffer || ggml_backend_buffer_get_size(stage.buffer.get()) < size) {
+        auto * device = ggml_backend_get_device(sampled_input_backend);
+        stage.buffer.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), std::max<size_t>(size, 64)));
+        if (!stage.buffer) {
+            throw std::runtime_error("failed to allocate sampled input staging");
+        }
+    }
+    if (!stage.uploaded) {
+        stage.uploaded.reset(ggml_backend_event_new(ggml_backend_get_device(sampled_input_backend)));
+        if (!stage.uploaded) {
+            throw std::runtime_error("failed to allocate sampled input event");
+        }
+    }
+
+    // Input setters write into pinned storage. Restore graph pointers before submitting any work.
+    auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(stage.buffer.get()));
+    for (auto & input : inputs) {
+        input.tensor->buffer = stage.buffer.get();
+        input.tensor->data = base + input.offset;
+    }
+    const auto restore = [&]() {
+        for (auto & input : inputs) {
+            input.tensor->buffer = input.buffer;
+            input.tensor->data = input.data;
+        }
+    };
+    try {
+        res->set_inputs(&ubatch, true);
+    } catch (...) {
+        restore();
+        throw;
+    }
+    restore();
+    for (const auto & input : inputs) {
+        ggml_backend_tensor_set_async(sampled_input_backend, input.tensor, base + input.offset, 0, ggml_nbytes(input.tensor));
+    }
+    ggml_backend_event_record(stage.uploaded.get(), sampled_input_backend);
+    stage.in_flight = true;
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -2048,7 +2133,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && sampled_inputs_device == use_sampled_input_async && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -2061,6 +2146,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        if (use_sampled_input_async || sampled_inputs_device) {
+            ggml_backend_sched_synchronize(sched.get());
+            workspace_in_flight = false;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -2078,10 +2167,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        place_sampled_inputs(res);
+        sampled_inputs_device = use_sampled_input_async;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (use_sampled_input && !res->can_decode_sampled()) {
+            LLAMA_LOG_ERROR("%s: rebuilt graph requires host token inputs\n", __func__);
+            ret = GGML_STATUS_FAILED;
+            return nullptr;
+        }
+        if (use_sampled_input_async) {
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+                auto * node = ggml_graph_node(gf, i);
+                if (node->op != GGML_OP_NONE && !ggml_is_view(node) &&
+                        ggml_backend_sched_get_tensor_backend(sched.get(), node) != sampled_input_backend) {
+                    LLAMA_LOG_ERROR("%s: rebuilt graph requires another backend\n", __func__);
+                    ret = GGML_STATUS_FAILED;
+                    return nullptr;
+                }
+            }
         }
     }
 
@@ -2091,7 +2199,33 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         acquire_shared_workspace();
-        res->set_inputs(&ubatch);
+        if (use_sampled_input) {
+            if (use_sampled_input_async) {
+                set_sampled_inputs(res, ubatch);
+            } else {
+                res->set_inputs(&ubatch, true);
+            }
+            for (auto * tokens : res->get_inp_token_tensors()) {
+                if (!tokens->buffer) {
+                    continue;
+                }
+                GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tokens) == sampled_input_backend);
+                GGML_ASSERT(ggml_nelements(tokens) == ubatch.n_tokens);
+                for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                    GGML_ASSERT(ubatch.n_seq_id[i] == 1);
+                    auto * source = sampled_input_by_seq.at(ubatch.seq_id[i][0]);
+                    GGML_ASSERT(source);
+                    ggml_tensor row = *source;
+                    row.buffer = tokens->buffer;
+                    row.data = static_cast<char *>(tokens->data) + i*sizeof(llama_token);
+                    row.view_src = tokens;
+                    row.view_offs = i*sizeof(llama_token);
+                    ggml_backend_tensor_copy_async(sampled_input_backend, sampled_input_backend, source, &row);
+                }
+            }
+        } else {
+            res->set_inputs(&ubatch);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2103,9 +2237,192 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    sampled_output_positions.clear();
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.output[i]) {
+            sampled_output_positions.emplace_back(ubatch.n_seq_id[i] == 1 ? ubatch.seq_id[i][0] : -1, ubatch.pos[i]);
+        }
+    }
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+int32_t llama_context::decode_sampled(llama_seq_id seq_id, llama_pos pos, llama_token * previous) {
+    const llama_sampled_decode_item item = {seq_id, pos};
+    return decode_sampled(&item, 1, previous);
+}
+
+int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous) {
+    if (!items || n_items <= 0 || (uint32_t) n_items > n_seq_max() ||
+            (uint32_t) n_items > cparams.n_batch || (uint32_t) n_items > cparams.n_ubatch ||
+            model.n_devices() != 1 || cparams.pipeline_parallel || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            cparams.embeddings || cparams.embeddings_nextn || cparams.cb_eval || !memory || n_outputs == 0) {
+        return 1;
+    }
+
+    auto * res = gf_res_prev.get();
+    if (!res->can_decode_sampled() || !memory->can_decode_sampled() || sampled_output_positions.size() != res->t_sampled.size()) {
+        return 1;
+    }
+
+    std::vector<ggml_tensor *> sources;
+    std::vector<bool> seen(n_seq_max(), false);
+    for (int32_t i = 0; i < n_items; ++i) {
+        const auto & item = items[i];
+        if (item.seq_id < 0 || (uint32_t) item.seq_id >= n_seq_max() || seen[item.seq_id] ||
+                sampling.samplers.count(item.seq_id) != 1 || item.pos < 0 || item.pos != memory->seq_pos_max(item.seq_id) + 1) {
+            return 1;
+        }
+        seen[item.seq_id] = true;
+        auto * chain = sampling.samplers.at(item.seq_id);
+        const int n_samplers = llama_sampler_chain_n(chain);
+        if (n_samplers < 1) {
+            return 1;
+        }
+        const char * terminal = llama_sampler_name(llama_sampler_chain_get(chain, n_samplers - 1));
+        if (strcmp(terminal, "+greedy") != 0 &&
+                (strcmp(terminal, "+dist") != 0 || cparams.n_outputs_max_per_seq != 1)) {
+            return 1;
+        }
+        for (int j = 0; j + 1 < n_samplers; ++j) {
+            const std::string name = llama_sampler_name(llama_sampler_chain_get(chain, j));
+            if (name != "+logit-bias" && name != "+top-k" && name != "+top-p" && name != "+min-p" &&
+                    name != "+temp" && name != "+temp-ext" && name != "?top-k" && name != "?top-p" &&
+                    name != "?min-p" && name != "?temp" && name != "?temp-ext" && name != "?typical" &&
+                    name != "?xtc" && name != "?penalties" && name != "?dry" && name != "?top-n-sigma" && name != "?logit-bias") {
+                return 1;
+            }
+        }
+        const auto position = std::make_pair(item.seq_id, item.pos - 1);
+        const auto it = std::find(sampled_output_positions.begin(), sampled_output_positions.end(), position);
+        if (it == sampled_output_positions.end()) {
+            return 1;
+        }
+        auto * source = res->t_sampled[it - sampled_output_positions.begin()];
+        if (!source || source->type != GGML_TYPE_I32 || ggml_nelements(source) != 1) {
+            return 1;
+        }
+        sources.push_back(source);
+    }
+
+    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), sources[0]);
+    auto * device = backend ? ggml_backend_get_device(backend) : nullptr;
+    if (!device || strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") != 0 ||
+            !model.tok_embd || !model.tok_embd->buffer || ggml_backend_buffer_is_host(model.tok_embd->buffer) ||
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.tok_embd->buffer)) != device) {
+        return 1;
+    }
+    for (auto * source : sources) {
+        if (ggml_backend_sched_get_tensor_backend(sched.get(), source) != backend || ggml_backend_buffer_is_host(source->buffer)) {
+            return 1;
+        }
+    }
+    const auto & token_tensors = res->get_inp_token_tensors();
+    const bool move_tokens = std::any_of(token_tensors.begin(), token_tensors.end(), [&](ggml_tensor * input) {
+        return ggml_backend_sched_get_tensor_backend(sched.get(), input) != backend;
+    });
+    if (previous) {
+        if (shared_workspace_peer() || !ggml_backend_dev_host_buffer_type(device)) {
+            return 1;
+        }
+        auto * gf = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_NONE && !ggml_is_view(node) &&
+                    ggml_backend_sched_get_tensor_backend(sched.get(), node) != backend) {
+                return 1;
+            }
+        }
+    }
+
+    if (!sampled_input) {
+        sampled_input_ctx.reset(ggml_init({ggml_tensor_overhead()*(n_seq_max() + 1), nullptr, true}));
+        if (!sampled_input_ctx) {
+            return -2;
+        }
+        auto * input = ggml_new_tensor_1d(sampled_input_ctx.get(), GGML_TYPE_I32, n_seq_max());
+        ggml_set_name(input, "decode_sampled_input");
+        sampled_input_rows.clear();
+        for (uint32_t i = 0; i < n_seq_max(); ++i) {
+            sampled_input_rows.push_back(ggml_view_1d(sampled_input_ctx.get(), input, 1, i*sizeof(llama_token)));
+        }
+        sampled_input_buf.reset(ggml_backend_alloc_ctx_tensors(sampled_input_ctx.get(), backend));
+        if (!sampled_input_buf) {
+            return -2;
+        }
+        sampled_input = input;
+        sampled_input_backend = backend;
+    }
+    if (sampled_input_backend != backend) {
+        return 1;
+    }
+    if (!sampled_output_ready || !sampled_output_host) {
+        sampled_output_ready.reset(ggml_backend_event_new(device));
+        sampled_output_host.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), n_seq_max()*sizeof(llama_token)));
+        if (!sampled_output_ready || !sampled_output_host) {
+            return -2;
+        }
+    }
+
+    // Preserve every selected output before decode can reuse the graph and host storage.
+    sampled_input_by_seq.assign(n_seq_max(), nullptr);
+    for (int32_t i = 0; i < n_items; ++i) {
+        ggml_backend_tensor_copy_async(backend, backend, sources[i], sampled_input_rows[i]);
+        sampled_input_by_seq[items[i].seq_id] = sampled_input_rows[i];
+    }
+    auto * host = static_cast<llama_token *>(ggml_backend_buffer_get_base(sampled_output_host.get()));
+    ggml_backend_tensor_get_async(backend, sampled_input, host, 0, n_items*sizeof(llama_token));
+    ggml_backend_event_record(sampled_output_ready.get(), backend);
+
+    std::vector<llama_token> tokens(n_items, 0);
+    std::vector<llama_pos> positions(n_items);
+    std::vector<llama_seq_id> seq_ids(n_items);
+    std::vector<llama_seq_id *> seq_ptrs(n_items);
+    std::vector<int32_t> n_seq_ids(n_items, 1);
+    std::vector<int8_t> outputs(n_items, 1);
+    for (int32_t i = 0; i < n_items; ++i) {
+        positions[i] = items[i].pos;
+        seq_ids[i] = items[i].seq_id;
+        seq_ptrs[i] = &seq_ids[i];
+    }
+    if (!previous) {
+        ggml_backend_event_synchronize(sampled_output_ready.get());
+        std::copy_n(host, n_items, tokens.data());
+    }
+    llama_batch batch = {n_items, tokens.data(), nullptr, positions.data(), n_seq_ids.data(), seq_ptrs.data(), outputs.data()};
+    use_sampled_input = true;
+    use_sampled_input_async = previous != nullptr;
+    sched_need_reserve |= move_tokens || (use_sampled_input_async && !sampled_inputs_device);
+    const int64_t preceding_tokens = n_queued_tokens;
+    const uint64_t preceding_generation = compute_sync_generation;
+    int32_t ret;
+    try {
+        ret = decode(batch);
+        if (previous) {
+            ggml_backend_event_synchronize(sampled_output_ready.get());
+            if (preceding_generation == compute_sync_generation && preceding_tokens > 0) {
+                const int64_t now = ggml_time_us();
+                finish_compute(preceding_tokens, now - t_compute_start_us);
+                n_queued_tokens -= preceding_tokens;
+                t_compute_start_us = n_queued_tokens > 0 ? now : 0;
+            }
+            std::copy_n(host, n_items, previous);
+            if (ret == 0) {
+                for (int32_t i = 0; i < n_items; ++i) {
+                    memory->seq_set_last_token(items[i].seq_id, items[i].pos, previous[i]);
+                }
+            }
+        }
+    } catch (...) {
+        use_sampled_input = false;
+        use_sampled_input_async = false;
+        synchronize();
+        throw;
+    }
+    use_sampled_input = false;
+    use_sampled_input_async = false;
+    return ret == 0 ? 0 : (ret < 0 ? ret : -3);
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -2917,7 +3234,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
         std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
-        std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        if (!use_sampled_input_async) {
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        }
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
@@ -3187,6 +3506,7 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
+    place_sampled_inputs(res);
     if (split_only) {
         if (sizes) {
             ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
@@ -5029,6 +5349,18 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_sampled(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx ? ctx->decode_sampled(seq_id, pos) : -1;
+}
+
+int32_t llama_decode_sampled_async(llama_context * ctx, llama_seq_id seq_id, llama_pos pos, llama_token * previous) {
+    return ctx && previous ? ctx->decode_sampled(seq_id, pos, previous) : -1;
+}
+
+int32_t llama_decode_sampled_batch_async(llama_context * ctx, const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous) {
+    return ctx && previous ? ctx->decode_sampled(items, n_items, previous) : -1;
 }
 
 //
