@@ -508,6 +508,8 @@ public:
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,

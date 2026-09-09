@@ -2276,9 +2276,23 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
         }
         seen[item.seq_id] = true;
         auto * chain = sampling.samplers.at(item.seq_id);
-        auto * greedy = llama_sampler_chain_get(chain, 0);
-        if (llama_sampler_chain_n(chain) != 1 || !greedy || strcmp(llama_sampler_name(greedy), "+greedy") != 0) {
+        const int n_samplers = llama_sampler_chain_n(chain);
+        if (n_samplers < 1) {
             return 1;
+        }
+        const char * terminal = llama_sampler_name(llama_sampler_chain_get(chain, n_samplers - 1));
+        if (strcmp(terminal, "+greedy") != 0 &&
+                (strcmp(terminal, "+dist") != 0 || cparams.n_outputs_max_per_seq != 1)) {
+            return 1;
+        }
+        for (int j = 0; j + 1 < n_samplers; ++j) {
+            const std::string name = llama_sampler_name(llama_sampler_chain_get(chain, j));
+            if (name != "+logit-bias" && name != "+top-k" && name != "+top-p" && name != "+min-p" &&
+                    name != "+temp" && name != "+temp-ext" && name != "?top-k" && name != "?top-p" &&
+                    name != "?min-p" && name != "?temp" && name != "?temp-ext" && name != "?typical" &&
+                    name != "?xtc" && name != "?penalties" && name != "?dry" && name != "?top-n-sigma" && name != "?logit-bias") {
+                return 1;
+            }
         }
         const auto position = std::make_pair(item.seq_id, item.pos - 1);
         const auto it = std::find(sampled_output_positions.begin(), sampled_output_positions.end(), position);

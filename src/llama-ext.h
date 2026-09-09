@@ -21,7 +21,8 @@ LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
         struct llama_context * ctx, bool enabled, int32_t selected_token);
 
 // Queue one decode using the previous backend-sampled token as device input.
-// Requires synchronized output and a single greedy sequence. On success, normal output access refers to the new decode.
+// Requires synchronized output and supported backend sampling. On success, normal output access refers to the new decode.
+// Stochastic sampling requires n_outputs_max_per_seq = 1. Discarding a queued position also requires restoring the sampler state saved before this call.
 // Returns 0 if queued, 1 if unsupported without changing memory, or a negative value on decode failure.
 LLAMA_API int32_t llama_decode_sampled(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
