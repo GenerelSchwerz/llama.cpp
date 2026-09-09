@@ -462,9 +462,9 @@ docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/l
 
 ### Experimental decode overlap
 
-`--decode-overlap` queues at most one additional decode while the CPU processes the previous result. It currently supports one sequence on one CUDA GPU, greedy sampling, and no speculative decoding. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Supported model families are Llama, Qwen2/3, Qwen3 Next, Qwen3.5/3.6, and GPT-OSS. Recurrent models reserve one extra state snapshot for rollback.
+`--decode-overlap` queues at most one additional decode while the CPU processes the previous result. It currently supports one sequence on one CUDA GPU, greedy sampling, and no speculative decoding. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Supported model families are Llama, Qwen2/3, Qwen3 Next, and Qwen3.5/3.6 with all compute operations on the same GPU. Recurrent models reserve one extra state snapshot for rollback.
 
-Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and non-greedy or history-dependent sampling use the normal path. Stops and cancellation drain and discard any extra queued position before releasing the slot. The prototype still waits before reusing graph inputs; it does not remove all host-side gaps. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
+Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and non-greedy or history-dependent sampling use the normal path. Stops and cancellation drain and discard any extra queued position before releasing the slot. The CPU prepares inputs in two pinned buffers and uploads them on the compute stream, then queues the next decode before waiting for the preceding token. Graph rebuilds and allocation changes still synchronize. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
 
 ## Using with CURL
 

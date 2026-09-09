@@ -2003,12 +2003,14 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
 }
 
 static void test_backend_decode_sampled(const test_params & params) {
-    const auto generate = [&](bool device_input) {
+    const auto generate = [&](int device_input) {
         llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
         llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
         std::vector<llama_sampler_seq_config> configs = {{0, sampler.get()}};
         test_context tc(params, configs, 1);
+        llama_token previous = LLAMA_TOKEN_NULL;
         GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, 0) == 1);
+        GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, 0, &previous) == 1);
         GGML_ASSERT(tc.decode({{0, "Hello"}}));
         llama_synchronize(tc.ctx.get());
 
@@ -2018,26 +2020,44 @@ static void test_backend_decode_sampled(const test_params & params) {
         const auto first_pos = llama_memory_seq_pos_max(memory, 0);
         GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, first_pos) == 1);
         GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 1, first_pos + 1) == 1);
+        GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, first_pos, &previous) == 1);
+        GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 1, first_pos + 1, &previous) == 1);
+        GGML_ASSERT(previous == LLAMA_TOKEN_NULL);
         GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == first_pos);
 
         if (!params.sampled_decode_gpu) {
             GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, first_pos + 1) == 1);
+            GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, first_pos + 1, &previous) == 1);
             GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == first_pos);
             return std::vector<llama_token> {token};
         }
 
-        std::vector<llama_token> result {token};
+        std::vector<llama_token> result;
+        if (device_input != 2) {
+            result.push_back(token);
+        }
         llama_token input = token;
-        for (int i = 0; i < 32; ++i) {
+        for (int i = 0; i < 288; ++i) {
             input = token;
             if (device_input) {
                 const llama_pos pos = llama_memory_seq_pos_max(memory, 0) + 1;
-                GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, pos) == 0);
+                if (device_input == 2) {
+                    GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, pos, &input) == 0);
+                    result.push_back(input);
+                } else {
+                    GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, pos) == 0);
+                }
                 tc.seq_positions[0] = pos + 1;
             } else {
                 GGML_ASSERT(tc.decode_token(input));
             }
-            llama_synchronize(tc.ctx.get());
+            if (device_input != 2) {
+                token = llama_get_sampled_token_ith(tc.ctx.get(), 0);
+                GGML_ASSERT(token != LLAMA_TOKEN_NULL);
+                result.push_back(token);
+            }
+        }
+        if (device_input == 2) {
             token = llama_get_sampled_token_ith(tc.ctx.get(), 0);
             GGML_ASSERT(token != LLAMA_TOKEN_NULL);
             result.push_back(token);
@@ -2050,12 +2070,18 @@ static void test_backend_decode_sampled(const test_params & params) {
         GGML_ASSERT(tc.decode_token(input));
         llama_synchronize(tc.ctx.get());
         GGML_ASSERT(llama_get_sampled_token_ith(tc.ctx.get(), 0) == token);
+        if (device_input == 2) {
+            GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, pos + 1, &previous) == 0);
+            GGML_ASSERT(previous == token);
+            llama_synchronize(tc.ctx.get());
+            GGML_ASSERT(llama_memory_seq_rm(memory, 0, pos + 1, -1));
+        }
         return result;
     };
 
-    const auto expected = generate(false);
-    const auto actual = generate(true);
-    GGML_ASSERT(expected == actual);
+    const auto expected = generate(0);
+    GGML_ASSERT(expected == generate(1));
+    GGML_ASSERT(expected == generate(2));
     printf("sampled decode parity, admission, and one-token rollback PASSED (%s)\n", params.sampled_decode_gpu ? "CUDA" : "fallback");
 }
 

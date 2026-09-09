@@ -336,6 +336,13 @@ public:
         return ext[(--it)->second].tok;
     }
 
+    void seq_set_last_token(llama_seq_id seq_id, llama_pos p, llama_token token) {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+        assert(!seq_pos[seq_id].empty() && seq_pos[seq_id].rbegin()->first == p);
+        GGML_UNUSED(p);
+        ext[seq_pos[seq_id].rbegin()->second].tok = token;
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());

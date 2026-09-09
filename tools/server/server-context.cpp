@@ -3983,7 +3983,8 @@ private:
             snapshot_mode_enabled = sparse_snapshots;
             try {
                 ret = consume_decode_overlap ? 0 : llama_decode(ctx_tgt, batch_view);
-                if (ret == 0 && (has_output || sparse_snapshots)) {
+                const bool defer_output = slots.size() == 1 && slots[0].decode_overlap_enabled && !sparse_snapshots;
+                if (ret == 0 && (has_output || sparse_snapshots) && !defer_output) {
                     llama_synchronize(ctx_tgt);
                 }
             } catch (...) {
@@ -4174,25 +4175,11 @@ private:
             // shifted according to the current sub-batch
             const int tok_idx = slot.i_batch - off;
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = slot.decode_overlap_sampler ? llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx) : LLAMA_TOKEN_NULL;
-                if (id == LLAMA_TOKEN_NULL) {
-                    slot.decode_overlap_enabled = false;
-                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-                }
-            }
-
-            slot.i_batch = -1;
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
+            llama_token id = LLAMA_TOKEN_NULL;
             if (slot.decode_overlap_enabled && slot.prompt.tokens.pos_next() + 2 < slot.n_ctx &&
-                    (slot.n_predict_max < 0 || slot.stats.n_gen + 1 < (uint64_t) slot.n_predict_max) && !llama_vocab_is_eog(vocab, id)) {
+                    (slot.n_predict_max < 0 || slot.stats.n_gen + 1 < (uint64_t) slot.n_predict_max)) {
                 const llama_pos pos = slot.prompt.tokens.pos_next();
-                const int ret = llama_decode_sampled(slot.ctx_tgt, slot.id, pos);
+                const int ret = llama_decode_sampled_async(slot.ctx_tgt, slot.id, pos, &id);
                 if (ret == 0) {
                     slot.decode_overlap_pos = pos;
                     slot.decode_overlap_token = id;
@@ -4207,6 +4194,21 @@ private:
                     throw std::runtime_error("failed to queue decode overlap");
                 }
             }
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                if (id == LLAMA_TOKEN_NULL && slot.decode_overlap_sampler) {
+                    id = llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx);
+                }
+                if (id == LLAMA_TOKEN_NULL) {
+                    slot.decode_overlap_enabled = false;
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
+            }
+
+            slot.i_batch = -1;
+
+            // The preceding output is ready; a queued decode can still be running.
+            const int64_t t_now = ggml_time_us();
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
