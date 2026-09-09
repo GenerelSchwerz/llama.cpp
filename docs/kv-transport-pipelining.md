@@ -186,26 +186,28 @@ Four device-resident layers are worth +14.3% on the ordered path and +1.4% on th
 
 | `-npl` | unified ordered | unified pipelined | streams ordered | streams pipelined |
 |---:|---:|---:|---:|---:|
-| 1 | 32.62 | 35.34 | 32.62 | 35.36 |
-| 2 | 51.51 | 58.48 | 34.09 | 58.45 |
-| 4 | 72.04 | 86.24 | 49.44 | 85.45 |
-| 8 | 83.95 | 105.22 | 70.92 | 105.63 |
+| 1 | 32.62 | 35.38 | 32.66 | 35.44 |
+| 2 | 51.59 | 58.76 | 51.48 | 58.61 |
+| 4 | 71.89 | 86.29 | 71.45 | 85.60 |
+| 8 | 83.44 | 105.76 | 84.16 | 106.02 |
 
-A cache split into streams delivers a window per stream, so it moves more than a unified one for the same work, and before the per-stream delivery it could send almost none of it early: 6.6% at 8 slots, because the prefix stopped at the lowest stream's head. Both caches now pipeline to the same throughput, and which of them to use is a question about how the context is shared between sequences rather than about the transport. The ordered arm is the one that separates them: a non-unified cache scales much worse without the pipeline, so the pipeline is worth more there.
+A cache split into streams delivers a window per stream, so it moves more than a unified one for the same work, and before the per-stream delivery it could send almost none of it early: 6.6% at 8 slots, because the prefix stopped at the lowest stream's head. The two caches now measure the same in both arms, so which of them to use is a question about how the context is shared between sequences rather than about the transport.
 
-**The streams-pipelined column is lower than it was before the multi-stream span was fixed**, and the earlier numbers were wrong rather than better. The delivery sized one stream's range from `ne[2]*nb[2]`, which is one KV cell rather than the window, so it moved a fraction of the bytes and the attention read whatever the ring slot held before. Measured on the same machine, the predecessor reports 61.04, 90.81 and 108.23 at 2, 4 and 8 slots against 58.45, 85.45 and 105.63 here; the difference is the cost of copying the right amount.
+**The streams-ordered column used to be far lower**, and that was a defect in the ordered copy rather than a property of a cache split into streams. `ggml_backend_tensor_copy` moves `ggml_nbytes()`, which for a window over several streams is the span the ranges are cut from, so the ordered arm copied every gap between them: 34.09, 49.44 and 70.92 at 2, 4 and 8 slots against the numbers above. Fixed separately, before this branch, so the gain the pipeline is credited with here is what it is worth against a baseline that moves the right bytes.
+
+**The streams-pipelined column is lower than it was before the multi-stream span was fixed**, and the earlier numbers were wrong rather than better. The delivery sized one stream's range from `ne[2]*nb[2]`, which is one KV cell rather than the window, so it moved a fraction of the bytes and the attention read whatever the ring slot held before. Measured on the same machine, the predecessor reports 61.04, 90.81 and 108.23 at 2, 4 and 8 slots against 58.61, 85.60 and 106.02 here; the difference is the cost of copying the right amount.
 
 **A slot holds the window, not the cache it is cut from.** A staged copy keeps its source's layout, and in a cache split into streams that layout steps a whole `kv_size` from one stream to the next while the graph reads only `n_kv` of it. Sizing the slot from that stride reserves every gap the delivery skips, so the ring grew with `n_stream` instead of with the window. The copy now packs the streams: one window padded to the ring's alignment, with `cudaMemcpy2DAsync` given the source stride and the packed stride separately. Nothing about the bytes delivered changes, only where they land.
 
 The ring is what the budget is applied to, so this decides whether there is a ring at all. `llama-batched-bench -npp 2048 -ntg 128 -npl 8` at `-c 32768 -no-kvu`, one process per cell, generation t/s:
 
-| budget | depth | ring slot | before | after |
+| budget | depth | ring slot | unpacked | packed |
 |---:|---:|---:|---:|---:|
-| 128 (default) | 0 | - | 71.09 | 70.99 |
-| 128 (default) | 1 | 8 MiB, then declined / 42.7 MiB | 70.90 | **106.19** |
-| 512 | 1 | 68 MiB / 64 MiB | 106.20 | 106.11 |
+| 128 (default) | 0 | - | 84.23 | 84.23 |
+| 128 (default) | 1 | 8 MiB, then declined / 42.7 MiB | 84.45 | **106.19** |
+| 512 | 1 | 68 MiB / 64 MiB | 106.28 | 106.11 |
 
-At the default budget the unpacked ring needs 170 MiB for a window worth 42.7 MiB, so it is declined and the arm reads the ordered path's own throughput. Packed, the same run keeps the ring and gains **+49.6%** over the ordered path. Where the budget was already raised past what the gaps cost, both are the same speed and the packed ring is slightly smaller. A unified cache is one range per delivery and is not affected either way, which the single-sequence A/B confirms: 18.976 -> 29.779 packed against 18.988 -> 29.784 before, at 16,384.
+At the default budget the unpacked ring needs 170 MiB for a window worth 42.7 MiB, so it is declined and that arm reads the ordered path's own throughput. Packed, the same run keeps the ring and gains **+25.7%** over the ordered path. Where the budget was already raised past what the gaps cost, both are the same speed and the packed ring is slightly smaller. A unified cache is one range per delivery and is not affected either way, which the single-sequence A/B confirms: 18.96 -> 29.70 packed against 18.99 -> 29.78 before, at 16,384.
 
 **Concurrent slots can be gated on output, with a harness that fixes the batching.** The server cannot: its batching varies between runs, so the same build at the same depth gives different greedy output, and three runs at `N = 0` produced three different hashes. `llama-parallel` seeds its client schedule, so the batches repeat, and `docs/repro/r4-kv-pipeline-parallel-exact.sh` compares the transcripts of 8 concurrent sequences over a non-unified cache. Its clients ask different questions, which is what makes it a gate: with one prompt shared by every sequence the streams hold the same bytes and a cross-stream read is invisible. The predecessor above fails it at `N = 1` on the first sequence.
 
@@ -285,7 +287,7 @@ The gates, and what was run for them:
 
 Gates 1, 2, 3 and 5 and `test-alloc` were run on the current head, on an RTX 4070 with a CUDA build, gate 5 also over both devices with `-sm layer`. The `llama-server` table and the parallel table under [Measurements](#measurements) are from those runs; the breakdowns marked as taken on an earlier head still are.
 
-Gate 5 and the A/B were re-run for the packed multi-stream ring, on both this head and the commit before it, and the two agree byte for byte: `9c13743e07b55934` at `N = 0`, `1` and `4` with `-sm none`, `7fc64d5ed9709861` at the same depths with `-sm layer`. Packing changes where a range lands in the slot and nothing about the bytes, so an unchanged hash is the result to expect; the gate is there because a stride mistake would not look like one.
+Gate 5 was re-run after the ordered range copy landed in `llama/dev` and this branch was rebased onto it, against a build of `llama/dev` itself rather than against an earlier head of this branch: `17f946c340db110b` with `-sm none` and `db661b7a08686b97` with `-sm layer` over both devices, the same on `llama/dev` and at `N = 0`, `1` and `4` here. Packing changes where a range lands in the slot and nothing about the bytes, so an unchanged hash is the result to expect; the gate is there because a stride mistake would not look like one.
 
 1. **Byte-identical greedy server output against the control.** Four fixed tasks at `temperature 0, top_k 1, seed 1234`, plus two tasks behind an 18,422-token prompt, hashed and compared against a build of the parent commit. Identical at `N = 0`, `N = 1` and `N = 4`, re-run on the current head. `docs/repro/r4-kv-pipeline-exact.sh` compares every requested depth with the first and fails on a hash difference. Two things keep the tasks independent of each other, and both were needed. Every task carries a nonce derived from its own name and length, so no two share a prefix the server could restore, and the harness fails a task whose `prompt_n` says one was reused anyway. Each request also sets `cache_prompt: false`, so a task never inherits what the previous one left in the cache.
 
