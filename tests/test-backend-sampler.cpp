@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "common.h"
+#include "../src/llama-ext.h"
 
 #ifdef NDEBUG
 #undef NDEBUG
@@ -28,12 +29,15 @@ struct test_args {
 
 struct test_params {
     llama_model_ptr model;
+    bool sampled_decode = false;
+    bool sampled_decode_gpu = false;
 };
 
 static llama_model_ptr load_model(const test_args & args) {
     auto mparams = llama_model_default_params();
 
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
+    llama_model_tensor_buft_override overrides[2] = {};
 
     if (args.device != "auto") {
         if (args.device == "gpu") {
@@ -45,6 +49,10 @@ static llama_model_ptr load_model(const test_args & args) {
             }
 
             mparams.n_gpu_layers = 999;
+            if (args.test == "decode_sampled") {
+                overrides[0] = {"token_embd.weight", ggml_backend_dev_buffer_type(devs[0])};
+                mparams.tensor_buft_overrides = overrides;
+            }
         } else if (args.device == "cpu") {
             devs[0] = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
 
@@ -104,6 +112,7 @@ struct test_context {
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
         cparams.kv_unified = true;
+        cparams.n_rs_seq = params.sampled_decode ? 1 : 0;
 
         // If n_seq_max is not specified, calculate it from configs
         if (n_seq_max < 0) {
@@ -1993,6 +2002,63 @@ static void test_backend_multi_output_cpu_suffix(const test_params & params) {
     printf("backend multi-output CPU suffix test PASSED\n");
 }
 
+static void test_backend_decode_sampled(const test_params & params) {
+    const auto generate = [&](bool device_input) {
+        llama_sampler_ptr sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+        llama_sampler_chain_add(sampler.get(), llama_sampler_init_greedy());
+        std::vector<llama_sampler_seq_config> configs = {{0, sampler.get()}};
+        test_context tc(params, configs, 1);
+        GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, 0) == 1);
+        GGML_ASSERT(tc.decode({{0, "Hello"}}));
+        llama_synchronize(tc.ctx.get());
+
+        auto * memory = llama_get_memory(tc.ctx.get());
+        llama_token token = llama_get_sampled_token_ith(tc.ctx.get(), tc.idx_for_seq(0));
+        GGML_ASSERT(token != LLAMA_TOKEN_NULL);
+        const auto first_pos = llama_memory_seq_pos_max(memory, 0);
+        GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, first_pos) == 1);
+        GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 1, first_pos + 1) == 1);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == first_pos);
+
+        if (!params.sampled_decode_gpu) {
+            GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, first_pos + 1) == 1);
+            GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == first_pos);
+            return std::vector<llama_token> {token};
+        }
+
+        std::vector<llama_token> result {token};
+        llama_token input = token;
+        for (int i = 0; i < 32; ++i) {
+            input = token;
+            if (device_input) {
+                const llama_pos pos = llama_memory_seq_pos_max(memory, 0) + 1;
+                GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, pos) == 0);
+                tc.seq_positions[0] = pos + 1;
+            } else {
+                GGML_ASSERT(tc.decode_token(input));
+            }
+            llama_synchronize(tc.ctx.get());
+            token = llama_get_sampled_token_ith(tc.ctx.get(), 0);
+            GGML_ASSERT(token != LLAMA_TOKEN_NULL);
+            result.push_back(token);
+        }
+
+        const llama_pos pos = llama_memory_seq_pos_max(memory, 0);
+        GGML_ASSERT(llama_memory_seq_rm(memory, 0, pos, -1));
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) == pos - 1);
+        tc.seq_positions[0] = pos;
+        GGML_ASSERT(tc.decode_token(input));
+        llama_synchronize(tc.ctx.get());
+        GGML_ASSERT(llama_get_sampled_token_ith(tc.ctx.get(), 0) == token);
+        return result;
+    };
+
+    const auto expected = generate(false);
+    const auto actual = generate(true);
+    GGML_ASSERT(expected == actual);
+    printf("sampled decode parity, admission, and one-token rollback PASSED (%s)\n", params.sampled_decode_gpu ? "CUDA" : "fallback");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2000,6 +2066,7 @@ struct backend_test_case {
 };
 
 static const backend_test_case BACKEND_TESTS[] = {
+    { "decode_sampled",  test_backend_decode_sampled,          false },
     { "greedy",          test_backend_greedy_sampling,         true  },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
@@ -2157,6 +2224,10 @@ int main(int argc, char ** argv) {
     test_params params = {
         /*.model =*/ load_model(args),
     };
+    params.sampled_decode = args.test == "decode_sampled";
+    auto * gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    params.sampled_decode_gpu = args.device == "gpu" && gpu &&
+            strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0;
 
     const std::vector<const backend_test_case *> tests = collect_tests_to_run(args.test);
     if (!tests.empty()) {

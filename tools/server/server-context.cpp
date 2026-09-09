@@ -13,6 +13,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "llama-cpp.h"
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -43,6 +44,36 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_decode_overlap_sampling(const common_params_sampling & params) {
+    if (!(params.temp <= 0.0f) || params.mirostat != 0 || params.adaptive_target >= 0.0f ||
+            params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
+            params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f || params.typ_p != 1.0f ||
+            params.n_probs != 0 || params.ignore_eos || !params.logit_bias.empty() ||
+            !common_grammar_value(params.grammar).empty() || params.reasoning_budget_tokens >= 0 || params.reasoning_control) {
+        return false;
+    }
+    bool has_temperature = false;
+    for (const auto sampler : params.samplers) {
+        switch (sampler) {
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                has_temperature = true;
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+            case COMMON_SAMPLER_TYPE_DRY:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_XTC:
+                break;
+            default:
+                return false;
+        }
+    }
+    return has_temperature;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -253,6 +284,13 @@ struct server_slot {
     llama_context * ctx_dft = nullptr;
     bool moe_cache_enabled = false;
 
+    llama_sampler_ptr decode_overlap_sampler;
+    bool decode_overlap_enabled = false;
+    llama_pos decode_overlap_pos = -1;
+    llama_token decode_overlap_token = LLAMA_TOKEN_NULL;
+    uint64_t decode_overlap_queued = 0;
+    uint64_t decode_overlap_discarded = 0;
+
     common_memory mem;
 
     // multimodal
@@ -409,6 +447,10 @@ struct server_slot {
         n_predict_max = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
+        decode_overlap_sampler.reset();
+        decode_overlap_enabled = false;
+        decode_overlap_queued = 0;
+        decode_overlap_discarded = 0;
 
         // clear alora start
         alora_invocation_start = -1;
@@ -552,9 +594,25 @@ struct server_slot {
         prompt.tokens.insert(spec_draft);
     }
 
+    void discard_decode_overlap() {
+        if (decode_overlap_pos < 0) {
+            return;
+        }
+        llama_synchronize(ctx_tgt);
+        mem.seq_rm(id, decode_overlap_pos, -1);
+        decode_overlap_pos = -1;
+        decode_overlap_token = LLAMA_TOKEN_NULL;
+        ++decode_overlap_discarded;
+    }
+
     void release() {
         if (is_processing()) {
             GGML_ASSERT(task);
+
+            discard_decode_overlap();
+            if (decode_overlap_queued > 0) {
+                SLT_INF(*this, "decode overlap: queued = %" PRIu64 ", discarded = %" PRIu64 "\n", decode_overlap_queued, decode_overlap_discarded);
+            }
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
@@ -1868,11 +1926,26 @@ private:
             // TODO: getting pre sampling logits is not yet supported with backend sampling
             use_backend_sampling &= !need_pre_sample_logits;
 
+            int32_t n_suppress = 0;
+            llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            const bool use_decode_overlap = params_base.decode_overlap && slots.size() == 1 && !spec && !mctx &&
+                    slot.lora.empty() && n_suppress == 0 &&
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
+                    !task.is_parent() && !task.is_child() && server_decode_overlap_sampling(task.params.sampling);
+
             // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
+            if (use_decode_overlap) {
+                slot.decode_overlap_sampler.reset(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+                llama_sampler_chain_add(slot.decode_overlap_sampler.get(), llama_sampler_init_greedy());
+                slot.decode_overlap_enabled = llama_set_sampler(ctx_tgt, slot.id, slot.decode_overlap_sampler.get());
+                SLT_INF(slot, "decode overlap: %s\n", slot.decode_overlap_enabled ? "greedy backend enabled, device input checked after prefill" : "backend unavailable");
+            } else if (use_backend_sampling) {
                 llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            if (params_base.decode_overlap && !use_decode_overlap) {
+                SLT_INF(slot, "%s", "decode overlap: unsupported request or context, using normal decode\n");
             }
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
@@ -3888,6 +3961,19 @@ private:
 
         int ret = 0;
         bool snapshot_mode_restored = true;
+        bool consume_decode_overlap = false;
+        if (slots.size() == 1 && slots[0].decode_overlap_pos >= 0) {
+            auto & slot = slots[0];
+            consume_decode_overlap = batch_view.n_tokens == 1 && batch_view.token && batch_view.pos &&
+                    batch_view.n_seq_id && batch_view.n_seq_id[0] == 1 && batch_view.seq_id[0][0] == slot.id &&
+                    batch_view.pos[0] == slot.decode_overlap_pos && batch_view.token[0] == slot.decode_overlap_token;
+            if (consume_decode_overlap) {
+                slot.decode_overlap_pos = -1;
+                slot.decode_overlap_token = LLAMA_TOKEN_NULL;
+            } else {
+                slot.discard_decode_overlap();
+            }
+        }
         queue_tasks.yield_to_queue([&]() {
             bool snapshot_mode_enabled = false;
             if (sparse_snapshots && !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token)) {
@@ -3896,7 +3982,7 @@ private:
             }
             snapshot_mode_enabled = sparse_snapshots;
             try {
-                ret = llama_decode(ctx_tgt, batch_view);
+                ret = consume_decode_overlap ? 0 : llama_decode(ctx_tgt, batch_view);
                 if (ret == 0 && (has_output || sparse_snapshots)) {
                     llama_synchronize(ctx_tgt);
                 }
@@ -4091,15 +4177,38 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                id = slot.decode_overlap_sampler ? llama_get_sampled_token_ith(slot.ctx_tgt, tok_idx) : LLAMA_TOKEN_NULL;
+                if (id == LLAMA_TOKEN_NULL) {
+                    slot.decode_overlap_enabled = false;
+                    id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                }
             }
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
-
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
+
+            if (slot.decode_overlap_enabled && slot.prompt.tokens.pos_next() + 2 < slot.n_ctx &&
+                    (slot.n_predict_max < 0 || slot.stats.n_gen + 1 < (uint64_t) slot.n_predict_max) && !llama_vocab_is_eog(vocab, id)) {
+                const llama_pos pos = slot.prompt.tokens.pos_next();
+                const int ret = llama_decode_sampled(slot.ctx_tgt, slot.id, pos);
+                if (ret == 0) {
+                    slot.decode_overlap_pos = pos;
+                    slot.decode_overlap_token = id;
+                    ++slot.decode_overlap_queued;
+                    SLT_DBG(slot, "queued decode overlap at pos = %d\n", pos);
+                } else if (ret == 1) {
+                    slot.decode_overlap_enabled = false;
+                    SLT_INF(slot, "%s", "decode overlap: device token input unavailable, using normal decode\n");
+                } else {
+                    llama_synchronize(slot.ctx_tgt);
+                    slot.mem.seq_rm(slot.id, pos, -1);
+                    throw std::runtime_error("failed to queue decode overlap");
+                }
+            }
+
+            common_sampler_accept(slot.smpl.get(), id, true);
 
             slot.stats.n_gen += 1;
 

@@ -157,6 +157,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
+| `--decode-overlap` | experimental: overlap single-sequence greedy decode with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
 
 
 ### Server-specific params
@@ -458,6 +459,12 @@ docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:se
 # or, with CUDA:
 docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
 ```
+
+### Experimental decode overlap
+
+`--decode-overlap` queues at most one additional decode while the CPU processes the previous result. It currently supports one sequence on one CUDA GPU, greedy sampling, and no speculative decoding. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Supported model families are Llama, Qwen2/3, Qwen3 Next, Qwen3.5/3.6, and GPT-OSS. Recurrent models reserve one extra state snapshot for rollback.
+
+Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and non-greedy or history-dependent sampling use the normal path. Stops and cancellation drain and discard any extra queued position before releasing the slot. The prototype still waits before reusing graph inputs; it does not remove all host-side gaps. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
 
 ## Using with CURL
 

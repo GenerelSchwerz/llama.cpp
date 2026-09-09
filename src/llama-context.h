@@ -83,6 +83,8 @@ struct llama_context {
 
     void synchronize();
 
+    int32_t decode_sampled(llama_seq_id seq_id, llama_pos pos);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -393,6 +395,12 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    ggml_context_ptr sampled_input_ctx;
+    ggml_backend_buffer_ptr sampled_input_buf;
+    ggml_tensor * sampled_input = nullptr;
+    ggml_backend_t sampled_input_backend = nullptr;
+    bool use_sampled_input = false;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

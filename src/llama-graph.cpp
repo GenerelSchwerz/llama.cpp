@@ -1409,8 +1409,12 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, bool skip_token_upload) {
     for (auto & input : inputs) {
+        if (skip_token_upload && dynamic_cast<llm_graph_input_embd *>(input.get())) {
+            GGML_ASSERT(ubatch->token && !ubatch->embd);
+            continue;
+        }
         input->set_input(ubatch);
     }
 }

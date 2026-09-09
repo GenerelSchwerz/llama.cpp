@@ -20,6 +20,11 @@ LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_con
 LLAMA_API bool llama_recurrent_set_sparse_snapshot_mode(
         struct llama_context * ctx, bool enabled, int32_t selected_token);
 
+// Queue one decode using the previous backend-sampled token as device input.
+// Requires synchronized output and a single greedy sequence. On success, normal output access refers to the new decode.
+// Returns 0 if queued, 1 if unsupported without changing memory, or a negative value on decode failure.
+LLAMA_API int32_t llama_decode_sampled(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

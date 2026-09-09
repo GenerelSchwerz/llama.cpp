@@ -2091,7 +2091,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         acquire_shared_workspace();
-        res->set_inputs(&ubatch);
+        if (use_sampled_input) {
+            // The previous decode is complete; only the token upload comes from the device.
+            res->set_inputs(&ubatch, true);
+            auto * tokens = res->get_inp_tokens();
+            GGML_ASSERT(tokens && ggml_backend_sched_get_tensor_backend(sched.get(), tokens) == sampled_input_backend);
+            ggml_backend_tensor_copy_async(sampled_input_backend, sampled_input_backend, sampled_input, tokens);
+        } else {
+            res->set_inputs(&ubatch);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2106,6 +2114,96 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ret = GGML_STATUS_SUCCESS;
 
     return res;
+}
+
+int32_t llama_context::decode_sampled(llama_seq_id seq_id, llama_pos pos) {
+    switch (model.arch) {
+        case LLM_ARCH_LLAMA:
+        case LLM_ARCH_QWEN2:
+        case LLM_ARCH_QWEN2MOE:
+        case LLM_ARCH_QWEN3:
+        case LLM_ARCH_QWEN3MOE:
+        case LLM_ARCH_OPENAI_MOE:
+            break;
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+            if (cparams.n_rs_seq == 0) {
+                return 1;
+            }
+            break;
+        default:
+            return 1;
+    }
+
+    if (n_seq_max() != 1 || model.n_devices() != 1 || cparams.pipeline_parallel || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
+            cparams.embeddings || cparams.embeddings_nextn || cparams.cb_eval ||
+            !memory || n_outputs != 1 || sampling.samplers.size() != 1 ||
+            sampling.samplers.count(seq_id) != 1 || pos < 0 || pos != memory->seq_pos_max(seq_id) + 1) {
+        return 1;
+    }
+
+    auto * chain = sampling.samplers.at(seq_id);
+    auto * greedy = llama_sampler_chain_get(chain, 0);
+    if (llama_sampler_chain_n(chain) != 1 || !greedy || strcmp(llama_sampler_name(greedy), "+greedy") != 0) {
+        return 1;
+    }
+
+    auto * res = gf_res_prev.get();
+    auto * tokens = res->get_inp_tokens();
+    auto * source = res->t_sampled.size() == 1 ? res->t_sampled[0] : nullptr;
+    if (!tokens || !source || source->type != GGML_TYPE_I32 || ggml_nelements(source) != 1) {
+        return 1;
+    }
+    auto * backend = ggml_backend_sched_get_tensor_backend(sched.get(), source);
+    auto * device = backend ? ggml_backend_get_device(backend) : nullptr;
+    if (!device || strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") != 0 ||
+            ggml_backend_buffer_is_host(source->buffer) || !model.tok_embd || !model.tok_embd->buffer ||
+            ggml_backend_buffer_is_host(model.tok_embd->buffer) ||
+            ggml_backend_buft_get_device(ggml_backend_buffer_get_type(model.tok_embd->buffer)) != device) {
+        return 1;
+    }
+    const bool move_tokens = ggml_backend_sched_get_tensor_backend(sched.get(), tokens) != backend;
+
+    if (!sampled_input) {
+        sampled_input_ctx.reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+        if (!sampled_input_ctx) {
+            return -2;
+        }
+        auto * input = ggml_new_tensor_1d(sampled_input_ctx.get(), GGML_TYPE_I32, 1);
+        ggml_set_name(input, "decode_sampled_input");
+        sampled_input_buf.reset(ggml_backend_alloc_ctx_tensors(sampled_input_ctx.get(), backend));
+        if (!sampled_input_buf) {
+            return -2;
+        }
+        sampled_input = input;
+        sampled_input_backend = backend;
+    }
+    if (sampled_input_backend != backend) {
+        return 1;
+    }
+
+    // Keep the token outside graph storage, which decode can rebuild or reallocate.
+    ggml_backend_tensor_copy_async(backend, backend, source, sampled_input);
+    ggml_backend_synchronize(backend);
+
+    llama_token token = get_sampled_token_ith(-1);
+    int32_t n_seq_id = 1;
+    int8_t output = 1;
+    auto * seq_ids = &seq_id;
+    llama_batch batch = {1, &token, nullptr, &pos, &n_seq_id, &seq_ids, &output};
+    use_sampled_input = true;
+    sched_need_reserve |= move_tokens;
+    int32_t ret;
+    try {
+        ret = decode(batch);
+    } catch (...) {
+        use_sampled_input = false;
+        synchronize();
+        throw;
+    }
+    use_sampled_input = false;
+    return ret == 0 ? 0 : (ret < 0 ? ret : -3);
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
@@ -3287,6 +3385,10 @@ llm_graph_cb llama_context::graph_get_cb() const {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
             ggml_set_name(cur, name);
+        }
+
+        if (use_sampled_input && strcmp(name, "inp_tokens") == 0) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), cur, sampled_input_backend);
         }
 
         // - norm may be automatically assigned to the backend of the previous layer, increasing data transfer between backends
@@ -5029,6 +5131,10 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_sampled(llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx ? ctx->decode_sampled(seq_id, pos) : -1;
 }
 
 //
