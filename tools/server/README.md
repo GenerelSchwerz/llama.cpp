@@ -157,7 +157,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-j, --json-schema SCHEMA` | JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
-| `--decode-overlap` | experimental: overlap single-sequence greedy decode with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
+| `--decode-overlap` | experimental: overlap batched greedy decode with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
 
 
 ### Server-specific params
@@ -462,9 +462,9 @@ docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/l
 
 ### Experimental decode overlap
 
-`--decode-overlap` queues at most one additional decode while the CPU processes the previous result. It currently supports one sequence on one CUDA GPU, greedy sampling, and no speculative decoding. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Supported model families are Llama, Qwen2/3, Qwen3 Next, and Qwen3.5/3.6 with all compute operations on the same GPU. Recurrent models reserve one extra state snapshot for rollback.
+`--decode-overlap` queues at most one additional decode batch while the CPU processes the previous results. It supports parallel requests on one CUDA GPU, greedy sampling, and no speculative decoding. Each queued batch contains one token per eligible sequence and must fit in one microbatch. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Support is determined by the graph inputs and memory capabilities, with all compute operations on the same GPU. Shared attention, sliding-window, and recurrent memory layouts qualify when their inputs do not require host token values and they support one-token rollback. Recurrent models reserve one extra state snapshot for rollback. Custom inputs and memory layouts default to normal decode until they provide these capabilities.
 
-Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and non-greedy or history-dependent sampling use the normal path. Stops and cancellation drain and discard any extra queued position before releasing the slot. The CPU prepares inputs in two pinned buffers and uploads them on the compute stream, then queues the next decode before waiting for the preceding token. Graph rebuilds and allocation changes still synchronize. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
+Grammar, reasoning budgets/control, probability output, LoRA, multimodal input, and non-greedy or history-dependent sampling use the normal path. A batch containing an incompatible request uses normal decode. New prompt admission discards queued positions before rebuilding the batch; overlap can resume once the batch qualifies. Stops and cancellation drain and discard the affected slot's extra queued position before releasing it. The CPU prepares inputs in two pinned buffers and uploads them on the compute stream, then queues the next decode before waiting for the preceding tokens. Graph rebuilds and allocation changes still synchronize. Both throughput and the extra snapshot memory cost should be measured for the intended workload.
 
 ## Using with CURL
 

@@ -55,6 +55,15 @@ void llama_kv_cache_msa::clear(bool data) {
     kv_idx ->clear(data);
 }
 
+bool llama_kv_cache_msa::can_decode_sampled() const {
+    return kv_base->can_decode_sampled() && kv_idx->can_decode_sampled();
+}
+
+void llama_kv_cache_msa::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    kv_base->seq_set_last_token(seq_id, pos, token);
+    kv_idx->seq_set_last_token(seq_id, pos, token);
+}
+
 bool llama_kv_cache_msa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = true;
 

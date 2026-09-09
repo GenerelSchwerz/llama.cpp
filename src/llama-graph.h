@@ -118,6 +118,9 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // The setter must not read host token values or access unstaged device data.
+    virtual bool can_decode_sampled() const { return false; }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -135,6 +138,8 @@ using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
     virtual ~llm_graph_input_embd() = default;
 
@@ -167,6 +172,8 @@ public:
 
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
     virtual ~llm_graph_input_pos() = default;
 
@@ -182,6 +189,8 @@ public:
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset)
         : n_attn_temp_floor_scale(n_attn_temp_floor_scale), f_attn_temp_scale(f_attn_temp_scale), f_attn_temp_offset(f_attn_temp_offset) {}
     virtual ~llm_graph_input_attn_temp() = default;
@@ -209,6 +218,8 @@ public:
 
 class llm_graph_input_pos_bucket_kv : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_pos_bucket_kv(
             const llama_hparams & hparams,
             const llama_kv_cache_context * mctx) : hparams(hparams), mctx(mctx) {}
@@ -225,6 +236,8 @@ public:
 
 class llm_graph_input_out_ids : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -245,6 +258,8 @@ public:
 
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
     virtual ~llm_graph_input_mean() = default;
 
@@ -257,6 +272,8 @@ public:
 
 class llm_graph_input_cls : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_cls(const llama_cparams & cparams, const llm_arch arch) : cparams(cparams), arch(arch) {}
     virtual ~llm_graph_input_cls() = default;
 
@@ -270,6 +287,8 @@ public:
 
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx);
     virtual ~llm_graph_input_rs() = default;
 
@@ -330,6 +349,8 @@ public:
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -373,6 +394,8 @@ public:
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_k(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -408,6 +431,8 @@ public:
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_k_dsa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -450,6 +475,8 @@ public:
 // DSA input (full-attention layers + indexer) with K-only input for the SWA layers
 class llm_graph_input_attn_k_dsa_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_k_dsa_iswa(
             std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa,
             std::unique_ptr<llm_graph_input_attn_k>     inp_swa,
@@ -495,6 +522,8 @@ public:
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -543,6 +572,8 @@ public:
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_k_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -674,6 +705,8 @@ public:
 
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_mem_hybrid(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
@@ -702,6 +735,8 @@ public:
 
 class llm_graph_input_mem_hybrid_k : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_mem_hybrid_k(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_k> inp_attn,
@@ -730,6 +765,8 @@ public:
 
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_mem_hybrid_iswa(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
@@ -758,6 +795,8 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
         samplers(std::move(samplers)) { }
     virtual ~llm_graph_input_sampling() = default;
@@ -927,6 +966,8 @@ public:
 
     void reset();
 
+    bool can_decode_sampled() const;
+    const std::vector<ggml_tensor *> & get_inp_token_tensors() const { return inp_token_tensors; }
     void set_inputs(const llama_ubatch * ubatch, bool skip_token_upload = false);
     void set_outputs(const llm_graph_params & params);
 
@@ -973,6 +1014,8 @@ public:
     int64_t max_nodes;
 
 private:
+    std::vector<ggml_tensor *> inp_token_tensors;
+
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph

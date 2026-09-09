@@ -49,7 +49,7 @@ static llama_model_ptr load_model(const test_args & args) {
             }
 
             mparams.n_gpu_layers = 999;
-            if (args.test == "decode_sampled") {
+            if (args.test == "decode_sampled" || args.test == "decode_sampled_batch") {
                 overrides[0] = {"token_embd.weight", ggml_backend_dev_buffer_type(devs[0])};
                 mparams.tensor_buft_overrides = overrides;
             }
@@ -95,7 +95,8 @@ struct test_context {
             int32_t n_seq_max = -1,
             uint32_t n_outputs_max = 0,
             uint32_t n_ubatch = 0,
-            uint32_t n_outputs_max_per_seq = 1) {
+            uint32_t n_outputs_max_per_seq = 1,
+            bool kv_unified = true) {
         auto * model = params.model.get();
 
         GGML_ASSERT(model);
@@ -111,7 +112,7 @@ struct test_context {
         cparams.n_outputs_max_per_seq = n_outputs_max_per_seq;
         cparams.samplers = configs.data();
         cparams.n_samplers = configs.size();
-        cparams.kv_unified = true;
+        cparams.kv_unified = kv_unified;
         cparams.n_rs_seq = params.sampled_decode ? 1 : 0;
 
         // If n_seq_max is not specified, calculate it from configs
@@ -2085,6 +2086,98 @@ static void test_backend_decode_sampled(const test_params & params) {
     printf("sampled decode parity, admission, and one-token rollback PASSED (%s)\n", params.sampled_decode_gpu ? "CUDA" : "fallback");
 }
 
+static void test_backend_decode_sampled_batch(const test_params & params) {
+    const auto generate = [&](bool overlap, bool unified) {
+        std::vector<llama_sampler_ptr> samplers;
+        std::vector<llama_sampler_seq_config> configs;
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            samplers.emplace_back(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            llama_sampler_chain_add(samplers.back().get(), llama_sampler_init_greedy());
+            configs.push_back({seq, samplers.back().get()});
+        }
+        test_context tc(params, configs, 4, 0, 0, 1, unified);
+        GGML_ASSERT(tc.decode({{0, "Hello"}, {1, "Count to ten"}, {2, "The sky is"}, {3, "A small cat"}}));
+        auto * memory = llama_get_memory(tc.ctx.get());
+        std::map<llama_seq_id, llama_token> tokens;
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            tokens[seq] = llama_get_sampled_token_ith(tc.ctx.get(), tc.idx_for_seq(seq));
+        }
+        // Unequal prompts can leave their final outputs in different recurrent microbatches.
+        GGML_ASSERT(tc.decode_tokens(tokens));
+        for (llama_seq_id seq = 0; seq < 4; ++seq) {
+            tokens[seq] = llama_get_sampled_token_ith(tc.ctx.get(), tc.idx_for_seq(seq));
+        }
+        llama_sampled_decode_item duplicate[] = {{0, tc.seq_positions[0]}, {0, tc.seq_positions[0]}};
+        llama_token previous[] = {LLAMA_TOKEN_NULL, LLAMA_TOKEN_NULL};
+        GGML_ASSERT(llama_decode_sampled_batch_async(tc.ctx.get(), duplicate, 2, previous) == 1);
+        GGML_ASSERT(previous[0] == LLAMA_TOKEN_NULL && previous[1] == LLAMA_TOKEN_NULL);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, 0) + 1 == tc.seq_positions[0]);
+
+        std::map<llama_seq_id, std::vector<llama_token>> result;
+        std::map<llama_seq_id, llama_token> last_inputs;
+        for (int step = 0; step < 64; ++step) {
+            std::vector<llama_seq_id> active = {3, 1, 2, 0};
+            if (unified && step >= 24) {
+                active.erase(std::remove(active.begin(), active.end(), 1), active.end());
+            }
+            if (unified && step >= 40) {
+                active.erase(std::remove(active.begin(), active.end(), 3), active.end());
+            }
+            if (step % 2) {
+                std::reverse(active.begin(), active.end());
+            }
+            if (!unified) {
+                std::sort(active.begin(), active.end());
+            }
+            std::vector<llama_sampled_decode_item> items;
+            for (auto seq : active) {
+                items.push_back({seq, tc.seq_positions[seq]});
+            }
+            if (overlap) {
+                std::vector<llama_token> consumed(items.size(), LLAMA_TOKEN_NULL);
+                GGML_ASSERT(llama_decode_sampled_batch_async(tc.ctx.get(), items.data(), items.size(), consumed.data()) == 0);
+                for (size_t i = 0; i < items.size(); ++i) {
+                    result[items[i].seq_id].push_back(consumed[i]);
+                    last_inputs[items[i].seq_id] = consumed[i];
+                }
+            } else {
+                llama_batch batch = llama_batch_init(items.size(), 0, 1);
+                for (const auto & item : items) {
+                    result[item.seq_id].push_back(tokens[item.seq_id]);
+                    last_inputs[item.seq_id] = tokens[item.seq_id];
+                    common_batch_add(batch, tokens[item.seq_id], item.pos, {item.seq_id}, true);
+                }
+                GGML_ASSERT(llama_decode(tc.ctx.get(), batch) == 0);
+                llama_batch_free(batch);
+            }
+            for (size_t i = 0; i < items.size(); ++i) {
+                tc.seq_positions[items[i].seq_id]++;
+                tc.last_batch_info[items[i].seq_id] = i;
+                if (!overlap || step == 63) {
+                    tokens[items[i].seq_id] = llama_get_sampled_token_ith(tc.ctx.get(), i);
+                }
+            }
+        }
+        const llama_pos peer_pos = llama_memory_seq_pos_max(memory, 2);
+        const llama_pos pos = llama_memory_seq_pos_max(memory, 0);
+        GGML_ASSERT(llama_memory_seq_rm(memory, 0, pos, -1));
+        tc.seq_positions[0] = pos;
+        GGML_ASSERT(tc.decode_token(last_inputs[0], 0));
+        GGML_ASSERT(llama_get_sampled_token_ith(tc.ctx.get(), 0) == tokens[0]);
+        GGML_ASSERT(llama_memory_seq_pos_max(memory, 2) == peer_pos);
+        return result;
+    };
+    if (!params.sampled_decode_gpu) {
+        return;
+    }
+    for (bool unified : {false, true}) {
+        const auto expected = generate(false, unified);
+        GGML_ASSERT(expected == generate(true, unified));
+        printf("sampled batch decode parity PASSED (kv_unified = %d)\n", unified);
+    }
+    printf("sampled batch decode parity, reordered rows, shrinking batch, and independent rollback PASSED\n");
+}
+
 struct backend_test_case {
     std::string name;
     void (*fn)(const test_params &);
@@ -2093,6 +2186,7 @@ struct backend_test_case {
 
 static const backend_test_case BACKEND_TESTS[] = {
     { "decode_sampled",  test_backend_decode_sampled,          false },
+    { "decode_sampled_batch", test_backend_decode_sampled_batch, false },
     { "greedy",          test_backend_greedy_sampling,         true  },
     { "logit_bias",      test_backend_logit_bias_sampling,     true  },
     { "penalties",       test_backend_penalties_sampling,      true  },
@@ -2250,7 +2344,7 @@ int main(int argc, char ** argv) {
     test_params params = {
         /*.model =*/ load_model(args),
     };
-    params.sampled_decode = args.test == "decode_sampled";
+    params.sampled_decode = (args.test == "decode_sampled" || args.test == "decode_sampled_batch");
     auto * gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     params.sampled_decode_gpu = args.device == "gpu" && gpu &&
             strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0;

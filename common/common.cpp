@@ -1739,7 +1739,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
-    if (params.decode_overlap && params.n_parallel == 1) {
+    if (params.decode_overlap) {
         cparams.n_rs_seq = std::max(cparams.n_rs_seq, 1u);
     }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);

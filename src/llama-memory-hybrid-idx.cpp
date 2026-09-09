@@ -145,6 +145,17 @@ void llama_memory_hybrid_idx::clear(bool data) {
     }
 }
 
+bool llama_memory_hybrid_idx::can_decode_sampled() const {
+    return llama_memory_hybrid::can_decode_sampled() && (!mem_idx || mem_idx->can_decode_sampled());
+}
+
+void llama_memory_hybrid_idx::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
+    llama_memory_hybrid::seq_set_last_token(seq_id, pos, token);
+    if (mem_idx) {
+        mem_idx->seq_set_last_token(seq_id, pos, token);
+    }
+}
+
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
