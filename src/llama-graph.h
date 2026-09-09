@@ -189,8 +189,6 @@ public:
 // temperature tuning, used by llama4
 class llm_graph_input_attn_temp : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_temp(uint32_t n_attn_temp_floor_scale, float f_attn_temp_scale, float f_attn_temp_offset)
         : n_attn_temp_floor_scale(n_attn_temp_floor_scale), f_attn_temp_scale(f_attn_temp_scale), f_attn_temp_offset(f_attn_temp_offset) {}
     virtual ~llm_graph_input_attn_temp() = default;
@@ -218,8 +216,6 @@ public:
 
 class llm_graph_input_pos_bucket_kv : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_pos_bucket_kv(
             const llama_hparams & hparams,
             const llama_kv_cache_context * mctx) : hparams(hparams), mctx(mctx) {}
@@ -258,8 +254,6 @@ public:
 
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
     virtual ~llm_graph_input_mean() = default;
 
@@ -272,8 +266,6 @@ public:
 
 class llm_graph_input_cls : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_cls(const llama_cparams & cparams, const llm_arch arch) : cparams(cparams), arch(arch) {}
     virtual ~llm_graph_input_cls() = default;
 
@@ -287,8 +279,6 @@ public:
 
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx);
     virtual ~llm_graph_input_rs() = default;
 
@@ -394,8 +384,6 @@ public:
 // ref: https://github.com/ggml-org/llama.cpp/pull/19067
 class llm_graph_input_attn_k : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_k(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -431,8 +419,6 @@ public:
 
 class llm_graph_input_attn_k_dsa : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_k_dsa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -475,8 +461,6 @@ public:
 // DSA input (full-attention layers + indexer) with K-only input for the SWA layers
 class llm_graph_input_attn_k_dsa_iswa : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_k_dsa_iswa(
             std::unique_ptr<llm_graph_input_attn_k_dsa> inp_dsa,
             std::unique_ptr<llm_graph_input_attn_k>     inp_swa,
@@ -503,6 +487,8 @@ public:
 // standard K/V attention input against the base cache, plus destination indices for the indexer key cache
 class llm_graph_input_attn_kv_msa : public llm_graph_input_attn_kv {
 public:
+    bool can_decode_sampled() const override { return false; }
+
     llm_graph_input_attn_kv_msa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -522,8 +508,6 @@ public:
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -572,8 +556,6 @@ public:
 
 class llm_graph_input_attn_k_iswa : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_attn_k_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -735,8 +717,6 @@ public:
 
 class llm_graph_input_mem_hybrid_k : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_mem_hybrid_k(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_k> inp_attn,
@@ -765,8 +745,6 @@ public:
 
 class llm_graph_input_mem_hybrid_iswa : public llm_graph_input_i {
 public:
-    bool can_decode_sampled() const override { return true; }
-
     llm_graph_input_mem_hybrid_iswa(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,

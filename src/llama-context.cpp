@@ -2262,7 +2262,7 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
     }
 
     auto * res = gf_res_prev.get();
-    if (!res->can_decode_sampled() || sampled_output_positions.size() != res->t_sampled.size()) {
+    if (!res->can_decode_sampled() || !memory->can_decode_sampled() || sampled_output_positions.size() != res->t_sampled.size()) {
         return 1;
     }
 
@@ -2309,7 +2309,7 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
         return ggml_backend_sched_get_tensor_backend(sched.get(), input) != backend;
     });
     if (previous) {
-        if (!memory->can_decode_sampled() || shared_workspace_peer() || !ggml_backend_dev_host_buffer_type(device)) {
+        if (shared_workspace_peer() || !ggml_backend_dev_host_buffer_type(device)) {
             return 1;
         }
         auto * gf = res->get_gf();

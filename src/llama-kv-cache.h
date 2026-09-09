@@ -176,7 +176,7 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
-    bool can_decode_sampled() const override { return true; }
+    bool can_decode_sampled() const override { return !other && swa_type == LLAMA_SWA_TYPE_NONE; }
     void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) override;
 
     // state_read, plus the cells the restored tokens were placed in

@@ -633,7 +633,7 @@ def test_cancel_active_request_and_reuse_slot():
         assert reference.body["id_slot"] == 0
 
         cancel_request = {
-            "prompt": "This request should remain active until its client disconnects. " * 24,
+            "prompt": "This request should remain active until its client disconnects. " * 4,
             "id_slot": 0,
             "n_predict": 512,
             "ignore_eos": True,
@@ -655,6 +655,7 @@ def test_cancel_active_request_and_reuse_slot():
         assert first_cancel_chunk is not None
         assert first_cancel_chunk["stop"] is False
         assert len(first_cancel_chunk["tokens"]) == 1
+        assert first_cancel_chunk["tokens_evaluated"] + cancel_request["n_predict"] < server.n_ctx // server.n_slots
 
         survivor_request = {
             "prompt": "This overlapping request must survive another client's cancellation:",

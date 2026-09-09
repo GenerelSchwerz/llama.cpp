@@ -55,8 +55,7 @@ llama_memory_placement_options placement,
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
-    bool can_decode_sampled() const override;
-    void seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) override;
+    bool can_decode_sampled() const override { return false; }
 
     void clear(bool data) override;
 

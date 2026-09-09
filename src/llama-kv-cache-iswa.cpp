@@ -112,15 +112,6 @@ void llama_kv_cache_iswa::clear(bool data) {
     kv_swa ->clear(data);
 }
 
-bool llama_kv_cache_iswa::can_decode_sampled() const {
-    return kv_base->can_decode_sampled() && kv_swa->can_decode_sampled();
-}
-
-void llama_kv_cache_iswa::seq_set_last_token(llama_seq_id seq_id, llama_pos pos, llama_token token) {
-    kv_base->seq_set_last_token(seq_id, pos, token);
-    kv_swa->seq_set_last_token(seq_id, pos, token);
-}
-
 bool llama_kv_cache_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     bool res = true;
 
