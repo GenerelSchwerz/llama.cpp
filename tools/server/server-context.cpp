@@ -287,6 +287,7 @@ struct server_slot {
     llama_sampler * decode_overlap_sampler = nullptr;
     llama_sampler_ptr decode_overlap_checkpoint;
     bool decode_overlap_enabled = false;
+    bool decode_overlap_mtp_enabled = false;
     llama_pos decode_overlap_pos = -1;
     llama_token decode_overlap_token = LLAMA_TOKEN_NULL;
     int32_t decode_overlap_output_index = -1;
@@ -349,6 +350,7 @@ struct server_slot {
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
+        common_speculative_discard_draft_overlap(spec, id);
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -469,6 +471,7 @@ struct server_slot {
         decode_overlap_sampler = nullptr;
         decode_overlap_checkpoint.reset();
         decode_overlap_enabled = false;
+        decode_overlap_mtp_enabled = false;
         decode_overlap_queued = 0;
         decode_overlap_discarded = 0;
 
@@ -638,6 +641,7 @@ struct server_slot {
             GGML_ASSERT(task);
 
             discard_decode_overlap();
+            common_speculative_discard_draft_overlap(spec, id);
             if (decode_overlap_queued > 0) {
                 SLT_INF(*this, "decode overlap: queued = %" PRIu64 ", discarded = %" PRIu64 "\n", decode_overlap_queued, decode_overlap_discarded);
             }
@@ -1976,6 +1980,12 @@ private:
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
                     !task.is_parent() && !task.is_child() && server_decode_overlap_sampling(task.params.sampling);
 
+            slot.decode_overlap_mtp_enabled = params_base.decode_overlap && !mctx && slot.lora.empty() &&
+                    !task.is_parent() && !task.is_child() && task.params.sampling.n_probs == 0 &&
+                    (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                     (ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_dft) > 0)) &&
+                    common_speculative_draft_overlap_supported(spec.get());
+
             // TODO: tmp until backend sampling is fully implemented
             if (use_decode_overlap) {
                 slot.decode_overlap_sampler = common_sampler_get(slot.smpl.get());
@@ -1986,7 +1996,9 @@ private:
             } else {
                 llama_set_sampler(ctx_tgt, slot.id, nullptr);
             }
-            if (params_base.decode_overlap && !use_decode_overlap) {
+            if (slot.decode_overlap_mtp_enabled) {
+                SLT_INF(slot, "%s", "decode overlap: MTP draft enabled after target acceptance\n");
+            } else if (params_base.decode_overlap && !use_decode_overlap) {
                 SLT_INF(slot, "%s", "decode overlap: unsupported request or context, using normal decode\n");
             }
 
@@ -2555,6 +2567,11 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        if (!is_yielding && task.type != SERVER_TASK_TYPE_NEXT_RESPONSE &&
+                task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            common_speculative_discard_draft_overlap(spec.get());
         }
 
         switch (task.type) {
@@ -4441,6 +4458,8 @@ private:
         struct speculative_completion {
             server_slot * slot;
             size_t n_draft;
+            llama_tokens ids;
+            size_t n_accepted = 0;
         };
         std::vector<speculative_completion> speculative_completions;
         std::vector<common_speculative_finish_accept_params> deferred_accepts;
@@ -4580,7 +4599,7 @@ private:
                 }
             }
 
-            speculative_completions.push_back({ &slot, n_draft });
+            speculative_completions.push_back({ &slot, n_draft, {} });
         });
 
         if (!deferred_accepts.empty()) {
@@ -4631,21 +4650,18 @@ private:
             }
         }
 
-        iterate_post_decode([&](server_slot & slot) {
-            const auto it = std::find_if(speculative_completions.begin(), speculative_completions.end(), [&](const auto & completion) {
-                return completion.slot == &slot;
-            });
-            if (it == speculative_completions.end()) {
-                return;
-            }
-            const size_t n_draft = it->n_draft;
+        auto prepare_completion = [&](speculative_completion & completion) {
+            auto & slot = *completion.slot;
+            const size_t n_draft = completion.n_draft;
 
-            const auto ids = std::move(slot.spec_draft);
+            auto & ids = completion.ids;
+            ids = std::move(slot.spec_draft);
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_replay.excludes_replayed_token_from_acceptance() && n_accepted > 0) {
                 n_accepted--;
             }
+            completion.n_accepted = n_accepted;
             slot.spec_replay.finish_verification();
 
             slot.stats.update_gen_last();
@@ -4670,6 +4686,48 @@ private:
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+        };
+
+        if (params_base.decode_overlap && off + n_batch_tokens == batch.size() &&
+                common_speculative_draft_overlap_supported(spec.get())) {
+            iterate_post_decode([&](server_slot & slot) {
+                const auto it = std::find_if(speculative_completions.begin(), speculative_completions.end(), [&](const auto & completion) {
+                    return completion.slot == &slot;
+                });
+                if (it != speculative_completions.end() && slot.state == SLOT_STATE_GENERATING) {
+                    prepare_completion(*it);
+                }
+            });
+
+            std::vector<common_speculative_draft_input> inputs;
+            for (const auto & completion : speculative_completions) {
+                const auto & slot = *completion.slot;
+                if (!slot.decode_overlap_mtp_enabled || slot.state != SLOT_STATE_GENERATING || completion.ids.empty() ||
+                        slot.prompt.n_tokens() + 2 >= slot.n_ctx ||
+                        (slot.n_remaining() >= 0 && (size_t) slot.n_remaining() <= completion.ids.size() + 1)) {
+                    continue;
+                }
+                inputs.push_back({slot.id, slot.prompt.n_tokens(), slot.sampled});
+            }
+            if (!inputs.empty()) {
+                // All target rows and deferred acceptance are consumed before the draft can reuse shared workspace.
+                common_speculative_queue_draft_overlap(spec.get(), inputs);
+            }
+        }
+
+        iterate_post_decode([&](server_slot & slot) {
+            const auto it = std::find_if(speculative_completions.begin(), speculative_completions.end(), [&](const auto & completion) {
+                return completion.slot == &slot;
+            });
+            if (it == speculative_completions.end() || slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+            if (it->ids.empty()) {
+                prepare_completion(*it);
+            }
+            const auto & ids = it->ids;
+            const size_t n_draft = it->n_draft;
+            const size_t n_accepted = it->n_accepted;
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
