@@ -661,16 +661,82 @@ struct llama_mmap::impl {
 
     void * addr;
     size_t size;
+    llama_mmap::ranges lazy_ranges;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {
+    pimpl->lazy_ranges = lazy_ranges;
+}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const {
+#if defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)
+    const uintptr_t base = reinterpret_cast<uintptr_t>(addr());
+    const uintptr_t ptr  = reinterpret_cast<uintptr_t>(data);
+    if (!data || !rows || row_size == 0 || ptr < base || ptr - base >= size()) {
+        return;
+    }
+    const size_t offset = ptr - base;
+    size_t limit = offset;
+    for (const auto & range : pimpl->lazy_ranges) {
+        if (offset >= range.first && offset < range.second) {
+            limit = std::min(range.second, size());
+            break;
+        }
+    }
+    if (limit <= offset || row_size > limit - offset) {
+        return;
+    }
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+
+    // Keep scratch bounded and merge only overlapping or adjacent requested pages.
+    std::pair<size_t, size_t> pages[256];
+    while (n_rows > 0) {
+        const size_t count = std::min(n_rows, size_t(256));
+        size_t n_pages = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (rows[i] < 0 || size_t(rows[i]) >= (limit - offset) / row_size) {
+                continue;
+            }
+            const size_t first = offset + size_t(rows[i]) * row_size;
+            const size_t end = first + row_size;
+            const size_t padding = (page_size - end % page_size) % page_size;
+            pages[n_pages++] = {first - first % page_size, end + std::min(padding, size() - end)};
+        }
+        std::sort(pages, pages + n_pages);
+        for (size_t i = 0; i < n_pages; ++i) {
+            const size_t first = pages[i].first;
+            size_t end = pages[i].second;
+            while (i + 1 < n_pages && pages[i + 1].first <= end) {
+                end = std::max(end, pages[++i].second);
+            }
+            for (const auto & fragment : pimpl->mapped_fragments) {
+                if (first >= fragment.first && end <= fragment.second) {
+                    // Advice failure leaves the ordinary demand-paged gather intact.
+                    (void) posix_madvise((char *) addr() + first, end - first, POSIX_MADV_WILLNEED);
+                    break;
+                }
+            }
+        }
+        rows += count;
+        n_rows -= count;
+    }
+#else
+    GGML_UNUSED(data);
+    GGML_UNUSED(row_size);
+    GGML_UNUSED(rows);
+    GGML_UNUSED(n_rows);
+#endif
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
