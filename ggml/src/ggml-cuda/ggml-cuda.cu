@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/staged-input.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -3797,6 +3798,8 @@ static bool ggml_cuda_compute_forward(
         struct ggml_tensor * dst,
         ggml_cuda_moe_graph_execution * execution) {
     switch (dst->op) {
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_staged_input_compute(ctx, dst);
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
             break;
@@ -7603,6 +7606,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     }
 
     switch (op->op) {
+        case GGML_OP_CUSTOM:
+            return ggml_cuda_staged_input_supports(op);
         case GGML_OP_UNARY:
             switch (ggml_get_unary_op(op)) {
                 case GGML_UNARY_OP_ABS:
@@ -8230,6 +8235,9 @@ static bool ggml_backend_cuda_required_grouped_execution_supported(ggml_backend_
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, GGML_STAGED_INPUT_PROC) == 0) {
+        return (void *) ggml_cuda_staged_input_api;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

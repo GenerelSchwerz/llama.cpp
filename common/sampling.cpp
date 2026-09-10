@@ -449,7 +449,7 @@ void common_sampler_free(struct common_sampler * gsmpl) {
     delete gsmpl;
 }
 
-static bool grammar_should_apply(struct common_sampler * gsmpl) {
+static bool grammar_should_apply(const struct common_sampler * gsmpl) {
     if (!gsmpl->grmr) {
         return false;
     }
@@ -724,6 +724,18 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+bool common_sampler_decode_overlap_safe(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->grmr) {
+        return true;
+    }
+
+    if (!gsmpl->params.grammar_lazy) {
+        return false;
+    }
+
+    return !grammar_should_apply(gsmpl) || !llama_sampler_grammar_is_active(gsmpl->grmr);
 }
 
 // helpers

@@ -124,6 +124,8 @@ struct llama_context {
 
     int32_t decode_sampled(llama_seq_id seq_id, llama_pos pos, llama_token * previous = nullptr);
     int32_t decode_sampled(const llama_sampled_decode_item * items, int32_t n_items, llama_token * previous);
+    bool can_decode_sampled_host() const;
+    int32_t decode_sampled_host(const llama_sampled_decode_item * items, int32_t n_items, const std::vector<ggml_tensor *> & sources, llama_token * previous);
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -455,6 +457,8 @@ private:
     bool use_sampled_input_async = false;
     uint64_t compute_sync_generation = 0;
     bool sampled_inputs_device = false;
+    std::unique_ptr<class llama_staged_inputs> staged_inputs;
+    bool staged_inputs_checked = false;
     struct sampled_input_staging {
         ggml_backend_buffer_ptr buffer;
         ggml_backend_event_ptr uploaded;

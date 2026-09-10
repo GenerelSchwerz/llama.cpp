@@ -16,6 +16,8 @@ add_library(llama
             llama-batch.cpp
             llama-chat.cpp
             llama-context.cpp
+            llama-context-overlap.cpp
+            llama-staged-input.cpp
             llama-cparams.cpp
             llama-grammar.cpp
             llama-graph.cpp

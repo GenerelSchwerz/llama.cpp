@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-staged-input.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -380,7 +381,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    ggml_tensor * inpL = params.staged_inputs ? params.staged_inputs->build_embedding(ctx0, res) : build_inp_embd(model.tok_embd);
     cb(inpL, "model.input_embed", -1);
     ggml_build_forward_expand(gf, inpL);
 
@@ -403,9 +404,11 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
 
     ggml_tensor * ple_emb = nullptr;
     if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
+        ple_emb = params.staged_inputs ? params.staged_inputs->build_ple(ctx0, res, mctx_hyb) : build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
+        if (!params.staged_inputs) {
+            ggml_build_forward_expand(gf, ple_emb);
+        }
     }
 
     // the wide residual starts as hc identical copies of the embedding
@@ -418,6 +421,9 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         res->t_layer_inp[il] = res_hc;
 
         if (hparams.is_ple(il)) {
+            if (params.staged_inputs) {
+                ggml_build_forward_expand(gf, res_hc);
+            }
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
         }
 
@@ -701,6 +707,7 @@ public:
     llm_graph_input_qsa(const llama_memory_hybrid_idx_context * mctx, uint32_t ratio, bool blk_bias) :
         mctx(mctx), ratio(ratio), blk_bias(blk_bias) {}
     virtual ~llm_graph_input_qsa() = default;
+    bool can_decode_sampled() const override { return true; }
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);

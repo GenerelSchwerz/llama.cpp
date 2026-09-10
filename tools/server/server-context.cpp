@@ -50,7 +50,7 @@ static bool server_decode_overlap_sampling(const common_params_sampling & params
             params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
             params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f || params.typ_p != 1.0f ||
             params.top_n_sigma > 0.0f || params.n_probs != 0 ||
-            !common_grammar_value(params.grammar).empty() || params.reasoning_budget_tokens >= 0 || params.reasoning_control) {
+            (!common_grammar_value(params.grammar).empty() && !params.grammar_lazy) || params.reasoning_budget_tokens >= 0) {
         return false;
     }
     for (const auto sampler : params.samplers) {
@@ -634,6 +634,17 @@ struct server_slot {
         decode_overlap_output_index = -1;
         decode_overlap_task_id = -1;
         ++decode_overlap_discarded;
+    }
+
+    void disable_decode_overlap(const char * reason) {
+        discard_decode_overlap();
+        llama_set_sampler(ctx_tgt, id, nullptr);
+        decode_overlap_sampler = nullptr;
+        decode_overlap_checkpoint.reset();
+        common_sampler_ptr cpu_smpl(common_sampler_clone(smpl.get()));
+        smpl = std::move(cpu_smpl);
+        decode_overlap_enabled = false;
+        SLT_INF(*this, "decode overlap: disabled before %s\n", reason);
     }
 
     void release() {
@@ -1978,7 +1989,10 @@ private:
             const bool use_decode_overlap = params_base.decode_overlap && !spec && !mctx &&
                     slot.lora.empty() &&
                     (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART || ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) &&
-                    !task.is_parent() && !task.is_child() && server_decode_overlap_sampling(task.params.sampling);
+                    !task.is_parent() && !task.is_child() &&
+                    (!task.params.sampling.reasoning_control || params_base.n_parallel == 1) &&
+                    server_decode_overlap_sampling(task.params.sampling) &&
+                    common_sampler_decode_overlap_safe(slot.smpl.get());
 
             slot.decode_overlap_mtp_enabled = params_base.decode_overlap && !mctx && slot.lora.empty() &&
                     !task.is_parent() && !task.is_child() && task.params.sampling.n_probs == 0 &&
@@ -2680,7 +2694,9 @@ private:
                             break;
                         }
                         // act on the live slot mid generation, never defer
-                        common_sampler_reasoning_budget_force(slot->smpl.get());
+                        if (common_sampler_reasoning_budget_force(slot->smpl.get()) && slot->decode_overlap_enabled) {
+                            slot->disable_decode_overlap("reasoning control");
+                        }
                         res->success = true;
                     } else {
                         res->success = false;
@@ -4423,6 +4439,10 @@ private:
             const int64_t t_now = ggml_time_us();
 
             common_sampler_accept(slot.smpl.get(), id, true);
+
+            if (slot.decode_overlap_enabled && !common_sampler_decode_overlap_safe(slot.smpl.get())) {
+                slot.disable_decode_overlap("grammar constraints");
+            }
 
             slot.stats.n_gen += 1;
 

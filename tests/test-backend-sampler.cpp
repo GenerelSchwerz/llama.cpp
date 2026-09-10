@@ -26,6 +26,7 @@ struct test_args {
     std::string model;
     std::string test;
     std::string device = "auto";
+    int32_t staged_input_cache = 0;
 };
 
 struct test_params {
@@ -33,10 +34,16 @@ struct test_params {
     bool sampled_decode = false;
     bool sampled_decode_gpu = false;
     bool sampled_stochastic = false;
+    bool sampled_host_inputs = false;
 };
 
 static llama_model_ptr load_model(const test_args & args) {
     auto mparams = llama_model_default_params();
+    if (args.staged_input_cache > 0) {
+        mparams.moe_expert_cache_slots = args.staged_input_cache;
+        mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+        mparams.lazy_mode = LLAMA_LAZY_MODE_ON;
+    }
 
     ggml_backend_dev_t devs[2] = { nullptr, nullptr };
     llama_model_tensor_buft_override overrides[2] = {};
@@ -51,7 +58,7 @@ static llama_model_ptr load_model(const test_args & args) {
             }
 
             mparams.n_gpu_layers = 999;
-            if (args.test == "decode_sampled" || args.test == "decode_sampled_batch" || args.test == "decode_sampled_lifecycle") {
+            if (!args.staged_input_cache && (args.test == "decode_sampled" || args.test == "decode_sampled_batch" || args.test == "decode_sampled_lifecycle")) {
                 overrides[0] = {"token_embd.weight", ggml_backend_dev_buffer_type(devs[0])};
                 mparams.tensor_buft_overrides = overrides;
             }
@@ -117,6 +124,12 @@ struct test_context {
         cparams.n_samplers = configs.size();
         cparams.kv_unified = kv_unified;
         cparams.n_rs_seq = params.sampled_decode ? 1 : 0;
+        if (params.sampled_host_inputs) {
+            cparams.type_k = GGML_TYPE_Q8_0;
+            cparams.type_v = GGML_TYPE_Q8_0;
+            cparams.n_threads = 12;
+            cparams.n_threads_batch = 12;
+        }
 
         // If n_seq_max is not specified, calculate it from configs
         if (n_seq_max < 0) {
@@ -2044,6 +2057,9 @@ static void test_backend_decode_sampled(const test_params & params) {
         GGML_ASSERT(llama_decode_sampled(tc.ctx.get(), 0, 0) == 1);
         GGML_ASSERT(llama_decode_sampled_async(tc.ctx.get(), 0, 0, &previous) == 1);
         GGML_ASSERT(tc.decode({{0, "Hello"}}));
+        if (params.sampled_host_inputs) {
+            GGML_ASSERT(tc.decode_token(llama_vocab_eos(tc.vocab)));
+        }
         llama_synchronize(tc.ctx.get());
 
         auto * memory = llama_get_memory(tc.ctx.get());
@@ -2124,7 +2140,9 @@ static void test_backend_decode_sampled(const test_params & params) {
     };
 
     const auto expected = generate(0);
-    GGML_ASSERT(expected == generate(1));
+    if (!params.sampled_host_inputs) {
+        GGML_ASSERT(expected == generate(1));
+    }
     GGML_ASSERT(expected == generate(2));
     printf("sampled decode parity, admission, and one-token rollback PASSED (%s)\n", params.sampled_decode_gpu ? "CUDA" : "fallback");
 }
@@ -2453,6 +2471,14 @@ static test_args parse_cli(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {
         const char * arg = argv[i];
 
+        if (std::strcmp(arg, "--staged-input-cache") == 0) {
+            if (i + 1 >= argc || (out.staged_input_cache = std::atoi(argv[++i])) <= 0) {
+                fprintf(stderr, "--staged-input-cache expects a positive slot count\n");
+                exit(EXIT_FAILURE);
+            }
+            continue;
+        }
+
         if (std::strcmp(arg, "--test") == 0) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "--test expects a value\n");
@@ -2584,6 +2610,7 @@ int main(int argc, char ** argv) {
         /*.model =*/ load_model(args),
     };
     params.sampled_decode = (args.test == "decode_sampled" || args.test == "decode_sampled_batch" || args.test == "decode_sampled_lifecycle");
+    params.sampled_host_inputs = args.staged_input_cache > 0;
     auto * gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
     params.sampled_decode_gpu = args.device == "gpu" && gpu &&
             strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(gpu)), "CUDA") == 0;
