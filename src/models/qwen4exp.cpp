@@ -1109,6 +1109,7 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    pmodel.prefetch_rows(pmodel.per_layer_tok_embd, idx.data(), idx.size());
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 

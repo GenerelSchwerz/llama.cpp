@@ -55,6 +55,8 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    void prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const;
+
     static const bool SUPPORTED;
 
 private:
