@@ -241,7 +241,7 @@ public:
                          bool   is_reserve,
             const slot_info   * sinfo = nullptr) const;
 
-    // tell the scheduler which part of each layer's K/V storage this ubatch does not write, so a host-resident cache can be delivered ahead of the attention that reads it
+    // tell the scheduler what this ubatch does not write, so a host cache can go out ahead of the attention that reads it
     // must be refreshed for every ubatch, including when the graph is reused, because the write position moves while the graph does not
     void update_stable_prefixes(const slot_info & sinfo) const;
     void clear_stable_prefixes() const;
@@ -285,6 +285,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // stable prefix of each stream, in bytes; ggml keeps the address of these, so they live as long as the cache
+        mutable std::vector<size_t> k_stable;
+        mutable std::vector<size_t> v_stable;
     };
 
     bool v_trans = true;  // the value tensor is transposed

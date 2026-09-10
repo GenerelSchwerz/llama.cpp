@@ -703,22 +703,24 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // bytes at the start of every stream that stay unchanged for the current graph evaluation, 0 for none
-        // padding comes first so that ggml_new_tensor_impl zeroes the whole storage, whatever size_t is
+        // bytes at the start of each stream that stay unchanged for the current graph evaluation, one entry per stream, NULL for none
+        // padding comes first so that ggml_new_tensor_impl zeroes the whole storage, whatever a pointer is
         union {
-            char   padding[8];
-            size_t stable_prefix;
+            char           padding[8];
+            const size_t * stable_prefix;
         };
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
 
-    // declare that the first nbytes of every stream of tensor->data cannot change while a graph that reads this tensor runs
-    // a reader splits the storage into streams along the last dimension of its own view, so nbytes counts from the start of a stream, not of the tensor, and the caller must not pass more than one stream holds
-    // set it on the tensor that owns the storage, not on a view of it, and refresh it for the graph that is about to run, including when that graph is reused
-    // a backend may deliver a declared region before the point in the graph that reads it, so 0 declares nothing and is always correct
-    GGML_API void   ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes);
-    GGML_API size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor);
+    // declare that the first nbytes[s] of stream s of tensor->data cannot change while a graph that reads this tensor runs
+    // a reader splits the storage into streams along the last dimension of its own view, so a value counts from the start of its stream
+    // the caller keeps the array: one entry per stream of the storage, valid and current for every graph that runs, including a reused one
+    // a reader whose streams do not tile the storage, or that holds less than one entry says, declares nothing for it rather than guessing
+    // set it on the tensor that owns the storage, not on a view of it
+    // a backend may deliver a declared region before the point in the graph that reads it, so NULL and zeroes are always correct
+    GGML_API void           ggml_set_stable_prefix(struct ggml_tensor * tensor, const size_t * nbytes);
+    GGML_API const size_t * ggml_get_stable_prefix(const struct ggml_tensor * tensor);
 
     // Abort callback
     // If not NULL, called before ggml computation

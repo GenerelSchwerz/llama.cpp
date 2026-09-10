@@ -1327,15 +1327,12 @@ size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
     return GGML_PAD(ggml_nbytes(tensor), GGML_MEM_ALIGN);
 }
 
-void ggml_set_stable_prefix(struct ggml_tensor * tensor, size_t nbytes) {
+void ggml_set_stable_prefix(struct ggml_tensor * tensor, const size_t * nbytes) {
     GGML_ASSERT(tensor);
-    // the storage does not say how a reader splits it into streams, so only the tensor itself bounds the value here
-    // a reader clamps it again to one stream of its own view
-    const size_t total = ggml_nbytes(tensor);
-    tensor->stable_prefix = nbytes < total ? nbytes : total;
+    tensor->stable_prefix = nbytes;
 }
 
-size_t ggml_get_stable_prefix(const struct ggml_tensor * tensor) {
+const size_t * ggml_get_stable_prefix(const struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor);
     return tensor->stable_prefix;
 }

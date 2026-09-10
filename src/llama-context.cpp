@@ -153,6 +153,9 @@ llama_context::llama_context(
     if (cparams.kv_pipeline_budget_mib > std::min<uint64_t>(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX, std::numeric_limits<size_t>::max()/(1024*1024))) {
         throw std::invalid_argument("kv_pipeline_budget_mib must be <= " + std::to_string(LLAMA_KV_PIPELINE_BUDGET_MIB_MAX));
     }
+    if (cparams.kv_pipeline_depth > 0 && !cparams.kv_cpu_pinned && cparams.offload_kqv) {
+        LLAMA_LOG_WARN("%s: kv_pipeline_depth needs a host-resident KV cache, staying on the ordered path (see --no-kv-offload, --kv-cpu-pinned)\n", __func__);
+    }
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;

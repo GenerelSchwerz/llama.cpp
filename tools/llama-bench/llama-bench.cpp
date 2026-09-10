@@ -481,7 +481,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -mg, --main-gpu <i>                               (default: %s)\n", join(cmd_params_defaults.main_gpu, ",").c_str());
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -kvcp, --kv-cpu-pinned <0|1>                      (default: %s)\n", join(cmd_params_defaults.kv_cpu_pinned, ",").c_str());
-    printf("  -kvpd, --kv-pipeline-depth <0...14>               (default: %s)\n", join(cmd_params_defaults.kv_pipeline_depth, ",").c_str());
+    printf("  -kvpd, --kv-pipeline-depth <0...%d>               (default: %s)\n", LLAMA_KV_PIPELINE_DEPTH_MAX, join(cmd_params_defaults.kv_pipeline_depth, ",").c_str());
     printf("  -kvpb, --kv-pipeline-budget <MiB>                 (default: %s)\n", join(cmd_params_defaults.kv_pipeline_budget_mib, ",").c_str());
     printf("  -rso, --recurrent-state-offload <0|1>             (default: %s)\n", join(cmd_params_defaults.recurrent_state_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());

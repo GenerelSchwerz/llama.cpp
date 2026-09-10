@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -429,6 +430,15 @@ static transport_graph_pair make_transport_graph_pair(dummy_backend & cpu, size_
     s1->data   = base + size;
 
     return { std::move(result), std::move(buffer), { s0, s1 }, output };
+}
+
+// ggml keeps the address of a prefix array, so the test owns one per tensor for as long as it runs
+static std::map<ggml_tensor *, std::vector<size_t>> g_stable_prefix;
+
+static void set_stable_prefix(ggml_tensor * tensor, size_t nbytes, int64_t n_stream = 1) {
+    std::vector<size_t> & prefix = g_stable_prefix[tensor];
+    prefix.assign((size_t) n_stream, nbytes);
+    ggml_set_stable_prefix(tensor, prefix.data());
 }
 
 static void transport_stats(
@@ -1506,7 +1516,7 @@ static void test_transport_prefix_and_configuration() {
         GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 1));
         ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
 
-        ggml_set_stable_prefix(graph.source, 32);
+        set_stable_prefix(graph.source, 32);
         GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
 
@@ -1518,12 +1528,12 @@ static void test_transport_prefix_and_configuration() {
         GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
         GGML_ASSERT(!ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
 
-        ggml_set_stable_prefix(graph.source, 0);
+        set_stable_prefix(graph.source, 0);
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
         transport_stats(sched.get(), &deliveries, &early, &late);
         GGML_ASSERT(deliveries == 2 && early == 32 && late == 96);
 
-        ggml_set_stable_prefix(graph.source, 64);
+        set_stable_prefix(graph.source, 64);
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
         transport_stats(sched.get(), &deliveries, &early, &late);
         GGML_ASSERT(deliveries == 3 && early == 96 && late == 96);
@@ -1551,8 +1561,8 @@ static void test_transport_entry_allocation() {
     ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
 
     // one input goes early in part, the other whole
-    ggml_set_stable_prefix(graph.sources[0], nbytes/2);
-    ggml_set_stable_prefix(graph.sources[1], nbytes);
+    set_stable_prefix(graph.sources[0], nbytes/2);
+    set_stable_prefix(graph.sources[1], nbytes);
 
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), graph.ctx.graph) == GGML_STATUS_SUCCESS);
@@ -1622,7 +1632,7 @@ static void test_transport_entry_allocation() {
     }
 }
 
-// Slot k starts at k*slot_size, so a slot size the budget caps must still be a multiple of the ring alignment, or every slot after the first binds its entries to a misaligned address.
+// Slot k starts at k*slot_size, so a capped slot size must stay a multiple of the alignment, or every slot after the first is misaligned.
 static void test_transport_slot_alignment() {
     const size_t alignment = 256;
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, alignment, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
@@ -1641,7 +1651,7 @@ static void test_transport_slot_alignment() {
     ggml_backend_buffer_ptr buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, store));
     source->buffer = buffer.get();
     source->data   = ggml_backend_buffer_get_base(buffer.get());
-    ggml_set_stable_prefix(source, used);
+    set_stable_prefix(source, used);
 
     // the budget lands between the window and the next power of two, and is not a multiple of the alignment
     const int n_slots = 3; // depth 1 plus the margin
@@ -1671,7 +1681,7 @@ static void test_transport_slot_alignment() {
     GGML_ASSERT(ring_size % (n_slots*alignment) == 0);
 }
 
-// A window over several streams sits a fixed stride apart in one tensor, with cells between one stream's window and the next that the graph never reads.
+// A window over several streams sits a stride apart in one tensor, with cells between the streams that the graph never reads.
 // The delivery has to cover each stream's window from its own offset and leave those cells alone.
 static void test_transport_multi_stream_ranges() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
@@ -1708,7 +1718,7 @@ static void test_transport_multi_stream_ranges() {
     // half of every stream's window is stable, so each stream splits into an early and a late range
     const size_t row_bytes  = (size_t) n_embd*sizeof(float);
     const size_t used_bytes = (size_t) n_row*row_bytes;
-    ggml_set_stable_prefix(store, used_bytes/2);
+    set_stable_prefix(store, used_bytes/2, n_stream);
 
     GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), ctx.graph));
     GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), ctx.graph) == GGML_STATUS_SUCCESS);
@@ -1753,6 +1763,15 @@ static void test_transport_multi_stream_ranges() {
     transport_stats(sched.get(), NULL, &early, &late);
     GGML_ASSERT(early == (int64_t) ((size_t) n_stream*used_bytes/2));
     GGML_ASSERT(late  == (int64_t) ((size_t) n_stream*used_bytes/2));
+
+    // a prefix larger than one stream was never a per-stream value, so the whole window goes late instead of coming from the wrong rows
+    set_stable_prefix(store, ggml_nbytes(store), n_stream);
+    GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), ctx.graph) == GGML_STATUS_SUCCESS);
+
+    int64_t early_bad = 0, late_bad = 0;
+    transport_stats(sched.get(), NULL, &early_bad, &late_bad);
+    GGML_ASSERT(early_bad == early);
+    GGML_ASSERT(late_bad  == late + (int64_t) ((size_t) n_stream*used_bytes));
 }
 
 static void test_transport_empty_graph() {
@@ -1777,7 +1796,7 @@ static size_t transport_fallback_buffer_size(int depth) {
     ggml_tensor * source = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, 4, 1);
     ggml_tensor * output = ggml_mul_mat(graph.ctx, weight, source);
     source->flags |= GGML_TENSOR_FLAG_TRANSPORT;
-    ggml_set_stable_prefix(source, ggml_nbytes(source));
+    set_stable_prefix(source, ggml_nbytes(source));
     ggml_build_forward_expand(graph.graph, output);
 
     ggml_backend_buffer_ptr weight_buffer(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, ggml_nbytes(weight)));
@@ -1808,7 +1827,7 @@ static size_t transport_scale_buffer_size(int depth, size_t nbytes, size_t capac
     cuda.context->capacity = capacity;
 
     auto graph = make_transport_graph(cpu, nbytes);
-    ggml_set_stable_prefix(graph.source, nbytes);
+    set_stable_prefix(graph.source, nbytes);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -1842,7 +1861,7 @@ static void test_transport_releases_ring_for_graph() {
     GGML_ASSERT(transfers == 0);
 }
 
-// a graph that stages nothing keeps the ring for a few graphs and the transfer context for good: a context shift runs between decodes and must not rebuild either every time
+// a graph that stages nothing keeps the ring for a few graphs and the transfer context for good: a context shift must not rebuild either
 static void test_transport_keeps_ring_over_idle_graph() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
@@ -1850,8 +1869,8 @@ static void test_transport_keeps_ring_over_idle_graph() {
     auto idle   = make_transport_graph(cpu, 64);
     auto second = make_transport_graph(cpu, 64);
     idle.source->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
-    ggml_set_stable_prefix(first.source,  64);
-    ggml_set_stable_prefix(second.source, 64);
+    set_stable_prefix(first.source,  64);
+    set_stable_prefix(second.source, 64);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -1872,7 +1891,7 @@ static void test_transport_keeps_ring_over_idle_graph() {
         GGML_ASSERT(ggml_backend_sched_graph_compute(sched.get(), idle.ctx.graph) == GGML_STATUS_SUCCESS);
     };
 
-    // one idle graph keeps the ring: freeing and allocating it again blocks the host on the device, which is what growing it in powers of two exists to avoid
+    // one idle graph keeps the ring: freeing and allocating it again blocks the host, which powers-of-two growth exists to avoid
     run_idle();
     GGML_ASSERT(cuda.context->buffers.size() == n_staged_buffers);
 
@@ -1937,7 +1956,7 @@ static void test_transport_environment_is_fallback() {
     scoped_test_env budget_env("GGML_KV_PIPELINE_BUDGET_MIB", "8");
     {
         auto graph = make_transport_graph(cpu, 64);
-        ggml_set_stable_prefix(graph.source, 64);
+        set_stable_prefix(graph.source, 64);
         ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
         ggml_backend_sched_set_tensor_backend(sched.get(), graph.output, cuda.handle.get());
         GGML_ASSERT(ggml_backend_sched_alloc_graph(sched.get(), graph.ctx.graph));
@@ -1948,7 +1967,7 @@ static void test_transport_environment_is_fallback() {
     }
     {
         auto graph = make_transport_graph(cpu, 64);
-        ggml_set_stable_prefix(graph.source, 64);
+        set_stable_prefix(graph.source, 64);
         ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, 128, false, false));
         GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_depth(sched.get(), 0));
         GGML_ASSERT(ggml_backend_sched_set_transport_pipeline_budget(sched.get(), 0));
@@ -1977,7 +1996,7 @@ static void test_transport_depth_zero() {
     dummy_backend cuda = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto graph = make_transport_graph(cpu, 64);
-    ggml_set_stable_prefix(graph.source, 64);
+    set_stable_prefix(graph.source, 64);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -2000,8 +2019,8 @@ static void test_transport_budget_recovers() {
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto large = make_transport_graph(cpu, 256);
     auto small = make_transport_graph(cpu, 64);
-    ggml_set_stable_prefix(large.source, 256);
-    ggml_set_stable_prefix(small.source, 64);
+    set_stable_prefix(large.source, 256);
+    set_stable_prefix(small.source, 64);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -2038,8 +2057,8 @@ static void test_transport_partial_backend_failure() {
     ggml_tensor * output      = ggml_add(graph.ctx, output_fail, output_ok);
     source_fail->flags |= GGML_TENSOR_FLAG_TRANSPORT;
     source_ok->flags   |= GGML_TENSOR_FLAG_TRANSPORT;
-    ggml_set_stable_prefix(source_fail, 64);
-    ggml_set_stable_prefix(source_ok, 64);
+    set_stable_prefix(source_fail, 64);
+    set_stable_prefix(source_ok, 64);
     ggml_build_forward_expand(graph.graph, output);
 
     ggml_backend_buffer_ptr buffer_fail(ggml_backend_buft_alloc_buffer(&cpu.buffer_type, 64));
@@ -2077,8 +2096,8 @@ static void test_transport_stops_after_backend_failure() {
     cuda.context->fail_event_init = true;
     auto first  = make_transport_graph(cpu, 64);
     auto second = make_transport_graph(cpu, 64);
-    ggml_set_stable_prefix(first.source,  64);
-    ggml_set_stable_prefix(second.source, 64);
+    set_stable_prefix(first.source,  64);
+    set_stable_prefix(second.source, 64);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -2105,7 +2124,7 @@ static void test_transport_excludes_meta() {
     dummy_backend meta = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_META, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto graph = make_transport_graph(cpu, 64);
-    ggml_set_stable_prefix(graph.source, 64);
+    set_stable_prefix(graph.source, 64);
 
     ggml_backend_t backends[] = { meta.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &meta.buffer_type, &cpu.buffer_type };
@@ -2126,7 +2145,7 @@ static void test_transport_requires_annotation() {
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto graph = make_transport_graph(cpu, 64);
     graph.source->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
-    ggml_set_stable_prefix(graph.source, 64);
+    set_stable_prefix(graph.source, 64);
 
     ggml_backend_t backends[] = { cuda.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &cuda.buffer_type, &cpu.buffer_type };
@@ -2146,7 +2165,7 @@ static void test_transport_excludes_non_cuda() {
     dummy_backend sycl = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_GPU, "SYCL", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
     auto graph = make_transport_graph(cpu, 64);
-    ggml_set_stable_prefix(graph.source, 64);
+    set_stable_prefix(graph.source, 64);
 
     ggml_backend_t backends[] = { sycl.handle.get(), cpu.handle.get() };
     ggml_backend_buffer_type_t bufts[] = { &sycl.buffer_type, &cpu.buffer_type };

@@ -325,22 +325,22 @@ extern "C" {
 
     // Pipelined delivery of host-resident split inputs.
     //
-    // Without it a split that reads a host-resident input pays copy + compute in series: the transfer is issued on the consumer's own stream right before the kernels that read it.
-    // With it the scheduler keeps a ring of staging slots outside the graph allocator's reach and issues the stable prefix of a later split on a separate transfer stream, so the transfer retires under the kernels of the split before it.
+    // Without it a split that reads a host input pays copy + compute in series: the copy goes on the consumer's stream right before the kernels.
+    // With it the scheduler keeps a ring of staging slots out of ggml-alloc's reach, and sends a later split's stable prefix on a transfer stream.
     //
-    // Only persistent host inputs marked with GGML_TENSOR_FLAG_TRANSPORT are eligible, and their stable prefix must be current before each evaluation.
+    // Only persistent host inputs marked GGML_TENSOR_FLAG_TRANSPORT are eligible, and their stable prefix must be current before each evaluation.
     // The producer must be the CPU or the same backend stream that consumes the late region.
     //
-    // `depth` is how many splits ahead deliveries run, 0 disables pipelining, and it must not be more than GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN (14 by default).
-    // The ring holds a couple of slots more than that, so recycling a slot never waits for a reader that is still running.
-    // Only the CUDA backend is accepted as the destination: the ring needs a second context on the same device that transfers asynchronously and orders with events, and CUDA is where that is measured. Every other backend ignores the setting and keeps the ordered path.
+    // `depth` is how many splits ahead deliveries run, 0 disables it, at most GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN (14).
+    // The ring holds a couple of slots more, so recycling a slot never waits for a reader that still runs.
+    // Only CUDA is accepted as the destination: the ring needs a second context that transfers async and orders with events. Others stay ordered.
     // Costs roughly (depth + 2) * (largest staged split) of device memory.
     // Returns false for a depth out of range, and after the first graph is allocated.
-    // The ring is optional: if the graph cannot be allocated next to it, the scheduler releases the rings that were holding memory and stops asking for them.
+    // The ring is optional: if a graph does not fit next to it, the scheduler releases the rings that held memory and stops asking for them.
     GGML_API bool                 ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth);
 
     // Hard cap on the staging ring, in bytes, default 128 MiB and 0 removes the cap.
-    // A host-resident cache exists to keep device memory free, so the ring is capped outright rather than against what happens to be free: past the cap the scheduler declines and keeps the ordered path.
+    // A host cache exists to keep device memory free, so the ring has a hard cap: past it the scheduler declines and keeps the ordered path.
     // Must be called before the first graph is allocated, and returns false after that.
     GGML_API bool                 ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched, size_t bytes);
 
