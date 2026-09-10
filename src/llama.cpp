@@ -325,6 +325,10 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // for the duration of this function, which outlives the loader's use
         // of the pointer.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
+        // Function scope, like the vector: the loader dereferences these pattern
+        // pointers long after the block below closes - a block-scoped string
+        // would dangle its c_str() before the loader runs.
+        std::string pin_pattern;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
         if (params.moe_expert_cache_slots > 0) {
             ggml_backend_moe_cache_set_slots_t set_slots_fn = nullptr;
@@ -347,9 +351,50 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             set_slots_fn(params.moe_expert_cache_slots);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
-            static const char * MOE_EXPS_PATTERN =
-                "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
+            //
+            // Windows WDDM caps TOTAL page-locked memory near ~50% of physical RAM, so
+            // pinning a full expert set (tens of GiB) fails there and the whole cache
+            // silently falls back to plain CPU buffers. GGML_CUDA_MOE_PIN_LAYERS=N
+            // remedies this by routing only the first N layers' expert tensors through
+            // the cached (pinned) buffer type - the subset then pins under the quota -
+            // while the remaining layers follow their normal placement (the
+            // --n-gpu-layers window, or --cpu-moe / --n-cpu-moe where they match).
+            // The MMID kernels read expert sources directly from pinned host memory,
+            // so the cached subset must pin in full: partial pins crash.
+            int pin_layers = 0;
+            const char * pin_layers_env = getenv("GGML_CUDA_MOE_PIN_LAYERS");
+            if (pin_layers_env != nullptr && pin_layers_env[0] != '\0') {
+                char * end = nullptr;
+                long v = strtol(pin_layers_env, &end, 10);
+                if (end == pin_layers_env || end == nullptr || *end != '\0' || v <= 0) {
+                    LLAMA_LOG_WARN("GGML_CUDA_MOE_PIN_LAYERS=%s is not a positive integer - ignoring\n",
+                                   pin_layers_env);
+                } else {
+                    // The cap only bounds the regex size: a count above the model
+                    // depth is harmless, the extra alternations never match.
+                    if (v > 512) {
+                        LLAMA_LOG_WARN("GGML_CUDA_MOE_PIN_LAYERS=%ld clamped to 512\n", v);
+                        v = 512;
+                    }
+                    pin_layers = (int) v;
+                }
+            }
+            if (pin_layers > 0) {
+                pin_pattern = "blk\\.(";
+                for (int i = 0; i < pin_layers; i++) {
+                    if (i > 0) pin_pattern += "|";
+                    pin_pattern += std::to_string(i);
+                }
+                pin_pattern += ")\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+                effective_overrides.push_back({pin_pattern.c_str(), buffer_type_fn()});
+                LLAMA_LOG_INFO("moe expert cache: pin-budget mode - routing expert tensors of the first %d layers "
+                               "through the GPU LRU cache (remaining layers keep their normal placement: the "
+                               "--n-gpu-layers window, or --cpu-moe / --n-cpu-moe where they match)\n", pin_layers);
+            } else {
+                static const char * MOE_EXPS_PATTERN =
+                    "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+                effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
+            }
 
             bool had_user_overrides = false;
             if (params.tensor_buft_overrides) {
@@ -359,8 +404,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 }
             }
             if (had_user_overrides) {
-                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
-                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                if (pin_layers > 0) {
+                    LLAMA_LOG_WARN("--moe-expert-cache-size with GGML_CUDA_MOE_PIN_LAYERS: expert tensors of "
+                                   "the first %d layers route through the GPU LRU cache and override "
+                                   "--cpu-moe / --n-cpu-moe for those layers only; later layers keep "
+                                   "those overrides.\n", pin_layers);
+                } else {
+                    LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
+                                   "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                }
             }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();

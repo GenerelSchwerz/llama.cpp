@@ -30,6 +30,10 @@
 #include "ggml-cuda.h"
 #include "ggml.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -11016,10 +11020,179 @@ static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
     return ptr;
 }
 
+#ifdef _WIN32
+// Windows WDDM pins have two limits: a per-allocation cap (a single tens-of-GiB
+// cudaMallocHost fails) and an aggregate quota near half of physical RAM. A
+// full-range VirtualAlloc + chunked cudaHostRegister (4 GiB pieces) yields one
+// contiguous, fully pinned buffer. Every chunk must register or the whole
+// thing unwinds: a partially-pinned store crashes the kernels.
+static const size_t MOE_WIN_PIN_CHUNK = 4ULL << 30;
+static const size_t MOE_WIN_PIN_CHUNK_MIN = 16ULL << 20;
+
+// Per-allocation registration records: each allocation resolves its own chunk
+// size, so cleanup must walk the addresses that were actually registered.
+struct moe_win_pin_segment {
+    void * addr;
+    size_t bytes;
+};
+
+struct moe_win_pin_record {
+    void * base;
+    size_t size;
+    std::vector<moe_win_pin_segment> segments;
+};
+
+// Serializes pin and unpin: the WDDM quota is process-wide.
+static std::mutex g_moe_win_pin_mu;
+static std::vector<moe_win_pin_record> g_moe_win_pin_records;
+
+// Caller must hold g_moe_win_pin_mu. VirtualFree runs only when all
+// unregisters succeed: freeing a range the driver still has registered
+// is worse than leaking the VA range.
+static bool moe_win_pin_release(void * base) {
+    for (auto it = g_moe_win_pin_records.begin(); it != g_moe_win_pin_records.end(); ++it) {
+        if (it->base != base) {
+            continue;
+        }
+        bool ok = true;
+        for (auto seg = it->segments.rbegin(); seg != it->segments.rend(); ++seg) {
+            cudaError_t err = cudaHostUnregister(seg->addr);
+            if (err != cudaSuccess) {
+                (void)cudaGetLastError();
+                GGML_LOG_WARN("moe-cache: win pin cudaHostUnregister of %zu MiB failed: %s\n",
+                              seg->bytes >> 20, cudaGetErrorString(err));
+                ok = false;
+            }
+        }
+        if (ok && !VirtualFree(base, 0, MEM_RELEASE)) {
+            GGML_LOG_ERROR("moe-cache: win pin VirtualFree failed: %lu\n", GetLastError());
+            ok = false;
+        }
+        g_moe_win_pin_records.erase(it);
+        return ok;
+    }
+    GGML_LOG_WARN("moe-cache: no win pin record for base %p\n", base);
+    return false;
+}
+
+static void * ggml_cuda_moe_cached_win_pinned_malloc(size_t size) {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_moe_win_pin_mu);
+
+    void * base = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (base == nullptr) {
+        GGML_LOG_DEBUG("%s: VirtualAlloc of %.2f MiB failed\n", __func__, size / 1024.0 / 1024.0);
+        return nullptr;
+    }
+
+    // The in-process WDDM pin ceiling depends on how much the CUDA context has
+    // already allocated, so probe downward and use the largest chunk that registers.
+    size_t chunk = MOE_WIN_PIN_CHUNK;
+    while (chunk >= MOE_WIN_PIN_CHUNK_MIN) {
+        // Touch the probe range first: cudaHostRegister needs resident pages.
+        unsigned char * p = (unsigned char *) base;
+        for (size_t off = 0; off < chunk && off < size; off += 4096) { p[off] = 0; }
+        cudaError_t e = cudaHostRegister(base, std::min(chunk, size), cudaHostRegisterDefault);
+        if (e == cudaSuccess) {
+            if (cudaHostUnregister(base) != cudaSuccess) {
+                (void)cudaGetLastError();
+                // Range stays registered: freeing it would fault. Leak the VA range.
+                GGML_LOG_ERROR("%s: probe cudaHostUnregister failed - leaking the range\n", __func__);
+                return nullptr;
+            }
+            break;
+        }
+        (void)cudaGetLastError();
+        chunk >>= 1;
+    }
+    if (chunk < MOE_WIN_PIN_CHUNK_MIN) {
+        GGML_LOG_DEBUG("%s: even a %zu MiB pin fails in this process - WDDM pin path exhausted\n",
+                       __func__, MOE_WIN_PIN_CHUNK_MIN >> 20);
+        VirtualFree(base, 0, MEM_RELEASE);
+        return nullptr;
+    }
+
+    std::vector<moe_win_pin_segment> segments;
+    size_t registered = 0;
+    while (registered < size) {
+        size_t n = std::min(chunk, size - registered);
+        // Touch the range first: cudaHostRegister needs resident committed pages.
+        unsigned char * p = (unsigned char *) base + registered;
+        for (size_t off = 0; off < n; off += 4096) { p[off] = 0; }
+
+        cudaError_t err = cudaHostRegister(p, n, cudaHostRegisterDefault);
+        if (err != cudaSuccess) {
+            (void)cudaGetLastError();
+            GGML_LOG_DEBUG("%s: cudaHostRegister of %.2f MiB at offset %.2f GiB failed: %s "
+                           "(aggregate pinned quota reached?)\n",
+                           __func__, n / 1024.0 / 1024.0, registered / 1024.0 / 1024.0 / 1024.0,
+                           cudaGetErrorString(err));
+            // Unwind the segments already registered, in reverse order.
+            bool ok = true;
+            for (auto seg = segments.rbegin(); seg != segments.rend(); ++seg) {
+                cudaError_t uerr = cudaHostUnregister(seg->addr);
+                if (uerr != cudaSuccess) {
+                    (void)cudaGetLastError();
+                    GGML_LOG_WARN("%s: unwind cudaHostUnregister of %zu MiB failed: %s\n",
+                                  __func__, seg->bytes >> 20, cudaGetErrorString(uerr));
+                    ok = false;
+                }
+            }
+            if (ok) {
+                VirtualFree(base, 0, MEM_RELEASE);
+            } else {
+                GGML_LOG_ERROR("%s: incomplete unwind - leaking the VA range\n", __func__);
+            }
+            return nullptr;
+        }
+        segments.push_back({p, n});
+        registered += n;
+    }
+
+    g_moe_win_pin_records.push_back({base, size, std::move(segments)});
+
+    GGML_LOG_INFO("moe-cache: Windows chunked pin engaged - %.2f GiB fully pinned in %zu MiB chunks\n",
+                  size / 1024.0 / 1024.0 / 1024.0, chunk >> 20);
+    return base;
+}
+
+static void ggml_backend_cuda_moe_cached_win_pinned_free_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || buffer->context == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_moe_win_pin_mu);
+    if (!moe_win_pin_release(buffer->context)) {
+        GGML_LOG_ERROR("moe-cache: win pin cleanup incomplete for base %p (%.2f GiB) - "
+                       "pinned quota may be held until process exit\n",
+                       buffer->context, buffer->size / 1024.0 / 1024.0 / 1024.0);
+    }
+}
+#endif // _WIN32
+
 static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
         ggml_backend_buffer_type_t buft, size_t size) {
 
-    void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    void * ptr = nullptr;
+#ifdef _WIN32
+    bool win_chunked = false;
+#endif
+
+#ifdef _WIN32
+    // Windows: a failed tens-of-GiB cudaMallocHost appears to poison the WDDM
+    // pin path for the rest of the process (subsequent cudaHostRegister of
+    // even one 4 GiB chunk fails with out-of-memory). Go chunked-first and
+    // keep cudaMallocHost as the small-allocation fallback.
+    ptr = ggml_cuda_moe_cached_win_pinned_malloc(size);
+    win_chunked = ptr != nullptr;
+    if (ptr == nullptr) {
+        ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+    }
+#else
+    ptr = ggml_cuda_moe_cached_pinned_malloc(size);
+#endif
 
     if (ptr == nullptr) {
         // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
@@ -11030,6 +11203,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft             = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_buffer_free_buffer;
+#ifdef _WIN32
+    if (win_chunked) {
+        buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_win_pinned_free_buffer;
+    }
+#endif
     return buffer;
 }
 
