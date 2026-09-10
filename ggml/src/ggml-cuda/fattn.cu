@@ -1,9 +1,12 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-quant-decl.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+
+#include <atomic>
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -127,6 +130,16 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2LL*n_kv_max);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// Counts the FlashAttention nodes that took the quantized-native route. Route
+// selection is otherwise only observable through allocation size or throughput,
+// which are incidental; test-backend-ops reads this to assert which path a case
+// actually ran.
+static std::atomic<int64_t> fattn_native_count{0};
+
+int64_t ggml_backend_cuda_fattn_native_count(void) {
+    return fattn_native_count.load(std::memory_order_relaxed);
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -375,6 +388,67 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     }
 }
 
+// One row of the quantized-native route table at both its widths: 64/ncols2
+// columns for Ampere and newer, 32/ncols2 for Turing. Those are the two widths
+// switch_ncols1() ends with.
+template <ggml_type type, int D, int ncols2>
+static void ggml_cuda_flash_attn_ext_mma_quant_shape(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1) {
+    if (ncols1 == 64/ncols2) {
+        ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 64/ncols2, ncols2, type, type>(ctx, dst);
+        return;
+    }
+    GGML_ASSERT(ncols1 == 32/ncols2); // the row has no other compiled width
+    ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 32/ncols2, ncols2, type, type>(ctx, dst);
+}
+
+// Launch one row of the quantized-native route table. The rows here are the
+// same ones fattn-mma-quant-decl.cuh declares and
+// ggml_cuda_fattn_native_supported() selects.
+template <ggml_type type>
+static void ggml_cuda_flash_attn_ext_mma_quant_case(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
+    const int64_t D = dst->src[0]->ne[0];
+
+    if (D == 256 && ncols2 == 8) {
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 8>(ctx, dst, ncols1);
+        return;
+    }
+
+    // The other two rows exist for Q4_0 and Q8_0 only.
+    if constexpr (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q8_0) {
+        if (D == 512) {
+            GGML_ASSERT(ncols2 == 8);
+            ggml_cuda_flash_attn_ext_mma_quant_shape<type, 512, 8>(ctx, dst, ncols1);
+            return;
+        }
+        GGML_ASSERT(D == 256 && ncols2 == 2);
+        ggml_cuda_flash_attn_ext_mma_quant_shape<type, 256, 2>(ctx, dst, ncols1);
+        return;
+    }
+
+    GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_supported
+}
+
+static void ggml_cuda_flash_attn_ext_mma_quant(
+        ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols1, const int ncols2) {
+    const ggml_tensor * K = dst->src[1];
+
+    GGML_ASSERT(ggml_cuda_fattn_mma_quant_pair(K->type, dst->src[2]->type));
+
+#define FATTN_MMA_QUANT_DISPATCH_CASE(t)                                          \
+        case t:                                                                   \
+            ggml_cuda_flash_attn_ext_mma_quant_case<t>(ctx, dst, ncols1, ncols2);  \
+            break;
+
+    switch (K->type) {
+        FATTN_MMA_QUANT_TYPES(FATTN_MMA_QUANT_DISPATCH_CASE)
+        default:
+            GGML_ABORT("fatal error"); // gated by ggml_cuda_fattn_native_supported
+    }
+#undef FATTN_MMA_QUANT_DISPATCH_CASE
+}
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -467,7 +541,96 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_MMA_NATIVE = 500, // MMA reading a quantized cache in place, no F16 copy
 };
+
+// Geometry the quantized-native route has a compiled kernel for, and the tile
+// shape that kernel uses. The rows are:
+//
+//   D=256, gqa_ratio == 2, n_q > 16 -> 32x2, Q4_0 and Q8_0
+//   D=256, gqa_ratio  > 4, n_q >  4 ->  8x8, every compiled native type
+//   D=512, gqa_ratio  > 4, n_q >  4 ->  8x8, Q4_0 and Q8_0
+//
+// Each shape is what ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1/2() would
+// pick inside those bounds. It is written out here rather than taken from those
+// switches so that the compiled kernel set is exactly the set this function can
+// select; fattn-mma-quant-decl.cuh declares the same rows.
+//
+// Turing takes the same rows with half the columns: 16x2, 4x8 and 4x8. That is
+// the Turing escape in switch_ncols1(), which caps ncols1*ncols2 at 32 there.
+// The escape fires exactly when Ampere is not the compiled target, so
+// ampere_mma_available() is what picks between the two shapes.
+//
+// Every condition here answers "is a kernel compiled for this". The caller opts
+// in with --flash-attn-native-quants and owns the decision from there; nothing
+// second-guesses it by cache length or by where the cache lives.
+static bool ggml_cuda_fattn_native_supported(
+        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        int * ncols1, int * ncols2) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    float logit_softcap;
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    // the q5_1 loader reads qh with an 8-byte aligned access
+    const auto q5_1_aligned = [](const ggml_tensor * tensor) {
+        return tensor->type != GGML_TYPE_Q5_1 || (((uintptr_t) tensor->data | tensor->nb[1]) & 7) == 0;
+    };
+
+    if (!turing_mma_available(cc) || logit_softcap != 0.0f || !gqa_opt_applies ||
+            !ggml_cuda_fattn_mma_quant_pair(K->type, V->type) ||
+            K->ne[0] != Q->ne[0] || V->ne[0] != Q->ne[0] ||
+            !q5_1_aligned(K) || !q5_1_aligned(V)) {
+        return false;
+    }
+
+    const bool default_tier = K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q8_0;
+    const bool wide_tile    = ampere_mma_available(cc);
+
+    if (Q->ne[0] == 512) {
+        if (!default_tier || gqa_ratio <= 4 || Q->ne[1] <= 4) {
+            return false;
+        }
+        *ncols1 = wide_tile ? 8 : 4;
+        *ncols2 = 8;
+        return true;
+    }
+
+    if (Q->ne[0] != 256) {
+        return false;
+    }
+
+    if (gqa_ratio == 2) {
+        if (!default_tier || Q->ne[1] <= 16) {
+            return false;
+        }
+        *ncols1 = wide_tile ? 32 : 16;
+        *ncols2 = 2;
+        return true;
+    }
+
+    if (gqa_ratio <= 4 || Q->ne[1] <= 4) {
+        return false;
+    }
+    *ncols1 = wide_tile ? 8 : 4;
+    *ncols2 = 8;
+    return true;
+}
+
+// The graph opts in per node, so a build that compiled the kernels still keeps
+// the F16-casting path unless the caller asked for this route.
+static bool ggml_cuda_fattn_native_enabled(const ggml_tensor * dst) {
+    return ggml_get_op_params_i32(dst, GGML_FLASH_ATTN_EXT_OP_PARAM_NATIVE_QUANTS) != 0;
+}
+
+static bool ggml_cuda_fattn_native_applies(
+        const int cc, const ggml_tensor * dst, const bool gqa_opt_applies, const int gqa_ratio,
+        int * ncols1, int * ncols2) {
+    return ggml_cuda_fattn_native_enabled(dst) &&
+        ggml_cuda_fattn_native_supported(cc, dst, gqa_opt_applies, gqa_ratio, ncols1, ncols2);
+}
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
@@ -489,7 +652,10 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     }
 }
 
-static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+// ncols1/ncols2 receive the tile shape when the return value is
+// BEST_FATTN_KERNEL_MMA_NATIVE; they are untouched otherwise.
+static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(
+        const int device, const ggml_tensor * dst, int * ncols1 = nullptr, int * ncols2 = nullptr) {
 #ifndef FLASH_ATTN_AVAILABLE
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
@@ -621,6 +787,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 return BEST_FATTN_KERNEL_VEC;
             }
         }
+        int native_ncols1 = 0;
+        int native_ncols2 = 0;
+        if (ggml_cuda_fattn_native_applies(cc, dst, gqa_opt_applies, gqa_ratio, &native_ncols1, &native_ncols2)) {
+            if (ncols1 && ncols2) {
+                *ncols1 = native_ncols1;
+                *ncols2 = native_ncols2;
+            }
+            return BEST_FATTN_KERNEL_MMA_NATIVE;
+        }
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
@@ -699,6 +874,8 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32;
             need_f16_V = V->type == GGML_TYPE_F32;
             break;
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
+            break;
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -711,7 +888,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    int ncols1 = 0;
+    int ncols2 = 0;
+    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst, &ncols1, &ncols2)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
@@ -722,6 +901,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_MMA_NATIVE:
+            fattn_native_count.fetch_add(1, std::memory_order_relaxed);
+            ggml_cuda_flash_attn_ext_mma_quant(ctx, dst, ncols1, ncols2);
             break;
     }
 }
