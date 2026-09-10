@@ -6,10 +6,6 @@
 #include "llama-hparams.h"
 #include "llama.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <array>
 #include <cinttypes>

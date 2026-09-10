@@ -25,10 +25,6 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
@@ -1735,9 +1731,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-#ifdef GGML_USE_CUDA
-        if (ml.use_mmap && use_mmap_buffer && ggml_backend_buft_is_cuda_moe_cached(buft)) {
+        ggml_backend_reg_t buft_reg = ggml_backend_dev_backend_reg(dev);
+        auto is_moe_cache_buft_fn = (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
+                buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME);
+        const bool is_moe_cache_buft = is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
+        if (ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            auto buffer_from_host_ptr_fn = (ggml_backend_moe_cache_buffer_from_host_ptr_t)
+                    ggml_backend_reg_get_proc_address(buft_reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME);
+            if (buffer_from_host_ptr_fn == nullptr) {
+                throw std::runtime_error(format("%s does not support buffers from mapped host memory", ggml_backend_buft_name(buft)));
+            }
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 void * addr = nullptr;
                 size_t first, last; // NOLINT
@@ -1745,16 +1749,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
-                ggml_backend_buffer_t buf = ggml_backend_cuda_moe_cached_buffer_from_host_ptr((char *) addr + first, last - first);
+                ggml_backend_buffer_t buf = buffer_from_host_ptr_fn((char *) addr + first, last - first);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        } else
-#endif
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2830,11 +2832,16 @@ void llama_free_model(llama_model * model) {
 }
 
 void llama_model_free(llama_model * model) {
-#ifdef GGML_USE_CUDA
     if (model && model->moe_expert_cache_slots() > 0) {
-        ggml_backend_cuda_moe_log_and_reset_stats();
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            auto log_stats_fn = (ggml_backend_moe_cache_log_and_reset_stats_t) ggml_backend_reg_get_proc_address(
+                    reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME);
+            if (log_stats_fn != nullptr) {
+                log_stats_fn();
+            }
+        }
     }
-#endif
     delete model;
 }
 
