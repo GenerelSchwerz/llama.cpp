@@ -247,15 +247,9 @@ the F16 path in both builds move by at most 0.4% on the 4070 and 1.7% on the
 Every row is faster on Ada. On Ampere the D=512 rows are the largest win of any
 row on either card, and the D=256 rows are slower.
 
-The cause is the loading pipeline, not the loaders. Every D=256 entry in the MMA
-config table sets `nstages_target = 2` and every D=512 entry sets `1`. The native
-loaders write the shared-memory tile themselves, so they force `nstages = 0`: at
-D=256 that gives up a real two-stage cp.async pipeline, at D=512 there is none to
-give up. Ada absorbs the loss and Ampere does not.
-
-The D=256 rows are kept on Ampere anyway, because that is where the route saves
-the transient copy and because the loss is bounded. Staging the quantized tiles
-through cp.async would remove the tradeoff and is the obvious follow-up.
+There are three causes, separated below under **Where the Ampere cost comes
+from**. An earlier revision of this document blamed the loading pipeline alone;
+that is wrong, and the measurement that shows it is there.
 
 End to end, Qwen3.8-27B-UD-IQ2_M (D=256, 24 heads, 4 KV heads, GQA 6) with a
 `q4_0` cache on one GPU, route asserted by the native-launch counter:
@@ -268,6 +262,73 @@ End to end, Qwen3.8-27B-UD-IQ2_M (D=256, 24 heads, 4 KV heads, GQA 6) with a
 
 t/s, higher is better. Decode is unaffected because a single-token query stays on
 the vector kernel.
+
+#### Where the Ampere cost comes from
+
+The native loaders write the shared-memory tile themselves, so they force
+`nstages = 0`. Every D=256 entry in the MMA config table sets
+`nstages_target = 2` and every D=512 entry sets `1`, so at D=256 the route gives
+up a two-stage cp.async pipeline and at D=512 there is none to give up. That is
+one cause, and for a long time it was the only one recorded here.
+
+Measuring it needs a third build: the F16-casting path with `nstages` forced to
+0, which removes the pipeline as a variable and leaves only the loaders. On the
+3060, `test-backend-ops perf`, us/run:
+
+| Row | n_q | F16 `ns=2` | native `ns=0` | F16 `ns=0` | native vs F16 | native vs F16 at equal `ns` |
+|---|---:|---:|---:|---:|---:|---:|
+| D=256, GQA 6, `q4_0`, n_kv 1024 | 2048 | 2190 | 2761 | 2561 | +26.0% | +7.8% |
+| D=256, GQA 6, `q8_0`, n_kv 512 | 2048 | 1162 | 1522 | 1401 | +30.9% | +8.6% |
+| D=256, GQA 6, `q8_0`, n_kv 512 | 512 | 329 | 409 | 389 | +24.2% | +4.9% |
+| D=256, GQA 2, `q4_0`, n_kv 1024 | 2048 | 1224 | 2061 | 1461 | +68.4% | +41.1% |
+| D=256, GQA 2, `q4_0`, n_kv 1024 | 512 | 371 | 586 | 444 | +58.1% | +31.9% |
+| D=256, GQA 2, `q8_0`, n_kv 1024 | 2048 | 1232 | 1498 | 1466 | +21.6% | +2.2% |
+| D=256, GQA 2, `q8_0`, n_kv 1024 | 512 | 373 | 425 | 446 | +13.9% | -4.6% |
+
+The last column is the loaders with the pipeline held equal. For `q8_0` it is
+between -4.6% and +8.6%: the loader is close to free, and at one row it beats
+the path it replaces. For `q4_0` at GQA 2 it is +31.9% and +41.1%. Same tile,
+same thread count, same pipeline; the difference is the dequant. `q8_0` converts
+bytes to half, `q4_0` extracts nibbles with a mask, a shift, `__byte_perm` and a
+bias subtract, and that integer work is what costs on GA106.
+
+Part of it was the per-thread load run rather than the arithmetic.
+`fattn_quant_load_width<GGML_TYPE_Q4_0>` used to be 8 for every 128-thread
+config, which is every D=256 row, where `q8_0` uses 16. Widening it to 16, which
+is what the type now uses, on the 3060:
+
+| Row | n_q | width 8 | width 16 | vs width 8 | width 16 vs F16 at equal `ns` |
+|---|---:|---:|---:|---:|---:|
+| D=256, GQA 6, `q4_0`, n_kv 1024 | 2048 | 2761 | 2701 | -2.2% | +5.5% |
+| D=256, GQA 6, `q4_0`, n_kv 16384 | 512 | 11018 | 10639 | -3.4% | -0.0% |
+| D=256, GQA 2, `q4_0`, n_kv 1024 | 2048 | 2061 | 1740 | -15.6% | +19.1% |
+| D=256, GQA 2, `q4_0`, n_kv 1024 | 512 | 586 | 504 | -14.0% | +13.5% |
+
+The 4070 agrees, so the narrower run was not a tradeoff between the two
+architectures, just worse:
+
+| Row | n_q | width 8 | width 16 | vs width 8 |
+|---|---:|---:|---:|---:|
+| D=256, GQA 6, `q4_0`, n_kv 1024 | 2048 | 1234 | 1192 | -3.5% |
+| D=256, GQA 6, `q4_0`, n_kv 1024 | 512 | 328 | 316 | -3.8% |
+| D=256, GQA 6, `q4_0`, n_kv 16384 | 2048 | 18300 | 16980 | -7.2% |
+| D=256, GQA 6, `q4_0`, n_kv 16384 | 512 | 4523 | 4384 | -3.1% |
+| D=256, GQA 2, `q4_0`, n_kv 1024 | 2048 | 695 | 673 | -3.1% |
+| D=512, GQA 16, `q4_0`, n_kv 4096 | 512 | 1325 | 1330 | +0.4% |
+
+The D=512 row already ran at 16, and moves by noise. So `q4_0` now takes the
+16-wide default like every other type, and the specialization is gone.
+
+So the D=256 Ampere cost is the cp.async pipeline, plus a load width tuned for
+Ada, plus a residual nibble-unpack cost that is real and specific to the nibble
+types. At GQA 6 and n_kv 16384, the long-context row, width 16 brings the native
+path level with the F16 path at equal `nstages`, and the whole remaining
+regression there is the pipeline.
+
+One incidental result from the same runs: at D=512 on Ampere, forcing
+`nstages = 0` made the F16-casting path itself faster, 3675 to 2939 us/run. That
+is `nstages_target = 1` being a pessimization on GA106 in code this route does
+not touch.
 
 #### Memory
 
