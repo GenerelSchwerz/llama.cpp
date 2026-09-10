@@ -12017,6 +12017,26 @@ static void test_moe_cache_proc_api() {
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
 }
 
+#ifdef _WIN32
+// Repeated interleaved alloc/free of the cached buffer type: each allocation
+// records its own registered segments, so out-of-order frees must clean up by
+// record, not by a process-wide stride.
+static void test_win_pin_alloc_free_cycles() {
+    for (int cycle = 0; cycle < 3; cycle++) {
+        ggml_backend_buffer_t big = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_moe_cached_buffer_type(), 512ULL << 20);
+        ggml_backend_buffer_t small = ggml_backend_buft_alloc_buffer(
+            ggml_backend_cuda_moe_cached_buffer_type(), 64ULL << 20);
+        CHECK(big != nullptr && small != nullptr);
+        memset(ggml_backend_buffer_get_base(big), 0, 4096);
+        memset(ggml_backend_buffer_get_base(small), 0, 4096);
+        ggml_backend_buffer_free(big);
+        ggml_backend_buffer_free(small);
+    }
+    fprintf(stderr, "test-moe-cache: win pin alloc/free cycles OK\n");
+}
+#endif
+
 int main(int argc, char ** argv) {
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
@@ -12029,7 +12049,16 @@ int main(int argc, char ** argv) {
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
+    const bool win_pin_only = argc == 2 && strcmp(argv[1], "--win-pin-only") == 0;
     test_moe_cache_proc_api();
+#ifdef _WIN32
+    if (win_pin_only) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        CHECK(backend != nullptr);
+        test_win_pin_alloc_free_cycles();
+        return 0;
+    }
+#endif
     if (prefill_resident_only) {
         test_prefill_resident_biases();
         return 0;
@@ -12475,6 +12504,10 @@ int main(int argc, char ** argv) {
 
     CUDA_OK(cudaStreamDestroy(copy_stream));
     CUDA_OK(cudaFreeHost(host_experts));
+
+#ifdef _WIN32
+    test_win_pin_alloc_free_cycles();
+#endif
 
     fprintf(stderr, "test-moe-cache: OK\n");
     return 0;

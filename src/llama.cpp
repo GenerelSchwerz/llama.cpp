@@ -357,11 +357,28 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             // silently falls back to plain CPU buffers. GGML_CUDA_MOE_PIN_LAYERS=N
             // remedies this by routing only the first N layers' expert tensors through
             // the cached (pinned) buffer type - the subset then pins under the quota -
-            // while the remaining layers keep the plain CPU path. The MMID kernels read
-            // expert sources directly from pinned host memory, so the cached subset must
-            // pin in full: partial pins crash with illegal memory access.
+            // while the remaining layers follow their normal placement (the
+            // --n-gpu-layers window, or --cpu-moe / --n-cpu-moe where they match).
+            // The MMID kernels read expert sources directly from pinned host memory,
+            // so the cached subset must pin in full: partial pins crash.
+            int pin_layers = 0;
             const char * pin_layers_env = getenv("GGML_CUDA_MOE_PIN_LAYERS");
-            int pin_layers = pin_layers_env ? atoi(pin_layers_env) : 0;
+            if (pin_layers_env != nullptr && pin_layers_env[0] != '\0') {
+                char * end = nullptr;
+                long v = strtol(pin_layers_env, &end, 10);
+                if (end == pin_layers_env || end == nullptr || *end != '\0' || v <= 0) {
+                    LLAMA_LOG_WARN("GGML_CUDA_MOE_PIN_LAYERS=%s is not a positive integer - ignoring\n",
+                                   pin_layers_env);
+                } else {
+                    // The cap only bounds the regex size: a count above the model
+                    // depth is harmless, the extra alternations never match.
+                    if (v > 512) {
+                        LLAMA_LOG_WARN("GGML_CUDA_MOE_PIN_LAYERS=%ld clamped to 512\n", v);
+                        v = 512;
+                    }
+                    pin_layers = (int) v;
+                }
+            }
             if (pin_layers > 0) {
                 pin_pattern = "blk\\.(";
                 for (int i = 0; i < pin_layers; i++) {
@@ -371,7 +388,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 pin_pattern += ")\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
                 effective_overrides.push_back({pin_pattern.c_str(), buffer_type_fn()});
                 LLAMA_LOG_INFO("moe expert cache: pin-budget mode - routing expert tensors of the first %d layers "
-                               "through the GPU LRU cache (remaining layers use plain CPU buffers)\n", pin_layers);
+                               "through the GPU LRU cache (remaining layers keep their normal placement: the "
+                               "--n-gpu-layers window, or --cpu-moe / --n-cpu-moe where they match)\n", pin_layers);
             } else {
                 static const char * MOE_EXPS_PATTERN =
                     "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
@@ -386,8 +404,15 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 }
             }
             if (had_user_overrides) {
-                LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
-                               "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                if (pin_layers > 0) {
+                    LLAMA_LOG_WARN("--moe-expert-cache-size with GGML_CUDA_MOE_PIN_LAYERS: expert tensors of "
+                                   "the first %d layers route through the GPU LRU cache and override "
+                                   "--cpu-moe / --n-cpu-moe for those layers only; later layers keep "
+                                   "those overrides.\n", pin_layers);
+                } else {
+                    LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
+                                   "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
+                }
             }
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
