@@ -330,6 +330,40 @@ One incidental result from the same runs: at D=512 on Ampere, forcing
 is `nstages_target = 1` being a pessimization on GA106 in code this route does
 not touch.
 
+#### Staging the quantized tiles, and why it does not work yet
+
+cp.async cannot dequantize; it copies 16 bytes global to shared and nothing
+else. So the half2 tile cannot be staged, but the raw quantized bytes can: copy
+them into shared while the previous tile computes, then convert out of shared.
+That was prototyped and measured, and it is not a win as written.
+
+Against the same native path without it, over all three route rows and all five
+types on both cards, it lands between -17.8% and +5.8%. Sorted by cache type the
+result is not noise:
+
+| Type | Block size | 4-byte aligned | Staged vs unstaged |
+|---|---:|:-:|---|
+| `q4_1` | 20 B | yes | -3.3% to -8.7% |
+| `q5_1` | 24 B | yes | -5.0% to -9.3% |
+| `q4_0` | 18 B | no | +1.3% to +4.9% at D=256 GQA 6 |
+| `q5_0` | 22 B | no | +1.7% to +5.8% |
+| `q8_0` | 34 B | no | +0.8% to +5.4% |
+
+The two types whose block is a multiple of 4 bytes win everywhere; the three
+that are not lose. `block_q4_0` is 18 bytes, so block n starts at byte 18n and
+is never 4-byte aligned, and the dequant reads it with a 2-byte aligned access.
+Out of global memory that costs little. Out of shared memory it becomes several
+sub-word loads, and that costs more than the overlap gains.
+
+Per-block padding would fix the alignment but cp.async copies a contiguous run,
+so it cannot scatter blocks to padded slots. Staging would have to hold a
+reformatted layout, with the scales separated from the quants so both land
+aligned, which changes the loaders rather than only what feeds them.
+
+One row does not fit that account: `q4_0` at D=256 GQA 2 gains 14.0% to 17.8% on
+Ampere despite the misalignment, at the same tile shape and thread count as the
+GQA 6 row that loses. That is unexplained.
+
 #### Memory
 
 The transient F16 copy that this route removes did not change any measured
