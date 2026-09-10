@@ -374,15 +374,36 @@ GQA 6 row that loses. That is unexplained.
 
 #### Memory
 
-The transient F16 copy that this route removes did not change any measured
-allocation on this base.
+The transient F16 copy is sized by the visible attention window, so what it
+costs depends on how much context is actually in use. With the KV cache on the
+host, where the GPU holds only the model and the compute buffers, that shows up
+directly.
 
-Reserve compute buffer, Qwen3.8-27B-UD-IQ2_M at 16K context on one 4070, is
-505.28 MiB with a `q4_0` cache, 505.28 MiB with `q8_0`, and 505.02 MiB with
-`f16`, which has no copy to remove at all. Peak device memory sampled during a
-`pp2048 @ d16384` run is 10419 MiB with the route on and with it off.
+Qwen3.8-27B-UD-IQ2_M on one 4070, `-nkvo`, `q8_0` cache, peak device memory
+sampled at 200 ms through a `pp2048` run at each depth:
 
-So on this base another node sets the high-water mark and the copy never reaches
-it. The route is worth taking for the throughput above, not for the memory. A
-model with more KV heads, or a tree where attention dominates the compute
-buffer, may still show the saving; nothing here measures that.
+| Context in use | Route off | Route on | Saved | `pp2048` off | `pp2048` on |
+|---:|---:|---:|---:|---:|---:|
+| 16384 | 9985 MiB | 9985 MiB | 0 | 800.75 | 804.46 |
+| 65536 | 10019 MiB | 10005 MiB | 14 MiB | 469.71 | 482.59 |
+| 131072 | 10357 MiB | 10005 MiB | 352 MiB | 305.19 | 321.26 |
+| 262144 | 11141 MiB | 10097 MiB | **1044 MiB** | 179.28 | 191.66 |
+
+t/s for the throughput columns, higher is better. The route was asserted on
+every row by the backend's native-launch counter, 640 to 8320 launches with it
+on and 0 with it off.
+
+The saving is the copy itself: `2 * n_kv_heads * head_dim * n_kv * sizeof(F16)`,
+which for this model is 4 KiB per cached token, or 1024 MiB at full context. The
+route-on curve is nearly flat, 9985 to 10097 MiB across a 16x increase in
+context, while route-off climbs 1156 MiB over the same range.
+
+Nothing shows at 16K because the copy still fits inside pool capacity the
+allocator already holds. It appears once the window grows past that, which is
+also the regime the route is for.
+
+The throughput columns run the other way from the **Throughput** matrix above,
+where D=256 GQA 6 loses on Ampere. That matrix uses a device-resident cache. With
+the cache on the host the traffic the route saves outweighs the dequant it adds,
+so it is between 0.5% and 5% faster at every depth here. Which side wins depends
+on where the cache lives.
