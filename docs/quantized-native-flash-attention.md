@@ -23,9 +23,10 @@ and read once. The native loaders instead dequantize the current tile straight
 into the shared-memory `half2` tiles that the existing MMA body already consumes,
 so nothing is materialized.
 
-The measured gain is the traffic, not the allocation: prefill at depth measured
-up to 21.5% faster on Ada, while no measured allocation changed. See
-**Validation**, and **Older measurements** for which revision those came from.
+The gain is the traffic, not the allocation, and it is not uniform: at long
+context on Ada this is up to 40% faster, at short context it is 8-23% slower,
+and Ampere pays on every D=256 row. See **Throughput** for the full matrix, and
+**Where the Ampere cost comes from** for why.
 
 ## Where it applies
 
@@ -65,9 +66,8 @@ Nothing narrows those rows further. The caller asked for this route, so the KV
 length and where the cache lives are not second-guessed. Two consequences worth
 knowing before turning the flag on:
 
-- on Ampere the D=256 rows measured slower than the F16 path, by up to 14% at
-  `n_kv 512`; the D=512 rows were the largest win on either card. See
-  **Older measurements**;
+- on Ampere every D=256 row measured slower than the F16 path, by 11% to 42%;
+  the D=512 rows gain for `q4_0` and lose for `q8_0`. See **Throughput**;
 - D=256 with a GQA ratio of 8 is reachable. PR 55 recorded one measured `q8_0`
   case at that geometry with an open correctness and memory-safety question
   under graph and workspace reuse, which was never diagnosed.
@@ -189,8 +189,9 @@ else. Regenerating the instance files reproduces the committed ones.
 
 ### Turing
 
-Correct, not yet compared. Quadro RTX 8000 (TU102, `sm_75`), default build,
-taken on the pre-rebase revision described under **Older measurements** below.
+Correct, not yet compared. Quadro RTX 8000 (TU102, `sm_75`), default build.
+These are the one set of numbers here not taken on this base: they come from the
+pre-rebase revision, before the tile swizzle and the widened Q4_0 load run.
 
 `test-backend-ops -o NATIVE_QUANT_EQUIVALENCE` passed every case of a default
 build, each asserted against the backend's native-launch counter. So the narrow
@@ -213,55 +214,62 @@ regression rather than a gain, and it is reasoning, not measurement.
 
 `scripts/fattn-turing-model-test.sh --ab` produces the missing comparison.
 
-### Older measurements
+### Throughput
 
-The throughput, end-to-end and memory numbers below were taken on the revision
-this work carried before it was rebased onto the current `llama/dev`: base
-commit `01b141fc`, and before the shared-memory K/V tile gained the XOR swizzle
-that `fattn-swizzle.cuh` now applies. The route table and the loaders are
-unchanged since, so the shape of the result should hold, but the numbers have
-not been re-taken on this base and nothing here claims they were.
+`test-backend-ops perf -o FLASH_ATTN_EXT`, us/run, lower is better. Every route
+row against every cache type it admits, on an otherwise idle machine, native
+against the F16-casting path with the cast included in both timings. Taken on
+this base, with the widened Q4_0 load run.
 
-#### Throughput
+| D | GQA | type | n_kv | n_q | 4070 F16 | 4070 native | 4070 | 3060 F16 | 3060 native | 3060 |
+|--:|--:|--|--:|--:|--:|--:|--:|--:|--:|--:|
+| 256 | 6 | `q4_0` | 1024 | 512 | 292 | 316 | +8.1% | 613 | 729 | +19.0% |
+| 256 | 6 | `q4_0` | 1024 | 2048 | 1065 | 1191 | +11.8% | 2184 | 2711 | +24.1% |
+| 256 | 6 | `q4_0` | 16384 | 512 | 4743 | 4387 | -7.5% | 9140 | 10716 | +17.2% |
+| 256 | 6 | `q4_0` | 16384 | 2048 | 16878 | 16980 | +0.6% | 32821 | 39668 | +20.9% |
+| 256 | 6 | `q4_1` | 1024 | 512 | 294 | 333 | +13.3% | 617 | 770 | +24.8% |
+| 256 | 6 | `q4_1` | 1024 | 2048 | 1070 | 1288 | +20.3% | 2202 | 2816 | +27.9% |
+| 256 | 6 | `q4_1` | 16384 | 512 | 4795 | 4635 | -3.3% | 9192 | 11283 | +22.8% |
+| 256 | 6 | `q4_1` | 16384 | 2048 | 16933 | 18669 | +10.3% | 32979 | 41265 | +25.1% |
+| 256 | 6 | `q5_0` | 1024 | 512 | 295 | 334 | +13.2% | 620 | 777 | +25.4% |
+| 256 | 6 | `q5_0` | 1024 | 2048 | 1071 | 1297 | +21.2% | 2207 | 2859 | +29.5% |
+| 256 | 6 | `q5_0` | 16384 | 512 | 4769 | 4725 | -0.9% | 9261 | 11167 | +20.6% |
+| 256 | 6 | `q5_0` | 16384 | 2048 | 17008 | 18890 | +11.1% | 33090 | 41804 | +26.3% |
+| 256 | 6 | `q5_1` | 1024 | 512 | 295 | 346 | +17.2% | 621 | 808 | +30.1% |
+| 256 | 6 | `q5_1` | 1024 | 2048 | 1072 | 1319 | +23.1% | 2208 | 2992 | +35.5% |
+| 256 | 6 | `q5_1` | 16384 | 512 | 4795 | 4816 | +0.4% | 9272 | 11877 | +28.1% |
+| 256 | 6 | `q5_1` | 16384 | 2048 | 17005 | 19592 | +15.2% | 33151 | 43544 | +31.4% |
+| 256 | 6 | `q8_0` | 1024 | 512 | 295 | 330 | +12.1% | 619 | 755 | +21.8% |
+| 256 | 6 | `q8_0` | 1024 | 2048 | 1072 | 1254 | +17.0% | 2207 | 2789 | +26.4% |
+| 256 | 6 | `q8_0` | 16384 | 512 | 4739 | 4793 | +1.1% | 9245 | 11267 | +21.9% |
+| 256 | 6 | `q8_0` | 16384 | 2048 | 17016 | 18420 | +8.3% | 33167 | 41261 | +24.4% |
+| 256 | 2 | `q4_0` | 1024 | 512 | 187 | 185 | -1.2% | 372 | 507 | +36.0% |
+| 256 | 2 | `q4_0` | 1024 | 2048 | 607 | 672 | +10.6% | 1233 | 1749 | +41.8% |
+| 256 | 2 | `q4_0` | 16384 | 512 | 4466 | 2660 | -40.4% | 5446 | 7090 | +30.2% |
+| 256 | 2 | `q4_0` | 16384 | 2048 | 10894 | 10595 | -2.7% | 18202 | 24301 | +33.5% |
+| 256 | 2 | `q8_0` | 1024 | 512 | 188 | 186 | -0.8% | 373 | 424 | +13.5% |
+| 256 | 2 | `q8_0` | 1024 | 2048 | 613 | 676 | +10.3% | 1237 | 1505 | +21.6% |
+| 256 | 2 | `q8_0` | 16384 | 512 | 4519 | 2796 | -38.1% | 5476 | 6090 | +11.2% |
+| 256 | 2 | `q8_0` | 16384 | 2048 | 11276 | 10217 | -9.4% | 18265 | 21754 | +19.1% |
+| 512 | 16 | `q4_0` | 4096 | 512 | 1359 | 1330 | -2.1% | 3682 | 3341 | -9.2% |
+| 512 | 16 | `q4_0` | 4096 | 2048 | 5253 | 5240 | -0.2% | 13928 | 12709 | -8.8% |
+| 512 | 16 | `q8_0` | 4096 | 512 | 1364 | 1452 | +6.4% | 3684 | 3994 | +8.4% |
+| 512 | 16 | `q8_0` | 4096 | 2048 | 5262 | 5719 | +8.7% | 13926 | 15200 | +9.1% |
 
-Kernel-level, `test-backend-ops perf -o FLASH_ATTN_EXT`, native against the
-F16-casting path with the cast kernel included in both timings. Rows that stay on
-the F16 path in both builds move by at most 0.4% on the 4070 and 1.7% on the
-3060, which is the noise floor for these numbers.
+Read by row rather than as an average. Long context on Ada is where the route
+pays: at D=256 GQA 2 and n_kv 16384 it is 38-40% faster, because it reads 4.5 or
+8.5 bit weights where the other path reads 16. Short context is where it does
+not: at n_kv 1024 every type costs 8-23% there, because the dequant is on the
+critical path and there is not enough memory traffic to hide it behind.
 
-| Route row | n_q | 4070 (Ada) | 3060 (Ampere) |
-|---|---:|---:|---:|
-| D=256, GQA 6, `q4_0`, n_kv 16384 | 512 | -21.5% | +0.3% |
-| D=256, GQA 6, `q4_0`, n_kv 16384 | 2048 | -15.8% | +2.4% |
-| D=256, GQA 6, `q4_0`, n_kv 1024 | 512 | -6.8% | +6.7% |
-| D=256, GQA 6, `q4_0`, n_kv 1024 | 2048 | -3.7% | +10.8% |
-| D=256, GQA 6, `q8_0`, n_kv 512 | 512 | -3.5% | +9.3% |
-| D=256, GQA 6, `q8_0`, n_kv 512 | 2048 | +0.9% | +13.9% |
-| D=256, GQA 2, `q4_0`, n_kv 1024 | 512 | -17.2% | +1.9% |
-| D=256, GQA 2, `q4_0`, n_kv 1024 | 2048 | -9.5% | +7.5% |
-| D=256, GQA 2, `q8_0`, n_kv 1024 | 512 | -17.0% | +1.0% |
-| D=256, GQA 2, `q8_0`, n_kv 1024 | 2048 | -7.0% | +9.2% |
-| D=512, GQA 16, `q4_0`, n_kv 4096 | 512 | -12.2% | -15.6% |
-| D=512, GQA 16, `q8_0`, n_kv 4096 | 512 | -6.4% | -5.1% |
+Ampere loses on every D=256 row, by 11% to 42%. D=512 is the mirror image: Q4_0
+gains 9% on Ampere and Q8_0 loses 8-9% on both cards. **Where the Ampere cost
+comes from** below takes that apart.
 
-Every row is faster on Ada. On Ampere the D=512 rows are the largest win of any
-row on either card, and the D=256 rows are slower.
-
-There are three causes, separated below under **Where the Ampere cost comes
-from**. An earlier revision of this document blamed the loading pipeline alone;
-that is wrong, and the measurement that shows it is there.
-
-End to end, Qwen3.8-27B-UD-IQ2_M (D=256, 24 heads, 4 KV heads, GQA 6) with a
-`q4_0` cache on one GPU, route asserted by the native-launch counter:
-
-| Test | 4070 off | 4070 on | 3060 off | 3060 on |
-|---|---:|---:|---:|---:|
-| `pp512` | 1179.46 | 1178.58 | 534.05 | 533.54 |
-| `pp2048 @ d16384` | 982.61 | 1022.77 | 453.35 | 450.35 |
-| `tg64 @ d16384` | 33.27 | 33.34 | 17.53 | 17.62 |
-
-t/s, higher is better. Decode is unaffected because a single-token query stays on
-the vector kernel.
+The two generic loaders are consistently the slowest of the five. Against their
+hand tuned counterparts at the same geometry on Ampere, Q4_1 costs about 4
+points more than Q4_0 and Q5_1 about 6 more than Q5_0, which is what the hand
+tuning is worth.
 
 #### Where the Ampere cost comes from
 
