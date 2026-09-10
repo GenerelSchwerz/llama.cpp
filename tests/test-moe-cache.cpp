@@ -12222,6 +12222,24 @@ static void test_moe_route_publication_lifetime() {
     fprintf(stderr, "test-moe-cache: bounded route publication and backend ownership OK\n");
 }
 
+static void test_moe_cache_proc_api() {
+    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
+    CHECK(reg != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FREE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_FROM_HOST_PTR_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_RESERVE_HOST_STAGING_BATCH_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_PIN_SOURCES_PROC_NAME) != nullptr);
+    fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
+}
+
 int main(int argc, char ** argv) {
     if (argc == 2 && strcmp(argv[1], "--host-pinning-fault") == 0) {
         test_bounded_host_pinning_fault();
@@ -12245,6 +12263,7 @@ int main(int argc, char ** argv) {
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
+    test_moe_cache_proc_api();
     if (prefill_resident_only) {
         test_prefill_resident_biases();
         return 0;

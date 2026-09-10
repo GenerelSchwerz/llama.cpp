@@ -118,6 +118,9 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // The setter must not read host token values or access unstaged device data.
+    virtual bool can_decode_sampled() const { return false; }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -135,6 +138,8 @@ using llm_graph_input_ptr = std::unique_ptr<llm_graph_input_i>;
 
 class llm_graph_input_embd : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_embd(int64_t n_embd) : n_embd(n_embd) {}
     virtual ~llm_graph_input_embd() = default;
 
@@ -167,6 +172,8 @@ public:
 
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
     virtual ~llm_graph_input_pos() = default;
 
@@ -225,6 +232,8 @@ public:
 
 class llm_graph_input_out_ids : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_out_ids(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -330,6 +339,8 @@ public:
 
 class llm_graph_input_attn_kv : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_kv(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -476,6 +487,8 @@ public:
 // standard K/V attention input against the base cache, plus destination indices for the indexer key cache
 class llm_graph_input_attn_kv_msa : public llm_graph_input_attn_kv {
 public:
+    bool can_decode_sampled() const override { return false; }
+
     llm_graph_input_attn_kv_msa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -495,6 +508,8 @@ public:
 
 class llm_graph_input_attn_kv_iswa : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_attn_kv_iswa(
             const llama_hparams & hparams,
             const llama_cparams & cparams,
@@ -674,6 +689,8 @@ public:
 
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_mem_hybrid(
             const llama_cparams & cparams,
             std::unique_ptr<llm_graph_input_attn_kv> inp_attn,
@@ -758,6 +775,8 @@ public:
 
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
+    bool can_decode_sampled() const override { return true; }
+
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
         samplers(std::move(samplers)) { }
     virtual ~llm_graph_input_sampling() = default;
@@ -927,7 +946,9 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    bool can_decode_sampled() const;
+    const std::vector<ggml_tensor *> & get_inp_token_tensors() const { return inp_token_tensors; }
+    void set_inputs(const llama_ubatch * ubatch, bool skip_token_upload = false);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -973,6 +994,8 @@ public:
     int64_t max_nodes;
 
 private:
+    std::vector<ggml_tensor *> inp_token_tensors;
+
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters
     // note: these are updated after constructing the new graph

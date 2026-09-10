@@ -1647,6 +1647,34 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// How a split input breaks into the ranges a graph reads.
+// A window over a cache split into streams is one range per stream, keyed on the last dimension: the ranges sit a fixed stride apart and the bytes between them are never read.
+// Anything else is one flat range of ggml_nbytes().
+struct ggml_backend_sched_ranges {
+    int64_t n;      // ranges to deliver
+    size_t  stride; // bytes from one range to the next
+    size_t  used;   // bytes of a range this graph reads
+};
+
+static void ggml_backend_sched_input_ranges(const struct ggml_tensor * input, struct ggml_backend_sched_ranges * out) {
+    out->n      = 1;
+    out->stride = 0;
+    out->used   = ggml_nbytes(input);
+
+    // a range is one stream's byte span, which is what the tensor covers below dimension 3
+    const size_t rows = ggml_nbytes(input) - (size_t) (input->ne[3] - 1)*input->nb[3];
+    const size_t offs = input->view_src ? input->view_offs : 0;
+    if (input->nb[3] < rows || (offs != 0 && (input->nb[3] == 0 || offs % input->nb[3] != 0))) {
+        return;
+    }
+
+    if (input->ne[3] > 1) {
+        out->n      = input->ne[3];
+        out->stride = input->nb[3];
+        out->used   = rows;
+    }
+}
+
 static bool ggml_backend_sched_execution_certificate_valid(const struct ggml_graph_execution_certificate * certificate) {
     static_assert(sizeof(struct ggml_graph_execution_certificate) == 96, "unexpected graph execution certificate size");
 
@@ -1839,16 +1867,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // ggml_backend_tensor_copy moves ggml_nbytes(), which for a window over several streams is the span the ranges are cut from, gaps and all
+                    ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
+                    struct ggml_backend_sched_ranges rg;
+                    ggml_backend_sched_input_ranges(input, &rg);
+                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf);
+
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
-                    if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
+                    if (ranged || !split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
                         ggml_backend_synchronize(input_backend);
                         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
                             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
                         } else {
                             ggml_backend_synchronize(split_backend);
                         }
-                        ggml_backend_tensor_copy(input, input_cpy);
+                        if (ranged) {
+                            // blocking like the copy it replaces: the split backend is idle here, so the ranges go on its own stream and the host waits for them
+                            ggml_backend_tensor_set_2d_async(split_backend, input_cpy, input->data, 0, rg.used, rg.n, rg.stride, rg.stride);
+                            ggml_backend_synchronize(split_backend);
+                        } else {
+                            ggml_backend_tensor_copy(input, input_cpy);
+                        }
                     }
                 }
             }

@@ -16,10 +16,6 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -330,24 +326,52 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // of the pointer.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
-#ifdef GGML_USE_CUDA
-        std::unique_ptr<ggml_backend_buffer_type, decltype(&ggml_backend_cuda_moe_bounded_buffer_type_free)> bounded_buft(
-            nullptr, ggml_backend_cuda_moe_bounded_buffer_type_free);
-        if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
-            if (params.moe_expert_cache_host_pinned_size == 0) {
-                throw std::runtime_error("a zero MoE host pin budget cannot provide GPU staging");
-            }
-            if (params.moe_expert_cache_slots <= 0) {
-                throw std::runtime_error("host pin budget requires a positive MoE expert cache size");
-            }
-            bounded_buft.reset(ggml_backend_cuda_moe_bounded_buffer_type(params.moe_expert_cache_host_pinned_size));
-            if (!bounded_buft) {
-                throw std::runtime_error("unable to create MoE host pin budget (check GGML_CUDA_NO_PINNED)");
-            }
+        std::unique_ptr<ggml_backend_buffer_type, ggml_backend_moe_cache_buffer_type_free_t> bounded_buft(nullptr, nullptr);
+        if (params.moe_expert_cache_host_pinned_size != SIZE_MAX && params.moe_expert_cache_slots <= 0) {
+            throw std::runtime_error("host pin budget requires a positive MoE expert cache size");
         }
         if (params.moe_expert_cache_slots > 0) {
-            ggml_backend_buffer_type_t cache_buft = bounded_buft ? bounded_buft.get() : ggml_backend_cuda_moe_cached_buffer_type();
-            ggml_backend_cuda_moe_set_cache_slots(params.moe_expert_cache_slots);
+            ggml_backend_moe_cache_set_slots_t set_slots_fn = nullptr;
+            ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
+            ggml_backend_moe_cache_bounded_buffer_type_t bounded_buffer_type_fn = nullptr;
+            ggml_backend_moe_cache_buffer_type_free_t buffer_type_free_fn = nullptr;
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                auto candidate_set_slots_fn = (ggml_backend_moe_cache_set_slots_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME);
+                auto candidate_buffer_type_fn = (ggml_backend_moe_cache_buffer_type_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME);
+                auto candidate_bounded_buffer_type_fn = (ggml_backend_moe_cache_bounded_buffer_type_t)
+                        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME);
+                auto candidate_buffer_type_free_fn = (ggml_backend_moe_cache_buffer_type_free_t)
+                        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FREE_PROC_NAME);
+                const bool has_bounded_support = params.moe_expert_cache_host_pinned_size == SIZE_MAX ||
+                        (candidate_bounded_buffer_type_fn != nullptr && candidate_buffer_type_free_fn != nullptr);
+                if (candidate_set_slots_fn != nullptr && candidate_buffer_type_fn != nullptr && has_bounded_support) {
+                    set_slots_fn = candidate_set_slots_fn;
+                    buffer_type_fn = candidate_buffer_type_fn;
+                    bounded_buffer_type_fn = candidate_bounded_buffer_type_fn;
+                    buffer_type_free_fn = candidate_buffer_type_free_fn;
+                    break;
+                }
+            }
+            if (set_slots_fn == nullptr || buffer_type_fn == nullptr) {
+                throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
+            }
+            ggml_backend_buffer_type_t cache_buft = nullptr;
+            if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
+                if (params.moe_expert_cache_host_pinned_size == 0) {
+                    throw std::runtime_error("a zero MoE host pin budget cannot provide GPU staging");
+                }
+                cache_buft = bounded_buffer_type_fn(params.moe_expert_cache_host_pinned_size);
+                if (cache_buft == nullptr) {
+                    throw std::runtime_error("unable to create MoE host pin budget (check GGML_CUDA_NO_PINNED)");
+                }
+                bounded_buft = decltype(bounded_buft)(cache_buft, buffer_type_free_fn);
+            } else {
+                cache_buft = buffer_type_fn();
+            }
+            set_slots_fn(params.moe_expert_cache_slots);
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
@@ -368,11 +392,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             effective_overrides.push_back({nullptr, nullptr});
             effective_overrides_ptr = effective_overrides.data();
         }
-#else
-        if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
-            throw std::runtime_error("MoE host pin budget requires the CUDA backend");
-        }
-#endif
 
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr);
@@ -381,9 +400,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
         ml.print_info();
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
-#ifdef GGML_USE_CUDA
-        model_ptr->own_moe_host_budget(bounded_buft.release());
-#endif
+        if (bounded_buft != nullptr) {
+            model_ptr->own_moe_host_budget(bounded_buft.release());
+        }
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
         if (!ok) {

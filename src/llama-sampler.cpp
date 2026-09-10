@@ -3903,6 +3903,7 @@ struct llama_sampler_logit_bias : public llama_sampler_backend {
     const int32_t n_vocab;
 
     const std::vector<llama_logit_bias> logit_bias;
+    const std::vector<llama_logit_bias> backend_bias;
 
     std::vector<llama_logit_bias> to_search;
 
@@ -3970,7 +3971,7 @@ static void llama_sampler_logit_bias_backend_apply(
         return;
     }
 
-    const size_t n = sctx->logit_bias.size();
+    const size_t n = sctx->backend_bias.size();
 
     if (sctx->inp_logit_bias == nullptr) {
         GGML_ASSERT(sctx->inp_logit_idxs == nullptr);
@@ -4002,12 +4003,12 @@ static void llama_sampler_logit_bias_backend_set_input(struct llama_sampler * sm
     GGML_ASSERT(sctx->inp_logit_bias != nullptr);
     GGML_ASSERT(sctx->inp_logit_idxs != nullptr);
 
-    const size_t n = sctx->logit_bias.size();
+    const size_t n = sctx->backend_bias.size();
 
     std::vector<float>   data_logit_bias(n, 0.0f);
     std::vector<int32_t> data_logit_idxs(n, 0);
     for (size_t i = 0; i < n; ++i) {
-        const auto & lb = sctx->logit_bias[i];
+        const auto & lb = sctx->backend_bias[i];
         GGML_ASSERT(lb.token >= 0 && lb.token < (int32_t) sctx->n_vocab);
         data_logit_bias[i] = lb.bias;
         data_logit_idxs[i] = lb.token;
@@ -4066,12 +4067,25 @@ struct llama_sampler * llama_sampler_init_logit_bias(
         return llama_sampler_init_empty("?logit-bias");
     }
 
+    // SET_ROWS requires unique indices. Add duplicate biases before uploading them.
+    std::vector<llama_logit_bias> backend_bias;
+    std::unordered_map<llama_token, size_t> indices;
+    for (int32_t i = 0; i < n_logit_bias; ++i) {
+        const auto inserted = indices.emplace(logit_bias[i].token, backend_bias.size());
+        if (inserted.second) {
+            backend_bias.push_back(logit_bias[i]);
+        } else {
+            backend_bias[inserted.first->second].bias += logit_bias[i].bias;
+        }
+    }
+
     return llama_sampler_init(
         /* .iface = */ &llama_sampler_logit_bias_i,
         /* .ctx   = */ new llama_sampler_logit_bias {
             ("logit-bias"),
             /* .n_vocab        = */ n_vocab,
             /* .logit_bias     = */ std::vector<llama_logit_bias>(logit_bias, logit_bias + n_logit_bias),
+            /* .backend_bias   = */ std::move(backend_bias),
             /* .to_search      = */ {},
             /* .inp_logit_bias = */ nullptr,
             /* .inp_logit_idxs = */ nullptr,

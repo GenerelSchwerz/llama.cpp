@@ -10,10 +10,6 @@
 #include "speculative.h"
 #include "unicode.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
@@ -1297,11 +1293,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
-#ifdef GGML_USE_CUDA
         if (params.n_moe_expert_cache_slots > 0) {
             COM_WRN("%s", "--fit does not account for MoE expert cache pools; set -fit off and size --moe-expert-cache-size manually\n");
         }
-#endif
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1414,9 +1408,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
-#ifdef GGML_USE_CUDA
-    ggml_backend_cuda_moe_set_debug_mm(params.experimental_logs);
-#endif
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto set_debug_fn = (ggml_backend_moe_cache_set_debug_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME);
+        if (set_debug_fn != nullptr) {
+            set_debug_fn(params.experimental_logs);
+        }
+    }
 
     set_process_priority(params.cpuparams.priority);
 
@@ -1739,6 +1738,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    if (params.decode_overlap) {
+        cparams.n_rs_seq = std::max(cparams.n_rs_seq, 1u);
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

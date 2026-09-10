@@ -60,6 +60,7 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    bool can_decode_sampled() const override { return n_rs_seq > 0 && !next_snapshot_mode.sparse; }
     bool recurrent_sparse_snapshots_supported() const override;
     bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
