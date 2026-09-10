@@ -13,13 +13,6 @@ static __device__ __forceinline__ half2 fattn_mma_q4_centered_half2(const uint32
 }
 #endif
 
-// Tuned on Ampere/Ada. The 128-thread configs are the Turing D=512 shape, which
-// gets the 8-wide run without its own measurement.
-template <int nthreads, int ncols1, int ncols2>
-struct fattn_quant_load_width<GGML_TYPE_Q4_0, nthreads, ncols1, ncols2> {
-    static constexpr int value = nthreads == 256 ? 16 : 8;
-};
-
 template <>
 struct fattn_quant_incremental_rows<GGML_TYPE_Q4_0> {
     static constexpr bool value = true;
