@@ -747,6 +747,7 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
     int32_t moe_expert_cache_slots() const;
+    void own_moe_host_budget(ggml_backend_buffer_type_t buft);
 
     void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
     void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;

@@ -19,9 +19,6 @@
 #include "speculative.h"
 #include "mtmd.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
 #include "mtmd-helper.h"
 
 #include <algorithm>
@@ -756,11 +753,16 @@ struct server_slot {
 
         common_speculative_print_stats(spec);
 
-#ifdef GGML_USE_CUDA
         if (moe_cache_enabled) {
-            ggml_backend_cuda_moe_log_and_reset_stats();
+            for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+                ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+                auto log_stats_fn = (ggml_backend_moe_cache_log_and_reset_stats_t) ggml_backend_reg_get_proc_address(
+                        reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME);
+                if (log_stats_fn != nullptr) {
+                    log_stats_fn();
+                }
+            }
         }
-#endif
     }
 
     json to_json(bool only_metrics = false) const {

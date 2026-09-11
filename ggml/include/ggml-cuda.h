@@ -43,6 +43,14 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
 GGML_BACKEND_API bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
 GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size);
+// The returned type owns one budget shared by its buffers and grouped resources.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_bounded_buffer_type(size_t bytes);
+GGML_BACKEND_API void ggml_backend_cuda_moe_bounded_buffer_type_free(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_bounded_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
+GGML_BACKEND_API bool ggml_backend_cuda_moe_host_pinned_stats(ggml_backend_buffer_type_t buft, size_t * used, size_t * peak);
+GGML_BACKEND_API bool ggml_backend_cuda_moe_reserve_host_staging(ggml_backend_buffer_type_t buft, size_t bytes);
+GGML_BACKEND_API bool ggml_backend_cuda_moe_reserve_host_staging_batch(ggml_backend_buffer_type_t buft, size_t bytes, uint32_t max_misses);
+GGML_BACKEND_API void ggml_backend_cuda_moe_pin_sources(ggml_backend_buffer_t buffer, bool read_only);
 // Compatibility shims. Cache resources are owned by CUDA backend contexts;
 // these process-wide entry points do not allocate or free resources.
 GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);

@@ -1153,6 +1153,8 @@ struct llama_model::impl {
 
     llama_ftype ftype = LLAMA_FTYPE_ALL_F32;
 
+    std::unique_ptr<ggml_backend_buffer_type, ggml_backend_moe_cache_buffer_type_free_t> moe_host_budget{nullptr, nullptr};
+
     // model memory mapped files
     llama_mmaps mappings;
 
@@ -1764,7 +1766,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
-                ggml_backend_buffer_t buf = buffer_from_host_ptr_fn((char *) addr + first, last - first);
+                ggml_backend_buffer_t buf = nullptr;
+                if (params.moe_expert_cache_host_pinned_size == SIZE_MAX) {
+                    buf = buffer_from_host_ptr_fn((char *) addr + first, last - first);
+                } else {
+                    auto bounded_buffer_from_host_ptr_fn = (ggml_backend_moe_cache_bounded_buffer_from_host_ptr_t)
+                            ggml_backend_reg_get_proc_address(buft_reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_FROM_HOST_PTR_PROC_NAME);
+                    if (bounded_buffer_from_host_ptr_fn == nullptr) {
+                        throw std::runtime_error(format("%s does not support bounded buffers from mapped host memory", ggml_backend_buft_name(buft)));
+                    }
+                    buf = bounded_buffer_from_host_ptr_fn(buft, (char *) addr + first, last - first);
+                }
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
@@ -1856,6 +1868,54 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return true;
     }
 
+    if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
+        std::map<ggml_backend_buffer_type_t, size_t> staging;
+        const size_t slots = params.moe_expert_cache_slots;
+        if (hparams.n_expert > SIZE_MAX / sizeof(int32_t) - 16 ||
+                slots > (SIZE_MAX / sizeof(int32_t) - hparams.n_expert - 16) / 8) {
+            throw std::runtime_error("MoE host staging size overflow");
+        }
+        const size_t control = (slots * 8 + hparams.n_expert + 16) * sizeof(int32_t);
+        for (const auto & entry : pimpl->ctxs_bufs) {
+            if (entry.second.empty()) {
+                continue;
+            }
+            auto * buft = ggml_backend_buffer_get_type(entry.second.front().get());
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto is_moe_cache_buft_fn = reg != nullptr ? (ggml_backend_moe_cache_is_buffer_type_t)
+                    ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
+            if (is_moe_cache_buft_fn == nullptr || !is_moe_cache_buft_fn(buft)) {
+                continue;
+            }
+            auto & total = staging[buft];
+            for (auto * tensor = ggml_get_first_tensor(entry.first.get()); tensor != nullptr; tensor = ggml_get_next_tensor(entry.first.get(), tensor)) {
+                const size_t bytes = ggml_nbytes(tensor);
+                const size_t expert_bytes = hparams.n_expert > 0 && bytes % hparams.n_expert == 0 ? bytes / hparams.n_expert : bytes;
+                if (control > SIZE_MAX - 65535 || expert_bytes > SIZE_MAX - control - 65535) {
+                    throw std::runtime_error("MoE host staging size overflow");
+                }
+                const size_t reservation = (expert_bytes + control + 65535) / 65536 * 65536;
+                if (reservation > SIZE_MAX - total) {
+                    throw std::runtime_error("MoE host staging size overflow");
+                }
+                total += reservation;
+            }
+        }
+        for (const auto & entry : staging) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(entry.first);
+            ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto reserve_host_staging_batch_fn = reg != nullptr ? (ggml_backend_moe_cache_reserve_host_staging_batch_t)
+                    ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_RESERVE_HOST_STAGING_BATCH_PROC_NAME) : nullptr;
+            if (reserve_host_staging_batch_fn == nullptr ||
+                    !reserve_host_staging_batch_fn(entry.first, entry.second, hparams.n_expert_used_max())) {
+                throw std::runtime_error("MoE host pin budget is below the model staging minimum");
+            }
+            LLAMA_LOG_INFO("%s: MoE host pin cap %.2f MiB, minimum staging %.2f MiB\n", __func__,
+                params.moe_expert_cache_host_pinned_size / 1048576.0, entry.second / 1048576.0);
+        }
+    }
+
     // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
     if (!ml.use_mmap) {
         std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
@@ -1874,6 +1934,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    if (params.moe_expert_cache_host_pinned_size != SIZE_MAX) {
+        for (auto & entry : pimpl->ctxs_bufs) {
+            for (auto & buffer : entry.second) {
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer.get());
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                auto pin_sources_fn = reg != nullptr ? (ggml_backend_moe_cache_pin_sources_t)
+                        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_PIN_SOURCES_PROC_NAME) : nullptr;
+                if (pin_sources_fn != nullptr) {
+                    pin_sources_fn(buffer.get(), ml.use_mmap && use_mmap_buffer);
+                }
+            }
         }
     }
 
@@ -2255,6 +2330,17 @@ bool llama_model::has_tensor_overrides() const {
 
 int32_t llama_model::moe_expert_cache_slots() const {
     return params.moe_expert_cache_slots;
+}
+
+void llama_model::own_moe_host_budget(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    auto buffer_type_free_fn = reg != nullptr ? (ggml_backend_moe_cache_buffer_type_free_t)
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FREE_PROC_NAME) : nullptr;
+    if (buffer_type_free_fn == nullptr) {
+        throw std::runtime_error("MoE host pin budget buffer type has no release procedure");
+    }
+    pimpl->moe_host_budget = decltype(pimpl->moe_host_budget)(buft, buffer_type_free_fn);
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2834,6 +2920,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.moe_expert_cache_slots      =*/ 0,
+        /*.moe_expert_cache_host_pinned_size =*/ SIZE_MAX,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,

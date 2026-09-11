@@ -53,12 +53,249 @@
 #include <utility>
 #include <vector>
 
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+#include <system_error>
+#include <thread>
+#endif
+
+#if defined(GGML_CUDA_MOE_STREAMING_COPY) && (defined(__x86_64__) || defined(_M_X64)) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#include <emmintrin.h>
+#endif
+
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
 
 namespace {
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+struct moe_host_copy_worker {
+    std::mutex mutex;
+    std::condition_variable ready_cv;
+    std::condition_variable done_cv;
+    std::once_flag start_once;
+    std::thread thread;
+    void (*function)(void *) = nullptr;
+    void * data = nullptr;
+    bool stopping = false;
+    bool busy = false;
+    bool ready = false;
+    bool done = false;
+    uint64_t submitted = 0;
+
+    ~moe_host_copy_worker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            GGML_ASSERT(!busy);
+            stopping = true;
+        }
+        ready_cv.notify_one();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+
+    bool start() {
+        std::call_once(start_once, [this]() {
+            try {
+                std::lock_guard<std::mutex> lock(mutex);
+                thread = std::thread([this]() {
+                    std::unique_lock<std::mutex> lock(mutex);
+                    for (;;) {
+                        ready_cv.wait(lock, [this]() { return stopping || ready; });
+                        if (stopping) {
+                            return;
+                        }
+                        ready = false;
+                        auto task = function;
+                        void * task_data = data;
+                        lock.unlock();
+                        task(task_data);
+                        lock.lock();
+                        done = true;
+                        done_cv.notify_one();
+                    }
+                });
+            } catch (const std::exception &) {
+                // Keep serial copying if the helper cannot start.
+            }
+        });
+        return thread.joinable();
+    }
+
+    bool try_submit(void (*task)(void *), void * task_data) {
+        std::unique_lock<std::mutex> lock(mutex, std::try_to_lock);
+        if (!lock.owns_lock() || !thread.joinable() || busy || stopping) {
+            return false;
+        }
+        busy = true;
+        done = false;
+        function = task;
+        data = task_data;
+        ready = true;
+        ++submitted;
+        ready_cv.notify_one();
+        return true;
+    }
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        GGML_ASSERT(busy);
+        done_cv.wait(lock, [this]() { return done; });
+        // The submitting callback owns the job until it observes completion.
+        busy = false;
+        function = nullptr;
+        data = nullptr;
+    }
+};
+#endif
+
+struct moe_host_budget {
+    ggml_backend_buffer_type buft = {};
+    std::atomic<size_t> references{1};
+    std::mutex mutex;
+    size_t limit = 0;
+    size_t used = 0;
+    size_t peak = 0;
+    size_t source_limit = 0;
+    size_t source_used = 0;
+    size_t staging_pinned = 0;
+    uint32_t staging_misses = 1;
+    std::atomic<int64_t> fail_stage_after{-1};
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    moe_host_copy_worker copy_worker;
+
+    ~moe_host_budget() {
+        if (copy_worker.thread.joinable()) {
+            GGML_LOG_INFO("MoE host copy helper: jobs=%llu\n", (unsigned long long) copy_worker.submitted);
+        }
+    }
+#endif
+
+    void retain() { references.fetch_add(1, std::memory_order_relaxed); }
+    void release() {
+        if (references.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            GGML_ASSERT(used == 0);
+            delete this;
+        }
+    }
+
+    bool reserve(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (bytes > limit - used) {
+            GGML_LOG_ERROR("MoE host pin budget exhausted: need %zu bytes, available %zu of %zu\n", bytes, limit - used, limit);
+            return false;
+        }
+        used += bytes;
+        peak = std::max(peak, used);
+        return true;
+    }
+
+    void unreserve(size_t bytes, bool pinned = false) {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(bytes <= used);
+        used -= bytes;
+        if (pinned) {
+            GGML_ASSERT(bytes <= staging_pinned);
+            staging_pinned -= bytes;
+        }
+    }
+
+    void commit_staging(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        staging_pinned += bytes;
+        GGML_LOG_INFO("MoE host pins: cap=%zu source=%zu staging=%zu pending=%zu peak_reserved=%zu bytes\n",
+            limit, source_used, staging_pinned, used - source_used - staging_pinned, peak);
+    }
+
+    size_t reserve_source(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        bytes = std::min({bytes, source_limit - source_used, limit - used});
+        bytes = bytes / (64 * 1024) * (64 * 1024);
+        used += bytes;
+        source_used += bytes;
+        peak = std::max(peak, used);
+        return bytes;
+    }
+
+    void unreserve_source(size_t bytes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(bytes <= source_used && bytes <= used);
+        source_used -= bytes;
+        used -= bytes;
+    }
+};
+
+struct moe_bounded_buffer {
+    ggml_backend_buffer_t backing;
+    moe_host_budget * budget;
+    void * registered = nullptr;
+    size_t registered_bytes = 0;
+};
+
+static bool moe_bounded_expert_alias(
+        ggml_backend_buffer_t buffer, const void * source, size_t stride, uint32_t n_experts,
+        const void ** alias, uint32_t * first, uint32_t * last);
+
+static moe_host_budget * moe_host_budget_for(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_cuda_moe_cached(buft) ? static_cast<moe_host_budget *>(buft->context) : nullptr;
+}
+
+struct moe_host_allocation {
+    moe_host_budget * budget = nullptr;
+    void * data = nullptr;
+    void * device_data = nullptr;
+    size_t bytes = 0;
+
+    ~moe_host_allocation() {
+        if (data != nullptr) {
+            CUDA_CHECK(cudaFreeHost(data));
+            budget->unreserve(bytes, true);
+            budget->release();
+        }
+    }
+
+    bool allocate(moe_host_budget * owner, size_t size, bool fail_for_test = false) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_UNUSED(owner);
+        GGML_UNUSED(size);
+        GGML_UNUSED(fail_for_test);
+        return false;
+#else
+        // Allocate and charge full 64 KiB blocks, also on platforms with smaller pages.
+        constexpr size_t granularity = 64 * 1024;
+        if (data != nullptr || owner == nullptr || size == 0 || size > SIZE_MAX - granularity + 1 ||
+                getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+            return false;
+        }
+        const size_t rounded = (size + granularity - 1) / granularity * granularity;
+        if (!owner->reserve(rounded)) {
+            return false;
+        }
+        cudaError_t error = fail_for_test ? cudaErrorMemoryAllocation : cudaHostAlloc(&data, rounded, cudaHostAllocMapped | cudaHostAllocPortable);
+        if (error == cudaSuccess) {
+            error = cudaHostGetDevicePointer(&device_data, data, 0);
+        }
+        if (error != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (data != nullptr) {
+                (void) cudaFreeHost(data);
+                data = nullptr;
+            }
+            owner->unreserve(rounded);
+            GGML_LOG_ERROR("MoE host staging allocation failed: %s\n", cudaGetErrorString(error));
+            return false;
+        }
+        budget = owner;
+        bytes = rounded;
+        budget->retain();
+        budget->commit_staging(bytes);
+        return true;
+#endif
+    }
+};
 
 static constexpr uint64_t MOE_CACHE_MM_SAMPLE_RATE = 64;
 static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
@@ -2775,13 +3012,145 @@ struct moe_grouped_device_bank {
     const char * source;
     char * data;
     size_t expert_stride;
+    bool staged = false;
+    const char * direct_source = nullptr;
+    uint32_t direct_first = 0;
+    uint32_t direct_last = 0;
 };
 
 struct moe_grouped_device_auxiliary {
     const float * source;
     float * data;
     size_t n_values;
+    bool staged = false;
+    const float * direct_source = nullptr;
+    uint32_t direct_first = 0;
+    uint32_t direct_last = 0;
 };
+
+struct moe_grouped_host_stage_bank {
+    const char * source = nullptr;
+    char * destination = nullptr;
+    size_t stride = 0;
+    uint32_t direct_first = 0;
+    uint32_t direct_last = 0;
+};
+
+struct moe_grouped_host_stage {
+    moe_host_allocation allocation;
+    moe_grouped_decode_plan * plan = nullptr;
+    uint32_t * status = nullptr;
+    uint32_t capacity = 0;
+    uint32_t n_experts = 0;
+    uint32_t batch_size = 1;
+    std::vector<moe_grouped_host_stage_bank> banks;
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    moe_host_copy_worker * copy_worker = nullptr;
+#endif
+};
+
+struct moe_grouped_host_stage_tile {
+    moe_grouped_host_stage * stage = nullptr;
+    uint32_t miss = 0;
+};
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+static void moe_grouped_host_copy(char * destination, const char * source, size_t bytes) {
+#if defined(GGML_CUDA_MOE_STREAMING_COPY) && (defined(__x86_64__) || defined(_M_X64))
+    // The GPU consumes these writes; do not retain large staging copies in CPU caches.
+    if (bytes >= 256 * 1024 && bytes % 64 == 0 && (uintptr_t) destination % 16 == 0) {
+        for (size_t i = 0; i < bytes; i += 64) {
+            if (bytes - i > 1024) {
+                _mm_prefetch(source + i + 1024, _MM_HINT_T0);
+            }
+            const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i));
+            const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 16));
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 32));
+            const __m128i d = _mm_loadu_si128(reinterpret_cast<const __m128i *>(source + i + 48));
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i), a);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 16), b);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 32), c);
+            _mm_stream_si128(reinterpret_cast<__m128i *>(destination + i + 48), d);
+        }
+        _mm_sfence();
+        return;
+    }
+#endif
+    memcpy(destination, source, bytes);
+}
+
+static bool moe_grouped_stage_copy(const moe_grouped_host_stage_tile & tile, uint32_t first, uint32_t last) {
+    auto & stage = *tile.stage;
+    for (uint32_t i = first; i < last; ++i) {
+        const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
+        const int32_t slot = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[tile.miss + i];
+        if (expert < 0 || (uint32_t) expert >= stage.n_experts || slot < 0 || (uint32_t) slot >= stage.capacity) {
+            return false;
+        }
+        for (const auto & bank : stage.banks) {
+            if ((uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
+                moe_grouped_host_copy(bank.destination + (size_t) i * bank.stride, bank.source + (size_t) expert * bank.stride, bank.stride);
+            }
+        }
+    }
+    return true;
+}
+
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+struct moe_grouped_host_copy_job {
+    const moe_grouped_host_stage_tile * tile;
+    uint32_t first;
+    uint32_t last;
+    bool success = false;
+};
+
+static void moe_grouped_host_copy_task(void * data) {
+    auto & job = *static_cast<moe_grouped_host_copy_job *>(data);
+    job.success = moe_grouped_stage_copy(*job.tile, job.first, job.last);
+}
+#endif
+
+static void CUDART_CB moe_grouped_stage_callback(void * data) {
+    const auto & tile = *static_cast<moe_grouped_host_stage_tile *>(data);
+    auto & stage = *tile.stage;
+    *stage.status = MOE_GROUPED_PLAN_INVALID_STATE;
+    auto & failure = stage.allocation.budget->fail_stage_after;
+    if (failure.load(std::memory_order_relaxed) >= 0 && failure.fetch_sub(1, std::memory_order_relaxed) == 0) {
+        fprintf(stderr, "MoE host staging: injected callback failure\n");
+        return;
+    }
+    if (stage.plan->status != MOE_GROUPED_PLAN_READY || stage.plan->n_misses > stage.capacity) {
+        return;
+    }
+    const uint32_t count = tile.miss < stage.plan->n_misses ? std::min(stage.batch_size, stage.plan->n_misses - tile.miss) : 0;
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+    if (stage.copy_worker != nullptr && count >= 2) {
+        const uint32_t split = count / 2;
+        size_t bytes[2] = {};
+        for (uint32_t i = 0; i < count; ++i) {
+            const int32_t expert = moe_grouped_plan_array_ptr(stage.plan, stage.capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[tile.miss + i];
+            for (const auto & bank : stage.banks) {
+                if (expert < 0 || (uint32_t) expert < bank.direct_first || (uint32_t) expert >= bank.direct_last) {
+                    bytes[i < split ? 0 : 1] += bank.stride;
+                }
+            }
+        }
+        moe_grouped_host_copy_job job{&tile, split, count};
+        if (std::min(bytes[0], bytes[1]) >= 512 * 1024 && stage.copy_worker->try_submit(moe_grouped_host_copy_task, &job)) {
+            const bool success = moe_grouped_stage_copy(tile, 0, split);
+            stage.copy_worker->wait();
+            if (success && job.success) {
+                *stage.status = MOE_GROUPED_PLAN_READY;
+            }
+            return;
+        }
+    }
+#endif
+    if (moe_grouped_stage_copy(tile, 0, count)) {
+        *stage.status = MOE_GROUPED_PLAN_READY;
+    }
+}
+#endif
 
 static __device__ uint32_t moe_grouped_effective_frequency(
         uint32_t frequency,
@@ -3206,7 +3575,7 @@ static __global__ void moe_grouped_plan_decode(
     }
 }
 
-template<bool debug_transfers>
+template<bool debug_transfers, bool bounded = false>
 static __global__ void moe_grouped_gather_decode(
         const moe_grouped_device_bank * banks,
         uint32_t n_banks,
@@ -3216,25 +3585,34 @@ static __global__ void moe_grouped_gather_decode(
         size_t auxiliary_values_per_miss,
         uint32_t plan_capacity,
         const moe_grouped_decode_plan * plan,
-        uint64_t * transfer_counters) {
+        uint64_t * transfer_counters,
+        uint32_t first_miss = 0,
+        uint32_t max_misses = UINT32_MAX,
+        const uint32_t * stage_status = nullptr) {
+    if constexpr (bounded) {
+        if (stage_status != nullptr && *stage_status != MOE_GROUPED_PLAN_READY) {
+            __trap();
+        }
+    }
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
+    const uint32_t n_misses = bounded ? (first_miss < plan->n_misses ? min(max_misses, plan->n_misses - first_miss) : 0) : plan->n_misses;
     if constexpr (debug_transfers) {
         if (blockIdx.x == 0 && threadIdx.x == 0) {
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
-                static_cast<unsigned long long>(plan->n_misses) * n_banks);
+                static_cast<unsigned long long>(n_misses) * n_banks);
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[1]),
-                static_cast<unsigned long long>(plan->n_misses) * words_per_miss * sizeof(uint4));
+                static_cast<unsigned long long>(n_misses) * words_per_miss * sizeof(uint4));
         }
     }
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
-    const size_t total_words = words_per_miss * plan->n_misses;
+    const size_t total_words = words_per_miss * n_misses;
     const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
     for (size_t word = first; word < total_words; word += stride) {
-        const uint32_t miss = word / words_per_miss;
+        const uint32_t miss = (bounded ? first_miss : 0) + word / words_per_miss;
         size_t bank_word = word % words_per_miss;
         for (uint32_t bank = 0; bank < n_banks; ++bank) {
             const auto descriptor = banks[bank];
@@ -3245,16 +3623,24 @@ static __global__ void moe_grouped_gather_decode(
             }
             const int32_t expert = miss_experts[miss];
             const int32_t slot = miss_slots[miss];
-            const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
+            const char * source_data;
+            if constexpr (bounded) {
+                const bool direct = (uint32_t) expert >= descriptor.direct_first && (uint32_t) expert < descriptor.direct_last;
+                source_data = direct ? descriptor.direct_source + (size_t) (expert - descriptor.direct_first) * descriptor.expert_stride :
+                    descriptor.source + (descriptor.staged ? (size_t) (miss - first_miss) : (size_t) expert) * descriptor.expert_stride;
+            } else {
+                source_data = descriptor.source + (size_t) expert * descriptor.expert_stride;
+            }
+            const uint4 * source = reinterpret_cast<const uint4 *>(source_data);
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
             destination[bank_word] = source[bank_word];
             break;
         }
     }
     if (n_auxiliaries != 0) {
-        const size_t total_values = auxiliary_values_per_miss * plan->n_misses;
+        const size_t total_values = auxiliary_values_per_miss * n_misses;
         for (size_t index = first; index < total_values; index += stride) {
-            const uint32_t miss = index / auxiliary_values_per_miss;
+            const uint32_t miss = (bounded ? first_miss : 0) + index / auxiliary_values_per_miss;
             size_t auxiliary_value = index % auxiliary_values_per_miss;
             uint32_t auxiliary = 0;
             while (auxiliary < n_auxiliaries && auxiliary_value >= auxiliaries[auxiliary].n_values) {
@@ -3266,8 +3652,15 @@ static __global__ void moe_grouped_gather_decode(
             const auto descriptor = auxiliaries[auxiliary];
             const int32_t expert = miss_experts[miss];
             const int32_t slot = miss_slots[miss];
-            descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
-                descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
+            const float * source;
+            if constexpr (bounded) {
+                const bool direct = (uint32_t) expert >= descriptor.direct_first && (uint32_t) expert < descriptor.direct_last;
+                source = direct ? descriptor.direct_source + (size_t) (expert - descriptor.direct_first) * descriptor.n_values :
+                    descriptor.source + (descriptor.staged ? (size_t) (miss - first_miss) : (size_t) expert) * descriptor.n_values;
+            } else {
+                source = descriptor.source + (size_t) expert * descriptor.n_values;
+            }
+            descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] = source[auxiliary_value];
         }
     }
 }
@@ -3577,7 +3970,8 @@ static void ggml_cuda_moe_cache_set_metadata(
         ggml_cuda_moe_cache * cache,
         const char * tensor_name,
         const void * tensor_data,
-        int64_t n_experts);
+        int64_t n_experts,
+        ggml_backend_buffer_t buffer);
 
 ggml_cuda_moe_group_call_lease::ggml_cuda_moe_group_call_lease() noexcept = default;
 
@@ -3863,6 +4257,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         size_t plan_bytes = 0;
         moe_grouped_device_bank * device_banks = nullptr;
         moe_grouped_device_auxiliary * device_auxiliaries = nullptr;
+        std::unique_ptr<moe_grouped_host_stage> host_stage;
+        std::vector<moe_grouped_host_stage_tile> host_tiles;
         cudaEvent_t completion = nullptr;
         cudaStream_t completion_stream = nullptr;
         uint64_t serial = 0;
@@ -4585,14 +4981,17 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (bank == nullptr || !moe_candidate_record_matches(*bank, bank->info.tensor) ||
                     bank->info.expert_stride % sizeof(uint4) != 0 ||
                     reinterpret_cast<uintptr_t>(bank->info.source_data) % alignof(uint4) != 0 ||
-                    !device_alias(device, bank->buffer_base, bank->data_offset, bank->info.source_data, false, false)) {
+                    (moe_host_budget_for(bank->buft) == nullptr &&
+                        !device_alias(device, bank->buffer_base, bank->data_offset, bank->info.source_data, false, false))) {
                 return false;
             }
         }
         for (uint32_t auxiliary_index = 0; auxiliary_index < n_scales + n_biases; ++auxiliary_index) {
             const auto * auxiliary = moe_candidate_slot_auxiliary_bank(group, auxiliary_index);
             if (auxiliary == nullptr || !moe_candidate_record_matches(*auxiliary, auxiliary->info.tensor) ||
-                    !device_alias(device, auxiliary->buffer_base, auxiliary->data_offset, auxiliary->info.source_data, true, true)) {
+                    (!device_alias(device, auxiliary->buffer_base, auxiliary->data_offset, auxiliary->info.source_data, true, true) &&
+                        !(moe_host_budget_for(moe_candidate_base_slot_bank(group, 0)->buft) != nullptr &&
+                          (ggml_backend_buft_is_host(auxiliary->buft) || moe_host_budget_for(auxiliary->buft) != nullptr)))) {
                 return false;
             }
         }
@@ -4716,14 +5115,13 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         moe_grouped_device_scope device_scope(device);
+        auto * host_budget = moe_host_budget_for(snapshot.banks[0].buft);
         std::array<moe_grouped_device_auxiliary, 3> device_auxiliaries = {};
         std::array<bool, 3> auxiliary_host_alias = {};
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             const auto & auxiliary = snapshot.slot_auxiliaries[i];
             const void * alias_data = nullptr;
             if (!descriptor_matches(auxiliary) ||
-                    !device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
-                        true, true, &alias_data, &auxiliary_host_alias[i]) ||
                     auxiliary.type != GGML_TYPE_F32 || !ggml_is_contiguous(auxiliary.tensor)) {
                 return nullptr;
             }
@@ -4734,8 +5132,23 @@ struct ggml_cuda_moe_grouped_context::impl {
                     auxiliary.byte_extent != n_values * sizeof(float) * n_experts) {
                 return nullptr;
             }
+            bool mapped;
+            if (moe_host_budget_for(auxiliary.buft) != nullptr) {
+                mapped = moe_bounded_expert_alias(auxiliary.buffer, auxiliary.source_data, n_values * sizeof(float), n_experts,
+                    &alias_data, &device_auxiliaries[i].direct_first, &device_auxiliaries[i].direct_last);
+                device_auxiliaries[i].direct_source = static_cast<const float *>(alias_data);
+                auxiliary_host_alias[i] = mapped;
+            } else {
+                mapped = device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
+                    true, true, &alias_data, &auxiliary_host_alias[i]);
+            }
+            if (!mapped && !(host_budget != nullptr &&
+                    (ggml_backend_buft_is_host(auxiliary.buft) || moe_host_budget_for(auxiliary.buft) != nullptr))) {
+                return nullptr;
+            }
             device_auxiliaries[i].source = static_cast<const float *>(alias_data);
             device_auxiliaries[i].n_values = n_values;
+            device_auxiliaries[i].staged = !mapped;
         }
 
         std::unique_ptr<grouped_device_resource> result;
@@ -4758,7 +5171,15 @@ struct ggml_cuda_moe_grouped_context::impl {
                     (uintptr_t) bank.source_data % alignof(uint4) != 0) {
                 return nullptr;
             }
-            if (!device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data, false, false, &alias_data)) {
+            bool mapped;
+            if (moe_host_budget_for(bank.buft) != nullptr) {
+                mapped = moe_bounded_expert_alias(bank.buffer, bank.source_data, bank.expert_stride, n_experts,
+                    &alias_data, &device_banks[i].direct_first, &device_banks[i].direct_last);
+                device_banks[i].direct_source = static_cast<const char *>(alias_data);
+            } else {
+                mapped = device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data, false, false, &alias_data);
+            }
+            if (!mapped && (host_budget == nullptr || moe_host_budget_for(bank.buft) != host_budget)) {
                 return nullptr;
             }
             if (bank.expert_stride > SIZE_MAX / snapshot.n_slots) {
@@ -4779,6 +5200,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             device_banks[i].source = static_cast<const char *>(alias_data);
             device_banks[i].data = static_cast<char *>(result->bank_data[i]);
             device_banks[i].expert_stride = bank.expert_stride;
+            device_banks[i].staged = !mapped;
         }
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             const size_t n_values = device_auxiliaries[i].n_values;
@@ -4790,6 +5212,73 @@ struct ggml_cuda_moe_grouped_context::impl {
             result->auxiliary_values_per_miss += n_values;
             device_auxiliaries[i].data = result->auxiliary_data[i];
             result->auxiliary_n_values[i] = n_values;
+        }
+        size_t stage_bytes = 0;
+        for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
+            if (device_banks[i].staged) {
+                if (device_banks[i].expert_stride > SIZE_MAX - stage_bytes) {
+                    return nullptr;
+                }
+                stage_bytes += device_banks[i].expert_stride;
+            }
+        }
+        for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
+            if (device_auxiliaries[i].staged) {
+                const size_t bytes = device_auxiliaries[i].n_values * sizeof(float);
+                if (bytes > SIZE_MAX - stage_bytes) {
+                    return nullptr;
+                }
+                stage_bytes += bytes;
+            }
+        }
+        if (stage_bytes != 0) {
+            if (result->plan_bytes > SIZE_MAX - 32) {
+                return nullptr;
+            }
+            const size_t control_bytes = (result->plan_bytes + sizeof(uint32_t) + 15) / 16 * 16;
+            const uint32_t batch_size = std::min(host_budget->staging_misses, snapshot.n_slots);
+            if (stage_bytes > (SIZE_MAX - control_bytes) / batch_size) {
+                return nullptr;
+            }
+            result->host_stage = std::make_unique<moe_grouped_host_stage>();
+            auto & stage = *result->host_stage;
+            if (!stage.allocation.allocate(host_budget, control_bytes + stage_bytes * batch_size)) {
+                return nullptr;
+            }
+#ifdef GGML_CUDA_MOE_PARALLEL_COPY
+            if (ggml_cuda_info().device_count == 1 && host_budget->copy_worker.start()) {
+                stage.copy_worker = &host_budget->copy_worker;
+            }
+#endif
+            stage.plan = static_cast<moe_grouped_decode_plan *>(stage.allocation.data);
+            stage.status = reinterpret_cast<uint32_t *>(static_cast<char *>(stage.allocation.data) + result->plan_bytes);
+            stage.capacity = snapshot.n_slots;
+            stage.n_experts = n_experts;
+            stage.batch_size = batch_size;
+            size_t offset = control_bytes;
+            for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
+                if (device_banks[i].staged) {
+                    device_banks[i].source = static_cast<const char *>(stage.allocation.device_data) + offset;
+                    stage.banks.push_back({static_cast<const char *>(snapshot.banks[i].source_data),
+                        static_cast<char *>(stage.allocation.data) + offset, device_banks[i].expert_stride,
+                        device_banks[i].direct_first, device_banks[i].direct_last});
+                    offset += device_banks[i].expert_stride * batch_size;
+                }
+            }
+            for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
+                if (device_auxiliaries[i].staged) {
+                    device_auxiliaries[i].source = reinterpret_cast<const float *>(static_cast<const char *>(stage.allocation.device_data) + offset);
+                    const size_t bytes = device_auxiliaries[i].n_values * sizeof(float);
+                    stage.banks.push_back({static_cast<const char *>(snapshot.slot_auxiliaries[i].source_data),
+                        static_cast<char *>(stage.allocation.data) + offset, bytes,
+                        device_auxiliaries[i].direct_first, device_auxiliaries[i].direct_last});
+                    offset += bytes * batch_size;
+                }
+            }
+            result->host_tiles.resize(1 + (snapshot.n_slots - 1) / batch_size);
+            for (uint32_t i = 0; i < result->host_tiles.size(); ++i) {
+                result->host_tiles[i] = {&stage, i * batch_size};
+            }
         }
         if (result->words_per_miss > SIZE_MAX / snapshot.n_slots ||
                 result->auxiliary_values_per_miss > SIZE_MAX / snapshot.n_slots) {
@@ -5330,6 +5819,20 @@ bool ggml_cuda_moe_grouped_context::recover_graph_coverage(
     if (coverage_mmid_fingerprint != nullptr) {
         *coverage_mmid_fingerprint = it->second.mmid_fingerprint;
     }
+    return true;
+}
+
+bool ggml_cuda_moe_grouped_context::probe_host_allocation_for_test(ggml_backend_buffer_type_t buft, size_t bytes, bool fail) {
+    moe_host_allocation allocation;
+    return allocation.allocate(moe_host_budget_for(buft), bytes, fail);
+}
+
+bool ggml_cuda_moe_grouped_context::fail_host_staging_after_for_test(ggml_backend_buffer_type_t buft, int64_t callbacks) {
+    auto * budget = moe_host_budget_for(buft);
+    if (budget == nullptr) {
+        return false;
+    }
+    budget->fail_stage_after.store(callbacks, std::memory_order_relaxed);
     return true;
 }
 
@@ -6022,7 +6525,7 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
                 source_is_mmap, l2_budget_bytes, l2_target_slots, nullptr, nullptr, false);
         }
         if (prospective != nullptr) {
-            ggml_cuda_moe_cache_set_metadata(prospective, tensor->name[0] ? tensor->name : "?", tensor->data, tensor->ne[2]);
+            ggml_cuda_moe_cache_set_metadata(prospective, tensor->name[0] ? tensor->name : "?", tensor->data, tensor->ne[2], tensor->buffer);
         }
     } catch (...) {
         ggml_cuda_moe_cache_free(prospective);
@@ -6404,7 +6907,8 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             auto prospective = impl_->make_device_resource(resource->snapshot, compute_stream);
             if (prospective == nullptr) {
                 (void) end_group_transaction(transaction);
-                return GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
+                return moe_host_budget_for(resource->snapshot.banks[0].buft) != nullptr ?
+                    GGML_CUDA_MOE_GROUPED_DECODE_ERROR : GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK;
             }
             bool installed = false;
             {
@@ -6469,6 +6973,30 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
         uint64_t * transfer_counters = debug != nullptr ? debug->device_transfers.load(std::memory_order_acquire) : nullptr;
         const uint32_t transfer_blocks = moe_grouped_transfer_blocks(
             impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, n_routes);
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+        if (device.host_stage != nullptr) {
+            auto & stage = *device.host_stage;
+            CUDA_CHECK(cudaMemcpyAsync(stage.plan, device.plan, device.plan_bytes, cudaMemcpyDeviceToHost, compute_stream));
+            const auto * status = reinterpret_cast<const uint32_t *>(
+                static_cast<const char *>(stage.allocation.device_data) + device.plan_bytes);
+            const uint32_t tile_blocks = moe_grouped_transfer_blocks(
+                impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, std::min(stage.batch_size, n_routes));
+            for (uint32_t miss = 0; miss < n_routes; miss += stage.batch_size) {
+                CUDA_CHECK(cudaLaunchHostFunc(compute_stream, moe_grouped_stage_callback, &device.host_tiles[miss / stage.batch_size]));
+                if (transfer_counters != nullptr) {
+                    moe_grouped_gather_decode<true, true><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+                        device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
+                        device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
+                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters, miss, stage.batch_size, status);
+                } else {
+                    moe_grouped_gather_decode<false, true><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+                        device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
+                        device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
+                        device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr, miss, stage.batch_size, status);
+                }
+            }
+        } else
+#endif
         if (transfer_counters != nullptr) {
             moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
@@ -9136,6 +9664,8 @@ struct ggml_cuda_moe_cache {
 
     std::string tensor_name;
     const void * tensor_data = nullptr;
+    uintptr_t registered_begin = 0;
+    uintptr_t registered_end = 0;
     int64_t n_experts = 0;
     uint64_t expert_access_counter = 0;
     std::vector<uint64_t> expert_access_counts;
@@ -9157,10 +9687,37 @@ static void ggml_cuda_moe_cache_set_metadata(
         ggml_cuda_moe_cache * cache,
         const char * tensor_name,
         const void * tensor_data,
-        int64_t n_experts) {
+        int64_t n_experts,
+        ggml_backend_buffer_t buffer) {
     cache->tensor_name = tensor_name;
     cache->tensor_data = tensor_data;
     cache->n_experts = n_experts;
+    if (buffer != nullptr && moe_host_budget_for(buffer->buft) != nullptr) {
+        const auto * context = static_cast<const moe_bounded_buffer *>(buffer->context);
+        cache->registered_begin = reinterpret_cast<uintptr_t>(context->registered);
+        cache->registered_end = cache->registered_begin + context->registered_bytes;
+    }
+}
+
+static cudaError_t moe_cache_copy_host(ggml_cuda_moe_cache * cache, void * dst, const void * src, size_t bytes, cudaStream_t stream) {
+    while (bytes != 0) {
+        size_t chunk = bytes;
+        const uintptr_t address = reinterpret_cast<uintptr_t>(src);
+        // CUDA copies cannot cross between registered and pageable host storage.
+        for (uintptr_t boundary : {cache->registered_begin, cache->registered_end}) {
+            if (address < boundary) {
+                chunk = std::min(chunk, boundary - address);
+            }
+        }
+        const auto error = cudaMemcpyAsync(dst, src, chunk, cudaMemcpyHostToDevice, stream);
+        if (error != cudaSuccess) {
+            return error;
+        }
+        src = static_cast<const char *>(src) + chunk;
+        dst = static_cast<char *>(dst) + chunk;
+        bytes -= chunk;
+    }
+    return cudaSuccess;
 }
 
 static void ggml_cuda_moe_cache_append_expert_counts(
@@ -9789,9 +10346,7 @@ static int ggml_cuda_moe_cache_acquire_locked(
             return -1;
         }
     }
-    err = cudaMemcpyAsync(
-        dst, copy_src, byte_count,
-        cudaMemcpyHostToDevice, copy_stream);
+    err = moe_cache_copy_host(cache, dst, copy_src, byte_count, copy_stream);
     if (debug_mm) {
         cache->h2d_copy_count.fetch_add(1, std::memory_order_relaxed);
         cache->h2d_copy_bytes.fetch_add(byte_count, std::memory_order_relaxed);
@@ -9903,12 +10458,13 @@ bool ggml_cuda_moe_cache_copy_to_staging(
             }
             ++run;
         }
-        CUDA_CHECK(cudaMemcpyAsync(
-            (char *)dst + (size_t)i * byte_count,
-            src,
-            (size_t)run * byte_count,
-            resident ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice,
-            cache->copy_stream));
+        if (resident) {
+            CUDA_CHECK(cudaMemcpyAsync((char *)dst + (size_t)i * byte_count, src,
+                (size_t)run * byte_count, cudaMemcpyDeviceToDevice, cache->copy_stream));
+        } else {
+            CUDA_CHECK(moe_cache_copy_host(cache, (char *)dst + (size_t)i * byte_count, src,
+                (size_t)run * byte_count, cache->copy_stream));
+        }
         i += run;
     }
 
@@ -10064,16 +10620,17 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
                 ++run;
             }
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
-            batch_dsts.push_back((char *) miss_dst + (size_t) copied * byte_count);
-            batch_srcs.push_back(src);
-            batch_sizes.push_back((size_t) run * byte_count);
+            if (cache->registered_begin != cache->registered_end) {
+                CUDA_CHECK(moe_cache_copy_host(cache, (char *) miss_dst + (size_t) copied * byte_count,
+                    src, (size_t) run * byte_count, cache->copy_stream));
+            } else {
+                batch_dsts.push_back((char *) miss_dst + (size_t) copied * byte_count);
+                batch_srcs.push_back(src);
+                batch_sizes.push_back((size_t) run * byte_count);
+            }
 #else
-            CUDA_CHECK(cudaMemcpyAsync(
-                (char *) miss_dst + (size_t) copied * byte_count,
-                src,
-                (size_t) run * byte_count,
-                cudaMemcpyHostToDevice,
-                cache->copy_stream));
+            CUDA_CHECK(moe_cache_copy_host(cache, (char *) miss_dst + (size_t) copied * byte_count,
+                src, (size_t) run * byte_count, cache->copy_stream));
 #endif
             copied += run;
         }
@@ -11066,6 +11623,226 @@ bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft) {
     return buft != nullptr
         && buft->iface.get_name == ggml_backend_cuda_moe_cached_buffer_type_name;
 }
+
+static void * moe_bounded_buffer_base(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buffer_get_base(static_cast<moe_bounded_buffer *>(buffer->context)->backing);
+}
+
+static void moe_bounded_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_buffer_clear(static_cast<moe_bounded_buffer *>(buffer->context)->backing, value);
+}
+
+static void moe_bounded_buffer_free(ggml_backend_buffer_t buffer) {
+    auto * context = static_cast<moe_bounded_buffer *>(buffer->context);
+    if (context->registered != nullptr) {
+        CUDA_CHECK(cudaHostUnregister(context->registered));
+        context->budget->unreserve_source(context->registered_bytes);
+    }
+    ggml_backend_buffer_free(context->backing);
+    context->budget->release();
+    delete context;
+}
+
+static ggml_backend_buffer_t moe_bounded_buffer_wrap(ggml_backend_buffer_type_t buft, ggml_backend_buffer_t backing) {
+    if (backing == nullptr) {
+        return nullptr;
+    }
+    auto * budget = moe_host_budget_for(buft);
+    auto * context = new (std::nothrow) moe_bounded_buffer{backing, budget};
+    if (context == nullptr) {
+        ggml_backend_buffer_free(backing);
+        return nullptr;
+    }
+    auto iface = backing->iface;
+    iface.get_base = moe_bounded_buffer_base;
+    iface.clear = moe_bounded_buffer_clear;
+    iface.free_buffer = moe_bounded_buffer_free;
+    budget->retain();
+    return ggml_backend_buffer_init(buft, iface, context, backing->size);
+}
+
+static ggml_backend_buffer_t moe_bounded_buffer_alloc(ggml_backend_buffer_type_t buft, size_t size) {
+    return moe_bounded_buffer_wrap(buft, ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size));
+}
+
+extern "C"
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_bounded_buffer_type(size_t bytes) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(bytes);
+    return nullptr;
+#else
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+    auto * budget = new (std::nothrow) moe_host_budget;
+    if (budget == nullptr) {
+        return nullptr;
+    }
+    budget->limit = bytes;
+    budget->buft = *ggml_backend_cuda_moe_cached_buffer_type();
+    budget->buft.context = budget;
+    budget->buft.iface.alloc_buffer = moe_bounded_buffer_alloc;
+    return &budget->buft;
+#endif
+}
+
+extern "C"
+void ggml_backend_cuda_moe_bounded_buffer_type_free(ggml_backend_buffer_type_t buft) {
+    auto * budget = moe_host_budget_for(buft);
+    if (budget != nullptr) {
+        budget->release();
+    }
+}
+
+extern "C"
+ggml_backend_buffer_t ggml_backend_cuda_moe_bounded_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
+    if (moe_host_budget_for(buft) == nullptr) {
+        return nullptr;
+    }
+    return moe_bounded_buffer_wrap(buft, ggml_backend_cpu_buffer_from_ptr(ptr, size));
+}
+
+extern "C"
+bool ggml_backend_cuda_moe_host_pinned_stats(ggml_backend_buffer_type_t buft, size_t * used, size_t * peak) {
+    auto * budget = moe_host_budget_for(buft);
+    if (budget == nullptr || used == nullptr || peak == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(budget->mutex);
+    *used = budget->used;
+    *peak = budget->peak;
+    return true;
+}
+
+extern "C"
+bool ggml_backend_cuda_moe_reserve_host_staging(ggml_backend_buffer_type_t buft, size_t bytes) {
+    return ggml_backend_cuda_moe_reserve_host_staging_batch(buft, bytes, 16);
+}
+
+extern "C"
+bool ggml_backend_cuda_moe_reserve_host_staging_batch(ggml_backend_buffer_type_t buft, size_t bytes, uint32_t max_misses) {
+    auto * budget = moe_host_budget_for(buft);
+    if (budget == nullptr || max_misses == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(budget->mutex);
+    if (budget->used != 0 || bytes > budget->limit) {
+        GGML_LOG_ERROR("MoE host pin budget needs at least %zu staging bytes; configured %zu\n", bytes, budget->limit);
+        return false;
+    }
+    // Keep the one-miss minimum; use spare capacity to reduce captured host handoffs.
+    budget->staging_misses = bytes == 0 ? 1 : static_cast<uint32_t>(std::min<size_t>({16, max_misses, budget->limit / bytes}));
+    const size_t headroom = bytes * budget->staging_misses;
+    budget->source_limit = budget->limit - headroom;
+    GGML_LOG_INFO("MoE host staging: batch=%u headroom=%zu bytes\n", budget->staging_misses, headroom);
+    return true;
+}
+
+extern "C"
+void ggml_backend_cuda_moe_pin_sources(ggml_backend_buffer_t buffer, bool read_only) {
+    if (buffer == nullptr || buffer->size == 0 || moe_host_budget_for(buffer->buft) == nullptr || getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return;
+    }
+    const char * register_sources = getenv("GGML_CUDA_MOE_HOST_REGISTER");
+    if (register_sources != nullptr && strcmp(register_sources, "0") == 0) {
+        GGML_LOG_INFO("MoE source registration disabled; using bounded staging\n");
+        return;
+    }
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    auto * context = static_cast<moe_bounded_buffer *>(buffer->context);
+    if (context->registered != nullptr) {
+        return;
+    }
+    int device = 0;
+    int supported = 0;
+    if (!moe_grouped_cuda_success(cudaGetDevice(&device)) ||
+            !moe_grouped_cuda_success(cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterSupported, device)) || !supported) {
+        GGML_LOG_INFO("MoE host registration unavailable; using bounded staging\n");
+        return;
+    }
+    unsigned flags = cudaHostRegisterMapped | cudaHostRegisterPortable;
+    if (read_only) {
+#if CUDART_VERSION >= 11010
+        if (!moe_grouped_cuda_success(cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterReadOnlySupported, device)) || !supported) {
+            GGML_LOG_INFO("MoE read-only host registration unavailable; using bounded staging\n");
+            return;
+        }
+        flags |= cudaHostRegisterReadOnly;
+#else
+        GGML_LOG_INFO("MoE read-only host registration requires CUDA 11.1; using bounded staging\n");
+        return;
+#endif
+    }
+    constexpr uintptr_t granularity = 64 * 1024;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(buffer));
+    if (base > UINTPTR_MAX - granularity + 1 || buffer->size > UINTPTR_MAX - base) {
+        return;
+    }
+    const uintptr_t first = (base + granularity - 1) / granularity * granularity;
+    const uintptr_t last = (base + buffer->size) / granularity * granularity;
+    if (first >= last) {
+        return;
+    }
+    const size_t bytes = context->budget->reserve_source(last - first);
+    if (bytes == 0) {
+        return;
+    }
+    const auto error = cudaHostRegister(reinterpret_cast<void *>(first), bytes, flags);
+    if (error != cudaSuccess) {
+        (void) cudaGetLastError();
+        context->budget->unreserve_source(bytes);
+        GGML_LOG_WARN("MoE source registration of %zu bytes failed: %s; using bounded staging\n", bytes, cudaGetErrorString(error));
+        return;
+    }
+    context->registered = reinterpret_cast<void *>(first);
+    context->registered_bytes = bytes;
+    GGML_LOG_INFO("MoE host sources: registered %zu bytes in place\n", bytes);
+#else
+    GGML_UNUSED(read_only);
+#endif
+}
+
+namespace {
+
+static bool moe_bounded_expert_alias(
+        ggml_backend_buffer_t buffer, const void * source, size_t stride, uint32_t n_experts,
+        const void ** alias, uint32_t * first, uint32_t * last) {
+    *alias = nullptr;
+    *first = *last = 0;
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(source);
+    GGML_UNUSED(stride);
+    GGML_UNUSED(n_experts);
+    return false;
+#else
+    if (buffer == nullptr || moe_host_budget_for(buffer->buft) == nullptr || stride == 0 || n_experts == 0) {
+        return false;
+    }
+    const auto * context = static_cast<const moe_bounded_buffer *>(buffer->context);
+    if (context->registered == nullptr) {
+        return false;
+    }
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(context->registered);
+    const uintptr_t end = begin + context->registered_bytes;
+    const uintptr_t data = reinterpret_cast<uintptr_t>(source);
+    if (data >= end || stride > (UINTPTR_MAX - data) / n_experts) {
+        return false;
+    }
+    const size_t start = data < begin ? (begin - data) / stride + ((begin - data) % stride != 0) : 0;
+    const size_t stop = std::min<size_t>(n_experts, (end - data) / stride);
+    void * device_base = nullptr;
+    if (start >= stop || !moe_grouped_cuda_success(cudaHostGetDevicePointer(&device_base, context->registered, 0))) {
+        return false;
+    }
+    *alias = static_cast<const char *>(device_base) + (data + start * stride - begin);
+    *first = start;
+    *last = stop;
+    return start == 0 && stop == n_experts;
+#endif
+}
+
+} // namespace
 
 extern "C"
 ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size) {

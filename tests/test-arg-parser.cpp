@@ -29,6 +29,41 @@ static void unset_test_env(const char * name) {
 #endif
 }
 
+static void test_moe_host_pin_arguments() {
+    const auto parse = [](std::initializer_list<const char *> arguments, bool valid, size_t bytes = SIZE_MAX) {
+        common_params params;
+        params.model.path = "test-model.gguf";
+        std::vector<char *> argv;
+        for (const char * arg : arguments) {
+            argv.push_back(const_cast<char *>(arg));
+        }
+        assert(common_params_parse(argv.size(), argv.data(), params, LLAMA_EXAMPLE_COMMON) == valid);
+        if (valid) {
+            assert(params.moe_expert_cache_host_pinned_size == bytes);
+            assert(common_model_params_to_llama(params).moe_expert_cache_host_pinned_size == bytes);
+        }
+    };
+    parse({"test"}, true);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "0"}, true, 0);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "7"}, true, 7 * 1024 * 1024);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "-1"}, false);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "18446744073709551616"}, false);
+    parse({"test", "--moe-expert-cache-l2-pinned-mb", "7"}, true, 7 * 1024 * 1024);
+    parse({"test", "--moe-expert-cache-l2-pinned-mb", "7", "--moe-expert-cache-host-pinned-mb", "7"}, false);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "7", "--moe-expert-cache-l2-pinned-mb", "7"}, false);
+    set_test_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB", "9");
+    parse({"test"}, true, 9 * 1024 * 1024);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "11"}, true, 11 * 1024 * 1024);
+    parse({"test", "--moe-expert-cache-l2-pinned-mb", "9"}, false);
+    set_test_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB", "9");
+    parse({"test"}, false);
+    unset_test_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB");
+    parse({"test"}, true, 9 * 1024 * 1024);
+    parse({"test", "--moe-expert-cache-host-pinned-mb", "9"}, false);
+    unset_test_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB");
+    printf("test-arg-parser: MoE host pin arguments OK\n");
+}
+
 static void test(void) {
     common_params params;
 
@@ -672,6 +707,7 @@ static void test_mtp_state_boundaries() {
 
 int main(void) {
     try {
+        test_moe_host_pin_arguments();
         test();
         test_draft_ubatch_override();
         test_mtp_draft_ubatch_validation();

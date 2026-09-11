@@ -1416,13 +1416,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
         ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-        auto set_l2_fn = (ggml_backend_moe_cache_set_l2_pinned_size_t) ggml_backend_reg_get_proc_address(
-                reg, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME);
         auto set_debug_fn = (ggml_backend_moe_cache_set_debug_t) ggml_backend_reg_get_proc_address(
                 reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME);
-        if (set_l2_fn != nullptr) {
-            set_l2_fn(params.moe_expert_cache_l2_pinned_size);
-        }
         if (set_debug_fn != nullptr) {
             set_debug_fn(params.experimental_logs);
         }
@@ -1711,6 +1706,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     mparams.n_gpu_layers          = params.n_gpu_layers;
     mparams.moe_expert_cache_slots = params.n_moe_expert_cache_slots;
+    mparams.moe_expert_cache_host_pinned_size = params.moe_expert_cache_host_pinned_size;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;

@@ -7877,6 +7877,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_log_and_reset_stats;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_bounded_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FREE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_bounded_buffer_type_free;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_FROM_HOST_PTR_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_bounded_buffer_from_host_ptr;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_RESERVE_HOST_STAGING_BATCH_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_reserve_host_staging_batch;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_PIN_SOURCES_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_pin_sources;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_moe_candidate_replace_v1;
     }

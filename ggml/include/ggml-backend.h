@@ -211,6 +211,11 @@ extern "C" {
 #define GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME "ggml_backend_moe_cache_set_l2_pinned_size"
 #define GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME "ggml_backend_moe_cache_set_debug"
 #define GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME "ggml_backend_moe_cache_log_and_reset_stats"
+#define GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_bounded_buffer_type"
+#define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_FREE_PROC_NAME "ggml_backend_moe_cache_buffer_type_free"
+#define GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_FROM_HOST_PTR_PROC_NAME "ggml_backend_moe_cache_bounded_buffer_from_host_ptr"
+#define GGML_BACKEND_MOE_CACHE_RESERVE_HOST_STAGING_BATCH_PROC_NAME "ggml_backend_moe_cache_reserve_host_staging_batch"
+#define GGML_BACKEND_MOE_CACHE_PIN_SOURCES_PROC_NAME "ggml_backend_moe_cache_pin_sources"
 
     typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
     typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type_t buft);
@@ -219,6 +224,11 @@ extern "C" {
     typedef void (*ggml_backend_moe_cache_set_l2_pinned_size_t)(size_t bytes);
     typedef void (*ggml_backend_moe_cache_set_debug_t)(bool enabled);
     typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
+    typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_bounded_buffer_type_t)(size_t bytes);
+    typedef void (*ggml_backend_moe_cache_buffer_type_free_t)(ggml_backend_buffer_type_t buft);
+    typedef ggml_backend_buffer_t (*ggml_backend_moe_cache_bounded_buffer_from_host_ptr_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
+    typedef bool (*ggml_backend_moe_cache_reserve_host_staging_batch_t)(ggml_backend_buffer_type_t buft, size_t bytes, uint32_t max_misses);
+    typedef void (*ggml_backend_moe_cache_pin_sources_t)(ggml_backend_buffer_t buffer, bool read_only);
 
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME "ggml_backend_moe_candidate_replace_v1"
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u
