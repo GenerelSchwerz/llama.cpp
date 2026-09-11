@@ -16,8 +16,8 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
-// Configure lazy row page advice (default: false) while the context is idle.
-// Returns false without changes if the CPU extension is unavailable.
+// Configure lazy row page advice (default: false) while idle, before the first staged decode attempt.
+// Returns false without changes if the CPU extension is unavailable or staged inputs were already checked.
 LLAMA_API bool llama_set_ple_prefetch(struct llama_context * ctx, bool enabled);
 
 LLAMA_API bool llama_recurrent_sparse_snapshots_supported(const struct llama_context * ctx);

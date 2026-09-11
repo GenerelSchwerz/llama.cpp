@@ -38,17 +38,19 @@ private:
 };
 }
 
-std::unique_ptr<llama_staged_inputs> llama_staged_inputs::create(const llama_model & model, ggml_backend_t backend) {
+std::unique_ptr<llama_staged_inputs> llama_staged_inputs::create(const llama_model & model, ggml_backend_t backend, bool prefetch) {
     const auto & hp = model.hparams;
     if (!readable(model.tok_embd) || !readable(model.per_layer_tok_embd) || hp.ple_ngram_size < 2 ||
-        hp.ple_n_heads == 0 || model.per_layer_tok_embd->ne[0] != hp.ple_head_dim ||
+        hp.ple_ngram_size > LLAMA_MAX_PLE_NGRAM || hp.ple_heads_per_ngram > LLAMA_MAX_PLE_HEADS / (hp.ple_ngram_size - 1) ||
+        hp.ple_n_heads != (hp.ple_ngram_size - 1)*hp.ple_heads_per_ngram ||
+        hp.ple_n_heads == 0 || hp.ple_n_heads > LLAMA_MAX_PLE_HEADS || model.per_layer_tok_embd->ne[0] != hp.ple_head_dim ||
         hp.n_embd_inp() != hp.n_embd || model.tok_embd->ne[0] != hp.n_embd || hp.f_embedding_scale != 0.0f) {
         return nullptr;
     }
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     auto get_api = reinterpret_cast<ggml_staged_input_get_api_t>(ggml_backend_reg_get_proc_address(reg, GGML_STAGED_INPUT_PROC));
     if (!get_api) { return nullptr; }
-    auto result = std::unique_ptr<llama_staged_inputs>(new llama_staged_inputs(model));
+    auto result = std::unique_ptr<llama_staged_inputs>(new llama_staged_inputs(model, prefetch));
     result->api = get_api();
     if (!result->api) { return nullptr; }
     result->embedding = result->api->create(backend, model.tok_embd->ne[0]*sizeof(float));
@@ -93,13 +95,31 @@ void llama_staged_inputs::prepare(const llama_ubatch & ubatch, const llama_memor
                 if (!cut) { context[s] = t; }
             }
             auto * dst = static_cast<float *>(api->data(ple));
-            for (uint32_t n = 2; n <= hp.ple_ngram_size; ++n) {
-                uint64_t mixed = uint64_t(context[0])*hp.ple_layer_multipliers[0];
-                for (uint32_t j = 1; j < n; ++j) { mixed ^= uint64_t(context[j])*hp.ple_layer_multipliers[j]; }
-                for (uint32_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
-                    const auto h = (n - 2)*hp.ple_heads_per_ngram + g;
-                    const auto row = mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h];
-                    read_row(model.per_layer_tok_embd, row, dst + h*hp.ple_head_dim);
+            if (prefetch) {
+                int32_t rows[LLAMA_MAX_PLE_HEADS];
+                for (uint32_t n = 2; n <= hp.ple_ngram_size; ++n) {
+                    uint64_t mixed = uint64_t(context[0])*hp.ple_layer_multipliers[0];
+                    for (uint32_t j = 1; j < n; ++j) { mixed ^= uint64_t(context[j])*hp.ple_layer_multipliers[j]; }
+                    for (uint32_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
+                        const auto h = (n - 2)*hp.ple_heads_per_ngram + g;
+                        const auto row = mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h];
+                        if (row > INT32_MAX) { throw std::runtime_error("staged PLE row does not fit int32"); }
+                        rows[h] = int32_t(row);
+                    }
+                }
+                model.prefetch_rows(model.per_layer_tok_embd, rows, hp.ple_n_heads);
+                for (uint32_t h = 0; h < hp.ple_n_heads; ++h) {
+                    read_row(model.per_layer_tok_embd, rows[h], dst + h*hp.ple_head_dim);
+                }
+            } else {
+                for (uint32_t n = 2; n <= hp.ple_ngram_size; ++n) {
+                    uint64_t mixed = uint64_t(context[0])*hp.ple_layer_multipliers[0];
+                    for (uint32_t j = 1; j < n; ++j) { mixed ^= uint64_t(context[j])*hp.ple_layer_multipliers[j]; }
+                    for (uint32_t g = 0; g < hp.ple_heads_per_ngram; ++g) {
+                        const auto h = (n - 2)*hp.ple_heads_per_ngram + g;
+                        const auto row = mixed % hp.ple_head_vocab_sizes[h] + hp.ple_head_offsets[h];
+                        read_row(model.per_layer_tok_embd, row, dst + h*hp.ple_head_dim);
+                    }
                 }
             }
             api->publish(ple);

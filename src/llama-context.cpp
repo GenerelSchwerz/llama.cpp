@@ -2251,6 +2251,7 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 }
 
 bool llama_context::set_ple_prefetch(bool enabled) {
+    if (staged_inputs_checked) { return false; }
     auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
     auto set_callback = reinterpret_cast<ggml_backend_set_get_rows_callback_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_get_rows_callback"));
     if (!set_callback) { return false; }
@@ -2704,9 +2705,12 @@ int32_t llama_context::decode_sampled(const llama_sampled_decode_item * items, i
             return decode_sampled_host(items, n_items, sources, previous);
         }
         if (!staged_inputs_checked) {
-            staged_inputs = llama_staged_inputs::create(model, backend);
+            staged_inputs = llama_staged_inputs::create(model, backend, ple_prefetch);
             staged_inputs_checked = true;
             LLAMA_LOG_INFO("%s: Flash Next staged inputs %s\n", __func__, staged_inputs ? "enabled" : "unavailable, using host inputs");
+            if (staged_inputs && ple_prefetch) {
+                LLAMA_LOG_INFO("%s: staged PLE prefetch enabled\n", __func__);
+            }
         }
         if (!staged_inputs) {
             return decode_sampled_host(items, n_items, sources, previous);
