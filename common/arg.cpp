@@ -2325,7 +2325,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_OVERLAP"));
     add_opt(common_arg(
         {"--ple-prefetch"},
-        "experimental, Linux-only support: advise lazy row pages before CPU GET_ROWS (default: disabled)",
+        "experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)",
         [](common_params & params) {
             params.ple_prefetch = true;
         }

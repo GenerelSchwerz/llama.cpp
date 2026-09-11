@@ -675,7 +675,7 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 
 bool llama_mmap::contains_lazy(const void * data, size_t bytes) const {
-#if defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)
+#if (defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     const uintptr_t base = reinterpret_cast<uintptr_t>(addr());
     const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
     if (!data || !bytes || ptr < base || ptr - base >= size() || bytes > size() - (ptr - base)) {
@@ -684,11 +684,15 @@ bool llama_mmap::contains_lazy(const void * data, size_t bytes) const {
     const size_t offset = ptr - base;
     for (const auto & range : pimpl->lazy_ranges) {
         if (offset >= range.first && offset < range.second && bytes <= range.second - offset) {
+#ifdef _WIN32
+            return true; // Windows keeps the complete view mapped until destruction.
+#else
             for (const auto & fragment : pimpl->mapped_fragments) {
                 if (offset >= fragment.first && offset < fragment.second && bytes <= fragment.second - offset) {
                     return true;
                 }
             }
+#endif
         }
     }
 #else
@@ -699,7 +703,7 @@ bool llama_mmap::contains_lazy(const void * data, size_t bytes) const {
 }
 
 void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const {
-#if defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)
+#if (defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
     const uintptr_t base = reinterpret_cast<uintptr_t>(addr());
     const uintptr_t ptr  = reinterpret_cast<uintptr_t>(data);
     if (!data || !rows || row_size == 0 || ptr < base || ptr - base >= size()) {
@@ -716,7 +720,20 @@ void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t
     if (limit <= offset || row_size > limit - offset) {
         return;
     }
+#ifdef _WIN32
+    using prefetch_fn = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const auto prefetch = reinterpret_cast<prefetch_fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory"));
+    if (!prefetch) {
+        return;
+    }
+    static const DWORD page_size = []() {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return info.dwPageSize;
+    }();
+#else
     static const long page_size = sysconf(_SC_PAGESIZE);
+#endif
     if (page_size <= 0) {
         return;
     }
@@ -736,12 +753,19 @@ void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t
             pages[n_pages++] = {first - first % page_size, end + std::min(padding, size() - end)};
         }
         std::sort(pages, pages + n_pages);
+#ifdef _WIN32
+        WIN32_MEMORY_RANGE_ENTRY entries[256];
+        size_t n_entries = 0;
+#endif
         for (size_t i = 0; i < n_pages; ++i) {
             const size_t first = pages[i].first;
             size_t end = pages[i].second;
             while (i + 1 < n_pages && pages[i + 1].first <= end) {
                 end = std::max(end, pages[++i].second);
             }
+#ifdef _WIN32
+            entries[n_entries++] = {(char *) addr() + first, end - first};
+#else
             for (const auto & fragment : pimpl->mapped_fragments) {
                 if (first >= fragment.first && end <= fragment.second) {
                     // Advice failure leaves the ordinary demand-paged gather intact.
@@ -749,7 +773,13 @@ void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t
                     break;
                 }
             }
+#endif
         }
+#ifdef _WIN32
+        if (n_entries) {
+            (void) prefetch(GetCurrentProcess(), n_entries, entries, 0);
+        }
+#endif
         rows += count;
         n_rows -= count;
     }
