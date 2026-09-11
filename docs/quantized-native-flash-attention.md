@@ -372,38 +372,125 @@ One row does not fit that account: `q4_0` at D=256 GQA 2 gains 14.0% to 17.8% on
 Ampere despite the misalignment, at the same tile shape and thread count as the
 GQA 6 row that loses. That is unexplained.
 
-#### Memory
+#### Memory and speed with the cache on the host
 
-The transient F16 copy is sized by the visible attention window, so what it
-costs depends on how much context is actually in use. With the KV cache on the
-host, where the GPU holds only the model and the compute buffers, that shows up
-directly.
+This is the configuration the route is for: the KV cache in host memory, the GPU
+holding only the model and the compute buffers. The transient F16 copy is sized
+by the visible attention window, so removing it saves device memory in
+proportion to the context actually in use.
 
-Qwen3.8-27B-UD-IQ2_M on one 4070, `-nkvo`, `q8_0` cache, peak device memory
-sampled at 200 ms through a `pp2048` run at each depth:
+Qwen3.8-27B, dense, `-nkvo --kv-cpu-pinned --recurrent-state-offload`, 262144
+token context, RTX 4070 and RTX 3060, CUDA 13.3. Peak device memory sampled at
+250 ms through each run; the route asserted on every row by the backend's
+native-launch counter.
 
-| Context in use | Route off | Route on | Saved | `pp2048` off | `pp2048` on |
-|---:|---:|---:|---:|---:|---:|
-| 16384 | 9985 MiB | 9985 MiB | 0 | 800.75 | 804.46 |
-| 65536 | 10019 MiB | 10005 MiB | 14 MiB | 469.71 | 482.59 |
-| 131072 | 10357 MiB | 10005 MiB | 352 MiB | 305.19 | 321.26 |
-| 262144 | 11141 MiB | 10097 MiB | **1044 MiB** | 179.28 | 191.66 |
+### Full-context prefill
 
-t/s for the throughput columns, higher is better. The route was asserted on
-every row by the backend's native-launch counter, 640 to 8320 launches with it
-on and 0 with it off.
+Ingesting all 262144 tokens, `-p 262144`. One run each.
 
-The saving is the copy itself: `2 * n_kv_heads * head_dim * n_kv * sizeof(F16)`,
-which for this model is 4 KiB per cached token, or 1024 MiB at full context. The
-route-on curve is nearly flat, 9985 to 10097 MiB across a 16x increase in
-context, while route-off climbs 1156 MiB over the same range.
+| Model | GPUs | Cache | Prefill off | Prefill on | Delta | VRAM off | VRAM on | Saved |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| UD-IQ2_M (9.6 GiB) | 4070 | `q8_0` | 381.6 | 388.5 | +1.8% | 11266 MiB | 10230 MiB | **1036 MiB** |
+| UD-IQ2_M (9.6 GiB) | 3060 | `q8_0` | 145.6 | 136.1 | -6.6% | 11206 MiB | 10170 MiB | **1036 MiB** |
+| UD-IQ2_M (9.6 GiB) | 4070 + 3060 | `q8_0` | 219.2 | 210.5 | -4.0% | 13084 MiB | 11012 MiB | **2072 MiB** |
+| UD-Q4_K_XL (16.4 GiB) | 4070 + 3060 | `q8_0` | 220.4 | 211.7 | -4.0% | 19548 MiB | 17476 MiB | **2072 MiB** |
+| UD-IQ2_M (9.6 GiB) | 4070 | `q4_0` | 411.1 | 443.8 | +7.9% | 11002 MiB | 10104 MiB | **898 MiB** |
+| UD-IQ2_M (9.6 GiB) | 3060 | `q4_0` | 177.7 | 165.0 | -7.1% | 10942 MiB | 10044 MiB | **898 MiB** |
+| UD-IQ2_M (9.6 GiB) | 4070 + 3060 | `q4_0` | 260.1 | 253.7 | -2.5% | 12556 MiB | 10632 MiB | **1924 MiB** |
+| UD-Q4_K_XL (16.4 GiB) | 4070 + 3060 | `q4_0` | 262.0 | 255.2 | -2.6% | 19020 MiB | 17096 MiB | **1924 MiB** |
 
-Nothing shows at 16K because the copy still fits inside pool capacity the
-allocator already holds. It appears once the window grows past that, which is
-also the regime the route is for.
+### Prefill and decode at depth
 
-The throughput columns run the other way from the **Throughput** matrix above,
-where D=256 GQA 6 loses on Ampere. That matrix uses a device-resident cache. With
-the cache on the host the traffic the route saves outweighs the dequant it adds,
-so it is between 0.5% and 5% faster at every depth here. Which side wins depends
-on where the cache lives.
+`pp2048` and `tg64` with that many tokens already in the cache. t/s, higher is better.
+
+
+**UD-IQ2_M (9.6 GiB), 4070, `q8_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 953.7 | 956.3 | +0.3% | 18.93 | 18.90 | -0.2% | 10096 | 10096 | +0 |
+| 65536 | 576.1 | 581.6 | +0.9% | 7.64 | 7.64 | +0.0% | 10100 | 10100 | +0 |
+| 131072 | 378.6 | 385.2 | +1.7% | 4.25 | 4.25 | +0.0% | 10486 | 10104 | +382 |
+| 262144 | 214.9 | 225.7 | +5.0% | 2.26 | 2.26 | +0.0% | 11278 | 10234 | +1044 |
+
+**UD-IQ2_M (9.6 GiB), 3060, `q8_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 392.0 | 381.3 | -2.7% | 4.38 | 4.39 | +0.2% | 10036 | 10036 | +0 |
+| 65536 | 226.3 | 214.2 | -5.3% | 1.32 | 1.32 | +0.0% | 10040 | 10040 | +0 |
+| 131072 | 145.0 | 135.5 | -6.6% | 0.68 | 0.68 | +0.0% | 10426 | 10044 | +382 |
+| 262144 | 83.6 | 77.8 | -6.9% | 0.35 | 0.35 | +0.0% | 11218 | 10174 | +1044 |
+
+**UD-IQ2_M (9.6 GiB), 4070 + 3060, `q8_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 569.7 | 560.6 | -1.6% | 7.05 | 7.06 | +0.1% | 10450 | 10382 | +68 |
+| 65536 | 334.4 | 323.5 | -3.3% | 2.24 | 2.24 | +0.0% | 10752 | 10476 | +276 |
+| 131072 | 216.0 | 206.8 | -4.2% | 1.17 | 1.17 | +0.0% | 11524 | 10620 | +904 |
+| 262144 | 126.1 | 120.6 | -4.4% | 0.60 | 0.60 | +0.0% | 13108 | 11020 | +2088 |
+
+**UD-Q4_K_XL (16.4 GiB), 4070 + 3060, `q8_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 577.2 | 568.1 | -1.6% | 6.58 | 6.58 | +0.0% | 16914 | 16846 | +68 |
+| 65536 | 337.0 | 325.5 | -3.4% | 2.19 | 2.19 | +0.0% | 17216 | 16940 | +276 |
+| 131072 | 217.8 | 208.1 | -4.5% | 1.16 | 1.16 | +0.0% | 17988 | 17084 | +904 |
+| 262144 | 127.0 | 121.0 | -4.7% | 0.59 | 0.59 | +0.0% | 19572 | 17484 | +2088 |
+
+**UD-IQ2_M (9.6 GiB), 4070, `q4_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 974.3 | 983.2 | +0.9% | 23.72 | 23.69 | -0.1% | 10096 | 10098 | -2 |
+| 65536 | 615.9 | 645.0 | +4.7% | 11.33 | 11.32 | -0.1% | 10098 | 10098 | +0 |
+| 131072 | 406.3 | 441.0 | +8.5% | 6.67 | 6.67 | +0.0% | 10352 | 10100 | +252 |
+| 262144 | 245.4 | 270.7 | +10.3% | 3.67 | 3.67 | +0.0% | 11012 | 10104 | +908 |
+
+**UD-IQ2_M (9.6 GiB), 3060, `q4_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 421.0 | 408.8 | -2.9% | 6.77 | 6.79 | +0.3% | 10040 | 10042 | -2 |
+| 65536 | 263.6 | 249.0 | -5.5% | 2.27 | 2.28 | +0.4% | 10038 | 10038 | +0 |
+| 131072 | 177.1 | 164.4 | -7.2% | 1.21 | 1.21 | +0.0% | 10292 | 10040 | +252 |
+| 262144 | 106.5 | 97.5 | -8.5% | 0.62 | 0.62 | +0.0% | 10952 | 10044 | +908 |
+
+**UD-IQ2_M (9.6 GiB), 4070 + 3060, `q4_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 602.3 | 595.5 | -1.1% | 10.39 | 10.42 | +0.3% | 10420 | 10382 | +38 |
+| 65536 | 383.4 | 374.5 | -2.3% | 3.77 | 3.77 | +0.0% | 10682 | 10406 | +276 |
+| 131072 | 256.1 | 249.4 | -2.6% | 2.03 | 2.03 | +0.0% | 11256 | 10482 | +774 |
+| 262144 | 154.3 | 149.7 | -3.0% | 1.06 | 1.06 | +0.0% | 12576 | 10634 | +1942 |
+
+**UD-Q4_K_XL (16.4 GiB), 4070 + 3060, `q4_0` cache**
+
+| Context | pp2048 off | pp2048 on | Delta | tg64 off | tg64 on | Delta | VRAM off | VRAM on | Saved |
+|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16384 | 611.9 | 602.9 | -1.5% | 9.40 | 9.40 | +0.0% | 16884 | 16848 | +36 |
+| 65536 | 387.7 | 377.3 | -2.7% | 3.63 | 3.63 | +0.0% | 17146 | 16870 | +276 |
+| 131072 | 242.8 | 250.7 | +3.3% | 1.99 | 1.99 | +0.0% | 17720 | 16946 | +774 |
+| 262144 | 154.7 | 150.2 | -2.9% | 1.05 | 1.05 | +0.0% | 19040 | 17098 | +1942 |
+
+The memory result is unconditional. Every configuration saves device memory, and
+the route-on figure barely moves with context while route-off climbs with it:
+on one 4070 with a `q4_0` cache, 10104 MiB at full context against 11002. Two
+GPUs save about twice as much as one, because each card stages the window for
+the layers it owns.
+
+The size matches the copy it removes,
+`2 * n_kv_heads * head_dim * n_kv * sizeof(F16)`, which for this model is 4 KiB
+per cached token, or 1024 MiB at 262144. Nothing shows below about 64K because
+the copy still fits inside pool capacity the allocator already holds.
+
+The speed result is not unconditional. Prefill gains on Ada and loses on Ampere,
+by up to 7.9% and 7.1% at full context, and the two-GPU rows land between the
+two because half the layers are on each card. That is the same D=256 cost
+**Where the Ampere cost comes from** takes apart, reaching a real model.
+
+Decode is untouched: every `tg64` delta here is within 0.4%, because a
+single-token query goes to the vector kernel and never reaches this route.
