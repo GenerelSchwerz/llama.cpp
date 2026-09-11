@@ -393,6 +393,11 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Optional row-read advice. Inputs are ready; the callback must not modify tensors or throw.
+    typedef void (*ggml_backend_get_rows_callback)(const struct ggml_tensor * table, const struct ggml_tensor * indices, void * user_data);
+    // Configure while idle. User data must outlive the backend and any plans that retain it.
+    typedef void (*ggml_backend_set_get_rows_callback_t)(ggml_backend_t backend, ggml_backend_get_rows_callback callback, void * user_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

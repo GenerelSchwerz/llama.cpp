@@ -3119,6 +3119,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.get_rows_callback =*/ cplan->get_rows_callback,
+        /*.get_rows_callback_data =*/ cplan->get_rows_callback_data,
     };
 
 #ifdef GGML_USE_OPENMP

@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "../src/llama-ext.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1407,6 +1408,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+    if (params.ple_prefetch && !llama_set_ple_prefetch(lctx, true)) {
+        COM_ERR("%s", "failed to enable lazy row prefetch\n");
+        pimpl->context.reset();
+        return;
+    }
 
     for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
         ggml_backend_reg_t reg = ggml_backend_reg_get(i);

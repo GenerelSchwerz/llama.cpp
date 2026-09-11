@@ -549,6 +549,7 @@ struct common_params {
     int32_t verbosity                  = 3;  // LOG_LEVEL_INFO
     bool    experimental_logs          = false;
     bool    decode_overlap             = false;
+    bool    ple_prefetch               = false;
     int32_t control_vector_layer_start = -1; // layer range for control vector
     int32_t control_vector_layer_end   = -1; // layer range for control vector
     bool    offline                    = false;

@@ -362,6 +362,27 @@ static void test(void) {
     }
 
     {
+        unset_test_env("LLAMA_ARG_PLE_PREFETCH");
+        common_params ple_params;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
+        assert(!ple_params.ple_prefetch);
+
+        argv = {"binary_name", "--ple-prefetch"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
+        assert(ple_params.ple_prefetch);
+
+        for (const char * value : {"0", "1"}) {
+            set_test_env("LLAMA_ARG_PLE_PREFETCH", value);
+            ple_params = common_params();
+            argv = {"binary_name"};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), ple_params, LLAMA_EXAMPLE_SERVER));
+            assert(ple_params.ple_prefetch == (value[0] == '1'));
+        }
+        unset_test_env("LLAMA_ARG_PLE_PREFETCH");
+    }
+
+    {
         unset_test_env("LLAMA_ARG_PHASE_AWARE_WORKSPACE");
         common_params phase_params;
         argv = {"binary_name", "-m", "model.gguf"};

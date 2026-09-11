@@ -1876,6 +1876,21 @@ bool llama_model::graph_supports_recurrent_sparse_snapshots() const {
     return false;
 }
 
+void llama_model::prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const {
+    if (!tensor || !tensor->data || !ggml_is_matrix(tensor) || !ggml_is_contiguous(tensor)) {
+        return;
+    }
+    for (const auto & mapping : pimpl->mappings) {
+        mapping->prefetch_rows(tensor->data, tensor->nb[1], rows, n_rows);
+    }
+}
+
+void llama_model::prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const {
+    for (const auto & mapping : pimpl->mappings) {
+        mapping->prefetch_rows(tensor, indices);
+    }
+}
+
 std::string llama_model::arch_name() const {
     return llm_arch_name(arch);
 }
