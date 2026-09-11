@@ -24,6 +24,9 @@ GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_init(int device);
 
 GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 
+// Set before the first graph submission to this backend.
+GGML_BACKEND_API void ggml_backend_cuda_set_decode_boundary_overlap(ggml_backend_t backend, bool enabled);
+
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 

@@ -503,6 +503,15 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         src0->ne[3] == 1 && nb02 == ne00 * ne01 * (int64_t)ggml_element_size(src0);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+    bool use_memcpy_2d = ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch);
+#ifdef USE_CUDA_GRAPH
+    if (ctx.decode_boundary_overlap && use_memcpy_2d && src0->type == GGML_TYPE_F32) {
+        cudaStreamCaptureStatus capture_status;
+        CUDA_CHECK(cudaStreamIsCapturing(main_stream, &capture_status));
+        // CUDA graph updates cannot change the height of a 2D memcpy node.
+        use_memcpy_2d = capture_status == cudaStreamCaptureStatusNone;
+    }
+#endif
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));
@@ -514,7 +523,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+    } else if (use_memcpy_2d) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {

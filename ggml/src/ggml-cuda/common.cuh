@@ -1466,6 +1466,7 @@ struct ggml_backend_cuda_context {
     int device;
     std::string name;
     cudaEvent_t copy_event = nullptr;
+    bool decode_boundary_overlap = false;
     std::once_flag moe_grouped_context_once;
     ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
     std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;

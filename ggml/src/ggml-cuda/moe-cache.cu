@@ -7757,16 +7757,19 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_EXECUTION;
         const bool consumer_legacy = decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_CONSUMER_EQUIVALENCE;
+        // layer-split decode graphs often keep argsort on one device; fail closed to cached mmid
+        const bool route_legacy = decode_group &&
+            record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE;
         mixed_certificate = mixed_certificate &&
             ((prefill_group && record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_PREFILL) ||
                 (decode_group && (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
-                    materialization_legacy || execution_legacy || consumer_legacy)));
+                    materialization_legacy || execution_legacy || consumer_legacy || route_legacy)));
         decode_certificate = decode_certificate && decode_group &&
             record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE;
         decode_legacy_certificate = decode_legacy_certificate && decode_group &&
             (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ELIGIBLE ||
-                materialization_legacy || execution_legacy || consumer_legacy);
-        legacy_groups += materialization_legacy || execution_legacy || consumer_legacy;
+                materialization_legacy || execution_legacy || consumer_legacy || route_legacy);
+        legacy_groups += materialization_legacy || execution_legacy || consumer_legacy || route_legacy;
     }
     decode_legacy_certificate = decode_legacy_certificate && legacy_groups != 0;
     plan->outcome_ = call_prefill && !call_decode ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
@@ -7784,6 +7787,9 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
     if (mixed_certificate || decode_certificate || decode_legacy_certificate) {
         for (uint32_t record_index = 0; record_index < plan->n_groups_; ++record_index) {
             const auto & record = plan->groups_[record_index];
+            if (record.reason == ggml_cuda_moe_graph_plan::GROUP_REASON_ROUTE) {
+                continue;
+            }
             const auto & group = impl_->table.groups[record.candidate.group_index];
             auto & dispatch = execution->groups_[record_index];
             dispatch.key.ids = record.ids;

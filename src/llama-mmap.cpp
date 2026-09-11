@@ -6,6 +6,7 @@
 
 #include <cstring>
 #include <climits>
+#include <cstdlib>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -660,16 +661,160 @@ struct llama_mmap::impl {
 
     void * addr;
     size_t size;
+    llama_mmap::ranges lazy_ranges;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {
+    pimpl->lazy_ranges = lazy_ranges;
+}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+
+bool llama_mmap::contains_lazy(const void * data, size_t bytes) const {
+#if (defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+    const uintptr_t base = reinterpret_cast<uintptr_t>(addr());
+    const uintptr_t ptr = reinterpret_cast<uintptr_t>(data);
+    if (!data || !bytes || ptr < base || ptr - base >= size() || bytes > size() - (ptr - base)) {
+        return false;
+    }
+    const size_t offset = ptr - base;
+    for (const auto & range : pimpl->lazy_ranges) {
+        if (offset >= range.first && offset < range.second && bytes <= range.second - offset) {
+#ifdef _WIN32
+            return true; // Windows keeps the complete view mapped until destruction.
+#else
+            for (const auto & fragment : pimpl->mapped_fragments) {
+                if (offset >= fragment.first && offset < fragment.second && bytes <= fragment.second - offset) {
+                    return true;
+                }
+            }
+#endif
+        }
+    }
+#else
+    GGML_UNUSED(data);
+    GGML_UNUSED(bytes);
+#endif
+    return false;
+}
+
+void llama_mmap::prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const {
+#if (defined(_POSIX_MAPPED_FILES) && defined(POSIX_MADV_WILLNEED)) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+    const uintptr_t base = reinterpret_cast<uintptr_t>(addr());
+    const uintptr_t ptr  = reinterpret_cast<uintptr_t>(data);
+    if (!data || !rows || row_size == 0 || ptr < base || ptr - base >= size()) {
+        return;
+    }
+    const size_t offset = ptr - base;
+    size_t limit = offset;
+    for (const auto & range : pimpl->lazy_ranges) {
+        if (offset >= range.first && offset < range.second) {
+            limit = std::min(range.second, size());
+            break;
+        }
+    }
+    if (limit <= offset || row_size > limit - offset) {
+        return;
+    }
+#ifdef _WIN32
+    using prefetch_fn = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+    static const auto prefetch = reinterpret_cast<prefetch_fn>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory"));
+    if (!prefetch) {
+        return;
+    }
+    static const DWORD page_size = []() {
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        return info.dwPageSize;
+    }();
+#else
+    static const long page_size = sysconf(_SC_PAGESIZE);
+#endif
+    if (page_size <= 0) {
+        return;
+    }
+
+    // Keep scratch bounded and merge only overlapping or adjacent requested pages.
+    std::pair<size_t, size_t> pages[256];
+    while (n_rows > 0) {
+        const size_t count = std::min(n_rows, size_t(256));
+        size_t n_pages = 0;
+        for (size_t i = 0; i < count; ++i) {
+            if (rows[i] < 0 || size_t(rows[i]) >= (limit - offset) / row_size) {
+                continue;
+            }
+            const size_t first = offset + size_t(rows[i]) * row_size;
+            const size_t end = first + row_size;
+            const size_t padding = (page_size - end % page_size) % page_size;
+            pages[n_pages++] = {first - first % page_size, end + std::min(padding, size() - end)};
+        }
+        std::sort(pages, pages + n_pages);
+#ifdef _WIN32
+        WIN32_MEMORY_RANGE_ENTRY entries[256];
+        size_t n_entries = 0;
+#endif
+        for (size_t i = 0; i < n_pages; ++i) {
+            const size_t first = pages[i].first;
+            size_t end = pages[i].second;
+            while (i + 1 < n_pages && pages[i + 1].first <= end) {
+                end = std::max(end, pages[++i].second);
+            }
+#ifdef _WIN32
+            entries[n_entries++] = {(char *) addr() + first, end - first};
+#else
+            for (const auto & fragment : pimpl->mapped_fragments) {
+                if (first >= fragment.first && end <= fragment.second) {
+                    // Advice failure leaves the ordinary demand-paged gather intact.
+                    (void) posix_madvise((char *) addr() + first, end - first, POSIX_MADV_WILLNEED);
+                    break;
+                }
+            }
+#endif
+        }
+#ifdef _WIN32
+        if (n_entries) {
+            (void) prefetch(GetCurrentProcess(), n_entries, entries, 0);
+        }
+#endif
+        rows += count;
+        n_rows -= count;
+    }
+#else
+    GGML_UNUSED(data);
+    GGML_UNUSED(row_size);
+    GGML_UNUSED(rows);
+    GGML_UNUSED(n_rows);
+#endif
+}
+
+void llama_mmap::prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const {
+    if (!tensor || !indices || !indices->data || indices->type != GGML_TYPE_I32 ||
+        !ggml_is_matrix(tensor) || !ggml_is_contiguous(tensor) || !ggml_is_vector(indices) ||
+        !contains_lazy(tensor->data, ggml_nbytes(tensor))) {
+        return;
+    }
+    int32_t rows[256];
+    for (int64_t first = 0; first < indices->ne[0];) {
+        const int64_t count = std::min(int64_t(256), indices->ne[0] - first);
+        size_t n_rows = 0;
+        for (int64_t i = 0; i < count; ++i) {
+            int32_t row;
+            memcpy(&row, static_cast<const char *>(indices->data) + (first + i)*indices->nb[0], sizeof(row));
+            if (row >= 0 && row < tensor->ne[1]) {
+                rows[n_rows++] = row;
+            }
+        }
+        if (n_rows) {
+            prefetch_rows(tensor->data, tensor->nb[1], rows, n_rows);
+        }
+        first += count;
+    }
+}
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;

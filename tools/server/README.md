@@ -73,9 +73,6 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-ctv, --cache-type-v TYPE` | KV cache data type for V<br/>allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1<br/>(default: f16)<br/>(env: LLAMA_ARG_CACHE_TYPE_V) |
 | `-dt, --defrag-thold N` | KV cache defragmentation threshold (DEPRECATED)<br/>(env: LLAMA_ARG_DEFRAG_THOLD) |
 | `--rpc SERVERS` | comma-separated list of RPC servers (host:port)<br/>(env: LLAMA_ARG_RPC) |
-| `--mlock` | DEPRECATED in favor of `--load-mode`: force system to keep model in RAM rather than swapping or compressing<br/>(env: LLAMA_ARG_MLOCK) |
-| `--mmap, --no-mmap` | DEPRECATED in favor of `--load-mode`: whether to memory-map model. (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>(env: LLAMA_ARG_MMAP) |
-| `-dio, --direct-io, -ndio, --no-direct-io` | DEPRECATED in favor of `--load-mode`: use DirectIO if available<br/>(env: LLAMA_ARG_DIO) |
 | `-lm, --load-mode MODE` | model loading mode (default: auto)<br/>- auto: mmap, unless a device does not support it<br/>- none: no special loading mode<br/>- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)<br/>- mlock: force system to keep model in RAM rather than swapping or compressing<br/>- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing<br/>- dio: use DirectIO if available<br/><br/>(env: LLAMA_ARG_LOAD_MODE) |
 | `-lzm, --lazy-mode MODE` | on-demand reading of certain tensors, for example per-layer embeddings (default: auto)<br/>- on: read the rows of such tensors from disk on demand instead of keeping them resident (requires mmap)<br/>- auto: on, but only for tensors larger than 4 GiB<br/>- off: always keep them resident<br/>(env: LLAMA_ARG_LAZY_MODE) |
 | `--numa TYPE` | attempt optimizations that help on some NUMA systems<br/>- distribute: spread execution evenly over all nodes<br/>- isolate: only spawn threads on CPUs on the node that execution started on<br/>- numactl: use the CPU map provided by numactl<br/>if run without this previously, it is recommended to drop the system page cache before using this<br/>see https://github.com/ggml-org/llama.cpp/issues/1437<br/>(env: LLAMA_ARG_NUMA) |
@@ -158,6 +155,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
 | `--decode-overlap` | experimental: overlap batched backend-sampled decode with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
+| `--decode-boundary-overlap` | experimental: overlap decode boundary preparation and update CUDA graphs (use with --decode-overlap) (default: disabled)<br/>(env: LLAMA_ARG_DECODE_BOUNDARY_OVERLAP) |
+| `--ple-prefetch` | experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)<br/>(env: LLAMA_ARG_PLE_PREFETCH) |
 
 
 ### Server-specific params
@@ -184,7 +183,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |
 | `--mmproj-auto, --no-mmproj, --no-mmproj-auto` | whether to use multimodal projector file (if available), useful when using -hf (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_AUTO) |
 | `--mmproj-offload, --no-mmproj-offload` | whether to enable GPU offloading for multimodal projector (default: enabled)<br/>(env: LLAMA_ARG_MMPROJ_OFFLOAD) |
-| `-mmdev, --mmproj-device DEVICE` | device to use for multimodal projector (none = don't offload, default: auto)<br/>use --list-devices to see a list of available devices<br/>(env: MTMD_BACKEND_DEVICE) |
+| `-mmdev, --mmproj-device DEVICE` | device to use for multimodal projector (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices<br/>(env: MTMD_BACKEND_DEVICE) |
 | `--image-min-tokens N` | minimum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MIN_TOKENS) |
 | `--image-max-tokens N` | maximum number of tokens each image can take, only used by vision models with dynamic resolution (default: read from model)<br/>(env: LLAMA_ARG_IMAGE_MAX_TOKENS) |
 | `--mtmd-batch-max-tokens N` | maximum number of image tokens per batch when encoding images (default: 1024)<br/>(env: LLAMA_ARG_MTMD_BATCH_MAX_TOKENS) |
@@ -271,7 +270,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--spec-draft-p-split, --draft-p-split P` | speculative decoding split probability (default: 0.10)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT) |
 | `--spec-draft-p-min, --draft-p-min P` | minimum speculative decoding probability (greedy) (default: 0.00)<br/>(env: LLAMA_ARG_SPEC_DRAFT_P_MIN) |
 | `--spec-draft-backend-sampling, --no-spec-draft-backend-sampling` | offload draft sampling to the backend (default: enabled)<br/>(env: LLAMA_ARG_SPEC_DRAFT_BACKEND_SAMPLING) |
-| `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload)<br/>use --list-devices to see a list of available devices |
+| `--spec-draft-device, -devd, --device-draft <dev1,dev2,..>` | comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)<br/>use --list-devices to see a list of available devices |
 | `--spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft N` | max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)<br/>(env: LLAMA_ARG_N_GPU_LAYERS_DRAFT) |
 | `--spec-draft-model, -md, --model-draft FNAME` | draft model for speculative decoding (default: unused)<br/>(env: LLAMA_ARG_SPEC_DRAFT_MODEL) |
 | `--spec-type none,draft-simple,draft-eagle3,draft-mtp,draft-dflash,draft-dspark,ngram-simple,ngram-map-k,ngram-map-k4v,ngram-mod,ngram-cache` | comma-separated list of types of speculative decoding to use (default: none)<br/><br/>(env: LLAMA_ARG_SPEC_TYPE) |
@@ -460,7 +459,17 @@ docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:se
 docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/llama.cpp:server-cuda -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080 --n-gpu-layers 99
 ```
 
+### Experimental lazy row prefetch
+
+`--ple-prefetch` (or `LLAMA_ARG_PLE_PREFETCH=1`) opts into page advice for lazy-backed row reads. It is disabled by default. The CPU `GET_ROWS` path uses the actual runtime index tensor, without model or tensor-name matching, in both prefill and decode. It supports contiguous 2D source tables and I32 index vectors, including strided index vectors. Other layouts, non-lazy tables, and GPU gathers retain ordinary reads. Models must already mark the source for lazy loading; the flag does not change loading or placement. Decode overlap is not required.
+
+Performance validation is Linux-only. Windows support is experimental and performance-unvalidated: builds targeting Windows 8 or newer (`_WIN32_WINNT >= 0x0602`) use dynamically resolved `PrefetchVirtualMemory`, with at most 256 merged requested page ranges per call. Older targets or a missing API retain ordinary reads. Other POSIX platforms have not been validated. Advice uses bounded scratch, does not pin the table or predict tokens, and does not change row order or dequantization. Cold reads can benefit, but resident reads have extra overhead and advice can block under memory pressure. Advice failure retains ordinary demand reads. Omit the flag and unset its environment variable (or set it to `0`) to disable advice. The CPU backend extension is optional; requesting this flag with a backend build that lacks it fails explicitly.
+
+Windows testers should compare repeated runs with the flag off/on in alternating order, keeping the exact prompt bytes, sampling, model placement, context, cache slots, and overlap setting fixed. Verify output token IDs before comparing speeds. Report Windows/build versions, storage type, RAM/VRAM, decode tokens/s and p50/p95/p99/max token intervals, separately for cold and warm reads. Include late-context intervals when testing microstutters, advice-related memory pressure, errors, and clean shutdown. Do not clear global caches or change system memory settings. Linux results do not establish a Windows speedup.
+
 ### Experimental decode overlap
+
+`--decode-boundary-overlap` (or `LLAMA_ARG_DECODE_BOUNDARY_OVERLAP=1`) opts into CUDA graph updates at decode boundaries, asynchronous graph preparation when the existing safety checks permit it, and advance reservation of sampled-input staging buffers. Use it with `--decode-overlap`. It is disabled by default and selected at context creation; changing it requires restarting the server. Without this option, the previous boundary synchronization, graph recreation, and staging allocation behavior remain in use. Unsupported layouts retain synchronized allocation. Output tokens can differ from the default path. `GGML_CUDA_GRAPH_PROFILE=1` logs host capture, update, launch, and cleanup durations; these are not measurements of GPU idle time.
 
 `--decode-overlap` queues at most one additional decode batch while the CPU processes the previous results. It supports parallel requests on one CUDA GPU with greedy or stochastic backend sampling and no speculative decoding. Supported sampling includes temperature, dynamic temperature, top-k, top-p, min-p, static logit bias, and `ignore_eos`. Each queued batch contains one token per eligible sequence and must fit in one microbatch. Token embeddings must be on that GPU, for example with `-ot token_embd.weight=CUDA0`. Initial support covers owned ordinary KV caches, standard sliding-window KV caches, and ordinary hybrid KV/recurrent memory, with compatible graph inputs and all compute operations on the same GPU. The request sampler applies model-declared token suppression and EOS suppression on the GPU. Recurrent models reserve one extra state snapshot for rollback. Borrowed caches, other sliding-window types, indexed/specialized attention, standalone recurrent inputs, sparse selected-token snapshots, and custom inputs use normal decode until separately validated.
 

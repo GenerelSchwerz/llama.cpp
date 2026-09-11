@@ -147,6 +147,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_ple_prefetch(bool enabled);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -398,6 +399,7 @@ private:
     bool recurrent_sparse_snapshot_ops_supported = false;
 
     ggml_backend_t backend_cpu = nullptr;
+    bool ple_prefetch = false;
     std::vector<ggml_backend_ptr> backends;
 
     ggml_context_ptr sampled_input_ctx;
@@ -418,6 +420,7 @@ private:
     };
     sampled_input_staging sampled_staging[2];
     uint32_t sampled_staging_next = 0;
+    size_t sampled_staging_reserve = 0;
     ggml_backend_buffer_ptr sampled_output_host;
     ggml_backend_event_ptr sampled_output_ready;
 

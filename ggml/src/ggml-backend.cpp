@@ -1592,7 +1592,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
-static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
+static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched, bool reuse_async) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
         if (sched->node_backend_ids[i] != sched->prev_node_backend_ids[i] &&
@@ -1612,7 +1612,9 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     }
 
     // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    const bool can_allocate = !backend_ids_changed && (!reuse_async ||
+        ggml_gallocr_reserve_n_if_fits(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids));
+    if (!can_allocate || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
@@ -1798,6 +1800,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(
                     // get the ids
                     ggml_tensor * ids_tensor = node->src[2];
                     ggml_backend_t ids_backend = split_backend;
+
+                    if (ggml_nelements(ids_tensor) == 0) {
+                        continue;
+                    }
 
                     // if the ids tensor is also an input of the split, it may not have been copied yet to the split backend
                     // in that case, we use the original ids tensor
@@ -2110,7 +2116,7 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     return true;
 }
 
-bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+static bool ggml_backend_sched_alloc_graph_impl(ggml_backend_sched_t sched, struct ggml_cgraph * graph, bool reuse_async) {
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
@@ -2120,13 +2126,21 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     ggml_backend_sched_split_graph(sched, graph);
 
-    if (!ggml_backend_sched_alloc_splits(sched)) {
+    if (!ggml_backend_sched_alloc_splits(sched, reuse_async)) {
         return false;
     }
 
     sched->is_alloc = true;
 
     return true;
+}
+
+bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, false);
+}
+
+bool ggml_backend_sched_alloc_graph_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    return ggml_backend_sched_alloc_graph_impl(sched, graph, true);
 }
 
 enum ggml_status ggml_backend_sched_graph_compute(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {

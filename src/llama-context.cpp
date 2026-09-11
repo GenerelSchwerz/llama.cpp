@@ -404,6 +404,7 @@ llama_context::llama_context(
     cparams.kv_gpu_layers           = params.kv_gpu_layers;
     cparams.phase_aware_workspace   = params.phase_aware_workspace;
     cparams.live_context_workspace  = params.live_context_workspace;
+    cparams.decode_boundary_overlap = params.decode_boundary_overlap;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -651,6 +652,14 @@ llama_context::llama_context(
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
             if (reg) {
+                if (cparams.decode_boundary_overlap) {
+                    auto enable = reinterpret_cast<void (*)(ggml_backend_t, bool)>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_decode_boundary_overlap"));
+                    if (enable) {
+                        enable(backend.get(), true);
+                        LLAMA_LOG_INFO("%s: decode boundary overlap enabled for %s\n", __func__, ggml_backend_name(backend.get()));
+                    }
+                }
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
@@ -1230,7 +1239,9 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
         //       need to implement a more robust mechanism that tries a few different inputs and analyzes the results
         ggml_cgraph * gf = nullptr;
         switch (model.arch) {
+            case LLM_ARCH_KIMI_LINEAR:
             case LLM_ARCH_MINIMAX_01:
+                // [TAG_RESERVE_DIAG_DECAY]
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(),
@@ -1886,6 +1897,19 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     sched_need_reserve = true;
 }
 
+bool llama_context::set_ple_prefetch(bool enabled) {
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+    auto set_callback = reinterpret_cast<ggml_backend_set_get_rows_callback_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_get_rows_callback"));
+    if (!set_callback) { return false; }
+    synchronize();
+    set_callback(backend_cpu, enabled ? +[](const ggml_tensor * table, const ggml_tensor * indices, void * data) {
+        static_cast<const llama_model *>(data)->prefetch_rows(table, indices);
+    } : nullptr, enabled ? const_cast<llama_model *>(&model) : nullptr);
+    ple_prefetch = enabled;
+    LLAMA_LOG_INFO("%s: lazy row prefetch %s for CPU GET_ROWS\n", __func__, enabled ? "enabled" : "disabled");
+    return true;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2049,6 +2073,14 @@ void llama_context::place_sampled_inputs(llm_graph_result * res) {
     }
 }
 
+static size_t sampled_input_staging_size(size_t size, const ggml_tensor * tensor) {
+    const size_t bytes = ggml_nbytes(tensor);
+    if (bytes > SIZE_MAX - 63 || GGML_PAD(bytes, 64) > SIZE_MAX - size) {
+        throw std::runtime_error("sampled input staging size overflow");
+    }
+    return size + GGML_PAD(bytes, 64);
+}
+
 void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch) {
     auto & stage = sampled_staging[sampled_staging_next];
     sampled_staging_next = (sampled_staging_next + 1) % 2;
@@ -2074,14 +2106,34 @@ void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatc
         GGML_ASSERT(!tensor->view_src && tensor->buffer && tensor->data);
         GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == sampled_input_backend);
         inputs.push_back({tensor, tensor->buffer, tensor->data, size});
-        size += GGML_PAD(ggml_nbytes(tensor), 64);
+        size = sampled_input_staging_size(size, tensor);
     }
 
     if (!stage.buffer || ggml_backend_buffer_get_size(stage.buffer.get()) < size) {
         auto * device = ggml_backend_get_device(sampled_input_backend);
-        stage.buffer.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), std::max<size_t>(size, 64)));
-        if (!stage.buffer) {
-            throw std::runtime_error("failed to allocate sampled input staging");
+        if (!cparams.decode_boundary_overlap) {
+            stage.buffer.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), std::max<size_t>(size, 64)));
+            if (!stage.buffer) {
+                throw std::runtime_error("failed to allocate sampled input staging");
+            }
+        } else {
+            const size_t previous_size = stage.buffer ? ggml_backend_buffer_get_size(stage.buffer.get()) : 64;
+            const size_t capacity = std::max({size, sampled_staging_reserve, previous_size <= SIZE_MAX/2 ? 2*previous_size : previous_size});
+            // Grow both slots together so the next token does not repeat the pinned allocation.
+            for (auto & slot : sampled_staging) {
+                if (slot.buffer && ggml_backend_buffer_get_size(slot.buffer.get()) >= capacity) {
+                    continue;
+                }
+                if (slot.in_flight) {
+                    ggml_backend_event_synchronize(slot.uploaded.get());
+                    slot.in_flight = false;
+                }
+                auto buffer = ggml_backend_buffer_ptr(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), capacity));
+                if (!buffer) {
+                    throw std::runtime_error("failed to allocate sampled input staging");
+                }
+                slot.buffer = std::move(buffer);
+            }
         }
     }
     if (!stage.uploaded) {
@@ -2144,7 +2196,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        if (use_sampled_input_async || sampled_inputs_device) {
+        bool rebuild_async = cparams.decode_boundary_overlap && use_sampled_input_async && sampled_inputs_device && !cparams.cb_eval && !cparams.pipeline_parallel;
+        for (int i = 0; rebuild_async && i < ggml_graph_n_nodes(gf); ++i) {
+            auto * node = ggml_graph_node(gf, i);
+            if (node->op != GGML_OP_NONE && !ggml_is_view(node) &&
+                    ggml_backend_sched_get_tensor_backend(sched.get(), node) != sampled_input_backend) {
+                rebuild_async = false;
+            }
+        }
+        // CUDA consumes graph metadata at submission. Reallocation still fences the backing buffers in the scheduler.
+        if ((use_sampled_input_async || sampled_inputs_device) && !rebuild_async) {
             ggml_backend_sched_synchronize(sched.get());
             workspace_in_flight = false;
         }
@@ -2167,7 +2228,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         place_sampled_inputs(res);
         sampled_inputs_device = use_sampled_input_async;
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        const bool allocated = rebuild_async ? ggml_backend_sched_alloc_graph_async(sched.get(), gf) :
+                                               ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -3501,6 +3564,16 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * gf = model.build_graph(gparams);
 
+    if (cparams.decode_boundary_overlap && n_tokens == n_seqs) {
+        size_t size = 0;
+        for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+            if (tensor->flags & GGML_TENSOR_FLAG_INPUT) {
+                size = sampled_input_staging_size(size, tensor);
+            }
+        }
+        sampled_staging_reserve = std::max(sampled_staging_reserve, size);
+    }
+
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -4735,6 +4808,7 @@ llama_context_params llama_context_default_params() {
         /*.recurrent_state_offload     =*/ false,
         /*.phase_aware_workspace       =*/ false,
         /*.live_context_workspace      =*/ false,
+        /*.decode_boundary_overlap     =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -4774,6 +4848,9 @@ llama_context * llama_init_from_model(
         if (params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
             LLAMA_LOG_ERROR("%s: SPLIT_MODE_TENSOR requires flash_attn to be enabled\n", __func__);
             return nullptr;
+        }
+        if (model->get_split_state_ud.n_devices == 1) {
+            LLAMA_LOG_WARN("%s: SPLIT_MODE_TENSOR being used for a single device is not recommended\n", __func__);
         }
     }
 
@@ -4988,6 +5065,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_set_ple_prefetch(llama_context * ctx, bool enabled) {
+    return ctx->set_ple_prefetch(enabled);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

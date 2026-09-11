@@ -935,6 +935,8 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
+        case LLM_TYPE_1B_A400M:      return "1B.A400M";
+        case LLM_TYPE_3B_A800M:      return "3B.A800M";
         case LLM_TYPE_7B_A1B:        return "7B.A1B";
         case LLM_TYPE_8B_A1B:        return "8B.A1B";
         case LLM_TYPE_7_9B_A1_3B:    return "7.9B.A1.3B";
@@ -945,6 +947,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
+        case LLM_TYPE_32B_A9B:       return "32B.A9B";
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_75B_A9B:       return "75B.A9B";
@@ -1419,6 +1422,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
                 ml.use_mmap = false;
+                break;
+            }
+        }
+    }
+
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+        for (const auto & dev : devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev.dev, &props);
+            if (!props.caps.mmap_support) {
+                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
@@ -1949,6 +1964,21 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
 
 bool llama_model::graph_supports_recurrent_sparse_snapshots() const {
     return false;
+}
+
+void llama_model::prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const {
+    if (!tensor || !tensor->data || !ggml_is_matrix(tensor) || !ggml_is_contiguous(tensor)) {
+        return;
+    }
+    for (const auto & mapping : pimpl->mappings) {
+        mapping->prefetch_rows(tensor->data, tensor->nb[1], rows, n_rows);
+    }
+}
+
+void llama_model::prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const {
+    for (const auto & mapping : pimpl->mappings) {
+        mapping->prefetch_rows(tensor, indices);
+    }
 }
 
 std::string llama_model::arch_name() const {
@@ -2768,9 +2798,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
-                            arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_DEEPSEEK32) &&
-                            hparams.n_layer_nextn > 0) {
+                    // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
+                    // or when a model is entirely n_layer_nextn layers and has no trunk
+                    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
                         if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                         } else {
