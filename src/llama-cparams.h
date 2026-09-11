@@ -37,6 +37,7 @@ struct llama_cparams {
     bool embeddings_nextn;        // also extract the hidden state before the final output norm
     bool embeddings_nextn_masked; // extract for only rows where batch.logits != 0
     bool causal_attn;
+    bool decode_boundary_overlap;
     bool offload_kqv;             // place persistent attention KV storage on the accelerator
     bool offload_attn_compute;    // allow attention compute to use the accelerator independently of KV storage
     bool flash_attn;

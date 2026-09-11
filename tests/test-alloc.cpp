@@ -23,6 +23,8 @@ struct dummy_backend_context {
     bool   unique_alloc_addresses = false;
     bool   real_memory            = false; // back the buffers with memory, so a test can look at the bytes a copy moved
     int    graph_compute_count    = 0;
+    int    synchronize_count      = 0;
+    size_t synchronized_bytes     = 0;
 
     ggml_backend_buffer_i                  buffer_interface;
     std::vector<ggml_backend_buffer_t>     buffers;
@@ -154,6 +156,12 @@ static enum ggml_status dummy_backend_graph_compute(ggml_backend_t backend, ggml
     return GGML_STATUS_SUCCESS;
 }
 
+static void dummy_backend_synchronize(ggml_backend_t backend) {
+    auto * ctx = static_cast<dummy_backend_context *>(backend->context);
+    ++ctx->synchronize_count;
+    ctx->synchronized_bytes = ctx->allocated_total();
+}
+
 static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev_t) {
     return GGML_BACKEND_DEVICE_TYPE_CPU;
 }
@@ -201,6 +209,7 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.handle = std::make_unique<ggml_backend>();
     b.handle->iface.get_name      = dummy_backend_get_name;
     b.handle->iface.graph_compute = dummy_backend_graph_compute;
+    b.handle->iface.synchronize   = dummy_backend_synchronize;
     b.handle->device              = b.device.get();
     b.handle->context             = b.context.get();
     return b;
@@ -669,6 +678,17 @@ static void test_reallocation() {
         ggml_set_output(x[2]);
         ggml_build_forward_expand(graph, x[2]);
 
+        const auto old_buffers = backend.context->buffers;
+        const auto old_bases = backend.context->buffer_bases;
+        // Total bytes fit, but the second chunk must grow from 16 to 20 bytes.
+        GGML_ASSERT(!ggml_gallocr_reserve_n_if_fits(galloc.get(), graph, nullptr, nullptr));
+        GGML_ASSERT(backend.context->buffers == old_buffers);
+        GGML_ASSERT(backend.context->buffer_bases == old_bases);
+        GGML_ASSERT(backend.context->allocated_total() == 40);
+        GGML_ASSERT(ggml_gallocr_reserve(galloc.get(), graph));
+        const auto grown_buffers = backend.context->buffers;
+        GGML_ASSERT(ggml_gallocr_reserve_n_if_fits(galloc.get(), graph, nullptr, nullptr));
+        GGML_ASSERT(backend.context->buffers == grown_buffers);
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
@@ -684,6 +704,43 @@ static auto make_resizable_add_graph(int64_t n_elements) {
     ggml_set_output(out);
     ggml_build_forward_expand(result.graph, out);
     return result;
+}
+
+static void test_async_scheduler_replan() {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX, 4, true);
+    auto reserve = make_resizable_add_graph(16);
+    auto small   = make_resizable_add_graph(4);
+    auto medium  = make_resizable_add_graph(8);
+    auto large   = make_resizable_add_graph(64);
+    auto failure = make_resizable_add_graph(256);
+    ggml_backend_t backends[] = { backend.handle.get() };
+    ggml_backend_buffer_type_t bufts[] = { &backend.buffer_type };
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 1, 128, false, false));
+    GGML_ASSERT(ggml_backend_sched_reserve(sched.get(), reserve.graph));
+    const auto buffers = backend.context->buffers;
+    const auto bases = backend.context->buffer_bases;
+    const size_t bytes = backend.context->allocated_total();
+    const int synchronized = backend.context->synchronize_count;
+    GGML_ASSERT(ggml_backend_sched_alloc_graph_async(sched.get(), small.graph));
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph_async(sched.get(), medium.graph));
+    check_all_allocated(medium.graph);
+    check_no_overlap(medium.graph);
+    GGML_ASSERT(backend.context->synchronize_count == synchronized);
+    GGML_ASSERT(backend.context->buffers == buffers && backend.context->buffer_bases == bases);
+
+    ggml_backend_sched_reset(sched.get());
+    GGML_ASSERT(ggml_backend_sched_alloc_graph_async(sched.get(), large.graph));
+    GGML_ASSERT(backend.context->synchronize_count == synchronized + 1);
+    GGML_ASSERT(backend.context->synchronized_bytes == bytes);
+    GGML_ASSERT(backend.context->allocated_total() > bytes);
+    check_all_allocated(large.graph);
+    check_no_overlap(large.graph);
+
+    ggml_backend_sched_reset(sched.get());
+    backend.context->fail_alloc = true;
+    GGML_ASSERT(!ggml_backend_sched_alloc_graph_async(sched.get(), failure.graph));
+    GGML_ASSERT(backend.context->synchronize_count == synchronized + 2);
 }
 
 static uint64_t gallocr_generation(ggml_gallocr_t alloc) {
@@ -721,6 +778,10 @@ static void test_resizable_buffers_grow_shrink_grow() {
         GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), large.graph));
         const size_t large_size = backend.context->allocated_total();
         const uint64_t large_generation = gallocr_generation(alloc.get());
+        const auto buffers = backend.context->buffers;
+        GGML_ASSERT(!ggml_gallocr_reserve_n_if_fits(alloc.get(), small.graph, nullptr, nullptr));
+        GGML_ASSERT(backend.context->buffers == buffers);
+        GGML_ASSERT(gallocr_generation(alloc.get()) == large_generation);
         GGML_ASSERT(large_size > 0);
 
         GGML_ASSERT(ggml_gallocr_reserve(alloc.get(), small.graph));
@@ -1301,6 +1362,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_async_scheduler_replan", test_async_scheduler_replan);
     run("test_resizable_buffers_grow_shrink_grow", test_resizable_buffers_grow_shrink_grow);
     run("test_resizable_buffers_fail_closed_on_allocation_failure", test_resizable_buffers_fail_closed_on_allocation_failure);
     run("test_resizable_buffers_multi_entry_allocation_failure", test_resizable_buffers_multi_entry_allocation_failure);

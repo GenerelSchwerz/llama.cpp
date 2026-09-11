@@ -420,6 +420,7 @@ private:
     };
     sampled_input_staging sampled_staging[2];
     uint32_t sampled_staging_next = 0;
+    size_t sampled_staging_reserve = 0;
     ggml_backend_buffer_ptr sampled_output_host;
     ggml_backend_event_ptr sampled_output_ready;
 

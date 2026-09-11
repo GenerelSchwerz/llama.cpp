@@ -2324,6 +2324,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_OVERLAP"));
     add_opt(common_arg(
+        {"--decode-boundary-overlap"},
+        "experimental: overlap decode boundary preparation and update CUDA graphs (use with --decode-overlap) (default: disabled)",
+        [](common_params & params) {
+            params.decode_boundary_overlap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP"));
+    add_opt(common_arg(
         {"--ple-prefetch"},
         "experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)",
         [](common_params & params) {
