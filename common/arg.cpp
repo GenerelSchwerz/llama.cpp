@@ -2324,6 +2324,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_OVERLAP"));
     add_opt(common_arg(
+        {"--ple-prefetch"},
+        "experimental, Linux-only support: advise lazy row pages before CPU GET_ROWS (default: disabled)",
+        [](common_params & params) {
+            params.ple_prefetch = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PLE_PREFETCH"));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

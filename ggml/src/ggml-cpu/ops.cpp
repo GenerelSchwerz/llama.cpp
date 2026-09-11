@@ -5149,6 +5149,10 @@ void ggml_compute_forward_get_rows(
 
     const ggml_tensor * src0 = dst->src[0];
 
+    if (params->get_rows_callback && params->ith == 0) {
+        params->get_rows_callback(src0, dst->src[1], params->get_rows_callback_data);
+    }
+
     switch (src0->type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:

@@ -204,6 +204,22 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
+#define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_buffer_type"
+#define GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_is_buffer_type"
+#define GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME "ggml_backend_moe_cache_buffer_from_host_ptr"
+#define GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME "ggml_backend_moe_cache_set_slots"
+#define GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME "ggml_backend_moe_cache_set_l2_pinned_size"
+#define GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME "ggml_backend_moe_cache_set_debug"
+#define GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME "ggml_backend_moe_cache_log_and_reset_stats"
+
+    typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
+    typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type_t buft);
+    typedef ggml_backend_buffer_t (*ggml_backend_moe_cache_buffer_from_host_ptr_t)(void * ptr, size_t size);
+    typedef void (*ggml_backend_moe_cache_set_slots_t)(int n_slots);
+    typedef void (*ggml_backend_moe_cache_set_l2_pinned_size_t)(size_t bytes);
+    typedef void (*ggml_backend_moe_cache_set_debug_t)(bool enabled);
+    typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
+
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME "ggml_backend_moe_candidate_replace_v1"
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_MAGIC 0x4d4f4531u
 #define GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V1_VERSION 1u
@@ -379,6 +395,11 @@ extern "C" {
     typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t device);
     // Set the abort callback for the backend
     typedef void                         (*ggml_backend_set_abort_callback_t)(ggml_backend_t backend, ggml_abort_callback abort_callback, void * abort_callback_data);
+
+    // Optional row-read advice. Inputs are ready; the callback must not modify tensors or throw.
+    typedef void (*ggml_backend_get_rows_callback)(const struct ggml_tensor * table, const struct ggml_tensor * indices, void * user_data);
+    // Configure while idle. User data must outlive the backend and any plans that retain it.
+    typedef void (*ggml_backend_set_get_rows_callback_t)(ggml_backend_t backend, ggml_backend_get_rows_callback callback, void * user_data);
     // Get a list of feature flags supported by the backend (returns a NULL-terminated array)
     struct ggml_backend_feature {
         const char * name;

@@ -745,6 +745,9 @@ struct llama_model {
     bool has_tensor_overrides() const;
     int32_t moe_expert_cache_slots() const;
 
+    void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
+    void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
