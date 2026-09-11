@@ -6658,6 +6658,7 @@ static void test_active_grouped_multirow_graph_modes_case(
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
     ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
     CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+    ggml_backend_cuda_set_decode_boundary_overlap(candidate_backend.get(), true);
     auto reference = build_active_grouped_dispatch_graph(
         reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type,
         layout, false, n_rows, n_experts, n_used, 256);
@@ -6810,6 +6811,30 @@ static void test_active_grouped_multirow_graph_modes_case(
     CHECK(telemetry.admitted_banks == executed_passes * candidate.banks.size());
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
     CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+
+    if (capture_available) {
+        ggml_backend_buffer_ptr output_buffer(ggml_backend_alloc_buffer(candidate_backend.get(), ggml_nbytes(candidate.output)));
+        CHECK(output_buffer != nullptr);
+        void * original_data = candidate.output->data;
+        auto * original_buffer = candidate.output->buffer;
+        for (bool relocated : {true, false}) {
+            candidate.output->data = relocated ? ggml_backend_buffer_get_base(output_buffer.get()) : original_data;
+            candidate.output->buffer = relocated ? output_buffer.get() : original_buffer;
+            candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
+            (void) candidate_certify_graph(*context, candidate.graph);
+            for (uint32_t variant : {1u, 2u}) {
+                set_active_grouped_dispatch_logits({&reference, &candidate}, variant);
+                const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+                const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, f3_skipped);
+                check_active_grouped_exact_output(expected, actual);
+                ggml_cuda_graph_capture_state_for_test state;
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &state));
+                CHECK(state.instance == captured_instance && state.graph != 0 && state.warmup_complete &&
+                    state.moe_resource_fingerprint == captured_resource_fingerprint);
+            }
+        }
+    }
 
     if (capture_available && test_transition) {
         auto expected = std::vector<float>();
@@ -12518,7 +12543,86 @@ static void test_moe_cache_proc_api() {
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_decode_boundary_overlap") != nullptr);
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
+}
+
+static void test_strided_copy_graph_update(int device, bool enabled) {
+    std::array<ggml_backend_ptr, 2> backends;
+    std::array<ggml_context_ptr, 2> contexts;
+    std::array<ggml_backend_buffer_ptr, 2> buffers;
+    std::array<ggml_cuda_graph_capture_state_for_test, 2> states;
+    ggml_tensor * output = nullptr;
+    for (uint32_t i = 0; i < 2; ++i) {
+        const int64_t height = i == 0 ? 128 : 192;
+        backends[i].reset(ggml_backend_cuda_init(device));
+        if (enabled) {
+            ggml_backend_cuda_set_decode_boundary_overlap(backends[i].get(), true);
+        }
+        const ggml_init_params params = {ggml_tensor_overhead() * 8 + ggml_graph_overhead_custom(8, false), nullptr, true};
+        contexts[i].reset(ggml_init(params));
+        CHECK(backends[i] != nullptr && contexts[i] != nullptr);
+        auto * source = ggml_new_tensor_2d(contexts[i].get(), GGML_TYPE_F32, 512, height);
+        auto * view = ggml_view_2d(contexts[i].get(), source, 128, height, source->nb[1], 0);
+        auto * destination = ggml_new_tensor_2d(contexts[i].get(), GGML_TYPE_F32, 128, height);
+        output = ggml_cpy(contexts[i].get(), view, destination);
+        auto * graph = ggml_new_graph_custom(contexts[i].get(), 8, false);
+        ggml_build_forward_expand(graph, output);
+        buffers[i].reset(ggml_backend_alloc_ctx_tensors(contexts[i].get(), backends[i].get()));
+        CHECK(buffers[i] != nullptr);
+        std::vector<float> values(512 * height);
+        std::iota(values.begin(), values.end(), 0.0f);
+        ggml_backend_tensor_set(source, values.data(), 0, values.size() * sizeof(float));
+        for (uint32_t pass = 0; pass < 3; ++pass) {
+            CHECK(ggml_backend_graph_compute(backends[i].get(), graph) == GGML_STATUS_SUCCESS);
+        }
+        ggml_backend_synchronize(backends[i].get());
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(backends[i].get(), graph, &states[i]));
+        if (!states[i].capture_available) {
+            fprintf(stderr, "test-moe-cache: strided copy graph update skipped (CUDA graphs unavailable)\n");
+            return;
+        }
+        CHECK(states[i].graph != 0 && states[i].instance != 0 && states[i].warmup_complete);
+        size_t count = 0;
+        auto captured = reinterpret_cast<cudaGraph_t>(states[i].graph);
+        CUDA_OK(cudaGraphGetNodes(captured, nullptr, &count));
+        CHECK(count == 1);
+        cudaGraphNode_t node;
+        CUDA_OK(cudaGraphGetNodes(captured, &node, &count));
+        cudaGraphNodeType node_type;
+        CUDA_OK(cudaGraphNodeGetType(node, &node_type));
+        CHECK(node_type == (enabled ? cudaGraphNodeTypeKernel : cudaGraphNodeTypeMemcpy));
+        std::vector<float> actual(128 * height);
+        ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+        for (size_t j = 0; j < actual.size(); ++j) {
+            CHECK(actual[j] == float((j / 128) * 512 + j % 128));
+        }
+    }
+    if (!enabled) {
+        fprintf(stderr, "test-moe-cache: default strided copy retains memcpy graph nodes, exact OK\n");
+        return;
+    }
+    auto instance = reinterpret_cast<cudaGraphExec_t>(states[0].instance);
+    auto graph = reinterpret_cast<cudaGraph_t>(states[1].graph);
+#if CUDART_VERSION >= 12000
+    cudaGraphExecUpdateResultInfo result;
+    CUDA_OK(cudaGraphExecUpdate(instance, graph, &result));
+    CHECK(result.result == cudaGraphExecUpdateSuccess);
+#else
+    cudaGraphExecUpdateResult result;
+    cudaGraphNode_t error_node;
+    CUDA_OK(cudaGraphExecUpdate(instance, graph, &error_node, &result));
+    CHECK(result == cudaGraphExecUpdateSuccess);
+#endif
+    std::vector<float> actual(128 * 192, -1.0f);
+    ggml_backend_tensor_set(output, actual.data(), 0, actual.size() * sizeof(float));
+    CUDA_OK(cudaGraphLaunch(instance, cudaStreamPerThread));
+    CUDA_OK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_backend_tensor_get(output, actual.data(), 0, actual.size() * sizeof(float));
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(actual[i] == float((i / 128) * 512 + i % 128));
+    }
+    fprintf(stderr, "test-moe-cache: strided copy graph height update exact OK\n");
 }
 
 int main(int argc, char ** argv) {
@@ -12617,6 +12721,8 @@ int main(int argc, char ** argv) {
     }
     test_grouped_decode(dev);
     test_grouped_graph_replay_lifecycle(dev);
+    test_strided_copy_graph_update(dev, false);
+    test_strided_copy_graph_update(dev, true);
     test_active_grouped_multirow_graph_modes(dev);
     test_active_grouped_dispatch();
 

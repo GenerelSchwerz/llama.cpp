@@ -4463,7 +4463,7 @@ static void ggml_cuda_graph_commit_properties(ggml_backend_cuda_context * cuda_c
     }
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -4486,8 +4486,10 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
         CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return false;
     } else {
         GGML_ASSERT(stat == cudaSuccess);
+        return true;
     }
 }
 #endif // USE_CUDA_GRAPH
@@ -6377,6 +6379,13 @@ static bool ggml_cuda_graph_evaluate_and_capture(
         const void * graph_key,
         ggml_cuda_moe_graph_execution * moe_execution) {
     bool graph_evaluated_or_captured = false;
+#ifdef USE_CUDA_GRAPH
+    cudaGraph_t retired_graph = nullptr;
+    static const bool profile = getenv("GGML_CUDA_GRAPH_PROFILE") != nullptr;
+    const bool measure = profile && use_cuda_graph && cuda_graph_update_required;
+    const int64_t capture_start = measure ? ggml_time_us() : 0;
+    int64_t capture_end = 0;
+#endif
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -6569,12 +6578,14 @@ static bool ggml_cuda_graph_evaluate_and_capture(
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (use_cuda_graph && cuda_graph_update_required) { // End CUDA graph capture
-            if (graph->graph != nullptr) {
+            if (cuda_ctx->decode_boundary_overlap) {
+                retired_graph = graph->graph;
+            } else if (graph->graph != nullptr) {
                 CUDA_CHECK(cudaGraphDestroy(graph->graph));
                 graph->graph = nullptr;
             }
-
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
+            capture_end = measure ? ggml_time_us() : 0;
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);
@@ -6588,14 +6599,29 @@ static bool ggml_cuda_graph_evaluate_and_capture(
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        const char * kind = "instantiate";
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            if (!cuda_ctx->decode_boundary_overlap && cuda_graph_update_required) {
+                kind = ggml_cuda_graph_update_executable(cuda_ctx, graph_key) ? "instantiate+update" : "reinstantiate";
+            }
+        } else if (cuda_graph_update_required) { // Update graph executable
+            kind = ggml_cuda_graph_update_executable(cuda_ctx, graph_key) ? "update" : "reinstantiate";
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
-        }
+        const int64_t update_end = measure ? ggml_time_us() : 0;
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        const int64_t launch_end = measure ? ggml_time_us() : 0;
+        if (retired_graph != nullptr) {
+            // Retire the old description while the new executable runs.
+            CUDA_CHECK(cudaGraphDestroy(retired_graph));
+        }
+        if (measure) {
+            GGML_LOG_INFO("cuda-graph-profile: uid=%llu kind=%s capture_us=%lld update_us=%lld launch_us=%lld cleanup_us=%lld\n",
+                (unsigned long long) cgraph->uid, kind,
+                (long long) (capture_end - capture_start), (long long) (update_end - capture_end),
+                (long long) (launch_end - update_end), (long long) (ggml_time_us() - launch_end));
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -6826,6 +6852,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         ggml_cuda_graph_invalidate_moe_capture(graph);
     };
     bool retain_grouped_capture = false;
+    bool update_grouped_capture = false;
 #ifdef USE_CUDA_GRAPH
     if (graph_enabled_compatible && graph_has_cached_mmid && prepared_plan != nullptr && moe_dispatch &&
             moe_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY &&
@@ -6849,7 +6876,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             ggml_cuda_graph_commit_properties(cuda_ctx, cgraph);
         }
         if (graph_properties_changed && graph->moe_resource_fingerprint != 0) {
-            force_moe_direct();
+            if (cuda_ctx->decode_boundary_overlap && moe_dispatch && moe_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+                    ggml_cuda_graph_has_complete_moe_capture(graph)) {
+                use_cuda_graph = true;
+                cuda_graph_update_required = true;
+                update_grouped_capture = true;
+            } else {
+                force_moe_direct();
+            }
         } else if (!graph->warmup_complete) {
             // Warmup: need at least 2 calls with no property change on the 2nd call
             if (!graph_properties_changed) {
@@ -6921,6 +6955,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     } catch (const std::bad_alloc &) {
                         force_moe_direct();
                     }
+                }
+            }
+            if (use_cuda_graph && update_grouped_capture) {
+                bool same_owners = graph->moe_resource_witnesses.size() == moe_resource_leases.size();
+                for (size_t i = 0; same_owners && i < moe_resource_leases.size(); ++i) {
+                    const auto & witness = graph->moe_resource_witnesses[i];
+                    const auto & lease = moe_resource_leases[i];
+                    same_owners = !witness.owner_before(lease) && !lease.owner_before(witness);
+                }
+                if (!same_owners) {
+                    force_moe_direct();
                 }
             }
             moe_dispatch_mode = !use_cuda_graph ? GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT :
@@ -8210,9 +8255,18 @@ static bool ggml_backend_cuda_required_grouped_execution_supported(ggml_backend_
     return backend != nullptr && ggml_backend_is_cuda(backend);
 }
 #endif
+void ggml_backend_cuda_set_decode_boundary_overlap(ggml_backend_t backend, bool enabled) {
+    GGML_ASSERT(ggml_backend_is_cuda(backend));
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    GGML_ASSERT(ctx->cuda_graphs.empty());
+    ctx->decode_boundary_overlap = enabled;
+}
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_set_decode_boundary_overlap") == 0) {
+        return (void *) ggml_backend_cuda_set_decode_boundary_overlap;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

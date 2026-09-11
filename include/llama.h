@@ -434,6 +434,7 @@ extern "C" {
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
+        bool decode_boundary_overlap; // experimental: overlap decode boundary preparation and update CUDA graphs
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
