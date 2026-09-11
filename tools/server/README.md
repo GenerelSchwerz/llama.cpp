@@ -158,7 +158,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `-jf, --json-schema-file FILE` | File containing a JSON schema to constrain generations (https://json-schema.org/), e.g. `{}` for any JSON object<br/>For schemas w/ external $refs, use --grammar + example/json_schema_to_grammar.py instead |
 | `-bs, --backend-sampling` | enable backend sampling (experimental) (default: disabled)<br/>(env: LLAMA_ARG_BACKEND_SAMPLING) |
 | `--decode-overlap` | experimental: overlap backend-sampled decode or the first MTP draft step with result processing (default: disabled)<br/>(env: LLAMA_ARG_DECODE_OVERLAP) |
-| `--ple-prefetch` | experimental, Linux-only support: advise lazy row pages before CPU GET_ROWS (default: disabled)<br/>(env: LLAMA_ARG_PLE_PREFETCH) |
+| `--ple-prefetch` | experimental: advise lazy row pages before CPU GET_ROWS (Linux; Windows unvalidated) (default: disabled)<br/>(env: LLAMA_ARG_PLE_PREFETCH) |
 
 
 ### Server-specific params
@@ -465,7 +465,9 @@ docker run -p 8080:8080 -v /path/to/models:/models --gpus all ghcr.io/ggml-org/l
 
 `--ple-prefetch` (or `LLAMA_ARG_PLE_PREFETCH=1`) opts into page advice for lazy-backed row reads. It is disabled by default. The CPU `GET_ROWS` path uses the actual runtime index tensor, without model or tensor-name matching, in both prefill and decode. It supports contiguous 2D source tables and I32 index vectors, including strided index vectors. Other layouts, non-lazy tables, and GPU gathers retain ordinary reads. Models must already mark the source for lazy loading; the flag does not change loading or placement. Decode overlap is not required.
 
-Support and performance validation are Linux-only. On Windows, the page-advice helper is a no-op; other POSIX platforms have not been validated. Advice uses bounded scratch, does not pin the table or predict tokens, and does not change row order or dequantization. Cold reads can benefit, but resident reads have extra overhead and advice can block under memory pressure. Advice failure retains ordinary demand reads. Omit the flag and unset its environment variable (or set it to `0`) to disable advice. The CPU backend extension is optional; requesting this flag with a backend build that lacks it fails explicitly.
+Performance validation is Linux-only. Windows support is experimental and performance-unvalidated: builds targeting Windows 8 or newer (`_WIN32_WINNT >= 0x0602`) use dynamically resolved `PrefetchVirtualMemory`, with at most 256 merged requested page ranges per call. Older targets or a missing API retain ordinary reads. Other POSIX platforms have not been validated. Advice uses bounded scratch, does not pin the table or predict tokens, and does not change row order or dequantization. Cold reads can benefit, but resident reads have extra overhead and advice can block under memory pressure. Advice failure retains ordinary demand reads. Omit the flag and unset its environment variable (or set it to `0`) to disable advice. The CPU backend extension is optional; requesting this flag with a backend build that lacks it fails explicitly.
+
+Windows testers should compare repeated runs with the flag off/on in alternating order, keeping the exact prompt bytes, sampling, model placement, context, cache slots, and overlap setting fixed. Verify output token IDs before comparing speeds. Report Windows/build versions, storage type, RAM/VRAM, decode tokens/s and p50/p95/p99/max token intervals, separately for cold and warm reads. Include late-context intervals when testing microstutters, advice-related memory pressure, errors, and clean shutdown. Do not clear global caches or change system memory settings. Linux results do not establish a Windows speedup.
 
 ### Experimental decode overlap
 
