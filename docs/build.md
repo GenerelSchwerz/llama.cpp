@@ -302,6 +302,8 @@ The following compilation options are also available to tweak performance:
 | GGML_CUDA_FORCE_CUBLAS        | Boolean                | false   | Force the use of FP16 cuBLAS instead of custom matrix multiplication kernels for quantized models. There may be issues with numerical overflows (except for V100, CDNA and RDNA4 which use FP32 compute type by default) and memory use will be higher. Prompt processing may become faster on recent datacenter GPUs (the custom kernels were tuned primarily for RTX 3000/4000).   |
 | GGML_CUDA_FA_ALL_QUANTS       | Boolean                | false   | Compile support for all KV cache quantization type (combinations) for the FlashAttention CUDA kernels. More fine-grained control over KV cache size but compilation takes much longer.                                                                                                                                                                                           |
 
+For a few measured geometries the MMA FlashAttention kernels read the quantized K/V cache in place instead of casting the visible window to F16, which removes that transient copy. There is no option: the backend picks that route where it is faster. `GGML_CUDA_FA_ALL_QUANTS` widens which cache types it covers. See [quantized-native-flash-attention.md](quantized-native-flash-attention.md).
+
 ## MUSA
 
 This provides GPU acceleration using a Moore Threads GPU. Make sure to have the [MUSA SDK](https://developer.mthreads.com/musa/musa-sdk) installed.

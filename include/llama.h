@@ -411,6 +411,9 @@ extern "C" {
         bool recurrent_state_offload; // offload recurrent state independently of attention KV storage
         bool phase_aware_workspace;   // resize this context's compute scheduler between prompt processing and token generation
         bool live_context_workspace;  // grow supported attention workspace plans with the padded live physical KV extent
+        bool flash_attn_native_quants; // let Flash Attention read a quantized K/V cache in place instead of
+                                       // casting it to F16 first; removes the transient F16 copy of the
+                                       // attention window. Where no native loader exists the F16 path is used.
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
