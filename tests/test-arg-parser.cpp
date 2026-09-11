@@ -384,6 +384,30 @@ static void test(void) {
     }
 
     {
+        unset_test_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP");
+        common_params boundary_params;
+        argv = {"binary_name"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), boundary_params, LLAMA_EXAMPLE_SERVER));
+        assert(!boundary_params.decode_boundary_overlap);
+        assert(!llama_context_default_params().decode_boundary_overlap);
+        assert(!common_context_params_to_llama(boundary_params).decode_boundary_overlap);
+
+        argv = {"binary_name", "--decode-boundary-overlap"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), boundary_params, LLAMA_EXAMPLE_SERVER));
+        assert(boundary_params.decode_boundary_overlap);
+        assert(common_context_params_to_llama(boundary_params).decode_boundary_overlap);
+
+        for (const char * value : {"0", "1"}) {
+            set_test_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP", value);
+            boundary_params = common_params();
+            argv = {"binary_name"};
+            assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), boundary_params, LLAMA_EXAMPLE_SERVER));
+            assert(boundary_params.decode_boundary_overlap == (value[0] == '1'));
+        }
+        unset_test_env("LLAMA_ARG_DECODE_BOUNDARY_OVERLAP");
+    }
+
+    {
         unset_test_env("LLAMA_ARG_PLE_PREFETCH");
         common_params ple_params;
         argv = {"binary_name"};

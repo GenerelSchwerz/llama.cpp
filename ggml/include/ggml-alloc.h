@@ -74,6 +74,14 @@ GGML_API bool ggml_gallocr_reserve_n(
     const int * node_buffer_ids,
     const int * leaf_buffer_ids);
 
+// Replan without allocating, freeing or resizing buffers. False requires a regular reserve before allocation.
+// Shared/resizable buffers are not supported. A failed attempt may change the allocation plan.
+GGML_API bool ggml_gallocr_reserve_n_if_fits(
+    ggml_gallocr_t galloc,
+    struct ggml_cgraph * graph,
+    const int * node_buffer_ids,
+    const int * leaf_buffer_ids);
+
 // automatic reallocation if the topology changes when using a single buffer
 // returns false if using multiple buffers and a re-allocation is needed (call ggml_gallocr_reserve_n first to set the node buffers)
 GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
