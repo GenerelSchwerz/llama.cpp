@@ -22,6 +22,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        ggml_backend_get_rows_callback get_rows_callback;
+        void * get_rows_callback_data;
     };
 
     // numa strategies

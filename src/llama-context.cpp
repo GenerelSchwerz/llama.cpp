@@ -17,10 +17,6 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -529,13 +525,15 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
     };
 
     auto is_cached = [](const ggml_tensor * tensor) {
-#ifdef GGML_USE_CUDA
-        return tensor != nullptr && tensor->buffer != nullptr &&
-            ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(tensor->buffer));
-#else
-        GGML_UNUSED(tensor);
-        return false;
-#endif
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return false;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        auto is_moe_cache_buft_fn = reg != nullptr ? (ggml_backend_moe_cache_is_buffer_type_t)
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
+        return is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
     };
 
     struct group_source {
@@ -2250,6 +2248,19 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
     sched_need_reserve = true;
+}
+
+bool llama_context::set_ple_prefetch(bool enabled) {
+    auto reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
+    auto set_callback = reinterpret_cast<ggml_backend_set_get_rows_callback_t>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_get_rows_callback"));
+    if (!set_callback) { return false; }
+    synchronize();
+    set_callback(backend_cpu, enabled ? +[](const ggml_tensor * table, const ggml_tensor * indices, void * data) {
+        static_cast<const llama_model *>(data)->prefetch_rows(table, indices);
+    } : nullptr, enabled ? const_cast<llama_model *>(&model) : nullptr);
+    ple_prefetch = enabled;
+    LLAMA_LOG_INFO("%s: lazy row prefetch %s for CPU GET_ROWS\n", __func__, enabled ? "enabled" : "disabled");
+    return true;
 }
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
@@ -5492,6 +5503,10 @@ void llama_set_embeddings_nextn(llama_context * ctx, bool value, bool masked) {
 
 void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
     ctx->set_embeddings_layer_inp(lid, value);
+}
+
+bool llama_set_ple_prefetch(llama_context * ctx, bool enabled) {
+    return ctx->set_ple_prefetch(enabled);
 }
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {

@@ -9,6 +9,7 @@
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;
+struct ggml_tensor;
 
 using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
@@ -54,6 +55,10 @@ struct llama_mmap {
     void * addr() const;
 
     void unmap_fragment(size_t first, size_t last);
+
+    void prefetch_rows(const void * data, size_t row_size, const int32_t * rows, size_t n_rows) const;
+    bool contains_lazy(const void * data, size_t bytes) const;
+    void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;
 
     static const bool SUPPORTED;
 

@@ -3,6 +3,7 @@
 // GGML CPU internal header
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-impl.h"
 
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
@@ -27,6 +28,9 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    ggml_backend_get_rows_callback get_rows_callback;
+    void * get_rows_callback_data;
 };
 
 

@@ -107,6 +107,8 @@ struct ggml_backend_cpu_context {
     void *              abort_callback_data;
 
     bool                use_ref;  // use reference implementation
+    ggml_backend_get_rows_callback get_rows_callback = nullptr;
+    void * get_rows_callback_data = nullptr;
 };
 
 static const char * ggml_backend_cpu_get_name(ggml_backend_t backend) {
@@ -146,6 +148,8 @@ static ggml_backend_graph_plan_t ggml_backend_cpu_graph_plan_create(ggml_backend
     cpu_plan->cplan.abort_callback      = cpu_ctx->abort_callback;
     cpu_plan->cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cpu_plan->cplan.use_ref             = cpu_ctx->use_ref;
+    cpu_plan->cplan.get_rows_callback = cpu_ctx->get_rows_callback;
+    cpu_plan->cplan.get_rows_callback_data = cpu_ctx->get_rows_callback_data;
 
     return cpu_plan;
 }
@@ -186,6 +190,8 @@ static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, s
     cplan.abort_callback      = cpu_ctx->abort_callback;
     cplan.abort_callback_data = cpu_ctx->abort_callback_data;
     cplan.use_ref             = cpu_ctx->use_ref;
+    cplan.get_rows_callback = cpu_ctx->get_rows_callback;
+    cplan.get_rows_callback_data = cpu_ctx->get_rows_callback_data;
 
     return ggml_graph_compute(cgraph, &cplan);
 }
@@ -282,6 +288,13 @@ void ggml_backend_cpu_set_use_ref(ggml_backend_t backend_cpu, bool use_ref) {
 
     struct ggml_backend_cpu_context * ctx = (struct ggml_backend_cpu_context *)backend_cpu->context;
     ctx->use_ref = use_ref;
+}
+
+static void ggml_backend_cpu_set_get_rows_callback(ggml_backend_t backend, ggml_backend_get_rows_callback callback, void * user_data) {
+    GGML_ASSERT(ggml_backend_is_cpu(backend));
+    auto * ctx = static_cast<ggml_backend_cpu_context *>(backend->context);
+    ctx->get_rows_callback = callback;
+    ctx->get_rows_callback_data = user_data;
 }
 
 // CPU backend - device
@@ -669,6 +682,9 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_set_get_rows_callback") == 0) {
+        return (void *) ggml_backend_cpu_set_get_rows_callback;
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

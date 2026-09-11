@@ -8253,6 +8253,27 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_buft_is_cuda_moe_cached;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_buffer_from_host_ptr;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_cache_slots;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_l2_pinned_cache_size;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_set_debug_mm;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_log_and_reset_stats;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_moe_candidate_replace_v1;
     }
