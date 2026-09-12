@@ -1207,6 +1207,13 @@ size_t llama_dsv4_comp_state::total_size() const {
 // llama_kv_cache_dsv4
 //
 
+llama_hparams llama_kv_cache_dsv4::get_hparams_raw(const llama_hparams & hparams) {
+    llama_hparams hparams_raw = hparams;
+    hparams_raw.n_layer_nextn = 0;
+    dsv4_make_k_only(hparams_raw);
+    return hparams_raw;
+}
+
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -1223,7 +1230,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     llama_memory_placement_options placement) :
-    hparams_raw(model.hparams),
+    hparams_raw(get_hparams_raw(model.hparams)),
     hparams_csa(model.hparams),
     hparams_hca(model.hparams),
     hparams_lid(model.hparams),
@@ -1241,17 +1248,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     GGML_UNUSED(unified);
 
-    // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
-    const bool unified_raw = false;
-
-    hparams_raw.n_layer_nextn = 0;
     hparams_csa.n_layer_nextn = 0;
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
     LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
-
-    dsv4_make_k_only(hparams_raw);
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,

@@ -6,6 +6,7 @@
 #include "llama-memory.h"
 
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 struct llama_cparams;
@@ -118,6 +119,17 @@ public:
                  const char *   name_tag = "");
 
     ~llama_kv_cache() = default;
+
+    static std::pair<ggml_tensor *, ggml_tensor *> create_layer_tensors(
+            ggml_context * ctx,
+            const llama_hparams & hparams,
+            ggml_type type_k,
+            ggml_type type_v,
+            bool v_trans,
+            uint32_t kv_size,
+            uint32_t n_stream,
+            uint32_t il,
+            const char * name_tag = "");
 
     //
     // llama_memory_i

@@ -9,7 +9,9 @@ import os
 import sqlite3
 import sys
 from collections.abc import Iterator, Sequence
+from contextlib import closing
 from glob import glob
+from pathlib import Path
 from typing import Any, Optional, Union
 
 try:
@@ -30,7 +32,8 @@ LLAMA_BENCH_DB_FIELDS = [
     "split_mode",   "main_gpu",     "no_kv_offload",  "flash_attn", "tensor_split", "tensor_buft_overrides",
     "load_mode",    "embeddings",   "no_op_offload",  "n_prompt",   "n_gen",        "n_depth",
     "test_time",    "avg_ns",       "stddev_ns",      "avg_ts",     "stddev_ts",    "n_cpu_moe",
-    "fit_target",   "fit_min_ctx"
+    "fit_target",   "fit_min_ctx",   "kv_cpu_pinned", "recurrent_state_offload", "phase_aware_workspace",
+    "live_context_workspace", "kv_gpu_layers"
 ]
 
 LLAMA_BENCH_DB_TYPES = [
@@ -40,8 +43,17 @@ LLAMA_BENCH_DB_TYPES = [
     "TEXT",    "INTEGER", "INTEGER", "INTEGER", "TEXT",    "TEXT",
     "TEXT", "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER",
     "TEXT",    "INTEGER", "INTEGER", "REAL",    "REAL",    "INTEGER",
+    "INTEGER", "INTEGER", "INTEGER", "INTEGER", "INTEGER",
     "INTEGER", "INTEGER"
 ]
+
+LLAMA_BENCH_DEFAULTS = {
+    "kv_cpu_pinned": 0,
+    "recurrent_state_offload": 0,
+    "phase_aware_workspace": 0,
+    "live_context_workspace": 0,
+    "kv_gpu_layers": 0,
+}
 
 # All test-backend-ops SQL fields
 TEST_BACKEND_OPS_DB_FIELDS = [
@@ -63,7 +75,8 @@ assert len(TEST_BACKEND_OPS_DB_FIELDS) == len(TEST_BACKEND_OPS_DB_TYPES)
 LLAMA_BENCH_KEY_PROPERTIES = [
     "cpu_info", "gpu_info", "backends", "n_gpu_layers", "n_cpu_moe", "tensor_buft_overrides", "model_filename", "model_type",
     "n_batch", "n_ubatch", "embeddings", "cpu_mask", "cpu_strict", "poll", "n_threads", "type_k", "type_v",
-    "load_mode", "no_kv_offload", "split_mode", "main_gpu", "tensor_split", "flash_attn", "n_prompt", "n_gen", "n_depth",
+    "load_mode", "no_kv_offload", "kv_cpu_pinned", "recurrent_state_offload", "phase_aware_workspace",
+    "live_context_workspace", "kv_gpu_layers", "split_mode", "main_gpu", "tensor_split", "flash_attn", "n_prompt", "n_gen", "n_depth",
     "fit_target", "fit_min_ctx"
 ]
 
@@ -73,7 +86,10 @@ TEST_BACKEND_OPS_KEY_PROPERTIES = [
 ]
 
 # Properties that are boolean and are converted to Yes/No for the table:
-LLAMA_BENCH_BOOL_PROPERTIES = ["embeddings", "cpu_strict", "no_kv_offload", "flash_attn"]
+LLAMA_BENCH_BOOL_PROPERTIES = [
+    "embeddings", "cpu_strict", "no_kv_offload", "flash_attn", "kv_cpu_pinned",
+    "recurrent_state_offload", "phase_aware_workspace", "live_context_workspace"
+]
 TEST_BACKEND_OPS_BOOL_PROPERTIES = ["supported", "passed"]
 
 # Header names for the table (llama-bench):
@@ -84,6 +100,8 @@ LLAMA_BENCH_PRETTY_NAMES = {
     "cpu_mask": "CPU mask", "cpu_strict": "CPU strict", "poll": "Poll", "n_threads": "Threads", "type_k": "K type", "type_v": "V type",
     "load_mode": "Load mode", "no_kv_offload": "NKVO", "split_mode": "Split mode", "main_gpu": "Main GPU", "tensor_split": "Tensor split",
     "flash_attn": "FlashAttention",
+    "kv_cpu_pinned": "Pinned KV", "recurrent_state_offload": "Recurrent offload",
+    "phase_aware_workspace": "Phase workspace", "live_context_workspace": "Live workspace", "kv_gpu_layers": "GPU KV layers",
 }
 
 # Header names for the table (test-backend-ops):
@@ -230,6 +248,7 @@ class LlamaBenchData:
         # Set schema-specific properties based on tool
         if self.tool == "llama-bench":
             self.check_keys = set(LLAMA_BENCH_KEY_PROPERTIES + ["build_commit", "test_time", "avg_ts"])
+            self.check_keys.difference_update(LLAMA_BENCH_DEFAULTS)
         elif self.tool == "test-backend-ops":
             self.check_keys = set(TEST_BACKEND_OPS_KEY_PROPERTIES + ["build_commit", "test_time"])
         else:
@@ -342,7 +361,13 @@ class LlamaBenchDataSQLite3(LlamaBenchData):
             else:
                 assert False
 
-            self.cursor.execute(f"CREATE TABLE {self.table_name}({', '.join(' '.join(x) for x in zip(db_fields, db_types))});")
+            columns = []
+            for field, field_type in zip(db_fields, db_types):
+                column = f"{field} {field_type}"
+                if self.tool == "llama-bench" and field in LLAMA_BENCH_DEFAULTS:
+                    column += f" DEFAULT {LLAMA_BENCH_DEFAULTS[field]}"
+                columns.append(column)
+            self.cursor.execute(f"CREATE TABLE {self.table_name}({', '.join(columns)});")
 
     def _builds_init(self):
         if self.connection:
@@ -403,7 +428,10 @@ class LlamaBenchDataSQLite3(LlamaBenchData):
 
 class LlamaBenchDataSQLite3File(LlamaBenchDataSQLite3):
     def __init__(self, data_file: str, tool: Any):
-        self.connection = sqlite3.connect(data_file)
+        self.connection = sqlite3.connect(":memory:")
+        # Normalize historical fields and commit hashes without changing the input database.
+        with closing(sqlite3.connect(f"{Path(data_file).resolve().as_uri()}?mode=ro", uri=True)) as source:
+            source.backup(self.connection)
         self.cursor = self.connection.cursor()
 
         # Check which table exists in the database
@@ -436,22 +464,23 @@ class LlamaBenchDataSQLite3File(LlamaBenchDataSQLite3):
             raise RuntimeError(f"Unknown tool: {tool}")
 
         super().__init__(tool)
+        if self.tool == "llama-bench":
+            fields = {row[1] for row in self.cursor.execute(f"PRAGMA table_info({self.table_name});")}
+            for field, value in LLAMA_BENCH_DEFAULTS.items():
+                if field not in fields:
+                    self.cursor.execute(f"ALTER TABLE {self.table_name} ADD COLUMN {field} INTEGER DEFAULT {value};")
         self._builds_init()
 
     @staticmethod
     def valid_format(data_file: str) -> bool:
-        connection = sqlite3.connect(data_file)
-        cursor = connection.cursor()
-
         try:
-            if cursor.execute("PRAGMA schema_version;").fetchone()[0] == 0:
-                raise sqlite3.DatabaseError("The provided input file does not exist or is empty.")
+            with closing(sqlite3.connect(f"{Path(data_file).resolve().as_uri()}?mode=ro", uri=True)) as connection:
+                if connection.execute("PRAGMA schema_version;").fetchone()[0] == 0:
+                    raise sqlite3.DatabaseError("The provided input file does not exist or is empty.")
         except sqlite3.DatabaseError as e:
             logger.debug(f'"{data_file}" is not a valid SQLite3 file.', exc_info=e)
-            cursor = None
-
-        connection.close()
-        return True if cursor else False
+            return False
+        return True
 
 
 class LlamaBenchDataJSONL(LlamaBenchDataSQLite3):

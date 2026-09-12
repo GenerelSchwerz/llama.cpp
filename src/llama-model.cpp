@@ -340,6 +340,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_SPARK2_5:
+            return new llama_model_spark2_5(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -935,6 +937,8 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
+        case LLM_TYPE_1B_A400M:      return "1B.A400M";
+        case LLM_TYPE_3B_A800M:      return "3B.A800M";
         case LLM_TYPE_7B_A1B:        return "7B.A1B";
         case LLM_TYPE_8B_A1B:        return "8B.A1B";
         case LLM_TYPE_7_9B_A1_3B:    return "7.9B.A1.3B";
@@ -945,6 +949,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
+        case LLM_TYPE_32B_A9B:       return "32B.A9B";
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_75B_A9B:       return "75B.A9B";
@@ -1417,6 +1422,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
                 ml.use_mmap = false;
+                break;
+            }
+        }
+    }
+
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+        for (const auto & dev : devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev.dev, &props);
+            if (!props.caps.mmap_support) {
+                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
@@ -2233,8 +2250,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-// The layers whose attention KV a hybrid cache of this model owns. A null filter means the model is
-// not hybrid and every layer with a KV state belongs to the attention cache.
+// Use the same hybrid attention ownership rules for selection and cache construction.
 static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama_model & model, bool is_mtp) {
     const llama_hparams & hparams = model.hparams;
     if (is_mtp) {
@@ -2262,8 +2278,12 @@ static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama
     }
 }
 
-// Measure the host-to-device bandwidth of a device, in bytes per microsecond. Returns 0 when it
-// cannot be measured.
+static bool llama_layer_in_context(const llama_hparams & hparams, uint32_t il, bool is_mtp) {
+    return hparams.n_layer_nextn == 0 || hparams.n_layer() == 0 || hparams.router_layer >= 0 ||
+           (il >= hparams.n_layer()) == is_mtp;
+}
+
+// Measure host-to-device bytes per microsecond; zero means the probe failed.
 static double llama_dev_h2d_bandwidth_measure(ggml_backend_dev_t dev, bool cpu_pinned) {
     const size_t n_bytes = 16u*1024*1024;
     const int    n_reps  = 3;
@@ -2311,23 +2331,24 @@ static double llama_dev_h2d_bandwidth_measure(ggml_backend_dev_t dev, bool cpu_p
     return t_us > 0 ? (double) n_bytes*n_reps/t_us : 0.0;
 }
 
-// the link does not change during a run, so every context reuses one measurement
-// rather than pushing its own 48 MB over the bus
+// Reuse successful measurements across contexts.
 static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev, bool cpu_pinned) {
     static std::mutex mutex;
     static std::map<std::pair<ggml_backend_dev_t, bool>, double> measured;
 
     std::lock_guard<std::mutex> lock(mutex);
     auto it = measured.find({dev, cpu_pinned});
-    if (it == measured.end()) {
-        it = measured.emplace(std::make_pair(dev, cpu_pinned), llama_dev_h2d_bandwidth_measure(dev, cpu_pinned)).first;
+    if (it != measured.end()) {
+        return it->second;
     }
-    return it->second;
+    const double bandwidth = llama_dev_h2d_bandwidth_measure(dev, cpu_pinned);
+    if (bandwidth > 0.0) {
+        measured.emplace(std::make_pair(dev, cpu_pinned), bandwidth);
+    }
+    return bandwidth;
 }
 
-// Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
-// memory. Taking them in layer order fills the device that owns the first layers and leaves the
-// free memory of the others unused, so take them per owning device instead.
+// Prefer slower host links while keeping similar devices in one round-robin group.
 static std::set<uint32_t> llama_pick_gpu_resident_layers(
         const llama_model & model, const llama_memory_params & params, const llama_cparams & cparams,
         uint32_t n_layers, bool is_mtp) {
@@ -2339,12 +2360,10 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
 
     const llama_hparams & hparams = model.hparams;
 
-    // A model split by tensor mishandles an iSWA cache whose layers are partly device- and partly
-    // host-resident: the result stays coherent but measurably degrades. Leave the whole cache in
-    // host memory there until the mix is understood.
+    // Mixed host/device iSWA under tensor split has a known numerical discrepancy.
     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-            if (hparams.is_swa(il)) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+            if (llama_layer_in_context(hparams, il, is_mtp) && hparams.has_kv(il) && hparams.is_swa(il)) {
                 LLAMA_LOG_WARN("%s: kv_gpu_layers is not supported for an iSWA cache split by tensor, ignoring it\n",
                         __func__);
                 return ret;
@@ -2359,8 +2378,7 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
     const llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(model, is_mtp);
 
     for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
-        // a nextn layer is cached by the MTP context, the rest of the model by the main one
-        if (hparams.n_layer_nextn > 0 && (il >= hparams.n_layer()) != is_mtp) {
+        if (!llama_layer_in_context(hparams, il, is_mtp)) {
             continue;
         }
         if (!hparams.has_kv(il)) {
@@ -2381,10 +2399,11 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
         }
         devs_ils[it - devs.begin()].push_back(il);
     }
+    if (devs.empty()) {
+        return ret;
+    }
 
-    // A device-resident layer saves the transfer it would cost, which is worth most on the slowest
-    // link, so spend the budget there first. Devices of similar speed stay one group and keep the
-    // round-robin, so their memory use stays even.
+    // If a link cannot be measured, retain round-robin placement for all devices.
     std::vector<double> bw(devs.size(), 1.0);
     if (devs.size() > 1) {
         std::vector<double> measured(devs.size());
@@ -2400,48 +2419,83 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
         }
     }
 
-    // Spending the whole budget on the slowest device can ask it for more than it has left, and the
-    // cache has no fallback if its allocation fails. Bound each device by the memory it reports free,
-    // minus a margin for the compute buffers that are allocated after this.
-    // A meta device reports the free memory of all the devices behind it, while a layer only takes
-    // its share from each of them, so bound those one by one instead of the sum.
+    // Keep a margin for state and compute buffers allocated after the cache.
     struct dev_budget {
-        size_t free;  // bytes still unspent
-        double share; // part of a layer this device holds
+        ggml_backend_dev_t dev;
+        size_t remaining;
     };
-    const uint32_t n_stream = cparams.kv_unified ? 1 : std::max((uint32_t) 1, cparams.n_seq_max);
     bool memory_bound = false;
+    const bool split_tensor = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model.devices_meta.empty();
     std::vector<std::vector<dev_budget>> budget(devs.size());
     for (size_t d = 0; d < devs.size(); d++) {
-        std::vector<ggml_backend_dev_t> parts(1, devs[d]);
-        std::vector<double>             shares(1, 1.0);
-        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model.devices_meta.empty()) {
-            parts = model.devices_meta;
-            shares.assign(parts.size(), 1.0/parts.size());
-            const float * tensor_split = model.tensor_split();
-            double sum = 0.0;
-            for (size_t i = 0; tensor_split != nullptr && i < parts.size(); i++) {
-                sum += tensor_split[i];
-            }
-            if (sum > 0.0) {
-                for (size_t i = 0; i < parts.size(); i++) {
-                    shares[i] = tensor_split[i]/sum;
+        const auto parts = split_tensor ? model.devices_meta : std::vector<ggml_backend_dev_t>{devs[d]};
+        for (auto * part : parts) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(part, &free, &total);
+            budget[d].push_back({part, free - free/8});
+        }
+    }
+
+    const bool is_dsv4_raw = model.arch == LLM_ARCH_DEEPSEEK4 && !is_mtp;
+    const auto hparams_kv = is_dsv4_raw ? llama_kv_cache_dsv4::get_hparams_raw(hparams) : hparams;
+    const bool unified = is_dsv4_raw ? llama_kv_cache_dsv4::unified_raw : cparams.kv_unified;
+    const uint32_t n_stream = unified ? 1 : std::max(uint32_t(1), cparams.n_seq_max);
+    const ggml_init_params ip = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx {ggml_init(ip)};
+    ggml_context_ptr ctx_split {ggml_init(ip)};
+    if (!ctx || !ctx_split) {
+        throw std::runtime_error("failed to create KV residency sizing context");
+    }
+
+    // Full context cells bound SWA storage; tensor shapes and device padding follow the allocator.
+    auto layer_bytes = [&](uint32_t il, const std::vector<dev_budget> & parts) {
+        ggml_reset(ctx.get());
+        const auto kv = llama_kv_cache::create_layer_tensors(ctx.get(), hparams_kv, params.type_k, params.type_v,
+                !cparams.flash_attn, cparams.n_ctx_seq, n_stream, il);
+        const ggml_tensor * tensors[] = {kv.first, kv.second};
+        std::vector<ggml_backend_meta_split_state> splits;
+        if (split_tensor) {
+            llama_meta_device_get_split_state_userdata ud {parts.size(), &model};
+            for (const auto * tensor : tensors) {
+                if (tensor) {
+                    splits.push_back(llama_meta_device_get_split_state(tensor, &ud));
                 }
             }
         }
-        for (size_t i = 0; i < parts.size(); i++) {
-            size_t free = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(parts[i], &free, &total);
-            budget[d].push_back({free - free/8, shares[i]});
+        std::vector<size_t> bytes(parts.size());
+        for (size_t d = 0; d < parts.size(); d++) {
+            auto * buft = ggml_backend_dev_buffer_type(parts[d].dev);
+            if (!split_tensor) {
+                bytes[d] = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                continue;
+            }
+            ggml_reset(ctx_split.get());
+            size_t i = 0;
+            for (const auto * tensor : tensors) {
+                if (!tensor) {
+                    continue;
+                }
+                const auto & split = splits[i++];
+                int64_t ne[GGML_MAX_DIMS];
+                std::copy(tensor->ne, tensor->ne + GGML_MAX_DIMS, ne);
+                if (split.axis >= 0 && split.axis < GGML_MAX_DIMS) {
+                    ne[split.axis] = 0;
+                    for (size_t segment = 0; segment < split.n_segments; segment++) {
+                        ne[split.axis] += split.ne[segment*parts.size() + d]*split.nr[segment];
+                    }
+                }
+                if (std::all_of(ne, ne + GGML_MAX_DIMS, [](int64_t n) { return n > 0; })) {
+                    ggml_new_tensor(ctx_split.get(), tensor->type, GGML_MAX_DIMS, ne);
+                }
+            }
+            bytes[d] = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_split.get(), buft);
         }
-    }
-    // An upper bound on one cache layer: a sub-cache can keep fewer cells than the context, no V at
-    // all, or a compressed state, but never more than this. A bound that errs high spends less of the
-    // budget than it could, one that errs low lets the allocation fail.
-    auto layer_bytes = [&](uint32_t il) {
-        return (ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
-                ggml_row_size(params.type_v, hparams.n_embd_v_gqa_max())) * cparams.n_ctx_seq * n_stream;
+        return bytes;
     };
 
     std::vector<size_t> order(devs.size());
@@ -2462,17 +2516,17 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(
                     continue;
                 }
                 any = true;
-                const size_t bytes = layer_bytes(ils[i]);
+                const auto bytes = layer_bytes(ils[i], budget[dd]);
                 bool fits = true;
-                for (const dev_budget & b : budget[dd]) {
-                    fits = fits && (size_t) (bytes*b.share) <= b.free;
+                for (size_t part = 0; part < budget[dd].size(); part++) {
+                    fits = fits && bytes[part] <= budget[dd][part].remaining;
                 }
                 if (!fits) {
                     memory_bound = true;
                     continue;
                 }
-                for (dev_budget & b : budget[dd]) {
-                    b.free -= (size_t) (bytes*b.share);
+                for (size_t part = 0; part < budget[dd].size(); part++) {
+                    budget[dd][part].remaining -= bytes[part];
                 }
                 ret.insert(ils[i]);
             }
@@ -2496,9 +2550,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_placement_options placement;
     placement.cpu_pinned        = cparams.kv_cpu_pinned;
     placement.recurrent_offload = cparams.offload_kqv || cparams.recurrent_state_offload;
-    // Resolved here rather than per cache, so that a cache built from several sub-caches shares one
-    // budget instead of giving each of them the full count. An offloaded cache is device-resident
-    // already, so it needs no set and must not pay for measuring the links.
+    // Share one residency budget across sub-caches; full offload needs no selection.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
         placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, params, cparams,
                 cparams.kv_gpu_layers, params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
@@ -2908,14 +2960,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
-                            arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_DEEPSEEK32) &&
-                            hparams.n_layer_nextn > 0) {
-                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                        } else {
-                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
-                        }
+                    // Router and all-nextn models keep all layers in the same context.
+                    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
+                        const bool is_mtp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        filter = [&, is_mtp](uint32_t il) { return llama_layer_in_context(hparams, il, is_mtp); };
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2996,9 +3044,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             }
     }
 
-    // Report what the caches did rather than what was picked: a cache filter can drop a picked
-    // layer, and a model without a standard attention cache keeps none. The attention compute
-    // follows the cache, so cparams must carry the count the caches reached.
+    // Attention compute placement follows the layers actually claimed by the caches.
     if (placement.gpu_resident_done) {
         const uint32_t n_resident = (uint32_t) placement.gpu_resident_done->size();
         if (n_resident == 0) {
@@ -3297,6 +3343,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_SPARK2_5:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
             return LLAMA_ROPE_TYPE_NEOX;
@@ -3531,6 +3578,12 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
     if (layer.wqkv) {
         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        // Fused weights may coexist with separate Q/K/V biases in legacy or custom GGUFs.
+        if (!layer.wqkv_b) {
+            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+            layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+            layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+        }
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);
