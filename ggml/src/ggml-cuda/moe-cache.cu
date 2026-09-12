@@ -3781,6 +3781,68 @@ static bool moe_early_router_copy_engine() {
 #endif
 }
 
+static bool moe_early_router_copy_engine_supported(int device) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
+    moe_grouped_device_scope device_scope(device);
+#if CUDA_VERSION < 13000
+    CUdevice cu_device;
+    int attribute = 0;
+    if (cuDeviceGet(&cu_device, device) != CUDA_SUCCESS ||
+            cuDeviceGetAttribute(&attribute, CU_DEVICE_ATTRIBUTE_CAN_USE_STREAM_MEM_OPS_V1, cu_device) != CUDA_SUCCESS ||
+            attribute == 0) {
+        return false;
+    }
+#endif
+    CUstream stream = nullptr;
+    CUdeviceptr value = 0;
+    CUgraph graph = nullptr;
+    CUgraphExec executable = nullptr;
+    CUgraphNode node;
+    CUstreamBatchMemOpParams operation = {};
+    CUDA_BATCH_MEM_OP_NODE_PARAMS params = {};
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    bool supported = cuMemAlloc(&value, sizeof(uint32_t)) == CUDA_SUCCESS;
+    if (supported) {
+        operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+        operation.waitValue.address = value;
+        operation.waitValue.value = 1;
+        operation.waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+        params.count = 1;
+        params.paramArray = &operation;
+        // Probe both direct waits and the batch-memory nodes used during capture.
+        supported = cuStreamWriteValue32(stream, value, 1, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS &&
+            cuStreamWaitValue32(stream, value, 1, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS &&
+            cuCtxGetCurrent(&params.ctx) == CUDA_SUCCESS &&
+            cuGraphCreate(&graph, 0) == CUDA_SUCCESS &&
+            cuGraphAddBatchMemOpNode(&node, graph, nullptr, 0, &params) == CUDA_SUCCESS &&
+            cuGraphInstantiateWithFlags(&executable, graph, 0) == CUDA_SUCCESS &&
+            cuGraphLaunch(executable, stream) == CUDA_SUCCESS;
+    }
+    if (stream != nullptr) {
+        supported = cuStreamSynchronize(stream) == CUDA_SUCCESS && supported;
+    }
+    if (executable != nullptr) {
+        (void) cuGraphExecDestroy(executable);
+    }
+    if (graph != nullptr) {
+        (void) cuGraphDestroy(graph);
+    }
+    if (value != 0) {
+        (void) cuMemFree(value);
+    }
+    if (stream != nullptr) {
+        (void) cuStreamDestroy(stream);
+    }
+    return supported;
+#else
+    GGML_UNUSED(device);
+    return false;
+#endif
+}
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
 static __global__ void moe_early_router_publish_copy(
         const int32_t * predicted, int32_t * host_ids, uint32_t top_k, uint64_t * request, uint64_t job) {
@@ -4773,9 +4835,16 @@ struct ggml_cuda_moe_grouped_context::impl {
     explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
+        if (moe_early_router_copy_engine()) {
+            early_copy_supported = moe_early_router_copy_engine_supported(device);
+            if (!early_copy_supported) {
+                fprintf(stderr, "moe-early-router: device=%d copy engine unavailable; using same-layer prefetch\n", device);
+            }
+        }
     }
 
     bool frequency_aware = true;
+    bool early_copy_supported = false;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -8786,7 +8855,8 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
         GGML_ASSERT(lane->active_group == UINT32_MAX);
     }
     // Eager warmup can allocate while the worker has pending CUDA submissions.
-    if (moe_early_router_copy_engine() && !capture) {
+    const bool copy_engine = moe_early_router_copy_engine() && impl_->early_copy_supported;
+    if (copy_engine && !capture) {
         return;
     }
     if (execution == nullptr || execution->plan_ == nullptr ||
@@ -8803,8 +8873,7 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
     if (!main && !mtp) {
         return;
     }
-    const uint32_t distance = moe_early_router_lookahead();
-    GGML_ASSERT(distance == 0 || moe_early_router_copy_engine());
+    const uint32_t distance = copy_engine ? moe_early_router_lookahead() : 0;
     const char * native_setting = getenv("GGML_CUDA_MOE_EARLY_ROUTER_NATIVE");
     const bool native_only = native_setting != nullptr && strcmp(native_setting, "1") == 0;
     size_t max_bytes = 0;
@@ -9010,7 +9079,7 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
             CUDA_CHECK(cudaMalloc(&early->staging, early->staging_bytes));
             CUDA_CHECK(cudaMalloc(&early->counters, 5 * sizeof(uint64_t)));
             CUDA_CHECK(cudaMemsetAsync(early->counters, 0, 5 * sizeof(uint64_t), stream));
-            early->copy_engine = moe_early_router_copy_engine();
+            early->copy_engine = copy_engine;
             if (early->copy_engine) {
                 early->start_copy_worker(impl_->device, false);
                 GGML_ASSERT(distance == 0 || (early->copy_mailbox && !early->copy_banks && !early->copy_ready_only));
