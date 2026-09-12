@@ -263,6 +263,14 @@ llama_kv_cache::llama_kv_cache(
                 layers.push_back(layer_share);
                 layers.back().il = il;
 
+                // this cache writes the shared tensors at its own slot, so their stable prefix would have two writers: keep them on the ordered path
+                if (layers.back().k) {
+                    layers.back().k->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+                if (layers.back().v) {
+                    layers.back().v->flags &= ~GGML_TENSOR_FLAG_TRANSPORT;
+                }
+
                 continue;
             }
         }
@@ -314,6 +322,15 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
+        if (ggml_backend_buft_is_host(buft)) {
+            if (k) {
+                k->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+            if (v && !v_trans) {
+                v->flags |= GGML_TENSOR_FLAG_TRANSPORT;
+            }
+        }
+
         bool k_store_quantize = false;
         bool v_store_quantize = false;
         if (ggml_backend_buft_is_host(buft)) {
@@ -336,7 +353,18 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream,
+                std::vector<size_t>(n_stream, 0), std::vector<size_t>(n_stream, 0), });
+    }
+
+    // the layer list is final here, so the arrays keep the address ggml is given
+    for (auto & layer : layers) {
+        if (layer.k && (layer.k->flags & GGML_TENSOR_FLAG_TRANSPORT)) {
+            ggml_set_stable_prefix(layer.k, layer.k_stable.data());
+        }
+        if (layer.v && (layer.v->flags & GGML_TENSOR_FLAG_TRANSPORT)) {
+            ggml_set_stable_prefix(layer.v, layer.v_stable.data());
+        }
     }
 
     if (!offload && placement.gpu_resident_layers > 0) {
@@ -468,6 +496,12 @@ void llama_kv_cache::clear(bool data) {
     }
 
     if (data) {
+        // a decode can still be delivering these buffers to the device, and the memset would race that read
+        // the scheduler alone, because llama_synchronize would also fold the running decode into the perf counters
+        if (lctx && lctx->get_sched()) {
+            ggml_backend_sched_synchronize(lctx->get_sched());
+        }
+
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
@@ -843,8 +877,15 @@ uint32_t llama_kv_cache::get_attn_reserve_capacity() const {
     return get_size();
 }
 
+void llama_kv_cache::set_lctx(llama_context * lctx) {
+    this->lctx = lctx;
+}
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
+
+    // every decode prepares an update, so this is set before a delivery can be in flight
+    set_lctx(lctx);
 
     bool do_shift = get_has_shift();
 
@@ -1199,9 +1240,13 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
 void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    // a cache that shares cells sets no stable prefix: the layers it aliases lost the transport flag, and the rest are the owner's to describe
     if (other) {
         return;
     }
+
+    // before the graph is built, so the plan and the deliveries it issues see the same write position
+    update_stable_prefixes(sinfo);
 
     // keep track of the max sequence position that we would overwrite with this ubatch
     // for non-SWA cache, this would be always empty
@@ -1633,6 +1678,40 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     }
 
     return res;
+}
+
+void llama_kv_cache::update_stable_prefixes(const slot_info & sinfo) const {
+    // the lowest row this ubatch writes in a stream: everything below it keeps what the previous ubatch left there for the whole graph
+    // per stream: a stream this ubatch does not write keeps all of it, and one row for the whole body would cap every stream at the lowest of them
+    uint64_t min_row[LLAMA_MAX_SEQ];
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        min_row[s] = get_size();
+    }
+
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        for (const uint32_t idx : sinfo.idxs[s]) {
+            min_row[sinfo.strm[s]] = std::min(min_row[sinfo.strm[s]], (uint64_t) idx);
+        }
+    }
+
+    for (const auto & layer : layers) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            if (layer.k) {
+                layer.k_stable[s] = min_row[s]*layer.k->nb[1];
+            }
+            if (layer.v) {
+                // the transposed V cache scatters each ubatch across the whole tensor, so there is no leading region that this ubatch leaves alone
+                layer.v_stable[s] = v_trans ? 0 : min_row[s]*layer.v->nb[1];
+            }
+        }
+    }
+}
+
+void llama_kv_cache::clear_stable_prefixes() const {
+    for (const auto & layer : layers) {
+        std::fill(layer.k_stable.begin(), layer.k_stable.end(), 0);
+        std::fill(layer.v_stable.begin(), layer.v_stable.end(), 0);
+    }
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -2274,6 +2353,9 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     GGML_ASSERT(!other);
 
+    // this graph rewrites the whole body in place, so nothing in it may be delivered early
+    clear_stable_prefixes();
+
     auto * ctx = res->get_ctx();
     auto * gf  = res->get_gf();
 
@@ -2408,6 +2490,11 @@ const slot_info_vec_t *   sinfos_in) {
     }
 
     GGML_UNUSED(flags);
+
+    // the writes below go to the same buffers a decode can still be delivering to the device, like clear() above
+    if (lctx && lctx->get_sched()) {
+        ggml_backend_sched_synchronize(lctx->get_sched());
+    }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));

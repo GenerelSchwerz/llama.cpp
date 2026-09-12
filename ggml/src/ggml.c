@@ -1261,6 +1261,9 @@ static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
+static_assert(sizeof(((struct ggml_tensor *) 0)->padding) == 8, "ggml_tensor trailing storage must be 8 bytes");
+static_assert(sizeof(((struct ggml_tensor *) 0)->stable_prefix) <= sizeof(((struct ggml_tensor *) 0)->padding), "stable_prefix must fit in trailing storage");
+static_assert(offsetof(struct ggml_tensor, stable_prefix) + sizeof(((struct ggml_tensor *) 0)->padding) == sizeof(struct ggml_tensor), "ggml_tensor trailing storage must remain last");
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1322,6 +1325,16 @@ size_t ggml_nbytes(const struct ggml_tensor * tensor) {
 
 size_t ggml_nbytes_pad(const struct ggml_tensor * tensor) {
     return GGML_PAD(ggml_nbytes(tensor), GGML_MEM_ALIGN);
+}
+
+void ggml_set_stable_prefix(struct ggml_tensor * tensor, const size_t * nbytes) {
+    GGML_ASSERT(tensor);
+    tensor->stable_prefix = nbytes;
+}
+
+const size_t * ggml_get_stable_prefix(const struct ggml_tensor * tensor) {
+    GGML_ASSERT(tensor);
+    return tensor->stable_prefix;
 }
 
 int64_t ggml_blck_size(enum ggml_type type) {
@@ -1820,7 +1833,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         /*.data         =*/ obj_alloc_size > 0 ? (void *)(result + 1) : data,
         /*.name         =*/ { 0 },
         /*.extra        =*/ NULL,
-        /*.padding      =*/ { 0 },
+        /*.padding      =*/ { { 0 } },
     };
 
     // TODO: this should not be needed as long as we don't rely on aligned SIMD loads

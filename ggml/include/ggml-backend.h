@@ -323,6 +323,30 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_get_buffer_state(ggml_backend_sched_t sched, uint64_t * generation, uint64_t * shrink_generation);
     GGML_API void                 ggml_backend_sched_request_buffer_shrink(ggml_backend_sched_t sched);
 
+    // Pipelined delivery of host-resident split inputs.
+    //
+    // Without it a split that reads a host input pays copy + compute in series: the copy goes on the consumer's stream right before the kernels.
+    // With it the scheduler keeps a ring of staging slots out of ggml-alloc's reach, and sends a later split's stable prefix on a transfer stream.
+    //
+    // Only persistent host inputs marked GGML_TENSOR_FLAG_TRANSPORT are eligible, and their stable prefix must be current before each evaluation.
+    // The producer must be the CPU or the same backend stream that consumes the late region.
+    //
+    // `depth` is how many splits ahead deliveries run, 0 disables it, at most GGML_SCHED_MAX_TRANSPORT_SLOTS - GGML_SCHED_TRANSPORT_MARGIN (14).
+    // The ring holds a couple of slots more, so recycling a slot never waits for a reader that still runs.
+    // Only CUDA is accepted as the destination: the ring needs a second context that transfers async and orders with events. Others stay ordered.
+    // Costs roughly (depth + 2) * (largest staged split) of device memory.
+    // Returns false for a depth out of range, and after the first graph is allocated.
+    // The ring is optional: if a graph does not fit next to it, the scheduler releases the rings that held memory and stops asking for them.
+    GGML_API bool                 ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth);
+
+    // Hard cap on the staging ring, in bytes, default 128 MiB and 0 removes the cap.
+    // A host cache exists to keep device memory free, so the ring has a hard cap: past it the scheduler declines and keeps the ordered path.
+    // Must be called before the first graph is allocated, and returns false after that.
+    GGML_API bool                 ggml_backend_sched_set_transport_pipeline_budget(ggml_backend_sched_t sched, size_t bytes);
+
+    // Number of staged deliveries and staged bytes issued since the scheduler was created.
+    GGML_API void                 ggml_backend_sched_get_transport_pipeline_stats(ggml_backend_sched_t sched, int64_t * n_deliveries, int64_t * n_bytes_early, int64_t * n_bytes_late);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
