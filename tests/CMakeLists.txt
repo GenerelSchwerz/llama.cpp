@@ -322,7 +322,7 @@ endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
-if (GGML_RPC AND UNIX)
+if (GGML_RPC AND UNIX AND NOT GGML_BACKEND_DL)
     target_compile_definitions(test-backend-ops PRIVATE GGML_TEST_RPC)
     target_link_libraries(test-backend-ops PRIVATE ggml-rpc)
     llama_test(test-backend-ops NAME test-backend-ops-rpc-gdn-rejection LABEL main ARGS --rpc-gdn-rejection)

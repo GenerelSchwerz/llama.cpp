@@ -5183,6 +5183,18 @@ static int test_gated_delta_net_rpc_client(const char * endpoint, int marker_fd)
 
     test_gated_delta_net test(GGML_TYPE_F32, 2, 16, 4, 1, 2, false, false, 4);
     ggml_tensor * out = test.build_graph(ctx.get());
+    if (!ggml_backend_supports_op(backend.get(), out)) {
+        fprintf(stderr, "RPC GDN wire test: default snapshots were rejected\n");
+        return 8;
+    }
+    ggml_tensor probe = *out;
+    for (int mode = 0; mode < 3; ++mode) {
+        ggml_gated_delta_net_set_snapshots(&probe, mode == 2 ? 0 : 3, mode == 2 ? 0 : -1, mode == 1);
+        if (ggml_backend_supports_op(backend.get(), &probe)) {
+            fprintf(stderr, "RPC GDN wire test: unsupported snapshot mode %d was accepted\n", mode);
+            return 9;
+        }
+    }
     ggml_cgraph * graph = ggml_new_graph(ctx.get());
     ggml_build_forward_expand(graph, out);
 
@@ -5202,8 +5214,9 @@ static int test_gated_delta_net_rpc_client(const char * endpoint, int marker_fd)
     if (write(marker_fd, &marker, sizeof(marker)) != sizeof(marker)) {
         return 6;
     }
-    fprintf(stderr, "RPC GDN wire test: malformed graph sent without an acknowledgement; issuing synchronous buffer clear\n");
-    ggml_backend_buffer_clear(buffer.get(), 0);
+    fprintf(stderr, "RPC GDN wire test: malformed graph sent without an acknowledgement; issuing synchronous tensor read\n");
+    float value;
+    ggml_backend_tensor_get(out, &value, 0, sizeof(value));
     fprintf(stderr, "RPC GDN wire test: server unexpectedly accepted the malformed graph\n");
     return 7;
 }
