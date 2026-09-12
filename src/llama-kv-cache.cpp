@@ -287,8 +287,7 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        // a layer picked for residency is claimed by the first cache that owns it, so that the
-        // sub-caches of one model share the budget instead of each spending it again
+        // Sub-caches claim each selected layer once.
         const bool layer_picked = placement.gpu_resident_ils.count(il) > 0 &&
             (!placement.gpu_resident_done || placement.gpu_resident_done->count(il) == 0);
         const bool layer_offload = offload || layer_picked;

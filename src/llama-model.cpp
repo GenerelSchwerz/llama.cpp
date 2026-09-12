@@ -339,6 +339,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_kimi_k3(params);
         case LLM_ARCH_STEP35:
             return new llama_model_step35(params);
+        case LLM_ARCH_SPARK2_5:
+            return new llama_model_spark2_5(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -934,6 +936,8 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_17B_16E:       return "17Bx16E (Scout)";
         case LLM_TYPE_17B_128E:      return "17Bx128E (Maverick)";
         case LLM_TYPE_A13B:          return "A13B";
+        case LLM_TYPE_1B_A400M:      return "1B.A400M";
+        case LLM_TYPE_3B_A800M:      return "3B.A800M";
         case LLM_TYPE_7B_A1B:        return "7B.A1B";
         case LLM_TYPE_8B_A1B:        return "8B.A1B";
         case LLM_TYPE_7_9B_A1_3B:    return "7.9B.A1.3B";
@@ -944,6 +948,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_26B_A4B:       return "26B.A4B";
         case LLM_TYPE_30B_A3B:       return "30B.A3B";
         case LLM_TYPE_31B_A3_5B:     return "31B.A3.5B";
+        case LLM_TYPE_32B_A9B:       return "32B.A9B";
         case LLM_TYPE_35B_A3B:       return "35B.A3B";
         case LLM_TYPE_48B_A3B:       return "48B.A3B";
         case LLM_TYPE_75B_A9B:       return "75B.A9B";
@@ -1416,6 +1421,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_get_props(dev.dev, &props);
             if (!props.caps.mmap_support) {
                 ml.use_mmap = false;
+                break;
+            }
+        }
+    }
+
+    // resolve AUTO on systems without mmap support (e.g. iGPUs): fall back to OFF; see #28160
+    if (ml.lazy.mode == LLAMA_LAZY_MODE_AUTO) {
+        for (const auto & dev : devices) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(dev.dev, &props);
+            if (!props.caps.mmap_support) {
+                ml.lazy.mode = LLAMA_LAZY_MODE_OFF;
                 break;
             }
         }
@@ -2232,8 +2249,7 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-// The layers whose attention KV a hybrid cache of this model owns. A null filter means the model is
-// not hybrid and every layer with a KV state belongs to the attention cache.
+// Use the same hybrid attention ownership rules for selection and cache construction.
 static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama_model & model, bool is_mtp) {
     const llama_hparams & hparams = model.hparams;
     if (is_mtp) {
@@ -2261,9 +2277,12 @@ static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama
     }
 }
 
-// Pick the layers whose attention KV stays device-resident while the rest of the cache is in host
-// memory. Taking them in layer order fills the device that owns the first layers and leaves the
-// free memory of the others unused, so take them per owning device instead.
+static bool llama_layer_in_context(const llama_hparams & hparams, uint32_t il, bool is_mtp) {
+    return hparams.n_layer_nextn == 0 || hparams.n_layer() == 0 || hparams.router_layer >= 0 ||
+           (il >= hparams.n_layer()) == is_mtp;
+}
+
+// Spread the residency budget across the devices that own attention layers.
 static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & model, uint32_t n_layers, bool is_mtp) {
     std::set<uint32_t> ret;
     if (n_layers == 0) {
@@ -2272,12 +2291,10 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
 
     const llama_hparams & hparams = model.hparams;
 
-    // A model split by tensor mishandles an iSWA cache whose layers are partly device- and partly
-    // host-resident: the result stays coherent but measurably degrades. Leave the whole cache in
-    // host memory there until the mix is understood.
+    // Mixed host/device iSWA under tensor split has a known numerical discrepancy.
     if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-            if (hparams.is_swa(il)) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+            if (llama_layer_in_context(hparams, il, is_mtp) && hparams.has_kv(il) && hparams.is_swa(il)) {
                 LLAMA_LOG_WARN("%s: kv_gpu_layers is not supported for an iSWA cache split by tensor, ignoring it\n",
                         __func__);
                 return ret;
@@ -2292,8 +2309,7 @@ static std::set<uint32_t> llama_pick_gpu_resident_layers(const llama_model & mod
     const llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(model, is_mtp);
 
     for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
-        // a nextn layer is cached by the MTP context, the rest of the model by the main one
-        if (hparams.n_layer_nextn > 0 && (il >= hparams.n_layer()) != is_mtp) {
+        if (!llama_layer_in_context(hparams, il, is_mtp)) {
             continue;
         }
         if (!hparams.has_kv(il)) {
@@ -2337,9 +2353,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     llama_memory_placement_options placement;
     placement.cpu_pinned        = cparams.kv_cpu_pinned;
     placement.recurrent_offload = cparams.offload_kqv || cparams.recurrent_state_offload;
-    // Resolved here rather than per cache, so that a cache built from several sub-caches shares one
-    // budget instead of giving each of them the full count. An offloaded cache is device-resident
-    // already, so it needs no set.
+    // Share one residency budget across sub-caches; full offload needs no selection.
     if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
         placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, cparams.kv_gpu_layers,
                 params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
@@ -2749,14 +2763,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    if ((arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_HY_V3 || arch == LLM_ARCH_GLM_DSA ||
-                            arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_DEEPSEEK32) &&
-                            hparams.n_layer_nextn > 0) {
-                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                        } else {
-                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
-                        }
+                    // Router and all-nextn models keep all layers in the same context.
+                    if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
+                        const bool is_mtp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        filter = [&, is_mtp](uint32_t il) { return llama_layer_in_context(hparams, il, is_mtp); };
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2837,9 +2847,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
             }
     }
 
-    // Report what the caches did rather than what was picked: a cache filter can drop a picked
-    // layer, and a model without a standard attention cache keeps none. The attention compute
-    // follows the cache, so cparams must carry the count the caches reached.
+    // Attention compute placement follows the layers actually claimed by the caches.
     if (placement.gpu_resident_done) {
         const uint32_t n_resident = (uint32_t) placement.gpu_resident_done->size();
         if (n_resident == 0) {
@@ -3138,6 +3146,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_SPARK2_5:
         case LLM_ARCH_TALKIE:
         case LLM_ARCH_MELLUM:
             return LLAMA_ROPE_TYPE_NEOX;
@@ -3372,6 +3381,12 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
     if (layer.wqkv) {
         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+        // Fused weights may coexist with separate Q/K/V biases in legacy or custom GGUFs.
+        if (!layer.wqkv_b) {
+            layer.wq_b = create_tensor(tn(LLM_TENSOR_ATTN_Q, "bias", bid), {n_embd_q_}, TENSOR_NOT_REQUIRED);
+            layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
+            layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
+        }
     } else {
         layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q, "weight", bid), {n_embd_, n_embd_q_}, flags);
         layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K, "weight", bid), {n_embd_, n_embd_k_}, flags);

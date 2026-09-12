@@ -158,8 +158,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8,  64, 2,  32, 128, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16,  64, 2,  32, 128, 128, 128, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  64, 128, 128,  64, 1, true);
-    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 128, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 256, 2,  64, 128, 128,  64, 1, true);
+    GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 64, 256, 2,  64, 128, 128,  64, 1, true);
 
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 32, 128, 2,  32, 160, 128, 128, 1, true);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(320, 256, 64, 128, 2,  32, 160, 128, 128, 1, true);
@@ -1580,16 +1580,18 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         }
     }
 
-    if constexpr (np > 1) {
+    if (np > 1) {
         constexpr int nmeta = np*cols_per_warp >= warp_size ? np*cols_per_warp/warp_size : 1;
-        const bool combine_meta = threadIdx.y % np == 0;
-        float KQ_cmn = 0.0f;
-        float KQ_cms[nmeta] = {0.0f};
-        float KQ_crs = 0.0f;
 
-        if (combine_meta) {
-            const int jc_meta = threadIdx.y*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
-            float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
+        float KQ_cmn;
+        float KQ_cms[nmeta];
+        float KQ_crs;
+
+        const int jc_meta = threadIdx.y*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
+        float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
+
+        if (threadIdx.y % np == 0) {
+            // Combine the meta data for parallel warps via shared memory.
             float2 meta[nmeta];
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
@@ -1608,7 +1610,6 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
 
-            // KQ combine max scale per warp.
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
                 KQ_cms[imeta] = expf(meta[imeta].x - KQ_cmn);
@@ -1629,10 +1630,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
         __syncthreads();
 
-        if (combine_meta) {
-            const int jc_meta = threadIdx.y*cols_per_warp + (np*cols_per_warp < warp_size ? threadIdx.x % (np*cols_per_warp) : threadIdx.x);
-            float2 * const meta_ptr = ((float2 *) tile_Q) + jc_meta*(tile_stride/2) + nbatch_combine/2;
-
+        if (threadIdx.y % np == 0) {
             // Write back combined meta data:
 #pragma unroll
             for (int imeta = 0; imeta < nmeta; ++imeta) {
@@ -1863,7 +1861,7 @@ static __global__ void flash_attn_ext_f16(
 #endif // __CUDA_ARCH__ == GGML_CUDA_CC_TURING
 
 #if defined(AMD_WMMA_AVAILABLE)
-    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 128) {
+    if (ncols1*ncols2 < 16 || ncols2 == 1 || DKQ > 256) {
         NO_DEVICE_CODE;
         return;
     }

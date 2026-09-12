@@ -19,14 +19,10 @@ struct llama_memory_placement_options {
     bool cpu_pinned = false;
     bool recurrent_offload = false;
 
-    // layers whose attention KV stays device-resident while the rest of the cache is in host
-    // memory, resolved once for the whole model so that a cache built from several sub-caches
-    // shares one budget instead of giving each of them the full count
+    // One residency set is shared by all sub-caches of this context.
     std::set<uint32_t> gpu_resident_ils;
 
-    // the layers a cache did keep device-resident, which can be fewer than the set above: a cache
-    // filter can drop a picked layer, and a model without a standard attention cache takes none.
-    // Shared by the sub-caches of one model, so the count is over the whole model.
+    // The first cache that owns a selected layer claims it; auxiliary copies remain on the host.
     std::shared_ptr<std::set<uint32_t>> gpu_resident_done;
 };
 
