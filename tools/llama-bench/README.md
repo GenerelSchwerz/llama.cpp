@@ -65,6 +65,11 @@ test parameters:
   -sm, --split-mode <none|layer|row|tensor> (default: layer)
   -mg, --main-gpu <i>                       (default: 0)
   -nkvo, --no-kv-offload <0|1>              (default: 0)
+  -kvcp, --kv-cpu-pinned <0|1>              (default: 0)
+  -rso, --recurrent-state-offload <0|1>     (default: 0)
+  -paw, --phase-aware-workspace <0|1>       (default: 0)
+  -lcw, --live-context-workspace <0|1>      (default: 0)
+  -kvgl, --kv-gpu-layers <n>                (default: 0)
   -fa, --flash-attn <on|off|auto>           (default: auto)
   -dev, --device <dev0/dev1/...>            (default: auto)
   -lzm, --lazy-mode <on|auto|off>           (default: auto)
@@ -95,6 +100,26 @@ Each test is repeated the number of times given by `-r`, and the results are ave
 Using the `-d <n>` option, each test can be run at a specified context depth, prefilling the KV cache with `<n>` tokens.
 
 For a description of the other options, see the [completion example](../completion/README.md).
+
+### KV and workspace parameters in this fork
+
+The maintained fork adds the following context parameters. The four boolean options require exactly `0` or `1` per value, for example `-paw 0,1`. `-kvgl` accepts nonnegative integers, lists such as `0,4,8`, and ranges such as `0-8+4`. Repeating an option also adds values to its sweep. Multiple sweeps run every combination.
+
+| Option | Behavior and limits |
+| --- | --- |
+| `-kvgl`, `--kv-gpu-layers` | With `-nkvo 1`, requests device residency for the first N independently owned attention KV layers. Standard and direct hybrid caches support it; unsupported specialized caches ignore it. The model's layer placement and available attention layers limit what can become GPU resident. |
+| `-kvcp`, `--kv-cpu-pinned` | Requests pinned buffers for host KV when the backend provides them. With operation offload enabled (`-nopo 0`), it also allows attention compute on the accelerator, so a `0,1` sweep can change both storage and compute placement. |
+| `-rso`, `--recurrent-state-offload` | Offloads recurrent state for recurrent and hybrid models independently of host attention KV. With `-nkvo 0`, KV offload already enables recurrent state offload, so changing this option has no additional effect. |
+| `-paw`, `--phase-aware-workspace` | Resizes compute workspaces between prompt processing and token generation; a later prompt regrows the reservation. It can be combined with `-lcw 1`. |
+| `-lcw`, `--live-context-workspace` | Grows compute reservations with the padded live KV extent for supported attention caches. Unsupported caches fall back to full-context reservation. It does not shrink the KV cache allocation itself. |
+
+The output fields `kv_gpu_layers`, `kv_cpu_pinned`, `recurrent_state_offload`, `phase_aware_workspace`, and `live_context_workspace` record requested settings. They do not prove successful pinning, realized GPU residency, or that a cache supports the requested mode. Warnings are shown by default unless structured results are sent to stderr with `-oe`. Use `-v` to record allocation and placement details, and retain stderr with the results; use `-o` for structured output when collecting these logs.
+
+For example, keep host KV pinning and compute settings fixed while sweeping partial KV residency:
+
+```sh
+./llama-bench -m model.gguf -ngl 99 -nkvo 1 -kvcp 1 -rso 1 -kvgl 0,4,8 -p 0 -n 128 -d 4096 -v -o jsonl > kv-results.jsonl 2> kv-results.log
+```
 
 > [!NOTE]
 > The measurements with `llama-bench` do not include the times for tokenization and for sampling.
