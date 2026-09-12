@@ -4177,6 +4177,10 @@ static bool ggml_cuda_compute_forward(
 
 // backend
 
+bool ggml_cuda_moe_router_compute(ggml_backend_cuda_context & context, ggml_tensor * node) {
+    return ggml_cuda_compute_forward(context, node, nullptr);
+}
+
 static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
@@ -6540,6 +6544,9 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                     continue;
                 }
 
+                if (cuda_ctx->moe_grouped_context != nullptr) {
+                    cuda_ctx->moe_grouped_context->launch_early_router(node, moe_execution, cuda_ctx->stream());
+                }
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, moe_execution);
 
                 if (nodes_to_skip < 0) {
@@ -7019,6 +7026,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         force_moe_direct();
     }
 
+    if (cuda_ctx->moe_grouped_context != nullptr && (!use_cuda_graph || cuda_graph_update_required)) {
+        cuda_ctx->moe_grouped_context->configure_early_router(cgraph, &moe_execution, cuda_ctx->stream(), use_cuda_graph && cuda_graph_update_required, *cuda_ctx);
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {

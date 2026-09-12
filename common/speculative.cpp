@@ -1540,12 +1540,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         if (is_mem_shared || chain_heads || n_mtp_layers != 1 || dparams.result == nullptr || dparams.result->size() != 1) {
             return false;
         }
-        if (llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id) != dparams.n_past) {
+        if (llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id) != dparams.pos0) {
             return false;
         }
 
         state.active = true;
-        state.pos = dparams.n_past;
+        state.pos = dparams.pos0;
         state.input = dparams.id_last;
         state.draft = dparams.result->front();
         return true;

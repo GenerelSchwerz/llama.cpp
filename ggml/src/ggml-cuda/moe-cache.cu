@@ -27,6 +27,7 @@
 #include "mmid.cuh"
 
 #include "ggml-backend-impl.h"
+#include "ggml-alloc.h"
 #include "ggml-cuda.h"
 #include "ggml.h"
 
@@ -47,11 +48,16 @@
 #include <new>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#include <cuda/atomic>
+#endif
 
 #ifdef __linux__
 #include <sys/mman.h>
@@ -3282,6 +3288,829 @@ static __global__ void moe_grouped_plan_decode(
     }
 }
 
+static bool moe_router_constant(const ggml_tensor * t) {
+    return t != nullptr && t->op == GGML_OP_NONE && t->view_src == nullptr && t->buffer != nullptr &&
+        ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static bool moe_router_pure_op(const ggml_tensor * t) {
+    switch (t->op) {
+        case GGML_OP_NONE:
+            return t->type == GGML_TYPE_I32 && (t->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+        case GGML_OP_CPY:
+            return t->src[1] == t && t->view_src == nullptr;
+        case GGML_OP_MUL_MAT:
+        case GGML_OP_ADD:
+        case GGML_OP_MUL:
+        case GGML_OP_DIV:
+        case GGML_OP_SCALE:
+        case GGML_OP_RMS_NORM:
+        case GGML_OP_NORM:
+        case GGML_OP_UNARY:
+        case GGML_OP_SQRT:
+        case GGML_OP_CLAMP:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_ARGSORT:
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_SUM_ROWS:
+        case GGML_OP_FILL:
+        case GGML_OP_CONT:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool moe_router_scale(const ggml_tensor * t, float & scale) {
+    if (t == nullptr || t->op != GGML_OP_SCALE) {
+        return false;
+    }
+    float parameters[2];
+    memcpy(parameters, t->op_params, sizeof(parameters));
+    scale = parameters[0];
+    return std::isfinite(scale) && scale > 0.0f && parameters[1] == 0.0f;
+}
+
+static bool moe_router_normalized(const ggml_tensor * t, float & multiplier) {
+    multiplier = 1.0f;
+    if (t == nullptr || t->op != GGML_OP_MUL || !moe_router_constant(t->src[1]) ||
+            ggml_nelements(t->src[1]) != t->ne[0]) {
+        return false;
+    }
+    t = t->src[0];
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_SCALE)) {
+        if (t->op == GGML_OP_SCALE) {
+            float scale;
+            if (!moe_router_scale(t, scale)) {
+                return false;
+            }
+            multiplier *= scale;
+        }
+        t = t->src[0];
+    }
+    return t != nullptr && t->op == GGML_OP_RMS_NORM && std::isfinite(multiplier);
+}
+
+static const ggml_tensor * moe_router_scores_node(const ggml_tensor * ids) {
+    std::unordered_set<const ggml_tensor *> visited;
+    const ggml_tensor * result = nullptr;
+    bool ambiguous = false;
+    std::function<void(const ggml_tensor *)> visit = [&](const ggml_tensor * t) {
+        if (t == nullptr || !visited.insert(t).second || moe_router_constant(t)) {
+            return;
+        }
+        if (t->flags & GGML_TENSOR_FLAG_MOE_ROUTER) {
+            ambiguous |= result != nullptr && result != t;
+            result = t;
+            return;
+        }
+        if (moe_router_pure_op(t)) {
+            for (const auto * src : t->src) {
+                visit(src);
+            }
+        }
+    };
+    visit(ids);
+    return ambiguous ? nullptr : result;
+}
+
+static const ggml_tensor * moe_router_projection(const ggml_tensor * ids) {
+    std::unordered_set<const ggml_tensor *> visited[2];
+    const ggml_tensor * result = nullptr;
+    std::function<void(const ggml_tensor *, bool)> visit = [&](const ggml_tensor * t, bool marked) {
+        if (t == nullptr || result != nullptr || moe_router_constant(t)) {
+            return;
+        }
+        marked |= (t->flags & GGML_TENSOR_FLAG_MOE_ROUTER) != 0;
+        if (!visited[marked].insert(t).second) {
+            return;
+        }
+        if (marked && t->op == GGML_OP_MUL_MAT) {
+            result = t;
+            return;
+        }
+        if (!moe_router_pure_op(t)) {
+            return;
+        }
+        for (const auto * src : t->src) {
+            visit(src, marked);
+        }
+    };
+    visit(ids, false);
+    return result;
+}
+
+static const ggml_tensor * moe_router_boundary(const ggml_tensor * input) {
+    std::unordered_set<const ggml_tensor *> visited, boundaries;
+    bool closed = true;
+    std::function<void(const ggml_tensor *)> visit = [&](const ggml_tensor * t) {
+        if (t == nullptr || !visited.insert(t).second || moe_router_constant(t)) {
+            return;
+        }
+        float multiplier;
+        if (moe_router_normalized(t, multiplier)) {
+            boundaries.insert(t);
+            return;
+        }
+        if (!moe_router_pure_op(t)) {
+            closed = false;
+            return;
+        }
+        for (const auto * src : t->src) {
+            visit(src);
+        }
+    };
+    visit(input);
+    return closed && boundaries.size() == 1 ? *boundaries.begin() : input;
+}
+
+static bool moe_router_plain_selection(const ggml_tensor * ids, const ggml_tensor * projection,
+        const ggml_tensor ** bias) {
+    *bias = nullptr;
+    while (ids != nullptr && (ids->op == GGML_OP_VIEW || ids->op == GGML_OP_RESHAPE)) {
+        ids = ids->src[0];
+    }
+    if (ids == nullptr || ids->op != GGML_OP_ARGSORT ||
+            ggml_get_op_params_i32(ids, 0) != GGML_SORT_ORDER_DESC) {
+        return false;
+    }
+    const auto * scores = ids->src[0];
+    if (scores != nullptr && scores->op == GGML_OP_SOFT_MAX && scores->src[1] == nullptr) {
+        scores = scores->src[0];
+    } else if (scores != nullptr && scores->op == GGML_OP_UNARY &&
+            ggml_get_unary_op(scores) == GGML_UNARY_OP_SIGMOID) {
+        scores = scores->src[0];
+    }
+    if (scores != nullptr && scores->op == GGML_OP_ADD && scores->src[0] == projection &&
+            moe_router_constant(scores->src[1])) {
+        *bias = scores->src[1];
+        scores = scores->src[0];
+    }
+    return scores == projection;
+}
+
+static bool moe_router_hc_pattern(const ggml_tensor * mixed, const ggml_tensor * input,
+        const ggml_tensor * projection, const ggml_tensor ** down, const ggml_tensor ** up, uint32_t & streams) {
+    const int64_t width = projection->src[0]->ne[0];
+    if (width <= 0 || input->ne[0] <= width || input->ne[0] % width != 0) {
+        return false;
+    }
+    streams = input->ne[0] / width;
+    float scale;
+    if (!moe_router_scale(mixed, scale) || scale != 1.0f / streams) {
+        return false;
+    }
+    const auto * sum = mixed->src[0];
+    const ggml_tensor * gated = nullptr;
+    for (uint32_t index = streams; index-- > 0;) {
+        const ggml_tensor * view = nullptr;
+        if (index == 0) {
+            if (sum == nullptr || sum->op != GGML_OP_CONT) {
+                return false;
+            }
+            view = sum->src[0];
+        } else {
+            if (sum == nullptr || sum->op != GGML_OP_ADD) {
+                return false;
+            }
+            view = sum->src[1];
+            sum = sum->src[0];
+        }
+        if (view == nullptr || view->op != GGML_OP_VIEW || view->ne[0] != width ||
+                view->nb[1] != input->ne[0] * sizeof(float) || view->view_offs != index * width * sizeof(float) ||
+                view->src[0] == nullptr || view->src[0]->op != GGML_OP_RESHAPE) {
+            return false;
+        }
+        const auto * source = view->src[0]->src[0];
+        if (gated != nullptr && gated != source) {
+            return false;
+        }
+        gated = source;
+    }
+    if (gated == nullptr || gated->op != GGML_OP_MUL || gated->src[0] != input) {
+        return false;
+    }
+    const auto * gate = gated->src[1];
+    if (gate == nullptr || gate->op != GGML_OP_UNARY || ggml_get_unary_op(gate) != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const auto * project_up = gate->src[0];
+    if (project_up == nullptr || project_up->op != GGML_OP_MUL_MAT || !moe_router_constant(project_up->src[0])) {
+        return false;
+    }
+    const auto * activation = project_up->src[1];
+    if (activation == nullptr || activation->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(activation) != GGML_UNARY_OP_SILU ||
+            !moe_router_scale(activation->src[0], scale) || scale != 1.0f / streams) {
+        return false;
+    }
+    const auto * project_down = activation->src[0]->src[0];
+    if (project_down == nullptr || project_down->op != GGML_OP_MUL_MAT ||
+            project_down->src[1] != input || !moe_router_constant(project_down->src[0])) {
+        return false;
+    }
+    *down = project_down->src[0];
+    *up = project_up->src[0];
+    return true;
+}
+
+struct moe_router_program {
+    using input_binding = std::pair<const ggml_tensor *, ggml_tensor *>;
+    uint32_t group = UINT32_MAX;
+    uint32_t lane = UINT32_MAX;
+    std::vector<uint64_t> signature;
+    std::vector<std::unique_ptr<ggml_tensor>> tensors;
+    std::vector<ggml_tensor *> operations;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * input = nullptr;
+    ggml_tensor * ids = nullptr;
+    size_t bytes = 0;
+
+    static std::vector<uint64_t> describe(const ggml_tensor * boundary, const ggml_tensor * selected) {
+        std::vector<uint64_t> result;
+        std::unordered_map<const ggml_tensor *, uint64_t> visited;
+        std::function<void(const ggml_tensor *)> visit = [&](const ggml_tensor * t) {
+            if (t == nullptr) {
+                result.push_back(0);
+                return;
+            }
+            const auto found = visited.find(t);
+            if (found != visited.end()) {
+                result.push_back(found->second);
+                result.push_back(0);
+                return;
+            }
+            const uint64_t id = visited.size() + 1;
+            visited.emplace(t, id);
+            result.push_back(id);
+            result.push_back(1);
+            const bool input = t == boundary;
+            const bool constant = !input && moe_router_constant(t);
+            result.push_back(input ? 1 : constant ? 2 : 3);
+            result.push_back(input ? GGML_OP_NONE : t->op);
+            result.push_back(input ? 0 : (t->flags & GGML_TENSOR_FLAG_INPUT));
+            result.push_back(t->type);
+            result.push_back(input ? 0 : t->view_offs);
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                result.push_back(t->ne[i]);
+                result.push_back(t->nb[i]);
+            }
+            for (const auto value : t->op_params) {
+                result.push_back(input ? 0 : (uint32_t) value);
+            }
+            if (constant) {
+                result.push_back((uintptr_t) t);
+                result.push_back((uintptr_t) t->data);
+                result.push_back((uintptr_t) t->buffer);
+            } else if (!input) {
+                for (const auto * src : t->src) {
+                    visit(src);
+                }
+                visit(t->view_src);
+            }
+        };
+        visit(selected);
+        return result;
+    }
+
+    ~moe_router_program() {
+        ggml_backend_buffer_free(buffer);
+    }
+
+    bool bind_inputs(const ggml_tensor * selected, int device, std::vector<input_binding> & bindings) const {
+        bool valid = true;
+        std::unordered_set<const ggml_tensor *> visited;
+        std::function<void(const ggml_tensor *, ggml_tensor *)> visit = [&](const ggml_tensor * src, ggml_tensor * dst) {
+            if (src == nullptr || dst == input || !visited.insert(dst).second || moe_router_constant(src)) {
+                return;
+            }
+            if (src->op == GGML_OP_NONE) {
+                valid &= moe_router_pure_op(src) && src->data != nullptr && src->buffer != nullptr &&
+                    src->buffer->buft == ggml_backend_cuda_buffer_type(device) && ggml_is_contiguous(src);
+                bindings.emplace_back(src, dst);
+                return;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                visit(src->src[s], dst->src[s]);
+            }
+            visit(src->view_src, dst->view_src);
+        };
+        visit(selected, ids);
+        return valid;
+    }
+
+    static std::unique_ptr<moe_router_program> create(
+            const ggml_tensor * boundary, const ggml_tensor * selected, int device, std::string & reason) {
+        auto result = std::make_unique<moe_router_program>();
+        result->signature = describe(boundary, selected);
+        std::unordered_map<const ggml_tensor *, ggml_tensor *> copies;
+        std::unordered_set<const ggml_tensor *> visiting;
+        const auto buft = ggml_backend_cuda_buffer_type(device);
+        const auto dev = ggml_backend_buft_get_device(buft);
+        std::function<ggml_tensor *(const ggml_tensor *)> copy = [&](const ggml_tensor * t) -> ggml_tensor * {
+            if (t == nullptr) {
+                return nullptr;
+            }
+            if (t != boundary && moe_router_constant(t)) {
+                if (t->buffer->buft != buft || t->data == nullptr) {
+                    reason = "router constant is not on the owning CUDA device";
+                    return nullptr;
+                }
+                return const_cast<ggml_tensor *>(t);
+            }
+            const auto found = copies.find(t);
+            if (found != copies.end()) {
+                return found->second;
+            }
+            if (!visiting.insert(t).second || (t != boundary && !moe_router_pure_op(t))) {
+                reason = "router has an unsupported or stateful dependency";
+                return nullptr;
+            }
+            auto tensor = std::make_unique<ggml_tensor>(*t);
+            auto * dst = tensor.get();
+            dst->extra = nullptr;
+            dst->buffer = nullptr;
+            dst->data = nullptr;
+            dst->flags = t->op == GGML_OP_NONE ? t->flags & GGML_TENSOR_FLAG_INPUT : 0;
+            if (t == boundary) {
+                dst->op = GGML_OP_NONE;
+                std::fill(std::begin(dst->src), std::end(dst->src), nullptr);
+                dst->view_src = nullptr;
+                dst->view_offs = 0;
+            } else {
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    if (t->op == GGML_OP_CPY && s == 1 && t->src[s] == t) {
+                        dst->src[s] = dst;
+                        continue;
+                    }
+                    dst->src[s] = copy(t->src[s]);
+                    if (t->src[s] != nullptr && dst->src[s] == nullptr) {
+                        return nullptr;
+                    }
+                }
+                dst->view_src = copy(t->view_src);
+                if (t->view_src != nullptr && dst->view_src == nullptr) {
+                    return nullptr;
+                }
+                const ggml_tensor * view_root = dst->view_src;
+                while (view_root != nullptr && view_root->view_src != nullptr) {
+                    view_root = view_root->view_src;
+                }
+                if (view_root != nullptr && moe_router_constant(view_root) &&
+                        dst->op != GGML_OP_VIEW && dst->op != GGML_OP_RESHAPE &&
+                        dst->op != GGML_OP_PERMUTE && dst->op != GGML_OP_TRANSPOSE) {
+                    reason = "router would write through a constant view";
+                    return nullptr;
+                }
+                if (!ggml_backend_dev_supports_op(dev, dst)) {
+                    reason = "native CUDA does not support a router operation";
+                    return nullptr;
+                }
+            }
+            visiting.erase(t);
+            copies.emplace(t, dst);
+            result->tensors.push_back(std::move(tensor));
+            if (t != boundary) {
+                result->operations.push_back(dst);
+            }
+            return dst;
+        };
+        result->ids = copy(selected);
+        const auto input = copies.find(boundary);
+        if (result->ids == nullptr || input == copies.end() || result->ids->type != GGML_TYPE_I32) {
+            if (reason.empty()) {
+                reason = "router does not close over the prediction input";
+            }
+            return nullptr;
+        }
+        result->input = input->second;
+        std::vector<input_binding> bindings;
+        if (!result->bind_inputs(selected, device, bindings)) {
+            reason = "router index input is not on the owning CUDA device";
+            return nullptr;
+        }
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        for (const auto & t : result->tensors) {
+            if (t->view_src == nullptr) {
+                const size_t size = ggml_backend_buft_get_alloc_size(buft, t.get());
+                if (result->bytes > SIZE_MAX - alignment || size > SIZE_MAX - result->bytes - alignment) {
+                    reason = "router scratch size overflow";
+                    return nullptr;
+                }
+                result->bytes += GGML_PAD(size, alignment);
+            }
+        }
+        result->buffer = ggml_backend_buft_alloc_buffer(buft, result->bytes);
+        if (result->buffer == nullptr) {
+            reason = "router scratch allocation failed";
+            return nullptr;
+        }
+        auto * data = static_cast<char *>(ggml_backend_buffer_get_base(result->buffer));
+        for (const auto & t : result->tensors) {
+            if (t->view_src != nullptr) {
+                t->buffer = t->view_src->buffer;
+                t->data = static_cast<char *>(t->view_src->data) + t->view_offs;
+            } else {
+                const size_t size = ggml_backend_buft_get_alloc_size(buft, t.get());
+                if (ggml_backend_tensor_alloc(result->buffer, t.get(), data) != GGML_STATUS_SUCCESS) {
+                    reason = "router scratch tensor allocation failed";
+                    return nullptr;
+                }
+                data += GGML_PAD(size, alignment);
+            }
+        }
+        return result;
+    }
+
+    void compute(ggml_backend_cuda_context & context) {
+        for (auto * node : operations) {
+            GGML_ASSERT(ggml_cuda_moe_router_compute(context, node));
+        }
+    }
+};
+
+static bool moe_early_router_enabled() {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER");
+        return value != nullptr && strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
+
+static uint32_t moe_early_router_lookahead() {
+    static const uint32_t distance = [] {
+        const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_LOOKAHEAD");
+        if (value == nullptr) {
+            return uint32_t{0};
+        }
+        GGML_ASSERT(strlen(value) == 1 && value[0] >= '0' && value[0] <= '2');
+        return static_cast<uint32_t>(value[0] - '0');
+    }();
+    return distance;
+}
+
+static uint32_t moe_early_router_stage_block_cap(int device) {
+    static const uint32_t override = [] {
+        const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_STAGE_BLOCKS");
+        if (value == nullptr) {
+            return uint32_t{0};
+        }
+        char * end = nullptr;
+        const long blocks = strtol(value, &end, 10);
+        GGML_ASSERT(end != value && *end == '\0' && blocks > 0 && (unsigned long) blocks <= UINT32_MAX);
+        return static_cast<uint32_t>(blocks);
+    }();
+    return override != 0 ? override : static_cast<uint32_t>(std::max(1, ggml_cuda_info().devices[device].nsm));
+}
+
+static bool moe_early_router_copy_engine() {
+    const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_ENGINE");
+    return value != nullptr && strcmp(value, "1") == 0;
+}
+
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+static __global__ void moe_early_router_publish_copy(
+        const int32_t * predicted, int32_t * host_ids, uint32_t top_k, uint64_t * request, uint64_t job) {
+    for (uint32_t p = threadIdx.x; p < top_k; p += blockDim.x) {
+        host_ids[p] = predicted[p];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*request).store(job, cuda::memory_order_release);
+    }
+}
+
+static __global__ void moe_early_router_ready_positions(
+        int32_t * positions, uint32_t experts, uint32_t * progress, bool retain_late = false) {
+    __shared__ uint32_t completed;
+    if (threadIdx.x == 0) {
+        completed = cuda::atomic_ref<uint32_t, cuda::thread_scope_system>(*progress).load(cuda::memory_order_acquire);
+    }
+    __syncthreads();
+    for (uint32_t e = threadIdx.x; e < experts; e += blockDim.x) {
+        if (positions[e] >= 0 && (uint32_t) positions[e] >= completed) {
+            positions[e] = retain_late ? -2 - positions[e] : -1;
+        }
+    }
+}
+
+static void moe_early_router_wait_copy(cudaStream_t stream, uint32_t * done) {
+    CUstreamCaptureStatus status;
+    CUgraph graph = nullptr;
+    const CUgraphNode * dependencies = nullptr;
+    size_t count = 0;
+    CU_CHECK(cuStreamGetCaptureInfo(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+    if (status == CU_STREAM_CAPTURE_STATUS_NONE) {
+        CU_CHECK(cuStreamWaitValue32(stream, (CUdeviceptr) done, 1, CU_STREAM_WAIT_VALUE_EQ));
+        return;
+    }
+    GGML_ASSERT(status == CU_STREAM_CAPTURE_STATUS_ACTIVE);
+    CUstreamBatchMemOpParams operation = {};
+    operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    operation.waitValue.address = (CUdeviceptr) done;
+    operation.waitValue.value = 1;
+    operation.waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+    CUDA_BATCH_MEM_OP_NODE_PARAMS params = {};
+    CU_CHECK(cuCtxGetCurrent(&params.ctx));
+    params.count = 1;
+    params.paramArray = &operation;
+    CUgraphNode node;
+    CU_CHECK(cuGraphAddBatchMemOpNode(&node, graph, dependencies, count, &params));
+    CU_CHECK(cuStreamUpdateCaptureDependencies_v2(stream, &node, nullptr, 1, CU_STREAM_SET_CAPTURE_DEPENDENCIES));
+}
+#endif
+
+static __global__ void moe_early_router_scores(
+        const float * input, const float * attention_scale, const float * ffn_scale,
+        const float * weights, int width, float * scores, float input_scale = 1.0f, const float * bias = nullptr) {
+    input += (size_t) blockIdx.y * width;
+    scores += (size_t) blockIdx.y * gridDim.x;
+    __shared__ float partial[128];
+    float sum = 0.0f;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        const float scale = attention_scale[i];
+        const float value = scale != 0.0f ? input[i] * (ffn_scale[i] / scale) : 0.0f;
+        sum += value * weights[(size_t) blockIdx.x * width + i];
+    }
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (int step = blockDim.x / 2; step > 0; step /= 2) {
+        if (threadIdx.x < step) {
+            partial[threadIdx.x] += partial[threadIdx.x + step];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        scores[blockIdx.x] = partial[0] * input_scale + (bias != nullptr ? bias[blockIdx.x] : 0.0f);
+    }
+}
+
+static __global__ void moe_early_hc_translate(float * input, const float * attention_scale, const float * ffn_scale, int width, float multiplier = 1.0f) {
+    input += (size_t) blockIdx.y * width;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) {
+        const float scale = attention_scale != nullptr ? attention_scale[i] : 1.0f;
+        const float target = ffn_scale != nullptr ? ffn_scale[i] : 1.0f;
+        input[i] = scale != 0.0f ? input[i] * (target / scale) * multiplier : 0.0f;
+    }
+}
+
+template<ggml_type type, int threads>
+static __global__ void moe_early_hc_mv(const void * weights, const float * input, float * output, int width, int rows, int streams, int activation) {
+    input += (size_t) blockIdx.y * width;
+    output += (size_t) blockIdx.y * rows;
+    const int lane = threadIdx.x % threads;
+    const int row = blockIdx.x * (128 / threads) + threadIdx.x / threads;
+    float sum = 0.0f;
+    if (row < rows) {
+        for (int i = lane; i < width; i += threads) {
+            float weight;
+            if constexpr (type == GGML_TYPE_Q8_0) {
+                const auto & block = ((const block_q8_0 *) weights)[(size_t) row * (width / QK8_0) + i / QK8_0];
+                weight = __half2float(block.d) * block.qs[i % QK8_0];
+            } else {
+                weight = ((const float *) weights)[(size_t) row * width + i];
+            }
+            sum += input[i] * weight;
+        }
+    }
+    if constexpr (threads == 32) {
+        sum = warp_reduce_sum<32>(sum);
+    } else {
+        __shared__ float partial[128];
+        partial[lane] = sum;
+        __syncthreads();
+        for (int step = threads / 2; step > 0; step /= 2) {
+            if (lane < step) {
+                partial[lane] += partial[lane + step];
+            }
+            __syncthreads();
+        }
+        sum = partial[0];
+    }
+    if (lane == 0 && row < rows) {
+        if (activation == 1) {
+            sum /= streams;
+            sum /= 1.0f + expf(-sum);
+        } else if (activation == 2) {
+            sum = 1.0f / (1.0f + expf(-sum));
+        }
+        output[row] = sum;
+    }
+}
+
+static __global__ void moe_early_hc_collapse(const float * input, const float * gate, float * mixed, int width, int streams) {
+    input += (size_t) blockIdx.y * width * streams;
+    gate += (size_t) blockIdx.y * width * streams;
+    mixed += (size_t) blockIdx.y * width;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < width) {
+        float sum = 0.0f;
+        for (int s = 0; s < streams; ++s) {
+            sum += input[s * width + i] * gate[s * width + i];
+        }
+        mixed[i] = sum / streams;
+    }
+}
+
+template<int threads>
+static void moe_early_hc_project(const ggml_tensor * weights, const float * input, float * output, int streams, int activation, cudaStream_t stream, uint32_t n_rows = 1) {
+    const int blocks = (weights->ne[1] + 128 / threads - 1) / (128 / threads);
+    const dim3 grid(blocks, n_rows);
+    if (weights->type == GGML_TYPE_Q8_0) {
+        moe_early_hc_mv<GGML_TYPE_Q8_0, threads><<<grid, 128, 0, stream>>>(weights->data, input, output, weights->ne[0], weights->ne[1], streams, activation);
+    } else {
+        GGML_ASSERT(weights->type == GGML_TYPE_F32);
+        moe_early_hc_mv<GGML_TYPE_F32, threads><<<grid, 128, 0, stream>>>(weights->data, input, output, weights->ne[0], weights->ne[1], streams, activation);
+    }
+}
+
+template<int items, bool batched = false, bool ordered_ids = false>
+static __global__ void moe_early_router_select(
+        float * scores, int experts, int top_k, const int32_t * residents,
+        const moe_grouped_decode_plan * prior, uint32_t capacity,
+        int32_t * predicted, int32_t * positions, uint64_t * counters, size_t entry_bytes, uint32_t n_rows = 1,
+        const int32_t * selected_ids = nullptr, size_t ids_row_stride = 0) {
+    extern __shared__ float values[];
+    __shared__ int32_t incoming_head[32], slots_head[32];
+    const uint32_t n_pending = prior->status == MOE_GROUPED_PLAN_READY && prior->n_misses <= capacity ? prior->n_misses : 0;
+    const int32_t * incoming = moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
+    const int32_t * slots = moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+    if (threadIdx.x < n_pending) {
+        incoming_head[threadIdx.x] = incoming[threadIdx.x];
+        slots_head[threadIdx.x] = slots[threadIdx.x];
+    }
+    for (int p = threadIdx.x; p < top_k * (batched ? n_rows : 1); p += blockDim.x) {
+        predicted[p] = -1;
+    }
+    for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+        positions[e] = -1;
+    }
+    int count = 0;
+    for (uint32_t row = 0; row < (batched ? n_rows : 1); ++row) {
+        for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+            if constexpr (items == 0) {
+                values[e] = isfinite(scores[e]) ? scores[e] : -INFINITY;
+            }
+        }
+        __syncwarp();
+        if constexpr (ordered_ids) {
+            for (int rank = threadIdx.x; rank < top_k; rank += blockDim.x) {
+                int32_t expert = selected_ids[rank];
+                for (int previous = 0; previous < rank; ++previous) {
+                    if (selected_ids[previous] == expert) {
+                        expert = -1;
+                        break;
+                    }
+                }
+                predicted[rank] = expert >= 0 && expert < experts ? expert : -1;
+            }
+        } else if (threadIdx.x < 32) {
+            float local[items > 0 ? items : 1];
+#pragma unroll
+            for (int i = 0; i < items; ++i) {
+                const int e = threadIdx.x + 32 * i;
+                const float value = e < experts ? scores[e] : -INFINITY;
+                local[i] = isfinite(value) ? value : -INFINITY;
+            }
+            for (int rank = 0; rank < top_k; ++rank) {
+                float best = -INFINITY;
+                int expert = INT_MAX;
+                if constexpr (items > 0) {
+#pragma unroll
+                    for (int i = 0; i < items; ++i) {
+                        const int e = threadIdx.x + 32 * i;
+                        if (local[i] > best) {
+                            best = local[i];
+                            expert = e;
+                        }
+                    }
+                } else {
+                    for (int e = threadIdx.x; e < experts; e += 32) {
+                        const float value = values[e];
+                        if (value > best) {
+                            best = value;
+                            expert = e;
+                        }
+                    }
+                }
+#pragma unroll
+                for (int mask = 16; mask > 0; mask /= 2) {
+                    const float value = __shfl_xor_sync(0xffffffff, best, mask, 32);
+                    const int other = __shfl_xor_sync(0xffffffff, expert, mask, 32);
+                    if (value > best || (value == best && other < expert)) {
+                        best = value;
+                        expert = other;
+                    }
+                }
+                if (!isfinite(best)) {
+                    break;
+                }
+                if constexpr (items > 0) {
+#pragma unroll
+                    for (int i = 0; i < items; ++i) {
+                        if (threadIdx.x + 32 * i == expert) {
+                            local[i] = -INFINITY;
+                        }
+                    }
+                } else {
+                    if (threadIdx.x == 0) {
+                        values[expert] = -INFINITY;
+                    }
+                    __syncwarp();
+                }
+                if (threadIdx.x == rank % 32) {
+                    predicted[rank] = expert;
+                }
+            }
+        }
+        __syncwarp();
+        for (int rank = threadIdx.x; rank < top_k; rank += blockDim.x) {
+            const int expert = predicted[rank];
+            if (expert < 0) {
+                continue;
+            }
+            const int32_t old_slot = residents[expert];
+            bool present = old_slot >= 0;
+            // The prior gather completed, but its slot updates are not published yet.
+            for (uint32_t m = 0; m < n_pending; ++m) {
+                const int32_t incoming_expert = m < 32 ? incoming_head[m] : incoming[m];
+                const int32_t incoming_slot = m < 32 ? slots_head[m] : slots[m];
+                if (incoming_expert == expert) {
+                    present = true;
+                    break;
+                }
+                if (incoming_slot == old_slot) {
+                    present = false;
+                }
+            }
+            if (present || (batched && positions[expert] >= 0)) {
+                predicted[rank] = -1;
+            } else {
+                positions[expert] = row * top_k + rank;
+                ++count;
+            }
+        }
+        if constexpr (batched) {
+            __syncwarp();
+            if constexpr (ordered_ids) {
+                selected_ids = (const int32_t *) ((const char *) selected_ids + ids_row_stride);
+            } else {
+                scores += experts;
+            }
+            predicted += top_k;
+        }
+    }
+    count = warp_reduce_sum(count);
+    if (threadIdx.x == 0) {
+        counters[0] += count * entry_bytes;
+        counters[2] += count;
+        counters[4] += 1;
+    }
+}
+
+template<int items = 1, bool batched = false>
+static void moe_early_router_select_launch(
+        float * scores, int experts, int top_k, const int32_t * residents,
+        const moe_grouped_decode_plan * prior, uint32_t capacity,
+        int32_t * predicted, int32_t * positions, uint64_t * counters, size_t entry_bytes, cudaStream_t stream, uint32_t n_rows = 1) {
+    if (experts <= 32 * items) {
+        moe_early_router_select<items, batched><<<1, 32, 0, stream>>>(scores, experts, top_k, residents, prior, capacity, predicted, positions, counters, entry_bytes, n_rows);
+    } else if constexpr (items < 64) {
+        moe_early_router_select_launch<2 * items, batched>(scores, experts, top_k, residents, prior, capacity, predicted, positions, counters, entry_bytes, stream, n_rows);
+    } else {
+        // Larger expert counts use the same selection rules without a register-size limit.
+        moe_early_router_select<0, batched><<<1, 32, experts * sizeof(float), stream>>>(scores, experts, top_k, residents, prior, capacity, predicted, positions, counters, entry_bytes, n_rows);
+    }
+}
+
+static __global__ void moe_early_router_stage(
+        const moe_grouped_device_bank * banks, uint32_t n_banks, size_t words_per_expert,
+        const int32_t * predicted, uint32_t top_k, uint4 * staging) {
+    const size_t total = words_per_expert * top_k;
+    for (size_t word = (size_t) blockIdx.x * blockDim.x + threadIdx.x; word < total; word += (size_t) gridDim.x * blockDim.x) {
+        const int32_t expert = predicted[word / words_per_expert];
+        if (expert < 0) {
+            continue;
+        }
+        size_t offset = word % words_per_expert;
+        for (uint32_t bank = 0; bank < n_banks; ++bank) {
+            const auto b = banks[bank];
+            const size_t words = b.expert_stride / sizeof(uint4);
+            if (offset < words) {
+                staging[word] = reinterpret_cast<const uint4 *>(b.source + (size_t) expert * b.expert_stride)[offset];
+                break;
+            }
+            offset -= words;
+        }
+    }
+}
+
 template<bool debug_transfers>
 static __global__ void moe_grouped_gather_decode(
         const moe_grouped_device_bank * banks,
@@ -3292,12 +4121,17 @@ static __global__ void moe_grouped_gather_decode(
         size_t auxiliary_values_per_miss,
         uint32_t plan_capacity,
         const moe_grouped_decode_plan * plan,
-        uint64_t * transfer_counters) {
+        uint64_t * transfer_counters,
+        const uint4 * early_staging = nullptr,
+        const int32_t * early_positions = nullptr,
+        uint64_t * early_counters = nullptr,
+        int early_phase = 0,
+        uint32_t bank_mask = UINT32_MAX) {
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
     if constexpr (debug_transfers) {
-        if (blockIdx.x == 0 && threadIdx.x == 0) {
+        if (early_phase != 2 && early_phase != 3 && blockIdx.x == 0 && threadIdx.x == 0) {
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
                 static_cast<unsigned long long>(plan->n_misses) * n_banks);
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[1]),
@@ -3306,11 +4140,24 @@ static __global__ void moe_grouped_gather_decode(
     }
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
     const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+    if (early_positions != nullptr && early_counters != nullptr && early_phase != 1 && blockIdx.x == 0 && threadIdx.x == 0) {
+        for (uint32_t m = 0; m < plan->n_misses; ++m) {
+            if (early_positions[miss_experts[m]] >= 0) {
+                early_counters[1] += words_per_miss * sizeof(uint4);
+                early_counters[3] += 1;
+            }
+        }
+    }
     const size_t total_words = words_per_miss * plan->n_misses;
     const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     const size_t stride = (size_t) gridDim.x * blockDim.x;
     for (size_t word = first; word < total_words; word += stride) {
         const uint32_t miss = word / words_per_miss;
+        const int32_t position = early_positions != nullptr ? early_positions[miss_experts[miss]] : -1;
+        const bool prefetched = position >= 0;
+        if ((early_phase == 1 && prefetched) || (early_phase == 2 && !prefetched) || (early_phase == 3 && position == -1)) {
+            continue;
+        }
         size_t bank_word = word % words_per_miss;
         for (uint32_t bank = 0; bank < n_banks; ++bank) {
             const auto descriptor = banks[bank];
@@ -3319,15 +4166,21 @@ static __global__ void moe_grouped_gather_decode(
                 bank_word -= bank_words;
                 continue;
             }
+            if ((bank_mask & (uint32_t{1} << bank)) == 0) {
+                break;
+            }
             const int32_t expert = miss_experts[miss];
             const int32_t slot = miss_slots[miss];
             const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (size_t) expert * descriptor.expert_stride);
+            if (early_positions != nullptr && early_positions[expert] >= 0) {
+                source = early_staging + (size_t) early_positions[expert] * words_per_miss + word % words_per_miss - bank_word;
+            }
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
             destination[bank_word] = source[bank_word];
             break;
         }
     }
-    if (n_auxiliaries != 0) {
+    if (n_auxiliaries != 0 && early_phase != 2 && early_phase != 3) {
         const size_t total_values = auxiliary_values_per_miss * plan->n_misses;
         for (size_t index = first; index < total_values; index += stride) {
             const uint32_t miss = index / auxiliary_values_per_miss;
@@ -3949,6 +4802,445 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::array<ggml_cuda_moe_grouped_bank_descriptor, 3> slot_auxiliaries;
         std::vector<ggml_cuda_moe_grouped_bank_descriptor> banks;
     };
+
+    struct early_binding {
+        uint32_t group;
+        uint32_t top_k;
+        const ggml_tensor * input;
+        const ggml_tensor * attention_scale;
+        const ggml_tensor * ffn_scale;
+        const ggml_tensor * weights;
+        const ggml_tensor * hc_down = nullptr;
+        const ggml_tensor * hc_up = nullptr;
+        uint32_t hc_streams = 0;
+        const ggml_tensor * down_reader = nullptr;
+        const ggml_tensor * ffn_input = nullptr;
+        const ggml_tensor * ffn_trigger = nullptr;
+        uint32_t lane = 0;
+        uint32_t n_rows = 1;
+        float input_multiplier = 1.0f;
+        float ffn_multiplier = 1.0f;
+        const ggml_tensor * router_bias = nullptr;
+        const ggml_tensor * selected_ids = nullptr;
+        moe_router_program * program = nullptr;
+        std::vector<moe_router_program::input_binding> index_inputs;
+        bool native_router = false;
+        uint32_t order = 0;
+
+        uint64_t copy_key() const {
+            return (uint64_t(group) << 32) | n_rows;
+        }
+    };
+
+    struct early_workspace {
+        struct copy_job {
+            early_workspace * owner;
+            uint32_t top_k;
+            uint32_t experts;
+            size_t entry_bytes;
+            std::vector<ggml_cuda_moe_grouped_bank_descriptor> banks;
+            uint32_t down_bank = UINT32_MAX;
+        };
+
+        static void CUDART_CB submit_copy(void * data) {
+            auto * job = static_cast<copy_job *>(data);
+            auto & owner = *job->owner;
+            if (owner.copy_poll) {
+                copy_job * expected = nullptr;
+                GGML_ASSERT(!owner.copy_stop.load(std::memory_order_acquire));
+                GGML_ASSERT(owner.pending_copy.compare_exchange_strong(expected, job, std::memory_order_release));
+            } else {
+                std::lock_guard<std::mutex> lock(owner.copy_mutex);
+                GGML_ASSERT(owner.pending_copy == nullptr && !owner.copy_stop);
+                owner.pending_copy = job;
+            }
+            if (!owner.copy_poll) {
+                owner.copy_wake.notify_one();
+            }
+            if (owner.copy_debug) {
+                fprintf(stderr, "early-copy-debug: submitted job=%p\n", (void *) job);
+            }
+        }
+
+        void start_copy_worker(int device, bool launch = true) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+            const char * mailbox = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_MAILBOX");
+            copy_mailbox = mailbox != nullptr && strcmp(mailbox, "1") == 0;
+            if (copy_mailbox) {
+                CUDA_CHECK(cudaHostAlloc(&host_predicted, top_k * sizeof(int32_t), cudaHostAllocMapped));
+                CUDA_CHECK(cudaHostGetDevicePointer(&mapped_predicted, host_predicted, 0));
+                CUDA_CHECK(cudaHostAlloc(&host_request, sizeof(uint64_t), cudaHostAllocMapped));
+                CUDA_CHECK(cudaHostGetDevicePointer(&mapped_request, host_request, 0));
+                *host_request = 0;
+            } else {
+                CUDA_CHECK(cudaMallocHost(&host_predicted, top_k * sizeof(int32_t)));
+            }
+            CUDA_CHECK(cudaMalloc(&copy_done, sizeof(uint32_t)));
+            copy_debug = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_DEBUG") != nullptr;
+            const char * poll = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_POLL");
+            copy_poll = copy_mailbox || (poll != nullptr && strcmp(poll, "1") == 0);
+            const char * batch = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BATCH");
+            copy_batch = batch != nullptr && strcmp(batch, "1") == 0;
+            const char * split = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_SPLIT");
+            copy_split = split != nullptr && strcmp(split, "1") == 0;
+            const char * ready_only = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_READY_ONLY");
+            copy_ready_late = ready_only != nullptr && strcmp(ready_only, "2") == 0;
+            copy_ready_only = copy_ready_late || (ready_only != nullptr && strcmp(ready_only, "1") == 0);
+            const char * banks = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_BANKS");
+            copy_banks = banks != nullptr && strcmp(banks, "1") == 0;
+            if (copy_banks) {
+                GGML_ASSERT(copy_split && copy_batch && copy_mailbox && !copy_ready_only);
+                CUDA_CHECK(cudaMalloc(&copy_head_done, sizeof(uint32_t)));
+                CUDA_CHECK(cudaEventCreateWithFlags(&head_ready, cudaEventDisableTiming));
+            }
+            if (copy_ready_only) {
+                GGML_ASSERT(copy_split && copy_batch && copy_mailbox);
+                CUDA_CHECK(cudaMalloc(&copy_progress, sizeof(uint32_t)));
+            }
+            if (copy_split) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&selected, cudaEventDisableTiming));
+            }
+            if (copy_batch) {
+                const size_t capacity = (size_t) top_k * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS;
+                copy_dsts.reserve(capacity);
+                copy_srcs.reserve(capacity);
+                copy_sizes.reserve(capacity);
+            }
+            if (launch) {
+                launch_copy_worker(device, {this});
+            }
+#else
+            GGML_UNUSED(device);
+            GGML_UNUSED(launch);
+            GGML_ABORT("experimental early-router copy engine requires CUDA 12.8 or newer");
+#endif
+        }
+
+        void launch_copy_worker(int device, const std::vector<early_workspace *> & clients) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+            GGML_ASSERT(!copy_worker.joinable() && !clients.empty());
+            for (const auto * client : clients) {
+                GGML_ASSERT(clients.size() == 1 || client->copy_mailbox);
+            }
+            copy_worker = std::thread([this, device, clients] {
+                CUDA_CHECK(cudaSetDevice(device));
+                if (copy_debug) {
+                    fprintf(stderr, "early-copy-debug: worker ready\n");
+                }
+                for (;;) {
+                    copy_job * job = nullptr;
+                    if (clients.size() > 1) {
+                        while (job == nullptr) {
+                            if (copy_stop.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                            for (size_t i = 0; i < clients.size(); ++i) {
+                                auto * client = clients[(copy_client_cursor + i) % clients.size()];
+                                auto request = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*client->host_request);
+                                const uint64_t value = request.load(cuda::memory_order_acquire);
+                                if (value != 0) {
+                                    job = reinterpret_cast<copy_job *>((uintptr_t) value);
+                                    GGML_ASSERT(job->owner == client);
+                                    request.store(0, cuda::memory_order_release);
+                                    copy_client_cursor = (copy_client_cursor + i + 1) % clients.size();
+                                    break;
+                                }
+                            }
+                        }
+                    } else if (copy_mailbox) {
+                        auto request = cuda::atomic_ref<uint64_t, cuda::thread_scope_system>(*host_request);
+                        uint64_t value;
+                        while ((value = request.load(cuda::memory_order_acquire)) == 0) {
+                            if (copy_stop.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                        }
+                        job = reinterpret_cast<copy_job *>((uintptr_t) value);
+                        request.store(0, cuda::memory_order_release);
+                    } else if (copy_poll) {
+                        while ((job = pending_copy.load(std::memory_order_acquire)) == nullptr) {
+                            if (copy_stop.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                            std::atomic_signal_fence(std::memory_order_acq_rel);
+                        }
+                        pending_copy.store(nullptr, std::memory_order_release);
+                    } else {
+                        std::unique_lock<std::mutex> lock(copy_mutex);
+                        copy_wake.wait(lock, [this] { return copy_stop || pending_copy != nullptr; });
+                        if (copy_stop) {
+                            return;
+                        }
+                        job = pending_copy;
+                        pending_copy = nullptr;
+                    }
+                    auto & owner = *job->owner;
+                    auto & copy_dsts = owner.copy_dsts;
+                    auto & copy_srcs = owner.copy_srcs;
+                    auto & copy_sizes = owner.copy_sizes;
+                    const auto * host_predicted = owner.host_predicted;
+                    auto * staging = owner.staging;
+                    auto * copy_progress = owner.copy_progress;
+                    auto * copy_head_done = owner.copy_head_done;
+                    auto * copy_done = owner.copy_done;
+                    const bool copy_batch = owner.copy_batch;
+                    const bool copy_banks = owner.copy_banks;
+                    const bool copy_ready_only = owner.copy_ready_only;
+                    auto & copy_bytes = owner.copy_bytes;
+                    auto & copy_calls = owner.copy_calls;
+                    if (copy_debug) {
+                        fprintf(stderr, "early-copy-debug: copying job=%p\n", (void *) job);
+                    }
+                    copy_dsts.clear();
+                    copy_srcs.clear();
+                    copy_sizes.clear();
+                    const auto submit_batch = [&] {
+                        if (copy_srcs.empty()) {
+                            return;
+                        }
+                        cudaMemcpyAttributes attributes = {};
+                        attributes.srcAccessOrder = cudaMemcpySrcAccessOrderAny;
+                        size_t attributes_index = 0;
+#if CUDART_VERSION < 13000
+                        size_t fail_index = SIZE_MAX;
+                        CUDA_CHECK(cudaMemcpyBatchAsync(copy_dsts.data(), copy_srcs.data(), copy_sizes.data(),
+                            copy_srcs.size(), &attributes, &attributes_index, 1, &fail_index, copy_stream));
+#else
+                        CUDA_CHECK(cudaMemcpyBatchAsync(copy_dsts.data(), copy_srcs.data(), copy_sizes.data(),
+                            copy_srcs.size(), &attributes, &attributes_index, 1, copy_stream));
+#endif
+                        copy_dsts.clear();
+                        copy_srcs.clear();
+                        copy_sizes.clear();
+                    };
+                    for (int phase = 0; phase < (copy_banks ? 2 : 1); ++phase) {
+                        for (uint32_t p = 0; p < job->top_k; ++p) {
+                            const int32_t expert = host_predicted[p];
+                            if (expert < 0) {
+                                continue;
+                            }
+                            GGML_ASSERT((uint32_t) expert < job->experts);
+                            size_t offset = p * job->entry_bytes;
+                            for (size_t b = 0; b < job->banks.size(); ++b) {
+                                const auto & bank = job->banks[b];
+                                if (copy_banks && ((b == job->down_bank) != (phase == 1))) {
+                                    offset += bank.expert_stride;
+                                    continue;
+                                }
+                                const auto * src = static_cast<const char *>(bank.source_data) + (size_t) expert * bank.expert_stride;
+                                void * dst = reinterpret_cast<char *>(staging) + offset;
+                                if (copy_batch) {
+                                    GGML_ASSERT(copy_srcs.size() < copy_srcs.capacity());
+                                    copy_dsts.push_back(dst);
+                                    copy_srcs.push_back(src);
+                                    copy_sizes.push_back(bank.expert_stride);
+                                } else {
+                                    CUDA_CHECK(cudaMemcpyAsync(dst, src, bank.expert_stride, cudaMemcpyHostToDevice, copy_stream));
+                                }
+                                offset += bank.expert_stride;
+                                copy_bytes += bank.expert_stride;
+                                ++copy_calls;
+                            }
+                            if (copy_ready_only) {
+                                submit_batch();
+                                // Publish only after all banks of this expert are visible.
+                                CU_CHECK(cuStreamWriteValue32(copy_stream, (CUdeviceptr) copy_progress, p + 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+                            }
+                        }
+                        submit_batch();
+                        if (copy_banks && phase == 0) {
+                            CU_CHECK(cuStreamWriteValue32(copy_stream, (CUdeviceptr) copy_head_done, 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+                        }
+                    }
+                    CU_CHECK(cuStreamWriteValue32(copy_stream, (CUdeviceptr) copy_done, 1, CU_STREAM_WRITE_VALUE_DEFAULT));
+                    if (copy_debug) {
+                        fprintf(stderr, "early-copy-debug: completion enqueued job=%p\n", (void *) job);
+                        CUDA_CHECK(cudaStreamSynchronize(copy_stream));
+                        fprintf(stderr, "early-copy-debug: completion reached job=%p copies=%llu\n", (void *) job, (unsigned long long) copy_calls);
+                    }
+                    ++owner.copy_jobs_completed;
+                }
+            });
+#else
+            GGML_UNUSED(device);
+            GGML_UNUSED(clients);
+            GGML_ABORT("experimental early-router copy engine requires CUDA 12.8 or newer");
+#endif
+        }
+
+        void enqueue_copy(copy_job & job) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+            CUDA_CHECK(cudaMemsetAsync(copy_done, 0, sizeof(uint32_t), stream));
+            if (copy_banks) {
+                GGML_ASSERT(job.down_bank < job.banks.size() && job.banks.size() <= 32);
+                CUDA_CHECK(cudaMemsetAsync(copy_head_done, 0, sizeof(uint32_t), stream));
+            }
+            if (copy_ready_only) {
+                CUDA_CHECK(cudaMemsetAsync(copy_progress, 0, sizeof(uint32_t), stream));
+            }
+            if (copy_split) {
+                CUDA_CHECK(cudaEventRecord(selected, stream));
+            }
+            if (copy_mailbox) {
+                moe_early_router_publish_copy<<<1, 32, 0, stream>>>(
+                    predicted, mapped_predicted, job.top_k, mapped_request, (uint64_t) (uintptr_t) &job);
+                CUDA_CHECK(cudaGetLastError());
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(host_predicted, predicted, job.top_k * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+                CUDA_CHECK(cudaLaunchHostFunc(stream, submit_copy, &job));
+            }
+            if (copy_banks) {
+                moe_early_router_wait_copy(stream, copy_head_done);
+                CUDA_CHECK(cudaEventRecord(head_ready, stream));
+            }
+            moe_early_router_wait_copy(stream, copy_done);
+#else
+            GGML_UNUSED(job);
+            GGML_ABORT("experimental early-router copy engine requires CUDA 12.8 or newer");
+#endif
+        }
+
+        void stop_copy_worker() {
+            if (copy_worker.joinable()) {
+                {
+                    std::lock_guard<std::mutex> lock(copy_mutex);
+                    GGML_ASSERT(pending_copy == nullptr);
+                    copy_stop = true;
+                }
+                copy_wake.notify_one();
+                copy_worker.join();
+                (void) cudaStreamSynchronize(copy_stream);
+            }
+        }
+
+        ~early_workspace() {
+            (void) cudaStreamSynchronize(main_stream);
+            (void) cudaStreamSynchronize(stream);
+            stop_copy_worker();
+            if (copy_stream != nullptr) {
+                fprintf(stderr, "moe-early-router-copy: jobs=%llu copies=%llu bytes=%llu poll=%d batch=%d split=%d mailbox=%d ready_only=%d ready_late=%d\n",
+                    (unsigned long long) copy_jobs_completed, (unsigned long long) copy_calls, (unsigned long long) copy_bytes, copy_poll, copy_batch, copy_split, copy_mailbox, copy_ready_only, copy_ready_late);
+                if (host_request != nullptr) {
+                    (void) cudaFreeHost(host_request);
+                }
+                if (selected != nullptr) {
+                    (void) cudaEventDestroy(selected);
+                }
+                (void) cudaFreeHost(host_predicted);
+                (void) cudaFree(copy_done);
+                (void) cudaFree(copy_progress);
+                (void) cudaFree(copy_head_done);
+                if (head_ready != nullptr) {
+                    (void) cudaEventDestroy(head_ready);
+                }
+                (void) cudaStreamDestroy(copy_stream);
+            }
+            uint64_t values[5] = {};
+            (void) cudaMemcpy(values, counters, sizeof(values), cudaMemcpyDeviceToHost);
+            fprintf(stderr, "moe-early-router: calls=%llu predicted_experts=%llu useful_experts=%llu predicted_bytes=%llu useful_bytes=%llu staging_bytes=%zu\n",
+                (unsigned long long) values[4], (unsigned long long) values[2], (unsigned long long) values[3],
+                (unsigned long long) values[0], (unsigned long long) values[1], staging_bytes);
+            (void) cudaFree(input);
+            (void) cudaFree(hc_low);
+            (void) cudaFree(hc_gate);
+            (void) cudaFree(hc_mixed);
+            (void) cudaFree(scores);
+            (void) cudaFree(predicted);
+            (void) cudaFree(positions);
+            (void) cudaFree(staging);
+            (void) cudaFree(counters);
+            (void) cudaEventDestroy(ready);
+            (void) cudaEventDestroy(done);
+            if (router_context != nullptr) {
+                router_context->streams[router_context->device][0] = nullptr;
+            }
+            (void) cudaStreamDestroy(stream);
+        }
+        ggml_backend_cuda_context * router_context = nullptr;
+        cudaStream_t main_stream = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaEvent_t ready = nullptr;
+        cudaEvent_t done = nullptr;
+        cudaEvent_t selected = nullptr;
+        float * input = nullptr;
+        float * hc_low = nullptr;
+        float * hc_gate = nullptr;
+        float * hc_mixed = nullptr;
+        float * scores = nullptr;
+        int32_t * predicted = nullptr;
+        int32_t * positions = nullptr;
+        uint4 * staging = nullptr;
+        uint64_t * counters = nullptr;
+        size_t staging_bytes = 0;
+        uint32_t width = 0;
+        uint32_t hc_rank = 0;
+        uint32_t experts = 0;
+        uint32_t top_k = 0;
+        uint32_t n_rows = 1;
+        copy_job * active_copy = nullptr;
+        bool copy_engine = false;
+        bool copy_debug = false;
+        bool copy_poll = false;
+        bool copy_batch = false;
+        bool copy_split = false;
+        bool copy_mailbox = false;
+        bool copy_ready_only = false;
+        bool copy_ready_late = false;
+        bool copy_banks = false;
+        uint32_t * copy_head_done = nullptr;
+        cudaEvent_t head_ready = nullptr;
+        const ggml_tensor * down_reader = nullptr;
+        uint32_t pending_bank_mask = 0;
+        cudaStream_t copy_stream = nullptr;
+        int32_t * host_predicted = nullptr;
+        int32_t * mapped_predicted = nullptr;
+        uint64_t * host_request = nullptr;
+        uint64_t * mapped_request = nullptr;
+        uint32_t * copy_done = nullptr;
+        uint32_t * copy_progress = nullptr;
+        std::thread copy_worker;
+        std::mutex copy_mutex;
+        std::condition_variable copy_wake;
+        std::atomic<copy_job *> pending_copy{nullptr};
+        std::atomic<bool> copy_stop{false};
+        uint64_t copy_calls = 0;
+        uint64_t copy_bytes = 0;
+        uint64_t copy_jobs_completed = 0;
+        size_t copy_client_cursor = 0;
+        uint32_t active_group = UINT32_MAX;
+        std::vector<void *> copy_dsts;
+        std::vector<const void *> copy_srcs;
+        std::vector<size_t> copy_sizes;
+        std::unordered_map<uint64_t, std::unique_ptr<copy_job>> copy_jobs;
+    };
+
+    std::vector<std::unique_ptr<early_workspace>> early;
+    std::vector<std::unique_ptr<moe_router_program>> early_programs;
+    std::unordered_map<const ggml_tensor *, early_binding> early_bindings;
+
+    early_workspace * early_for_group(uint32_t group) {
+        for (auto & lane : early) {
+            if (lane->active_group == group) {
+                return lane.get();
+            }
+        }
+        return nullptr;
+    }
+
+    void clear_early() {
+        if (early.empty()) {
+            return;
+        }
+        CUDA_CHECK(cudaStreamSynchronize(early[0]->main_stream));
+        for (auto & lane : early) {
+            CUDA_CHECK(cudaStreamSynchronize(lane->stream));
+        }
+        early[0]->stop_copy_worker();
+        early.clear();
+        early_bindings.clear();
+        early_programs.clear();
+    }
 
     struct grouped_device_resource {
         explicit grouped_device_resource(int device) : device(device) {}
@@ -5430,6 +6722,875 @@ ggml_cuda_moe_grouped_context::~ggml_cuda_moe_grouped_context() {
     shutdown();
 }
 
+size_t ggml_cuda_moe_grouped_context::early_program_count_for_test() const {
+    return impl_->early_programs.size();
+}
+
+uint64_t ggml_cuda_moe_grouped_context::early_bytes_for_test(uint64_t * calls) const {
+    uint64_t bytes = 0;
+    if (calls != nullptr) {
+        *calls = 0;
+    }
+    for (const auto & lane : impl_->early) {
+        uint64_t counts[5] = {};
+        CUDA_CHECK(cudaStreamSynchronize(lane->stream));
+        CUDA_CHECK(cudaMemcpy(counts, lane->counters, sizeof(counts), cudaMemcpyDeviceToHost));
+        bytes += counts[0];
+        if (calls != nullptr) {
+            *calls += counts[4];
+        }
+    }
+    return bytes;
+}
+
+bool ggml_cuda_moe_grouped_context::early_graph_for_test() {
+    CUDA_CHECK(cudaSetDevice(impl_->device));
+    bool valid = true;
+    const auto buft = ggml_backend_cuda_buffer_type(impl_->device);
+    for (int rows : {1, 4}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+            for (int variant = 0; variant < 11; ++variant) {
+                const int width = variant == 10 ? 96 : 64;
+                const int experts = variant == 4 ? 17 : variant == 9 ? 257 : variant == 10 ? 33 : 16;
+                const int top_k = variant == 5 ? 1 : variant == 6 ? 8 : variant == 9 ? 16 : 4;
+                ggml_init_params params{1024 * 1024, nullptr, true};
+                auto * weights_ctx = ggml_init(params);
+                auto * ctx = ggml_init(params);
+                auto * weights = ggml_new_tensor_2d(weights_ctx, type, width, experts);
+                auto * bias = ggml_new_tensor_1d(weights_ctx, GGML_TYPE_F32, experts);
+                auto * scale = ggml_new_tensor_1d(weights_ctx, GGML_TYPE_F32, width);
+                auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+                auto * norm = ggml_rms_norm(ctx, input, 1e-6f);
+                if (variant == 7) {
+                    norm = ggml_scale(ctx, norm, 0.125f);
+                }
+                auto * boundary = variant == 8 ? input : ggml_mul(ctx, norm, scale);
+                auto * router_weights = variant == 10 ? ggml_view_2d(ctx, weights, width, experts, weights->nb[1], 0) : weights;
+                auto * projection = ggml_mul_mat(ctx, router_weights, boundary);
+                projection->flags |= GGML_TENSOR_FLAG_MOE_ROUTER;
+                ggml_set_name(projection, "arbitrary-router-name");
+                ggml_tensor * scores = variant == 0 ? ggml_soft_max(ctx, ggml_add(ctx, projection, bias)) :
+                    ggml_add(ctx, ggml_sigmoid(ctx, projection), bias);
+                if (variant == 3) {
+                    projection->flags &= ~GGML_TENSOR_FLAG_MOE_ROUTER;
+                    scores->flags |= GGML_TENSOR_FLAG_MOE_ROUTER;
+                }
+                if (variant == 4) {
+                    scores = ggml_add(ctx, ggml_sqrt(ctx, ggml_softplus(ctx, projection)), bias);
+                }
+                if (variant == 5) {
+                    scores = projection;
+                }
+                if (variant == 2) {
+                    auto * groups = ggml_reshape_3d(ctx, scores, 4, 4, rows);
+                    auto * ranks = ggml_argsort_top_k(ctx, groups, 2);
+                    auto * best = ggml_get_rows(ctx, ggml_reshape_4d(ctx, groups, 1, 4, 4, rows), ranks);
+                    auto * totals = ggml_sum_rows(ctx, ggml_reshape_3d(ctx, best, 2, 4, rows));
+                    auto * selected_groups = ggml_argsort_top_k(ctx, ggml_reshape_2d(ctx, totals, 4, rows), 2);
+                    scores = ggml_reshape_2d(ctx, ggml_set_rows(ctx, ggml_fill(ctx, groups, -INFINITY),
+                        ggml_get_rows(ctx, groups, selected_groups), selected_groups), experts, rows);
+                }
+                auto * ids = ggml_argsort_top_k(ctx, scores, top_k);
+                if (variant == 6) {
+                    ids = ggml_cast(ctx, ggml_scale(ctx, ggml_cast(ctx, ids, GGML_TYPE_F32), 0.5f), GGML_TYPE_I32);
+                }
+                auto * graph = ggml_new_graph(ctx);
+                ggml_build_forward_expand(graph, ids);
+                auto weights_buffer = ggml_backend_alloc_ctx_tensors_from_buft(weights_ctx, buft);
+                auto buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+                GGML_ASSERT(weights_buffer != nullptr && buffer != nullptr);
+                ggml_backend_buffer_set_usage(weights_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<float> values(width * experts), inputs(width * rows), biases(experts), scales(width, 1.0f);
+                for (size_t i = 0; i < values.size(); ++i) {
+                    values[i] = std::sin(float(i * 13 + 7)) / 8.0f;
+                }
+                for (int i = 0; i < experts; ++i) {
+                    biases[i] = float((i * 7) % 11) / 17.0f;
+                }
+                std::vector<uint8_t> quant(ggml_nbytes(weights));
+                ggml_quantize_chunk(type, values.data(), quant.data(), 0, experts, width, nullptr);
+                ggml_backend_tensor_set(weights, quant.data(), 0, quant.size());
+                ggml_backend_tensor_set(bias, biases.data(), 0, biases.size() * sizeof(float));
+                ggml_backend_tensor_set(scale, scales.data(), 0, scales.size() * sizeof(float));
+                std::string reason;
+                auto program = moe_router_program::create(boundary, ids, impl_->device, reason);
+                if (program == nullptr) {
+                    fprintf(stderr, "early-graph-test: rejected variant=%d type=%s rows=%d reason=%s\n", variant, ggml_type_name(type), rows, reason.c_str());
+                    valid = false;
+                } else {
+                    valid &= moe_router_projection(ids) == projection && moe_router_boundary(boundary) == boundary;
+                    valid &= program->signature == moe_router_program::describe(program->input, program->ids);
+                    const ggml_tensor * found_bias = nullptr;
+                    valid &= moe_router_plain_selection(ids, projection, &found_bias) == (variant == 0 || variant == 5);
+                    ggml_backend_cuda_context reference(impl_->device), predictor(impl_->device);
+                    cudaGraph_t captured = nullptr;
+                    cudaGraphExec_t replay = nullptr;
+                    std::vector<int32_t> expected(rows * top_k), actual(rows * top_k);
+                    int32_t * selection;
+                    uint64_t * counters;
+                    moe_grouped_decode_plan * prior;
+                    size_t plan_bytes;
+                    GGML_ASSERT(moe_grouped_plan_size(experts, experts, &plan_bytes));
+                    CUDA_CHECK(cudaMalloc(&selection, (2 * experts + rows * top_k) * sizeof(int32_t)));
+                    CUDA_CHECK(cudaMalloc(&counters, 5 * sizeof(uint64_t)));
+                    CUDA_CHECK(cudaMalloc(&prior, plan_bytes));
+                    CUDA_CHECK(cudaMemset(selection, 0xff, (2 * experts + rows * top_k) * sizeof(int32_t)));
+                    CUDA_CHECK(cudaMemset(counters, 0, 5 * sizeof(uint64_t)));
+                    CUDA_CHECK(cudaMemset(prior, 0, plan_bytes));
+                    const auto predict = [&]() {
+                        program->compute(predictor);
+                        moe_early_router_select<1, true, true><<<1, 32, 0, predictor.stream()>>>(
+                            nullptr, experts, top_k, selection, prior, experts, selection + 2 * experts,
+                            selection + experts, counters, 4096, rows, (const int32_t *) program->ids->data, program->ids->nb[1]);
+                        CUDA_CHECK(cudaGetLastError());
+                    };
+                    for (int step = 0; step < 3; ++step) {
+                        for (size_t i = 0; i < inputs.size(); ++i) {
+                            inputs[i] = std::cos(float(i * 3 + step * 11));
+                        }
+                        ggml_backend_tensor_set(input, inputs.data(), 0, inputs.size() * sizeof(float));
+                        for (int i = 0; i < graph->n_nodes; ++i) {
+                            GGML_ASSERT(ggml_cuda_moe_router_compute(reference, graph->nodes[i]));
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(reference.stream()));
+                        CUDA_CHECK(cudaMemcpyAsync(program->input->data, boundary->data, ggml_nbytes(boundary), cudaMemcpyDeviceToDevice, predictor.stream()));
+                        if (step == 0) {
+                            predict();
+                        } else if (step == 1) {
+                            CUDA_CHECK(cudaStreamBeginCapture(predictor.stream(), cudaStreamCaptureModeThreadLocal));
+                            predict();
+                            CUDA_CHECK(cudaStreamEndCapture(predictor.stream(), &captured));
+                            CUDA_CHECK(cudaGraphInstantiate(&replay, captured, nullptr, nullptr, 0));
+                            CUDA_CHECK(cudaGraphLaunch(replay, predictor.stream()));
+                        } else {
+                            CUDA_CHECK(cudaGraphLaunch(replay, predictor.stream()));
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(predictor.stream()));
+                        for (int row = 0; row < rows; ++row) {
+                            CUDA_CHECK(cudaMemcpy(expected.data() + row * top_k, (char *) ids->data + row * ids->nb[1], top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                            CUDA_CHECK(cudaMemcpy(actual.data() + row * top_k, (char *) program->ids->data + row * program->ids->nb[1], top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        }
+                        valid &= expected == actual;
+                        std::unordered_set<int32_t> seen;
+                        for (auto & expert : expected) {
+                            if (!seen.insert(expert).second) {
+                                expert = -1;
+                            }
+                        }
+                        CUDA_CHECK(cudaMemcpy(actual.data(), selection + 2 * experts, actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                        valid &= expected == actual;
+                    }
+                    CUDA_CHECK(cudaGraphExecDestroy(replay));
+                    CUDA_CHECK(cudaGraphDestroy(captured));
+                    CUDA_CHECK(cudaFree(prior));
+                    CUDA_CHECK(cudaFree(counters));
+                    CUDA_CHECK(cudaFree(selection));
+                    auto invalid = *ids;
+                    invalid.op = GGML_OP_CPY;
+                    valid &= moe_router_program::create(boundary, &invalid, impl_->device, reason) == nullptr;
+                    auto write = *weights;
+                    write.op = GGML_OP_SCALE;
+                    write.src[0] = weights;
+                    write.view_src = weights;
+                    auto unsafe_projection = *projection;
+                    unsafe_projection.src[0] = &write;
+                    auto * unsafe_ids = ggml_argsort_top_k(ctx, &unsafe_projection, top_k);
+                    const bool rejected_write = moe_router_program::create(boundary, unsafe_ids, impl_->device, reason) == nullptr;
+                    valid &= rejected_write;
+                    if (!rejected_write) {
+                        fprintf(stderr, "early-graph-test: accepted a write through a weight alias\n");
+                    }
+                    auto weight_view = *weights;
+                    weight_view.op = GGML_OP_VIEW;
+                    weight_view.src[0] = weights;
+                    weight_view.view_src = weights;
+                    write.src[0] = &weight_view;
+                    write.view_src = &weight_view;
+                    valid &= moe_router_program::create(boundary, unsafe_ids, impl_->device, reason) == nullptr;
+                    auto mutable_input = *input;
+                    mutable_input.flags = 0;
+                    unsafe_projection.src[0] = router_weights;
+                    unsafe_projection.src[1] = ggml_add(ctx, boundary, &mutable_input);
+                    valid &= moe_router_program::create(boundary, unsafe_ids, impl_->device, reason) == nullptr;
+                    fprintf(stderr, "early-graph-test: variant=%d type=%s rows=%d scratch=%zu exact=%d\n", variant, ggml_type_name(type), rows, program->bytes, valid);
+                }
+                program.reset();
+                ggml_backend_buffer_free(buffer);
+                ggml_backend_buffer_free(weights_buffer);
+                ggml_free(ctx);
+                ggml_free(weights_ctx);
+            }
+        }
+    }
+    return valid;
+}
+
+bool ggml_cuda_moe_grouped_context::early_select_for_test() {
+    CUDA_CHECK(cudaSetDevice(impl_->device));
+    bool valid = true;
+    int cases = 0;
+    for (int experts : {17, 33, 65, 129, 256, 257, 512, 513, 1025, 2049}) {
+        const bool long_plan = experts == 513 || experts == 2049;
+        const uint32_t capacity = std::min(experts / 2, long_plan ? 60 : 30);
+        size_t plan_bytes;
+        GGML_ASSERT(moe_grouped_plan_size(capacity, experts, &plan_bytes));
+        std::vector<uint64_t> storage((plan_bytes + 7) / 8);
+        auto * prior = reinterpret_cast<moe_grouped_decode_plan *>(storage.data());
+        prior->n_misses = long_plan ? 40 : 3;
+        for (uint32_t i = 0; i < prior->n_misses; ++i) {
+            moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_EXPERTS)[i] = experts - 1 - i;
+            moe_grouped_plan_array_ptr(prior, capacity, MOE_GROUPED_PLAN_MISS_SLOTS)[i] = i;
+        }
+        std::vector<float> scores(experts);
+        std::vector<int32_t> residents(experts, -1), actual(experts), positions(experts);
+        for (uint32_t i = 0; i < capacity; ++i) {
+            residents[i] = i;
+        }
+        float * d_scores;
+        int32_t * d_residents, * d_predicted, * d_positions;
+        uint64_t * d_counters;
+        moe_grouped_decode_plan * d_prior;
+        CUDA_CHECK(cudaMalloc(&d_scores, 4 * experts * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_residents, experts * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_predicted, 4 * experts * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_positions, experts * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&d_counters, 5 * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&d_prior, plan_bytes));
+        CUDA_CHECK(cudaMemcpy(d_residents, residents.data(), experts * sizeof(int32_t), cudaMemcpyHostToDevice));
+        for (int pattern = 0; pattern < 4; ++pattern) {
+            uint32_t random = 12345;
+            for (int e = 0; e < experts; ++e) {
+                random = random * 1664525u + 1013904223u;
+                scores[e] = pattern == 0 ? (int(random % 101) - 50) / 8.0f : pattern == 1 ? 0.0f : float(e);
+                if (pattern == 1 && e % 2 == 0) {
+                    scores[e] = -0.0f;
+                }
+                if (pattern == 3 || e % 37 == 0) {
+                    scores[e] = e % 3 == 0 ? NAN : e % 3 == 1 ? INFINITY : -INFINITY;
+                }
+            }
+            std::vector<int> order;
+            for (int e = 0; e < experts; ++e) {
+                if (std::isfinite(scores[e])) {
+                    order.push_back(e);
+                }
+            }
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return scores[a] > scores[b] || (scores[a] == scores[b] && a < b);
+            });
+            CUDA_CHECK(cudaMemcpy(d_scores, scores.data(), experts * sizeof(float), cudaMemcpyHostToDevice));
+            for (bool pending : {false, true}) {
+                prior->status = pending ? MOE_GROUPED_PLAN_READY : MOE_GROUPED_PLAN_BUILDING;
+                CUDA_CHECK(cudaMemcpy(d_prior, prior, plan_bytes, cudaMemcpyHostToDevice));
+                auto after = residents;
+                if (pending) {
+                    for (uint32_t i = 0; i < prior->n_misses; ++i) {
+                        after[i] = -1;
+                        after[experts - 1 - i] = i;
+                    }
+                }
+                for (int top_k : {1, 10, experts}) {
+                    std::vector<int32_t> expected(top_k, -1), expected_positions(experts, -1);
+                    uint64_t expected_count = 0;
+                    for (int r = 0; r < std::min(top_k, (int) order.size()); ++r) {
+                        if (after[order[r]] < 0) {
+                            expected[r] = order[r];
+                            expected_positions[order[r]] = r;
+                            ++expected_count;
+                        }
+                    }
+                    CUDA_CHECK(cudaMemset(d_counters, 0, 5 * sizeof(uint64_t)));
+                    moe_early_router_select_launch(d_scores, experts, top_k, d_residents,
+                        d_prior, capacity, d_predicted, d_positions, d_counters, 4096, nullptr);
+                    CUDA_CHECK(cudaGetLastError());
+                    CUDA_CHECK(cudaMemcpy(actual.data(), d_predicted, top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    CUDA_CHECK(cudaMemcpy(positions.data(), d_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                    uint64_t counters[5];
+                    CUDA_CHECK(cudaMemcpy(counters, d_counters, sizeof(counters), cudaMemcpyDeviceToHost));
+                    const bool match = std::equal(expected.begin(), expected.end(), actual.begin()) && positions == expected_positions &&
+                        counters[0] == expected_count * 4096 && counters[1] == 0 && counters[2] == expected_count && counters[3] == 0 && counters[4] == 1;
+                    if (!match) {
+                        fprintf(stderr, "early-select-test: mismatch experts=%d top_k=%d pattern=%d pending=%d\n", experts, top_k, pattern, pending);
+                    }
+                    valid = valid && match;
+                    ++cases;
+                }
+            }
+        }
+        for (int n_rows : {2, 3, 4}) {
+            for (bool shared : {false, true}) {
+                const int top_k = std::min(experts, 10);
+                std::vector<float> batch_scores(n_rows * experts);
+                std::vector<int32_t> expected(n_rows * top_k, -1), expected_positions(experts, -1);
+                std::vector<int32_t> batch_actual(n_rows * top_k);
+                uint64_t expected_count = 0;
+                prior->status = MOE_GROUPED_PLAN_READY;
+                auto after = residents;
+                for (uint32_t i = 0; i < prior->n_misses; ++i) {
+                    after[i] = -1;
+                    after[experts - 1 - i] = i;
+                }
+                for (int row = 0; row < n_rows; ++row) {
+                    std::vector<int> order;
+                    for (int e = 0; e < experts; ++e) {
+                        const float value = e % 19 == 0 ? NAN : float((e + (shared ? 0 : row * 7)) % experts);
+                        batch_scores[row * experts + e] = value;
+                        if (std::isfinite(value)) {
+                            order.push_back(e);
+                        }
+                    }
+                    std::sort(order.begin(), order.end(), [&](int a, int b) {
+                        return batch_scores[row * experts + a] > batch_scores[row * experts + b];
+                    });
+                    for (int rank = 0; rank < std::min(top_k, (int) order.size()); ++rank) {
+                        const int e = order[rank];
+                        if (after[e] < 0 && expected_positions[e] < 0) {
+                            const int position = row * top_k + rank;
+                            expected[position] = e;
+                            expected_positions[e] = position;
+                            ++expected_count;
+                        }
+                    }
+                }
+                CUDA_CHECK(cudaMemcpy(d_scores, batch_scores.data(), batch_scores.size() * sizeof(float), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(d_prior, prior, plan_bytes, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemset(d_counters, 0, 5 * sizeof(uint64_t)));
+                moe_early_router_select_launch<1, true>(d_scores, experts, top_k, d_residents,
+                    d_prior, capacity, d_predicted, d_positions, d_counters, 4096, nullptr, n_rows);
+                CUDA_CHECK(cudaGetLastError());
+                CUDA_CHECK(cudaMemcpy(batch_actual.data(), d_predicted, batch_actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(positions.data(), d_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToHost));
+                uint64_t counters[5];
+                CUDA_CHECK(cudaMemcpy(counters, d_counters, sizeof(counters), cudaMemcpyDeviceToHost));
+                const bool match = batch_actual == expected && positions == expected_positions &&
+                    counters[0] == expected_count * 4096 && counters[2] == expected_count && counters[4] == 1;
+                if (!match) {
+                    fprintf(stderr, "early-select-test: batch mismatch experts=%d rows=%d shared=%d\n", experts, n_rows, shared);
+                }
+                valid = valid && match;
+                ++cases;
+            }
+        }
+        CUDA_CHECK(cudaFree(d_scores));
+        CUDA_CHECK(cudaFree(d_residents));
+        CUDA_CHECK(cudaFree(d_predicted));
+        CUDA_CHECK(cudaFree(d_positions));
+        CUDA_CHECK(cudaFree(d_counters));
+        CUDA_CHECK(cudaFree(d_prior));
+    }
+    fprintf(stderr, "early-select-test: cases=%d valid=%d\n", cases, valid);
+    return valid;
+}
+
+bool ggml_cuda_moe_grouped_context::early_hc_for_test() {
+    CUDA_CHECK(cudaSetDevice(impl_->device));
+    bool valid = true;
+    for (int streams : {3, 4}) {
+        constexpr int width = 64, rank = 32;
+        const int wide = width * streams;
+        std::vector<float> input(wide), attention(wide), ffn(wide), translated(wide), low(rank), gate(wide), expected(width), actual(width);
+        for (int i = 0; i < wide; ++i) {
+            input[i] = ((i * 7) % 31 - 15) / 16.0f;
+            attention[i] = i % 23 == 0 ? 0.0f : (i % 7 + 1) / 8.0f;
+            ffn[i] = (i % 11 - 5) / 8.0f;
+            translated[i] = attention[i] == 0.0f ? 0.0f : input[i] * ffn[i] / attention[i];
+        }
+        float * scratch;
+        CUDA_CHECK(cudaMalloc(&scratch, (5 * wide + rank + width) * sizeof(float)));
+        float * d_input = scratch, * d_attention = scratch + wide, * d_ffn = scratch + 2 * wide;
+        float * d_low = scratch + 3 * wide, * d_gate = d_low + rank, * d_mixed = d_gate + wide;
+        CUDA_CHECK(cudaMemcpy(d_attention, attention.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_ffn, ffn.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+            std::vector<float> weights(wide * rank);
+            std::vector<block_q8_0> quant(weights.size() / QK8_0);
+            for (size_t b = 0; b < quant.size(); ++b) {
+                quant[b].d = __float2half(1.0f / 256.0f);
+                for (int i = 0; i < QK8_0; ++i) {
+                    const int v = ((b * QK8_0 + i) * 13) % 31 - 15;
+                    quant[b].qs[i] = v;
+                    weights[b * QK8_0 + i] = v / 256.0f;
+                }
+            }
+            ggml_tensor down = {}, up = {};
+            down.type = up.type = type;
+            down.ne[0] = up.ne[1] = wide;
+            down.ne[1] = up.ne[0] = rank;
+            const size_t bytes = type == GGML_TYPE_F32 ? weights.size() * sizeof(float) : quant.size() * sizeof(block_q8_0);
+            CUDA_CHECK(cudaMalloc(&down.data, bytes));
+            up.data = down.data;
+            CUDA_CHECK(cudaMemcpy(down.data, type == GGML_TYPE_F32 ? (void *) weights.data() : (void *) quant.data(), bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_input, input.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
+            moe_early_hc_translate<<<(wide + 255) / 256, 256>>>(d_input, d_attention, d_ffn, wide);
+            moe_early_hc_project<128>(&down, d_input, d_low, streams, 1, nullptr);
+            moe_early_hc_project<32>(&up, d_low, d_gate, streams, 2, nullptr);
+            moe_early_hc_collapse<<<1, 128>>>(d_input, d_gate, d_mixed, width, streams);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(actual.data(), d_mixed, width * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int r = 0; r < rank; ++r) {
+                double sum = 0;
+                for (int i = 0; i < wide; ++i) {
+                    sum += (double) weights[r * wide + i] * translated[i];
+                }
+                sum /= streams;
+                low[r] = sum / (1.0 + exp(-sum));
+            }
+            for (int r = 0; r < wide; ++r) {
+                double sum = 0;
+                for (int i = 0; i < rank; ++i) {
+                    sum += (double) weights[r * rank + i] * low[i];
+                }
+                gate[r] = 1.0 / (1.0 + exp(-sum));
+            }
+            float max_error = 0;
+            for (int i = 0; i < width; ++i) {
+                double sum = 0;
+                for (int s = 0; s < streams; ++s) {
+                    sum += (double) translated[s * width + i] * gate[s * width + i];
+                }
+                expected[i] = sum / streams;
+                const float error = fabsf(actual[i] - expected[i]);
+                valid = valid && std::isfinite(actual[i]) && error < 2e-5f;
+                max_error = std::max(max_error, error);
+            }
+            fprintf(stderr, "early-hc-test: streams=%d type=%s max_abs_error=%g\n", streams, ggml_type_name(type), max_error);
+            constexpr int n_rows = 4;
+            std::vector<float> batch_input(n_rows * wide), batch_actual(n_rows * width), serial(width);
+            for (int row = 0; row < n_rows; ++row) {
+                for (int i = 0; i < wide; ++i) {
+                    batch_input[row * wide + i] = input[i] + row / 8.0f;
+                }
+            }
+            float * batch_scratch;
+            CUDA_CHECK(cudaMalloc(&batch_scratch, n_rows * (2 * wide + rank + width) * sizeof(float)));
+            float * batch_low = batch_scratch + n_rows * wide;
+            float * batch_gate = batch_low + n_rows * rank;
+            float * batch_mixed = batch_gate + n_rows * wide;
+            CUDA_CHECK(cudaMemcpy(batch_scratch, batch_input.data(), batch_input.size() * sizeof(float), cudaMemcpyHostToDevice));
+            moe_early_hc_translate<<<dim3((wide + 255) / 256, n_rows), 256>>>(batch_scratch, d_attention, d_ffn, wide);
+            moe_early_hc_project<128>(&down, batch_scratch, batch_low, streams, 1, nullptr, n_rows);
+            moe_early_hc_project<32>(&up, batch_low, batch_gate, streams, 2, nullptr, n_rows);
+            moe_early_hc_collapse<<<dim3(1, n_rows), 128>>>(batch_scratch, batch_gate, batch_mixed, width, streams);
+            CUDA_CHECK(cudaMemcpy(batch_actual.data(), batch_mixed, batch_actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            bool batch_valid = true;
+            for (int row = 0; row < n_rows; ++row) {
+                CUDA_CHECK(cudaMemcpy(d_input, batch_input.data() + row * wide, wide * sizeof(float), cudaMemcpyHostToDevice));
+                moe_early_hc_translate<<<(wide + 255) / 256, 256>>>(d_input, d_attention, d_ffn, wide);
+                moe_early_hc_project<128>(&down, d_input, d_low, streams, 1, nullptr);
+                moe_early_hc_project<32>(&up, d_low, d_gate, streams, 2, nullptr);
+                moe_early_hc_collapse<<<1, 128>>>(d_input, d_gate, d_mixed, width, streams);
+                CUDA_CHECK(cudaMemcpy(serial.data(), d_mixed, width * sizeof(float), cudaMemcpyDeviceToHost));
+                batch_valid = batch_valid && std::equal(serial.begin(), serial.end(), batch_actual.begin() + row * width);
+            }
+            if (type == GGML_TYPE_F32) {
+                std::vector<float> batch_scores(n_rows * rank), serial_scores(rank);
+                CUDA_CHECK(cudaMemcpy(batch_scratch, batch_input.data(), batch_input.size() * sizeof(float), cudaMemcpyHostToDevice));
+                moe_early_router_scores<<<dim3(rank, n_rows), 128>>>(batch_scratch, d_attention, d_ffn, (const float *) down.data, wide, batch_low);
+                CUDA_CHECK(cudaMemcpy(batch_scores.data(), batch_low, batch_scores.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                for (int row = 0; row < n_rows; ++row) {
+                    moe_early_router_scores<<<rank, 128>>>(batch_scratch + row * wide, d_attention, d_ffn, (const float *) down.data, wide, d_low);
+                    CUDA_CHECK(cudaMemcpy(serial_scores.data(), d_low, rank * sizeof(float), cudaMemcpyDeviceToHost));
+                    batch_valid = batch_valid && std::equal(serial_scores.begin(), serial_scores.end(), batch_scores.begin() + row * rank);
+                }
+                std::vector<float> bias(rank);
+                for (int r = 0; r < rank; ++r) {
+                    bias[r] = (r % 7 - 3) / 16.0f;
+                }
+                CUDA_CHECK(cudaMemcpy(d_gate, bias.data(), rank * sizeof(float), cudaMemcpyHostToDevice));
+                for (float multiplier : {1.0f, 0.125f}) {
+                    moe_early_router_scores<<<dim3(rank, n_rows), 128>>>(
+                        batch_scratch, d_attention, d_ffn, (const float *) down.data, wide, batch_low, multiplier, d_gate);
+                    CUDA_CHECK(cudaMemcpy(batch_scores.data(), batch_low, batch_scores.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                    for (int row = 0; row < n_rows; ++row) {
+                        for (int r = 0; r < rank; ++r) {
+                            double sum = 0;
+                            for (int i = 0; i < wide; ++i) {
+                                const float value = attention[i] != 0.0f ? batch_input[row * wide + i] * (ffn[i] / attention[i]) : 0.0f;
+                                sum += (double) value * weights[r * wide + i];
+                            }
+                            const float expected_score = sum * multiplier + bias[r];
+                            batch_valid &= std::isfinite(batch_scores[row * rank + r]) &&
+                                fabsf(batch_scores[row * rank + r] - expected_score) < 2e-5f;
+                        }
+                    }
+                }
+            }
+            CUDA_CHECK(cudaGetLastError());
+            fprintf(stderr, "early-hc-test: streams=%d type=%s rows=%d serial_exact=%d\n", streams, ggml_type_name(type), n_rows, batch_valid);
+            valid = valid && batch_valid;
+            CUDA_CHECK(cudaFree(batch_scratch));
+            CUDA_CHECK(cudaFree(down.data));
+        }
+        CUDA_CHECK(cudaFree(scratch));
+    }
+    return valid;
+}
+
+bool ggml_cuda_moe_grouped_context::early_copy_for_test(bool capture) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+    CUDA_CHECK(cudaSetDevice(impl_->device));
+    cudaStream_t main;
+    CUDA_CHECK(cudaStreamCreateWithFlags(&main, cudaStreamNonBlocking));
+    constexpr size_t stride = 512 * 1024;
+    constexpr uint32_t experts = 5, top_k = 3;
+    uint32_t * source;
+    CUDA_CHECK(cudaMallocHost(&source, stride * experts * 2));
+    for (size_t i = 0; i < stride * experts * 2 / sizeof(uint32_t); ++i) {
+        source[i] = (uint32_t) i;
+    }
+    bool valid = true;
+    {
+        impl::early_workspace early;
+        early.main_stream = main;
+        early.top_k = top_k;
+        early.staging_bytes = stride * 2 * top_k;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&early.stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&early.ready, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&early.done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaMalloc(&early.staging, early.staging_bytes));
+        CUDA_CHECK(cudaMalloc(&early.predicted, top_k * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&early.counters, 5 * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(early.counters, 0, 5 * sizeof(uint64_t)));
+        early.start_copy_worker(impl_->device);
+        impl::early_workspace::copy_job job{&early, top_k, experts, stride * 2, {}};
+        job.down_bank = 1;
+        for (int b = 0; b < 2; ++b) {
+            ggml_cuda_moe_grouped_bank_descriptor bank;
+            bank.source_data = reinterpret_cast<const char *>(source) + b * stride * experts;
+            bank.expert_stride = stride;
+            job.banks.push_back(bank);
+        }
+        moe_grouped_decode_plan * test_plan = nullptr;
+        moe_grouped_device_bank * test_banks = nullptr;
+        moe_grouped_device_auxiliary * test_auxiliaries = nullptr;
+        float * auxiliary_source = nullptr;
+        float * auxiliary_output = nullptr;
+        constexpr uint32_t auxiliary_sizes[] = {1, 7, 129};
+        constexpr uint32_t n_auxiliaries = 3, auxiliary_values = 137;
+        std::vector<float> auxiliary_expected(experts * auxiliary_values);
+        std::vector<float> auxiliary_actual(top_k * auxiliary_values);
+        int32_t * test_positions = nullptr;
+        char * test_output = nullptr;
+        char * test_head_output = nullptr;
+        size_t plan_bytes = 0;
+        std::vector<uint64_t> plan_storage;
+        {
+            GGML_ASSERT(moe_grouped_plan_size(top_k, experts, &plan_bytes));
+            plan_storage.resize((plan_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+            CUDA_CHECK(cudaMalloc(&test_plan, plan_bytes));
+            CUDA_CHECK(cudaMalloc(&test_banks, 2 * sizeof(moe_grouped_device_bank)));
+            CUDA_CHECK(cudaMalloc(&test_auxiliaries, n_auxiliaries * sizeof(moe_grouped_device_auxiliary)));
+            CUDA_CHECK(cudaMalloc(&auxiliary_source, experts * auxiliary_values * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&auxiliary_output, top_k * auxiliary_values * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&test_positions, experts * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&early.positions, experts * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&test_output, early.staging_bytes));
+            if (early.copy_banks) {
+                CUDA_CHECK(cudaMalloc(&test_head_output, stride * top_k));
+            }
+            moe_grouped_device_bank banks[2];
+            for (int b = 0; b < 2; ++b) {
+                banks[b] = {reinterpret_cast<const char *>(source) + b * stride * experts, test_output + b * stride * top_k, stride};
+            }
+            CUDA_CHECK(cudaMemcpy(test_banks, banks, sizeof(banks), cudaMemcpyHostToDevice));
+            moe_grouped_device_auxiliary auxiliaries[n_auxiliaries];
+            size_t auxiliary_offset = 0;
+            for (uint32_t a = 0; a < n_auxiliaries; ++a) {
+                auxiliaries[a] = {auxiliary_source + auxiliary_offset * experts,
+                    auxiliary_output + auxiliary_offset * top_k, auxiliary_sizes[a]};
+                auxiliary_offset += auxiliary_sizes[a];
+            }
+            CUDA_CHECK(cudaMemcpy(test_auxiliaries, auxiliaries, sizeof(auxiliaries), cudaMemcpyHostToDevice));
+            // Load the gather kernel before the worker has a pending handoff.
+            CUDA_CHECK(cudaMemset(test_plan, 0, plan_bytes));
+            moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                early.staging, early.positions, early.counters);
+            CUDA_CHECK(cudaStreamSynchronize(main));
+            for (uint32_t prefix = 0; early.copy_ready_only && prefix <= top_k; ++prefix) {
+                int32_t positions[experts] = {2, -1, 0, -1, 1};
+                int32_t filtered[experts];
+                CUDA_CHECK(cudaMemcpy(early.positions, positions, sizeof(positions), cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(early.copy_progress, &prefix, sizeof(prefix), cudaMemcpyHostToDevice));
+                moe_early_router_ready_positions<<<1, 128, 0, main>>>(early.positions, experts, early.copy_progress, early.copy_ready_late);
+                CUDA_CHECK(cudaMemcpyAsync(filtered, early.positions, sizeof(filtered), cudaMemcpyDeviceToHost, main));
+                CUDA_CHECK(cudaStreamSynchronize(main));
+                for (uint32_t e = 0; e < experts; ++e) {
+                    const int32_t expected = positions[e] >= 0 && (uint32_t) positions[e] >= prefix ?
+                        (early.copy_ready_late ? -2 - positions[e] : -1) : positions[e];
+                    valid &= filtered[e] == expected;
+                }
+            }
+        }
+        auto enqueue = [&](bool wait_before_gather) {
+            CUDA_CHECK(cudaMemcpyAsync(early.positions, test_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToDevice, main));
+            CUDA_CHECK(cudaEventRecord(early.ready, main));
+            CUDA_CHECK(cudaStreamWaitEvent(early.stream, early.ready, 0));
+            early.enqueue_copy(job);
+            CUDA_CHECK(cudaEventRecord(early.done, early.stream));
+            if (early.copy_banks) {
+                CUDA_CHECK(cudaStreamWaitEvent(main, early.selected, 0));
+                moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                    test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                    early.staging, early.positions, early.counters, 1);
+                CUDA_CHECK(cudaStreamWaitEvent(main, early.head_ready, 0));
+                moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                    test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                    early.staging, early.positions, early.counters, 2, 1);
+                CUDA_CHECK(cudaMemcpyAsync(test_head_output, test_output, stride * top_k, cudaMemcpyDeviceToDevice, main));
+                CUDA_CHECK(cudaStreamWaitEvent(main, early.done, 0));
+                moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                    test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                    early.staging, early.positions, nullptr, 2, 2);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (early.copy_ready_only) {
+                CUDA_CHECK(cudaStreamWaitEvent(main, wait_before_gather ? early.done : early.selected, 0));
+                if (early.copy_ready_late) {
+                    moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                        test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                        early.staging, early.positions, early.counters, 1);
+                }
+                moe_early_router_ready_positions<<<1, 128, 0, main>>>(early.positions, experts, early.copy_progress, early.copy_ready_late);
+                moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                    test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values, top_k, test_plan, nullptr,
+                    early.staging, early.positions, early.counters, early.copy_ready_late ? 3 : 0);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            if (!early.copy_ready_only && !early.copy_banks) {
+                CUDA_CHECK(cudaStreamWaitEvent(main, early.copy_split ? early.selected : early.done, 0));
+                if (early.copy_split) {
+                    moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                        test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values,
+                        top_k, test_plan, nullptr, early.staging, early.positions, early.counters, 1);
+                    CUDA_CHECK(cudaStreamWaitEvent(main, early.done, 0));
+                }
+                moe_grouped_gather_decode<false><<<8, MOE_GROUPED_TRANSFER_THREADS, 0, main>>>(
+                    test_banks, 2, stride * 2 / sizeof(uint4), test_auxiliaries, n_auxiliaries, auxiliary_values,
+                    top_k, test_plan, nullptr, early.staging, early.positions, early.counters, early.copy_split ? 2 : 0);
+                CUDA_CHECK(cudaGetLastError());
+            }
+            CUDA_CHECK(cudaStreamWaitEvent(main, early.done, 0));
+        };
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        if (capture) {
+            CUDA_CHECK(cudaStreamBeginCapture(main, cudaStreamCaptureModeGlobal));
+            for (int layer = 0; layer < 40; ++layer) {
+                enqueue(layer % 2 != 0);
+            }
+            CUDA_CHECK(cudaStreamEndCapture(main, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        }
+        std::vector<uint32_t> actual(early.staging_bytes / sizeof(uint32_t));
+        void * scratch = nullptr;
+        if (getenv("GGML_CUDA_MOE_EARLY_COPY_TEST_FREE") != nullptr) {
+            CUDA_CHECK(cudaMalloc(&scratch, 16 * 1024 * 1024));
+        }
+        for (int step = 0; step < 128; ++step) {
+            int32_t ids[top_k] = {(int32_t) (step % experts), (int32_t) ((step + 2) % experts), -1};
+            const int32_t demand[top_k] = {ids[0], ids[1], (int32_t) ((step + 1) % experts)};
+            {
+                auto * plan = reinterpret_cast<moe_grouped_decode_plan *>(plan_storage.data());
+                plan->status = MOE_GROUPED_PLAN_READY;
+                plan->n_misses = top_k;
+                int32_t positions[experts] = {-1, -1, -1, -1, -1};
+                for (uint32_t p = 0; p < top_k; ++p) {
+                    moe_grouped_plan_array_ptr(plan, top_k, MOE_GROUPED_PLAN_MISS_EXPERTS)[p] = demand[p];
+                    moe_grouped_plan_array_ptr(plan, top_k, MOE_GROUPED_PLAN_MISS_SLOTS)[p] = p;
+                    if (ids[p] >= 0) {
+                        positions[ids[p]] = p;
+                    }
+                }
+                CUDA_CHECK(cudaMemcpyAsync(test_plan, plan, plan_bytes, cudaMemcpyHostToDevice, main));
+                CUDA_CHECK(cudaMemcpyAsync(test_positions, positions, sizeof(positions), cudaMemcpyHostToDevice, main));
+                for (size_t i = 0; i < auxiliary_expected.size(); ++i) {
+                    auxiliary_expected[i] = static_cast<float>(step * auxiliary_expected.size() + i);
+                }
+                CUDA_CHECK(cudaMemcpyAsync(auxiliary_source, auxiliary_expected.data(), auxiliary_expected.size() * sizeof(float), cudaMemcpyHostToDevice, main));
+                CUDA_CHECK(cudaMemsetAsync(auxiliary_output, 0xff, auxiliary_actual.size() * sizeof(float), main));
+                CUDA_CHECK(cudaStreamSynchronize(main));
+            }
+            CUDA_CHECK(cudaMemcpyAsync(early.predicted, ids, sizeof(ids), cudaMemcpyHostToDevice, main));
+            fprintf(stderr, "early-copy-test: step=%d capture=%d enqueue\n", step, capture);
+            if (capture) {
+                CUDA_CHECK(cudaGraphLaunch(executable, main));
+            } else {
+                enqueue(step % 2 != 0);
+            }
+            if (scratch != nullptr) {
+                fprintf(stderr, "early-copy-test: freeing scratch\n");
+                CUDA_CHECK(cudaFree(scratch));
+                scratch = nullptr;
+                fprintf(stderr, "early-copy-test: scratch freed\n");
+            }
+            CUDA_CHECK(cudaMemcpyAsync(actual.data(), early.staging, early.staging_bytes, cudaMemcpyDeviceToHost, main));
+            CUDA_CHECK(cudaStreamSynchronize(main));
+            for (uint32_t p = 0; p < 2; ++p) {
+                for (size_t b = 0; b < 2; ++b) {
+                    const auto * expected = reinterpret_cast<const char *>(job.banks[b].source_data) + ids[p] * stride;
+                    valid &= memcmp(reinterpret_cast<const char *>(actual.data()) + p * stride * 2 + b * stride, expected, stride) == 0;
+                }
+            }
+            {
+                CUDA_CHECK(cudaMemcpy(actual.data(), test_output, early.staging_bytes, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(auxiliary_actual.data(), auxiliary_output, auxiliary_actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                size_t offset = 0;
+                for (uint32_t a = 0; a < n_auxiliaries; ++a) {
+                    for (uint32_t p = 0; p < top_k; ++p) {
+                        valid &= memcmp(auxiliary_actual.data() + offset * top_k + p * auxiliary_sizes[a],
+                            auxiliary_expected.data() + offset * experts + demand[p] * auxiliary_sizes[a],
+                            auxiliary_sizes[a] * sizeof(float)) == 0;
+                    }
+                    offset += auxiliary_sizes[a];
+                }
+                for (size_t b = 0; b < 2; ++b) {
+                    for (uint32_t p = 0; p < top_k; ++p) {
+                        const auto * expected = reinterpret_cast<const char *>(job.banks[b].source_data) + demand[p] * stride;
+                        valid &= memcmp(reinterpret_cast<const char *>(actual.data()) + (b * top_k + p) * stride, expected, stride) == 0;
+                    }
+                }
+                if (early.copy_banks) {
+                    CUDA_CHECK(cudaMemcpy(actual.data(), test_head_output, stride * top_k, cudaMemcpyDeviceToHost));
+                    for (uint32_t p = 0; p < top_k; ++p) {
+                        const auto * expected = reinterpret_cast<const char *>(source) + demand[p] * stride;
+                        valid &= memcmp(reinterpret_cast<const char *>(actual.data()) + p * stride, expected, stride) == 0;
+                    }
+                }
+            }
+        }
+        if (executable != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(executable));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        CUDA_CHECK(cudaFree(test_plan));
+        CUDA_CHECK(cudaFree(test_banks));
+        CUDA_CHECK(cudaFree(test_auxiliaries));
+        CUDA_CHECK(cudaFree(auxiliary_source));
+        CUDA_CHECK(cudaFree(auxiliary_output));
+        CUDA_CHECK(cudaFree(test_positions));
+        CUDA_CHECK(cudaFree(test_output));
+        CUDA_CHECK(cudaFree(test_head_output));
+    }
+    CUDA_CHECK(cudaFreeHost(source));
+    const uint32_t distance = moe_early_router_lookahead();
+    if (distance != 0) {
+        constexpr uint32_t groups = 40;
+        constexpr size_t bank_stride = 4096;
+        constexpr size_t staged_bytes = bank_stride * 2 * top_k;
+        std::vector<std::unique_ptr<impl::early_workspace>> lanes;
+        std::vector<impl::early_workspace *> clients;
+        std::vector<impl::early_workspace::copy_job> jobs;
+        CUDA_CHECK(cudaMallocHost(&source, bank_stride * experts * 2));
+        for (size_t i = 0; i < bank_stride * experts * 2 / sizeof(uint32_t); ++i) {
+            source[i] = (uint32_t) i ^ 0xabc123;
+        }
+        for (uint32_t i = 0; i <= distance; ++i) {
+            auto lane = std::make_unique<impl::early_workspace>();
+            lane->main_stream = main;
+            lane->top_k = top_k;
+            lane->staging_bytes = staged_bytes;
+            CUDA_CHECK(cudaStreamCreateWithFlags(&lane->stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lane->ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&lane->done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaMalloc(&lane->staging, staged_bytes));
+            CUDA_CHECK(cudaMalloc(&lane->predicted, top_k * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&lane->counters, 5 * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMemset(lane->counters, 0, 5 * sizeof(uint64_t)));
+            lane->start_copy_worker(impl_->device, false);
+            GGML_ASSERT(lane->copy_mailbox && !lane->copy_banks && !lane->copy_ready_only);
+            clients.push_back(lane.get());
+            lanes.push_back(std::move(lane));
+        }
+        for (uint32_t group = 0; group < groups; ++group) {
+            impl::early_workspace::copy_job job{clients[group % clients.size()], top_k, experts, bank_stride * 2, {}};
+            for (uint32_t b = 0; b < 2; ++b) {
+                ggml_cuda_moe_grouped_bank_descriptor bank;
+                bank.source_data = reinterpret_cast<const char *>(source) + b * bank_stride * experts;
+                bank.expert_stride = bank_stride;
+                job.banks.push_back(bank);
+            }
+            jobs.push_back(std::move(job));
+        }
+        int32_t * device_ids;
+        char * output;
+        CUDA_CHECK(cudaMalloc(&device_ids, groups * top_k * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&output, groups * staged_bytes));
+        std::vector<int32_t> ids(groups * top_k);
+        std::vector<char> actual(groups * staged_bytes);
+        clients[0]->launch_copy_worker(impl_->device, clients);
+        const auto enqueue = [&] {
+            const auto publish = [&](uint32_t group) {
+                auto & lane = *jobs[group].owner;
+                CUDA_CHECK(cudaMemcpyAsync(lane.predicted, device_ids + group * top_k, top_k * sizeof(int32_t), cudaMemcpyDeviceToDevice, main));
+                CUDA_CHECK(cudaEventRecord(lane.ready, main));
+                CUDA_CHECK(cudaStreamWaitEvent(lane.stream, lane.ready, 0));
+                lane.enqueue_copy(jobs[group]);
+                CUDA_CHECK(cudaEventRecord(lane.done, lane.stream));
+            };
+            for (uint32_t group = 0; group < groups; ++group) {
+                if (group < distance) {
+                    publish(group);
+                }
+                if (group + distance < groups) {
+                    publish(group + distance);
+                }
+                const auto & lane = *jobs[group].owner;
+                CUDA_CHECK(cudaStreamWaitEvent(main, lane.done, 0));
+                CUDA_CHECK(cudaMemcpyAsync(output + group * staged_bytes, lane.staging, staged_bytes, cudaMemcpyDeviceToDevice, main));
+            }
+        };
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t executable = nullptr;
+        if (capture) {
+            CUDA_CHECK(cudaStreamBeginCapture(main, cudaStreamCaptureModeGlobal));
+            enqueue();
+            CUDA_CHECK(cudaStreamEndCapture(main, &graph));
+            CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        }
+        for (uint32_t step = 0; step < 128; ++step) {
+            for (uint32_t group = 0; group < groups; ++group) {
+                for (uint32_t p = 0; p < top_k; ++p) {
+                    ids[group * top_k + p] = p == 2 ? -1 : static_cast<int32_t>((step + group * 3 + p) % experts);
+                }
+            }
+            CUDA_CHECK(cudaMemcpyAsync(device_ids, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, main));
+            if (capture) {
+                CUDA_CHECK(cudaGraphLaunch(executable, main));
+            } else {
+                enqueue();
+            }
+            CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, actual.size(), cudaMemcpyDeviceToHost, main));
+            CUDA_CHECK(cudaStreamSynchronize(main));
+            for (uint32_t group = 0; group < groups; ++group) {
+                for (uint32_t p = 0; p < 2; ++p) {
+                    for (uint32_t b = 0; b < 2; ++b) {
+                        const auto * expected = reinterpret_cast<const char *>(source) + (b * experts + ids[group * top_k + p]) * bank_stride;
+                        valid &= memcmp(actual.data() + group * staged_bytes + (p * 2 + b) * bank_stride, expected, bank_stride) == 0;
+                    }
+                }
+            }
+        }
+        if (executable != nullptr) {
+            CUDA_CHECK(cudaGraphExecDestroy(executable));
+            CUDA_CHECK(cudaGraphDestroy(graph));
+        }
+        clients[0]->stop_copy_worker();
+        lanes.clear();
+        CUDA_CHECK(cudaFree(device_ids));
+        CUDA_CHECK(cudaFree(output));
+        CUDA_CHECK(cudaFreeHost(source));
+        fprintf(stderr, "early-copy-test: lookahead=%u lanes=%u capture=%d interleaved_jobs=%u exact=%d\n",
+            distance, distance + 1, capture, groups * 128, valid);
+    }
+    CUDA_CHECK(cudaStreamDestroy(main));
+    fprintf(stderr, "early-copy-test: capture=%d exact=%d\n", capture, valid);
+    return valid;
+#else
+    return false;
+#endif
+}
+
 static void moe_candidate_graph_mmid_fingerprint_add(
         uint64_t & fingerprint,
         int32_t node_index,
@@ -6601,6 +8762,455 @@ bool ggml_cuda_moe_grouped_context::get_group_resource_bank(
     return true;
 }
 
+void ggml_cuda_moe_grouped_context::configure_early_router(
+        const ggml_cgraph * graph, ggml_cuda_moe_graph_execution * execution, cudaStream_t stream, bool capture,
+        ggml_backend_cuda_context & parent) {
+    if (!moe_early_router_enabled()) {
+        return;
+    }
+    impl_->early_bindings.clear();
+    for (auto & lane : impl_->early) {
+        GGML_ASSERT(lane->active_group == UINT32_MAX);
+    }
+    // Eager warmup can allocate while the worker has pending CUDA submissions.
+    if (moe_early_router_copy_engine() && !capture) {
+        return;
+    }
+    if (execution == nullptr || execution->plan_ == nullptr ||
+            execution->outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        return;
+    }
+    const auto & certificate = execution->plan_->execution_certificate_;
+    const bool main = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN &&
+        (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+         certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE);
+    const bool mtp = certificate.domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP &&
+        (certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ||
+         certificate.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL);
+    if (!main && !mtp) {
+        return;
+    }
+    const uint32_t distance = moe_early_router_lookahead();
+    GGML_ASSERT(distance == 0 || moe_early_router_copy_engine());
+    const char * native_setting = getenv("GGML_CUDA_MOE_EARLY_ROUTER_NATIVE");
+    const bool native_only = native_setting != nullptr && strcmp(native_setting, "1") == 0;
+    size_t max_bytes = 0;
+    uint32_t max_width = 0, max_experts = 0, max_top_k = 0, max_hc_rank = 0, hc_groups = 0, max_rows = 1;
+    std::unordered_map<const ggml_tensor *, int> node_order;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        node_order.emplace(graph->nodes[i], i);
+    }
+    const auto gpu_f32 = [&](const ggml_tensor * t) {
+        return t != nullptr && t->data != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+            t->buffer != nullptr && t->buffer->buft == ggml_backend_cuda_buffer_type(impl_->device);
+    };
+    for (uint32_t index = 0; index < execution->n_groups_; ++index) {
+        const auto & group = execution->groups_[index];
+        if (group.strategy != GGML_CUDA_MOE_EXECUTION_STRATEGY_DEVICE_DIRECT ||
+                group.key.ids.ne[1] < 1 || group.key.ids.ne[2] != 1 || group.key.ids.ne[3] != 1 ||
+                group.stream != stream || group.first_reader == nullptr || group.key.candidate.group_index >= impl_->resources.size()) {
+            continue;
+        }
+        const auto & resource = impl_->resources[group.key.candidate.group_index];
+        if (resource == nullptr || resource->device == nullptr) {
+            continue;
+        }
+        const auto decline = [&](const char * reason) {
+            fprintf(stderr, "moe-early-router: group=%u prediction=disabled reason=%s; grouped demand unchanged\n", index, reason);
+        };
+        const auto * ids = group.first_reader->src[2];
+        const auto * scores = moe_router_scores_node(ids);
+        const auto * router = moe_router_projection(ids);
+        if (scores == nullptr || (router != nullptr && (router->src[0] == nullptr || router->src[1] == nullptr))) {
+            decline("no unambiguous graph-described router scores");
+            continue;
+        }
+        const auto * late = moe_router_boundary(router != nullptr ? router->src[1] : scores);
+        float ffn_multiplier = 1.0f;
+        const bool normalized = moe_router_normalized(late, ffn_multiplier);
+        if (!gpu_f32(late) || ggml_nelements(late) != late->ne[0] * group.key.ids.ne[1] ||
+                (normalized && !gpu_f32(late->src[1])) ||
+                (router == nullptr && late == scores) ||
+                (router != nullptr && (router->src[0]->ne[1] != resource->device->n_experts || ggml_n_dims(router->src[0]) != 2))) {
+            decline("unsupported router boundary shape or device");
+            continue;
+        }
+        const ggml_tensor * input = late;
+        const ggml_tensor * trigger = router != nullptr ? router : scores;
+        const ggml_tensor * ffn_trigger = trigger;
+        float input_multiplier = ffn_multiplier;
+        const auto previous = index == 0 ? node_order.end() : node_order.find(execution->groups_[index - 1].last_reader);
+        const int begin = previous == node_order.end() ? 0 : previous->second + 1;
+        const auto late_pos = node_order.find(late);
+        if (late_pos == node_order.end()) {
+            decline("router boundary is outside this backend graph");
+            continue;
+        }
+        for (int i = late_pos->second + 1; i < graph->n_nodes; ++i) {
+            const auto * node = graph->nodes[i];
+            if (node->op == GGML_OP_MUL_MAT && node->src[1] == late) {
+                ffn_trigger = node;
+                trigger = node;
+                break;
+            }
+        }
+        if (normalized) {
+            for (int i = begin; i < late_pos->second; ++i) {
+                const auto * node = graph->nodes[i];
+                float multiplier;
+                if (node->op == GGML_OP_MUL_MAT && moe_router_normalized(node->src[1], multiplier) &&
+                        gpu_f32(node->src[1]) && gpu_f32(node->src[1]->src[1]) &&
+                        ggml_are_same_shape(node->src[1], late)) {
+                    input = node->src[1];
+                    input_multiplier = multiplier;
+                    trigger = node;
+                    break;
+                }
+            }
+        }
+        const ggml_tensor * router_bias = nullptr;
+        const ggml_tensor * hc_down = nullptr;
+        const ggml_tensor * hc_up = nullptr;
+        uint32_t hc_streams = 0;
+        const bool plain_selection = router != nullptr && moe_router_plain_selection(ids, router, &router_bias);
+        const bool router_f32 = router != nullptr && gpu_f32(router->src[0]) &&
+            (router_bias == nullptr || (gpu_f32(router_bias) && ggml_nelements(router_bias) == resource->device->n_experts));
+        bool hc = !native_only && normalized && plain_selection && router_f32 && router_bias == nullptr &&
+            input_multiplier == 1.0f && ffn_multiplier == 1.0f &&
+            moe_router_hc_pattern(router->src[1], late, router, &hc_down, &hc_up, hc_streams);
+        if (hc) {
+            const auto gpu_hc_weight = [&](const ggml_tensor * t) {
+                return t != nullptr && t->data != nullptr && ggml_n_dims(t) == 2 && ggml_is_contiguous(t) &&
+                    (t->type == GGML_TYPE_F32 || (t->type == GGML_TYPE_Q8_0 && t->ne[0] % QK8_0 == 0)) &&
+                    t->buffer != nullptr && t->buffer->buft == ggml_backend_cuda_buffer_type(impl_->device);
+            };
+            hc = gpu_hc_weight(hc_down) && gpu_hc_weight(hc_up) &&
+                hc_down->ne[0] == late->ne[0] && hc_up->ne[1] == late->ne[0] && hc_up->ne[0] == hc_down->ne[1];
+        }
+        const bool plain = !native_only && normalized && plain_selection && router_f32 &&
+            router->src[1] == late && router->src[0]->ne[0] == late->ne[0];
+        if (hc) {
+            max_hc_rank = std::max(max_hc_rank, (uint32_t) hc_up->ne[0]);
+            ++hc_groups;
+        } else {
+            hc_down = hc_up = nullptr;
+            hc_streams = 0;
+        }
+        const uint32_t top_k = group.key.ids.ne[0];
+        const uint32_t n_rows = group.key.ids.ne[1];
+        max_rows = std::max(max_rows, n_rows);
+        max_bytes = std::max(max_bytes, resource->device->words_per_miss * sizeof(uint4) * top_k);
+        max_width = std::max(max_width, (uint32_t) late->ne[0]);
+        max_experts = std::max(max_experts, resource->device->n_experts);
+        max_top_k = std::max(max_top_k, top_k);
+        impl::early_binding binding{
+            group.key.candidate.group_index, top_k, input, normalized ? input->src[1] : nullptr,
+            normalized ? late->src[1] : nullptr, router != nullptr ? router->src[0] : nullptr, hc_down, hc_up, hc_streams,
+            group.last_reader, late, ffn_trigger, 0, n_rows, input_multiplier, ffn_multiplier, router_bias};
+        binding.selected_ids = ids;
+        binding.native_router = !plain && !hc;
+        binding.order = index;
+        if (!impl_->early_bindings.emplace(trigger, binding).second) {
+            decline("prediction trigger is already owned");
+        }
+    }
+    if (impl_->early_bindings.empty()) {
+        return;
+    }
+    // Graph order defines distance; candidate indices need not follow layer order.
+    std::vector<std::pair<const ggml_tensor *, impl::early_binding>> ordered;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const auto it = impl_->early_bindings.find(graph->nodes[i]);
+        if (it != impl_->early_bindings.end()) {
+            ordered.push_back(*it);
+        }
+    }
+    uint32_t lane_base = impl_->early.size();
+    for (uint32_t base = 0; base < impl_->early.size(); base += distance + 1) {
+        const auto & lane = *impl_->early[base];
+        if (lane.n_rows >= max_rows && lane.width >= max_width && lane.experts >= max_experts &&
+                lane.hc_rank >= max_hc_rank && lane.top_k >= max_top_k * max_rows && lane.staging_bytes >= max_bytes * max_rows) {
+            lane_base = base;
+            break;
+        }
+    }
+    impl_->early_bindings.clear();
+    for (size_t i = 0; i < ordered.size(); ++i) {
+        auto binding = ordered[i].second;
+        const ggml_tensor * trigger = ordered[i].first;
+        binding.lane = lane_base + binding.order % (distance + 1);
+        const auto source_entry = std::find_if(ordered.begin(), ordered.end(), [&](const auto & entry) {
+            return binding.order >= distance && entry.second.order == binding.order - distance;
+        });
+        if (distance != 0 && source_entry != ordered.end()) {
+            const auto & source = source_entry->second;
+            if (source.ffn_input->ne[0] != binding.input->ne[0] || source.n_rows != binding.n_rows ||
+                    (source.ffn_scale == nullptr) != (binding.ffn_scale == nullptr) ||
+                    !gpu_f32(source.ffn_input) || (source.ffn_scale != nullptr && !gpu_f32(source.ffn_scale))) {
+                fprintf(stderr, "moe-early-router: group=%u lookahead=0 reason=incompatible source boundary\n", binding.order);
+            } else {
+                trigger = source.ffn_trigger;
+                binding.input = source.ffn_input;
+                binding.attention_scale = source.ffn_scale;
+                binding.input_multiplier = source.ffn_multiplier;
+            }
+        }
+        if (!impl_->early_bindings.emplace(trigger, binding).second) {
+            fprintf(stderr, "moe-early-router: group=%u prediction=disabled reason=shared lookahead trigger; grouped demand unchanged\n", binding.order);
+        }
+    }
+    if (lane_base == impl_->early.size()) {
+        // Captured graphs retain their buffers and jobs when a larger batch arrives.
+        if (!impl_->early.empty()) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (const auto & lane : impl_->early) {
+                CUDA_CHECK(cudaStreamSynchronize(lane->stream));
+            }
+            impl_->early[0]->stop_copy_worker();
+            impl_->early[0]->copy_stop = false;
+        }
+        uint32_t row_capacity = 1;
+        while (row_capacity < max_rows) {
+            row_capacity *= 2;
+        }
+        for (uint32_t lane = 0; lane <= distance; ++lane) {
+            auto early = std::make_unique<impl::early_workspace>();
+            early->main_stream = stream;
+            early->staging_bytes = max_bytes * row_capacity;
+            early->width = max_width;
+            early->experts = max_experts;
+            early->top_k = max_top_k * row_capacity;
+            early->n_rows = row_capacity;
+            early->hc_rank = max_hc_rank;
+            CUDA_CHECK(cudaStreamCreateWithFlags(&early->stream, cudaStreamNonBlocking));
+            CUDA_CHECK(cudaEventCreateWithFlags(&early->ready, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&early->done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaMalloc(&early->input, row_capacity * max_width * sizeof(float)));
+            if (max_hc_rank != 0) {
+                CUDA_CHECK(cudaMalloc(&early->hc_low, row_capacity * max_hc_rank * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&early->hc_gate, row_capacity * max_width * sizeof(float)));
+                CUDA_CHECK(cudaMalloc(&early->hc_mixed, row_capacity * max_width * sizeof(float)));
+            }
+            CUDA_CHECK(cudaMalloc(&early->scores, row_capacity * max_experts * sizeof(float)));
+            CUDA_CHECK(cudaMalloc(&early->predicted, early->top_k * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&early->positions, max_experts * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&early->staging, early->staging_bytes));
+            CUDA_CHECK(cudaMalloc(&early->counters, 5 * sizeof(uint64_t)));
+            CUDA_CHECK(cudaMemsetAsync(early->counters, 0, 5 * sizeof(uint64_t), stream));
+            early->copy_engine = moe_early_router_copy_engine();
+            if (early->copy_engine) {
+                early->start_copy_worker(impl_->device, false);
+                GGML_ASSERT(distance == 0 || (early->copy_mailbox && !early->copy_banks && !early->copy_ready_only));
+            }
+            impl_->early.push_back(std::move(early));
+        }
+        if (impl_->early[0]->copy_engine) {
+            std::vector<impl::early_workspace *> clients;
+            for (auto & lane : impl_->early) {
+                clients.push_back(lane.get());
+            }
+            impl_->early[0]->launch_copy_worker(impl_->device, clients);
+        }
+        fprintf(stderr, "moe-early-router: experimental rows=%u capacity=%u staging=%zu bytes groups=%zu hc_groups=%u hc_rank=%u stage_block_cap=%u copy_engine=%d lookahead=%u lanes=%zu boundary=same-layer\n",
+            max_rows, row_capacity, max_bytes * row_capacity * (distance + 1), impl_->early_bindings.size(), hc_groups, max_hc_rank,
+            moe_early_router_stage_block_cap(impl_->device), impl_->early[0]->copy_engine, distance, impl_->early.size());
+    }
+    for (auto it = impl_->early_bindings.begin(); it != impl_->early_bindings.end();) {
+        auto & binding = it->second;
+        if (!binding.native_router) {
+            ++it;
+            continue;
+        }
+        auto & early = *impl_->early[binding.lane];
+        const auto signature = moe_router_program::describe(binding.ffn_input, binding.selected_ids);
+        for (const auto & program : impl_->early_programs) {
+            if (program->group == binding.group && program->lane == binding.lane && program->signature == signature) {
+                binding.program = program.get();
+                break;
+            }
+        }
+        const bool new_program = binding.program == nullptr;
+        if (new_program) {
+            std::string reason;
+            auto program = moe_router_program::create(binding.ffn_input, binding.selected_ids, impl_->device, reason);
+            if (program == nullptr) {
+                fprintf(stderr, "moe-early-router: group=%u prediction=disabled reason=%s; grouped demand unchanged\n", binding.order, reason.c_str());
+                it = impl_->early_bindings.erase(it);
+                continue;
+            }
+            program->group = binding.group;
+            program->lane = binding.lane;
+            binding.program = program.get();
+            impl_->early_programs.push_back(std::move(program));
+        }
+        const bool new_context = early.router_context == nullptr;
+        if (!binding.program->bind_inputs(binding.selected_ids, impl_->device, binding.index_inputs)) {
+            fprintf(stderr, "moe-early-router: group=%u prediction=disabled reason=unsupported router index input; grouped demand unchanged\n", binding.order);
+            it = impl_->early_bindings.erase(it);
+            continue;
+        }
+        if (new_context) {
+            auto context = std::make_unique<ggml_backend_cuda_context>(impl_->device);
+            context->streams[impl_->device][0] = early.stream;
+            early.router_context = context.get();
+            parent.moe_router_contexts.push_back(std::move(context));
+        }
+        if (new_program || new_context) {
+            CUDA_CHECK(cudaMemsetAsync(ggml_backend_buffer_get_base(binding.program->buffer), 0, binding.program->bytes, early.stream));
+            binding.program->compute(*early.router_context);
+            CUDA_CHECK(cudaStreamSynchronize(early.stream));
+        }
+        ++it;
+    }
+    uint32_t native_groups = 0;
+    for (const auto & entry : impl_->early_bindings) {
+        native_groups += entry.second.native_router;
+    }
+    fprintf(stderr, "moe-early-router: graph coverage=%zu/%u optimized=%zu native=%u; unbound groups use grouped demand\n",
+        impl_->early_bindings.size(), execution->n_groups_, impl_->early_bindings.size() - native_groups, native_groups);
+    if (impl_->early[0]->copy_engine) {
+        for (const auto & entry : impl_->early_bindings) {
+            const auto & binding = entry.second;
+            const auto & resource = *impl_->resources[binding.group];
+            auto & early = *impl_->early[binding.lane];
+            auto & job = early.copy_jobs[binding.copy_key()];
+            if (job == nullptr) {
+                job = std::make_unique<impl::early_workspace::copy_job>(impl::early_workspace::copy_job{
+                    &early, binding.top_k * binding.n_rows, resource.device->n_experts,
+                    resource.device->words_per_miss * sizeof(uint4), resource.snapshot.banks});
+                size_t bytes = 0;
+                for (const auto & bank : job->banks) {
+                    cudaPointerAttributes attributes = {};
+                    CUDA_CHECK(cudaPointerGetAttributes(&attributes, bank.source_data));
+                    GGML_ASSERT(attributes.type == cudaMemoryTypeHost);
+                    bytes += bank.expert_stride;
+                }
+                GGML_ASSERT(bytes == job->entry_bytes && bytes * job->top_k <= early.staging_bytes);
+            }
+            GGML_ASSERT(job->top_k == binding.top_k * binding.n_rows && job->experts == resource.device->n_experts &&
+                job->entry_bytes == resource.device->words_per_miss * sizeof(uint4) && job->banks.size() == resource.snapshot.banks.size());
+            for (size_t b = 0; b < job->banks.size(); ++b) {
+                if (job->banks[b].role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT) {
+                    job->down_bank = b;
+                }
+                GGML_ASSERT(job->banks[b].source_data == resource.snapshot.banks[b].source_data &&
+                    job->banks[b].expert_stride == resource.snapshot.banks[b].expert_stride);
+            }
+        }
+    }
+}
+
+void ggml_cuda_moe_grouped_context::launch_early_router(
+        const ggml_tensor * node, ggml_cuda_moe_graph_execution * execution, cudaStream_t stream) {
+    finish_early_router_banks(node, stream);
+    if (!moe_early_router_enabled() || impl_->early.empty() || execution == nullptr ||
+            execution->outcome() != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        return;
+    }
+    auto it = impl_->early_bindings.find(node);
+    if (it == impl_->early_bindings.end()) {
+        return;
+    }
+    const auto & binding = it->second;
+    auto & early = *impl_->early[binding.lane];
+    const auto & resource = *impl_->resources[binding.group];
+    const auto & device = *resource.device;
+    GGML_ASSERT(early.active_group == UINT32_MAX && stream == early.main_stream);
+    const uint32_t n_rows = binding.n_rows;
+    early.down_reader = binding.down_reader;
+    CUDA_CHECK(cudaMemcpyAsync(early.input, binding.input->data, ggml_nbytes(binding.input), cudaMemcpyDeviceToDevice, stream));
+    for (const auto & index : binding.index_inputs) {
+        CUDA_CHECK(cudaMemcpyAsync(index.second->data, index.first->data, ggml_nbytes(index.first), cudaMemcpyDeviceToDevice, stream));
+    }
+    CUDA_CHECK(cudaEventRecord(early.ready, stream));
+    CUDA_CHECK(cudaStreamWaitEvent(early.stream, early.ready, 0));
+    if (binding.native_router) {
+        GGML_ASSERT(binding.program != nullptr && early.router_context != nullptr);
+        moe_early_hc_translate<<<dim3((binding.input->ne[0] + 255) / 256, n_rows), 256, 0, early.stream>>>(
+            early.input, binding.attention_scale != nullptr ? (const float *) binding.attention_scale->data : nullptr,
+            binding.ffn_scale != nullptr ? (const float *) binding.ffn_scale->data : nullptr,
+            binding.input->ne[0], binding.ffn_multiplier / binding.input_multiplier);
+        CUDA_CHECK(cudaMemcpyAsync(binding.program->input->data, early.input, ggml_nbytes(binding.program->input), cudaMemcpyDeviceToDevice, early.stream));
+        binding.program->compute(*early.router_context);
+    } else if (binding.hc_streams != 0) {
+        const int wide = binding.input->ne[0];
+        const int width = binding.weights->ne[0];
+        moe_early_hc_translate<<<dim3((wide + 255) / 256, n_rows), 256, 0, early.stream>>>(
+            early.input, (const float *) binding.attention_scale->data, (const float *) binding.ffn_scale->data, wide);
+        moe_early_hc_project<128>(binding.hc_down, early.input, early.hc_low, binding.hc_streams, 1, early.stream, n_rows);
+        moe_early_hc_project<32>(binding.hc_up, early.hc_low, early.hc_gate, binding.hc_streams, 2, early.stream, n_rows);
+        moe_early_hc_collapse<<<dim3((width + 255) / 256, n_rows), 256, 0, early.stream>>>(early.input, early.hc_gate, early.hc_mixed, width, binding.hc_streams);
+        moe_early_hc_project<128>(binding.weights, early.hc_mixed, early.scores, 1, 0, early.stream, n_rows);
+    } else {
+        moe_early_router_scores<<<dim3(device.n_experts, n_rows), 128, 0, early.stream>>>(
+            early.input, (const float *) binding.attention_scale->data, (const float *) binding.ffn_scale->data,
+            (const float *) binding.weights->data, binding.input->ne[0], early.scores,
+            binding.ffn_multiplier / binding.input_multiplier, binding.router_bias != nullptr ? (const float *) binding.router_bias->data : nullptr);
+    }
+    if (binding.native_router) {
+        const auto * ids = binding.program->ids;
+        if (n_rows == 1) {
+            moe_early_router_select<1, false, true><<<1, 32, 0, early.stream>>>(nullptr, device.n_experts, binding.top_k,
+                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.predicted, early.positions,
+                early.counters, device.words_per_miss * sizeof(uint4), n_rows, (const int32_t *) ids->data, ids->nb[1]);
+        } else {
+            moe_early_router_select<1, true, true><<<1, 32, 0, early.stream>>>(nullptr, device.n_experts, binding.top_k,
+                device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.predicted, early.positions,
+                early.counters, device.words_per_miss * sizeof(uint4), n_rows, (const int32_t *) ids->data, ids->nb[1]);
+        }
+    } else if (n_rows == 1) {
+        moe_early_router_select_launch(early.scores, device.n_experts, binding.top_k,
+            device.slot_for_expert, device.plan, resource.snapshot.n_slots,
+            early.predicted, early.positions, early.counters, device.words_per_miss * sizeof(uint4), early.stream);
+    } else {
+        moe_early_router_select_launch<1, true>(early.scores, device.n_experts, binding.top_k,
+            device.slot_for_expert, device.plan, resource.snapshot.n_slots,
+            early.predicted, early.positions, early.counters, device.words_per_miss * sizeof(uint4), early.stream, n_rows);
+    }
+    if (early.copy_engine) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+        early.active_copy = early.copy_jobs.at(binding.copy_key()).get();
+        early.enqueue_copy(*early.active_copy);
+#endif
+    } else {
+        const uint32_t blocks = std::min(moe_early_router_stage_block_cap(impl_->device),
+            moe_grouped_transfer_blocks(impl_->device, device.words_per_miss, 0, binding.top_k * n_rows));
+        moe_early_router_stage<<<blocks, MOE_GROUPED_TRANSFER_THREADS, 0, early.stream>>>(
+            device.device_banks, resource.snapshot.banks.size(), device.words_per_miss, early.predicted, binding.top_k * n_rows, early.staging);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(early.done, early.stream));
+    early.active_group = binding.group;
+}
+
+void ggml_cuda_moe_grouped_context::finish_early_router_banks(const ggml_tensor * node, cudaStream_t stream) {
+    if (impl_->early.empty() || !impl_->early[0]->copy_banks) {
+        return;
+    }
+    impl::early_workspace * early = nullptr;
+    for (const auto & lane : impl_->early) {
+        if (lane->pending_bank_mask != 0 && lane->down_reader == node) {
+            early = lane.get();
+            break;
+        }
+    }
+    if (early == nullptr || early->pending_bank_mask == 0 || node != early->down_reader) {
+        return;
+    }
+    GGML_ASSERT(stream == early->main_stream && early->active_group < impl_->resources.size());
+    const auto & resource = *impl_->resources[early->active_group];
+    auto & device = *resource.device;
+    CUDA_CHECK(cudaStreamWaitEvent(stream, early->done, 0));
+    const uint32_t blocks = moe_grouped_transfer_blocks(impl_->device, device.words_per_miss, 0, early->active_copy->top_k);
+    moe_grouped_gather_decode<false><<<blocks, MOE_GROUPED_TRANSFER_THREADS, 0, stream>>>(
+        device.device_banks, resource.snapshot.banks.size(), device.words_per_miss,
+        nullptr, 0, 0, resource.snapshot.n_slots, device.plan, nullptr,
+        early->staging, early->positions, nullptr, 2, early->pending_bank_mask);
+    CUDA_CHECK(cudaGetLastError());
+    early->pending_bank_mask = 0;
+    early->active_group = UINT32_MAX;
+}
+
 ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decode(
         const ggml_cuda_moe_complete_group_key & key,
         cudaStream_t compute_stream,
@@ -6734,6 +9344,16 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             }
         }
 
+        auto * early = impl_->early_for_group(key.candidate.group_index);
+        const bool bank_split = early != nullptr && early->copy_banks;
+        const uint32_t down_mask = bank_split ? uint32_t{1} << early->active_copy->down_bank : 0;
+        const uint32_t head_mask = ~down_mask;
+        const bool ready_only = early != nullptr && early->copy_ready_only;
+        const bool ready_late = early != nullptr && early->copy_ready_late;
+        const bool split_early = early != nullptr && early->copy_split && (!ready_only || ready_late);
+        if (early != nullptr) {
+            CUDA_CHECK(cudaStreamWaitEvent(compute_stream, early->copy_split ? early->selected : early->done, 0));
+        }
         const uint32_t plan_threads = moe_grouped_plan_threads(resource->snapshot.n_slots);
         moe_grouped_plan_decode<<<1, plan_threads, 0, compute_stream>>>(
             static_cast<const int32_t *>(ids->data), n_routes, top_k, row_stride,
@@ -6742,20 +9362,61 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
         CUDA_CHECK(cudaGetLastError());
+#if CUDART_VERSION >= 12080
+        if (ready_only && !ready_late) {
+            moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(early->positions, device.n_experts, early->copy_progress);
+            CUDA_CHECK(cudaGetLastError());
+        }
+#endif
         auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
         uint64_t * transfer_counters = debug != nullptr ? debug->device_transfers.load(std::memory_order_acquire) : nullptr;
         const uint32_t transfer_blocks = moe_grouped_transfer_blocks(
             impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, n_routes);
+        if (split_early) {
+            if (transfer_counters != nullptr) {
+                moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+                    device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
+                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
+                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                    early->staging, early->positions, early->counters, 1);
+            } else {
+                moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+                    device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
+                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
+                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                    early->staging, early->positions, early->counters, 1);
+            }
+            CUDA_CHECK(cudaGetLastError());
+#if CUDART_VERSION >= 12080
+            if (ready_late) {
+                moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(early->positions, device.n_experts, early->copy_progress, true);
+                CUDA_CHECK(cudaGetLastError());
+            } else
+#endif
+            {
+                CUDA_CHECK(cudaStreamWaitEvent(compute_stream, bank_split ? early->head_ready : early->done, 0));
+            }
+        }
         if (transfer_counters != nullptr) {
             moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters);
+                device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                early != nullptr ? early->staging : nullptr, early != nullptr ? early->positions : nullptr,
+                early != nullptr ? early->counters : nullptr, ready_late ? 3 : split_early ? 2 : 0, head_mask);
         } else {
             moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr);
+                device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                early != nullptr ? early->staging : nullptr, early != nullptr ? early->positions : nullptr,
+                early != nullptr ? early->counters : nullptr, ready_late ? 3 : split_early ? 2 : 0, head_mask);
+        }
+        if (bank_split) {
+            GGML_ASSERT(early->down_reader != nullptr && early->pending_bank_mask == 0);
+            early->pending_bank_mask = down_mask;
+        } else if (early != nullptr && !ready_only) {
+            early->active_group = UINT32_MAX;
         }
         CUDA_CHECK(cudaGetLastError());
         decode->transaction = transaction;
@@ -6789,11 +9450,19 @@ bool ggml_cuda_moe_grouped_context::finish_decode(
     if (compute_stream == nullptr) {
         return false;
     }
-
     std::lock_guard<std::mutex> lock(impl_->mutex);
     auto * resource = impl_->find_resource(decode.transaction);
     if (resource == nullptr || resource->device == nullptr || resource->active_decode_stream != compute_stream) {
         return false;
+    }
+    auto * early = impl_->early_for_group(decode.transaction.acquisition.candidate.group_index);
+    if (early != nullptr && early->copy_banks) {
+        finish_early_router_banks(early->down_reader, compute_stream);
+    }
+    if (early != nullptr && early->copy_ready_only) {
+        // Join after the consumers, before staging reuse or graph completion.
+        CUDA_CHECK(cudaStreamWaitEvent(compute_stream, early->done, 0));
+        early->active_group = UINT32_MAX;
     }
     CUDA_CHECK(cudaEventRecord(resource->device->completion, compute_stream));
     resource->device->has_completion = true;
@@ -9475,6 +12144,11 @@ bool ggml_cuda_moe_grouped_context::finish_graph_group(
         }
         return false;
     }
+    auto * early = impl_->early_for_group(group->key.candidate.group_index);
+    if (early != nullptr && early->copy_ready_only) {
+        CUDA_CHECK(cudaStreamWaitEvent(stream, early->done, 0));
+        early->active_group = UINT32_MAX;
+    }
     if (group->defer_completion) {
         return true;
     }
@@ -9690,6 +12364,10 @@ void ggml_cuda_moe_grouped_context::shutdown() {
             return !impl_->has_active_transaction() && impl_->active_maintenance == 0 &&
                 impl_->active_legacy_operations == 0 && !impl_->has_active_legacy_lease() && !impl_->has_active_group_call();
         });
+        if (!impl_->early.empty()) {
+            moe_grouped_device_scope device_scope(impl_->device);
+            impl_->clear_early();
+        }
         retired = impl_->detach_resources();
         retired_legacy = impl_->detach_legacy_records();
         impl_->refreshing.fill(0);

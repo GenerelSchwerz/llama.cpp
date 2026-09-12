@@ -2104,6 +2104,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         logits = probs_in;
     }
+    logits->flags |= GGML_TENSOR_FLAG_MOE_ROUTER;
 
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);

@@ -273,6 +273,25 @@ static void test_speculative_required_grouped_backend_capability(int device) {
 }
 
 struct ggml_cuda_moe_grouped_context_test_access {
+    static bool early_graph(ggml_cuda_moe_grouped_context & context) {
+        return context.early_graph_for_test();
+    }
+    static uint64_t early_bytes(ggml_cuda_moe_grouped_context & context, uint64_t * calls = nullptr) {
+        return context.early_bytes_for_test(calls);
+    }
+    static size_t early_programs(ggml_cuda_moe_grouped_context & context) {
+        return context.early_program_count_for_test();
+    }
+    static bool early_select(ggml_cuda_moe_grouped_context & context) {
+        return context.early_select_for_test();
+    }
+    static bool early_hc(ggml_cuda_moe_grouped_context & context) {
+        return context.early_hc_for_test();
+    }
+    static bool early_copy(ggml_cuda_moe_grouped_context & context, bool capture) {
+        return context.early_copy_for_test(capture);
+    }
+
     static bool admission_closed(const ggml_cuda_moe_grouped_context & context) {
         return context.admission_closed_for_test();
     }
@@ -5231,13 +5250,16 @@ struct active_grouped_dispatch_graph {
     ggml_tensor * token_ids = nullptr;
     ggml_context_ptr weights;
     ggml_context_ptr nodes;
+    ggml_context_ptr router_weights;
     ggml_backend_buffer_ptr weight_buffer;
     ggml_backend_buffer_ptr node_buffer;
+    ggml_backend_buffer_ptr router_buffer;
     ggml_cgraph * graph = nullptr;
     ggml_tensor * down = nullptr;
     ggml_tensor * input = nullptr;
     ggml_tensor * logits = nullptr;
     ggml_tensor * concurrent_root = nullptr;
+    ggml_tensor * router_rows = nullptr;
     ggml_tensor * ids = nullptr;
     ggml_tensor * gate_output = nullptr;
     ggml_tensor * up_output = nullptr;
@@ -5281,7 +5303,8 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         bool original_direct_biases = false,
         uint32_t n_ff = 0,
         bool mapped_host_biases = false,
-        bool lookup_route = false) {
+        bool lookup_route = false,
+        int router_variant = -1) {
     CHECK(n_rows >= 1 && n_used >= 1 && n_used <= n_experts);
     CHECK(layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP ||
         layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ||
@@ -5291,6 +5314,7 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && n_rows == 1 && n_used == 1));
     CHECK(!original_direct_biases || (shared_banks == nullptr && !original_direct_down_scale && !original_direct_nvfp4_scales));
     CHECK(!mapped_host_biases || original_direct_biases);
+    CHECK(!lookup_route || router_variant < 0);
     const ggml_init_params weight_params = {
         /* .mem_size = */ ggml_tensor_overhead() * 12,
         /* .mem_base = */ nullptr,
@@ -5407,6 +5431,84 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         concurrent_branch = ggml_sqr(result.nodes.get(), result.concurrent_root);
         mmid_input = result.concurrent_root;
     }
+    ggml_tensor * router_scores = result.logits;
+    ggml_tensor * selected_table = nullptr;
+    if (router_variant >= 0) {
+        result.router_weights.reset(ggml_init(weight_params));
+        CHECK(result.router_weights != nullptr && !concurrent_stream_fixture);
+        const uint32_t router_width = router_variant == 2 ? n_dim * 2 : n_dim;
+        const uint32_t router_experts = router_variant == 1 || router_variant == 15 ? n_experts * 2 : n_experts;
+        auto * router = ggml_new_tensor_2d(result.router_weights.get(), GGML_TYPE_F32, router_width, router_experts);
+        auto * norm_scale = ggml_new_tensor_1d(result.router_weights.get(), GGML_TYPE_F32, router_width);
+        auto * bias = ggml_new_tensor_1d(result.router_weights.get(), GGML_TYPE_F32, router_experts);
+        if (router_variant == 16) {
+            selected_table = ggml_new_tensor_2d(result.router_weights.get(), GGML_TYPE_I32, n_used, 16);
+        }
+        ggml_tensor * lora_a = nullptr;
+        ggml_tensor * lora_b = nullptr;
+        auto * input = ggml_cont(result.nodes.get(), ggml_view_2d(result.nodes.get(), result.input,
+            n_dim, n_rows, result.input->nb[2], 0));
+        if (router_variant == 2) {
+            input = ggml_concat(result.nodes.get(), input, input, 0);
+        }
+        if (router_variant != 3 && router_variant != 7) {
+            input = ggml_mul(result.nodes.get(), ggml_rms_norm(result.nodes.get(), input, 1e-6f), norm_scale);
+        }
+        router_scores = ggml_mul_mat(result.nodes.get(), router, input);
+        if (router_variant == 6 || router_variant == 7) {
+            lora_a = ggml_new_tensor_2d(result.router_weights.get(), GGML_TYPE_F32, router_width, 16);
+            lora_b = ggml_new_tensor_2d(result.router_weights.get(), GGML_TYPE_F32, 16, router_experts);
+            auto * correction = ggml_mul_mat(result.nodes.get(), lora_b, ggml_mul_mat(result.nodes.get(), lora_a, input));
+            router_scores = ggml_add(result.nodes.get(), router_scores, ggml_scale(result.nodes.get(), correction, 0.1f));
+        }
+        if (router_variant == 4) {
+            router_scores = ggml_add(result.nodes.get(), ggml_sigmoid(result.nodes.get(), router_scores), bias);
+        }
+        if (router_variant == 5) {
+            result.router_rows = ggml_new_tensor_1d(result.nodes.get(), GGML_TYPE_I32, n_rows);
+            ggml_set_input(result.router_rows);
+            router_scores = ggml_get_rows(result.nodes.get(), router_scores, result.router_rows);
+        }
+        router_scores->flags |= GGML_TENSOR_FLAG_MOE_ROUTER;
+        result.router_buffer.reset(ggml_backend_alloc_ctx_tensors(result.router_weights.get(), backend));
+        CHECK(result.router_buffer != nullptr);
+        ggml_backend_buffer_set_usage(result.router_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        std::vector<float> values(router_width * router_experts), scales(router_width, 1.0f), biases(router_experts);
+        for (size_t i = 0; i < values.size(); ++i) {
+            values[i] = std::sin(float(i * 13 + 7)) / 8.0f;
+        }
+        for (size_t i = 0; i < biases.size(); ++i) {
+            biases[i] = float((i * 7) % 11) / 17.0f;
+        }
+        ggml_backend_tensor_set(router, values.data(), 0, ggml_nbytes(router));
+        ggml_backend_tensor_set(norm_scale, scales.data(), 0, ggml_nbytes(norm_scale));
+        ggml_backend_tensor_set(bias, biases.data(), 0, ggml_nbytes(bias));
+        if (selected_table != nullptr) {
+            std::vector<int32_t> values(ggml_nelements(selected_table));
+            for (size_t i = 0; i < values.size(); ++i) {
+                values[i] = (i * 3) % n_experts;
+            }
+            ggml_backend_tensor_set(selected_table, values.data(), 0, ggml_nbytes(selected_table));
+        }
+        for (auto * weight : {lora_a, lora_b}) {
+            if (weight != nullptr) {
+                const auto bytes = cached_fusion_test_data(weight, 123);
+                ggml_backend_tensor_set(weight, bytes.data(), 0, bytes.size());
+            }
+        }
+    }
+    if (!lookup_route) {
+        result.ids = ggml_argsort_top_k(result.nodes.get(), router_scores, n_used);
+    }
+    if (router_variant == 1 || router_variant == 15) {
+        result.ids = ggml_cast(result.nodes.get(), ggml_scale(result.nodes.get(),
+            ggml_cast(result.nodes.get(), result.ids, GGML_TYPE_F32), 0.5f), GGML_TYPE_I32);
+    }
+    if (selected_table != nullptr) {
+        result.router_rows = ggml_new_tensor_1d(result.nodes.get(), GGML_TYPE_I32, n_rows);
+        ggml_set_input(result.router_rows);
+        result.ids = ggml_get_rows(result.nodes.get(), selected_table, result.router_rows);
+    }
     if (lookup_route) {
         CHECK(shared_banks == nullptr && !concurrent_stream_fixture);
         result.lookup_weights.reset(ggml_init(weight_params));
@@ -5417,8 +5519,6 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
         result.token_ids = ggml_new_tensor_1d(result.nodes.get(), GGML_TYPE_I32, n_rows);
         ggml_set_input(result.token_ids);
         result.ids = ggml_get_rows(result.nodes.get(), result.lookup_table, result.token_ids);
-    } else {
-        result.ids = ggml_argsort_top_k(result.nodes.get(), result.logits, n_used);
     }
     ggml_set_name(result.ids, "test.active.ids");
     ggml_tensor * hidden = nullptr;
@@ -5509,6 +5609,11 @@ static active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
     CHECK((shared_banks != nullptr || result.weight_buffer != nullptr) && result.node_buffer != nullptr);
     if (result.weight_buffer != nullptr) {
         ggml_backend_buffer_set_usage(result.weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+    if (result.router_rows != nullptr) {
+        std::vector<int32_t> rows(n_rows);
+        std::iota(rows.begin(), rows.end(), 0);
+        ggml_backend_tensor_set(result.router_rows, rows.data(), 0, ggml_nbytes(result.router_rows));
     }
     return result;
 }
@@ -5679,7 +5784,8 @@ static void initialize_active_grouped_dispatch_graphs(
         const std::vector<active_grouped_dispatch_graph *> & graphs,
         const std::vector<std::vector<uint8_t>> * bank_data = nullptr) {
     CHECK(graphs.size() >= 2);
-    const auto logits = active_grouped_logits(*graphs[0]);
+    const auto logits = graphs[0]->router_weights != nullptr ?
+        std::vector<float>(ggml_nelements(graphs[0]->logits)) : active_grouped_logits(*graphs[0]);
     for (auto * graph : graphs) {
         CHECK(graph->banks.size() == graphs[0]->banks.size());
     }
@@ -6431,6 +6537,195 @@ static void check_active_grouped_exact_output(
         squared_expected += static_cast<double>(expected[i]) * expected[i];
     }
     CHECK(squared_expected > 0.0 && squared_error == 0.0);
+}
+
+static void test_early_grouped_graphs() {
+    const char * enabled = getenv("GGML_CUDA_MOE_EARLY_ROUTER");
+    CHECK(enabled != nullptr && strcmp(enabled, "1") == 0);
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    for (uint32_t rows : {1u, 4u}) {
+        for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+                GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {
+            for (int variant = 0; variant < 21; ++variant) {
+                if ((variant == 9 && layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) ||
+                        (variant == 10 && layout != GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE) ||
+                        ((variant == 14 || variant >= 17) && rows == 1)) {
+                    continue;
+                }
+                ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+                ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
+                const ggml_type type = variant == 8 ? GGML_TYPE_Q4_K : variant == 9 ? GGML_TYPE_MXFP4 :
+                    variant == 10 ? GGML_TYPE_NVFP4 : variant == 11 ? GGML_TYPE_BF16 :
+                    variant == 12 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_0;
+                const std::array<ggml_type, 3> types = {type, type, type};
+                auto reference = build_active_grouped_dispatch_graph_types(reference_backend.get(),
+                    ggml_backend_cuda_moe_cached_buffer_type(), types, layout, false, variant == 10, rows, 16, 2, 256,
+                    nullptr, false, variant == 9, 0, false, false, variant);
+                auto candidate = build_active_grouped_dispatch_graph_types(candidate_backend.get(),
+                    ggml_backend_cuda_moe_cached_buffer_type(), types, layout, false, variant == 10, rows, 16, 2, 256,
+                    nullptr, false, variant == 9, 0, false, false, variant);
+                initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+                if (variant == 13 || variant == 14 || variant >= 17) {
+                    candidate_stamp_execution(candidate.graph,
+                        variant == 20 ? GGML_GRAPH_EXECUTION_DOMAIN_DRAFT :
+                        variant == 13 || variant == 18 ? GGML_GRAPH_EXECUTION_DOMAIN_MTP : GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+                        variant == 13 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT :
+                        variant == 14 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL :
+                        variant == 18 || variant == 20 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL :
+                            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE,
+                        rows, variant == 13 ? rows : 1, 0,
+                        variant == 14 ? GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE :
+                            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+                }
+                const auto disabled = candidate_snapshot(8, nullptr, 0);
+                CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
+                    GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                if (variant == 15) {
+                    const ggml_backend_moe_candidate_group_v2 group = {layout, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, 0, 0};
+                    std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
+                    for (size_t bank = 0; bank < candidate.banks.size(); ++bank) {
+                        tensors.push_back({candidate.banks[bank], 0, candidate.roles[bank], GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE,
+                            GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER, 0});
+                    }
+                    const auto snapshot = candidate_snapshot_v2(8, &group, 1, tensors.data(), tensors.size());
+                    CHECK(ggml_backend_cuda_moe_candidate_replace_v2(candidate_backend.get(), &snapshot) ==
+                        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                } else if (variant == 10) {
+                    CHECK(replace_active_grouped_nvfp4_dispatch_v2(candidate_backend.get(), candidate, 8) ==
+                        GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                } else {
+                    register_active_grouped_dispatch(candidate_backend.get(), candidate, layout,
+                        variant == 19 ? 4 : 8);
+                }
+                if (variant == 13 || variant >= 17) {
+                    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+                    CHECK(context != nullptr);
+                    (void) candidate_certify_graph(*context, candidate.graph);
+                }
+                ggml_context_ptr rebound_nodes;
+                ggml_backend_buffer_ptr rebound_buffer;
+                if (variant == 15) {
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate.graph) != GGML_STATUS_SUCCESS);
+                    ggml_backend_synchronize(reference_backend.get());
+                    ggml_backend_synchronize(candidate_backend.get());
+                    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+                    CHECK(context != nullptr && ggml_cuda_moe_grouped_context_test_access::early_bytes(*context) == 0);
+                    fprintf(stderr, "early-grouped-test: layout=%u rows=%u variant=%d baseline_route_rejection=expected prediction=unsupported\n",
+                        layout, rows, variant);
+                    continue;
+                }
+                for (int pass = 0; pass < 4; ++pass) {
+                    if (variant == 5 && pass == 2) {
+                        const ggml_init_params params = {ggml_tensor_overhead() * 2, nullptr, true};
+                        rebound_nodes.reset(ggml_init(params));
+                        auto * replacement = ggml_new_tensor_1d(rebound_nodes.get(), GGML_TYPE_I32, rows);
+                        ggml_set_input(replacement);
+                        rebound_buffer.reset(ggml_backend_alloc_ctx_tensors(rebound_nodes.get(), candidate_backend.get()));
+                        CHECK(rebound_buffer != nullptr);
+                        for (int n = 0; n < candidate.graph->n_nodes; ++n) {
+                            for (auto & src : candidate.graph->nodes[n]->src) {
+                                if (src == candidate.router_rows) {
+                                    src = replacement;
+                                }
+                            }
+                        }
+                        candidate.router_rows = replacement;
+                        ggml_graph_clear(candidate.graph);
+                        ggml_build_forward_expand(candidate.graph, candidate.output);
+                        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+                            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows, rows);
+                    }
+                    if (variant == 5 || variant == 16) {
+                        std::vector<int32_t> indices(rows);
+                        for (uint32_t row = 0; row < rows; ++row) {
+                            indices[row] = (row + pass) % (variant == 16 ? 16 : rows);
+                        }
+                        ggml_backend_tensor_set(reference.router_rows, indices.data(), 0, ggml_nbytes(reference.router_rows));
+                        ggml_backend_tensor_set(candidate.router_rows, indices.data(), 0, ggml_nbytes(candidate.router_rows));
+                    }
+                    std::vector<float> input(ggml_nelements(reference.input));
+                    for (size_t i = 0; i < input.size(); ++i) {
+                        input[i] = std::cos(float(i * 3 + pass * 11));
+                    }
+                    ggml_backend_tensor_set(reference.input, input.data(), 0, ggml_nbytes(reference.input));
+                    ggml_backend_tensor_set(candidate.input, input.data(), 0, ggml_nbytes(candidate.input));
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+                    ggml_backend_synchronize(reference_backend.get());
+                    ggml_backend_synchronize(candidate_backend.get());
+                    std::vector<float> expected(ggml_nelements(reference.output)), actual(expected.size());
+                    ggml_backend_tensor_get(reference.output, expected.data(), 0, ggml_nbytes(reference.output));
+                    ggml_backend_tensor_get(candidate.output, actual.data(), 0, ggml_nbytes(candidate.output));
+                    check_active_grouped_exact_output(expected, actual);
+                }
+                auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+                CHECK(context != nullptr);
+                uint64_t calls = 0;
+                const uint64_t bytes = ggml_cuda_moe_grouped_context_test_access::early_bytes(*context, &calls);
+                if (variant == 5) {
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::early_programs(*context) == 1);
+                }
+                fprintf(stderr, "early-grouped-test: layout=%u rows=%u variant=%d calls=%llu predicted_bytes=%llu\n",
+                    layout, rows, variant, (unsigned long long) calls, (unsigned long long) bytes);
+                if (variant == 1 || (variant == 11 && rows > 1)) {
+                    CHECK(calls == 0 && bytes == 0);
+                    const auto coverage = candidate_certify_graph(*context, candidate.graph);
+                    std::shared_ptr<ggml_cuda_moe_graph_plan> plan;
+                    auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+                    CHECK(context->prepare_graph_execution(candidate.graph, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
+                        &plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
+                        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+                    CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+                    fprintf(stderr, "early-grouped-test: layout=%u rows=%u variant=%d baseline legacy fallback, exact output, prediction=unsupported\n",
+                        layout, rows, variant);
+                    continue;
+                }
+                if (variant == 16) {
+                    CHECK(calls == 0 && bytes == 0);
+                    const auto coverage = candidate_certify_graph(*context, candidate.graph);
+                    ggml_cuda_moe_graph_plan plan;
+                    auto execution = std::make_unique<ggml_cuda_moe_graph_execution>();
+                    context->compile_graph_plan(candidate.graph, 1, &plan, execution.get(),
+                        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+                    CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED);
+                    const auto bind = [&]() {
+                        return context->bind_graph_plan(candidate.graph, 1, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN,
+                            plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+                    };
+                    CHECK(bind());
+                    auto * table = candidate.ids->src[0];
+                    const size_t stride = table->nb[1];
+                    table->nb[1] += sizeof(int32_t);
+                    CHECK(!bind());
+                    table->nb[1] = stride;
+                    CHECK(bind());
+                    candidate.ids->src[1] = reference.router_rows;
+                    CHECK(!bind());
+                    candidate.ids->src[1] = candidate.router_rows;
+                    CHECK(bind());
+                    candidate.ids->view_src = table;
+                    CHECK(!bind());
+                    candidate.ids->view_src = nullptr;
+                    CHECK(bind());
+                    ggml_backend_buffer_set_usage(table->buffer, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                    CHECK(!bind());
+                    ggml_backend_buffer_set_usage(table->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                    CHECK(bind());
+                    fprintf(stderr, "early-grouped-test: token lookup grouped, exact output, malformed bindings rejected, prediction=unsupported\n");
+                    continue;
+                }
+                if (variant == 14 || variant == 19 || variant == 20) {
+                    CHECK(calls == 0 && bytes == 0);
+                    fprintf(stderr, "early-grouped-test: unsupported domain or host-staged rows, exact output, prediction=excluded\n");
+                    continue;
+                }
+                CHECK(calls > 0 && (variant == 4 || bytes > 0));
+            }
+        }
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
 }
 
 struct cached_mmid_path_test_graph {
@@ -12631,6 +12926,30 @@ static void test_strided_copy_graph_update(int device, bool enabled) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--early-grouped-only") == 0) {
+        test_early_grouped_graphs();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-graph-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_graph(context));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-select-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_select(context));
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--early-hc-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_hc(context));
+        return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--early-copy-only") == 0 || strcmp(argv[1], "--early-copy-graph-only") == 0)) {
+        ggml_cuda_moe_grouped_context context(nullptr, 0);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_copy(context, strcmp(argv[1], "--early-copy-graph-only") == 0));
+        return 0;
+    }
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
     const bool cached_fusion_only = argc == 2 && strcmp(argv[1], "--cached-fusion-only") == 0;

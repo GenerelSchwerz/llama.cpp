@@ -1469,6 +1469,7 @@ struct ggml_backend_cuda_context {
     bool decode_boundary_overlap = false;
     std::once_flag moe_grouped_context_once;
     ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
+    std::vector<std::unique_ptr<ggml_backend_cuda_context>> moe_router_contexts;
     std::unique_ptr<ggml_cuda_moe_ids_cache_state> moe_ids_cache;
 
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };

@@ -28,6 +28,9 @@ using ggml_cuda_moe_stream_t = cudaStream_t;
 #include <vector>
 
 struct ggml_cuda_moe_cache;
+struct ggml_backend_cuda_context;
+
+bool ggml_cuda_moe_router_compute(ggml_backend_cuda_context & context, ggml_tensor * node);
 class ggml_cuda_moe_grouped_context;
 struct ggml_cuda_moe_grouped_context_test_access;
 struct ggml_cuda_moe_graph_capability_witness;
@@ -920,6 +923,9 @@ public:
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream);
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
+    void configure_early_router(const ggml_cgraph * graph, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream, bool capture, ggml_backend_cuda_context & parent);
+    void launch_early_router(const ggml_tensor * node, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
+    void finish_early_router_banks(const ggml_tensor * node, ggml_cuda_moe_stream_t stream);
     bool prefill_add_id_source(
             const ggml_cuda_moe_graph_execution & execution,
             const ggml_tensor * node,
@@ -949,6 +955,12 @@ private:
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
     bool admission_closed_for_test() const;
+    bool early_copy_for_test(bool capture);
+    bool early_hc_for_test();
+    bool early_select_for_test();
+    bool early_graph_for_test();
+    uint64_t early_bytes_for_test(uint64_t * calls) const;
+    size_t early_program_count_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool get_clock_bound_for_test(const ggml_cuda_moe_candidate_group_key & key, uint64_t * clock_bound) const;
     bool device_slot_for_expert_for_test(
