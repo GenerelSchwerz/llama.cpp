@@ -312,6 +312,8 @@ function gg_run_test_llama_archs_tensor_split {
         GGML_CUDA_DEVICES=2 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_CUDA_DEVICES=3 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
         GGML_CUDA_DEVICES=4 ./build-ci-release/bin/test-llama-archs -s 1 2>&1
+        # the scheduler names a copy after its source, and 8 device names fill the name field
+        GGML_CUDA_DEVICES=8 ./build-ci-release/bin/test-llama-archs -s 1 -a llama 2>&1
     fi
 
     if [ ! -z ${GG_BUILD_METAL} ]; then
@@ -327,7 +329,7 @@ function gg_run_test_llama_archs_tensor_split {
 function gg_sum_test_llama_archs_tensor_split {
     gg_printf '### %s\n\n' "${ci}"
 
-    gg_printf 'Runs test-llama-archs with 1 to 4 devices\n'
+    gg_printf 'Runs test-llama-archs with 1 to 4 and 8 devices\n'
     gg_printf '- status: %s\n' "$(cat $OUT/${ci}.exit)"
     gg_printf '```\n'
     gg_printf '%s\n' "$(cat $OUT/${ci}.log)"

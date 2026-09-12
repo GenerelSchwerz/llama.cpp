@@ -1034,6 +1034,57 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
+// The name field has a fixed size, so cut the backend label rather than the source name.
+// See the contract at the declaration in ggml-backend-impl.h.
+void ggml_backend_sched_name_copy(
+        struct ggml_tensor * copy, const char * backend_name, const struct ggml_tensor * src, int c) {
+    const int n_tail = snprintf(NULL, 0, "#%s#%d", src->name, c);
+    const int n_max  = GGML_MAX_NAME - 1 - n_tail;
+    GGML_ASSERT(n_max >= 0 && "source name too long to name a scheduler copy");
+    int n_head = (int) strlen(backend_name);
+    if (n_head > n_max) {
+        n_head = n_max;
+    }
+    ggml_format_name(copy, "%.*s#%s#%d", n_head, backend_name, src->name, c);
+}
+
+bool ggml_backend_sched_copy_source_name(const char * name, char * buf, size_t buf_size) {
+    GGML_ASSERT(buf_size > 0);
+
+    const char * first = strchr(name, '#');
+    if (first == NULL) {
+        return false;
+    }
+    const char * src = first + 1;
+    size_t len = strlen(src);
+
+    // ggml writes a view suffix as " (...)", a graph name has no spaces
+    const char * suffix = strstr(src, " (");
+    if (suffix != NULL) {
+        len = suffix - src;
+    } else {
+        const char * copy = strrchr(src, '#');
+        if (copy == NULL) {
+            return false;
+        }
+        const char * digits = copy + 1;
+        while (*digits >= '0' && *digits <= '9') {
+            digits++;
+        }
+        if (digits == copy + 1 || *digits != '\0') {
+            return false;
+        }
+        len = copy - src;
+    }
+
+    if (len > buf_size - 1) {
+        return false;
+    }
+    memcpy(buf, src, len);
+    buf[len] = '\0';
+    return true;
+}
+
 static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
@@ -1381,7 +1432,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                                 tensor_copy = src; // use the original tensor as the current copy
                             } else {
                                 tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                                ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                                ggml_backend_sched_name_copy(tensor_copy, ggml_backend_name(backend), src, c);
                             }
                             ggml_set_input(tensor_copy);
                             ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
@@ -1402,7 +1453,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         ggml_backend_t backend = sched->backends[cur_backend_id];
                         for (int c = 0; c < sched->n_copies; c++) {
                             struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                            ggml_backend_sched_name_copy(tensor_copy, ggml_backend_name(backend), src, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
