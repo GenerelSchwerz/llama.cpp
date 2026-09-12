@@ -578,7 +578,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
-        if (std::regex_match(tensor_name, pattern_output_weight)) {
+        // a tied model has no output.weight, its output projection is a copy of token_embd.weight.
+        // the input table carries that name as well, so tell the two apart by the tensor, not by the name
+        const bool is_output_weight = std::regex_match(tensor_name, pattern_output_weight) ||
+            (tensor == ud->model->output && tensor != ud->model->tok_embd);
+        if (is_output_weight) {
             if (is_dsv4) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             }

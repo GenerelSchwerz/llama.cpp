@@ -13,6 +13,7 @@
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cstddef>
@@ -68,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-tied-output-split]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1051,6 +1052,57 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
+// a tied model has no output.weight - its output projection is a copy of token_embd.weight and must get the same split.
+// the input table keeps that name too, it must never be split by vocab row
+struct tied_split_states {
+    ggml_backend_meta_split_state output;   // output.weight
+    ggml_backend_meta_split_state tied;     // the same projection, renamed like a tied model
+    ggml_backend_meta_split_state tok_embd; // the input table
+};
+
+static void test_tied_output_split(size_t seed) {
+    auto split_states_of = [&](llm_arch arch, bool moe, size_t n_devices) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        ggml_backend_dev_t devices[] = { nullptr };
+        model_params.devices = devices;
+
+        size_t tensor_seed = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+        GGML_ASSERT(model);
+        GGML_ASSERT(model->output   != nullptr);
+        GGML_ASSERT(model->tok_embd != nullptr);
+        GGML_ASSERT(model->output   != model->tok_embd);
+
+        llama_meta_device_get_split_state_userdata ud = { n_devices, model.get() };
+        tied_split_states ret;
+        ret.output = llama_meta_device_get_split_state(model->output, &ud);
+        // a tied model gives both tensors the same name
+        ggml_set_name(model->output, "token_embd.weight");
+        ret.tied     = llama_meta_device_get_split_state(model->output,   &ud);
+        ret.tok_embd = llama_meta_device_get_split_state(model->tok_embd, &ud);
+        return ret;
+    };
+
+    const size_t n_devices = 2;
+    const tied_split_states ss_llama = split_states_of(LLM_ARCH_LLAMA, false, n_devices);
+    GGML_ASSERT(ss_llama.output.axis == GGML_BACKEND_SPLIT_AXIS_1);
+    GGML_ASSERT(ss_llama.tied.axis == ss_llama.output.axis);
+    GGML_ASSERT(ss_llama.tied.n_segments == ss_llama.output.n_segments);
+    for (size_t i = 0; i < n_devices; i++) {
+        GGML_ASSERT(ss_llama.tied.ne[i] == ss_llama.output.ne[i]);
+        GGML_ASSERT(ss_llama.tied.ne[i] > 0);
+    }
+    GGML_ASSERT(ss_llama.tok_embd.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+
+    // DeepSeek v4 mirrors its output projection, the tied copy must follow
+    const tied_split_states ss_dsv4 = split_states_of(LLM_ARCH_DEEPSEEK4, true, n_devices);
+    GGML_ASSERT(ss_dsv4.output.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(ss_dsv4.tied.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+    GGML_ASSERT(ss_dsv4.tok_embd.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1450,6 +1502,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool test_tied_output = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1503,6 +1556,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-tied-output-split") == 0) {
+            test_tied_output = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1518,6 +1575,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
             test_live_context_workspace_unsupported(seed);
+            return 0;
+        }
+        if (test_tied_output) {
+            test_tied_output_split(seed);
             return 0;
         }
         if (!out.empty()) {
