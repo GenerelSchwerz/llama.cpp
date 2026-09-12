@@ -3743,6 +3743,7 @@ static bool moe_early_router_enabled() {
 }
 
 static uint32_t moe_early_router_lookahead() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
     static const uint32_t distance = [] {
         const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_LOOKAHEAD");
         if (value == nullptr) {
@@ -3752,6 +3753,9 @@ static uint32_t moe_early_router_lookahead() {
         return static_cast<uint32_t>(value[0] - '0');
     }();
     return distance;
+#else
+    return 0;
+#endif
 }
 
 static uint32_t moe_early_router_stage_block_cap(int device) {
@@ -3769,11 +3773,15 @@ static uint32_t moe_early_router_stage_block_cap(int device) {
 }
 
 static bool moe_early_router_copy_engine() {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
     const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_ENGINE");
     return value != nullptr && strcmp(value, "1") == 0;
+#else
+    return false;
+#endif
 }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
 static __global__ void moe_early_router_publish_copy(
         const int32_t * predicted, int32_t * host_ids, uint32_t top_k, uint64_t * request, uint64_t job) {
     for (uint32_t p = threadIdx.x; p < top_k; p += blockDim.x) {
@@ -3804,7 +3812,11 @@ static void moe_early_router_wait_copy(cudaStream_t stream, uint32_t * done) {
     CUgraph graph = nullptr;
     const CUgraphNode * dependencies = nullptr;
     size_t count = 0;
-    CU_CHECK(cuStreamGetCaptureInfo(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#if CUDA_VERSION < 13000
+    CU_CHECK(cuStreamGetCaptureInfo_v2(stream, &status, nullptr, &graph, &dependencies, &count));
+#else
+    CU_CHECK(cuStreamGetCaptureInfo_v3(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#endif
     if (status == CU_STREAM_CAPTURE_STATUS_NONE) {
         CU_CHECK(cuStreamWaitValue32(stream, (CUdeviceptr) done, 1, CU_STREAM_WAIT_VALUE_EQ));
         return;
@@ -4863,7 +4875,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         void start_copy_worker(int device, bool launch = true) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
             CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
             const char * mailbox = getenv("GGML_CUDA_MOE_EARLY_ROUTER_COPY_MAILBOX");
             copy_mailbox = mailbox != nullptr && strcmp(mailbox, "1") == 0;
@@ -4918,7 +4930,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         void launch_copy_worker(int device, const std::vector<early_workspace *> & clients) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
             GGML_ASSERT(!copy_worker.joinable() && !clients.empty());
             for (const auto * client : clients) {
                 GGML_ASSERT(clients.size() == 1 || client->copy_mailbox);
@@ -5070,7 +5082,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         void enqueue_copy(copy_job & job) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
             CUDA_CHECK(cudaMemsetAsync(copy_done, 0, sizeof(uint32_t), stream));
             if (copy_banks) {
                 GGML_ASSERT(job.down_bank < job.banks.size() && job.banks.size() <= 32);
@@ -7227,7 +7239,7 @@ bool ggml_cuda_moe_grouped_context::early_hc_for_test() {
 }
 
 bool ggml_cuda_moe_grouped_context::early_copy_for_test(bool capture) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
     CUDA_CHECK(cudaSetDevice(impl_->device));
     cudaStream_t main;
     CUDA_CHECK(cudaStreamCreateWithFlags(&main, cudaStreamNonBlocking));
@@ -7587,6 +7599,7 @@ bool ggml_cuda_moe_grouped_context::early_copy_for_test(bool capture) {
     fprintf(stderr, "early-copy-test: capture=%d exact=%d\n", capture, valid);
     return valid;
 #else
+    GGML_UNUSED(capture);
     return false;
 #endif
 }
@@ -9168,7 +9181,7 @@ void ggml_cuda_moe_grouped_context::launch_early_router(
             early.predicted, early.positions, early.counters, device.words_per_miss * sizeof(uint4), early.stream, n_rows);
     }
     if (early.copy_engine) {
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
         early.active_copy = early.copy_jobs.at(binding.copy_key()).get();
         early.enqueue_copy(*early.active_copy);
 #endif
@@ -9362,7 +9375,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
         CUDA_CHECK(cudaGetLastError());
-#if CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
         if (ready_only && !ready_late) {
             moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(early->positions, device.n_experts, early->copy_progress);
             CUDA_CHECK(cudaGetLastError());
@@ -9387,7 +9400,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     early->staging, early->positions, early->counters, 1);
             }
             CUDA_CHECK(cudaGetLastError());
-#if CUDART_VERSION >= 12080
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
             if (ready_late) {
                 moe_early_router_ready_positions<<<1, 128, 0, compute_stream>>>(early->positions, device.n_experts, early->copy_progress, true);
                 CUDA_CHECK(cudaGetLastError());
