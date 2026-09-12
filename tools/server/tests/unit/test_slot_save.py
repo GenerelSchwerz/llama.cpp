@@ -493,6 +493,71 @@ def test_slot_save_restore_image_payload_larger_than_context(mmproj_server):
     assert res.body["timings"]["prompt_n"] == 1
 
 
+#
+# Prompt cache reuse on a multimodal server (mmproj loaded).
+#
+# Cache reuse is gated on real media chunks, not on has_mtmd.
+# swa_full keeps the shifted match valid, cache_ram 0 leaves the KV shift as the only reuse path.
+#
+
+CACHE_REUSE_LEAD = "Throw away this opening line."
+
+# starts on a newline, so the shared chunk tokenizes the same with and without the lead
+CACHE_REUSE_TEXT = (
+    "\nAlpha beta gamma delta epsilon zeta eta theta iota kappa"
+    " lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega."
+)
+
+
+def test_cache_reuse_with_mmproj(mmproj_server):
+    server = mmproj_server
+    server.cache_reuse = 4
+    server.swa_full = True
+    server.cache_ram = 0
+    server.start()
+
+    img = _get_img_base64(IMG_URL_CAT)
+
+    def send_text(prompt, id_slot):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": prompt,
+            "id_slot": id_slot,
+            "cache_prompt": True,
+            "n_predict": 1,
+        })
+        assert res.status_code == 200
+        return res.body["timings"]["cache_n"]
+
+    def send_media(prompt_string, id_slot):
+        res = server.make_request("POST", "/completions", data={
+            "id_slot": id_slot,
+            "cache_prompt": True,
+            "n_predict": 1,
+            "prompt": {
+                "prompt_string": prompt_string,
+                "multimodal_data": [img],
+            },
+        })
+        assert res.status_code == 200
+        return res.body["timings"]["cache_n"]
+
+    # text-only: dropping the lead must shift the shared chunk and reuse it
+    send_text(CACHE_REUSE_LEAD + CACHE_REUSE_TEXT, 0)
+    assert send_text(CACHE_REUSE_TEXT, 0) > 10
+
+    # media in the cached prompt blocks the very same shift
+    send_media(CACHE_REUSE_LEAD + CACHE_REUSE_TEXT + " <__media__>", 1)
+    assert send_text(CACHE_REUSE_TEXT, 1) < 10
+
+    # media in the incoming prompt blocks it too, even though it sits after the shared chunk
+    send_text(CACHE_REUSE_LEAD + CACHE_REUSE_TEXT, 1)
+    assert send_media(CACHE_REUSE_TEXT + " <__media__>", 1) < 10
+
+    # reuse resumes as soon as the slot holds text only again
+    send_text(CACHE_REUSE_LEAD + CACHE_REUSE_TEXT, 1)
+    assert send_text(CACHE_REUSE_TEXT, 1) > 10
+
+
 def test_slot_restore_media_file_without_mmproj(mmproj_server):
     server = mmproj_server
     server.start()
