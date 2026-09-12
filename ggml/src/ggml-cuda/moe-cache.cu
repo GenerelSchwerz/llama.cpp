@@ -10967,27 +10967,81 @@ static const char * ggml_backend_cuda_moe_cached_buffer_type_name(ggml_backend_b
     return GGML_CUDA_NAME "_MoE_Cached";
 }
 
+// Pinned bytes currently handed out for expert sources, checked against an optional budget.
+// WSL2 caps pinned host memory well below RAM (about 80% of the VM's memory, measured), and a
+// cudaMallocHost failure late in the load would also take the cache's own staging buffers
+// down with it. A budget makes the pageable spill a decision instead of an accident.
+static std::atomic<size_t> g_moe_cache_pinned_source_bytes{0};
+
 static void ggml_backend_cuda_moe_cached_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     CUDA_CHECK(cudaFreeHost(buffer->context));
+    g_moe_cache_pinned_source_bytes.fetch_sub(buffer->size, std::memory_order_relaxed);
 }
 
 static void ggml_backend_cuda_moe_cached_mmap_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     moe_cache_unregister_mmap_range(buffer->context, buffer->size);
 }
 
+static size_t moe_cache_pinned_source_budget_bytes() {
+    static const size_t budget = [] {
+        const char * env = getenv("GGML_CUDA_MOE_PINNED_BUDGET_MIB");
+        if (env == nullptr || *env == '\0') {
+            return (size_t) SIZE_MAX;
+        }
+        const long long mib = atoll(env);
+        return mib <= 0 ? (size_t) 0 : (size_t) mib << 20;
+    }();
+    return budget;
+}
+
 static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+    const size_t budget  = moe_cache_pinned_source_budget_bytes();
+    const size_t already = g_moe_cache_pinned_source_bytes.load(std::memory_order_relaxed);
+    if (size > budget || already > budget - size) {
+        GGML_LOG_INFO("moe-cache: pinned source budget reached (%.2f MiB pinned, budget %.2f MiB); "
+                      "%.2f MiB buffer stays pageable but cached\n",
+                      already / 1024.0 / 1024.0,
+                      budget == SIZE_MAX ? -1.0 : budget / 1024.0 / 1024.0,
+                      size / 1024.0 / 1024.0);
         return nullptr;
     }
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n",
-                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s; "
+                      "buffer stays pageable but cached\n",
+                      __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
+    g_moe_cache_pinned_source_bytes.fetch_add(size, std::memory_order_relaxed);
+    GGML_LOG_INFO("moe-cache: pinned %.2f MiB of expert source (%.2f MiB pinned so far)\n",
+                  size / 1024.0 / 1024.0,
+                  (already + size) / 1024.0 / 1024.0);
     return ptr;
+}
+
+static void ggml_backend_cuda_moe_cached_pageable_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_aligned_free(buffer->context, buffer->size);
+}
+
+// Optional cap on a single expert-source buffer. ggml splits a tensor context into several
+// buffers when one would exceed the buffer type's max size, which is what lets part of the
+// source be pinned when all of it cannot be. Unset means one buffer, as upstream.
+static size_t ggml_backend_cuda_moe_cached_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    static const size_t max_size = [] {
+        const char * env = getenv("GGML_CUDA_MOE_SOURCE_CHUNK_MIB");
+        if (env == nullptr || *env == '\0') {
+            return (size_t) SIZE_MAX;
+        }
+        const long long mib = atoll(env);
+        return mib <= 0 ? (size_t) SIZE_MAX : (size_t) mib << 20;
+    }();
+    return max_size;
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer(
@@ -10996,9 +11050,22 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
 
     if (ptr == nullptr) {
-        // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
-        // PCIe bandwidth on cache miss but keeps the model loadable.
-        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        if (size == 0) {
+            // The loader's memory-fit pass asks for a zero-byte dummy buffer; nothing to cache.
+            return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        }
+        // Pinned alloc failed or the budget is spent. Keep the buffer under THIS buffer type
+        // so the CUDA dispatch hook still owns mul_mat_id for these experts; only the H2D
+        // copies change (pageable source). Returning a plain CPU buffer type here, as before,
+        // made ggml's scheduler run the experts on the CPU backend and bypass the cache.
+        void * pageable = ggml_aligned_malloc(size);
+        if (pageable == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(pageable, size);
+        buffer->buft              = buft;
+        buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_pageable_buffer_free_buffer;
+        return buffer;
     }
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -11025,7 +11092,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void) {
             /* .get_name         = */ ggml_backend_cuda_moe_cached_buffer_type_name,
             /* .alloc_buffer     = */ ggml_backend_cuda_moe_cached_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
-            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_max_size     = */ ggml_backend_cuda_moe_cached_buffer_type_get_max_size,
             /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
             /* .is_host          = */ ggml_backend_cuda_moe_cached_buffer_type_is_host,
         },
