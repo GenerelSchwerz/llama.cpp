@@ -741,8 +741,10 @@ struct moe_cache_telemetry {
     moe_cache_expert_stats experts = {};
     moe_cache_hot_tensor_stats hot_tensor = {};
     std::vector<uint64_t> all_expert_access_counts;
+    bool expert_details_omitted = false;
     moe_cache_tensor_decode_stats hot_decode_miss_tensor = {};
     std::vector<moe_cache_tensor_decode_stats> decode_tensor_stats;
+    bool decode_details_omitted = false;
     moe_cache_phase_stats phase_stats[2] = {};
     ggml_cuda_moe_grouped_debug_telemetry grouped = {};
 };
@@ -9907,7 +9909,15 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         return nullptr;
     }
 
-    auto * c = new ggml_cuda_moe_cache;
+    struct device_restore {
+        int previous;
+        ~device_restore() {
+            (void) cudaSetDevice(previous);
+        }
+    } restore{prev_device};
+    std::unique_ptr<ggml_cuda_moe_cache, decltype(&ggml_cuda_moe_cache_free)> owner(
+        new ggml_cuda_moe_cache{}, ggml_cuda_moe_cache_free);
+    auto * c = owner.get();
     c->device          = device;
     c->slot_size_bytes = slot_size_bytes;
     c->trailing_padding_bytes = trailing_padding_bytes;
@@ -9933,17 +9943,12 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         if (err != cudaSuccess) {
             fprintf(stderr, "moe-cache: cudaMalloc(%zu bytes) failed: %s\n",
                     allocation_size, cudaGetErrorString(err));
-            delete c;
-            cudaSetDevice(prev_device);
             return nullptr;
         }
         if (trailing_padding_bytes > 0) {
             err = cudaMemset(
                 (char *) c->slot_pool_d + (size_t) n_slots * slot_size_bytes, 0, trailing_padding_bytes);
             if (err != cudaSuccess) {
-                cudaFree(c->slot_pool_d);
-                delete c;
-                cudaSetDevice(prev_device);
                 return nullptr;
             }
         }
@@ -9952,20 +9957,9 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     err = cudaStreamCreateWithFlags(&c->copy_stream, cudaStreamNonBlocking);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaStreamCreate failed: %s\n", cudaGetErrorString(err));
-        if (c->owns_slot_pool) {
-            cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        cudaSetDevice(prev_device);
         return nullptr;
     }
     if (wait_event != nullptr && !moe_grouped_cuda_success(cudaStreamWaitEvent(c->copy_stream, wait_event, 0))) {
-        cudaStreamDestroy(c->copy_stream);
-        if (c->owns_slot_pool) {
-            cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        cudaSetDevice(prev_device);
         return nullptr;
     }
 
@@ -9989,12 +9983,6 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
                 fprintf(stderr, "moe-cache: stream memory operation probe failed: %s\n", cudaGetErrorString(err));
                 (void) cudaGetLastError();
                 (void) cudaFree(stream_mem_probe);
-                (void) cudaStreamDestroy(c->copy_stream);
-                if (c->owns_slot_pool) {
-                    (void) cudaFree(c->slot_pool_d);
-                }
-                delete c;
-                (void) cudaSetDevice(prev_device);
                 return nullptr;
             }
             c->stream_mem_ops_supported = true;
@@ -10005,54 +9993,26 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     }
 #endif
 
-    if (fail_after_stream_probe) {
-        (void) cudaStreamSynchronize(c->copy_stream);
-        (void) cudaStreamDestroy(c->copy_stream);
-        if (c->owns_slot_pool) {
-            (void) cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        (void) cudaSetDevice(prev_device);
-        return nullptr;
-    }
-
     err = cudaEventCreateWithFlags(&c->compute_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
-        cudaStreamDestroy(c->copy_stream);
-        if (c->owns_slot_pool) {
-            cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        cudaSetDevice(prev_device);
         return nullptr;
     }
 
     err = cudaEventCreateWithFlags(&c->stage_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
-        cudaEventDestroy(c->compute_done);
-        cudaStreamDestroy(c->copy_stream);
-        if (c->owns_slot_pool) {
-            cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        cudaSetDevice(prev_device);
         return nullptr;
     }
 
     err = cudaEventCreateWithFlags(&c->handoff_done, cudaEventDisableTiming);
     if (err != cudaSuccess) {
         fprintf(stderr, "moe-cache: cudaEventCreate failed: %s\n", cudaGetErrorString(err));
-        cudaEventDestroy(c->stage_done);
-        cudaEventDestroy(c->compute_done);
-        cudaStreamDestroy(c->copy_stream);
-        if (c->owns_slot_pool) {
-            cudaFree(c->slot_pool_d);
-        }
-        delete c;
-        cudaSetDevice(prev_device);
         return nullptr;
+    }
+
+    if (fail_after_stream_probe) {
+        throw std::bad_alloc();
     }
 
     c->slot_to_host.assign(n_slots, nullptr);
@@ -10061,7 +10021,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     c->slot_hit_count.assign(n_slots, 0);
     c->slot_fill_access.assign(n_slots, 0);
     c->slot_pin_count.assign(n_slots, 0);
-    c->host_to_slot.reserve(n_slots * 2);
+    c->host_to_slot.reserve((size_t) n_slots * 2);
     for (int phase = 0; phase < 2; ++phase) {
         c->phase_hits[phase].store(0, std::memory_order_relaxed);
         c->phase_misses[phase].store(0, std::memory_order_relaxed);
@@ -10084,8 +10044,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         c->phase_prefetch_h2d_enqueue_time_us[phase].store(0, std::memory_order_relaxed);
     }
 
-    cudaSetDevice(prev_device);
-    return c;
+    return owner.release();
 }
 
 extern "C"
@@ -11623,15 +11582,30 @@ static void moe_cache_add_telemetry(moe_cache_telemetry & dst, moe_cache_telemet
     if (src.hot_tensor.accesses > dst.hot_tensor.accesses) {
         dst.hot_tensor = std::move(src.hot_tensor);
     }
-    dst.all_expert_access_counts.insert(
-        dst.all_expert_access_counts.end(), src.all_expert_access_counts.begin(), src.all_expert_access_counts.end());
+    // Retired owners can accumulate without a stats reset. Keep totals when detail exceeds the limit.
+    constexpr size_t max_expert_counts = 1024 * 1024;
+    constexpr size_t max_decode_tensors = 8192;
+    dst.expert_details_omitted |= src.expert_details_omitted ||
+        src.all_expert_access_counts.size() > max_expert_counts - dst.all_expert_access_counts.size();
+    if (dst.expert_details_omitted) {
+        std::vector<uint64_t>().swap(dst.all_expert_access_counts);
+    } else {
+        dst.all_expert_access_counts.insert(
+            dst.all_expert_access_counts.end(), src.all_expert_access_counts.begin(), src.all_expert_access_counts.end());
+    }
     if (src.hot_decode_miss_tensor.h2d_copy_bytes > dst.hot_decode_miss_tensor.h2d_copy_bytes) {
         dst.hot_decode_miss_tensor = std::move(src.hot_decode_miss_tensor);
     }
-    dst.decode_tensor_stats.insert(
-        dst.decode_tensor_stats.end(),
-        std::make_move_iterator(src.decode_tensor_stats.begin()),
-        std::make_move_iterator(src.decode_tensor_stats.end()));
+    dst.decode_details_omitted |= src.decode_details_omitted ||
+        src.decode_tensor_stats.size() > max_decode_tensors - dst.decode_tensor_stats.size();
+    if (dst.decode_details_omitted) {
+        std::vector<moe_cache_tensor_decode_stats>().swap(dst.decode_tensor_stats);
+    } else {
+        dst.decode_tensor_stats.insert(
+            dst.decode_tensor_stats.end(),
+            std::make_move_iterator(src.decode_tensor_stats.begin()),
+            std::make_move_iterator(src.decode_tensor_stats.end()));
+    }
     for (int phase = 0; phase < 2; ++phase) {
         ggml_cuda_moe_add_phase_stats(dst.phase_stats[phase], src.phase_stats[phase]);
     }
@@ -11996,11 +11970,11 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             experts.top5_accesses = ggml_cuda_moe_cache_top_accesses(all_expert_access_counts, n_top5);
             experts.top10_accesses = ggml_cuda_moe_cache_top_accesses(all_expert_access_counts, n_top10);
         }
-        const double top1_pct = experts.accesses > 0 ?
+        const double top1_pct = telemetry.expert_details_omitted ? -1.0 : experts.accesses > 0 ?
             100.0 * (double) experts.top1_accesses / (double) experts.accesses : 0.0;
-        const double top5_pct = experts.accesses > 0 ?
+        const double top5_pct = telemetry.expert_details_omitted ? -1.0 : experts.accesses > 0 ?
             100.0 * (double) experts.top5_accesses / (double) experts.accesses : 0.0;
-        const double top10_pct = experts.accesses > 0 ?
+        const double top10_pct = telemetry.expert_details_omitted ? -1.0 : experts.accesses > 0 ?
             100.0 * (double) experts.top10_accesses / (double) experts.accesses : 0.0;
         const double hot_unique_pct = hot_tensor.experts > 0 ?
             100.0 * (double) hot_tensor.unique_experts / (double) hot_tensor.experts : 0.0;
@@ -12072,6 +12046,11 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             (unsigned long long) hot_decode_miss_tensor.prefetch_h2d_copy_count,
             (double) hot_decode_miss_tensor.prefetch_h2d_copy_bytes / 1024.0 / 1024.0,
             hot_decode_reuse_gt_l1_pct);
+
+        if (telemetry.expert_details_omitted || telemetry.decode_details_omitted) {
+            GGML_LOG("moe-cache-telemetry: detail limit reached; expert_percentiles_omitted=%d (-1 means unavailable) decode_rankings_omitted=%d; reset stats more often for full detail\n",
+                telemetry.expert_details_omitted, telemetry.decode_details_omitted);
+        }
 
         std::vector<moe_cache_tensor_decode_stats> top_miss = decode_tensor_stats;
         std::sort(top_miss.begin(), top_miss.end(),
