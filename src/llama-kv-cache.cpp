@@ -80,6 +80,29 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+std::pair<ggml_tensor *, ggml_tensor *> llama_kv_cache::create_layer_tensors(
+        ggml_context * ctx,
+        const llama_hparams & hparams,
+        ggml_type type_k,
+        ggml_type type_v,
+        bool v_trans,
+        uint32_t kv_size,
+        uint32_t n_stream,
+        uint32_t il,
+        const char * name_tag) {
+    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+    // [TAG_V_CACHE_VARIABLE]
+    const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+
+    ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
+    ggml_tensor * v = hparams.is_mla() ? nullptr : ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
+    ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+    if (v) {
+        ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+    }
+    return {k, v};
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -281,13 +304,12 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        // [TAG_V_CACHE_VARIABLE]
-        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
-        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
-
         const char * dev_name = "CPU";
 
-        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
+        // Sub-caches claim each selected layer once.
+        const bool layer_picked = placement.gpu_resident_ils.count(il) > 0 &&
+            (!placement.gpu_resident_done || placement.gpu_resident_done->count(il) == 0);
+        const bool layer_offload = offload || layer_picked;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (layer_offload) {
@@ -299,6 +321,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
+            if (placement.gpu_resident_done) {
+                placement.gpu_resident_done->insert(il);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -308,11 +333,11 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-        const bool has_k = true;
-        const bool has_v = !is_mla;
-
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        const auto [k, v] = create_layer_tensors(ctx, hparams, type_k, type_v, v_trans, kv_size, n_stream, il, name_tag);
+        const bool has_k = k != nullptr;
+        const bool has_v = v != nullptr;
+        const int64_t n_embd_k_gqa = k->ne[0];
+        const int64_t n_embd_v_gqa = v ? v->ne[0] : 0;
 
         bool k_store_quantize = false;
         bool v_store_quantize = false;
@@ -322,9 +347,6 @@ llama_kv_cache::llama_kv_cache(
             v_store_quantize = has_v && !v_trans && resolve_store_quantize(
                     il, type_v, n_embd_v_gqa, kv_store_side::value);
         }
-
-        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
-        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
@@ -339,9 +361,8 @@ llama_kv_cache::llama_kv_cache(
         layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream, });
     }
 
-    if (!offload && placement.gpu_resident_layers > 0) {
-        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested owned attention layers device-resident\n",
-                __func__, n_gpu_resident, placement.gpu_resident_layers);
+    if (!offload && n_gpu_resident > 0) {
+        LLAMA_LOG_DEBUG("%s: %u attention layers device-resident\n", __func__, n_gpu_resident);
     }
 
     if (reuse) {

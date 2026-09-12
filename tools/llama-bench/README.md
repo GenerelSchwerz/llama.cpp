@@ -107,11 +107,13 @@ The maintained fork adds the following context parameters. The four boolean opti
 
 | Option | Behavior and limits |
 | --- | --- |
-| `-kvgl`, `--kv-gpu-layers` | With `-nkvo 1`, requests device residency for the first N independently owned attention KV layers. Standard and direct hybrid caches support it; unsupported specialized caches ignore it. The model's layer placement and available attention layers limit what can become GPU resident. |
+| `-kvgl`, `--kv-gpu-layers` | With `-nkvo 1`, requests up to N independently owned attention KV layers on their assigned devices, prioritizing slower measured host links. Devices with similar link speeds are selected in turn. Sub-caches share one count; auxiliary caches can remain host-resident. Tensor-split iSWA caches do not support partial residency. |
 | `-kvcp`, `--kv-cpu-pinned` | Requests pinned buffers for host KV when the backend provides them. With operation offload enabled (`-nopo 0`), it also allows attention compute on the accelerator, so a `0,1` sweep can change both storage and compute placement. |
 | `-rso`, `--recurrent-state-offload` | Offloads recurrent state for recurrent and hybrid models independently of host attention KV. With `-nkvo 0`, KV offload already enables recurrent state offload, so changing this option has no additional effect. |
 | `-paw`, `--phase-aware-workspace` | Resizes compute workspaces between prompt processing and token generation; a later prompt regrows the reservation. It can be combined with `-lcw 1`. |
 | `-lcw`, `--live-context-workspace` | Grows compute reservations with the padded live KV extent for supported attention caches. Unsupported caches fall back to full-context reservation. It does not shrink the KV cache allocation itself. |
+
+Partial residency uses estimated cache sizes and reported free device memory, with a margin for later allocations. This is a best-effort capacity bound: the realized layer count can be lower, and allocation can still fail as memory use changes or compute buffers grow. `-kvgl` sets a layer count, not a VRAM limit. Allocation failure does not trigger an automatic retry with fewer resident layers.
 
 The output fields `kv_gpu_layers`, `kv_cpu_pinned`, `recurrent_state_offload`, `phase_aware_workspace`, and `live_context_workspace` record requested settings. They do not prove successful pinning, realized GPU residency, or that a cache supports the requested mode. Warnings are shown by default unless structured results are sent to stderr with `-oe`. Use `-v` to record allocation and placement details, and retain stderr with the results; use `-o` for structured output when collecting these logs.
 

@@ -703,6 +703,9 @@ struct llama_model {
     // list of devices used in this model
     std::vector<llama_device> devices;
 
+    // the devices behind the meta device under split mode tensor, empty otherwise
+    std::vector<ggml_backend_dev_t> devices_meta;
+
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
@@ -754,7 +757,8 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
+    // cparams.kv_gpu_layers is updated to the number of layers that became device-resident
+    llama_memory_i * create_memory(const llama_memory_params & params, llama_cparams & cparams) const;
 
     ggml_cgraph * build_graph(const llm_graph_params & params) const;
 

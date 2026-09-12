@@ -87,6 +87,10 @@ private:
 
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
+    static constexpr bool unified_raw = false;
+
+    static llama_hparams get_hparams_raw(const llama_hparams & hparams);
+
     llama_kv_cache_dsv4(
             const llama_model & model,
                     ggml_type   type_k,

@@ -33,8 +33,10 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <mutex>
 #include <numeric>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -2248,15 +2250,312 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
-llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
-    llama_memory_i * res;
-    const llama_memory_placement_options placement = {
-        cparams.kv_cpu_pinned,
-        cparams.kv_gpu_layers,
-        cparams.offload_kqv || cparams.recurrent_state_offload,
+// Use the same hybrid attention ownership rules for selection and cache construction.
+static llama_memory_hybrid::layer_filter_cb llama_hybrid_filter_attn(const llama_model & model, bool is_mtp) {
+    const llama_hparams & hparams = model.hparams;
+    if (is_mtp) {
+        // an MTP head caches the nextn layers with a plain attention cache, not the hybrid wrapper
+        return nullptr;
+    }
+    switch (model.arch) {
+        case LLM_ARCH_FALCON_H1:
+            return [](uint32_t) { return true; };
+        case LLM_ARCH_NEMOTRON_H:
+        case LLM_ARCH_NEMOTRON_H_MOE:
+            return [&hparams](uint32_t il) {
+                return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
+            };
+        case LLM_ARCH_QWEN3NEXT:
+        case LLM_ARCH_QWEN35:
+        case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_QWEN4EXP:
+        case LLM_ARCH_MINIMAX_01:
+            return [&hparams](uint32_t il) {
+                return il < hparams.n_layer() && !hparams.is_recr(il);
+            };
+        default:
+            return nullptr;
+    }
+}
+
+static bool llama_layer_in_context(const llama_hparams & hparams, uint32_t il, bool is_mtp) {
+    return hparams.n_layer_nextn == 0 || hparams.n_layer() == 0 || hparams.router_layer >= 0 ||
+           (il >= hparams.n_layer()) == is_mtp;
+}
+
+// Measure host-to-device bytes per microsecond; zero means the probe failed.
+static double llama_dev_h2d_bandwidth_measure(ggml_backend_dev_t dev, bool cpu_pinned) {
+    const size_t n_bytes = 16u*1024*1024;
+    const int    n_reps  = 3;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        return 0.0;
+    }
+
+    ggml_init_params ip = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
     };
-    llama_memory_placement_options specialized_placement = placement;
-    specialized_placement.gpu_resident_layers = 0;
+    ggml_context_ptr ctx { ggml_init(ip) };
+    if (!ctx) {
+        return 0.0;
+    }
+
+    ggml_tensor * dst = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, n_bytes);
+    ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+    if (!buf) {
+        return 0.0;
+    }
+
+    // pinned host memory transfers faster than pageable, so measure the storage the cache will use
+    ggml_backend_buffer_type_t host_buft = cpu_pinned ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+    ggml_backend_buffer_ptr host_buf { host_buft ? ggml_backend_buft_alloc_buffer(host_buft, n_bytes) : nullptr };
+    std::vector<uint8_t> host_fallback;
+    void * src = host_buf ? ggml_backend_buffer_get_base(host_buf.get()) : nullptr;
+    if (!src) {
+        host_fallback.resize(n_bytes);
+        src = host_fallback.data();
+    }
+    memset(src, 0, n_bytes);
+
+    ggml_backend_tensor_set(dst, src, 0, n_bytes);
+
+    const int64_t t_start = ggml_time_us();
+    for (int i = 0; i < n_reps; i++) {
+        ggml_backend_tensor_set(dst, src, 0, n_bytes);
+    }
+    const int64_t t_us = ggml_time_us() - t_start;
+
+    return t_us > 0 ? (double) n_bytes*n_reps/t_us : 0.0;
+}
+
+// Reuse successful measurements across contexts.
+static double llama_dev_h2d_bandwidth(ggml_backend_dev_t dev, bool cpu_pinned) {
+    static std::mutex mutex;
+    static std::map<std::pair<ggml_backend_dev_t, bool>, double> measured;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = measured.find({dev, cpu_pinned});
+    if (it != measured.end()) {
+        return it->second;
+    }
+    const double bandwidth = llama_dev_h2d_bandwidth_measure(dev, cpu_pinned);
+    if (bandwidth > 0.0) {
+        measured.emplace(std::make_pair(dev, cpu_pinned), bandwidth);
+    }
+    return bandwidth;
+}
+
+// Prefer slower host links while keeping similar devices in one round-robin group.
+static std::set<uint32_t> llama_pick_gpu_resident_layers(
+        const llama_model & model, const llama_memory_params & params, const llama_cparams & cparams,
+        uint32_t n_layers, bool is_mtp) {
+    const uint32_t n_layers_req = n_layers;
+    std::set<uint32_t> ret;
+    if (n_layers == 0) {
+        return ret;
+    }
+
+    const llama_hparams & hparams = model.hparams;
+
+    // Mixed host/device iSWA under tensor split has a known numerical discrepancy.
+    if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
+        for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+            if (llama_layer_in_context(hparams, il, is_mtp) && hparams.has_kv(il) && hparams.is_swa(il)) {
+                LLAMA_LOG_WARN("%s: kv_gpu_layers is not supported for an iSWA cache split by tensor, ignoring it\n",
+                        __func__);
+                return ret;
+            }
+        }
+    }
+
+    std::vector<ggml_backend_dev_t>    devs;
+    std::vector<std::vector<uint32_t>> devs_ils;
+
+    // a layer the attention cache does not own must not take from the budget, so ask the same filter
+    const llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(model, is_mtp);
+
+    for (uint32_t il = 0; il < hparams.n_layer_all; il++) {
+        if (!llama_layer_in_context(hparams, il, is_mtp)) {
+            continue;
+        }
+        if (!hparams.has_kv(il)) {
+            continue;
+        }
+        if (filter_attn ? !filter_attn(il) : hparams.is_recr(il)) {
+            continue;
+        }
+        auto * dev = model.dev_layer(il);
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        auto it = std::find(devs.begin(), devs.end(), dev);
+        if (it == devs.end()) {
+            devs.push_back(dev);
+            devs_ils.emplace_back();
+            it = devs.end() - 1;
+        }
+        devs_ils[it - devs.begin()].push_back(il);
+    }
+    if (devs.empty()) {
+        return ret;
+    }
+
+    // If a link cannot be measured, retain round-robin placement for all devices.
+    std::vector<double> bw(devs.size(), 1.0);
+    if (devs.size() > 1) {
+        std::vector<double> measured(devs.size());
+        for (size_t d = 0; d < devs.size(); d++) {
+            measured[d] = llama_dev_h2d_bandwidth(devs[d], cparams.kv_cpu_pinned);
+        }
+        if (std::all_of(measured.begin(), measured.end(), [](double b) { return b > 0.0; })) {
+            bw = measured;
+            for (size_t d = 0; d < devs.size(); d++) {
+                LLAMA_LOG_INFO("%s: %s: host-to-device %.1f GB/s\n", __func__,
+                        ggml_backend_dev_name(devs[d]), bw[d]/1000.0);
+            }
+        }
+    }
+
+    // Keep a margin for state and compute buffers allocated after the cache.
+    struct dev_budget {
+        ggml_backend_dev_t dev;
+        size_t remaining;
+    };
+    bool memory_bound = false;
+    const bool split_tensor = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && !model.devices_meta.empty();
+    std::vector<std::vector<dev_budget>> budget(devs.size());
+    for (size_t d = 0; d < devs.size(); d++) {
+        const auto parts = split_tensor ? model.devices_meta : std::vector<ggml_backend_dev_t>{devs[d]};
+        for (auto * part : parts) {
+            size_t free = 0;
+            size_t total = 0;
+            ggml_backend_dev_memory(part, &free, &total);
+            budget[d].push_back({part, free - free/8});
+        }
+    }
+
+    const bool is_dsv4_raw = model.arch == LLM_ARCH_DEEPSEEK4 && !is_mtp;
+    const auto hparams_kv = is_dsv4_raw ? llama_kv_cache_dsv4::get_hparams_raw(hparams) : hparams;
+    const bool unified = is_dsv4_raw ? llama_kv_cache_dsv4::unified_raw : cparams.kv_unified;
+    const uint32_t n_stream = unified ? 1 : std::max(uint32_t(1), cparams.n_seq_max);
+    const ggml_init_params ip = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx {ggml_init(ip)};
+    ggml_context_ptr ctx_split {ggml_init(ip)};
+    if (!ctx || !ctx_split) {
+        throw std::runtime_error("failed to create KV residency sizing context");
+    }
+
+    // Full context cells bound SWA storage; tensor shapes and device padding follow the allocator.
+    auto layer_bytes = [&](uint32_t il, const std::vector<dev_budget> & parts) {
+        ggml_reset(ctx.get());
+        const auto kv = llama_kv_cache::create_layer_tensors(ctx.get(), hparams_kv, params.type_k, params.type_v,
+                !cparams.flash_attn, cparams.n_ctx_seq, n_stream, il);
+        const ggml_tensor * tensors[] = {kv.first, kv.second};
+        std::vector<ggml_backend_meta_split_state> splits;
+        if (split_tensor) {
+            llama_meta_device_get_split_state_userdata ud {parts.size(), &model};
+            for (const auto * tensor : tensors) {
+                if (tensor) {
+                    splits.push_back(llama_meta_device_get_split_state(tensor, &ud));
+                }
+            }
+        }
+        std::vector<size_t> bytes(parts.size());
+        for (size_t d = 0; d < parts.size(); d++) {
+            auto * buft = ggml_backend_dev_buffer_type(parts[d].dev);
+            if (!split_tensor) {
+                bytes[d] = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+                continue;
+            }
+            ggml_reset(ctx_split.get());
+            size_t i = 0;
+            for (const auto * tensor : tensors) {
+                if (!tensor) {
+                    continue;
+                }
+                const auto & split = splits[i++];
+                int64_t ne[GGML_MAX_DIMS];
+                std::copy(tensor->ne, tensor->ne + GGML_MAX_DIMS, ne);
+                if (split.axis >= 0 && split.axis < GGML_MAX_DIMS) {
+                    ne[split.axis] = 0;
+                    for (size_t segment = 0; segment < split.n_segments; segment++) {
+                        ne[split.axis] += split.ne[segment*parts.size() + d]*split.nr[segment];
+                    }
+                }
+                if (std::all_of(ne, ne + GGML_MAX_DIMS, [](int64_t n) { return n > 0; })) {
+                    ggml_new_tensor(ctx_split.get(), tensor->type, GGML_MAX_DIMS, ne);
+                }
+            }
+            bytes[d] = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx_split.get(), buft);
+        }
+        return bytes;
+    };
+
+    std::vector<size_t> order(devs.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) { return bw[a] < bw[b]; });
+
+    for (size_t first = 0; first < order.size() && ret.size() < n_layers; ) {
+        size_t last = first + 1;
+        while (last < order.size() && bw[order[last]] <= bw[order[first]]*1.15) {
+            last++;
+        }
+        for (size_t i = 0; ret.size() < n_layers; i++) {
+            bool any = false;
+            for (size_t d = first; d < last && ret.size() < n_layers; d++) {
+                const size_t                  dd  = order[d];
+                const std::vector<uint32_t> & ils = devs_ils[dd];
+                if (i >= ils.size()) {
+                    continue;
+                }
+                any = true;
+                const auto bytes = layer_bytes(ils[i], budget[dd]);
+                bool fits = true;
+                for (size_t part = 0; part < budget[dd].size(); part++) {
+                    fits = fits && bytes[part] <= budget[dd][part].remaining;
+                }
+                if (!fits) {
+                    memory_bound = true;
+                    continue;
+                }
+                for (size_t part = 0; part < budget[dd].size(); part++) {
+                    budget[dd][part].remaining -= bytes[part];
+                }
+                ret.insert(ils[i]);
+            }
+            if (!any) {
+                break;
+            }
+        }
+        first = last;
+    }
+
+    if (memory_bound && ret.size() < n_layers_req) {
+        LLAMA_LOG_WARN("%s: the free device memory limits the residency set to %zu of %u requested attention layers\n",
+                __func__, ret.size(), n_layers_req);
+    }
+
+    return ret;
+}
+
+llama_memory_i * llama_model::create_memory(const llama_memory_params & params, llama_cparams & cparams) const {
+    llama_memory_i * res;
+    llama_memory_placement_options placement;
+    placement.cpu_pinned        = cparams.kv_cpu_pinned;
+    placement.recurrent_offload = cparams.offload_kqv || cparams.recurrent_state_offload;
+    // Share one residency budget across sub-caches; full offload needs no selection.
+    if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+        placement.gpu_resident_ils  = llama_pick_gpu_resident_layers(*this, params, cparams,
+                cparams.kv_gpu_layers, params.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
+        placement.gpu_resident_done = std::make_shared<std::set<uint32_t>>();
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2299,7 +2598,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         nullptr,
                         filter_idx,
                         nullptr,
-                        specialized_placement);
+                        placement);
             } break;
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
@@ -2353,7 +2652,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_HY_V4:
@@ -2397,7 +2696,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter_lid,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DOTS3NOTE:
@@ -2450,7 +2749,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mla,
                             filter_lid,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DEEPSEEK4:
@@ -2478,7 +2777,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             filter_mtp,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 } else {
                     res = new llama_kv_cache_dsv4(
                             *this,
@@ -2495,7 +2794,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_rs_seq,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                 }
             } break;
         case LLM_ARCH_DFLASH:
@@ -2520,7 +2819,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             nullptr,
                             nullptr,
-                            specialized_placement);
+                            placement);
                     break;
                 }
             }
@@ -2551,26 +2850,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 } else if (llm_arch_is_hybrid(arch) && !mtp_on_hybrid_qwen && !mtp_on_hybrid_nemotron) {
                     // The main difference between hybrid architectures is the
                     // layer filters, so pick the right one here
-                    llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
+                    llama_memory_hybrid::layer_filter_cb filter_attn = llama_hybrid_filter_attn(*this, false);
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
                     // only the sparse-attention architectures use llama_memory_hybrid_idx
                     // a null filter_idx means the GGUF has no indexer tensors
                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
                     if (arch == LLM_ARCH_FALCON_H1) {
-                        filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
-                        filter_attn = [&](uint32_t il) {
-                            return !hparams.is_recr(il) && hparams.n_ff(il) == 0;
-                        };
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
-                        };
                         filter_recr = [&](uint32_t il) {
                             return il < hparams.n_layer() && hparams.is_recr(il);
                         };
@@ -2595,7 +2887,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* attn_n_ubatch     */ cparams.n_ubatch,
                             /* attn_n_pad        */ 1,
                             /* attn_offload      */ cparams.offload_kqv,
-                            /* placement         */ specialized_placement,
+                            /* placement         */ placement,
                             /* recurrent_type_r  */ GGML_TYPE_F32,
                             /* recurrent_type_s  */ GGML_TYPE_F32,
                             /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2668,14 +2960,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
                     }
 
-                    // don't filter when n_layer_nextn is repurposed for a router layer the trunk attends
-                    // or when a model is entirely n_layer_nextn layers and has no trunk
+                    // Router and all-nextn models keep all layers in the same context.
                     if (hparams.n_layer_nextn > 0 && hparams.n_layer() > 0 && hparams.router_layer < 0) {
-                        if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
-                            filter = [&](uint32_t il) { return il >= hparams.n_layer(); };
-                        } else {
-                            filter = [&](uint32_t il) { return il <  hparams.n_layer(); };
-                        }
+                        const bool is_mtp = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+                        filter = [&, is_mtp](uint32_t il) { return llama_layer_in_context(hparams, il, is_mtp); };
                     }
 
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
@@ -2710,7 +2998,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    specialized_placement);
+                                    placement);
                         } else {
                             res = new llama_kv_cache_iswa(
                                     *this,
@@ -2728,7 +3016,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     filter,
                                     reuse,
                                     share,
-                                    specialized_placement);
+                                    placement);
                         }
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
@@ -2754,6 +3042,18 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
                 }
             }
+    }
+
+    // Attention compute placement follows the layers actually claimed by the caches.
+    if (placement.gpu_resident_done) {
+        const uint32_t n_resident = (uint32_t) placement.gpu_resident_done->size();
+        if (n_resident == 0) {
+            LLAMA_LOG_WARN("%s: no attention layer can be kept device-resident; ignoring kv_gpu_layers\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested attention layers device-resident\n",
+                    __func__, n_resident, cparams.kv_gpu_layers);
+        }
+        cparams.kv_gpu_layers = n_resident;
     }
 
     return res;
