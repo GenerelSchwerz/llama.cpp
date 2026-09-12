@@ -66,10 +66,6 @@ public:
     bool recurrent_sparse_snapshots_supported() const override;
     bool recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) override;
 
-    bool get_supports_partial_kv() const override {
-        return true;
-    }
-
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;

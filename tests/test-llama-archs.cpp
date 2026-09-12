@@ -12,6 +12,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -68,7 +69,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-kv-residency]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1051,6 +1052,168 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     GGML_ASSERT(llama_contexts_share_workspace(target.get(), draft.get()) == (status == 1));
 }
 
+static size_t host_context_bytes(const llama_context * ctx) {
+    size_t ret = 0;
+    for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+        if (ggml_backend_buft_is_host(buft)) {
+            ret += data.context;
+        }
+    }
+    return ret;
+}
+
+static size_t device_context_bytes(const llama_context * ctx, ggml_backend_dev_t dev) {
+    size_t ret = 0;
+    for (const auto & [buft, data] : llama_get_memory_breakdown(ctx)) {
+        if (!ggml_backend_buft_is_host(buft) && ggml_backend_buft_get_device(buft) == dev) {
+            ret += data.context;
+        }
+    }
+    return ret;
+}
+
+static llama_context_params kv_residency_context_params() {
+    llama_context_params ret = llama_context_default_params();
+    ret.n_ctx = 32;
+    ret.n_batch = 32;
+    ret.n_ubatch = 32;
+    ret.n_seq_max = 1;
+    ret.n_outputs_max = 4;
+    ret.n_threads = 4;
+    ret.n_threads_batch = 4;
+    return ret;
+}
+
+// MTP owns the nextn cache, while the main context owns the trunk cache and recurrent state.
+static void test_mtp_kv_residency(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        printf("test_mtp_kv_residency: skipped, GPU device required\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.n_gpu_layers = 99;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { gpu, nullptr };
+    model_params.devices = devices;
+
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+
+    for (llama_context_type ctx_type : {LLAMA_CONTEXT_TYPE_DEFAULT, LLAMA_CONTEXT_TYPE_MTP}) {
+        size_t host_bytes = 0;
+        size_t resident_bytes = 0;
+        std::vector<float> logits_host;
+        for (uint32_t requested : {0u, 1u, 99u}) {
+            llama_context_params ctx_params = kv_residency_context_params();
+            ctx_params.ctx_type = ctx_type;
+            ctx_params.offload_kqv = false;
+            ctx_params.kv_gpu_layers = requested;
+            llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+            GGML_ASSERT(ctx);
+            GGML_ASSERT(ctx->get_cparams().kv_gpu_layers == (requested > 0 ? 1u : 0u));
+            const size_t host = host_context_bytes(ctx.get());
+            const size_t device = device_context_bytes(ctx.get(), gpu);
+            if (requested == 0) {
+                host_bytes = host;
+                GGML_ASSERT(host > 0 && device == 0);
+            } else {
+                GGML_ASSERT(host < host_bytes && device > 0);
+                GGML_ASSERT((host == 0) == (ctx_type == LLAMA_CONTEXT_TYPE_MTP));
+                if (requested == 1) {
+                    resident_bytes = device;
+                } else {
+                    GGML_ASSERT(device == resident_bytes);
+                }
+            }
+            if (ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+                llama_batch batch = make_mtp_batch(4, llama_model_n_embd_out(model.get()), 0, n_vocab, seed);
+                GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
+                const float * logits = llama_get_logits_ith(ctx.get(), -1);
+                const std::vector<float> result(logits, logits + n_vocab);
+                if (requested == 0) {
+                    logits_host = result;
+                } else {
+                    const double error = nmse(logits_host, result);
+                    GGML_ASSERT(error <= 1e-4);
+                    printf("test_mtp_kv_residency: requested=%u actual=%u NMSE=%.2e\n", requested, ctx->get_cparams().kv_gpu_layers, error);
+                }
+                llama_batch_free(batch);
+            }
+            printf("test_mtp_kv_residency: type=%d requested=%u actual=%u host=%zu device=%zu\n", ctx_type, requested, ctx->get_cparams().kv_gpu_layers, host, device);
+        }
+        llama_context_params defaults = kv_residency_context_params();
+        defaults.ctx_type = ctx_type;
+        GGML_ASSERT(defaults.offload_kqv && defaults.kv_gpu_layers == 0);
+        llama_context_ptr ctx(llama_init_from_model(model.get(), defaults));
+        GGML_ASSERT(ctx);
+        GGML_ASSERT(host_context_bytes(ctx.get()) == 0);
+        GGML_ASSERT(device_context_bytes(ctx.get(), gpu) > 0);
+    }
+    printf("test_mtp_kv_residency: OK\n");
+}
+
+// Hybrid attention ownership differs from the recurrent layer flags and the total layer count.
+static void test_kv_residency_ownership(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    for (llm_arch arch : {LLM_ARCH_LLAMA, LLM_ARCH_FALCON_H1, LLM_ARCH_NEMOTRON_H, LLM_ARCH_MAMBA}) {
+        if (gpu == nullptr && arch != LLM_ARCH_LLAMA) {
+            continue;
+        }
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        model_params.n_gpu_layers = arch == LLM_ARCH_LLAMA ? 0 : 99;
+        ggml_backend_dev_t devices[] = { arch == LLM_ARCH_LLAMA ? nullptr : gpu, nullptr };
+        model_params.devices = devices;
+
+        size_t tensor_seed = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+        GGML_ASSERT(model);
+
+        const uint32_t available = arch == LLM_ARCH_FALCON_H1 ? 2 : arch == LLM_ARCH_NEMOTRON_H ? 1 : 0;
+        size_t host_bytes = 0;
+        for (uint32_t requested : {0u, 1u, 99u}) {
+            llama_context_params ctx_params = kv_residency_context_params();
+            ctx_params.offload_kqv = false;
+            ctx_params.kv_gpu_layers = requested;
+            llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+            GGML_ASSERT(ctx);
+            const uint32_t actual = ctx->get_cparams().kv_gpu_layers;
+            GGML_ASSERT(actual == std::min(requested, available));
+            const size_t host = host_context_bytes(ctx.get());
+            const size_t device = device_context_bytes(ctx.get(), gpu);
+            if (requested == 0) {
+                host_bytes = host;
+                GGML_ASSERT(host > 0);
+            }
+            GGML_ASSERT((device > 0) == (actual > 0));
+            GGML_ASSERT(actual > 0 ? host < host_bytes : host == host_bytes);
+            printf("test_kv_residency_ownership: arch=%s requested=%u actual=%u host=%zu device=%zu\n", llm_arch_name(arch), requested, actual, host, device);
+        }
+    }
+    printf("test_kv_residency_ownership: OK\n");
+}
+
 static std::vector<float> get_logits(
         llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
@@ -1083,6 +1246,191 @@ static std::vector<float> get_logits(
     }
     llama_batch_free(batch);
     return ret;
+}
+
+static void test_kv_residency_devices(size_t seed) {
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        printf("test_kv_residency_devices: skipped, GPU device required\n");
+        return;
+    }
+
+    const uint32_t n_devices = devices.size();
+    const uint32_t n_layers = 2*n_devices;
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    llama_model_saver ms(LLM_ARCH_LLAMA, gguf_ctx.get());
+    ms.add_kv(LLM_KV_BLOCK_COUNT, n_layers);
+
+    // Each device owns two repeating layers; the last device also owns the output layer.
+    std::vector<float> tensor_split(llama_max_devices(), 0.0f);
+    GGML_ASSERT(n_devices <= tensor_split.size());
+    for (uint32_t d = 0; d < n_devices; ++d) {
+        tensor_split[d] = d + 1 == n_devices ? 3.0f : 2.0f;
+    }
+    devices.push_back(nullptr);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.n_gpu_layers = n_layers + 1;
+    model_params.devices = devices.data();
+    model_params.tensor_split = tensor_split.data();
+    model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    size_t tensor_seed = seed;
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    GGML_ASSERT(model);
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        GGML_ASSERT(model->dev_layer(il) == devices[il/2]);
+    }
+
+    const std::vector<llama_token> tokens = get_tokens(4, llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed);
+    std::vector<uint32_t> requests = {0, 1};
+    if (n_devices > 1) {
+        requests.push_back(n_devices);
+    }
+    requests.push_back(n_devices + 1);
+    requests.push_back(99);
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+        llama_context_params defaults = kv_residency_context_params();
+        defaults.type_k = type;
+        defaults.type_v = type;
+        defaults.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        GGML_ASSERT(defaults.offload_kqv && defaults.kv_gpu_layers == 0);
+        llama_context_ptr full(llama_init_from_model(model.get(), defaults));
+        GGML_ASSERT(full);
+        GGML_ASSERT(host_context_bytes(full.get()) == 0);
+        std::vector<size_t> device_layer_bytes(n_devices);
+        for (uint32_t d = 0; d < n_devices; ++d) {
+            const size_t bytes = device_context_bytes(full.get(), devices[d]);
+            printf("test_kv_residency_devices: type=%s default device=%s layers=2 bytes=%zu\n", ggml_type_name(type), ggml_backend_dev_name(devices[d]), bytes);
+            fflush(stdout);
+            GGML_ASSERT(bytes > 0 && bytes % 2 == 0);
+            device_layer_bytes[d] = bytes/2;
+        }
+        const std::vector<float> logits_full = get_logits(model.get(), full.get(), tokens);
+        full.reset();
+
+        size_t layer_bytes = 0;
+        std::vector<float> logits_host;
+        for (uint32_t requested : requests) {
+            llama_context_params ctx_params = kv_residency_context_params();
+            ctx_params.offload_kqv = false;
+            ctx_params.kv_gpu_layers = requested;
+            ctx_params.type_k = type;
+            ctx_params.type_v = type;
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+            GGML_ASSERT(ctx);
+            const uint32_t actual = ctx->get_cparams().kv_gpu_layers;
+            const size_t host = host_context_bytes(ctx.get());
+            printf("test_kv_residency_devices: type=%s requested=%u actual=%u host=%zu\n", ggml_type_name(type), requested, actual, host);
+            fflush(stdout);
+            GGML_ASSERT(actual == std::min(requested, n_layers));
+            if (requested == 0) {
+                GGML_ASSERT(host > 0 && host % n_layers == 0);
+                layer_bytes = host/n_layers;
+            }
+            GGML_ASSERT(host == (n_layers - actual)*layer_bytes);
+            for (uint32_t d = 0; d < n_devices; ++d) {
+                const uint32_t resident = actual/n_devices + (d < actual % n_devices ? 1 : 0);
+                const size_t bytes = device_context_bytes(ctx.get(), devices[d]);
+                const size_t expected = resident*device_layer_bytes[d];
+                printf("test_kv_residency_devices: type=%s requested=%u actual=%u device=%s layers=%u bytes=%zu expected=%zu\n", ggml_type_name(type), requested, actual, ggml_backend_dev_name(devices[d]), resident, bytes, expected);
+                fflush(stdout);
+                GGML_ASSERT(bytes == expected);
+            }
+            const std::vector<float> logits = get_logits(model.get(), ctx.get(), tokens);
+            if (requested == 0) {
+                logits_host = logits;
+            } else {
+                const double error = nmse(logits_host, logits);
+                printf("test_kv_residency_devices: type=%s requested=%u host=%zu NMSE=%.2e\n", ggml_type_name(type), requested, host, error);
+                fflush(stdout);
+                GGML_ASSERT(error <= 1e-4);
+            }
+        }
+        const double error = nmse(logits_host, logits_full);
+        printf("test_kv_residency_devices: type=%s default NMSE=%.2e\n", ggml_type_name(type), error);
+        fflush(stdout);
+        GGML_ASSERT(error <= 1e-4);
+    }
+    printf("test_kv_residency_devices: OK (%u devices)\n", n_devices);
+}
+
+static void test_kv_residency_context_filter(size_t seed) {
+    ggml_backend_dev_t gpu = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu = dev;
+            break;
+        }
+    }
+    if (gpu == nullptr) {
+        printf("test_kv_residency_context_filter: skipped, GPU device required\n");
+        return;
+    }
+
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    for (llama_split_mode split_mode : {LLAMA_SPLIT_MODE_LAYER, LLAMA_SPLIT_MODE_TENSOR}) {
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        model_params.n_gpu_layers = 99;
+        ggml_backend_dev_t devices[] = {gpu, nullptr};
+        model_params.devices = devices;
+        model_params.split_mode = split_mode;
+        size_t tensor_seed = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+        GGML_ASSERT(model);
+        llama_context_params ctx_params = kv_residency_context_params();
+        ctx_params.offload_kqv = false;
+        llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+        GGML_ASSERT(ctx);
+        const llama_cparams resolved = ctx->get_cparams();
+        ctx.reset();
+
+        // Test cache ownership directly; these metadata variants do not define inference graphs.
+        const llama_hparams original = model->hparams;
+        auto check = [&](const char * name, llama_context_type ctx_type, uint32_t expected) {
+            llama_cparams cparams = resolved;
+            cparams.kv_gpu_layers = 99;
+            cparams.ctx_type = ctx_type;
+            llama_memory_params mparams = {GGML_TYPE_F16, GGML_TYPE_F16, false, ctx_type, nullptr};
+            std::unique_ptr<llama_memory_i> memory(model->create_memory(mparams, cparams));
+            GGML_ASSERT(memory);
+            size_t host = 0;
+            size_t device = 0;
+            for (const auto & [buft, bytes] : memory->memory_breakdown()) {
+                (ggml_backend_buft_is_host(buft) ? host : device) += bytes;
+            }
+            printf("test_kv_residency_context_filter: case=%s split=%d type=%d requested=99 actual=%u host=%zu device=%zu\n", name, split_mode, ctx_type, cparams.kv_gpu_layers, host, device);
+            GGML_ASSERT(cparams.kv_gpu_layers == expected);
+            GGML_ASSERT((device > 0) == (expected > 0));
+            GGML_ASSERT((host > 0) == (expected == 0));
+        };
+        model->hparams.n_layer_nextn = 2;
+        check("all-nextn", LLAMA_CONTEXT_TYPE_DEFAULT, 2);
+        model->hparams.n_layer_nextn = 1;
+        model->hparams.router_layer = 1;
+        check("router", LLAMA_CONTEXT_TYPE_DEFAULT, 2);
+        model->hparams.router_layer = -1;
+        check("trunk", LLAMA_CONTEXT_TYPE_DEFAULT, 1);
+        check("mtp", LLAMA_CONTEXT_TYPE_MTP, 1);
+        if (split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+            model->hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+            model->hparams.n_swa = 16;
+            model->hparams.is_swa_impl[0] = 1;
+            model->hparams.is_swa_impl[1] = 0;
+            check("swa-trunk", LLAMA_CONTEXT_TYPE_DEFAULT, 0);
+            check("dense-mtp-with-swa-trunk", LLAMA_CONTEXT_TYPE_MTP, 1);
+        }
+        model->hparams = original;
+    }
+    printf("test_kv_residency_context_filter: OK\n");
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -1450,6 +1798,7 @@ int main(int argc, char ** argv) {
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
+    bool test_kv_residency = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1503,6 +1852,10 @@ int main(int argc, char ** argv) {
             test_live_context_workspace = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-kv-residency") == 0) {
+            test_kv_residency = true;
+            continue;
+        }
     }
     printf("%s: using seed %zu\n", __func__, seed);
 
@@ -1518,6 +1871,13 @@ int main(int argc, char ** argv) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
             test_live_context_workspace_unsupported(seed);
+            return 0;
+        }
+        if (test_kv_residency) {
+            test_mtp_kv_residency(seed);
+            test_kv_residency_ownership(seed);
+            test_kv_residency_devices(seed);
+            test_kv_residency_context_filter(seed);
             return 0;
         }
         if (!out.empty()) {

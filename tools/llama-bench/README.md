@@ -107,7 +107,7 @@ The maintained fork adds the following context parameters. The four boolean opti
 
 | Option | Behavior and limits |
 | --- | --- |
-| `-kvgl`, `--kv-gpu-layers` | With `-nkvo 1`, requests device residency for the first N independently owned attention KV layers. Standard and direct hybrid caches support it; unsupported specialized caches ignore it. The model's layer placement and available attention layers limit what can become GPU resident. |
+| `-kvgl`, `--kv-gpu-layers` | With `-nkvo 1`, requests up to N independently owned attention KV layers, selected in turn from each owning device. Sub-caches share one budget; auxiliary caches can remain host-resident. Tensor-split iSWA caches do not support partial residency. The count depends on the context's owned layers and model placement; it is not a VRAM limit. |
 | `-kvcp`, `--kv-cpu-pinned` | Requests pinned buffers for host KV when the backend provides them. With operation offload enabled (`-nopo 0`), it also allows attention compute on the accelerator, so a `0,1` sweep can change both storage and compute placement. |
 | `-rso`, `--recurrent-state-offload` | Offloads recurrent state for recurrent and hybrid models independently of host attention KV. With `-nkvo 0`, KV offload already enables recurrent state offload, so changing this option has no additional effect. |
 | `-paw`, `--phase-aware-workspace` | Resizes compute workspaces between prompt processing and token generation; a later prompt regrows the reservation. It can be combined with `-lcw 1`. |
