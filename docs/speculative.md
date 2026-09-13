@@ -248,7 +248,7 @@ Use exactly one of these options:
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
 --spec-draft-rs-planes, --spec-mtp-rs-planes N
-                                        total target recurrent-state planes for draft-mtp, including the current state (default: 0, use spec-draft-n-max + 1)
+                                        total target recurrent-state planes for draft-mtp or draft-dflash, including the current state (default: 0, use spec-draft-n-max + 1)
                                         (env: LLAMA_ARG_SPEC_DRAFT_RS_PLANES)
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
@@ -264,11 +264,13 @@ Use exactly one of these options:
                                         (use --list-devices to see available devices)
 ```
 
-#### Capped MTP recurrent planes
+#### Capped recurrent planes
 
-`--spec-draft-rs-planes` (formerly `--spec-mtp-rs-planes`, still accepted) applies only to `draft-mtp`. The default value `0` allocates `--spec-draft-n-max + 1` target recurrent-state planes. An explicit value must be in `[2, --spec-draft-n-max + 1]`; a smaller value enables capped replay. Capped replay cannot be combined with Eagle3, DFlash, or DSpark because those modes also control recurrent rollback.
+`--spec-draft-rs-planes` (formerly `--spec-mtp-rs-planes`, still accepted) applies to `draft-mtp` and `draft-dflash`. The default value `0` allocates `--spec-draft-n-max + 1` target recurrent-state planes. An explicit value must be in `[2, --spec-draft-n-max + 1]`; a smaller value enables capped replay. The planes belong to one speculative mode, so capped replay cannot be combined with a second mode that rolls back the recurrent state (MTP, Eagle3, DFlash or DSpark), and DSpark and Eagle3 cannot use it.
 
-The effective target ubatch is `min(batch-size, ubatch-size)`, or `batch-size` when `ubatch-size` is zero. For capped replay it must be at least `--spec-draft-n-max + 1`. A nonzero draft ubatch override must equal the target ubatch.
+Each plane holds one copy of the recurrent state for every sequence, so the saving is `n_parallel * (n_max + 1 - planes)` copies. DFlash keeps its own state in the draft KV cache, which a replay rewinds together with the target, so no extra speculative state is saved for it.
+
+The effective target ubatch is `min(batch-size, ubatch-size)`, or `batch-size` when `ubatch-size` is zero. For capped replay it must be at least `--spec-draft-n-max + 1`. For `draft-mtp`, a nonzero draft ubatch override must equal the target ubatch.
 
 Every device selected for the recurrent graph operations must support sparse snapshots. The server rejects an unsupported device layout at startup; it does not move the operations to another device or fall back to CPU.
 

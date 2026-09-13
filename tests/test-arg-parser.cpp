@@ -270,7 +270,10 @@ static void test(void) {
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "-1" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "1" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "10" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, true, 4, 3, true },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-dspark", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-dflash", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
     };
     for (const auto & test_case : mtp_cases) {
@@ -604,6 +607,9 @@ static void test_mtp_draft_ubatch_validation() {
     params.draft.n_ubatch = 0;
     params.draft.n_max = 8;
     params.rs_planes = 2;
+    common_validate_speculative_params(params, 512, 512);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     rejected = false;
     try {
         common_validate_speculative_params(params, 512, 512);

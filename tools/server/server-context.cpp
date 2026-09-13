@@ -1039,7 +1039,7 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool capped_rs = spec_mtp && params_base.speculative.is_rs_capped();
+        const bool capped_rs = params_base.speculative.is_rs_capped();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1131,18 +1131,18 @@ private:
             return false;
         }
 
-        if (spec_mtp && params_base.speculative.rs_planes > 0 &&
+        if (params_base.speculative.rs_planes > 0 &&
                 llama_n_rs_seq(ctx_tgt) != uint32_t(params_base.speculative.rs_planes - 1)) {
-            SRV_ERR("requested %d MTP recurrent planes, but the target context allocated %u; the target model does not support this recurrent rollback configuration\n",
+            SRV_ERR("requested %d recurrent planes, but the target context allocated %u; the target model does not support this recurrent rollback configuration\n",
                     params_base.speculative.rs_planes, llama_n_rs_seq(ctx_tgt) + 1);
             return false;
         }
         if (capped_rs && !llama_recurrent_sparse_snapshots_supported(ctx_tgt)) {
-            SRV_ERR("%s", "capped MTP recurrent planes require a model graph and recurrent-state backend with selected sparse-snapshot support\n");
+            SRV_ERR("%s", "capped recurrent planes require a model graph and recurrent-state backend with selected sparse-snapshot support\n");
             return false;
         }
         if (capped_rs && params_base.speculative.draft.n_max + 1 > (int32_t) llama_n_ubatch(ctx_tgt)) {
-            SRV_ERR("capped MTP replay requires an ubatch of at least %d tokens, but the target context has %u\n",
+            SRV_ERR("capped recurrent replay requires an ubatch of at least %d tokens, but the target context has %u\n",
                     params_base.speculative.draft.n_max + 1, llama_n_ubatch(ctx_tgt));
             return false;
         }
@@ -1283,10 +1283,10 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
-        if (spec_mtp) {
+        if (has_spec && llama_n_rs_seq(ctx_tgt) > 0) {
             const uint32_t total_planes = llama_n_rs_seq(ctx_tgt) + 1;
             const uint32_t direct_rollback = capped_rs ? total_planes - 2 : total_planes - 1;
-            SRV_INF("MTP recurrent-plane policy: draft depth = %d, total planes = %u, direct rollback horizon = %u, full-shape GPU replay = %s\n",
+            SRV_INF("recurrent-plane policy: draft depth = %d, total planes = %u, direct rollback horizon = %u, full-shape GPU replay = %s\n",
                     params_base.speculative.draft.n_max, total_planes, direct_rollback,
                     capped_rs ? "enabled" : "disabled");
         }
@@ -3096,7 +3096,7 @@ private:
             }
             if (ctx_dft != nullptr && !llama_memory_seq_rm(
                         llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                fail_speculative_replay(slot, "failed to rewind the MTP draft context for GPU replay");
+                fail_speculative_replay(slot, "failed to rewind the draft context for GPU replay");
                 return;
             }
             if (!common_speculative_set_replay_state(spec.get(), slot.id, ckpt.data_spec)) {
@@ -3149,7 +3149,7 @@ private:
                         slot.spec_ckpt.data_spec.clear();
                         if (params_base.speculative.is_rs_capped()) {
                             if (!common_speculative_get_replay_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
-                                throw std::runtime_error("failed to capture capped MTP speculative state");
+                                throw std::runtime_error("failed to capture the speculative state for capped replay");
                             }
                         }
 
@@ -4177,7 +4177,7 @@ private:
                     }
                     if (ctx_dft != nullptr && !llama_memory_seq_rm(
                                 llama_get_memory(ctx_dft), slot.id, accepted_end, -1)) {
-                        fail_speculative_replay(slot, "failed to align the MTP draft context after GPU replay");
+                        fail_speculative_replay(slot, "failed to align the draft context after GPU replay");
                         return;
                     }
 
