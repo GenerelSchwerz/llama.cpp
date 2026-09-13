@@ -214,6 +214,13 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-live-context-workspace
     )
 
+    llama_test(
+        test-llama-archs
+        NAME test-sched-copy-name
+        LABEL main
+        ARGS --test-sched-copy-name
+    )
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
