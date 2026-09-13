@@ -1038,6 +1038,50 @@ static void test_resizable_buffers_owner_borrower_compatible_placement() {
     GGML_ASSERT(backend_borrower.context->allocated_total() == 0);
 }
 
+static ggml_backend_meta_split_state meta_mirrored_split_state(const ggml_tensor *, void *) {
+    return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
+}
+
+static void test_resizable_buffers_owner_borrower_meta_private() {
+    ggml_backend_dev_t dev_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    GGML_ASSERT(dev_cpu != nullptr);
+    ggml_backend_dev_t devs[] = { dev_cpu, dev_cpu };
+    ggml_backend_dev_t dev_meta = ggml_backend_meta_device(devs, 2, meta_mirrored_split_state, nullptr);
+    GGML_ASSERT(dev_meta != nullptr);
+
+    dummy_backend backend_shared = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+
+    auto owner_graph    = make_resizable_add_graph(16);
+    auto borrower_graph = make_resizable_add_graph(24);
+    int leaf_buffer_ids[2] = { 0, 1 };
+    int node_buffer_ids[1] = { 0 };
+
+    ggml_backend_buffer_type_t bufts[2] = {
+        ggml_backend_dev_buffer_type(dev_meta),
+        &backend_shared.buffer_type,
+    };
+
+    {
+        ggml_gallocr_ptr owner(ggml_gallocr_new_n(bufts, 2));
+        ggml_gallocr_ptr borrower(ggml_gallocr_new_n(bufts, 2));
+        GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
+        GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
+
+        GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), owner_graph.graph, node_buffer_ids, leaf_buffer_ids));
+        GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), borrower_graph.graph, node_buffer_ids, leaf_buffer_ids));
+
+        // each graph keeps its own meta buffer, sized for itself
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) > 0);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) < ggml_gallocr_get_buffer_size(borrower.get(), 0));
+
+        const size_t shared_size = backend_shared.context->allocated_total();
+        GGML_ASSERT(backend_shared.context->buffers.size() == 1);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 1) == shared_size);
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(borrower.get(), 1) == shared_size);
+    }
+    GGML_ASSERT(backend_shared.context->allocated_total() == 0);
+}
+
 static void test_resizable_buffers_owner_borrower_allocation_failure() {
     dummy_backend backend = dummy_backend_init(SIZE_MAX, /*align*/ 4, /*unique_alloc_addresses*/ true);
 
@@ -1308,6 +1352,7 @@ int main() {
     run("test_resizable_buffers_alias_duplicate_buffer_types", test_resizable_buffers_alias_duplicate_buffer_types);
     run("test_resizable_buffers_owner_borrower_maximum", test_resizable_buffers_owner_borrower_maximum);
     run("test_resizable_buffers_owner_borrower_compatible_placement", test_resizable_buffers_owner_borrower_compatible_placement);
+    run("test_resizable_buffers_owner_borrower_meta_private", test_resizable_buffers_owner_borrower_meta_private);
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);

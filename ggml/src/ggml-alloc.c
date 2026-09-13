@@ -882,6 +882,12 @@ static void ggml_gallocr_set_resizable_owner(ggml_gallocr_t galloc) {
     galloc->shared_entry_ids = (int *) malloc((size_t) galloc->n_buffers * sizeof(int));
     GGML_ASSERT(galloc->shared_entry_ids != NULL);
     for (int i = 0; i < galloc->n_buffers; ++i) {
+        // a meta buffer maps its tensors for one graph at a time, so keep it private
+        // the borrower finds no entry for it and keeps its own buffer too
+        if (ggml_backend_buft_is_meta(galloc->bufts[i])) {
+            galloc->shared_entry_ids[i] = -1;
+            continue;
+        }
         int entry_id = -1;
         for (int j = 0; j < shared->n_entries; ++j) {
             if (shared->entries[j].buft == galloc->bufts[i]) {
