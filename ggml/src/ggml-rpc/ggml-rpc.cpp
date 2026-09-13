@@ -2194,7 +2194,10 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
 
 static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+    // Remote workers do not negotiate sparse GDN snapshot support yet.
+    if (op->op == GGML_OP_GATED_DELTA_NET && !ggml_gated_delta_net_has_default_snapshot_params(op)) {
+        return false;
+    }
     //TODO: call the remote backend and cache the results
     return true;
 }
