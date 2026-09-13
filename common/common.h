@@ -385,14 +385,14 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    int32_t rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
 
     bool has_dft() const {
         return !draft.mparams.empty();
     }
 
-    bool is_mtp_rs_capped() const {
-        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
+    bool is_rs_capped() const {
+        return rs_planes > 0 && int64_t(rs_planes) < int64_t(draft.n_max) + 1;
     }
 
     bool has_synth() const {
@@ -405,8 +405,8 @@ struct common_params_speculative {
         });
 
         const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
-        if (has_mtp && mtp_rs_planes > 0) {
-            return uint32_t(mtp_rs_planes - 1);
+        if (has_mtp && rs_planes > 0) {
+            return uint32_t(rs_planes - 1);
         }
 
         return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;

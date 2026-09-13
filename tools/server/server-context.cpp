@@ -128,7 +128,7 @@ struct server_batch {
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
     server_slot * replay_slot = nullptr;
-    bool mtp_sparse_snapshots = false;
+    bool rs_sparse_snapshots = false;
 
     // in embd mode, we temporarily swap out the tokens arr and restore it on clear()
     bool has_embd = false;
@@ -184,7 +184,7 @@ struct server_batch {
         common_batch_clear(batch);
         slot_batched = nullptr;
         replay_slot = nullptr;
-        mtp_sparse_snapshots = false;
+        rs_sparse_snapshots = false;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         batch_rendered    = false;
@@ -890,8 +890,8 @@ private:
     llama_context * ctx_tgt = nullptr;
 
     server_batch batch;
-    llama_seq_id capped_mtp_next_verification_slot = 0;
-    bool capped_mtp_prompt_turn = false;
+    llama_seq_id capped_rs_next_verification_slot = 0;
+    bool capped_rs_prompt_turn = false;
 
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
@@ -1039,7 +1039,7 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-        const bool capped_mtp = spec_mtp && params_base.speculative.is_mtp_rs_capped();
+        const bool capped_rs = spec_mtp && params_base.speculative.is_rs_capped();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1131,17 +1131,17 @@ private:
             return false;
         }
 
-        if (spec_mtp && params_base.speculative.mtp_rs_planes > 0 &&
-                llama_n_rs_seq(ctx_tgt) != uint32_t(params_base.speculative.mtp_rs_planes - 1)) {
+        if (spec_mtp && params_base.speculative.rs_planes > 0 &&
+                llama_n_rs_seq(ctx_tgt) != uint32_t(params_base.speculative.rs_planes - 1)) {
             SRV_ERR("requested %d MTP recurrent planes, but the target context allocated %u; the target model does not support this recurrent rollback configuration\n",
-                    params_base.speculative.mtp_rs_planes, llama_n_rs_seq(ctx_tgt) + 1);
+                    params_base.speculative.rs_planes, llama_n_rs_seq(ctx_tgt) + 1);
             return false;
         }
-        if (capped_mtp && !llama_recurrent_sparse_snapshots_supported(ctx_tgt)) {
+        if (capped_rs && !llama_recurrent_sparse_snapshots_supported(ctx_tgt)) {
             SRV_ERR("%s", "capped MTP recurrent planes require a model graph and recurrent-state backend with selected sparse-snapshot support\n");
             return false;
         }
-        if (capped_mtp && params_base.speculative.draft.n_max + 1 > (int32_t) llama_n_ubatch(ctx_tgt)) {
+        if (capped_rs && params_base.speculative.draft.n_max + 1 > (int32_t) llama_n_ubatch(ctx_tgt)) {
             SRV_ERR("capped MTP replay requires an ubatch of at least %d tokens, but the target context has %u\n",
                     params_base.speculative.draft.n_max + 1, llama_n_ubatch(ctx_tgt));
             return false;
@@ -1271,8 +1271,8 @@ private:
         }
 
         slots.clear();
-        capped_mtp_next_verification_slot = 0;
-        capped_mtp_prompt_turn = false;
+        capped_rs_next_verification_slot = 0;
+        capped_rs_prompt_turn = false;
 
         ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1285,10 +1285,10 @@ private:
 
         if (spec_mtp) {
             const uint32_t total_planes = llama_n_rs_seq(ctx_tgt) + 1;
-            const uint32_t direct_rollback = capped_mtp ? total_planes - 2 : total_planes - 1;
+            const uint32_t direct_rollback = capped_rs ? total_planes - 2 : total_planes - 1;
             SRV_INF("MTP recurrent-plane policy: draft depth = %d, total planes = %u, direct rollback horizon = %u, full-shape GPU replay = %s\n",
                     params_base.speculative.draft.n_max, total_planes, direct_rollback,
-                    capped_mtp ? "enabled" : "disabled");
+                    capped_rs ? "enabled" : "disabled");
         }
 
         // setup slots
@@ -2814,7 +2814,7 @@ private:
     }
 
     void iterate_post_decode(std::function<void(server_slot &)> callback) {
-        if (batch.replay_slot == nullptr && !batch.mtp_sparse_snapshots) {
+        if (batch.replay_slot == nullptr && !batch.rs_sparse_snapshots) {
             iterate(slots, std::move(callback));
             return;
         }
@@ -2835,12 +2835,12 @@ private:
 
     void clear_failed_sparse_batch_state() {
         const int32_t replay_slot_id = batch.replay_slot != nullptr ? batch.replay_slot->id : -1;
-        if (replay_slot_id < 0 && !batch.mtp_sparse_snapshots) {
+        if (replay_slot_id < 0 && !batch.rs_sparse_snapshots) {
             return;
         }
         for (auto & slot : slots) {
             if (slot.is_processing() && server_sparse_batch_slot_is_affected(
-                        replay_slot_id, batch.mtp_sparse_snapshots, batch.tokens, slot.id)) {
+                        replay_slot_id, batch.rs_sparse_snapshots, batch.tokens, slot.id)) {
                 slot.prompt_clear();
             }
         }
@@ -3078,9 +3078,9 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
-        if (params_base.speculative.is_mtp_rs_capped()) {
+        if (params_base.speculative.is_rs_capped()) {
             iterate(slots, [&](server_slot & slot) {
-                if (batch.replay_slot == nullptr && slot.state == SLOT_STATE_GENERATING && slot.spec_replay.mtp_gpu_replay_pending()) {
+                if (batch.replay_slot == nullptr && slot.state == SLOT_STATE_GENERATING && slot.spec_replay.gpu_replay_pending()) {
                     batch.replay_slot = &slot;
                 }
             });
@@ -3099,7 +3099,7 @@ private:
                 fail_speculative_replay(slot, "failed to rewind the MTP draft context for GPU replay");
                 return;
             }
-            if (!common_speculative_set_mtp_state(spec.get(), slot.id, ckpt.data_spec)) {
+            if (!common_speculative_set_replay_state(spec.get(), slot.id, ckpt.data_spec)) {
                 fail_speculative_replay(slot, "failed to restore speculative state for GPU replay");
                 return;
             }
@@ -3147,8 +3147,8 @@ private:
                                 llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
                                 llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
                         slot.spec_ckpt.data_spec.clear();
-                        if (params_base.speculative.is_mtp_rs_capped()) {
-                            if (!common_speculative_get_mtp_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
+                        if (params_base.speculative.is_rs_capped()) {
+                            if (!common_speculative_get_replay_state(spec.get(), slot.id, slot.spec_ckpt.data_spec)) {
                                 throw std::runtime_error("failed to capture capped MTP speculative state");
                             }
                         }
@@ -3202,12 +3202,12 @@ private:
             }
 
             if (!draft.empty()) {
-                const bool capped_mtp = params_base.speculative.is_mtp_rs_capped();
-                if (capped_mtp) {
-                    slot.spec_replay.arm_mtp_gpu_snapshots();
+                const bool capped_rs = params_base.speculative.is_rs_capped();
+                if (capped_rs) {
+                    slot.spec_replay.arm_gpu_snapshots();
                 }
                 const bool use_ckpt_tgt =
-                    !capped_mtp && (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                    !capped_rs && (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && draft.size() > llama_n_rs_seq(ctx_tgt)));
 
                 const bool use_ckpt_dft =
@@ -3234,62 +3234,62 @@ private:
         });
 
         // update the batch with the sampled/drafted tokens
-        const bool capped_mtp_verification = params_base.speculative.is_mtp_rs_capped() &&
+        const bool capped_rs_verification = params_base.speculative.is_rs_capped() &&
                 batch.replay_slot == nullptr && !generating.empty();
-        if (capped_mtp_verification) {
+        if (capped_rs_verification) {
             const auto first = std::find_if(generating.begin(), generating.end(), [&](const server_slot * slot) {
-                return slot->id >= capped_mtp_next_verification_slot;
+                return slot->id >= capped_rs_next_verification_slot;
             });
             if (first != generating.end()) {
                 std::rotate(generating.begin(), first, generating.end());
             }
         }
 
-        const bool capped_mtp_empty_draft_class = capped_mtp_verification && generating.front()->spec_draft.empty();
-        const size_t capped_mtp_verification_size = capped_mtp_verification && !capped_mtp_empty_draft_class
+        const bool capped_rs_empty_draft_class = capped_rs_verification && generating.front()->spec_draft.empty();
+        const size_t capped_rs_verification_size = capped_rs_verification && !capped_rs_empty_draft_class
                 ? generating.front()->spec_draft.size() + 1 : 0;
-        const bool capped_mtp_prompt_ready = capped_mtp_verification && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+        const bool capped_rs_prompt_ready = capped_rs_verification && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.is_processing() &&
                     (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT);
         });
-        bool capped_mtp_prompt_only = false;
-        if (capped_mtp_verification_size > 1 && capped_mtp_prompt_ready) {
-            capped_mtp_prompt_only = capped_mtp_prompt_turn;
-            capped_mtp_prompt_turn = !capped_mtp_prompt_turn;
+        bool capped_rs_prompt_only = false;
+        if (capped_rs_verification_size > 1 && capped_rs_prompt_ready) {
+            capped_rs_prompt_only = capped_rs_prompt_turn;
+            capped_rs_prompt_turn = !capped_rs_prompt_turn;
         }
-        if (capped_mtp_prompt_only) {
+        if (capped_rs_prompt_only) {
             slot_batched = nullptr;
         }
 
-        const size_t capped_mtp_batch_limit = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
-        size_t capped_mtp_verification_tokens = 0;
-        server_slot * capped_mtp_scheduled_anchor = nullptr;
-        if (!capped_mtp_prompt_only) {
+        const size_t capped_rs_batch_limit = std::min(llama_n_batch(ctx_tgt), llama_n_ubatch(ctx_tgt));
+        size_t capped_rs_verification_tokens = 0;
+        server_slot * capped_rs_scheduled_anchor = nullptr;
+        if (!capped_rs_prompt_only) {
             iterate(generating, [&](server_slot & slot) {
-                if (capped_mtp_verification) {
-                    if (slot.spec_draft.empty() != capped_mtp_empty_draft_class) {
+                if (capped_rs_verification) {
+                    if (slot.spec_draft.empty() != capped_rs_empty_draft_class) {
                         return;
                     }
-                    if (!capped_mtp_empty_draft_class && slot.spec_draft.size() + 1 != capped_mtp_verification_size) {
+                    if (!capped_rs_empty_draft_class && slot.spec_draft.size() + 1 != capped_rs_verification_size) {
                         return;
                     }
-                    if (!capped_mtp_empty_draft_class &&
-                            capped_mtp_verification_tokens + capped_mtp_verification_size > capped_mtp_batch_limit) {
+                    if (!capped_rs_empty_draft_class &&
+                            capped_rs_verification_tokens + capped_rs_verification_size > capped_rs_batch_limit) {
                         return;
                     }
                 }
                 slot.handle_last_sampled_token(batch);
-                if (capped_mtp_verification && capped_mtp_scheduled_anchor == nullptr) {
-                    capped_mtp_scheduled_anchor = &slot;
+                if (capped_rs_verification && capped_rs_scheduled_anchor == nullptr) {
+                    capped_rs_scheduled_anchor = &slot;
                 }
-                if (!capped_mtp_empty_draft_class && capped_mtp_verification_size != 0) {
-                    capped_mtp_verification_tokens += capped_mtp_verification_size;
-                    batch.mtp_sparse_snapshots = true;
+                if (!capped_rs_empty_draft_class && capped_rs_verification_size != 0) {
+                    capped_rs_verification_tokens += capped_rs_verification_size;
+                    batch.rs_sparse_snapshots = true;
                 }
             });
         }
-        if (capped_mtp_scheduled_anchor != nullptr) {
-            capped_mtp_next_verification_slot = capped_mtp_scheduled_anchor->id + 1;
+        if (capped_rs_scheduled_anchor != nullptr) {
+            capped_rs_next_verification_slot = capped_rs_scheduled_anchor->id + 1;
         }
 
         // process in chunks of params.n_batch
@@ -3300,7 +3300,7 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (batch.replay_slot == nullptr && (capped_mtp_prompt_only || capped_mtp_verification_size == 0) &&
+        if (batch.replay_slot == nullptr && (capped_rs_prompt_only || capped_rs_verification_size == 0) &&
                 (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
@@ -3878,12 +3878,12 @@ private:
             for (int32_t i = 0; i < batch_view.n_tokens; ++i) {
                 GGML_ASSERT(batch.tokens[i].id_slot == replay_slot->id);
             }
-            GGML_ASSERT(replay_slot->spec_replay.mtp_gpu_replay_selected_token() < (uint32_t) batch_view.n_tokens);
+            GGML_ASSERT(replay_slot->spec_replay.gpu_replay_selected_token() < (uint32_t) batch_view.n_tokens);
         }
 
-        const bool sparse_snapshots = replay_slot != nullptr || batch.mtp_sparse_snapshots;
+        const bool sparse_snapshots = replay_slot != nullptr || batch.rs_sparse_snapshots;
         const int32_t selected_token = replay_slot != nullptr
-                ? (int32_t) replay_slot->spec_replay.mtp_gpu_replay_selected_token() : -1;
+                ? (int32_t) replay_slot->spec_replay.gpu_replay_selected_token() : -1;
         if (sparse_snapshots) {
             GGML_ASSERT(off == 0);
             GGML_ASSERT(batch_view.n_tokens == batch.size());
@@ -4147,7 +4147,7 @@ private:
             const size_t n_draft = slot.spec_draft.size();
 
             GGML_ASSERT(n_draft > 0);
-            const bool gpu_snapshot_replay = slot.spec_replay.mtp_gpu_replay_pending();
+            const bool gpu_snapshot_replay = slot.spec_replay.gpu_replay_pending();
 
             // verify and try to accept the draft
             {
@@ -4167,7 +4167,7 @@ private:
                 slot.spec_i_batch.clear();
 
                 if (gpu_snapshot_replay) {
-                    const uint32_t replay_accepted = slot.spec_replay.consume_mtp_gpu_replay(accepted, slot.smpl);
+                    const uint32_t replay_accepted = slot.spec_replay.consume_gpu_replay(accepted, slot.smpl);
 
                     const auto & ckpt = slot.spec_ckpt;
                     const llama_pos accepted_end = ckpt.pos_max + 2 + replay_accepted;
@@ -4188,7 +4188,7 @@ private:
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
                     const uint32_t direct_horizon = llama_n_rs_seq(ctx_tgt) > 0 ? llama_n_rs_seq(ctx_tgt) - 1 : 0;
-                    const bool use_gpu_replay = slot.spec_replay.mtp_gpu_snapshots_armed() && n_rollback > direct_horizon;
+                    const bool use_gpu_replay = slot.spec_replay.gpu_snapshots_armed() && n_rollback > direct_horizon;
 
                     if (use_gpu_replay) {
                         const uint32_t n_accepted = accepted.size() - 1;
@@ -4199,7 +4199,7 @@ private:
                                     n_accepted, slot.spec_draft.size());
                         }
 
-                        slot.spec_replay.begin_mtp_gpu_replay(
+                        slot.spec_replay.begin_gpu_replay(
                                 std::move(accepted), std::move(slot.smpl), n_accepted);
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         slot.smpl = std::move(smpl_save);
@@ -4247,7 +4247,7 @@ private:
                     common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                     slot.spec_draft = std::move(accepted);
-                    slot.spec_replay.discard_mtp_gpu_snapshot_arm();
+                    slot.spec_replay.discard_gpu_snapshot_arm();
                 }
             }
 

@@ -4208,12 +4208,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
     add_opt(common_arg(
-        {"--spec-mtp-rs-planes"}, "N",
+        {"--spec-draft-rs-planes", "--spec-mtp-rs-planes"}, "N",
         "total target recurrent-state planes for draft-mtp, including the current state (default: 0, allocate spec-draft-n-max + 1)",
         [](common_params & params, int value) {
-            params.speculative.mtp_rs_planes = value;
+            params.speculative.rs_planes = value;
         }
-    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_RS_PLANES"));
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_RS_PLANES"));
     add_opt(common_arg(
         {"--spec-draft-ubatch-size", "--ubatch-size-draft", "-ubd"}, "N",
         "physical maximum batch size for the draft context (default: 0, inherit target ubatch); "
