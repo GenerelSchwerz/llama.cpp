@@ -2460,7 +2460,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-gpu-layers"}, "N",
         string_format("with --no-kv-offload, keep N independently owned attention KV layers device-resident. "
-                      "Layers are selected on devices with slower host links first, within an estimated memory budget. "
+                      "Layers are selected on devices with slower host links first, within the free device memory. "
                       "Unsupported cache layouts keep fewer, or none (default: %d)", params.kv_gpu_layers),
         [](common_params & params, int value) {
             if (value < 0) {

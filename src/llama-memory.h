@@ -15,6 +15,9 @@ class llama_batch_allocr;
 class llama_io_write_i;
 class llama_io_read_i;
 
+// K and V of each attention layer, recorded by the first cache that owns the layer
+using llama_kv_layer_tensors = std::map<uint32_t, std::pair<ggml_tensor *, ggml_tensor *>>;
+
 struct llama_memory_placement_options {
     bool cpu_pinned = false;
     bool recurrent_offload = false;
@@ -24,6 +27,9 @@ struct llama_memory_placement_options {
 
     // The first cache that owns a selected layer claims it; auxiliary copies remain on the host.
     std::shared_ptr<std::set<uint32_t>> gpu_resident_done;
+
+    // Sizing only: allocate no KV storage and record the owned layers here.
+    std::shared_ptr<llama_kv_layer_tensors> kv_layers;
 };
 
 struct llama_memory_params {
@@ -37,6 +43,12 @@ struct llama_memory_params {
     llama_context_type ctx_type;
 
     llama_memory_t mem_other;
+
+    // Sizing only: see llama_memory_placement_options::kv_layers.
+    std::shared_ptr<llama_kv_layer_tensors> kv_layers = nullptr;
+
+    // Device memory that the context allocates after the memory, such as compute buffers.
+    std::map<ggml_backend_dev_t, size_t> dev_reserved = {};
 };
 
 enum llama_memory_status {

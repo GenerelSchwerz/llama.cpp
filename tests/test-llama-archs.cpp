@@ -1152,7 +1152,7 @@ static llama_model_ptr kv_residency_test_model(llm_arch arch, std::vector<ggml_b
 
 static void kv_residency_check_capacity(
         const char * name, llama_model * model, const std::vector<kv_residency_test_device *> & devices,
-        uint32_t n_seq, bool unified, llama_context_type type, bool full, uint32_t expected) {
+        uint32_t n_seq, bool unified, llama_context_type type, bool full, uint32_t expected, size_t reserved = 0) {
     for (auto * device : devices) { device->allocated = 0; }
     llama_cparams cp = {};
     cp.n_ctx = cp.n_ctx_seq = 256;
@@ -1164,6 +1164,7 @@ static void kv_residency_check_capacity(
     cp.kv_gpu_layers = full ? 0 : 1;
     cp.ctx_type = type;
     llama_memory_params mp = {GGML_TYPE_F16, GGML_TYPE_F16, true, type, nullptr};
+    mp.dev_reserved[&devices[0]->dev] = reserved;
     std::unique_ptr<llama_memory_i> memory(model->create_memory(mp, cp));
     GGML_ASSERT(memory);
     bool within_cap = true;
@@ -1171,7 +1172,7 @@ static void kv_residency_check_capacity(
     printf("test_kv_residency_capacity: case=%s requested=%u actual=%u expected=%u", name, full ? 0 : 1, cp.kv_gpu_layers, expected);
     for (auto * device : devices) {
         allocated += device->allocated;
-        const size_t cap = device->free_bytes - device->free_bytes/8;
+        const size_t cap = device->free_bytes - device->free_bytes/8 - (device == devices[0] ? reserved : 0);
         printf(" %s(bytes=%zu free=%zu cap=%zu)", device->name, device->allocated, device->free_bytes, cap);
         within_cap = within_cap && device->allocated <= cap;
     }
@@ -1193,6 +1194,8 @@ static void test_kv_residency_capacity(size_t seed) {
         kv_residency_check_capacity("dsv4-default-offload", model.get(), {&a}, 4, true, LLAMA_CONTEXT_TYPE_DEFAULT, true, 0);
         a.free_bytes = 150*1024;
         kv_residency_check_capacity("dsv4-four-seq-fit", model.get(), {&a}, 4, true, LLAMA_CONTEXT_TYPE_DEFAULT, false, 1);
+        // Memory that the context allocates later, such as compute buffers, is not available to the cache.
+        kv_residency_check_capacity("dsv4-four-seq-reserved", model.get(), {&a}, 4, true, LLAMA_CONTEXT_TYPE_DEFAULT, false, 0, 64*1024);
         // Factory-only MTP ownership: its cache stores both K and V, unlike the main raw cache.
         model->hparams.n_layer_kv_from_start = -1;
         model->hparams.n_layer_nextn = 1;

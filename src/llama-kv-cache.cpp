@@ -80,29 +80,6 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
-std::pair<ggml_tensor *, ggml_tensor *> llama_kv_cache::create_layer_tensors(
-        ggml_context * ctx,
-        const llama_hparams & hparams,
-        ggml_type type_k,
-        ggml_type type_v,
-        bool v_trans,
-        uint32_t kv_size,
-        uint32_t n_stream,
-        uint32_t il,
-        const char * name_tag) {
-    const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-    // [TAG_V_CACHE_VARIABLE]
-    const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
-
-    ggml_tensor * k = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream);
-    ggml_tensor * v = hparams.is_mla() ? nullptr : ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream);
-    ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
-    if (v) {
-        ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
-    }
-    return {k, v};
-}
-
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -304,6 +281,10 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
+        // [TAG_V_CACHE_VARIABLE]
+        const uint32_t n_embd_k_gqa =            hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = !v_trans ? hparams.n_embd_v_gqa(il) : hparams.n_embd_v_gqa_max();
+
         const char * dev_name = "CPU";
 
         // Sub-caches claim each selected layer once.
@@ -333,11 +314,11 @@ llama_kv_cache::llama_kv_cache(
             throw std::runtime_error("failed to create ggml context for kv cache");
         }
 
-        const auto [k, v] = create_layer_tensors(ctx, hparams, type_k, type_v, v_trans, kv_size, n_stream, il, name_tag);
-        const bool has_k = k != nullptr;
-        const bool has_v = v != nullptr;
-        const int64_t n_embd_k_gqa = k->ne[0];
-        const int64_t n_embd_v_gqa = v ? v->ne[0] : 0;
+        const bool has_k = true;
+        const bool has_v = !is_mla;
+
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         bool k_store_quantize = false;
         bool v_store_quantize = false;
@@ -348,12 +329,19 @@ llama_kv_cache::llama_kv_cache(
                     il, type_v, n_embd_v_gqa, kv_store_side::value);
         }
 
+        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+        has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
             k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
+        }
+
+        if (placement.kv_layers && !offload) {
+            placement.kv_layers->emplace(il, std::make_pair(k, v));
         }
 
         map_layer_ids[il] = layers.size();
@@ -392,7 +380,7 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
+        if (hparams.no_alloc || placement.kv_layers) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
