@@ -493,10 +493,23 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
     const int64_t row_used   = top_k + top_k * top_k;
 
-    ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
-    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
-    ggml_tensor * unary       = ggml_reshape_2d(ctx0,
-            ggml_get_rows(ctx0, logits_rows, candidates), top_k, n_tokens);
+    ggml_tensor * logits = res->t_logits;
+    // split mode tensor splits the logits over the vocab, and the Meta backend cannot run top-k on that
+    // copy them to the CPU, the scheduler gathers the slices on the way
+    const bool vocab_on_cpu = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR;
+    if (vocab_on_cpu) {
+        logits = ggml_cont(ctx0, logits);
+        ggml_backend_sched_set_tensor_backend(g.sched, logits, g.backend_cpu);
+    }
+
+    ggml_tensor * candidates  = ggml_top_k(ctx0, logits, top_k);
+    ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_tokens);
+    ggml_tensor * unary_rows  = ggml_get_rows(ctx0, logits_rows, candidates);
+    ggml_tensor * unary       = ggml_reshape_2d(ctx0, unary_rows, top_k, n_tokens);
+    if (vocab_on_cpu) {
+        ggml_backend_sched_set_tensor_backend(g.sched, candidates, g.backend_cpu);
+        ggml_backend_sched_set_tensor_backend(g.sched, unary_rows, g.backend_cpu);
+    }
     ggml_tensor * gate        = g.build_lora_mm(model.dflash_selector_hidden, res->t_embd);
 
     // Everything below indexes [.., tokens_per_block, n_blocks]: the block
