@@ -87,7 +87,7 @@ die()  { printf '\n\033[31mfatal:\033[0m %s\n' "$*" >&2; exit 1; }
 [ -n "$MODEL" ] || { usage >&2; die "no model given (-m /path/to/model.gguf)"; }
 [ -f "$MODEL" ] || die "model not found: $MODEL"
 
-case "$CTK" in q4_0|q8_0) ;; *) die "--cache-type must be q4_0 or q8_0 (others need GGML_CUDA_FA_ALL_QUANTS)";; esac
+case "$CTK" in q4_0|q8_0) ;; *) die "--cache-type must be q4_0 or q8_0 (others need their pair in GGML_CUDA_FA_QUANTS)";; esac
 
 if [ -z "$BUILD" ]; then
     for d in build build-turing build-turing-test; do

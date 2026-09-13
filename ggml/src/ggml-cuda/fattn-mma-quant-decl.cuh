@@ -21,8 +21,8 @@
 
 // D=256 with a GQA ratio above 4, the only row that covers the extra tier.
 #define DECL_FATTN_MMA_QUANT_CASE_D256_GQA_WIDE(type_K, stem, tier, args) \
-    FATTN_MMA_QUANT_TIER_##tier(extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 8, 8);) \
-    FATTN_MMA_QUANT_TIER_##tier(extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 4, 8);)
+    FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 8, 8);) \
+    FATTN_MMA_QUANT_TIER_##tier(stem, extern DECL_FATTN_MMA_QUANT_CASE(type_K, 256, 256, 4, 8);)
 
 FATTN_MMA_QUANT_TYPE_LIST(DECL_FATTN_MMA_QUANT_CASE_D256_GQA_WIDE, ())
 

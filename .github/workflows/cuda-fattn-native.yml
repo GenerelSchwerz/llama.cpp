@@ -2,8 +2,9 @@ name: CUDA FA native quants
 
 # Compile the coupling axis of the quantized-native MMA FlashAttention route.
 #
-# GGML_CUDA_FA_ALL_QUANTS decides which cache types get native kernels at all,
-# and with them every extern declaration and generated instance file. Nothing
+# GGML_CUDA_FA_QUANTS decides which cache types get native kernels at all: q4_0
+# and q8_0 always, q4_1, q5_0 and q5_1 when their type-type pair is selected.
+# With them go every extern declaration and generated instance file. Nothing
 # else in CI crosses it against this route.
 #
 # The failure this guards against is a build/inventory failure, not a wrong
@@ -20,6 +21,7 @@ on:
     paths:
       - 'ggml/src/ggml-cuda/**'
       - 'ggml/CMakeLists.txt'
+      - 'ggml/cmake/common.cmake'
       - 'tests/test-backend-ops.cpp'
       - 'scripts/fattn-native-inventory.py'
       - '.github/workflows/cuda-fattn-native.yml'
@@ -29,6 +31,7 @@ on:
     paths:
       - 'ggml/src/ggml-cuda/**'
       - 'ggml/CMakeLists.txt'
+      - 'ggml/cmake/common.cmake'
       - 'tests/test-backend-ops.cpp'
       - 'scripts/fattn-native-inventory.py'
       - '.github/workflows/cuda-fattn-native.yml'
@@ -40,7 +43,7 @@ concurrency:
 
 jobs:
   compile-matrix:
-    name: Compile ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}
+    name: Compile ${{ matrix.slug }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}
     runs-on: ubuntu-24.04
     container: nvidia/cuda:12.6.2-devel-ubuntu24.04
     # Give the all-quants arm room, but stay inside GitHub's 6 h ceiling so a
@@ -50,29 +53,34 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - all_quants: 'OFF'
+          - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16'
             fa: 'ON'
             arch: '89-real'
-            slug: allq-off
-          - all_quants: 'ON'
+            slug: default
+          # one extra pair, so the per-pair source filter is compiled and inventoried
+          - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16;q5_0-q5_0'
             fa: 'ON'
             arch: '89-real'
-            slug: allq-on
+            slug: q5_0-pair
+          - fa_quants: 'all'
+            fa: 'ON'
+            arch: '89-real'
+            slug: all
           # Turing takes the narrow tile shapes and a different MMA config table,
           # so its kernel bodies are a separate compile. The tile loader asserts
           # and the per-type load widths are functions of that table, so the
           # extra tier needs its own Turing compile too.
-          - all_quants: 'OFF'
+          - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16'
             fa: 'ON'
             arch: '75-real'
             slug: turing
-          - all_quants: 'ON'
+          - fa_quants: 'all'
             fa: 'ON'
             arch: '75-real'
-            slug: turing-allq
+            slug: turing-all
           # The route must also compile out cleanly where FlashAttention itself
           # is disabled, which is the one build with no native kernels at all.
-          - all_quants: 'OFF'
+          - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16'
             fa: 'OFF'
             arch: '89-real'
             slug: fa-off
@@ -105,7 +113,7 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DGGML_CUDA=ON \
             -DGGML_CUDA_FA=${{ matrix.fa }} \
-            -DGGML_CUDA_FA_ALL_QUANTS=${{ matrix.all_quants }} \
+            "-DGGML_CUDA_FA_QUANTS=${{ matrix.fa_quants }}" \
             -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} \
             -DLLAMA_BUILD_TESTS=OFF \
             -DLLAMA_BUILD_EXAMPLES=OFF \
@@ -124,16 +132,14 @@ jobs:
         run: |
           LIB=$(find build -name 'libggml-cuda.so' -print -quit)
           test -n "$LIB"
-          ARGS=""
-          if [ "${{ matrix.all_quants }}" = "ON" ]; then ARGS="--all-quants"; fi
-          python3 scripts/fattn-native-inventory.py "$LIB" $ARGS \
+          python3 scripts/fattn-native-inventory.py "$LIB" --fa-quants "${{ matrix.fa_quants }}" \
             --json "inventory-${{ matrix.slug }}.json"
 
       - name: Object and library size
         run: |
           LIB=$(find build -name 'libggml-cuda.so' -print -quit)
           {
-            echo "### ALL_QUANTS=${{ matrix.all_quants }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}"
+            echo "### FA_QUANTS=${{ matrix.fa_quants }} FA=${{ matrix.fa }} ARCH=${{ matrix.arch }}"
             echo
             echo "libggml-cuda.so: $(stat -c %s "$LIB") bytes"
             echo
@@ -167,10 +173,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - all_quants: 'OFF'
-            native_cases: 10
-            fallback_cases: 2
-          - all_quants: 'ON'
+          - fa_quants: 'q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16'
+            native_cases: 13
+            fallback_cases: 8
+          - fa_quants: 'all'
             native_cases: 13
             fallback_cases: 8
     steps:
@@ -183,7 +189,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DGGML_CUDA=ON \
             -DGGML_CUDA_FA=ON \
-            -DGGML_CUDA_FA_ALL_QUANTS=${{ matrix.all_quants }} \
+            "-DGGML_CUDA_FA_QUANTS=${{ matrix.fa_quants }}" \
             -DLLAMA_CURL=OFF
           cmake --build build-test --target test-backend-ops -j "$(nproc)"
 
@@ -191,9 +197,9 @@ jobs:
         # Both routes are exercised in one run: the cases marked
         # expected_native=1 must take the native path and the ones marked 0 must
         # stay on the F16-casting path. The harness exits 0 when it runs no
-        # tests at all, so the counts are asserted here. The two tiers differ by
-        # the nine extra-tier cases, which a default build skips because it
-        # reports those K/V cache types as unsupported.
+        # tests at all, so the counts are asserted here. The counts follow the
+        # declared expected_native; for an extra type whose pair the build does
+        # not select, the case expects the F16-casting path instead.
         run: |
           set -o pipefail
           ./build-test/bin/test-backend-ops -b CUDA0 -o NATIVE_QUANT_EQUIVALENCE | tee focused.log

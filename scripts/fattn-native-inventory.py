@@ -2,7 +2,7 @@
 """Report and check the compiled quantized-native MMA FlashAttention inventory.
 
 The route's build switches are coupled in a way that no runtime test observes.
-GGML_CUDA_FA_ALL_QUANTS decides which cache types get kernels at all, and an
+GGML_CUDA_FA_QUANTS decides which cache types get kernels at all, and an
 extern-macro mistake can instantiate a whole attention body per tile shape in
 one translation unit. Both compile and pass every runtime test.
 
@@ -14,7 +14,7 @@ specialization and any sparse K/V specialization, none of which the route can
 reach.
 
 Usage:
-    scripts/fattn-native-inventory.py build/bin/libggml-cuda.so [--all-quants]
+    scripts/fattn-native-inventory.py build/bin/libggml-cuda.so [--fa-quants LIST]
                                       [--manifest PATH] [--json PATH]
 
 Exit status is non-zero when an invariant fails.
@@ -40,6 +40,10 @@ ENTRY_RE = re.compile(
 # ggml_type values appear in demangled names as "(ggml_type)N", so the manifest's
 # enum names have to be resolved to numbers. ggml.h is the source for that.
 GGML_TYPE_ENUM_RE = re.compile(r"^\s*GGML_TYPE_(\w+)\s*=\s*(\d+)\s*,")
+
+GUARD_RE = re.compile(r"^#if GGML_CUDA_FA_([A-Z]+[0-9]+(?:_[0-9]+)?)_([A-Z]+[0-9]+(?:_[0-9]+)?)\s*$")
+
+DEFAULT_FA_QUANTS = "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16"
 
 CASE_RE = re.compile(
     r"^\s*DECL_FATTN_MMA_QUANT_CASE\(\s*(GGML_TYPE_\w+)\s*,"
@@ -78,7 +82,13 @@ def read_ggml_type_values():
     return values
 
 
-def read_expected_cases(all_quants):
+def read_fa_quants(value):
+    """The K-V pairs GGML_CUDA_FA_QUANTS selects, or None for all of them."""
+    pairs = {item.strip().lower() for item in re.split(r"[;,]", value) if item.strip()}
+    return None if "all" in pairs else pairs
+
+
+def read_expected_cases(fa_pairs):
     """The cases the generated instance files declare for this build.
 
     Reading the sources rather than restating the route table keeps this script
@@ -90,15 +100,17 @@ def read_expected_cases(all_quants):
     if not files:
         sys.exit(f"{INSTANCE_GLOB}: no generated instance files found")
     for path in files:
-        guarded = False
+        selected = True
         with open(path) as f:
             for line in f:
-                if line.startswith("#ifdef GGML_CUDA_FA_ALL_QUANTS"):
-                    guarded = True
+                g = GUARD_RE.match(line)
+                if g:
+                    pair = f"{g.group(1)}-{g.group(2)}".lower()
+                    selected = fa_pairs is None or pair in fa_pairs
                 elif line.startswith("#endif"):
-                    guarded = False
+                    selected = True
                 m = CASE_RE.match(line)
-                if m and (all_quants or not guarded):
+                if m and selected:
                     cases.add((m.group(1),) + tuple(int(m.group(i)) for i in range(2, 6)))
     if not cases:
         sys.exit(f"{INSTANCE_GLOB}: no DECL_FATTN_MMA_QUANT_CASE entries found")
@@ -125,8 +137,8 @@ def read_symbols(library):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("library")
-    ap.add_argument("--all-quants", action="store_true",
-                    help="the build set GGML_CUDA_FA_ALL_QUANTS")
+    ap.add_argument("--fa-quants", default=DEFAULT_FA_QUANTS,
+                    help="the GGML_CUDA_FA_QUANTS value of the build, 'all' for GGML_CUDA_FA_ALL_QUANTS")
     ap.add_argument("--manifest", default=DEFAULT_MANIFEST)
     ap.add_argument("--json", help="write the inventory to this file")
     args = ap.parse_args()
@@ -138,7 +150,7 @@ def main():
             sys.exit(f"{args.manifest}: {name} is not a ggml_type enumerator")
     value_to_name = {type_values[n]: n for n in tiers}
 
-    expected = read_expected_cases(args.all_quants)
+    expected = read_expected_cases(read_fa_quants(args.fa_quants))
     symbols, source = read_symbols(args.library)
 
     failures = []
@@ -178,7 +190,7 @@ def main():
     print(f"library      : {args.library}")
     print(f"size         : {os.path.getsize(args.library)} bytes")
     print(f"symbol source: {source}")
-    print(f"all-quants   : {'ON' if args.all_quants else 'OFF'}")
+    print(f"fa-quants    : {args.fa_quants}")
     print()
     print(f"{'type':<16}{'tier':<10}{'DKQ':>6}{'DV':>6}{'ncols1':>8}{'ncols2':>8}{'symbols':>9}")
     for case in sorted(expected):
@@ -209,7 +221,7 @@ def main():
             json.dump({
                 "library": args.library,
                 "size_bytes": os.path.getsize(args.library),
-                "all_quants": args.all_quants,
+                "fa_quants": args.fa_quants,
                 "expected": sorted(expected),
                 "found": {str(k): v for k, v in sorted(found.items())},
                 "tiers": tiers,

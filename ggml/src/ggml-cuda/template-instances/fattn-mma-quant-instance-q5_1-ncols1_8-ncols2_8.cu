@@ -3,6 +3,6 @@
 #include "../fattn-mma-quant-q5_1.cuh"
 #include "../fattn-mma-f16.cuh"
 
-#ifdef GGML_CUDA_FA_ALL_QUANTS
+#if GGML_CUDA_FA_Q5_1_Q5_1
 DECL_FATTN_MMA_QUANT_CASE(GGML_TYPE_Q5_1, 256, 256, 8, 8);
-#endif // GGML_CUDA_FA_ALL_QUANTS
+#endif // GGML_CUDA_FA_Q5_1_Q5_1

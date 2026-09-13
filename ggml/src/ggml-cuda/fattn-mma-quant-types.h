@@ -17,20 +17,27 @@
 #endif
 
 // Select the types compiled by this build.
+// An EXTRA type compiles when GGML_CUDA_FA_QUANTS selects its K-V pair of the same type.
+// The CMake definition GGML_CUDA_FA_<K>_<V> is 0 or 1. Each EXTRA entry needs a line here.
+#define FATTN_MMA_QUANT_PAIR_q5_1 GGML_CUDA_FA_Q5_1_Q5_1
+#define FATTN_MMA_QUANT_PAIR_q5_0 GGML_CUDA_FA_Q5_0_Q5_0
+#define FATTN_MMA_QUANT_PAIR_q4_1 GGML_CUDA_FA_Q4_1_Q4_1
+
+#define FATTN_MMA_QUANT_IF_0(...)
+#define FATTN_MMA_QUANT_IF_1(...) __VA_ARGS__
+#define FATTN_MMA_QUANT_IF_(value) FATTN_MMA_QUANT_IF_##value
+#define FATTN_MMA_QUANT_IF(value) FATTN_MMA_QUANT_IF_(value)
+
 #ifdef FATTN_MMA_QUANT_AVAILABLE
-#define FATTN_MMA_QUANT_TIER_DEFAULT(...) __VA_ARGS__
-#ifdef GGML_CUDA_FA_ALL_QUANTS
-#define FATTN_MMA_QUANT_TIER_EXTRA(...) __VA_ARGS__
+#define FATTN_MMA_QUANT_TIER_DEFAULT(stem, ...) __VA_ARGS__
+#define FATTN_MMA_QUANT_TIER_EXTRA(stem, ...) FATTN_MMA_QUANT_IF(FATTN_MMA_QUANT_PAIR_##stem)(__VA_ARGS__)
 #else
-#define FATTN_MMA_QUANT_TIER_EXTRA(...)
-#endif // GGML_CUDA_FA_ALL_QUANTS
-#else
-#define FATTN_MMA_QUANT_TIER_DEFAULT(...)
-#define FATTN_MMA_QUANT_TIER_EXTRA(...)
+#define FATTN_MMA_QUANT_TIER_DEFAULT(stem, ...)
+#define FATTN_MMA_QUANT_TIER_EXTRA(stem, ...)
 #endif // FATTN_MMA_QUANT_AVAILABLE
 
 // Expand the types compiled by this build.
-#define FATTN_MMA_QUANT_TYPES_ENTRY(type, stem, tier, F) FATTN_MMA_QUANT_TIER_##tier(F(type))
+#define FATTN_MMA_QUANT_TYPES_ENTRY(type, stem, tier, F) FATTN_MMA_QUANT_TIER_##tier(stem, F(type))
 #define FATTN_MMA_QUANT_TYPES(F) FATTN_MMA_QUANT_TYPE_LIST(FATTN_MMA_QUANT_TYPES_ENTRY, F)
 
 // Expand a parenthesized argument pack from FATTN_MMA_QUANT_TYPE_LIST.

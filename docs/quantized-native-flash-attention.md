@@ -85,22 +85,33 @@ The cache-type inventory lives in exactly one place,
 |---|---|---|
 | `q8_0` | DEFAULT | every CUDA FlashAttention build |
 | `q4_0` | DEFAULT | every CUDA FlashAttention build |
-| `q4_1` | EXTRA | `GGML_CUDA_FA_ALL_QUANTS=ON` |
-| `q5_0` | EXTRA | `GGML_CUDA_FA_ALL_QUANTS=ON` |
-| `q5_1` | EXTRA | `GGML_CUDA_FA_ALL_QUANTS=ON` |
+| `q4_1` | EXTRA | `GGML_CUDA_FA_QUANTS` with `q4_1-q4_1`, or `all` |
+| `q5_0` | EXTRA | `GGML_CUDA_FA_QUANTS` with `q5_0-q5_0`, or `all` |
+| `q5_1` | EXTRA | `GGML_CUDA_FA_QUANTS` with `q5_1-q5_1`, or `all` |
 
-The tiers mirror `ggml_cuda_fattn_kv_type_supported()`: a default build only
-ever sees `q4_0` and `q8_0` caches, so native kernels for the other types would
-be dead code there. The extra tier only adds the D=256 GQA-wide row, because that
-is the only row those types can reach.
+The default tier matches the `GGML_CUDA_FA_QUANTS` default list. An extra type
+follows its own `type-type` pair, the same selection that compiles its vector
+kernel, so a build compiles native kernels only for the cache types it asked
+for. Without its pair a cache of that type still runs, on the F16-casting path.
+`GGML_CUDA_FA_ALL_QUANTS` is a deprecated alias for `all` and selects every
+pair. The extra tier only adds the D=256 GQA-wide row, because that is the only
+row those types can reach.
+
+Each extra entry in the manifest needs its pair definition in
+`FATTN_MMA_QUANT_PAIR_<stem>` next to it; a missing one fails to compile. CMake
+excludes the instance files of an extra type whose `GGML_CUDA_FA_<T>_<T>`
+definition is 0, and the generated files guard their declarations with the same
+definition.
 
 `q4_0`, `q5_0` and `q8_0` have hand-tuned loaders. `q4_1` and `q5_1` share the
 generic nibble loader in `fattn-mma-quant-packed.cuh`, which is correct but was
 not tuned per type.
 
-That gives 12 kernels in a default build and 18 with `GGML_CUDA_FA_ALL_QUANTS`:
-six and nine type-and-geometry combinations, each at both tile widths.
-`scripts/fattn-native-inventory.py` reads the built library back and fails on a
+That gives 12 kernels in a default build, two more for each selected extra
+pair, and 18 with `GGML_CUDA_FA_QUANTS=all`: six to nine type-and-geometry
+combinations, each at both tile widths.
+`scripts/fattn-native-inventory.py --fa-quants <value>` takes the same value as
+the build option, reads the built library back and fails on a
 missing, unexpected or duplicated one, and on any mixed K/V or logit-softcap
 kernel, neither of which the route can select.
 
@@ -177,14 +188,14 @@ Correctness, `test-backend-ops -o FLASH_ATTN_EXT`:
 Route, `test-backend-ops -o NATIVE_QUANT_EQUIVALENCE`: each case compares the
 native result against the same attention over an F16 copy of the same cache, and
 asserts which path the dispatcher took by reading the backend's native-launch
-counter. A default build runs 6 native and 3 fallback cases, an all-quants build
-7 and 5; the difference is the three `q5_0` cases, which a default build skips
-because it reports a `q5_0` K/V cache as unsupported. Both counts pass on both
-GPUs, and the CI job asserts them, so a run that selects nothing fails instead
-of passing vacuously.
+counter. Every build runs 13 cases declared native and 8 declared fallback. For
+an extra type whose pair the build does not select, a case declared native
+expects the F16-casting path instead, since no native kernel exists for it. The
+CI job asserts both counts, so a run that selects nothing fails instead of
+passing vacuously.
 
 Kernel inventory (`scripts/fattn-native-inventory.py`): 12 cases in a default
-build, 18 with `GGML_CUDA_FA_ALL_QUANTS`, exactly the declared set and nothing
+build, 18 with `GGML_CUDA_FA_QUANTS=all`, exactly the declared set and nothing
 else. Regenerating the instance files reproduces the committed ones.
 
 ### Turing

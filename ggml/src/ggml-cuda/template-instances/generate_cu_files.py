@@ -172,15 +172,16 @@ for type_k in FATTN_MMA_QUANT_TYPES + FATTN_MMA_QUANT_TYPES_EXTRA:
         name = f"fattn-mma-quant-instance-{short_k}-ncols1_{ncols1}-ncols2_{ncols2}.cu"
         with open(name, "w") as f:
             f.write(SOURCE_FATTN_MMA_QUANT_START.format(short_k=short_k))
+            pair_def = f"GGML_CUDA_FA_{short_k.upper()}_{short_k.upper()}"
             if extra_k:
-                f.write("#ifdef GGML_CUDA_FA_ALL_QUANTS\n")
+                f.write(f"#if {pair_def}\n")
             for head_size, nc1, nc2 in routes:
                 if (nc1, nc2) != (ncols1, ncols2):
                     continue
                 f.write(SOURCE_FATTN_MMA_QUANT_CASE.format(
                     type_k=type_k, head_size=head_size, ncols1=nc1, ncols2=nc2))
             if extra_k:
-                f.write("#endif // GGML_CUDA_FA_ALL_QUANTS\n")
+                f.write(f"#endif // {pair_def}\n")
 
 for type in TYPES_MMQ:
     with open(f"mmq-instance-{get_short_name(type)}.cu", "w") as f:

@@ -510,6 +510,35 @@ static bool backend_has_feature(ggml_backend_t backend, const char * feature_nam
     return false;
 }
 
+// whether the FA_QUANTS feature of the backend selects the K-V pair type-type
+static bool backend_fa_quants_selects(ggml_backend_t backend, ggml_type type) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+
+    auto get_features = (ggml_backend_get_features_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+    const ggml_backend_feature * features = get_features ? get_features(reg) : nullptr;
+    if (!features) {
+        return false;
+    }
+
+    const std::string pair = std::string(ggml_type_name(type)) + "-" + ggml_type_name(type);
+    for (const ggml_backend_feature * f = features; f->name; ++f) {
+        if (strcmp(f->name, "FA_QUANTS") != 0) {
+            continue;
+        }
+        std::stringstream ss(f->value);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            item.erase(0, item.find_first_not_of(' '));
+            item.erase(item.find_last_not_of(' ') + 1);
+            if (item == "all" || item == pair) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool backend_has_flash_attn_causal_prefix(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     using fn_t = bool (*)(ggml_backend_dev_t);
@@ -8490,9 +8519,12 @@ struct test_flash_attn_ext : public test_case {
                 strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev)), "CUDA") != 0) {
             return test_case::max_err(backend);
         }
+        // Q4_0 and Q8_0 always have native kernels, other types only when GGML_CUDA_FA_QUANTS selects their pair
+        const bool compiled = type_K == GGML_TYPE_Q4_0 || type_K == GGML_TYPE_Q8_0 || backend_fa_quants_selects(backend, type_K);
+        const bool expected = expected_native && compiled;
         const bool native = native_count() > native_count_before;
-        if (native != bool(expected_native)) {
-            fprintf(stderr, "unexpected CUDA FlashAttention route: expected native=%d, got native=%d\n", expected_native, int(native));
+        if (native != expected) {
+            fprintf(stderr, "unexpected CUDA FlashAttention route: expected native=%d, got native=%d\n", int(expected), int(native));
             return -1.0;
         }
         return test_case::max_err(backend);
@@ -11523,10 +11555,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // expected_native says which route the case must take: 1 native, 0 the
     // F16-casting path. With the graph opted in, that is purely whether a kernel
-    // is compiled for the geometry. Q5_0 only has one with
-    // GGML_CUDA_FA_ALL_QUANTS; without it the backend reports a q5_0 K/V cache
-    // as unsupported and these cases are skipped rather than run on the wrong
-    // expectation.
+    // is compiled for the geometry. The extra tier only has one when
+    // GGML_CUDA_FA_QUANTS selects its pair; max_err expects the F16 path otherwise.
     const auto add_native_equivalence = [&](ggml_type type, int64_t hs, int64_t nh, std::array<int64_t, 2> nr23, int64_t kv, int64_t nb, int expected_native) {
         test_cases.emplace_back(new test_flash_attn_ext(
                     hs, hs, nh, nr23, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
