@@ -1042,44 +1042,51 @@ static ggml_backend_meta_split_state meta_mirrored_split_state(const ggml_tensor
     return { GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1 };
 }
 
-static void test_resizable_buffers_owner_borrower_meta_private() {
+static void test_resizable_buffers_owner_borrower_meta_alias() {
     ggml_backend_dev_t dev_cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(dev_cpu != nullptr);
     ggml_backend_dev_t devs[] = { dev_cpu, dev_cpu };
     ggml_backend_dev_t dev_meta = ggml_backend_meta_device(devs, 2, meta_mirrored_split_state, nullptr);
     GGML_ASSERT(dev_meta != nullptr);
-
-    dummy_backend backend_shared = dummy_backend_init(SIZE_MAX, /*align*/ 4);
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev_meta, nullptr));
+    GGML_ASSERT(backend != nullptr);
 
     auto owner_graph    = make_resizable_add_graph(16);
     auto borrower_graph = make_resizable_add_graph(24);
-    int leaf_buffer_ids[2] = { 0, 1 };
-    int node_buffer_ids[1] = { 0 };
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev_meta);
 
-    ggml_backend_buffer_type_t bufts[2] = {
-        ggml_backend_dev_buffer_type(dev_meta),
-        &backend_shared.buffer_type,
+    auto compute_add = [&](ggml_cgraph * graph, float value) {
+        ggml_tensor * out = ggml_graph_node(graph, -1);
+        std::vector<float> data(ggml_nelements(out), value);
+        ggml_backend_tensor_set(out->src[0], data.data(), 0, ggml_nbytes(out));
+        ggml_backend_tensor_set(out->src[1], data.data(), 0, ggml_nbytes(out));
+        GGML_ASSERT(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(out, data.data(), 0, ggml_nbytes(out));
+        for (float x : data) {
+            GGML_ASSERT(x == 2.0f*value);
+        }
     };
 
     {
-        ggml_gallocr_ptr owner(ggml_gallocr_new_n(bufts, 2));
-        ggml_gallocr_ptr borrower(ggml_gallocr_new_n(bufts, 2));
+        ggml_gallocr_ptr owner(ggml_gallocr_new(buft));
+        ggml_gallocr_ptr borrower(ggml_gallocr_new(buft));
         GGML_ASSERT(ggml_gallocr_set_resizable(owner.get(), nullptr));
         GGML_ASSERT(ggml_gallocr_set_resizable(borrower.get(), owner.get()));
 
-        GGML_ASSERT(ggml_gallocr_reserve_n(owner.get(), owner_graph.graph, node_buffer_ids, leaf_buffer_ids));
-        GGML_ASSERT(ggml_gallocr_reserve_n(borrower.get(), borrower_graph.graph, node_buffer_ids, leaf_buffer_ids));
-
-        // each graph keeps its own meta buffer, sized for itself
+        GGML_ASSERT(ggml_gallocr_reserve(owner.get(), owner_graph.graph));
+        GGML_ASSERT(ggml_gallocr_reserve(borrower.get(), borrower_graph.graph));
         GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) > 0);
-        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) < ggml_gallocr_get_buffer_size(borrower.get(), 0));
+        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 0) == ggml_gallocr_get_buffer_size(borrower.get(), 0));
 
-        const size_t shared_size = backend_shared.context->allocated_total();
-        GGML_ASSERT(backend_shared.context->buffers.size() == 1);
-        GGML_ASSERT(ggml_gallocr_get_buffer_size(owner.get(), 1) == shared_size);
-        GGML_ASSERT(ggml_gallocr_get_buffer_size(borrower.get(), 1) == shared_size);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(owner.get(), owner_graph.graph));
+        compute_add(owner_graph.graph, 1.0f);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(borrower.get(), borrower_graph.graph));
+        compute_add(borrower_graph.graph, 2.0f);
+        GGML_ASSERT(ggml_graph_node(owner_graph.graph, -1)->buffer != ggml_graph_node(borrower_graph.graph, -1)->buffer);
+
+        // reuse the owner graph without a new alloc, as a reused llama graph does
+        compute_add(owner_graph.graph, 3.0f);
     }
-    GGML_ASSERT(backend_shared.context->allocated_total() == 0);
 }
 
 static void test_resizable_buffers_owner_borrower_allocation_failure() {
@@ -1352,7 +1359,7 @@ int main() {
     run("test_resizable_buffers_alias_duplicate_buffer_types", test_resizable_buffers_alias_duplicate_buffer_types);
     run("test_resizable_buffers_owner_borrower_maximum", test_resizable_buffers_owner_borrower_maximum);
     run("test_resizable_buffers_owner_borrower_compatible_placement", test_resizable_buffers_owner_borrower_compatible_placement);
-    run("test_resizable_buffers_owner_borrower_meta_private", test_resizable_buffers_owner_borrower_meta_private);
+    run("test_resizable_buffers_owner_borrower_meta_alias", test_resizable_buffers_owner_borrower_meta_alias);
     run("test_resizable_buffers_owner_borrower_allocation_failure", test_resizable_buffers_owner_borrower_allocation_failure);
     run("test_resizable_buffers_owner_borrower_scheduler_failure", test_resizable_buffers_owner_borrower_scheduler_failure);
     run("test_resizable_buffers_owner_borrower_teardown_order", test_resizable_buffers_owner_borrower_teardown_order);
