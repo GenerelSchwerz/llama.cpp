@@ -1211,10 +1211,7 @@ private:
                 SRV_WRN("%s\n", "ctx_shift is not supported by multimodal, it will be disabled");
             }
 
-            if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
-            }
+            // keep cache_reuse: it is applied per request and only while the prompt has no media
         }
 
         if (!llama_memory_can_shift(llama_get_memory(ctx_tgt))) {
@@ -3419,25 +3416,34 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
-                                const bool can_cache_reuse =
-                                    llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                // the shift is applied to the draft context too, so both must support it
+                                const bool can_shift = llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                                       (!ctx_dft || llama_memory_can_shift(llama_get_memory(ctx_dft)));
 
-                                if (!can_cache_reuse && n_cache_reuse > 0) {
-                                    SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                // the loop below uses token indices as positions, which a media chunk breaks.
+                                // an mmproj alone is fine, only a real media chunk in either prompt is not
+                                const bool has_media = slot.prompt.tokens.has_media_chunks() || input_tokens.has_media_chunks();
+
+                                // the loop moves n_past past the alora cap applied above
+                                const bool has_alora = slot.alora_invocation_start > 0;
+
+                                const bool can_cache_reuse = n_cache_reuse > 0 && can_shift && !has_media && !has_alora;
+
+                                if (n_cache_reuse > 0 && !can_cache_reuse) {
+                                    if (!can_shift) {
+                                        SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    } else {
+                                        // expected on every request with media or an alora, so keep it out of the log
+                                        SLT_DBG(slot, "cache reuse is disabled for this prompt - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+                                    }
                                 }
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
-                                if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
-
+                                if (can_cache_reuse) {
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
-                                        // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
-                                    }
+                                    bool kv_shifted = false;
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
 
@@ -3462,6 +3468,8 @@ private:
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
                                             slot.mem.seq_add(slot.id, head_c, head_c + n_match, kv_shift);
 
+                                            kv_shifted |= kv_shift != 0;
+
                                             for (size_t i = 0; i < n_match; i++) {
                                                 slot.prompt.tokens.set_token(head_p + i, slot.prompt.tokens[head_c + i]);
                                                 n_past++;
@@ -3472,6 +3480,11 @@ private:
                                         } else {
                                             head_c += 1;
                                         }
+                                    }
+
+                                    if (kv_shifted) {
+                                        // the checkpoints were taken before the shift, they no longer match the cache
+                                        slot.prompt.checkpoints.clear();
                                     }
 
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
