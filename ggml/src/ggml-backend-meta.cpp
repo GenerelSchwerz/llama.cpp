@@ -468,6 +468,10 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
 
+    // Share of the meta size each simple buffer holds, in units of 1/65536, empty when every simple buffer holds all of it.
+    // A tensor at meta offset X lands at X*share on simple buffer j, see ggml_backend_meta_alloc_buffer_shares.
+    std::vector<uint32_t> shares;
+
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
     // However, it is also expensive to build and clearing it on every rebuild in ggml_backend_meta_graph_compute is too expensive.
@@ -1241,6 +1245,38 @@ static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     return (void *) 0x1000000000000000; // FIXME
 }
 
+// ne and nb of the part of a tensor on simple buffer j
+static void ggml_backend_meta_simple_shape(const ggml_tensor * tensor, const ggml_backend_meta_split_state & split_state,
+        size_t n_simple_bufs, size_t j, int64_t * ne, size_t * nb) {
+    for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+        ne[k] = tensor->ne[k];
+        nb[k] = tensor->nb[k];
+    }
+    const int split_dim = split_state.axis;
+    if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
+        // TODO: the following assert fails for llama-parallel even though the results are correct:
+        // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
+        ne[split_dim] = 0;
+        for (size_t s = 0; s < split_state.n_segments; s++) {
+            ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
+        }
+        for (int i = 0; i < GGML_MAX_DIMS; i++) {
+            if (tensor->nb[i] > tensor->nb[split_dim]) {
+                nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
+            }
+        }
+    }
+}
+
+// offset on simple buffer j of what sits at meta offset `offset`
+static size_t ggml_backend_meta_simple_offset(const ggml_backend_meta_buffer_context * buf_ctx, size_t j, size_t offset) {
+    if (buf_ctx->shares.empty() || buf_ctx->shares[j] == 65536) {
+        return offset;
+    }
+    const size_t alignment = ggml_backend_buffer_get_alignment(buf_ctx->bufs[j].get());
+    return GGML_PAD((size_t) (((uint64_t) offset * buf_ctx->shares[j]) >> 16), alignment);
+}
+
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(tensor->buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) tensor->buffer->context;
@@ -1253,10 +1289,6 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
     int split_dim = split_state.axis;
     int64_t ne[GGML_MAX_DIMS];
     size_t  nb[GGML_MAX_DIMS];
-    for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
-        ne[k] = tensor->ne[k];
-        nb[k] = tensor->nb[k];
-    }
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
@@ -1269,19 +1301,7 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             GGML_ABORT("multi buffers are not supported by the meta backend");
         }
 
-        if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
-            // TODO: the following assert fails for llama-parallel even though the results are correct:
-            // GGML_ASSERT(ggml_is_contiguously_allocated(tensor));
-            ne[split_dim] = 0;
-            for (size_t s = 0; s < split_state.n_segments; s++) {
-                ne[split_dim] += split_state.ne[s*n_simple_bufs + j] * split_state.nr[s];
-            }
-            for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->nb[i] > tensor->nb[split_dim]) {
-                    nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
-                }
-            }
-        }
+        ggml_backend_meta_simple_shape(tensor, split_state, n_simple_bufs, j, ne, nb);
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
         t_ij->op = tensor->op;
@@ -1319,8 +1339,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         if (t_ij->view_src != nullptr) {
             t_ij->data = (char *) t_ij->view_src->data + t_ij->view_offs;
         } else if (simple_buf != nullptr) {
-            t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf)
-                + size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer));
+            const size_t offset = ggml_backend_meta_simple_offset(buf_ctx, j,
+                size_t(tensor->data) - size_t(ggml_backend_buffer_get_base(tensor->buffer)));
+            GGML_ASSERT(buf_ctx->shares.empty() ||
+                offset + ggml_backend_buffer_get_alloc_size(simple_buf, t_ij) <= ggml_backend_buffer_get_size(simple_buf));
+            t_ij->data = (char *) ggml_backend_buffer_get_base(simple_buf) + offset;
         }
 
         if (simple_buf) {
@@ -1856,6 +1879,91 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
+}
+
+ggml_backend_buffer_t ggml_backend_meta_alloc_buffer_shares(ggml_backend_buffer_type_t buft, size_t size, const uint32_t * shares) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 1024*1024*ggml_tensor_overhead(), // FIXME
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_backend_meta_simple_tensor_container stc_static;
+    ggml_backend_meta_simple_tensor_container stc_compute_0(params, n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_compute_1(params, n_simple_bufts);
+
+    std::vector<ggml_backend_buffer_t> bufs;
+    bufs.reserve(n_simple_bufts);
+    for (size_t i = 0; i < n_simple_bufts; i++) {
+        GGML_ASSERT(shares[i] > 0 && shares[i] <= 65536);
+        const size_t size_i = (size_t) (((uint64_t) size * shares[i] + 65535) >> 16);
+        bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size_i));
+        if (bufs.back() == nullptr) {
+            for (ggml_backend_buffer_t buf : bufs) {
+                ggml_backend_buffer_free(buf);
+            }
+            return nullptr;
+        }
+    }
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    buf_ctx->shares.assign(shares, shares + n_simple_bufts);
+
+    // the meta size stays the one asked for: tensors are placed against it, and each simple buffer holds its share
+    return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, size);
+}
+
+void ggml_backend_meta_get_shares(ggml_backend_buffer_type_t buft, const struct ggml_tensor * const * tensors, size_t n_tensors, uint32_t * shares) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(buft));
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+
+    // the split state is asked of a compute leaf, so ask it through an empty compute buffer of this type
+    ggml_backend_meta_simple_tensor_container stc_static;
+    ggml_backend_meta_simple_tensor_container stc_compute_0;
+    ggml_backend_meta_simple_tensor_container stc_compute_1;
+    std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute_0, stc_compute_1, bufs);
+    ggml_backend_buffer_t probe = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, 0);
+    probe->usage = GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+
+    for (size_t j = 0; j < n_simple_bufts; j++) {
+        shares[j] = 1;
+    }
+
+    for (size_t i = 0; i < n_tensors; i++) {
+        ggml_tensor t = *tensors[i];
+        GGML_ASSERT(t.view_src == nullptr);
+        t.buffer = probe;
+        t.data   = ggml_backend_buffer_get_base(probe);
+
+        const size_t alloc_size = ggml_backend_buft_get_alloc_size(buft, &t);
+        if (alloc_size == 0) {
+            continue;
+        }
+
+        const ggml_backend_meta_split_state split_state =
+            ggml_backend_meta_get_split_state(buf_ctx->stc_compute[0], &t, /*assume_sync =*/ true);
+        for (size_t j = 0; j < n_simple_bufts; j++) {
+            int64_t ne[GGML_MAX_DIMS];
+            size_t  nb[GGML_MAX_DIMS];
+            ggml_backend_meta_simple_shape(&t, split_state, n_simple_bufts, j, ne, nb);
+
+            ggml_tensor t_j = t;
+            for (int k = 0; k < GGML_MAX_DIMS; k++) {
+                t_j.ne[k] = ne[k];
+                t_j.nb[k] = nb[k];
+            }
+            ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, j);
+
+            // with the alignment in it, the next tensor never starts inside this one after both offsets are rounded, see ggml_backend_meta_simple_offset
+            const uint64_t need = ggml_backend_buft_get_alloc_size(simple_buft, &t_j) + ggml_backend_buft_get_alignment(simple_buft);
+            const uint64_t share = (need*65536 + alloc_size - 1) / alloc_size;
+            shares[j] = (uint32_t) std::min<uint64_t>(std::max<uint64_t>(shares[j], share), 65536);
+        }
+    }
+
+    ggml_backend_buffer_free(probe);
 }
 
 struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft) {
