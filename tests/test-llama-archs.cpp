@@ -13,6 +13,7 @@
 #include "../src/llama-arch.h"
 #include "../src/llama-context.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-model-saver.h"
 
 #include <cinttypes>
@@ -495,8 +496,8 @@ static llama_context_ptr make_phase_workspace_context(
         llama_model * model, llama_context_type type, llama_context * other = nullptr, uint32_t n_seq_max = 1,
         ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr);
 
-static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed) {
-    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, false);
+static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed, bool moe = false) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     ggml_backend_dev_t devices[] = { nullptr };
@@ -651,6 +652,33 @@ static void test_live_context_workspace_iswa_reserve(size_t seed) {
 
     const auto contraction = ctx->make_sched_reserve_plan(0);
     GGML_ASSERT(contraction.n_kv == 256);
+}
+
+static void test_live_context_workspace_indexer_reserve(size_t seed) {
+    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_QWEN4EXP, seed, true);
+    llama_context_params ctx_params = make_live_context_workspace_params();
+
+    llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
+    GGML_ASSERT(ctx);
+
+    const auto initial = ctx->make_sched_reserve_plan(1, 1);
+    GGML_ASSERT(initial.live_kv);
+    GGML_ASSERT(initial.n_kv == 256);
+
+    auto assert_reserve = [&](uint32_t n_kv) {
+        llama_memory_context_ptr reserve = ctx->get_memory()->init_reserve(n_kv);
+        auto * hybrid = dynamic_cast<llama_memory_hybrid_idx_context *>(reserve.get());
+        GGML_ASSERT(hybrid != nullptr);
+        GGML_ASSERT(hybrid->get_attn()->get_n_kv() == n_kv);
+        GGML_ASSERT(hybrid->get_idx() != nullptr);
+        GGML_ASSERT(hybrid->get_idx()->get_n_kv() == n_kv);
+    };
+    assert_reserve(256);
+
+    ctx->sched_reserve(ctx_params.n_batch, 257);
+    const auto grown = ctx->make_sched_reserve_plan(ctx_params.n_batch, 257);
+    GGML_ASSERT(grown.n_kv == 512);
+    assert_reserve(512);
 }
 
 static void test_live_context_workspace_unsupported(size_t seed) {
@@ -1839,6 +1867,7 @@ int main(int argc, char ** argv) {
         if (test_live_context_workspace) {
             test_live_context_workspace_reserve(seed);
             test_live_context_workspace_iswa_reserve(seed);
+            test_live_context_workspace_indexer_reserve(seed);
             test_live_context_workspace_unsupported(seed);
             return 0;
         }

@@ -2886,14 +2886,15 @@ static void ggml_cuda_mul_mat_id_staged(ggml_backend_cuda_context & ctx, ggml_te
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_ptrs.data(), n_unique, expert_stride, source_padding, min_resident,
                 split_slot_ids.data(), source_wait_class_host.empty() ? nullptr : source_wait_class_host.data(),
-                &n_resident, scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, stream);
+                &n_resident, scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, stream,
+                telemetry_is_decode);
         }
     }
 
     bool cache_staged = false;
     if (overflow && cache && !split_staged) {
         cache_staged = ggml_cuda_moe_cache_copy_to_staging(
-            cache, host_ptrs.data(), n_unique, expert_stride, scratch_experts.get(), stream);
+            cache, host_ptrs.data(), n_unique, expert_stride, scratch_experts.get(), stream, telemetry_is_decode);
     }
 
     if (!cache_staged && !split_staged) {
@@ -3045,6 +3046,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
             ids->ne[0] > SIZE_MAX / static_cast<size_t>(ids->ne[1])) {
         return false;
     }
+    const bool telemetry_is_decode = group->authority.legacy_telemetry_is_decode(ids->ne[1] == 1);
     const size_t n_ids = static_cast<size_t>(ids->ne[0]) * static_cast<size_t>(ids->ne[1]);
     if (n_ids == 0 || n_ids > SIZE_MAX / sizeof(int32_t)) {
         return false;
@@ -3105,7 +3107,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
     const auto stage_full_source = [&]() {
         if (!ggml_cuda_moe_cache_copy_to_staging(
                 cache, host_sources.data(), static_cast<int>(host_sources.size()),
-                expert_stride, scratch_experts.get(), ctx.stream())) {
+                expert_stride, scratch_experts.get(), ctx.stream(), telemetry_is_decode)) {
             return false;
         }
         return source_padding == 0 || cudaMemsetAsync(
@@ -3180,7 +3182,8 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
             split_staged = ggml_cuda_moe_cache_prepare_split_staging(
                 cache, host_sources.data(), static_cast<int>(unique_experts.size()), expert_stride, source_padding, min_resident,
                 split_slots.data(), wait_classes.empty() ? nullptr : wait_classes.data(), &n_resident,
-                scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, ctx.stream());
+                scratch_experts.get(), stage_ready.get(), stage_ready_capacity, &n_wait_classes, ctx.stream(),
+                telemetry_is_decode);
         }
 
         std::vector<int32_t> expert_source(static_cast<size_t>(n_experts), -1);
@@ -3288,7 +3291,8 @@ static void ggml_cuda_mul_mat_id_cached(
     auto * owner = ctx.moe_grouped_context;
     auto owner_lease = owner != nullptr ? owner->begin_legacy_operation() : ggml_cuda_moe_legacy_operation_lease{};
     auto * leased_owner = owner_lease ? owner : nullptr;
-    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority, stream) : ggml_cuda_moe_legacy_cache_lease{};
+    const uint32_t top_k = ids->ne[0] > 0 && ids->ne[0] <= UINT32_MAX ? static_cast<uint32_t>(ids->ne[0]) : 1;
+    auto cache_lease = leased_owner != nullptr ? leased_owner->acquire_legacy_cache(src0, nullptr, authority, stream, top_k) : ggml_cuda_moe_legacy_cache_lease{};
     ggml_cuda_moe_cache * cache = cache_lease.get();
 
     std::vector<char> ids_host_storage;
@@ -3320,7 +3324,6 @@ static void ggml_cuda_mul_mat_id_cached(
     const int64_t ids_ne0 = ids->ne[0];
     const int64_t ids_ne1 = ids->ne[1];
     const int64_t ids_ne2 = ids->ne[2];
-    const bool use_l2 = true;
 
     // Single dedup pass: build unique_eids with -2 sentinel for "seen".
     // If we exceed the cache's slot count, fall back to staging.
@@ -3349,7 +3352,7 @@ static void ggml_cuda_mul_mat_id_cached(
     if (overflow) {
         if (ids_group_pending && leased_owner != nullptr) {
             leased_owner->prefetch_legacy_siblings(
-                cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, telemetry_is_decode);
+                cache_lease, unique_eids.data(), (int) unique_eids.size(), telemetry_is_decode);
         }
         // More unique experts than the cache can hold simultaneously.
         // Stage so no slot gets overwritten mid-op.
@@ -3366,7 +3369,7 @@ static void ggml_cuda_mul_mat_id_cached(
 
     if (leased_owner != nullptr) {
         leased_owner->prefetch_legacy_siblings(
-            cache_lease, unique_eids.data(), (int) unique_eids.size(), use_l2, telemetry_is_decode);
+            cache_lease, unique_eids.data(), (int) unique_eids.size(), telemetry_is_decode);
     }
 
     // 5. Reset sentinels and acquire each unique expert on this tensor's cache.
@@ -3388,7 +3391,7 @@ static void ggml_cuda_mul_mat_id_cached(
 
                 const void * host_ptr = src_base + (size_t)eid * expert_stride;
                 int slot = ggml_cuda_moe_cache_acquire(
-                    cache, host_ptr, expert_stride, copy_stream, use_l2, telemetry_is_decode, false, true);
+                    cache, host_ptr, expert_stride, copy_stream, telemetry_is_decode, false, true);
                 if (slot < 0) {
                     any_cache_failure = true;
                     break;
@@ -8316,6 +8319,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_buffer_type;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_bounded_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_free_buffer_type;
+    }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_configure_sources;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) == 0) {
         return (void *) ggml_backend_buft_is_cuda_moe_cached;
     }
@@ -8324,9 +8336,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_cache_slots;
-    }
-    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) == 0) {
-        return (void *) ggml_backend_cuda_moe_set_l2_pinned_cache_size;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_debug_mm;

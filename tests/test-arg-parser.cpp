@@ -247,6 +247,18 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
 
     params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "32"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_host_pinned_size == size_t{32} * 1024 * 1024);
+    assert(common_model_params_to_llama(params).moe_expert_cache_host_pinned_size == params.moe_expert_cache_host_pinned_size);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "-1"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-host-pinned-mb", "0"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_host_pinned_size == 0);
+
     params.n_moe_expert_cache_slots = 40;
     assert(params.speculative.draft.n_moe_expert_cache_slots == -1);
     assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 40);
@@ -256,7 +268,10 @@ static void test(void) {
     assert(params.n_moe_expert_cache_slots == 40);
     assert(params.speculative.draft.n_moe_expert_cache_slots == 0);
     params.speculative.draft.mparams.path = "draft.gguf";
-    assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 0);
+    params.moe_expert_cache_host_pinned_size = size_t{32} * 1024 * 1024;
+    const auto uncached_draft = common_base_params_to_speculative(params);
+    assert(uncached_draft.n_moe_expert_cache_slots == 0);
+    assert(uncached_draft.moe_expert_cache_host_pinned_size == 0);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--spec-draft-moe-expert-cache-size", "12"};

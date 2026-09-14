@@ -288,12 +288,19 @@ struct ggml_cuda_moe_grouped_context_test_access {
     static bool early_hc(ggml_cuda_moe_grouped_context & context) {
         return context.early_hc_for_test();
     }
-    static bool early_copy(ggml_cuda_moe_grouped_context & context, bool capture) {
-        return context.early_copy_for_test(capture);
+    static bool prepack(ggml_cuda_moe_grouped_context & context) {
+        return context.prepack_for_test();
+    }
+    static uint64_t host_copy_jobs(const ggml_cuda_moe_grouped_context & context, const ggml_cuda_moe_candidate_group_key & key) {
+        return context.host_copy_jobs_for_test(key);
     }
 
     static bool admission_closed(const ggml_cuda_moe_grouped_context & context) {
         return context.admission_closed_for_test();
+    }
+
+    static bool attach_prepack(ggml_cuda_moe_grouped_context & context, const ggml_cuda_moe_candidate_group_key & key, cudaStream_t stream) {
+        return context.attach_prepack_for_test(key, stream);
     }
 
     static bool set_clock_bound(
@@ -698,7 +705,7 @@ struct candidate_test_fixture {
 
     ggml_tensor * cached_tensor(enum ggml_type type, int n_dims, const int64_t * ne) {
         if (cached_buffer == nullptr) {
-            cached_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(storage, BUFFER_SIZE);
+            cached_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_cuda_moe_cached_buffer_type(), storage, BUFFER_SIZE);
             CHECK(cached_buffer != nullptr);
         }
         ggml_tensor * result = tensor(type, n_dims, ne);
@@ -2635,6 +2642,7 @@ static void test_candidate_producer() {
     ggml_set_name(separate.ffn_down_exps, "blk.0.ffn_down_exps.weight");
 
     llama_adapter_loras loras;
+    model->build_moe_sources();
     llama_moe_candidate_snapshot produced(*model, loras);
     const auto & snapshot = produced.get();
     CHECK(snapshot.magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC);
@@ -2717,6 +2725,7 @@ static void test_candidate_producer() {
     llama_adapter_lora adapter(model.get());
     adapter.ab_map.emplace(separate.ffn_gate_exps->name, llama_adapter_lora_weight());
     loras.emplace(&adapter, 1.0f);
+    model->build_moe_sources();
     llama_moe_candidate_snapshot lora_on(*model, loras);
     CHECK(lora_on.get().n_groups == 4);
     CHECK(lora_on.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_ACTIVE_LORA);
@@ -2725,12 +2734,14 @@ static void test_candidate_producer() {
     CHECK(registry.state().n_groups == 2);
     CHECK(!registry.find_weight(separate.ffn_gate_exps, nullptr));
     loras.clear();
+    model->build_moe_sources();
     llama_moe_candidate_snapshot lora_off(*model, loras);
     CHECK(lora_off.get().n_groups == 4);
     CHECK(registry.replace(&lora_off.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(registry.find_weight(separate.ffn_gate_exps, nullptr));
 
     fused.ffn_up_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
+    model->build_moe_sources();
     llama_moe_candidate_snapshot fused_scale(*model, loras);
     CHECK(fused_scale.get().n_groups == 4);
     const auto * fused_scale_record = candidate_tensor(fused_scale.get(), fused.ffn_up_exps_s);
@@ -2745,6 +2756,7 @@ static void test_candidate_producer() {
 
     ggml_tensor * saved_shared = separate.ffn_up_shexp;
     separate.ffn_up_shexp = separate.ffn_gate_exps;
+    model->build_moe_sources();
     llama_moe_candidate_snapshot typed_alias(*model, loras);
     CHECK(typed_alias.get().flags & GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE);
     CHECK(typed_alias.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE);
@@ -2762,6 +2774,7 @@ static void test_candidate_producer() {
     CHECK(overridden->has_tensor_overrides());
     ggml_backend_buffer_t saved_buffer = separate.ffn_gate_exps->buffer;
     separate.ffn_gate_exps->buffer = fixture.buffer;
+    overridden->build_moe_sources();
     llama_moe_candidate_snapshot affected(*overridden, loras);
     CHECK(affected.get().n_slots == 48 && affected.get().n_groups == 4);
     CHECK(affected.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
@@ -2774,6 +2787,7 @@ static void test_candidate_producer() {
     CHECK(registry.state().accepted == 1 && registry.state().n_groups == 2 && registry.state().n_slots == 48);
 
     separate.ffn_gate_exps->buffer = saved_buffer;
+    overridden->build_moe_sources();
     llama_moe_candidate_snapshot shadowed(*overridden, loras);
     CHECK(shadowed.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
     CHECK((shadowed.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) == 0);
@@ -2787,6 +2801,7 @@ static void test_candidate_producer() {
     llama_adapter_lora overridden_adapter(overridden.get());
     overridden_adapter.ab_map.emplace(separate.ffn_gate_exps->name, llama_adapter_lora_weight());
     loras.emplace(&overridden_adapter, 1.0f);
+    overridden->build_moe_sources();
     llama_moe_candidate_snapshot shadowed_lora(*overridden, loras);
     CHECK(shadowed_lora.get().flags == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_NONE);
     CHECK((shadowed_lora.get().groups[0].flags & GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_TENSOR_OVERRIDES) == 0);
@@ -2803,6 +2818,7 @@ static void test_candidate_producer() {
     llama_model_params uncached_params = llama_model_default_params();
     std::unique_ptr<llama_model> uncached(llama_model_create(LLM_ARCH_LLAMA, uncached_params));
     CHECK(uncached != nullptr && uncached->moe_expert_cache_slots() == 0);
+    uncached->build_moe_sources();
     llama_moe_candidate_snapshot uncached_snapshot(*uncached, loras);
     CHECK(uncached_snapshot.get().n_slots == 0 && uncached_snapshot.get().n_groups == 0);
     CHECK(registry.replace(&uncached_snapshot.get()) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -2820,6 +2836,7 @@ static void test_candidate_producer() {
         layer.ffn_down_exps = fixture.cached_tensor(GGML_TYPE_Q4_0, 3, down_ne);
         layer.ffn_down_exps_s = fixture.cached_tensor(GGML_TYPE_F32, 1, scale_ne);
     }
+    gemma->build_moe_sources();
     llama_moe_candidate_snapshot gemma_produced(*gemma, loras);
     const auto & gemma_snapshot = gemma_produced.get();
     CHECK(gemma_snapshot.n_slots == 12 && gemma_snapshot.n_groups == 30);
@@ -5168,11 +5185,7 @@ static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * t
 }
 
 #ifdef __linux__
-static void (*file_mmap_cached_unregister)(ggml_backend_buffer_t) = nullptr;
-
 static void file_mmap_cached_buffer_free(ggml_backend_buffer_t buffer) {
-    CHECK(file_mmap_cached_unregister != nullptr);
-    file_mmap_cached_unregister(buffer);
     CHECK(munmap(buffer->context, buffer->size) == 0);
 }
 
@@ -5195,15 +5208,10 @@ static ggml_backend_buffer_t file_mmap_cached_buffer_type_alloc_buffer(
     if (data == MAP_FAILED) {
         return nullptr;
     }
-    ggml_backend_buffer_t buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(data, size);
+    ggml_backend_buffer_t buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_cuda_moe_cached_buffer_type(), data, size);
     if (buffer == nullptr) {
         (void) munmap(data, size);
         return nullptr;
-    }
-    if (file_mmap_cached_unregister == nullptr) {
-        file_mmap_cached_unregister = buffer->iface.free_buffer;
-    } else {
-        CHECK(file_mmap_cached_unregister == buffer->iface.free_buffer);
     }
     buffer->iface.free_buffer = file_mmap_cached_buffer_free;
     return buffer;
@@ -6221,15 +6229,29 @@ static void check_active_grouped_contract(
     CHECK(clock_bound == graph.n_rows * graph.n_used);
 }
 
-static void test_grouped_graph_replay_lifecycle(int device) {
+static void test_grouped_graph_replay_lifecycle(int device, size_t host_budget = 0, size_t expected_host_nodes = 0, uint32_t n_dim = 256) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr backend(ggml_backend_cuda_init(device));
     CHECK(backend != nullptr);
+    auto buft = ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
+    CHECK(buft != nullptr);
     auto graph = build_active_grouped_dispatch_graph(
-        backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
+        backend.get(), buft, GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1, 8, 2, n_dim);
+    ggml_backend_cuda_moe_cached_free_buffer_type(buft);
     initialize_active_grouped_dispatch_graph(graph, 177);
+    if (host_budget != 0) {
+        const ggml_backend_moe_candidate_group_v2 group = {
+            GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0,
+        };
+        std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
+        for (uint32_t i = 0; i < graph.banks.size(); ++i) {
+            tensors.push_back({graph.banks[i], 0, graph.roles[i], GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0});
+        }
+        const auto sources = candidate_snapshot_v2(12, &group, 1, tensors.data(), tensors.size());
+        CHECK(ggml_backend_cuda_moe_cached_configure_sources(buft, &sources));
+    }
     register_active_grouped_dispatch(
         backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
@@ -6237,6 +6259,24 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     const int32_t routes[] = {3, 5};
     ggml_backend_tensor_set(graph.ids, routes, 0, sizeof(routes));
     ggml_backend_synchronize(backend.get());
+    const auto check_payload = [&](const int32_t * remapped, const int32_t * experts) {
+        CHECK(remapped != nullptr);
+        std::vector<int32_t> slots(graph.n_used);
+        CUDA_OK(cudaMemcpy(slots.data(), remapped, slots.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        ggml_cuda_moe_candidate_group_key key;
+        CHECK(context->find_down_group_key(graph.down, &key));
+        for (const auto * bank : graph.banks) {
+            const auto * data = static_cast<const char *>(ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, key, bank));
+            CHECK(data != nullptr);
+            std::vector<uint8_t> bytes(bank->nb[2]);
+            for (uint32_t route = 0; route < graph.n_used; ++route) {
+                const int32_t slot = slots[route];
+                CHECK(slot >= 0 && slot < 12);
+                CUDA_OK(cudaMemcpy(bytes.data(), data + slot * bank->nb[2], bytes.size(), cudaMemcpyDeviceToHost));
+                CHECK(memcmp(bytes.data(), static_cast<const char *>(bank->data) + experts[route] * bank->nb[2], bytes.size()) == 0);
+            }
+        }
+    };
 
     cudaStream_t stream = nullptr;
     cudaStream_t previous_stream = nullptr;
@@ -6288,21 +6328,26 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     CUDA_OK(cudaGraphGetNodes(captured_graph, nullptr, &captured_node_count));
     std::vector<cudaGraphNode_t> captured_nodes(captured_node_count);
     CUDA_OK(cudaGraphGetNodes(captured_graph, captured_nodes.data(), &captured_node_count));
+    size_t host_nodes = 0;
     for (cudaGraphNode_t node : captured_nodes) {
         cudaGraphNodeType type = cudaGraphNodeTypeCount;
         CUDA_OK(cudaGraphNodeGetType(node, &type));
         CHECK(type != cudaGraphNodeTypeWaitEvent && type != cudaGraphNodeTypeEventRecord);
+        host_nodes += type == cudaGraphNodeTypeHost;
     }
+    CHECK(host_nodes == expected_host_nodes);
     CUDA_OK(cudaGraphInstantiate(&captured_instance, captured_graph, nullptr, nullptr, 0));
     CUDA_OK(cudaGraphLaunch(captured_instance, stream));
     auto * capture_group = capture.find_group(graph.readers.front(), nullptr);
     CHECK(capture_group != nullptr && capture_group->state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE &&
         capture_group->defer_completion);
+    const int32_t * capture_remapped = capture_group->remapped_ids;
     ggml_cuda_moe_grouped_resource_info capture_info;
     CHECK(context->get_group_resources(capture_acquisition, &capture_info) && capture_info.transaction_active);
     CHECK(context->finish_graph_dispatch(&capture));
     CHECK(context->get_group_resources(capture_acquisition, &capture_info) && !capture_info.transaction_active);
     CUDA_OK(cudaStreamSynchronize(stream));
+    check_payload(capture_remapped, routes);
 
     uint64_t captured_fingerprint = 0;
     CHECK(context->graph_resource_fingerprint(capture, stream, &captured_fingerprint));
@@ -6315,6 +6360,10 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     capture_leases.clear();
     CHECK(capture_witnesses.size() == 1 && !capture_witnesses[0].expired());
 
+    int32_t * replay_routes = nullptr;
+    CUDA_OK(cudaMallocHost(&replay_routes, 2 * sizeof(int32_t)));
+    replay_routes[0] = 0;
+    replay_routes[1] = 7;
     host_barrier direct_barrier;
     CUDA_OK(cudaLaunchHostFunc(previous_stream, wait_on_host_barrier, &direct_barrier));
     ggml_cuda_moe_graph_execution intervening_direct;
@@ -6331,6 +6380,7 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     CHECK(context->begin_graph_dispatch(&replay, GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY));
     CHECK(context->activate_graph_resources(
         &replay, GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY, captured_fingerprint, &capture_witnesses));
+    CUDA_OK(cudaMemcpyAsync(graph.ids->data, replay_routes, 2 * sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_OK(cudaGraphLaunch(captured_instance, stream));
     cudaEvent_t replay_done = nullptr;
     CUDA_OK(cudaEventCreateWithFlags(&replay_done, cudaEventDisableTiming));
@@ -6352,6 +6402,9 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     }
     const bool replay_waited_for_direct = !replay_reached;
     direct_barrier.released.store(true, std::memory_order_release);
+    CUDA_OK(cudaStreamSynchronize(stream));
+    check_payload(replay_group->remapped_ids, replay_routes);
+    CUDA_OK(cudaFreeHost(replay_routes));
 
     std::atomic<bool> replacement_started{false};
     std::atomic<bool> replacement_done{false};
@@ -6436,11 +6489,71 @@ static void test_grouped_graph_replay_lifecycle(int device) {
     CHECK(context->find_down_group_key(graph.down, &key));
     CHECK(ggml_cuda_moe_grouped_context_test_access::get_clock_bound(*context, key, &clock_bound));
     CHECK(clock_bound == 2);
+    if (n_dim == 1024) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::host_copy_jobs(*context, key) != 0);
+    }
+    if (host_budget != 0) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
+        std::vector<std::shared_ptr<void>> pending_leases;
+        CHECK(context->graph_resource_fingerprint(overflow_replay, stream, &refreshed_fingerprint, &pending_leases));
+        CHECK(pending_leases.size() == 1);
+        std::weak_ptr<void> pending_witness = pending_leases[0];
+        ggml_backend_tensor_set(graph.ids, routes, 0, sizeof(routes));
+        ggml_backend_synchronize(backend.get());
+
+        host_barrier pending_barrier;
+        CUDA_OK(cudaLaunchHostFunc(previous_stream, wait_on_host_barrier, &pending_barrier));
+        ggml_cuda_moe_graph_execution pending_direct;
+        prepare_execution(pending_direct, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, previous_stream);
+        CHECK(context->begin_graph_dispatch(&pending_direct, GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT));
+        run_callbacks(pending_direct, previous_stream);
+        CHECK(context->finish_graph_dispatch(&pending_direct));
+        while (!pending_barrier.entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+
+        const bool replace_pending = host_budget == 393216;
+        std::thread replace_pending_thread;
+        if (replace_pending) {
+            replace_pending_thread = std::thread([&] {
+                register_active_grouped_dispatch(backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+            });
+            while (ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key)) {
+                std::this_thread::yield();
+            }
+        }
+        std::atomic<bool> lease_released{false}, shutdown_done{false};
+        std::thread release_pending([&] {
+            pending_leases.clear();
+            lease_released.store(true, std::memory_order_release);
+        });
+        std::thread shutdown_pending([&] {
+            context->shutdown();
+            shutdown_done.store(true, std::memory_order_release);
+        });
+        while (!ggml_cuda_moe_grouped_context_test_access::admission_closed(*context)) {
+            std::this_thread::yield();
+        }
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const bool retained = lease_released.load(std::memory_order_acquire) && !pending_witness.expired();
+        const bool shutdown_waited = !shutdown_done.load(std::memory_order_acquire);
+        pending_barrier.released.store(true, std::memory_order_release);
+        release_pending.join();
+        if (replace_pending_thread.joinable()) {
+            replace_pending_thread.join();
+        }
+        shutdown_pending.join();
+        CHECK(retained && shutdown_waited && pending_witness.expired());
+        fprintf(stderr, "test-moe-cache: prepack cross-stream teardown replaced=%d retained=1 waited=1 OK\n", replace_pending);
+    }
     CUDA_OK(cudaStreamSynchronize(previous_stream));
     CUDA_OK(cudaStreamDestroy(previous_stream));
     CUDA_OK(cudaStreamDestroy(stream));
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
-    fprintf(stderr, "test-moe-cache: grouped graph replay lifecycle OK\n");
+    fprintf(stderr, "test-moe-cache: grouped graph replay lifecycle host_budget=%zu host_nodes=%zu OK\n", host_budget, host_nodes);
 }
 
 static std::vector<float> run_active_grouped_dispatch(
@@ -6665,7 +6778,7 @@ static void test_early_grouped_graphs() {
                 uint64_t calls = 0;
                 const uint64_t bytes = ggml_cuda_moe_grouped_context_test_access::early_bytes(*context, &calls);
                 if (variant == 5) {
-                    CHECK(ggml_cuda_moe_grouped_context_test_access::early_programs(*context) == 1);
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::early_programs(*context) == 0);
                 }
                 fprintf(stderr, "early-grouped-test: layout=%u rows=%u variant=%d calls=%llu predicted_bytes=%llu\n",
                     layout, rows, variant, (unsigned long long) calls, (unsigned long long) bytes);
@@ -6721,7 +6834,7 @@ static void test_early_grouped_graphs() {
                     fprintf(stderr, "early-grouped-test: unsupported domain or host-staged rows, exact output, prediction=excluded\n");
                     continue;
                 }
-                CHECK(calls > 0 && (variant == 4 || bytes > 0));
+                CHECK(calls == 0 && bytes == 0);
             }
         }
     }
@@ -11192,7 +11305,7 @@ static void check_gemma_q4_materialization(
         }
 
         std::unique_ptr<ggml_cuda_moe_cache, decltype(&ggml_cuda_moe_cache_free)> cache(
-            ggml_cuda_moe_cache_init(device, bank->nb[2], n_slots, false, 0, 0),
+            ggml_cuda_moe_cache_init(device, bank->nb[2], n_slots),
             ggml_cuda_moe_cache_free);
         CHECK(cache != nullptr);
         const char * source = static_cast<const char *>(bank->data);
@@ -11204,7 +11317,7 @@ static void check_gemma_q4_materialization(
             for (int32_t expert : unique) {
                 const int slot = ggml_cuda_moe_cache_acquire(
                     cache.get(), source + (size_t) expert * bank->nb[2], bank->nb[2],
-                    copy_stream, false, false, false, true);
+                    copy_stream, false, false, true);
                 CHECK(slot >= 0);
                 slots[index++] = slot;
             }
@@ -11214,7 +11327,7 @@ static void check_gemma_q4_materialization(
             for (size_t index = 0; index < 4; ++index) {
                 const int slot = ggml_cuda_moe_cache_acquire(
                     cache.get(), source + (size_t) unique[index] * bank->nb[2], bank->nb[2],
-                    copy_stream, false, false, false, true);
+                    copy_stream, false, false, true);
                 CHECK(slot >= 0);
                 primed_slots.push_back(slot);
             }
@@ -11230,7 +11343,7 @@ static void check_gemma_q4_materialization(
             int n_wait_classes = 0;
             CHECK(ggml_cuda_moe_cache_prepare_split_staging(
                 cache.get(), sources.data(), sources.size(), bank->nb[2], 0, 2,
-                slots.data(), nullptr, &n_resident, misses, nullptr, 0, &n_wait_classes, stream));
+                slots.data(), nullptr, &n_resident, misses, nullptr, 0, &n_wait_classes, stream, false));
             CHECK(n_resident == (int) n_slots && n_wait_classes == 1);
             CHECK(ggml_cuda_moe_cache_finish_split_staging(cache.get(), stream));
             CUDA_OK(cudaStreamSynchronize(stream));
@@ -11662,17 +11775,21 @@ struct grouped_decode_fixture {
             int device,
             bool pinned = true,
             size_t source_bytes = SOURCE_BYTES,
-            uint32_t n_experts = N_EXPERTS) : n_experts(n_experts) {
+            uint32_t n_experts = N_EXPERTS,
+            size_t host_budget = 0) : n_experts(n_experts) {
         backend = ggml_backend_cuda_init(device);
         CHECK(backend != nullptr);
+        auto buft = ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
+        CHECK(buft != nullptr);
         if (pinned) {
-            source_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_moe_cached_buffer_type(), source_bytes);
+            source_buffer = ggml_backend_buft_alloc_buffer(buft, source_bytes);
         } else {
             source_storage = ggml_aligned_malloc(source_bytes);
             source_storage_size = source_bytes;
             CHECK(source_storage != nullptr);
-            source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(source_storage, source_bytes);
+            source_buffer = ggml_backend_cuda_moe_cached_buffer_from_host_ptr(buft, source_storage, source_bytes);
         }
+        ggml_backend_cuda_moe_cached_free_buffer_type(buft);
         ids_buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), 4096);
         CHECK(source_buffer != nullptr && ids_buffer != nullptr);
         ggml_init_params params = {};
@@ -11723,6 +11840,139 @@ struct grouped_decode_fixture {
         return tensor;
     }
 };
+
+static void test_pageable_staging_pipeline(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    constexpr size_t HOST_BUDGET = 262144;
+    constexpr int N_SLOTS = 6;
+    grouped_decode_fixture fixture(device, false, grouped_decode_fixture::SOURCE_BYTES,
+        grouped_decode_fixture::N_EXPERTS, HOST_BUDGET);
+    ggml_tensor * gate_up = fixture.weight(GGML_TYPE_F32, 64, 128);
+    ggml_tensor * down = fixture.weight(GGML_TYPE_F32, 64, 64);
+    CHECK(gate_up->nb[2] > down->nb[2]);
+    for (uint32_t expert = 0; expert < fixture.n_experts; ++expert) {
+        memset(static_cast<char *>(gate_up->data) + expert * gate_up->nb[2], 17 + expert, gate_up->nb[2]);
+        memset(static_cast<char *>(down->data) + expert * down->nb[2], 41 + expert, down->nb[2]);
+    }
+    const ggml_backend_moe_candidate_group_v2 group = {
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0,
+    };
+    const ggml_backend_moe_candidate_tensor_v2 tensors[] = {
+        {gate_up, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+        {down, 0, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0},
+    };
+    const auto snapshot = candidate_snapshot_v2(N_SLOTS, &group, 1, tensors, 2);
+    auto buft = ggml_backend_buffer_get_type(fixture.source_buffer);
+    CHECK(ggml_backend_cuda_moe_cached_configure_sources(buft, &snapshot));
+
+    auto make_cache = [&](ggml_cuda_moe_staging_failure_for_test failure = GGML_CUDA_MOE_STAGING_FAIL_NONE) {
+        auto * cache = ggml_cuda_moe_cache_init(device, gate_up->nb[2], N_SLOTS);
+        CHECK(cache != nullptr);
+        ggml_cuda_moe_cache_fail_staging_for_test(cache, failure);
+        CHECK(ggml_cuda_moe_cache_set_source_for_test(cache, gate_up));
+        return cache;
+    };
+    const auto source = [&](uint32_t expert) {
+        return static_cast<const char *>(gate_up->data) + expert * gate_up->nb[2];
+    };
+    const auto check_slot = [&](ggml_cuda_moe_cache * cache, int slot, uint32_t expert) {
+        std::vector<uint8_t> actual(gate_up->nb[2]);
+        CUDA_OK(cudaMemcpy(actual.data(), ggml_cuda_moe_cache_slot_ptr(cache, slot), actual.size(), cudaMemcpyDeviceToHost));
+        CHECK(memcmp(actual.data(), source(expert), actual.size()) == 0);
+    };
+
+    auto * cache = make_cache();
+    const auto initial = ggml_cuda_moe_cache_staging_state_for_test(cache, false);
+    CHECK(initial.tiles == 2 && initial.host_optional_bytes == gate_up->nb[2]);
+    int slots[4];
+    for (uint32_t expert = 0; expert < 4; ++expert) {
+        slots[expert] = ggml_cuda_moe_cache_acquire(
+            cache, source(expert), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, true);
+        CHECK(slots[expert] >= 0);
+    }
+    auto state = ggml_cuda_moe_cache_staging_state_for_test(cache, false);
+    CHECK(state.pipeline_tiles == 4 && state.tile_wait_calls >= 2 && state.pending == 2);
+    CHECK(state.pre_sync_calls == 0 && state.post_sync_calls == 0 && state.upload_errors == 0);
+    CUDA_OK(cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(cache)));
+    for (uint32_t expert = 0; expert < 4; ++expert) {
+        check_slot(cache, slots[expert], expert);
+    }
+    ggml_cuda_moe_cache_release_slots(cache, slots, 4);
+
+    const int decode_slot = ggml_cuda_moe_cache_acquire(
+        cache, source(4), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), true, false, false);
+    CHECK(decode_slot >= 0);
+    const auto decode_state = ggml_cuda_moe_cache_staging_state_for_test(cache, true);
+    CHECK(decode_state.pipeline_tiles == 0 && decode_state.pending == 0);
+    CHECK(decode_state.pre_sync_calls == 1 && decode_state.post_sync_calls == 1 && decode_state.upload_errors == 0);
+    check_slot(cache, decode_slot, 4);
+    ggml_cuda_moe_cache_free(cache);
+
+    for (auto failure : {GGML_CUDA_MOE_STAGING_FAIL_GROWTH, GGML_CUDA_MOE_STAGING_FAIL_EVENT_CREATE}) {
+        cache = make_cache(failure);
+        state = ggml_cuda_moe_cache_staging_state_for_test(cache, false);
+        CHECK(state.tiles == 1 && state.host_optional_bytes == 0 && state.host_staging_bytes <= state.host_limit);
+        for (uint32_t expert = 0; expert < 2; ++expert) {
+            const int slot = ggml_cuda_moe_cache_acquire(
+                cache, source(expert), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false);
+            CHECK(slot >= 0);
+            check_slot(cache, slot, expert);
+        }
+        ggml_cuda_moe_cache_free(cache);
+    }
+
+    for (auto failure : {GGML_CUDA_MOE_STAGING_FAIL_WAIT, GGML_CUDA_MOE_STAGING_FAIL_SUBMIT, GGML_CUDA_MOE_STAGING_FAIL_RECORD}) {
+        cache = make_cache();
+        const size_t staging_bytes = ggml_cuda_moe_cache_staging_state_for_test(cache, false).host_staging_bytes;
+        for (uint32_t expert = 0; expert < 2; ++expert) {
+            CHECK(ggml_cuda_moe_cache_acquire(
+                cache, source(expert), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false) >= 0);
+        }
+        ggml_cuda_moe_cache_fail_staging_for_test(cache, failure);
+        CHECK(ggml_cuda_moe_cache_acquire(
+            cache, source(2), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false) < 0);
+        state = ggml_cuda_moe_cache_staging_state_for_test(cache, false);
+        CHECK(state.failed && state.pending == 0 && state.upload_errors == 1);
+        ggml_cuda_moe_cache_fail_staging_for_test(cache, GGML_CUDA_MOE_STAGING_FAIL_NONE);
+        CHECK(ggml_cuda_moe_cache_acquire(
+            cache, source(0), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false) < 0);
+        CHECK(ggml_cuda_moe_cache_acquire(
+            cache, source(3), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false) < 0);
+        ggml_cuda_moe_cache_free(cache);
+        cache = make_cache();
+        CHECK(ggml_cuda_moe_cache_staging_state_for_test(cache, false).host_staging_bytes == staging_bytes);
+        ggml_cuda_moe_cache_free(cache);
+    }
+
+    cache = ggml_cuda_moe_cache_init(device, gate_up->nb[2], 2);
+    CHECK(cache != nullptr && ggml_cuda_moe_cache_set_source_for_test(cache, gate_up));
+    for (uint32_t expert = 0; expert < 2; ++expert) {
+        CHECK(ggml_cuda_moe_cache_acquire(
+            cache, source(expert), gate_up->nb[2], ggml_cuda_moe_cache_copy_stream(cache), false, false, false) >= 0);
+    }
+    cudaStream_t compute_stream = nullptr;
+    void * miss_dst = nullptr;
+    CUDA_OK(cudaStreamCreateWithFlags(&compute_stream, cudaStreamNonBlocking));
+    CUDA_OK(cudaMalloc(&miss_dst, 6 * gate_up->nb[2]));
+    const void * split_sources[8];
+    for (uint32_t expert = 0; expert < 8; ++expert) {
+        split_sources[expert] = source(expert);
+    }
+    int split_slots[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int n_resident = 0;
+    int n_wait_classes = 0;
+    ggml_cuda_moe_cache_fail_staging_for_test(cache, GGML_CUDA_MOE_STAGING_FAIL_SUBMIT);
+    CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
+        cache, split_sources, 8, gate_up->nb[2], 0, 1, split_slots, nullptr,
+        &n_resident, miss_dst, nullptr, 0, &n_wait_classes, compute_stream, false));
+    CHECK(ggml_cuda_moe_cache_staging_state_for_test(cache, false).failed);
+    CUDA_OK(cudaFree(miss_dst));
+    CUDA_OK(cudaStreamDestroy(compute_stream));
+    ggml_cuda_moe_cache_free(cache);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: pageable two-tile staging pipeline OK\n");
+}
 
 static void test_owner_legacy_cache(int device) {
     grouped_decode_fixture fixture(device);
@@ -11783,7 +12033,7 @@ static void test_owner_legacy_cache(int device) {
     }
 
     const int32_t experts[] = {1, 3};
-    first.prefetch_legacy_siblings(first_gate, experts, 2, true, true);
+    first.prefetch_legacy_siblings(first_gate, experts, 2, true);
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t evictions = 0;
@@ -11802,7 +12052,7 @@ static void test_owner_legacy_cache(int device) {
         int n_wait_classes = 0;
         const bool prepared = ggml_cuda_moe_cache_prepare_split_staging(
             first_down.get(), split_sources, 6, down->nb[2], 0, 1, slot_ids, wait_classes,
-            &n_resident, prefetch_staging, prefetch_stage_ready, 3, &n_wait_classes, prefetch_compute_stream);
+            &n_resident, prefetch_staging, prefetch_stage_ready, 3, &n_wait_classes, prefetch_compute_stream, false);
         prefetch_barrier.released.store(true, std::memory_order_release);
         if (prepared) {
             CHECK(ggml_cuda_moe_cache_finish_split_staging(first_down.get(), prefetch_compute_stream));
@@ -11838,7 +12088,7 @@ static void test_owner_legacy_cache(int device) {
 
     auto second_up = second.acquire_legacy_cache(up);
     CHECK(second_up && second_up.get() != nullptr && second_up.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
-    second.prefetch_legacy_siblings(second_up, experts, 2, true, true);
+    second.prefetch_legacy_siblings(second_up, experts, 2, true);
     auto second_separate_gate = second.acquire_legacy_cache(gate);
     auto second_separate_down = second.acquire_legacy_cache(separate_down);
     CHECK(second_separate_gate && second_separate_down);
@@ -11949,8 +12199,22 @@ static void test_grouped_decode_type(
         uint32_t layout,
         bool pinned = true,
         uint32_t n_slots = grouped_decode_fixture::N_SLOTS,
-        bool auxiliary_scale = false) {
-    grouped_decode_fixture fixture(device, pinned);
+        bool auxiliary_scale = false,
+        size_t host_budget = 0,
+        bool mixed = false) {
+    grouped_decode_fixture fixture(device, pinned, grouped_decode_fixture::SOURCE_BYTES, grouped_decode_fixture::N_EXPERTS, host_budget);
+    ggml_tensor * registration_prefix = nullptr;
+#ifdef __linux__
+    if (pinned && host_budget == 65536) {
+        const long page = sysconf(_SC_PAGESIZE);
+        CHECK(page > 128);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(fixture.source_buffer));
+        fixture.source_offset = 2 * static_cast<size_t>(page) - base % page - 128;
+        registration_prefix = fixture.scale();
+        ggml_set_name(registration_prefix, "test.registration_prefix");
+        fixture.source_offset += 64 - ggml_nbytes(registration_prefix);
+    }
+#endif
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
     std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
@@ -11980,6 +12244,11 @@ static void test_grouped_decode_type(
     if (type == GGML_TYPE_NVFP4) {
         CHECK(ggml_blck_size(type) == 64 && ggml_type_size(type) == 36);
     }
+    if (registration_prefix != nullptr) {
+        // The prefix pins the first 64 bytes of expert 0 in a separate registration.
+        CHECK(static_cast<const char *>(weights[0]->data) - static_cast<const char *>(registration_prefix->data) == 64);
+        CHECK(weights[0]->nb[2] > 64);
+    }
     if (auxiliary_scale) {
         banks[n_banks] = {fixture.scale(), GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0};
     }
@@ -11987,7 +12256,55 @@ static void test_grouped_decode_type(
     group.banks = banks.data();
     group.n_banks = n_banks + auxiliary_scale;
     group.layout = layout;
-    const auto snapshot = candidate_snapshot(n_slots, &group, 1);
+    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {group, group};
+    std::array<ggml_backend_moe_candidate_bank_v1, 3> extra_banks = {};
+    if (mixed) {
+        CHECK(host_budget != 0 && !auxiliary_scale);
+        fixture.source_offset += 4096;
+        for (uint32_t bank = 0; bank < n_banks; ++bank) {
+            auto * extra = fixture.weight(type, weights[bank]->ne[0], weights[bank]->ne[1]);
+            extra_banks[bank] = {extra, banks[bank].role, 0};
+            for (uint32_t expert = 0; expert < fixture.n_experts; ++expert) {
+                memset(static_cast<char *>(extra->data) + expert * extra->nb[2], 64 + 17 * bank + expert, extra->nb[2]);
+            }
+        }
+        groups[1].banks = extra_banks.data();
+    }
+    const auto snapshot = candidate_snapshot(n_slots, groups.data(), mixed ? 2 : 1);
+    if (host_budget != 0) {
+        std::vector<ggml_backend_moe_candidate_group_v2> source_groups;
+        std::vector<ggml_backend_moe_candidate_tensor_v2> sources;
+        if (registration_prefix != nullptr) {
+            sources.push_back({registration_prefix, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE,
+                GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED, 0, 0});
+        }
+        for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+            source_groups.push_back({layout, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0});
+            for (uint32_t i = 0; i < groups[group_index].n_banks; ++i) {
+                const auto & bank = groups[group_index].banks[i];
+                sources.push_back({bank.tensor, group_index, bank.role,
+                    i < n_banks ? GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE : GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE, 0, 0});
+            }
+        }
+        const auto source_snapshot = candidate_snapshot_v2(
+            n_slots, source_groups.data(), source_groups.size(), sources.data(), sources.size());
+        CHECK(ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_get_type(fixture.source_buffer), &source_snapshot));
+        int read_only_supported = 0;
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11010
+        if (!pinned) {
+            CUDA_OK(cudaDeviceGetAttribute(&read_only_supported, cudaDevAttrHostRegisterReadOnlySupported, device));
+        }
+#endif
+        for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+            const bool budget_admits = mixed ? group_index == 0 : host_budget >= 65536;
+            const bool direct = budget_admits && (pinned || read_only_supported);
+            for (uint32_t bank = 0; bank < n_banks; ++bank) {
+                cudaPointerAttributes attributes = {};
+                CUDA_OK(cudaPointerGetAttributes(&attributes, groups[group_index].banks[bank].tensor->data));
+                CHECK(attributes.type == (direct ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
+            }
+        }
+    }
     ggml_cuda_moe_grouped_context registry(ggml_backend_get_device(fixture.backend), device);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
@@ -12003,11 +12320,25 @@ static void test_grouped_decode_type(
     auto wrong_key = key;
     --wrong_key.n_banks;
     ggml_cuda_moe_grouped_decode_acquisition decode;
+    const auto check_payload = [&](const int32_t * experts) {
+        std::array<int32_t, 4> slots = {};
+        CUDA_OK(cudaMemcpy(slots.data(), decode.remapped_ids, sizeof(slots), cudaMemcpyDeviceToHost));
+        for (uint32_t bank = 0; bank < decode.n_banks; ++bank) {
+            const auto * tensor = decode.banks[bank].tensor;
+            std::vector<uint8_t> bytes(tensor->nb[2]);
+            for (uint32_t route = 0; route < slots.size(); ++route) {
+                CHECK(slots[route] >= 0 && static_cast<uint32_t>(slots[route]) < decode.n_slots);
+                CUDA_OK(cudaMemcpy(bytes.data(), static_cast<const char *>(decode.banks[bank].data) + slots[route] * tensor->nb[2],
+                    bytes.size(), cudaMemcpyDeviceToHost));
+                CHECK(memcmp(bytes.data(), static_cast<const char *>(tensor->data) + experts[route] * tensor->nb[2], bytes.size()) == 0);
+            }
+        }
+    };
     CHECK(registry.prepare_decode(wrong_key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
 
     const int32_t first_ids[] = {3, 1, 3, 6};
     CUDA_OK(cudaMemcpyAsync(ids->data, first_ids, sizeof(first_ids), cudaMemcpyHostToDevice, stream));
-    if (!pinned) {
+    if (!pinned && host_budget == 0) {
         CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
         CUDA_OK(cudaStreamSynchronize(stream));
         CUDA_OK(cudaStreamDestroy(wrong_stream));
@@ -12027,14 +12358,8 @@ static void test_grouped_decode_type(
     }
     for (uint32_t bank = 0; bank < n_banks; ++bank) {
         CHECK(decode.banks[bank].tensor == weights[bank] && decode.banks[bank].role == banks[bank].role && decode.banks[bank].type == (uint32_t) type);
-        std::vector<uint8_t> row(weights[bank]->nb[2]);
-        for (uint32_t route : {0u, 1u, 3u}) {
-            const int32_t expert = first_ids[route];
-            const int32_t slot = remapped[route];
-            CUDA_OK(cudaMemcpy(row.data(), static_cast<const char *>(decode.banks[bank].data) + slot * weights[bank]->nb[2], row.size(), cudaMemcpyDeviceToHost));
-            CHECK(memcmp(row.data(), static_cast<const char *>(weights[bank]->data) + expert * weights[bank]->nb[2], row.size()) == 0);
-        }
     }
+    check_payload(first_ids);
     CHECK(!registry.finish_decode(decode, wrong_stream));
     CHECK(registry.finish_decode(decode, stream));
 
@@ -12046,6 +12371,7 @@ static void test_grouped_decode_type(
     const std::array<int32_t, 4> expected_second = n_slots == grouped_decode_fixture::N_SLOTS ?
         std::array<int32_t, 4>{2, 3, 0, 2} : std::array<int32_t, 4>{2, 3, 4, 2};
     CHECK(remapped == expected_second);
+    check_payload(second_ids);
     if (check_deferred_commit) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 1) == 1);
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 3) == 0);
@@ -12057,6 +12383,7 @@ static void test_grouped_decode_type(
 
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CUDA_OK(cudaStreamSynchronize(stream));
+    check_payload(second_ids);
     if (check_deferred_commit) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 1) == 1);
         CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, 3) == -1);
@@ -12083,6 +12410,105 @@ static void test_grouped_decode_type(
     finish_thread.join();
     CHECK(finish_was_async && finish_result.load(std::memory_order_acquire));
     CUDA_OK(cudaStreamSynchronize(stream));
+    const int32_t full_miss_ids[] = {0, 3, 4, 5};
+    if (host_budget != 0) {
+        for (int32_t expert : full_miss_ids) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::device_slot_for_expert(registry, key.candidate, expert) == -1);
+        }
+        CUDA_OK(cudaMemcpyAsync(ids->data, full_miss_ids, sizeof(full_miss_ids), cudaMemcpyHostToDevice, stream));
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+            CUDA_OK(cudaStreamSynchronize(stream));
+            check_payload(full_miss_ids);
+            CHECK(registry.finish_decode(decode, stream));
+        }
+    }
+    if (mixed) {
+        const auto extra_key = grouped_decode_key(registry, extra_banks[n_banks - 1].tensor, ids, layout, n_banks);
+        for (const int32_t * routes : {first_ids, second_ids, second_ids, full_miss_ids, full_miss_ids}) {
+            CUDA_OK(cudaMemcpyAsync(ids->data, routes, sizeof(first_ids), cudaMemcpyHostToDevice, stream));
+            CHECK(registry.prepare_decode(extra_key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
+            CUDA_OK(cudaStreamSynchronize(stream));
+            check_payload(routes);
+            CHECK(registry.finish_decode(decode, stream));
+        }
+        CUDA_OK(cudaStreamSynchronize(stream));
+    }
+    if (host_budget != 0) {
+        ggml_cuda_moe_grouped_context legacy(ggml_backend_get_device(fixture.backend), device);
+        const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
+        CHECK(legacy.replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
+            for (uint32_t bank = 0; bank < n_banks; ++bank) {
+                const auto * tensor = groups[group_index].banks[bank].tensor;
+                auto lease = legacy.acquire_legacy_cache(tensor);
+                CHECK(lease && lease.get() != nullptr);
+                std::vector<uint8_t> bytes(tensor->nb[2]);
+                const std::array<int32_t, 8> split_routes = {3, 1, 6, 2, 7, 0, 4, 5};
+                std::array<const void *, 8> split_sources = {};
+                for (size_t i = 0; i < split_sources.size(); ++i) {
+                    split_sources[i] = static_cast<const char *>(tensor->data) + split_routes[i] * tensor->nb[2];
+                }
+                constexpr size_t padding = 16;
+                void * staging = nullptr;
+                CUDA_OK(cudaMalloc(&staging, split_sources.size() * tensor->nb[2] + padding));
+                for (bool overlap : {false, true}) {
+                    if (overlap && !ggml_cuda_moe_cache_can_overlap_staging(lease.get())) {
+                        continue;
+                    }
+                    uint32_t * ready = nullptr;
+                    if (overlap) {
+                        CUDA_OK(cudaMalloc(&ready, 3 * sizeof(uint32_t)));
+                    }
+                    CUDA_OK(cudaMemsetAsync(staging, 0xff, split_sources.size() * tensor->nb[2] + padding, stream));
+                    std::array<int, 8> slots = {};
+                    std::array<int32_t, 8> waits = {};
+                    int resident = 0;
+                    int wait_classes = 0;
+                    CHECK(ggml_cuda_moe_cache_prepare_split_staging(lease.get(), split_sources.data(), split_sources.size(),
+                        tensor->nb[2], padding, 1, slots.data(), overlap ? waits.data() : nullptr, &resident,
+                        staging, ready, overlap ? 3 : 0, &wait_classes, stream, false));
+                    CHECK(resident == 4 && wait_classes == (overlap ? 3 : 1));
+                    CHECK(ggml_cuda_moe_cache_finish_split_staging(lease.get(), stream));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                    size_t miss = 0;
+                    for (size_t i = 0; i < split_sources.size(); ++i) {
+                        const void * source = slots[i] >= 0 ? ggml_cuda_moe_cache_slot_ptr(lease.get(), slots[i]) :
+                            static_cast<char *>(staging) + miss++ * tensor->nb[2];
+                        CUDA_OK(cudaMemcpy(bytes.data(), source, bytes.size(), cudaMemcpyDeviceToHost));
+                        CHECK(memcmp(bytes.data(), split_sources[i], bytes.size()) == 0);
+                        if (overlap) {
+                            CHECK(waits[i] == (slots[i] >= 0 ? 1 : 2));
+                        }
+                    }
+                    CHECK(miss == 4);
+                    std::array<uint8_t, padding> tail = {};
+                    CUDA_OK(cudaMemcpy(tail.data(), static_cast<char *>(staging) + miss * tensor->nb[2], tail.size(), cudaMemcpyDeviceToHost));
+                    CHECK(std::all_of(tail.begin(), tail.end(), [](uint8_t value) { return value == 0; }));
+                    if (overlap) {
+                        std::array<uint32_t, 3> flags = {};
+                        CUDA_OK(cudaMemcpy(flags.data(), ready, sizeof(flags), cudaMemcpyDeviceToHost));
+                        CHECK((flags == std::array<uint32_t, 3>{1, 1, 0}));
+                        CUDA_OK(cudaFree(ready));
+                    }
+                    CHECK(ggml_cuda_moe_cache_release_split_slots(lease.get(), slots.data(), slots.size(), stream));
+                    CUDA_OK(cudaStreamSynchronize(stream));
+                }
+                CUDA_OK(cudaFree(staging));
+                for (int32_t expert : {3, 1, 6, 2, 7, 0}) {
+                    const auto * source = static_cast<const char *>(tensor->data) + expert * tensor->nb[2];
+                    const int slot = ggml_cuda_moe_cache_acquire(
+                        lease.get(), source, tensor->nb[2], ggml_cuda_moe_cache_copy_stream(lease.get()), true, false, false);
+                    CHECK(slot >= 0);
+                    CUDA_OK(cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(lease.get())));
+                    CUDA_OK(cudaMemcpy(bytes.data(), ggml_cuda_moe_cache_slot_ptr(lease.get(), slot), bytes.size(), cudaMemcpyDeviceToHost));
+                    CHECK(memcmp(bytes.data(), source, bytes.size()) == 0);
+                }
+            }
+        }
+        fprintf(stderr, "test-moe-cache: bounded sources allocated=%d budget=%zu mixed=%d registration_boundary=%d grouped/ordinary/split exact OK\n",
+            pinned, host_budget, mixed, registration_prefix != nullptr);
+    }
     CUDA_OK(cudaStreamDestroy(wrong_stream));
     CUDA_OK(cudaStreamDestroy(stream));
 }
@@ -12565,6 +12991,12 @@ static void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, true, 12);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
+    for (bool allocated : {false, true}) {
+        for (size_t budget : {size_t{16384}, size_t{20480}, size_t{65536}}) {
+            test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, budget);
+        }
+        test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, 53248, true);
+    }
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
         for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
             for (uint32_t n_slots : {12u, 48u}) {
@@ -12668,8 +13100,8 @@ static size_t grouped_decode_source_bytes(const grouped_decode_bench_spec & spec
     return result;
 }
 
-static void grouped_decode_benchmark_case(int device, const grouped_decode_bench_spec & spec, uint32_t n_slots) {
-    grouped_decode_fixture fixture(device, true, grouped_decode_source_bytes(spec), spec.n_experts);
+static void grouped_decode_benchmark_case(int device, const grouped_decode_bench_spec & spec, uint32_t n_slots, size_t host_budget = 0) {
+    grouped_decode_fixture fixture(device, true, grouped_decode_source_bytes(spec), spec.n_experts, host_budget);
     std::array<ggml_tensor *, 3> weights = {};
     std::array<ggml_backend_moe_candidate_bank_v1, 3> banks = {};
     size_t expert_bytes = 0;
@@ -12684,6 +13116,15 @@ static void grouped_decode_benchmark_case(int device, const grouped_decode_bench
     group.banks = banks.data();
     group.n_banks = spec.n_banks;
     group.layout = spec.layout;
+    if (host_budget != 0) {
+        const ggml_backend_moe_candidate_group_v2 source_group = {spec.layout, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0};
+        std::array<ggml_backend_moe_candidate_tensor_v2, 3> sources = {};
+        for (uint32_t bank = 0; bank < spec.n_banks; ++bank) {
+            sources[bank] = {weights[bank], 0, spec.roles[bank], GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE, 0, 0};
+        }
+        const auto source_snapshot = candidate_snapshot_v2(n_slots, &source_group, 1, sources.data(), spec.n_banks);
+        CHECK(ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_get_type(fixture.source_buffer), &source_snapshot));
+    }
     const auto snapshot = candidate_snapshot(n_slots, &group, 1);
     ggml_cuda_moe_grouped_context registry(ggml_backend_get_device(fixture.backend), device);
     CHECK(registry.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -12837,10 +13278,12 @@ static void test_moe_cache_proc_api() {
     ggml_backend_reg_t reg = ggml_backend_cuda_reg();
     CHECK(reg != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) != nullptr);
-    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_L2_PINNED_SIZE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_decode_boundary_overlap") != nullptr);
@@ -12926,6 +13369,18 @@ static void test_strided_copy_graph_update(int device, bool enabled) {
 }
 
 int main(int argc, char ** argv) {
+    if (argc == 2 && strcmp(argv[1], "--grouped-staging-bench") == 0) {
+        int device = 0;
+        CUDA_OK(cudaGetDevice(&device));
+        const grouped_decode_bench_spec spec = {
+            "staged-q4_k-separate", GGML_TYPE_Q4_K, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 512, 80, 3,
+            {2048, 2048, 768}, {768, 768, 2048},
+            {GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
+                GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT},
+        };
+        grouped_decode_benchmark_case(device, spec, 80, 64 * 1024 * 1024);
+        return 0;
+    }
     if (argc == 2 && strcmp(argv[1], "--early-grouped-only") == 0) {
         test_early_grouped_graphs();
         return 0;
@@ -12945,10 +13400,14 @@ int main(int argc, char ** argv) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::early_hc(context));
         return 0;
     }
-    if (argc == 2 && (strcmp(argv[1], "--early-copy-only") == 0 || strcmp(argv[1], "--early-copy-graph-only") == 0)) {
-        ggml_cuda_moe_grouped_context context(nullptr, 0);
-        CHECK(ggml_cuda_moe_grouped_context_test_access::early_copy(context, strcmp(argv[1], "--early-copy-graph-only") == 0));
+    if (argc == 2 && strcmp(argv[1], "--prepack-only") == 0) {
+        ggml_cuda_moe_grouped_context context(nullptr, -1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::prepack(context));
         return 0;
+    }
+    if (argc == 2 && (strcmp(argv[1], "--early-copy-only") == 0 || strcmp(argv[1], "--early-copy-graph-only") == 0)) {
+        fprintf(stderr, "test-moe-cache: old copy transport retired; use --prepack-only\n");
+        return 1;
     }
     const bool registry_only = argc == 2 && strcmp(argv[1], "--registry-only") == 0;
     const bool registry_bench = argc == 2 && strcmp(argv[1], "--registry-bench") == 0;
@@ -12959,6 +13418,7 @@ int main(int argc, char ** argv) {
     const bool grouped_multirow_only = argc == 2 && strcmp(argv[1], "--grouped-multirow-only") == 0;
     const bool grouped_nvfp4_only = argc == 2 && strcmp(argv[1], "--grouped-nvfp4-only") == 0;
     const bool legacy_phase_telemetry_only = argc == 2 && strcmp(argv[1], "--legacy-phase-telemetry-only") == 0;
+    const bool staging_pipeline_only = argc == 2 && strcmp(argv[1], "--staging-pipeline-only") == 0;
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
     test_moe_cache_proc_api();
@@ -12997,6 +13457,9 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_grouped_graph_replay_lifecycle(dev);
+        test_grouped_graph_replay_lifecycle(dev, 262144, 2);
+        test_grouped_graph_replay_lifecycle(dev, 393216, 1);
+        test_grouped_graph_replay_lifecycle(dev, 4 * 1024 * 1024, 2, 1024);
         return 0;
     }
     if (grouped_nvfp4_only) {
@@ -13007,6 +13470,12 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_active_grouped_legacy_phase_telemetry(dev);
+        return 0;
+    }
+    if (staging_pipeline_only) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_pageable_staging_pipeline(dev);
         return 0;
     }
     test_speculative_grouped_intent_splits();
@@ -13038,6 +13507,7 @@ int main(int argc, char ** argv) {
     test_moe_route_publication_lifetime();
     test_cached_mmid_fusion_decline();
     test_cached_mmid_prefill_and_overflow();
+    test_pageable_staging_pipeline(dev);
     test_owner_legacy_cache(dev);
     if (cached_fusion_only) {
         test_cached_mmid_routed_separate_chain();
@@ -13045,6 +13515,9 @@ int main(int argc, char ** argv) {
     }
     test_grouped_decode(dev);
     test_grouped_graph_replay_lifecycle(dev);
+    test_grouped_graph_replay_lifecycle(dev, 262144, 2);
+    test_grouped_graph_replay_lifecycle(dev, 393216, 1);
+    test_grouped_graph_replay_lifecycle(dev, 4 * 1024 * 1024, 2, 1024);
     test_strided_copy_graph_update(dev, false);
     test_strided_copy_graph_update(dev, true);
     test_active_grouped_multirow_graph_modes(dev);
@@ -13076,7 +13549,7 @@ int main(int argc, char ** argv) {
     cudaStream_t copy_stream = nullptr;
     CUDA_OK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
 
-    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS, false, 0, 0);
+    auto * cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, N_SLOTS);
     CHECK(cache != nullptr);
 
     std::mt19937 rng(SEED);
@@ -13086,7 +13559,7 @@ int main(int argc, char ** argv) {
         int eid = sample_zipf(rng, N_EXPERTS, ZIPF_S);
         const void * src = host_experts + (size_t)eid * N_FLOATS;
 
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false, false);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         trace.push_back(eid);
     }
@@ -13119,7 +13592,7 @@ int main(int argc, char ** argv) {
     int verified = 0;
     for (int eid = 0; eid < N_EXPERTS; ++eid) {
         const float * src = host_experts + (size_t)eid * N_FLOATS;
-        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false, false);
+        int slot = ggml_cuda_moe_cache_acquire(cache, src, SLOT_BYTES, copy_stream, false, false, false);
         CHECK(slot >= 0 && slot < N_SLOTS);
         CUDA_OK(cudaStreamSynchronize(copy_stream));
 
@@ -13140,18 +13613,18 @@ int main(int argc, char ** argv) {
 
     ggml_cuda_moe_cache_free(cache);
 
-    auto * batch_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 4, false, 0, 0);
+    auto * batch_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 4);
     CHECK(batch_cache != nullptr);
     int batch_slots[4];
     for (int eid = 0; eid < 4; ++eid) {
         batch_slots[eid] = ggml_cuda_moe_cache_acquire(
             batch_cache, host_experts + (size_t) eid * N_FLOATS,
-            SLOT_BYTES, copy_stream, false, true, false, true);
+            SLOT_BYTES, copy_stream, true, false, true);
         CHECK(batch_slots[eid] >= 0);
     }
     CHECK(ggml_cuda_moe_cache_acquire(
         batch_cache, host_experts + 4 * N_FLOATS,
-        SLOT_BYTES, copy_stream, false, true, false, false) < 0);
+        SLOT_BYTES, copy_stream, true, false, false) < 0);
     CHECK(!ggml_cuda_moe_cache_grow_pool(batch_cache, 2 * SLOT_BYTES));
     CUDA_OK(cudaStreamSynchronize(copy_stream));
     for (int eid = 0; eid < 4; ++eid) {
@@ -13165,7 +13638,7 @@ int main(int argc, char ** argv) {
     CHECK(ggml_cuda_moe_cache_grow_pool(batch_cache, 2 * SLOT_BYTES));
     ggml_cuda_moe_cache_free(batch_cache);
 
-    auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2, false, 0, 0);
+    auto * staging_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2);
     CHECK(staging_cache != nullptr);
     cudaStream_t staging_copy_stream = ggml_cuda_moe_cache_copy_stream(staging_cache);
     CHECK(staging_copy_stream != nullptr);
@@ -13173,9 +13646,9 @@ int main(int argc, char ** argv) {
     const void * resident_src_0 = host_experts;
     const void * resident_src_1 = host_experts + N_FLOATS;
     CHECK(ggml_cuda_moe_cache_acquire(
-        staging_cache, resident_src_0, SLOT_BYTES, staging_copy_stream, false, false, false, false) == 0);
+        staging_cache, resident_src_0, SLOT_BYTES, staging_copy_stream, false, false, false) == 0);
     CHECK(ggml_cuda_moe_cache_acquire(
-        staging_cache, resident_src_1, SLOT_BYTES, staging_copy_stream, false, false, false, false) == 1);
+        staging_cache, resident_src_1, SLOT_BYTES, staging_copy_stream, false, false, false) == 1);
     CUDA_OK(cudaStreamSynchronize(staging_copy_stream));
 
     cudaStream_t compute_stream = nullptr;
@@ -13203,7 +13676,7 @@ int main(int argc, char ** argv) {
         }
 
         CHECK(ggml_cuda_moe_cache_copy_to_staging(
-            staging_cache, staging_srcs, 4, SLOT_BYTES, staging_dst, compute_stream));
+            staging_cache, staging_srcs, 4, SLOT_BYTES, staging_dst, compute_stream, false));
         cudaError_t staging_copy_status = cudaErrorNotReady;
         for (int attempt = 0; attempt < 100 && staging_copy_status == cudaErrorNotReady; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -13224,7 +13697,7 @@ int main(int argc, char ** argv) {
     }
 
     CHECK(!ggml_cuda_moe_cache_copy_to_staging(
-        staging_cache, staging_srcs, 4, SLOT_BYTES + 1, staging_dst, compute_stream));
+        staging_cache, staging_srcs, 4, SLOT_BYTES + 1, staging_dst, compute_stream, false));
     CHECK(cudaStreamQuery(staging_copy_stream) == cudaSuccess);
     CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
 
@@ -13232,7 +13705,7 @@ int main(int argc, char ** argv) {
     CUDA_OK(cudaStreamDestroy(compute_stream));
     ggml_cuda_moe_cache_free(staging_cache);
 
-    auto * split_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2, false, 0, 0);
+    auto * split_cache = ggml_cuda_moe_cache_init(dev, SLOT_BYTES, 2);
     CHECK(split_cache != nullptr);
     cudaStream_t split_copy_stream = ggml_cuda_moe_cache_copy_stream(split_cache);
     CHECK(split_copy_stream != nullptr);
@@ -13241,7 +13714,7 @@ int main(int argc, char ** argv) {
     std::vector<float> split_readback(6 * N_FLOATS);
 
     constexpr size_t SMALL_STRIDE = SOURCE_PADDING / 2;
-    auto * padding_decline_cache = ggml_cuda_moe_cache_init(dev, SMALL_STRIDE, 2, false, 0, 0);
+    auto * padding_decline_cache = ggml_cuda_moe_cache_init(dev, SMALL_STRIDE, 2);
     CHECK(padding_decline_cache != nullptr);
     const void * padding_decline_srcs[] = {
         (const char *) host_experts + 48 * SMALL_STRIDE,
@@ -13255,7 +13728,7 @@ int main(int argc, char ** argv) {
     CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
         padding_decline_cache, padding_decline_srcs, 4, SMALL_STRIDE, SOURCE_PADDING, 1,
         padding_decline_slots, nullptr, &padding_decline_resident, staging_dst, nullptr, 0,
-        &padding_decline_wait_classes, compute_stream));
+        &padding_decline_wait_classes, compute_stream, false));
     CHECK(std::all_of(std::begin(padding_decline_slots), std::end(padding_decline_slots), [](int slot) { return slot == -7; }));
     CHECK(padding_decline_resident == -7 && padding_decline_wait_classes == -7);
     uint64_t padding_decline_hits = 0;
@@ -13293,7 +13766,7 @@ int main(int argc, char ** argv) {
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
             split_cache, split_srcs, 4, SLOT_BYTES, SOURCE_PADDING, 1, slot_ids, nullptr,
-            &n_resident, staging_dst, nullptr, 0, &n_wait_classes, compute_stream));
+            &n_resident, staging_dst, nullptr, 0, &n_wait_classes, compute_stream, false));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 1);
         CHECK(slot_ids[0] >= 0 && slot_ids[1] >= 0);
@@ -13343,7 +13816,7 @@ int main(int argc, char ** argv) {
         int n_wait_classes = 0;
         CHECK(ggml_cuda_moe_cache_prepare_split_staging(
             split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, SOURCE_PADDING, 1, slot_ids, wait_classes,
-            &n_resident, staging_dst, stage_ready, 3, &n_wait_classes, compute_stream));
+            &n_resident, staging_dst, stage_ready, 3, &n_wait_classes, compute_stream, false));
         CHECK(n_resident == 2);
         CHECK(n_wait_classes == 4);
         CHECK(wait_classes[0] == 1 && wait_classes[1] == 1);
@@ -13388,7 +13861,7 @@ int main(int argc, char ** argv) {
         CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
             split_cache, split_srcs, N_SPLIT_SRCS, SLOT_BYTES, 0, 1, invalid_slots, invalid_wait_classes,
             &invalid_n_resident, staging_dst, (uint32_t *)staging_dst, 1,
-            &invalid_n_wait_classes, compute_stream));
+            &invalid_n_wait_classes, compute_stream, false));
         CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
         CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
     }
@@ -13400,7 +13873,7 @@ int main(int argc, char ** argv) {
     CHECK(!ggml_cuda_moe_cache_prepare_split_staging(
         split_cache, non_overflow_srcs, 2, SLOT_BYTES, 0, 1, non_overflow_slots,
         nullptr, &non_overflow_resident, staging_dst, nullptr, 0,
-        &non_overflow_wait_classes, compute_stream));
+        &non_overflow_wait_classes, compute_stream, false));
     CHECK(cudaStreamQuery(split_copy_stream) == cudaSuccess);
     CHECK(cudaStreamQuery(compute_stream) == cudaSuccess);
 

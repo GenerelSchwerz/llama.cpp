@@ -817,12 +817,12 @@ public:
             const ggml_tensor * tensor,
             const ggml_cuda_moe_legacy_acquisition * expected = nullptr,
             const ggml_cuda_moe_group_call_lease * authority = nullptr,
-            ggml_cuda_moe_stream_t compute_stream = nullptr);
+            ggml_cuda_moe_stream_t compute_stream = nullptr,
+            uint32_t top_k = 1);
     void prefetch_legacy_siblings(
             const ggml_cuda_moe_legacy_cache_lease & source,
             const int32_t * expert_ids,
             int n_expert_ids,
-            bool use_l2,
             bool is_decode);
     void record_legacy_op(
             bool is_decode,
@@ -925,7 +925,6 @@ public:
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
     void configure_early_router(const ggml_cgraph * graph, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream, bool capture, ggml_backend_cuda_context & parent);
     void launch_early_router(const ggml_tensor * node, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
-    void finish_early_router_banks(const ggml_tensor * node, ggml_cuda_moe_stream_t stream);
     bool prefill_add_id_source(
             const ggml_cuda_moe_graph_execution & execution,
             const ggml_tensor * node,
@@ -955,7 +954,9 @@ private:
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
     bool admission_closed_for_test() const;
-    bool early_copy_for_test(bool capture);
+    bool attach_prepack_for_test(const ggml_cuda_moe_candidate_group_key & key, ggml_cuda_moe_stream_t stream);
+    bool prepack_for_test();
+    uint64_t host_copy_jobs_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool early_hc_for_test();
     bool early_select_for_test();
     bool early_graph_for_test();
@@ -1068,10 +1069,7 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
 struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_init(
     int    device,
     size_t slot_size_bytes,
-    int    n_slots,
-    bool   source_is_mmap,
-    size_t l2_budget_bytes,
-    int    l2_target_slots);
+    int    n_slots);
 
 void ggml_cuda_moe_cache_free(struct ggml_cuda_moe_cache * cache);
 
@@ -1090,7 +1088,6 @@ int ggml_cuda_moe_cache_acquire(
     const void * host_src,
     size_t       byte_count,
     ggml_cuda_moe_stream_t copy_stream,
-    bool         use_l2,
     bool         is_decode,
     bool         is_prefetch,
     bool         pin);
@@ -1108,7 +1105,8 @@ bool ggml_cuda_moe_cache_copy_to_staging(
     int                  n_host_srcs,
     size_t               byte_count,
     void *               dst,
-    ggml_cuda_moe_stream_t compute_stream);
+    ggml_cuda_moe_stream_t compute_stream,
+    bool                  is_decode);
 
 bool ggml_cuda_moe_cache_prepare_split_staging(
     struct ggml_cuda_moe_cache * cache,
@@ -1124,10 +1122,39 @@ bool ggml_cuda_moe_cache_prepare_split_staging(
     uint32_t *           stage_ready,
     int                  stage_ready_capacity,
     int *                out_n_wait_classes,
-    ggml_cuda_moe_stream_t compute_stream);
+    ggml_cuda_moe_stream_t compute_stream,
+    bool                  is_decode);
 
 size_t ggml_cuda_moe_cache_trailing_padding_bytes_for_test(const struct ggml_cuda_moe_cache * cache);
 bool ggml_cuda_moe_cache_trailing_padding_zero_for_test(struct ggml_cuda_moe_cache * cache);
+
+enum ggml_cuda_moe_staging_failure_for_test {
+    GGML_CUDA_MOE_STAGING_FAIL_NONE,
+    GGML_CUDA_MOE_STAGING_FAIL_GROWTH,
+    GGML_CUDA_MOE_STAGING_FAIL_EVENT_CREATE,
+    GGML_CUDA_MOE_STAGING_FAIL_WAIT,
+    GGML_CUDA_MOE_STAGING_FAIL_SUBMIT,
+    GGML_CUDA_MOE_STAGING_FAIL_RECORD,
+};
+
+struct ggml_cuda_moe_staging_state_for_test {
+    uint32_t tiles;
+    uint32_t pending;
+    bool failed;
+    uint64_t pipeline_tiles;
+    uint64_t tile_wait_calls;
+    uint64_t pre_sync_calls;
+    uint64_t post_sync_calls;
+    uint64_t upload_errors;
+    size_t host_limit;
+    size_t host_source_bytes;
+    size_t host_staging_bytes;
+    size_t host_optional_bytes;
+};
+
+bool ggml_cuda_moe_cache_set_source_for_test(struct ggml_cuda_moe_cache * cache, const struct ggml_tensor * tensor);
+void ggml_cuda_moe_cache_fail_staging_for_test(struct ggml_cuda_moe_cache * cache, enum ggml_cuda_moe_staging_failure_for_test failure);
+struct ggml_cuda_moe_staging_state_for_test ggml_cuda_moe_cache_staging_state_for_test(struct ggml_cuda_moe_cache * cache, bool is_decode);
 
 bool ggml_cuda_moe_cache_can_overlap_staging(
     const struct ggml_cuda_moe_cache * cache);

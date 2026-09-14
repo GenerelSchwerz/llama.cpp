@@ -2868,15 +2868,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
-        {"--moe-expert-cache-l2-pinned-mb"}, "N",
-        "MoE expert cache: total mmap-only pinned host L2 cache budget in MiB. 0 disables (default).",
+        {"--moe-expert-cache-host-pinned-mb"}, "N",
+        "MoE expert cache: model-wide pinned host budget in MiB, including source weights and staging. 0 keeps full pinning (default).",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
-            params.moe_expert_cache_l2_pinned_size = (size_t) value * 1024 * 1024;
+            if ((uint64_t) value > SIZE_MAX / (1024 * 1024)) {
+                throw std::invalid_argument("pinned host budget is too large");
+            }
+            params.moe_expert_cache_host_pinned_size = (size_t) value * 1024 * 1024;
         }
-    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_L2_PINNED_MB"));
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_HOST_PINNED_MB"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

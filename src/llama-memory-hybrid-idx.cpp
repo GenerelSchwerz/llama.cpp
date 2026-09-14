@@ -137,6 +137,13 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_full() {
     return std::make_unique<llama_memory_hybrid_idx_context>(this);
 }
 
+llama_memory_context_ptr llama_memory_hybrid_idx::init_reserve(uint32_t n_kv) {
+    return std::make_unique<llama_memory_hybrid_idx_context>(
+            this,
+            get_mem_attn()->init_reserve(n_kv),
+            mem_idx == nullptr ? nullptr : mem_idx->init_reserve(n_kv));
+}
+
 llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lctx, bool optimize) {
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
@@ -617,6 +624,16 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
         new llama_kv_cache_context(mem->get_mem_idx())) {}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
+        llama_memory_hybrid_idx * mem,
+      llama_memory_context_ptr   ctx_attn,
+      llama_memory_context_ptr   ctx_idx) :
+    llama_memory_hybrid_context(mem, std::move(ctx_attn)),
+    mem(mem),
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(std::move(ctx_idx)) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,

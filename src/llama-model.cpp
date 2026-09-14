@@ -1162,6 +1162,7 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+    std::vector<llama_moe_source_group> moe_sources;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1764,7 +1765,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 if (first >= last) {
                     continue;
                 }
-                ggml_backend_buffer_t buf = buffer_from_host_ptr_fn((char *) addr + first, last - first);
+                ggml_backend_buffer_t buf = buffer_from_host_ptr_fn(buft, (char *) addr + first, last - first);
                 if (buf == nullptr) {
                     throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                 }
@@ -1868,6 +1869,56 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
+        }
+    }
+
+    build_moe_sources();
+    if (params.moe_expert_cache_host_pinned_size > 0) {
+        std::vector<ggml_backend_moe_candidate_group_v2> groups;
+        std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
+        std::unordered_set<ggml_backend_buffer_type_t> owners;
+        std::unordered_set<const ggml_tensor *> seen;
+        for (const auto & group : moe_sources()) {
+            const uint32_t index = groups.size();
+            groups.push_back({group.layout, group.domain, group.route_present ? 0u : uint32_t(GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE), 0});
+            for (const auto & bank : group.banks) {
+                tensors.push_back({bank.tensor, index, bank.role, bank.status, 0, 0});
+                seen.insert(bank.tensor);
+            }
+        }
+        for (const auto & named : tensors_by_name) {
+            auto * tensor = named.second;
+            if (tensor->buffer == nullptr) {
+                continue;
+            }
+            auto buft = ggml_backend_buffer_get_type(tensor->buffer);
+            auto dev = ggml_backend_buft_get_device(buft);
+            auto reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto is_cached = reg != nullptr ? (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
+            if (is_cached != nullptr && is_cached(buft)) {
+                owners.insert(buft);
+                if (seen.insert(tensor).second) {
+                    tensors.push_back({tensor, UINT32_MAX, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_INVALID, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_UNCLASSIFIED, 0, 0});
+                }
+            }
+        }
+        ggml_backend_moe_candidate_snapshot_v2 sources = {};
+        sources.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
+        sources.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
+        sources.struct_size = sizeof(sources);
+        sources.n_slots = params.moe_expert_cache_slots;
+        sources.groups = groups.data();
+        sources.n_groups = groups.size();
+        sources.tensors = tensors.data();
+        sources.n_tensors = tensors.size();
+        for (auto buft : owners) {
+            auto reg = ggml_backend_dev_backend_reg(ggml_backend_buft_get_device(buft));
+            auto configure = (ggml_backend_moe_cache_configure_sources_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME);
+            if (configure == nullptr || !configure(buft, &sources)) {
+                throw std::runtime_error("unable to reserve the bounded MoE host source budget");
+            }
         }
     }
 
@@ -2255,6 +2306,67 @@ bool llama_model::has_tensor_overrides() const {
 
 int32_t llama_model::moe_expert_cache_slots() const {
     return params.moe_expert_cache_slots;
+}
+
+void llama_model::build_moe_sources() {
+    std::vector<llama_moe_source_group> result;
+    result.reserve(layers.size() * 2);
+    auto append = [&](uint32_t domain, bool route_present, ggml_tensor * gate, ggml_tensor * up, ggml_tensor * gate_up, ggml_tensor * down) -> llama_moe_source_group * {
+        if (!gate && !up && !gate_up && !down) {
+            return nullptr;
+        }
+        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
+        if (gate && up && !gate_up && down) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE;
+        } else if (!gate && !up && gate_up && down) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP;
+        } else if (!gate && up && !gate_up && down) {
+            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED;
+        }
+        result.push_back({layout, domain, route_present, {}});
+        auto & banks = result.back().banks;
+        ggml_tensor * weights[] = {gate, up, gate_up, down};
+        const uint32_t roles[] = {
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT,
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT,
+            GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
+        };
+        for (uint32_t i = 0; i < 4; ++i) {
+            if (weights[i]) {
+                banks.push_back({weights[i], roles[i], GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE});
+            }
+        }
+        return &result.back();
+    };
+    for (const auto & layer : layers) {
+        auto * group = append(GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, layer.ffn_gate_inp != nullptr,
+            layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps);
+        if (group) {
+            auto add = [&](ggml_tensor * tensor, uint32_t role, uint32_t status) {
+                if (tensor) {
+                    group->banks.push_back({tensor, role, status});
+                }
+            };
+            add(layer.ffn_gate_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+            add(layer.ffn_up_exps_s, layer.ffn_gate_up_exps ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+            add(layer.ffn_down_exps_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
+            add(layer.ffn_gate_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+            add(layer.ffn_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+            add(layer.ffn_gate_up_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+            add(layer.ffn_down_exps_b, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
+            add(layer.ffn_gate_exps_in_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+            add(layer.ffn_up_exps_in_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+            add(layer.ffn_down_exps_in_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+        }
+        append(GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, true,
+            layer.ffn_gate_chexps, layer.ffn_up_chexps, nullptr, layer.ffn_down_chexps);
+    }
+    pimpl->moe_sources = std::move(result);
+}
+
+const std::vector<llama_moe_source_group> & llama_model::moe_sources() const {
+    return pimpl->moe_sources;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
@@ -2834,6 +2946,7 @@ llama_model_params llama_model_default_params() {
         /*.tensor_buft_overrides       =*/ nullptr,
         /*.n_gpu_layers                =*/ -1,
         /*.moe_expert_cache_slots      =*/ 0,
+        /*.moe_expert_cache_host_pinned_size =*/ 0,
         /*.split_mode                  =*/ LLAMA_SPLIT_MODE_LAYER,
         /*.load_mode                   =*/ LLAMA_LOAD_MODE_AUTO,
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,

@@ -18,6 +18,19 @@ struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
 
+struct llama_moe_source_bank {
+    ggml_tensor * tensor;
+    uint32_t role;
+    uint32_t status;
+};
+
+struct llama_moe_source_group {
+    uint32_t layout;
+    uint32_t domain;
+    bool route_present;
+    std::vector<llama_moe_source_bank> banks;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -752,6 +765,8 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
     int32_t moe_expert_cache_slots() const;
+    void build_moe_sources();
+    const std::vector<llama_moe_source_group> & moe_sources() const;
 
     void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
     void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;

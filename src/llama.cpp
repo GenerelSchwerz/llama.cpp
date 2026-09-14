@@ -325,10 +325,23 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // for the duration of this function, which outlives the loader's use
         // of the pointer.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
+        struct moe_buffer_type_owner {
+            ggml_backend_buffer_type_t type = nullptr;
+            ggml_backend_moe_cache_free_buffer_type_t release = nullptr;
+            ~moe_buffer_type_owner() {
+                if (type != nullptr) {
+                    release(type);
+                }
+            }
+        } moe_buffer_type;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
+        if (params.moe_expert_cache_host_pinned_size > 0 && params.moe_expert_cache_slots <= 0) {
+            throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires --moe-expert-cache-size");
+        }
         if (params.moe_expert_cache_slots > 0) {
             ggml_backend_moe_cache_set_slots_t set_slots_fn = nullptr;
             ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
+            ggml_backend_reg_t cache_reg = nullptr;
             for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
                 ggml_backend_reg_t reg = ggml_backend_reg_get(i);
                 auto candidate_set_slots_fn = (ggml_backend_moe_cache_set_slots_t) ggml_backend_reg_get_proc_address(
@@ -338,6 +351,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 if (candidate_set_slots_fn != nullptr && candidate_buffer_type_fn != nullptr) {
                     set_slots_fn = candidate_set_slots_fn;
                     buffer_type_fn = candidate_buffer_type_fn;
+                    cache_reg = reg;
                     break;
                 }
             }
@@ -345,11 +359,23 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
             set_slots_fn(params.moe_expert_cache_slots);
+            ggml_backend_buffer_type_t buft = buffer_type_fn();
+            if (params.moe_expert_cache_host_pinned_size > 0) {
+                auto create = (ggml_backend_moe_cache_bounded_buffer_type_t) ggml_backend_reg_get_proc_address(
+                    cache_reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME);
+                moe_buffer_type.release = (ggml_backend_moe_cache_free_buffer_type_t) ggml_backend_reg_get_proc_address(
+                    cache_reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME);
+                if (create == nullptr || moe_buffer_type.release == nullptr ||
+                        (moe_buffer_type.type = create(params.moe_expert_cache_host_pinned_size)) == nullptr) {
+                    throw std::runtime_error("backend cannot create the bounded MoE host source buffer");
+                }
+                buft = moe_buffer_type.type;
+            }
             // Pattern matches the same expert tensors that --cpu-moe / --n-cpu-moe target.
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, buffer_type_fn()});
+            effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
 
             bool had_user_overrides = false;
             if (params.tensor_buft_overrides) {

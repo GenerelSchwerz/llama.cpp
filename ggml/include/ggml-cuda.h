@@ -41,8 +41,11 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 // count is configured via llama_model_params::moe_expert_cache_slots.
 // See ggml/src/ggml-cuda/moe-cache.cu and DESIGN.md.
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes);
+GGML_BACKEND_API void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t buft);
+GGML_BACKEND_API bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 GGML_BACKEND_API bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
-GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(void * ptr, size_t size);
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
 // Compatibility shims. Cache resources are owned by CUDA backend contexts;
 // these process-wide entry points do not allocate or free resources.
 GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
@@ -50,8 +53,6 @@ GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 // Legacy route publication hint. Model-owned cache resources use backend candidate snapshots and do not read this process-wide value.
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_cache_slots(int n_slots);
 GGML_BACKEND_API int  ggml_backend_cuda_moe_get_cache_slots(void);
-GGML_BACKEND_API void ggml_backend_cuda_moe_set_l2_pinned_cache_size(size_t bytes);
-GGML_BACKEND_API size_t ggml_backend_cuda_moe_get_l2_pinned_cache_size(void);
 GGML_BACKEND_API void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 GGML_BACKEND_API bool ggml_backend_cuda_moe_get_debug_mm(void);
 
@@ -70,7 +71,6 @@ GGML_BACKEND_API void ggml_backend_cuda_moe_prefetch_experts(
     const char *  tensor_name,
     const int32_t * eids,
     int           n_eids,
-    bool          use_l2,
     bool          is_decode);
 
 // Print cache hit/miss/eviction counters per device and reset them. Call at

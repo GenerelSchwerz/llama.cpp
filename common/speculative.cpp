@@ -2909,6 +2909,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (params_spec.n_moe_expert_cache_slots >= 0) {
             result.n_moe_expert_cache_slots = params_spec.n_moe_expert_cache_slots;
         }
+        if (result.n_moe_expert_cache_slots == 0) {
+            result.moe_expert_cache_host_pinned_size = 0;
+        }
 
         // a draft pinned to a single device doesn't need the meta wrapper an inherited -sm tensor would give it
         // (the device list is null-terminated, so a single device means size 2)

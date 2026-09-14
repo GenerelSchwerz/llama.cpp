@@ -53,6 +53,8 @@ llama_memory_placement_options placement,
 
     llama_memory_context_ptr init_full() override;
 
+    llama_memory_context_ptr init_reserve(uint32_t n_kv) override;
+
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
     bool can_decode_sampled() const override { return false; }
@@ -111,6 +113,11 @@ public:
 
     // used to create a full-cache context
     explicit llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem);
+
+    llama_memory_hybrid_idx_context(
+            llama_memory_hybrid_idx * mem,
+          llama_memory_context_ptr   ctx_attn,
+          llama_memory_context_ptr   ctx_idx);
 
     // used to create an update context
     llama_memory_hybrid_idx_context(

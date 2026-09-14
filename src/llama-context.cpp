@@ -536,25 +536,6 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
         return is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
     };
 
-    struct group_source {
-        uint32_t domain;
-        bool route_present;
-        ggml_tensor * gate;
-        ggml_tensor * up;
-        ggml_tensor * gate_up;
-        ggml_tensor * down;
-        ggml_tensor * gate_scale;
-        ggml_tensor * up_scale;
-        ggml_tensor * down_scale;
-        ggml_tensor * gate_bias;
-        ggml_tensor * up_bias;
-        ggml_tensor * gate_up_bias;
-        ggml_tensor * down_bias;
-        ggml_tensor * gate_input_scale;
-        ggml_tensor * up_input_scale;
-        ggml_tensor * down_input_scale;
-    };
-
     std::unordered_set<const ggml_tensor *> seen;
     groups.reserve(std::min<size_t>(model.layers.size() * 2, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS));
     tensors.reserve(std::min<size_t>(model.layers.size() * 12, GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2));
@@ -568,30 +549,18 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
         }
     };
 
-    auto append_group = [&](const group_source & source) {
-        if (source.gate == nullptr && source.up == nullptr && source.gate_up == nullptr && source.down == nullptr) {
-            return;
-        }
+    auto append_group = [&](const llama_moe_source_group & source) {
         if (groups.size() == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS) {
             snapshot.flags |= GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_FLAG_INCOMPLETE;
             return;
         }
 
-        uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID;
-        if (source.gate != nullptr && source.up != nullptr && source.gate_up == nullptr && source.down != nullptr) {
-            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE;
-        } else if (source.gate == nullptr && source.up == nullptr && source.gate_up != nullptr && source.down != nullptr) {
-            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP;
-        } else if (source.gate == nullptr && source.up != nullptr && source.gate_up == nullptr && source.down != nullptr) {
-            layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED;
-        }
-
         const uint32_t group_index = groups.size();
         uint32_t group_flags = 0;
-        if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID || !source.route_present) {
+        if (source.layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_INVALID || !source.route_present) {
             group_flags |= GGML_BACKEND_MOE_CANDIDATE_GROUP_V2_FLAG_INCOMPLETE;
         }
-        groups.push_back({layout, source.domain, group_flags, 0});
+        groups.push_back({source.layout, source.domain, group_flags, 0});
 
         auto append_tensor = [&](ggml_tensor * tensor, uint32_t role, uint32_t status) {
             if (tensor == nullptr) {
@@ -625,39 +594,13 @@ llama_moe_candidate_snapshot::llama_moe_candidate_snapshot(
             tensors.push_back({tensor, group_index, role, status, flags, 0});
         };
 
-        append_tensor(source.gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
-        append_tensor(source.up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
-        append_tensor(source.gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
-        append_tensor(source.down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE);
-        append_tensor(source.gate_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
-        append_tensor(source.up_scale,
-            source.gate_up != nullptr ? GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_SCALE : GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_SCALE,
-            GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
-        append_tensor(source.down_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE);
-        append_tensor(source.gate_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
-        append_tensor(source.up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
-        append_tensor(source.gate_up_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
-        append_tensor(source.down_bias, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS);
-        append_tensor(source.gate_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
-        append_tensor(source.up_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
-        append_tensor(source.down_input_scale, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
+        for (const auto & bank : source.banks) {
+            append_tensor(bank.tensor, bank.role, bank.status);
+        }
     };
 
-    for (const auto & layer : model.layers) {
-        append_group({
-            GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY,
-            layer.ffn_gate_inp != nullptr,
-            layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps,
-            layer.ffn_gate_exps_s, layer.ffn_up_exps_s, layer.ffn_down_exps_s,
-            layer.ffn_gate_exps_b, layer.ffn_up_exps_b, layer.ffn_gate_up_exps_b, layer.ffn_down_exps_b,
-            layer.ffn_gate_exps_in_s, layer.ffn_up_exps_in_s, layer.ffn_down_exps_in_s,
-        });
-        append_group({
-            GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK,
-            true,
-            layer.ffn_gate_chexps, layer.ffn_up_chexps, nullptr, layer.ffn_down_chexps,
-            nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-        });
+    for (const auto & source : model.moe_sources()) {
+        append_group(source);
     }
 
     auto append_excluded = [&](ggml_tensor * tensor, uint32_t status) {
