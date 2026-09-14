@@ -2165,6 +2165,26 @@ static size_t ggml_backend_sched_transport_slot_alloc(size_t need, size_t limit,
     return std::max(size, need);
 }
 
+// Free memory of the device a ring lands on, 0 when unknown.
+// A meta buffer allocates the whole ring on every simple device, so the device with the least free memory decides; the meta device reports the sum.
+static size_t ggml_backend_sched_transport_dev_free(ggml_backend_t backend) {
+    size_t dev_free = 0, dev_total = 0;
+    if (ggml_backend_is_meta(backend)) {
+        for (size_t j = 0; j < ggml_backend_meta_n_backends(backend); j++) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j));
+            size_t simple_free = 0, simple_total = 0;
+            ggml_backend_dev_memory(dev, &simple_free, &simple_total);
+            dev_free = j == 0 ? simple_free : std::min(dev_free, simple_free);
+        }
+        return dev_free;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev != NULL) {
+        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    }
+    return dev_free;
+}
+
 // Created on demand, so a backend that never gets to stage anything does not carry a second device context for nothing.
 static bool ggml_backend_sched_transport_ensure_backend(ggml_backend_sched_t sched, int backend_id) {
     struct ggml_backend_sched_transport * tr = &sched->transport;
@@ -2179,7 +2199,8 @@ static bool ggml_backend_sched_transport_ensure_backend(ggml_backend_sched_t sch
         return false;
     }
 
-    ggml_backend_t transfer = ggml_backend_dev_init(dev, NULL);
+    // a transfer backend never computes, so a meta one goes without the communicator a second set of streams would otherwise start
+    ggml_backend_t transfer = ggml_backend_is_meta(sched->backends[backend_id]) ? ggml_backend_meta_init_transfer(dev) : ggml_backend_dev_init(dev, NULL);
     if (transfer == NULL) {
         return false;
     }
@@ -2484,11 +2505,7 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             ggml_backend_buffer_type_t buft = sched->bufts[bid];
 
             // the graph allocator reserved before this, so leave it the room its buffers may still grow into
-            ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[bid]);
-            size_t dev_free = 0, dev_total = 0;
-            if (dev != NULL) {
-                ggml_backend_dev_memory(dev, &dev_free, &dev_total);
-            }
+            const size_t dev_free = ggml_backend_sched_transport_dev_free(sched->backends[bid]);
             if (dev_free > 0 && (dev_free <= GGML_SCHED_TRANSPORT_HEADROOM || ring_size > dev_free - GGML_SCHED_TRANSPORT_HEADROOM)) {
                 if (!r->reported_no_room) {
                     GGML_LOG_WARN("%s: transport ring on %s would need %zu MiB and leave less than "
@@ -2949,8 +2966,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
                     struct ggml_backend_sched_ranges rg;
                     ggml_backend_sched_input_ranges(input, input_cpy, &rg);
-                    // a meta backend writes a whole contiguous tensor, it cannot take one range per stream
-                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf) && !ggml_backend_is_meta(split_backend);
+                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf);
 
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -3227,6 +3243,23 @@ static void ggml_backend_sched_transport_teardown(ggml_backend_sched_t sched) {
 }
 
 
+static bool ggml_backend_sched_transport_backend_supported(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == NULL) {
+        return false;
+    }
+
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == NULL || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
+        return false;
+    }
+
+    return backend->iface.set_tensor_async != NULL &&
+           backend->iface.event_record     != NULL &&
+           backend->iface.event_wait       != NULL &&
+           dev->iface.event_new            != NULL;
+}
+
 bool ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched, int depth) {
     GGML_ASSERT(sched);
 
@@ -3272,22 +3305,22 @@ bool ggml_backend_sched_set_transport_pipeline_depth(ggml_backend_sched_t sched,
             continue;
         }
         const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
-        if (type == GGML_BACKEND_DEVICE_TYPE_META || type == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        if (type == GGML_BACKEND_DEVICE_TYPE_CPU) {
             continue;
         }
 
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-        if (reg == NULL || strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) {
-            continue;
+        // a meta backend delivers through its simple backends, so each of them must qualify on its own
+        bool can_transport = true;
+        if (ggml_backend_is_meta(backend)) {
+            for (size_t j = 0; j < ggml_backend_meta_n_backends(backend) && can_transport; j++) {
+                can_transport = ggml_backend_sched_transport_backend_supported(ggml_backend_meta_simple_backend(backend, j));
+            }
+        } else if (type == GGML_BACKEND_DEVICE_TYPE_META) {
+            can_transport = false;
+        } else {
+            can_transport = ggml_backend_sched_transport_backend_supported(backend);
         }
-
-        if (backend->iface.set_tensor_async == NULL ||
-            backend->iface.event_record     == NULL ||
-            backend->iface.event_wait       == NULL) {
-            continue;
-        }
-
-        if (dev->iface.event_new == NULL) {
+        if (!can_transport) {
             continue;
         }
 

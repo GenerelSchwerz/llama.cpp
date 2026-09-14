@@ -402,8 +402,9 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 // with offload_kqv=false the cache lives in host memory
 // n_seq_max > 1 gives the cache one stream per sequence
 struct kv_config {
-    bool     offload_kqv = true;
-    uint32_t n_seq_max   = 1;
+    bool     offload_kqv       = true;
+    uint32_t n_seq_max         = 1;
+    uint32_t kv_pipeline_depth = 0;
 };
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
@@ -423,6 +424,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_threads_batch = 4;
     ctx_params.offload_kqv = kvc.offload_kqv;
     ctx_params.n_seq_max   = kvc.n_seq_max;
+    ctx_params.kv_pipeline_depth = kvc.kv_pipeline_depth;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -1458,6 +1460,11 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         kv_config kvc_host_streams = kvc_host;
         kvc_host_streams.n_seq_max = 2;
         dev_configs.emplace_back(devices_meta, "Meta -nkvo -np 2", LLAMA_SPLIT_MODE_TENSOR, kvc_host_streams);
+
+        // the same copy, delivered ahead of the split that reads it
+        kv_config kvc_host_pipelined = kvc_host_streams;
+        kvc_host_pipelined.kv_pipeline_depth = 1;
+        dev_configs.emplace_back(devices_meta, "Meta -nkvo -np 2 -kvpd 1", LLAMA_SPLIT_MODE_TENSOR, kvc_host_pipelined);
 
         for (const device_config & dc : dev_configs) {
             max_device_label_length = std::max(max_device_label_length, dc.label.length());
