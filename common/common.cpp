@@ -7,6 +7,7 @@
 #include "log.h"
 #include "llama.h"
 #include "../src/llama-ext.h"
+#include "../ggml/src/ggml-backend-moe.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"

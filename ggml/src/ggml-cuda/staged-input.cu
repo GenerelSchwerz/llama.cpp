@@ -5,15 +5,18 @@
 #include <cstring>
 #include <new>
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12000
+// Windows uses host inputs until the host-mapped memop path is validated.
+#if !defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 12000
+#include <cudaTypedefs.h>
+
 namespace {
 struct staged_input {
     void * host = nullptr;
     std::atomic<uint32_t> * flag = nullptr;
     CUdeviceptr device_flag = 0;
     size_t bytes = 0;
-    decltype(&cuStreamWaitValue32) wait = nullptr;
-    decltype(&cuStreamWriteValue32) write = nullptr;
+    PFN_cuStreamWaitValue32_v11070 wait = nullptr;
+    PFN_cuStreamWriteValue32_v11070 write = nullptr;
 
     ~staged_input() {
         if (host) { cudaFreeHost(host); }
@@ -35,9 +38,17 @@ static void * create(ggml_backend_t backend, size_t bytes) {
     if (!bytes || bytes > 1024*1024) { return nullptr; }
     // Resolve stream memops without adding a CUDA driver link dependency.
     auto input = std::make_unique<staged_input>();
-    cudaDriverEntryPointQueryResult query;
-    if (cudaGetDriverEntryPoint("cuStreamWaitValue32", reinterpret_cast<void **>(&input->wait), cudaEnableDefault, &query) != cudaSuccess || !input->wait ||
-        cudaGetDriverEntryPoint("cuStreamWriteValue32", reinterpret_cast<void **>(&input->write), cudaEnableDefault, &query) != cudaSuccess || !input->write) {
+    const auto resolve = [](const char * name, void ** function) {
+        cudaDriverEntryPointQueryResult query;
+#if CUDART_VERSION >= 12050
+        const auto error = cudaGetDriverEntryPointByVersion(name, function, 11070, cudaEnableDefault, &query);
+#else
+        const auto error = cudaGetDriverEntryPoint(name, function, cudaEnableDefault, &query);
+#endif
+        return error == cudaSuccess && query == cudaDriverEntryPointSuccess && *function != nullptr;
+    };
+    if (!resolve("cuStreamWaitValue32", reinterpret_cast<void **>(&input->wait)) ||
+        !resolve("cuStreamWriteValue32", reinterpret_cast<void **>(&input->write))) {
         cudaGetLastError();
         return nullptr;
     }
@@ -53,12 +64,16 @@ static void * create(ggml_backend_t backend, size_t bytes) {
     new (input->flag) std::atomic<uint32_t>(1);
     std::memset(input->host, 0, bytes);
 
-    // Probe capture and replay before the model graph can contain a wait.
+    // Probe eager execution and replay before the model graph can contain a wait.
     cudaStream_t stream = nullptr;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t exec = nullptr;
     void * dst = nullptr;
     bool ok = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess && cudaMalloc(&dst, bytes) == cudaSuccess;
+    if (ok) {
+        ok = enqueue(*input, stream, dst) && cudaStreamSynchronize(stream) == cudaSuccess &&
+            input->flag->load(std::memory_order_acquire) == 0;
+    }
     if (ok) {
         ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
         if (ok) {
@@ -68,7 +83,11 @@ static void * create(ggml_backend_t backend, size_t bytes) {
         }
     }
     if (ok) { ok = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess; }
-    if (ok) { ok = cudaGraphLaunch(exec, stream) == cudaSuccess && cudaStreamSynchronize(stream) == cudaSuccess; }
+    for (int replay = 0; ok && replay < 2; ++replay) {
+        input->flag->store(1, std::memory_order_release);
+        ok = cudaGraphLaunch(exec, stream) == cudaSuccess && cudaStreamSynchronize(stream) == cudaSuccess &&
+            input->flag->load(std::memory_order_acquire) == 0;
+    }
     if (exec) { cudaGraphExecDestroy(exec); }
     if (graph) { cudaGraphDestroy(graph); }
     if (dst) { cudaFree(dst); }

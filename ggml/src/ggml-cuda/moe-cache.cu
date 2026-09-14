@@ -1,26 +1,4 @@
-// MoE expert cache - week-1 implementation + buffer type registration.
-// See ../../../../DESIGN.md (project root) for the full design.
-//
-// This file owns:
-//   - struct ggml_cuda_moe_cache : the GPU slot pool + LRU bookkeeping
-//   - init / free / acquire / slot_ptr / stats : the cache C API
-//   - ggml_backend_cuda_moe_cached_buffer_type : a ggml buffer type that
-//     marks expert tensors (`ffn_*_exps`) as "live in CPU pinned memory and
-//     route GPU access through the cache". The implementation mirrors the
-//     existing CUDA host buffer type (same pinned-memory allocator) but
-//     uses a distinct name so the dispatch hook in ggml_cuda_mul_mat_id can
-//     distinguish them and divert to the cached path.
-//
-// Design choices for v1 (kept deliberately simple):
-//   * Single std::mutex around the cache metadata. Single-GPU only.
-//   * Linear scan for LRU eviction. n_slots is typically 16-256, so the
-//     O(n) scan per miss is in the hundreds of ns.
-//   * acquire() hands back a slot_id; the caller is responsible for
-//     synchronizing the compute stream against the copy stream before
-//     touching the slab. The cache does not own the compute stream.
-//   * The cache itself is created lazily on first cached-buffer access in
-//     mul_mat_id_cached (forthcoming). The buffer type only flags tensors;
-//     it does not allocate GPU slot pool memory.
+// MoE expert buffers, backend-owned GPU caches, and grouped execution.
 
 #include "moe-cache.cuh"
 #include "common.cuh"
@@ -1812,7 +1790,8 @@ static moe_candidate_execution_geometry moe_candidate_execution_geometry_for(
     result.required_grouped = result.certificate_valid &&
         certificate.flags == GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
     result.phase = moe_candidate_execution_phase_for(cgraph, node);
-    result.row_semantics = result.certificate_valid ? certificate.row_semantics : GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
+    result.row_semantics = result.certificate_valid ? certificate.row_semantics :
+        static_cast<uint32_t>(GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID);
 
     const ggml_tensor * activation = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[1] : nullptr;
     const ggml_tensor * ids = node != nullptr && node->op == GGML_OP_MUL_MAT_ID ? node->src[2] : nullptr;
@@ -12733,7 +12712,8 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         return nullptr;
     }
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
+// Use event staging on Windows; a failed host-mapped memop can poison the CUDA context.
+#if !defined(_WIN32) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(GGML_CUDA_NO_VMM) && CUDART_VERSION >= 12080
     bool can_use_stream_mem_ops = true;
 #if CUDA_VERSION < 13000
     CUdevice cu_device;
@@ -12745,21 +12725,49 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         stream_mem_ops_attribute != 0;
 #endif
     uint32_t * stream_mem_probe = nullptr;
-    if (can_use_stream_mem_ops && cudaMalloc(&stream_mem_probe, sizeof(*stream_mem_probe)) == cudaSuccess) {
-        if (cuStreamWriteValue32(
-                c->copy_stream, (CUdeviceptr) stream_mem_probe, 0, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS) {
-            err = cudaStreamSynchronize(c->copy_stream);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "moe-cache: stream memory operation probe failed: %s\n", cudaGetErrorString(err));
-                (void) cudaGetLastError();
-                (void) cudaFree(stream_mem_probe);
-                return nullptr;
-            }
-            c->stream_mem_ops_supported = true;
+    cudaStream_t probe_stream = nullptr;
+    cudaGraph_t probe_graph = nullptr;
+    cudaGraphExec_t probe_exec = nullptr;
+    bool probe_ok = can_use_stream_mem_ops &&
+        cudaStreamCreateWithFlags(&probe_stream, cudaStreamNonBlocking) == cudaSuccess &&
+        cudaMalloc(&stream_mem_probe, sizeof(*stream_mem_probe)) == cudaSuccess;
+    const auto probe_enqueue = [&] {
+        return cudaMemsetAsync(stream_mem_probe, 0, sizeof(*stream_mem_probe), probe_stream) == cudaSuccess &&
+            cuStreamWriteValue32(probe_stream, (CUdeviceptr) stream_mem_probe, 1, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS &&
+            cuStreamWaitValue32(probe_stream, (CUdeviceptr) stream_mem_probe, 1, CU_STREAM_WAIT_VALUE_EQ) == CUDA_SUCCESS &&
+            cuStreamWriteValue32(probe_stream, (CUdeviceptr) stream_mem_probe, 2, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
+    };
+    const auto probe_complete = [&] {
+        uint32_t value = 0;
+        return cudaStreamSynchronize(probe_stream) == cudaSuccess &&
+            cudaMemcpy(&value, stream_mem_probe, sizeof(value), cudaMemcpyDeviceToHost) == cudaSuccess && value == 2;
+    };
+    if (probe_ok) {
+        probe_ok = probe_enqueue() && probe_complete();
+    }
+    if (probe_ok) {
+        probe_ok = cudaStreamBeginCapture(probe_stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+        if (probe_ok) {
+            probe_ok = probe_enqueue();
+            const cudaError_t end = cudaStreamEndCapture(probe_stream, &probe_graph);
+            probe_ok = probe_ok && end == cudaSuccess && probe_graph != nullptr;
         }
-        (void) cudaFree(stream_mem_probe);
-    } else {
+    }
+    if (probe_ok) {
+        probe_ok = cudaGraphInstantiate(&probe_exec, probe_graph, nullptr, nullptr, 0) == cudaSuccess;
+    }
+    for (int replay = 0; probe_ok && replay < 2; ++replay) {
+        probe_ok = cudaGraphLaunch(probe_exec, probe_stream) == cudaSuccess && probe_complete();
+    }
+    if (probe_exec != nullptr) { (void) cudaGraphExecDestroy(probe_exec); }
+    if (probe_graph != nullptr) { (void) cudaGraphDestroy(probe_graph); }
+    if (probe_stream != nullptr) { (void) cudaStreamSynchronize(probe_stream); }
+    if (stream_mem_probe != nullptr) { (void) cudaFree(stream_mem_probe); }
+    if (probe_stream != nullptr) { (void) cudaStreamDestroy(probe_stream); }
+    c->stream_mem_ops_supported = probe_ok;
+    if (!probe_ok) {
         (void) cudaGetLastError();
+        GGML_LOG_DEBUG("moe-cache: stream memory operations unavailable; using event staging\n");
     }
 #endif
 
@@ -14488,8 +14496,8 @@ static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        GGML_LOG_DEBUG("%s: failed to allocate %.2f MiB of pinned memory: %s\n",
-                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s; using pageable cached fallback\n",
+                      __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
     return ptr;
@@ -14505,9 +14513,12 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
 
     if (ptr == nullptr) {
-        // Pinned alloc failed -- fall back to a regular CPU buffer. This costs
-        // PCIe bandwidth on cache miss but keeps the model loadable.
-        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        // Keep CUDA cache dispatch and the CPU backing's deallocator.
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        if (buffer != nullptr) {
+            buffer->buft = buft;
+        }
+        return buffer;
     }
 
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
@@ -14820,42 +14831,6 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
     return true;
 }
 
-// Backward-compat wrapper: keys solely by slot_size. Kept so existing callers
-// don't break, but prefer the per-tensor variant.
-extern "C"
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
-    int    device,
-    size_t slot_size_bytes,
-    int    n_slots) {
-    GGML_UNUSED(slot_size_bytes);
-    GGML_UNUSED(n_slots);
-    GGML_UNUSED(device);
-    return nullptr; // dispatch hook now uses the per-tensor variant
-}
-
-extern "C"
-void ggml_cuda_moe_cache_free_all(void) {
-}
-
-// ---------------------------------------------------------------------------
-// Process-wide legacy route publication hint
-// ---------------------------------------------------------------------------
-
-static std::atomic<int> g_moe_cache_route_publication_slots{0};
-
-extern "C"
-void ggml_backend_cuda_moe_set_cache_slots(int n_slots) {
-    if (n_slots < 0) n_slots = 0;
-    g_moe_cache_route_publication_slots.store(n_slots, std::memory_order_relaxed);
-}
-
-extern "C"
-int ggml_backend_cuda_moe_get_cache_slots(void) {
-    return g_moe_cache_route_publication_slots.load(std::memory_order_relaxed);
-}
-
-
-
 extern "C"
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
     g_moe_cache_mm_debug.store(enabled, std::memory_order_relaxed);
@@ -14864,47 +14839,6 @@ void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
 extern "C"
 bool ggml_backend_cuda_moe_get_debug_mm(void) {
     return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
-}
-
-extern "C"
-void ggml_backend_cuda_moe_observe_expert_tensor(
-    const void * tensor_data,
-    const char * tensor_name,
-    size_t       per_expert_bytes,
-    int64_t      n_experts) {
-    GGML_UNUSED(tensor_data);
-    GGML_UNUSED(tensor_name);
-    GGML_UNUSED(per_expert_bytes);
-    GGML_UNUSED(n_experts);
-}
-
-extern "C"
-void ggml_backend_cuda_moe_reset_expert_size_observation(void) {
-}
-
-extern "C"
-void ggml_backend_cuda_moe_preallocate_pools(int device) {
-    GGML_UNUSED(device);
-}
-
-extern "C"
-void ggml_backend_cuda_moe_prefetch_experts(
-    int             device,
-    const char *    tensor_name,
-    const int32_t * eids,
-    int             n_eids,
-    bool            is_decode) {
-    GGML_UNUSED(device);
-    GGML_UNUSED(tensor_name);
-    GGML_UNUSED(eids);
-    GGML_UNUSED(n_eids);
-    GGML_UNUSED(is_decode);
-}
-
-// Deprecated singular-pool entry point; superseded by preallocate_pools (plural).
-extern "C"
-void ggml_backend_cuda_moe_preallocate_pool(int device) {
-    GGML_UNUSED(device);
 }
 
 static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {

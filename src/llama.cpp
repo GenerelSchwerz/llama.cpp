@@ -14,6 +14,7 @@
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "ggml-backend.h"
+#include "../ggml/src/ggml-backend-moe.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -339,26 +340,21 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires --moe-expert-cache-size");
         }
         if (params.moe_expert_cache_slots > 0) {
-            ggml_backend_moe_cache_set_slots_t set_slots_fn = nullptr;
             ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
             ggml_backend_reg_t cache_reg = nullptr;
             for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
                 ggml_backend_reg_t reg = ggml_backend_reg_get(i);
-                auto candidate_set_slots_fn = (ggml_backend_moe_cache_set_slots_t) ggml_backend_reg_get_proc_address(
-                        reg, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME);
                 auto candidate_buffer_type_fn = (ggml_backend_moe_cache_buffer_type_t) ggml_backend_reg_get_proc_address(
                         reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME);
-                if (candidate_set_slots_fn != nullptr && candidate_buffer_type_fn != nullptr) {
-                    set_slots_fn = candidate_set_slots_fn;
+                if (candidate_buffer_type_fn != nullptr) {
                     buffer_type_fn = candidate_buffer_type_fn;
                     cache_reg = reg;
                     break;
                 }
             }
-            if (set_slots_fn == nullptr || buffer_type_fn == nullptr) {
+            if (buffer_type_fn == nullptr) {
                 throw std::runtime_error("--moe-expert-cache-size requires a backend with MoE cache support");
             }
-            set_slots_fn(params.moe_expert_cache_slots);
             ggml_backend_buffer_type_t buft = buffer_type_fn();
             if (params.moe_expert_cache_host_pinned_size > 0) {
                 auto create = (ggml_backend_moe_cache_bounded_buffer_type_t) ggml_backend_reg_get_proc_address(

@@ -416,12 +416,21 @@ endif()
 
 # This test uses internal symbols that are not exported from Windows DLLs.
 #
-# The test is a plain .cpp (no device kernels, only host-side cudaMalloc /
+# The test sources are plain C++ (no device kernels, only host-side cudaMalloc /
 # cudaMemcpyAsync calls), so it does not require enable_language(CUDA) in
 # this directory scope. CUDA headers + libcudart come in via CUDA::cudart.
 if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT BUILD_SHARED_LIBS))
     find_package(CUDAToolkit REQUIRED)
-    add_executable(test-moe-cache test-moe-cache.cpp)
+    add_executable(test-moe-cache
+        test-moe-cache.cpp
+        test-moe-cache-fixtures.cpp
+        test-moe-cache-registry.cpp
+        test-moe-cache-plans.cpp
+        test-moe-cache-graphs.cpp
+        test-moe-cache-dispatch.cpp
+        test-moe-cache-mmid.cpp
+        test-moe-cache-staging.cpp
+    )
     target_compile_features(test-moe-cache PRIVATE cxx_std_17)
     target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)

@@ -10,6 +10,7 @@
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
+#include "../ggml/src/ggml-backend-moe.h"
 
 #include <map>
 #include <memory>

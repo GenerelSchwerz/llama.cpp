@@ -21,7 +21,7 @@ using ggml_cuda_moe_stream_t = musaStream_t;
 using ggml_cuda_moe_stream_t = cudaStream_t;
 #endif
 
-#include "ggml-backend.h"
+#include "ggml-backend-moe.h"
 
 #include <array>
 #include <memory>
@@ -1046,14 +1046,25 @@ bool ggml_cuda_moe_take_host_staged_evaluator_failure_for_test(ggml_cuda_moe_gro
 //   - acquire() takes the actual byte count to copy on miss, which can be
 //     less than slot_size_bytes. Smaller experts simply leave padding inside
 //     their slot.
-//
-// See ../../DESIGN.md for the full design.
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct ggml_cuda_moe_cache;
+
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
+ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes);
+void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t buft);
+bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
+bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
+ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
+void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
+bool ggml_backend_cuda_moe_get_debug_mm(void);
+void ggml_backend_cuda_moe_log_and_reset_stats(void);
+
+// Set before the first graph submission to this backend.
+void ggml_backend_cuda_set_decode_boundary_overlap(ggml_backend_t backend, bool enabled);
 
 int32_t ggml_backend_cuda_moe_candidate_replace_v1(
     ggml_backend_t backend,
@@ -1218,15 +1229,6 @@ void ggml_cuda_moe_cache_stats(
     uint64_t * out_evictions);
 
 void ggml_cuda_moe_cache_reset_stats(struct ggml_cuda_moe_cache * cache);
-
-// Deprecated: keys solely by slot_size_bytes. Kept for compat; returns nullptr.
-struct ggml_cuda_moe_cache * ggml_cuda_moe_cache_get_or_create(
-    int    device,
-    size_t slot_size_bytes,
-    int    n_slots);
-
-// Compatibility shim. Cache resources are owned by CUDA backend contexts.
-GGML_BACKEND_API void ggml_cuda_moe_cache_free_all(void);
 
 #ifdef __cplusplus
 }

@@ -24,6 +24,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../ggml/src/ggml-backend-moe.h"
 
 #include <algorithm>
 #include <cassert>

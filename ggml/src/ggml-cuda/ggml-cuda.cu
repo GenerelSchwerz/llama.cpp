@@ -2519,7 +2519,7 @@ static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         ggml_backend_cuda_context & ctx,
         const ggml_tensor * ids) {
     const size_t count = (size_t) ids->ne[0];
-    if (ggml_backend_cuda_moe_get_cache_slots() <= 0 || ids->ne[1] * ids->ne[2] != 1 ||
+    if (ctx.moe_grouped_context == nullptr || ctx.moe_grouped_context->state().n_slots == 0 || ids->ne[1] * ids->ne[2] != 1 ||
             ids->nb[0] != sizeof(int32_t) || ggml_nbytes(ids) != count*sizeof(int32_t)) {
         return {};
     }
@@ -3043,7 +3043,7 @@ static bool ggml_cuda_mul_mat_id_grouped_host_staged(
     ggml_tensor * ids = dst->src[2];
     if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32 || src0->ne[2] <= 0 ||
             ids->ne[0] <= 0 || ids->ne[1] <= 0 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
-            ids->ne[0] > SIZE_MAX / static_cast<size_t>(ids->ne[1])) {
+            static_cast<uint64_t>(ids->ne[0]) > SIZE_MAX / static_cast<uint64_t>(ids->ne[1])) {
         return false;
     }
     const bool telemetry_is_decode = group->authority.legacy_telemetry_is_decode(ids->ne[1] == 1);
@@ -8333,9 +8333,6 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_buffer_from_host_ptr;
-    }
-    if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_SLOTS_PROC_NAME) == 0) {
-        return (void *) ggml_backend_cuda_moe_set_cache_slots;
     }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_debug_mm;
