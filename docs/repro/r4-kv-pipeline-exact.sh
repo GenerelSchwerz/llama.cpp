@@ -4,6 +4,7 @@
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-exact.sh [pipeline-depth ...]
 #   LLAMA_KV_LENGTHS=2048,18432,65536 selects the prefill lengths (default 2048,18432).
+#   LLAMA_KV_SM=tensor splits the model and its cache by head over every device.
 set -u
 MODEL="${LLAMA_KV_MODEL:?set LLAMA_KV_MODEL to a .gguf path}"
 BUILD="${LLAMA_KV_BUILD:-build}"
@@ -12,6 +13,7 @@ PORT="${LLAMA_KV_PORT:-18099}"
 LENGTHS="${LLAMA_KV_LENGTHS:-2048,18432}"
 CTX="${LLAMA_KV_CTX:-32768}"
 BUDGET="${LLAMA_KV_BUDGET:-512}"
+SM="${LLAMA_KV_SM:-none}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 DEPTHS=(0 1 4); [ $# -gt 0 ] && DEPTHS=("$@")
@@ -22,7 +24,7 @@ for I in "${!DEPTHS[@]}"; do
   echo "== pipeline depth=$D  ctx=$CTX  prefill lengths=$LENGTHS"
   LOG=$(mktemp /tmp/r4-kv-pipeline.XXXX.log)
   taskset -c "$PIN" "$BUILD/bin/llama-server" -m "$MODEL" --kv-pipeline-depth "$D" \
-    --kv-pipeline-budget "$BUDGET" -ngl 99 -sm none -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
+    --kv-pipeline-budget "$BUDGET" -ngl 99 -sm "$SM" -mg 0 -t 3 -nkvo --kv-cpu-pinned --recurrent-state-offload \
     -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 -c "$CTX" --parallel 1 \
     --host 127.0.0.1 --port "$PORT" --no-warmup > "$LOG" 2>&1 &
   SRV=$!

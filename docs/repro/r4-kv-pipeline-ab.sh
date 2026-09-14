@@ -3,11 +3,13 @@
 # The two arms are the same binary: --kv-pipeline-depth 0 is the ordered path.
 #
 #   LLAMA_KV_MODEL=/path/model.gguf docs/repro/r4-kv-pipeline-ab.sh [depth ...]
+#   LLAMA_KV_SM=tensor splits the model and its cache by head over every device.
 set -euo pipefail
 MODEL="${LLAMA_KV_MODEL:?set LLAMA_KV_MODEL to a .gguf path}"
 BUILD="${LLAMA_KV_BUILD:-build}"
 PIN="${LLAMA_KV_TASKSET:-0,2,4}"
 BUDGET="${LLAMA_KV_BUDGET:-512}"
+SM="${LLAMA_KV_SM:-none}"
 LOCK=/tmp/beellama-single-gpu.lock
 
 # An unpinned host cache and a host-resident recurrent state both cost more than the transport can win back, and without a budget the ring is declined at the larger contexts, so a build without these options does not measure what the doc reports.
@@ -30,7 +32,7 @@ run () { # $1 label, $2 pipeline depth, $3 context depth, $4 reps
   err="$(mktemp)"
   rc=0
   taskset -c "$PIN" "$BUILD/bin/llama-bench" -m "$MODEL" --kv-pipeline-depth "$2" \
-    --kv-pipeline-budget "$BUDGET" -ngl 99 -sm none -mg 0 -t 3 -nkvo 1 -kvcp 1 -rso 1 \
+    --kv-pipeline-budget "$BUDGET" -ngl 99 -sm "$SM" -mg 0 -t 3 -nkvo 1 -kvcp 1 -rso 1 \
     -fa on -ctk q8_0 -ctv q8_0 -b 512 -ub 512 --no-warmup -p 0 -n 128 -d "$3" -r "$4" -o json \
     > "$out" 2> "$err" || rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -55,7 +57,7 @@ for D in "${DEPTHS[@]}"; do
     R=5
   fi
   echo "== context depth=$D reps=$R"
-  flock "$LOCK" bash -c "set -euo pipefail; $(declare -f run); BUILD='$BUILD'; MODEL='$MODEL'; PIN='$PIN'; BUDGET='$BUDGET'
+  flock "$LOCK" bash -c "set -euo pipefail; $(declare -f run); BUILD='$BUILD'; MODEL='$MODEL'; PIN='$PIN'; BUDGET='$BUDGET'; SM='$SM'
     run ordered    0 $D $R
     run pipelined  1 $D $R
     run ordered2   0 $D $R
