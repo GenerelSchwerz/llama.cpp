@@ -373,6 +373,7 @@ private:
     bool workspace_in_flight = false;
 
     bool sched_need_reserve = true;
+    bool sched_sizing       = false; // reserve only measures the compute buffer sizes
     uint32_t sched_reserved_tokens = 0;
     uint32_t sched_reserved_kv = 0;
     uint32_t sched_decode_outputs = 0;

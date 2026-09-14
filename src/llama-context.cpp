@@ -416,34 +416,6 @@ llama_context::llama_context(
         }
     }
 
-    // init the memory module
-    if (!hparams.vocab_only) {
-        llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
-        };
-
-        memory.reset(model.create_memory(params_mem, cparams));
-
-        if (cparams.live_context_workspace && hparams.no_alloc) {
-            cparams.live_context_workspace = false;
-        } else if (cparams.live_context_workspace && (!memory || memory->get_attn_reserve_capacity() == 0)) {
-            LLAMA_LOG_WARN("%s: live-context workspace sizing unsupported; using full-context reserve\n", __func__);
-            cparams.live_context_workspace = false;
-        }
-
-        if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
-            if (memory && memory->get_supports_partial_kv()) {
-                cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
-            } else {
-                LLAMA_LOG_WARN("%s: partial GPU KV residency is not supported for this memory layout; ignoring kv_gpu_layers\n", __func__);
-            }
-        }
-    }
-
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -505,6 +477,56 @@ llama_context::llama_context(
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // init the memory module
+        llama_memory_params params_mem = {
+            /*.type_k    =*/ params.type_k,
+            /*.type_v    =*/ params.type_v,
+            /*.swa_full  =*/ params.swa_full,
+            /*.ctx_type  =*/ cparams.ctx_type,
+            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+        };
+
+        // Measure the compute buffers with host KV first; the device-resident layers must leave room for them.
+        if (!hparams.no_alloc && !cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+            const llama_cparams cparams_req = cparams;
+            cparams.offload_attn_compute   = cparams.offload_attn_compute || cparams.op_offload;
+            cparams.phase_aware_workspace  = false;
+            cparams.live_context_workspace = false;
+
+            llama_memory_params params_sizing = params_mem;
+            params_sizing.kv_layers = std::make_shared<llama_kv_layer_tensors>();
+            memory.reset(model.create_memory(params_sizing, cparams));
+            if (memory) {
+                LLAMA_LOG_INFO("%s: sizing compute buffers for partial GPU KV residency\n", __func__);
+                sched_sizing = true;
+                sched_reserve();
+                sched_sizing = false;
+                for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+                    ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+                    if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        params_mem.dev_reserved[dev] += backend_buf_exp_size[i];
+                    }
+                }
+            }
+            reset_sched_workspace();
+            memory.reset();
+            cparams = cparams_req;
+        }
+
+        memory.reset(model.create_memory(params_mem, cparams));
+
+        if (cparams.live_context_workspace && hparams.no_alloc) {
+            cparams.live_context_workspace = false;
+        } else if (cparams.live_context_workspace && (!memory || memory->get_attn_reserve_capacity() == 0)) {
+            LLAMA_LOG_WARN("%s: live-context workspace sizing unsupported; using full-context reserve\n", __func__);
+            cparams.live_context_workspace = false;
+        }
+
+        // create_memory lowered kv_gpu_layers to the layers that became device-resident
+        if (!cparams.offload_kqv && cparams.kv_gpu_layers > 0) {
+            cparams.offload_attn_compute = cparams.offload_attn_compute || cparams.op_offload;
         }
 
         sched_reserve();
@@ -807,14 +829,16 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
 void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     acquire_shared_workspace();
 
+    const bool no_alloc = model.hparams.no_alloc || sched_sizing;
+
     const bool sched_resizable_requested = (cparams.phase_aware_workspace || cparams.live_context_workspace) &&
-            !model.hparams.no_alloc;
+            !no_alloc;
     if (!sched_need_reserve && !sched_resizable_requested) {
         return;
     }
 
     const auto plan = make_sched_reserve_plan(n_tokens_req, n_kv_req);
-    const bool sched_resizable = (cparams.phase_aware_workspace || plan.live_kv) && !model.hparams.no_alloc;
+    const bool sched_resizable = (cparams.phase_aware_workspace || plan.live_kv) && !no_alloc;
     if (!sched_need_reserve && !sched_resizable) {
         return;
     }
@@ -930,7 +954,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
+                no_alloc, no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             const bool can_recreate = !sched_resizable ||
                     (sched_buffer_owner == nullptr && sched_buffer_borrower == nullptr);
@@ -952,7 +976,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     // reserve with tg (token generation) graph to get the number of splits and nodes
     {
         auto * gf = graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(),
-                model.hparams.no_alloc || sched_resizable);
+                no_alloc || sched_resizable);
         if (!gf) {
             throw std::runtime_error("failed to allocate compute tg buffers");
         }
@@ -973,11 +997,11 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
                 // the `inp_diag_decay` tensor size scales with `n_seq_tokens^2` which
                 // makes `n_seqs == 1` use more memory for the compute graph compared to `n_seqs > 1`
                 gf = graph_reserve(n_tokens, 1,      n_outputs_pp, mctx.get(),
-                        model.hparams.no_alloc || sched_resizable);
+                        no_alloc || sched_resizable);
                 break;
             default:
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
-                        model.hparams.no_alloc || sched_resizable);
+                        no_alloc || sched_resizable);
         };
         if (!gf) {
             throw std::runtime_error("failed to allocate compute pp buffers");
@@ -987,7 +1011,7 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         ggml_backend_t             backend = backend_ptrs[i];
         ggml_backend_buffer_type_t buft    = backend_buft[i];
-        if (!model.hparams.no_alloc) {
+        if (!no_alloc) {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {

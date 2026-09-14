@@ -287,7 +287,10 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        const bool layer_offload = offload || n_gpu_resident < placement.gpu_resident_layers;
+        // Sub-caches claim each selected layer once.
+        const bool layer_picked = placement.gpu_resident_ils.count(il) > 0 &&
+            (!placement.gpu_resident_done || placement.gpu_resident_done->count(il) == 0);
+        const bool layer_offload = offload || layer_picked;
         ggml_backend_buffer_type_t buft = llama_kv_cache_get_host_buft(model, il, placement.cpu_pinned);
 
         if (layer_offload) {
@@ -299,6 +302,9 @@ llama_kv_cache::llama_kv_cache(
 
         if (!offload && layer_offload) {
             ++n_gpu_resident;
+            if (placement.gpu_resident_done) {
+                placement.gpu_resident_done->insert(il);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -334,14 +340,17 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        if (placement.kv_layers && !offload) {
+            placement.kv_layers->emplace(il, std::make_pair(k, v));
+        }
+
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_store_quantize, v_store_quantize, k_stream, v_stream, });
     }
 
-    if (!offload && placement.gpu_resident_layers > 0) {
-        LLAMA_LOG_INFO("%s: partial GPU KV residency: %u of %u requested owned attention layers device-resident\n",
-                __func__, n_gpu_resident, placement.gpu_resident_layers);
+    if (!offload && n_gpu_resident > 0) {
+        LLAMA_LOG_DEBUG("%s: %u attention layers device-resident\n", __func__, n_gpu_resident);
     }
 
     if (reuse) {
@@ -371,7 +380,7 @@ llama_kv_cache::llama_kv_cache(
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
+        if (hparams.no_alloc || placement.kv_layers) {
             buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
