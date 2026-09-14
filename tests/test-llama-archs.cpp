@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -1427,6 +1428,73 @@ static std::vector<float> get_logits(
     return ret;
 }
 
+// decode two sequences in one batch, compare each with a decode of it alone
+// logits_a: logits of tokens decoded alone with the same device config
+static bool test_parallel_seqs(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_a, bool encode) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_tokens = tokens.size();
+
+    // same per-sequence n_ctx as the reference context
+    const auto make_cparams = [&](uint32_t n_seq_max) {
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx           = n_seq_max*llama_model_n_ctx_train(model);
+        cparams.n_threads       = 4;
+        cparams.n_threads_batch = 4;
+        cparams.n_seq_max       = n_seq_max;
+        if (!encode) {
+            cparams.n_ubatch = 64;
+        }
+        return cparams;
+    };
+
+    llama_context_ptr ctx_par(llama_init_from_model(model, make_cparams(2)));
+    llama_context_ptr ctx_b(llama_init_from_model(model, make_cparams(1)));
+    if (!ctx_par || !ctx_b) {
+        return false;
+    }
+
+    std::vector<llama_token> tokens_b(n_tokens);
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        tokens_b[i] = tokens[(i + 1) % n_tokens];
+    }
+
+    llama_batch batch_par = llama_batch_init(2*n_tokens, 0, 1);
+    llama_batch batch_b   = llama_batch_init(n_tokens, 0, 1);
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        common_batch_add(batch_par, tokens[pos],   pos, {0}, true);
+        common_batch_add(batch_par, tokens_b[pos], pos, {1}, true);
+        common_batch_add(batch_b,   tokens_b[pos], pos, {0}, true);
+    }
+    bool ok = true;
+    if (encode) {
+        ok = llama_encode(ctx_par.get(), batch_par) == 0 && llama_encode(ctx_b.get(), batch_b) == 0;
+    }
+    ok = ok && llama_decode(ctx_par.get(), batch_par) == 0 && llama_decode(ctx_b.get(), batch_b) == 0;
+    llama_batch_free(batch_par);
+    llama_batch_free(batch_b);
+    if (!ok) {
+        return false;
+    }
+
+    std::vector<float> logits_par_a;
+    std::vector<float> logits_par_b;
+    std::vector<float> logits_b;
+    for (uint32_t i = 0; i < n_tokens; i++) {
+        const float * l_par_a = llama_get_logits_ith(ctx_par.get(), 2*i);
+        const float * l_par_b = llama_get_logits_ith(ctx_par.get(), 2*i + 1);
+        const float * l_b     = llama_get_logits_ith(ctx_b.get(), i);
+        if (l_par_a == nullptr || l_par_b == nullptr || l_b == nullptr) {
+            return false;
+        }
+        logits_par_a.insert(logits_par_a.end(), l_par_a, l_par_a + n_vocab);
+        logits_par_b.insert(logits_par_b.end(), l_par_b, l_par_b + n_vocab);
+        logits_b.insert(logits_b.end(), l_b, l_b + n_vocab);
+    }
+
+    // ubatch splits differ from the reference, so use the NMSE limit of the CPU comparison; NaN fails
+    return nmse(logits_a, logits_par_a) <= 1e-4 && nmse(logits_b, logits_par_b) <= 1e-4;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_LLAMA4:
@@ -1574,6 +1642,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         }
     }, &ud);
 
+    bool ok = true;
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1603,10 +1672,22 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
+
+            const std::string path_q4_0 = dir + "/" + llm_arch_name(arch) + (moe ? "-moe-q4_0.gguf" : "-dense-q4_0.gguf");
+            LOG_INF("%s: Quantizing %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path_q4_0.c_str());
+            llama_model_quantize_params qparams = llama_model_quantize_default_params();
+            qparams.ftype   = LLAMA_FTYPE_MOSTLY_Q4_0;
+            qparams.nthread = 1;
+            if (llama_model_quantize(path.c_str(), path_q4_0.c_str(), &qparams) != 0) {
+                LOG_ERR("%s: failed to quantize %s\n", __func__, path.c_str());
+                // a failed quantization can leave a file with an invalid header
+                std::filesystem::remove(path_q4_0);
+                ok = false;
+            }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
-    return 0;
+    return ok ? 0 : 1;
 }
 
 static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
@@ -1669,13 +1750,13 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|%9s|\n";
     const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
-    const std::string template_row_res = "%15s %10s|%20s|\n";
+    const std::string template_row_res = "%15s %10s|%20s|%20s|\n";
 
     bool all_ok = true;
     common_log_flush(common_log_main());
-    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip");
+    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Parallel");
     printf("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
         printf("-");
@@ -1684,7 +1765,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     for (size_t i = 0; i < max_device_label_length; i++) {
         printf("-");
     }
-    printf("|------|---------------|---------|\n");
+    printf("|------|---------------|---------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1724,6 +1805,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 std::vector<float> logits_dev;
                 std::string status_nmse      = "\033[1;33mSKIP\033[0m";
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
+                std::string status_parallel  = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
 
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
@@ -1741,6 +1823,15 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         if (nmse_val > 1e-4) {
                             all_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
+                        }
+
+                        // FIXME: T5 kq_b does not broadcast over KV streams, so context init with n_seq_max > 1 aborts
+                        if (arch != LLM_ARCH_T5) {
+                            status_parallel = "\033[1;32mOK\033[0m";
+                            if (!test_parallel_seqs(model_and_ctx_dev.first.get(), tokens, logits_dev, encode)) {
+                                all_ok = false;
+                                status_parallel = "\033[1;31mFAIL\033[0m";
+                            }
                         }
                     }
 
@@ -1772,7 +1863,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
 
                 // log the results for this test case
                 printf(template_row_res.c_str(),
-                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+                    status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_parallel.c_str());
             }
         }
     }
