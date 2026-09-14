@@ -112,6 +112,24 @@ static std::string get_arch(const std::string & path) {
     return val ? val : "unknown";
 }
 
+// the baselines are recorded on the unquantized dummy models
+static bool is_quantized(const std::string & path) {
+    gguf_init_params params = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), params));
+    if (!ctx.get()) {
+        throw std::runtime_error("failed to read gguf: " + path);
+    }
+    const int idx = gguf_find_key(ctx.get(), "general.file_type");
+    if (idx < 0) {
+        return false;
+    }
+    if (gguf_get_kv_type(ctx.get(), idx) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error("invalid general.file_type type: " + path);
+    }
+    const uint32_t ftype = gguf_get_val_u32(ctx.get(), idx);
+    return ftype != LLAMA_FTYPE_ALL_F32 && ftype != LLAMA_FTYPE_MOSTLY_F16 && ftype != LLAMA_FTYPE_MOSTLY_BF16;
+}
+
 static llama_model_ptr load_model(const std::string & path, ggml_backend_dev_t dev) {
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -215,7 +233,7 @@ static void usage(const char * argv0) {
     printf("%s: verify fusion counts on a device against a per-device baseline\n\n", argv0);
     printf("usage: %s [options]\n\n", argv0);
     printf("options:\n");
-    printf("  --models DIR   run over all .gguf models in a directory\n");
+    printf("  --models DIR   run over all unquantized .gguf models in a directory\n");
     printf("  --model FILE   run over a single model file (mutually exclusive with --models)\n");
     printf("  --device NAME  device to run on (e.g. MTL0, CPU)\n");
     printf("  --record CSV   write the golden baseline\n");
@@ -284,7 +302,7 @@ int main(int argc, char ** argv) {
             return 1;
         }
         for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf" && !is_quantized(entry.path().string())) {
                 models.push_back(entry.path().string());
             }
         }

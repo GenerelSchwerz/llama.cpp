@@ -4215,22 +4215,26 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
         const size_t src1_col_stride = ggml_row_size(PARAM_TYPE, ne10);
 
-        GGML_ASSERT(ne03 == 1 && ne13 == 1);
+        GGML_ASSERT(ne03 == 1);
         GGML_ASSERT(ne12 % ne02 == 0);
         const int64_t r2 = ne12 / ne02;
 
-        const int64_t i12 = src1_start / ne1;
-        const int64_t i11 = src1_start - i12 * ne1;
+        // src1 planes are flattened over dims 2 and 3
+        const int64_t i123 = src1_start / ne1;
+        const int64_t i13  = i123 / ne12;
+        const int64_t i12  = i123 - i13 * ne12;
+        const int64_t i11  = src1_start - i123 * ne1;
 
         // Determine batch index
         const int64_t i02 = i12 / r2;
 
         const int64_t i1 = i11;
         const int64_t i2 = i12;
+        const int64_t i3 = i13;
 
         const char * src0_ptr = (const char *) src0->data + i02 * nb02;
-        const char * src1_ptr = (const char *) params->wdata + (i11 + i12 * ne11) * src1_col_stride;
-        char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2));
+        const char * src1_ptr = (const char *) params->wdata + (i11 + i123 * ne11) * src1_col_stride;
+        char *       dst_ptr  = ((char *) dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
         const int64_t nrows = src1_end - src1_start;
         const int64_t ncols = src0_end - src0_start;
@@ -4271,11 +4275,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         GGML_ASSERT(nb1 <= nb2);
         GGML_ASSERT(nb2 <= nb3);
 
-        // TODO: General batched mul mat for 4D tensors
-        // Currently only supports 3D tensors
         GGML_ASSERT(ne03 == 1);
-        GGML_ASSERT(ne13 == 1);
-        GGML_ASSERT(ne3 == 1);
 
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
@@ -4286,16 +4286,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         const size_t nbw1  = ggml_row_size(PARAM_TYPE, ne10);
         const size_t nbw2  = nbw1 * ne11;
 
-        assert(params->wsize >= nbw2 * ne12);
+        assert(params->wsize >= nbw2 * ne12 * ne13);
 
         const ggml_from_float_t from_float = ggml_get_type_traits_cpu(PARAM_TYPE)->from_float;
 
         // INFO: Quantization is done in planes to avoid extra complexity in chunking.
         // Flattening dimensions not multiple of INTER_SIZE would require extra handling depending on how
         // the planes are broadcast.
-        for (int64_t i12 = 0; i12 < ne12; i12++) {
-            char * data_ptr  = (char *) src1->data + i12 * nb12;
-            char * wdata_ptr = wdata + i12 * nbw2;
+        for (int64_t i123 = 0; i123 < ne12 * ne13; i123++) {
+            const int64_t i13 = i123 / ne12;
+            const int64_t i12 = i123 - i13 * ne12;
+
+            char * data_ptr  = (char *) src1->data + i12 * nb12 + i13 * nb13;
+            char * wdata_ptr = wdata + i123 * nbw2;
 
             for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
                 ggml_quantize_mat_t<INTER_SIZE, PARAM_TYPE>((float *) (data_ptr + i11 * nb11),
@@ -4321,9 +4324,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
         // src1 is chunked only by full planes.
         // When we flatten we need to address dimensions not multiple of the q8 INTER_SIZE
         // to route them thorugh GEMV.
-        // nchunk1 = ne12 also avoids messing the chunking for models with no 3d tensors
+        // nchunk1 = ne12 * ne13 also avoids messing the chunking for models with no 3d tensors
         // to avoid affecting their performance
-        int64_t nchunk1 = ne12;
+        int64_t nchunk1 = ne12 * ne13;
 
         // Ensure minimum chunk size to avoid alignment issues with high thread counts
         // Minimum chunk size should be at least NB_COLS to prevent overlapping chunks after alignment
