@@ -817,6 +817,7 @@ struct ggml_backend_sched_transport_ring {
     ggml_backend_buffer_t buffer;   // the ring itself
     size_t                slot_size;
     size_t                alignment;
+    uint32_t              shares[GGML_BACKEND_META_MAX_DEVICES]; // share of the ring each device of the buffer holds, in units of 1/65536
 
     struct ggml_backend_sched_transport_slot slots[GGML_SCHED_MAX_TRANSPORT_SLOTS];
 
@@ -2165,24 +2166,57 @@ static size_t ggml_backend_sched_transport_slot_alloc(size_t need, size_t limit,
     return std::max(size, need);
 }
 
-// Free memory of the device a ring lands on, 0 when unknown.
-// A meta buffer allocates the whole ring on every simple device, so the device with the least free memory decides; the meta device reports the sum.
-static size_t ggml_backend_sched_transport_dev_free(ggml_backend_t backend) {
-    size_t dev_free = 0, dev_total = 0;
-    if (ggml_backend_is_meta(backend)) {
-        for (size_t j = 0; j < ggml_backend_meta_n_backends(backend); j++) {
-            ggml_backend_dev_t dev = ggml_backend_get_device(ggml_backend_meta_simple_backend(backend, j));
-            size_t simple_free = 0, simple_total = 0;
-            ggml_backend_dev_memory(dev, &simple_free, &simple_total);
-            dev_free = j == 0 ? simple_free : std::min(dev_free, simple_free);
+// A share of a size, in units of 1/65536, rounded up.
+static size_t ggml_backend_sched_share_size(size_t size, uint32_t share) {
+    return size/65536*share + ((size%65536)*share + 65535)/65536;
+}
+
+// The largest size whose share is at most `bytes`.
+static size_t ggml_backend_sched_share_limit(size_t bytes, uint32_t share) {
+    GGML_ASSERT(share > 0);
+    const size_t q = bytes/share;
+    return q > SIZE_MAX/65536 ? SIZE_MAX : q*65536 + (bytes%share)*65536/share;
+}
+
+// The devices a ring lands on, and the share of the ring each of them holds: a meta backend holds only each device's part of its entries.
+// Returns how many devices there are.
+static int ggml_backend_sched_transport_ring_shares(ggml_backend_sched_t sched, int backend_id, uint32_t * shares) {
+    const struct ggml_backend_sched_transport * tr = &sched->transport;
+    ggml_backend_t backend = sched->backends[backend_id];
+
+    if (!ggml_backend_is_meta(backend)) {
+        shares[0] = 65536;
+        return 1;
+    }
+
+    std::vector<const struct ggml_tensor *> entries;
+    for (int i = 0; i < sched->n_splits; i++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[i];
+        if (split->backend_id != backend_id || tr->split_order[i] < 0) {
+            continue;
         }
-        return dev_free;
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (tr->input_staged[tr->split_input_ofs[i] + j]) {
+                entries.push_back(tensor_copy(split->inputs[j], backend_id, sched->cur_copy));
+            }
+        }
     }
-    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
-    if (dev != NULL) {
-        ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+    ggml_backend_meta_get_shares(sched->bufts[backend_id], entries.data(), entries.size(), shares);
+
+    return (int) ggml_backend_meta_n_backends(backend);
+}
+
+// Free memory of each device a ring lands on, 0 where unknown.
+static void ggml_backend_sched_transport_dev_free(ggml_backend_t backend, size_t * dev_free, int n_devs) {
+    for (int j = 0; j < n_devs; j++) {
+        ggml_backend_t simple = ggml_backend_is_meta(backend) ? ggml_backend_meta_simple_backend(backend, j) : backend;
+        ggml_backend_dev_t dev = ggml_backend_get_device(simple);
+        size_t total = 0;
+        dev_free[j] = 0;
+        if (dev != NULL) {
+            ggml_backend_dev_memory(dev, &dev_free[j], &total);
+        }
     }
-    return dev_free;
 }
 
 // Created on demand, so a backend that never gets to stage anything does not carry a second device context for nothing.
@@ -2478,13 +2512,22 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             ring_size_max = SIZE_MAX;
         }
 
-        if (tr->budget > 0 && ring_size > tr->budget) {
+        // the budget caps what the ring costs on the device that holds the most of it
+        uint32_t shares[GGML_BACKEND_META_MAX_DEVICES];
+        const int n_devs = ggml_backend_sched_transport_ring_shares(sched, bid, shares);
+        uint32_t share_max = 0;
+        for (int j = 0; j < n_devs; j++) {
+            share_max = std::max(share_max, shares[j]);
+        }
+        const size_t ring_bytes = ggml_backend_sched_share_size(ring_size, share_max);
+
+        if (tr->budget > 0 && ring_bytes > tr->budget) {
             if (!r->reported_no_room) {
                 GGML_LOG_WARN("%s: transport ring on %s needs %zu MiB now and %zu MiB at the full "
                         "context, against a %zu MiB budget, staying on the ordered path (raise "
                         "--kv-pipeline-budget to spend more device memory on it)\n", __func__,
-                        ggml_backend_name(sched->backends[bid]), ring_size >> 20,
-                        ring_size_max >> 20, tr->budget >> 20);
+                        ggml_backend_name(sched->backends[bid]), ring_bytes >> 20,
+                        ggml_backend_sched_share_size(ring_size_max, share_max) >> 20, tr->budget >> 20);
                 r->reported_no_room = true;
             }
             ggml_backend_sched_transport_decline_backend(sched, bid);
@@ -2499,41 +2542,59 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
             continue;
         }
 
-        if (r->buffer == NULL || r->slot_size < slot_size[bid]) {
+        bool grow = r->buffer == NULL || r->slot_size < slot_size[bid];
+        for (int j = 0; j < n_devs && !grow; j++) {
+            grow = r->shares[j] < shares[j];
+        }
+
+        if (grow) {
             ggml_backend_sched_transport_free_ring(sched, bid);
 
             ggml_backend_buffer_type_t buft = sched->bufts[bid];
 
+            // grow past what this graph needs, but never past the full context, the budget, or the room left on each device
+            size_t slot_limit = std::min(slot_size_max[bid], SIZE_MAX/tr->n_slots);
+            if (tr->budget > 0) {
+                slot_limit = std::min(slot_limit, ggml_backend_sched_share_limit(tr->budget, share_max)/tr->n_slots);
+            }
+
             // the graph allocator reserved before this, so leave it the room its buffers may still grow into
-            const size_t dev_free = ggml_backend_sched_transport_dev_free(sched->backends[bid]);
-            if (dev_free > 0 && (dev_free <= GGML_SCHED_TRANSPORT_HEADROOM || ring_size > dev_free - GGML_SCHED_TRANSPORT_HEADROOM)) {
-                if (!r->reported_no_room) {
-                    GGML_LOG_WARN("%s: transport ring on %s would need %zu MiB and leave less than "
-                            "%u MiB of the %zu MiB free, staying on the ordered path\n", __func__,
-                            ggml_backend_name(sched->backends[bid]), ring_size >> 20,
-                            GGML_SCHED_TRANSPORT_HEADROOM >> 20, dev_free >> 20);
-                    r->reported_no_room = true;
+            size_t dev_free[GGML_BACKEND_META_MAX_DEVICES];
+            ggml_backend_sched_transport_dev_free(sched->backends[bid], dev_free, n_devs);
+            bool no_room = false;
+            for (int j = 0; j < n_devs && !no_room; j++) {
+                if (dev_free[j] == 0) {
+                    continue;
                 }
+                const size_t need = ggml_backend_sched_share_size(ring_size, shares[j]);
+                if (dev_free[j] <= GGML_SCHED_TRANSPORT_HEADROOM || need > dev_free[j] - GGML_SCHED_TRANSPORT_HEADROOM) {
+                    if (!r->reported_no_room) {
+                        GGML_LOG_WARN("%s: transport ring on %s would need %zu MiB on device %d and leave less than "
+                                "%u MiB of the %zu MiB free, staying on the ordered path\n", __func__,
+                                ggml_backend_name(sched->backends[bid]), need >> 20, j,
+                                GGML_SCHED_TRANSPORT_HEADROOM >> 20, dev_free[j] >> 20);
+                        r->reported_no_room = true;
+                    }
+                    no_room = true;
+                    break;
+                }
+                slot_limit = std::min(slot_limit,
+                        ggml_backend_sched_share_limit(dev_free[j] - GGML_SCHED_TRANSPORT_HEADROOM, shares[j])/tr->n_slots);
+            }
+            if (no_room) {
                 ggml_backend_sched_transport_decline_backend(sched, bid);
                 continue;
             }
 
-            // grow past what this graph needs, but never past the full context, the budget, or what the headroom check just approved
-            size_t slot_limit = std::min(slot_size_max[bid], SIZE_MAX/tr->n_slots);
-            if (tr->budget > 0) {
-                slot_limit = std::min(slot_limit, tr->budget/tr->n_slots);
-            }
-            if (dev_free > GGML_SCHED_TRANSPORT_HEADROOM) {
-                slot_limit = std::min(slot_limit, (dev_free - GGML_SCHED_TRANSPORT_HEADROOM)/tr->n_slots);
-            }
             const size_t slot_alloc = ggml_backend_sched_transport_slot_alloc(slot_size[bid], slot_limit, r->alignment);
             const size_t alloc_size = slot_alloc*tr->n_slots;
 
-            ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+            ggml_backend_buffer_t buffer = ggml_backend_is_meta(sched->backends[bid]) ?
+                ggml_backend_meta_alloc_buffer_shares(buft, alloc_size, shares) : ggml_backend_buft_alloc_buffer(buft, alloc_size);
             if (buffer == NULL) {
                 // the headroom check passed, so the device is out of memory for reasons this cannot see; a retry per graph costs a context per token
                 GGML_LOG_WARN("%s: failed to allocate %zu MiB for the transport ring on %s, "
-                        "pipelining disabled there\n", __func__, alloc_size >> 20,
+                        "pipelining disabled there\n", __func__, ggml_backend_sched_share_size(alloc_size, share_max) >> 20,
                         ggml_backend_name(sched->backends[bid]));
                 ggml_backend_sched_transport_disable_backend(sched, bid);
                 continue;
@@ -2544,10 +2605,14 @@ static void ggml_backend_sched_transport_plan(ggml_backend_sched_t sched) {
 
             r->buffer    = buffer;
             r->slot_size = slot_alloc;
+            memcpy(r->shares, shares, n_devs*sizeof(shares[0]));
 
             if (tr->debug > 0) {
-                GGML_LOG_INFO("%s: transport ring on %s: %d slots x %zu KiB\n", __func__,
-                        ggml_backend_name(sched->backends[bid]), tr->n_slots, slot_alloc >> 10);
+                for (int j = 0; j < n_devs; j++) {
+                    GGML_LOG_INFO("%s: transport ring on %s, device %d: %d slots x %zu KiB\n", __func__,
+                            ggml_backend_name(sched->backends[bid]), j, tr->n_slots,
+                            ggml_backend_sched_share_size(slot_alloc, shares[j]) >> 10);
+                }
             }
         }
 

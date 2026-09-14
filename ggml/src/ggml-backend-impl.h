@@ -104,6 +104,13 @@ extern "C" {
     // a meta backend without a communicator, for moving data on streams of its own: a graph it computes reduces through copies
     GGML_API ggml_backend_t ggml_backend_meta_init_transfer(ggml_backend_dev_t meta_dev);
 
+    // A meta buffer whose simple buffer j holds shares[j]/65536 of `size`: a tensor at meta offset X lands at X*shares[j] there, rounded up to the alignment.
+    // Every tensor placed in it must take at most that share on each device, which ggml_backend_meta_get_shares returns for a set of tensors.
+    GGML_API ggml_backend_buffer_t ggml_backend_meta_alloc_buffer_shares(ggml_backend_buffer_type_t buft, size_t size, const uint32_t * shares);
+
+    // for each simple buffer type of buft, the smallest share that holds every one of these compute leaves, 65536 for all of it
+    GGML_API void ggml_backend_meta_get_shares(ggml_backend_buffer_type_t buft, const struct ggml_tensor * const * tensors, size_t n_tensors, uint32_t * shares);
+
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 

@@ -312,7 +312,7 @@ A device-resident KV run is unaffected, and was measured to confirm it: 38.5612 
 - **One ring per accelerator.** A layer-split model pipelines on every device that qualifies; a device with no room within the budget falls back to the ordered path on its own without disabling the others. The exception is a graph that cannot be allocated next to the rings: there every device that was holding one gives it back for good, because the allocator does not say which of them it competed with.
 - **The producer of a staged input must be the CPU or the consumer itself.** Neither part of a staged delivery is ordered against a third device: the stable prefix goes on the transfer stream and the rest on the consumer's own stream, where the ordered path would have synchronized the producer first. An input a second accelerator writes keeps the ordered path.
 - **It turns graph-level pipeline parallelism off while it is delivering.** A graph that delivered has to block the host on its consumer before the next graph writes the host cache, because the host source of a delivery is read long after the call that issued it returned. That block is what `n_copies > 1` exists to avoid, so the two do not overlap: with `-sm layer` over several GPUs and `--kv-cpu-pinned`, `llama_context` enables both and the ring wins. Use `--kv-pipeline-depth 0` to keep the graph-level pipelining instead.
-- **Tensor parallelism pipelines through the meta backend**, and each device allocates the whole ring. See [Tensor parallelism](#tensor-parallelism).
+- **Tensor parallelism pipelines through the meta backend**, and each device allocates its share of the ring. See [Tensor parallelism](#tensor-parallelism).
 - **A host write to the cache waits for the delivery.** `llama_memory_clear(mem, true)` waits for the scheduler before it clears the buffers, because a delivery the last decode issued can still be reading them. This was already needed without the transport: with a device-resident cache the same call cleared the buffers under the running graph, and `llama_decode` followed by that clear changed the logits of that decode on every trial.
 - The scheduler must be configured with the device's own default buffer type. A scheduler built on a split or host buffer type keeps the ordered path.
 - `GGML_KV_PIPELINE_DEPTH` and `GGML_KV_PIPELINE_BUDGET_MIB` set the defaults of a scheduler that nothing else configures. `llama_context` always configures its own from the context parameters, so under `llama-server` and `llama-bench` use `--kv-pipeline-depth` / `LLAMA_ARG_KV_PIPELINE_DEPTH` and `--kv-pipeline-budget` / `LLAMA_ARG_KV_PIPELINE_BUDGET` instead.
@@ -330,7 +330,20 @@ What the meta backend adds:
 - **A transfer backend without a communicator.** The transfer backend never computes, so `ggml_backend_meta_init_transfer` builds its streams without starting a second NCCL context.
 - **The ring is a meta buffer.** A copy in it gets its per-device tensors from the same split-state callback as the copy the graph allocator would have made. The meta graph compute also rotates the compute containers of buffers that appear only as sources, or the ring's per-device tensors would accumulate one set per plan.
 
-**Each device allocates the whole slot.** A meta buffer places a tensor at the same offset in every device's buffer and sizes each of those buffers for the whole tensor, so a device that holds half the heads still allocates the full slot. The meta compute buffers already work this way. The budget and the headroom check are applied per device, against the device with the least free memory, so a ring that fits the budget costs that much on every device.
+**Each device allocates its share of the ring.** A meta buffer normally sizes every device's buffer for the whole tensor and places a tensor at the same offset in each, so a device that holds half the heads would allocate the full slot; the meta compute buffers still work this way. The ring is allocated with `ggml_backend_meta_alloc_buffer_shares` instead:
+
+- `ggml_backend_meta_get_shares` asks the split state of each staged copy and returns, per device, the largest fraction of an entry that device holds, in units of 1/65536.
+- Device `j` allocates that share of the ring, and an entry at meta offset `X` lands at `X * share_j` there, rounded up to the device's alignment. The share includes one alignment per entry, so two neighbouring entries never overlap after rounding; binding a tensor asserts that it fits.
+- The budget caps the ring on the device with the largest share, and the headroom check is applied on each device against its own share.
+- A plan whose entries need a larger share than the ring was allocated with grows the ring, the same as one that needs a larger slot.
+
+A ring that holds a mirrored entry has a share of 1 on every device, which is the same as a plain meta buffer. The share is the largest over the entries, so a layer that puts all of its KV heads on one device costs that device the whole slot: gemma-4 at `-ts 55,45` allocates 8,192 KiB per slot on the first device and 4,097 KiB on the second.
+
+With `-ts 50,50` on Qwen3.8-27B-UD-IQ2_M each device allocates 4,097 KiB of an 8,192 KiB slot. That moves where the default budget declines. At 32,768 a slot is 70.7 MiB, so the ring is 212 MiB on each device if every device holds all of it, over the 128 MiB default, and 103.6 MiB per device at its share, under it. `llama-bench` at the default budget, one pass each:
+
+| depth | ordered | pipelined | ring per device |
+|---:|---:|---:|---:|
+| 32,768 | 4.07 | 4.88 | 3 x 34.5 MiB |
 
 ### Measurements
 
@@ -361,7 +374,7 @@ Per decode graph at 16,384, `GGML_SCHED_TRANSPORT_DEBUG=2`:
 | blocked in the ordered copy | 103.81 ms | 12.16 ms |
 | blocked waiting for the consumer | 31.06 ms | 95.43 ms |
 | bytes delivered early / late | 0 / 0 MiB | 549.3 / 3.2 MiB |
-| ring | - | 3 slots x 35 MiB, per device |
+| ring | - | 3 slots x 35 MiB |
 
 The copy is three times the compute here, where on the single RTX 4070 above the two were about equal. The 553 MiB cross in 104 ms, about 5.3 GB/s, and the 3060's half of them crosses a gen3 x4 link. The pipeline hides the compute behind the copy, and the consumer wait now contains the rest of the transfer, so the token is bounded by the slower link rather than by the order of the work. The ceiling is `max(copy, compute)` plus the work outside the split loop, the same as on one device, and at 16,384 the pipeline is within a few milliseconds of it.
 
@@ -376,7 +389,3 @@ On the same two devices:
 - Greedy `llama-completion`, 64 tokens behind a 3k prompt: Qwen3.8-27B-UD-IQ2_M gives `64e86551f7ef1638` with a device-resident cache and at `N = 0`, `1` and `4` with a host one. gemma-4-26B-A4B gives `5525e3f5ac7337d7` at `N = 0` and `1` with `-ts 50,50`, and `4f8986fb3655a567` at both with `-ts 55,45`.
 - `test-llama-archs` adds a `Meta -nkvo -np 2 -kvpd 1` configuration, which stages the cache on the meta ring and delivers it through the ranged head-split write. It passes on 2, 3 and 4 CUDA devices. It evaluates one ubatch, so it delivers only the late part.
 - `test-alloc` passes. Its meta test now covers a device of the meta type that is not the ggml meta backend, which stays ordered.
-
-## Future work
-
-- Allocate each device's part of a meta ring at its own share of the heads, instead of the whole slot on every device.
