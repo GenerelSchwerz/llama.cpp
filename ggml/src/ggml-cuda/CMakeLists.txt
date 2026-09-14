@@ -107,8 +107,6 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
-    file(GLOB   SRCS "template-instances/fattn-mma*.cu")
-    list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/mmf*.cu")
@@ -116,6 +114,22 @@ if (CUDAToolkit_FOUND)
 
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
+
+    if (GGML_CUDA_FA)
+        file(GLOB   SRCS "template-instances/fattn-mma-f16*.cu")
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+        # an extra native type compiles when GGML_CUDA_FA_QUANTS selects its K-V pair of the same type
+        file(GLOB   SRCS "template-instances/fattn-mma-quant*.cu")
+        get_directory_property(FATTN_DEFINITIONS COMPILE_DEFINITIONS)
+        ggml_cuda_fattn_mma_quant_extra_stems(FATTN_MMA_QUANT_EXTRA_STEMS)
+        foreach (STEM IN LISTS FATTN_MMA_QUANT_EXTRA_STEMS)
+            string(TOUPPER "GGML_CUDA_FA_${STEM}_${STEM}=1" PAIR_DEFINITION)
+            if (NOT PAIR_DEFINITION IN_LIST FATTN_DEFINITIONS)
+                list(FILTER SRCS EXCLUDE REGEX "fattn-mma-quant-instance-${STEM}-.*[.]cu$")
+            endif()
+        endforeach()
+        list(APPEND GGML_SOURCES_CUDA ${SRCS})
+    endif()
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}

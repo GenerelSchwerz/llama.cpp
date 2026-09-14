@@ -33,6 +33,8 @@ if (MUSAToolkit_FOUND)
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
+    # the quantized-native instances are CUDA only
+    list(FILTER SRCS EXCLUDE REGEX "fattn-mma-quant.*[.]cu$")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/mmq*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
