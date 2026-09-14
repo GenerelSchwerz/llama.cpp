@@ -27,26 +27,26 @@ bool server_sparse_batch_slot_is_affected(
 // Checkpoint and capped-MTP GPU replay use the same slot lifetime.
 // Only GPU replay owns accepted tokens and its sampler snapshot.
 struct server_speculative_replay_state {
-    bool mtp_gpu_snapshots_armed() const {
-        return phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED;
+    bool gpu_snapshots_armed() const {
+        return phase == phase_type::GPU_SNAPSHOTS_ARMED;
     }
 
-    bool mtp_gpu_replay_pending() const {
-        return phase == phase_type::MTP_GPU_REPLAY_PENDING;
+    bool gpu_replay_pending() const {
+        return phase == phase_type::GPU_REPLAY_PENDING;
     }
 
     bool excludes_replayed_token_from_acceptance() const {
         return phase == phase_type::CHECKPOINT_REPLAY;
     }
 
-    uint32_t mtp_gpu_replay_selected_token() const {
-        GGML_ASSERT(mtp_gpu_replay_pending());
+    uint32_t gpu_replay_selected_token() const {
+        GGML_ASSERT(gpu_replay_pending());
         return n_accepted;
     }
 
-    void arm_mtp_gpu_snapshots() {
-        GGML_ASSERT(phase == phase_type::IDLE || phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED);
-        phase = phase_type::MTP_GPU_SNAPSHOTS_ARMED;
+    void arm_gpu_snapshots() {
+        GGML_ASSERT(phase == phase_type::IDLE || phase == phase_type::GPU_SNAPSHOTS_ARMED);
+        phase = phase_type::GPU_SNAPSHOTS_ARMED;
     }
 
     void begin_checkpoint_replay() {
@@ -54,16 +54,16 @@ struct server_speculative_replay_state {
         phase = phase_type::CHECKPOINT_REPLAY;
     }
 
-    void begin_mtp_gpu_replay(llama_tokens tokens, common_sampler_ptr sampler, uint32_t accepted) {
-        GGML_ASSERT(phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED && sampler != nullptr);
+    void begin_gpu_replay(llama_tokens tokens, common_sampler_ptr sampler, uint32_t accepted) {
+        GGML_ASSERT(phase == phase_type::GPU_SNAPSHOTS_ARMED && sampler != nullptr);
         accepted_tokens = std::move(tokens);
         accepted_sampler = std::move(sampler);
         n_accepted = accepted;
-        phase = phase_type::MTP_GPU_REPLAY_PENDING;
+        phase = phase_type::GPU_REPLAY_PENDING;
     }
 
-    uint32_t consume_mtp_gpu_replay(llama_tokens & tokens, common_sampler_ptr & sampler) {
-        GGML_ASSERT(mtp_gpu_replay_pending() && accepted_sampler != nullptr);
+    uint32_t consume_gpu_replay(llama_tokens & tokens, common_sampler_ptr & sampler) {
+        GGML_ASSERT(gpu_replay_pending() && accepted_sampler != nullptr);
         tokens = std::move(accepted_tokens);
         sampler = std::move(accepted_sampler);
         const uint32_t accepted = n_accepted;
@@ -72,18 +72,18 @@ struct server_speculative_replay_state {
         return accepted;
     }
 
-    void discard_mtp_gpu_snapshot_arm() {
+    void discard_gpu_snapshot_arm() {
         GGML_ASSERT(phase == phase_type::IDLE ||
-                    phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED ||
+                    phase == phase_type::GPU_SNAPSHOTS_ARMED ||
                     phase == phase_type::CHECKPOINT_REPLAY);
-        if (phase == phase_type::MTP_GPU_SNAPSHOTS_ARMED) {
+        if (phase == phase_type::GPU_SNAPSHOTS_ARMED) {
             phase = phase_type::IDLE;
         }
     }
 
     void finish_verification() {
-        GGML_ASSERT(phase != phase_type::MTP_GPU_SNAPSHOTS_ARMED &&
-                    phase != phase_type::MTP_GPU_REPLAY_PENDING);
+        GGML_ASSERT(phase != phase_type::GPU_SNAPSHOTS_ARMED &&
+                    phase != phase_type::GPU_REPLAY_PENDING);
         reset();
     }
 
@@ -95,9 +95,9 @@ struct server_speculative_replay_state {
 private:
     enum class phase_type {
         IDLE,
-        MTP_GPU_SNAPSHOTS_ARMED,
+        GPU_SNAPSHOTS_ARMED,
         CHECKPOINT_REPLAY,
-        MTP_GPU_REPLAY_PENDING,
+        GPU_REPLAY_PENDING,
     };
 
     void clear_payload() {

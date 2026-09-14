@@ -257,20 +257,24 @@ static void test(void) {
         { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512" }, true, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-draft-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-draft-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8" }, true, 0, 8, false },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "0" }, true, 0, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "0" }, true, 0, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "2" }, true, 2, 1, true },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "2" }, true, 2, 1, true },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, true, 2, 1, true },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-mtp-rs-planes", "2" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "9" }, true, 9, 8, false },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "-1" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "1" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "10" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-mtp-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-draft-rs-planes", "2" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--ubatch-size", "9", "--spec-draft-rs-planes", "2" }, true, 2, 1, true },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--batch-size", "8", "--ubatch-size", "9", "--spec-draft-rs-planes", "2" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "9" }, true, 9, 8, false },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "-1" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "1" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "10" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, true, 4, 3, true },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "8", "--ubatch-size", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-dspark", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-dflash", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp,draft-eagle3", "--spec-draft-n-max", "8", "--spec-draft-rs-planes", "4" }, false, -1, -1, -1 },
     };
     for (const auto & test_case : mtp_cases) {
         params = common_params();
@@ -278,9 +282,9 @@ static void test(void) {
         argv.insert(argv.end(), test_case.args.begin(), test_case.args.end());
         assert(test_case.valid == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
         if (test_case.planes >= 0) {
-            assert(params.speculative.mtp_rs_planes == test_case.planes);
+            assert(params.speculative.rs_planes == test_case.planes);
             assert(params.speculative.need_n_rs_seq() == (uint32_t) test_case.n_rs_seq);
-            assert(params.speculative.is_mtp_rs_capped() == (bool) test_case.capped);
+            assert(params.speculative.is_rs_capped() == (bool) test_case.capped);
         }
     }
 
@@ -602,7 +606,10 @@ static void test_mtp_draft_ubatch_validation() {
 
     params.draft.n_ubatch = 0;
     params.draft.n_max = 8;
-    params.mtp_rs_planes = 2;
+    params.rs_planes = 2;
+    common_validate_speculative_params(params, 512, 512);
+
+    params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK };
     rejected = false;
     try {
         common_validate_speculative_params(params, 512, 512);
@@ -615,14 +622,14 @@ static void test_mtp_draft_ubatch_validation() {
     common_validate_speculative_params(params, 512, 512);
 }
 
-static void test_mtp_state_boundaries() {
+static void test_replay_state_boundaries() {
     std::vector<uint8_t> state;
     const std::vector<uint8_t> malformed = { 0x01, 0x02, 0x03 };
 
-    assert(!common_speculative_get_mtp_state(nullptr, 0, state));
+    assert(!common_speculative_get_replay_state(nullptr, 0, state));
     assert(state.empty());
-    assert(common_speculative_set_mtp_state(nullptr, 0, {}));
-    assert(!common_speculative_set_mtp_state(nullptr, 0, malformed));
+    assert(common_speculative_set_replay_state(nullptr, 0, {}));
+    assert(!common_speculative_set_replay_state(nullptr, 0, malformed));
 }
 
 int main(void) {
@@ -630,7 +637,7 @@ int main(void) {
         test();
         test_draft_ubatch_override();
         test_mtp_draft_ubatch_validation();
-        test_mtp_state_boundaries();
+        test_replay_state_boundaries();
     } catch (std::exception & e) {
         fprintf(stderr, "test-arg-parser: exception: %s\n", e.what());
         return 1;
