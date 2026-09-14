@@ -15,8 +15,11 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <limits>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -689,6 +692,33 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
+// Run the rollback suite for a single model. Models that are neither recurrent
+// nor hybrid have nothing to test and count as passing.
+static bool run_rollback_tests_for_model(const std::string & model_path, common_params params) {
+    params.model.path = model_path;
+
+    common_init_result_ptr llama_init = common_init_from_params(params);
+    llama_model * model = llama_init->model();
+    if (model == nullptr) {
+        fprintf(stderr, "%s : failed to init model '%s'\n", __func__, model_path.c_str());
+        return false;
+    }
+
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
+        return true;
+    }
+
+    for (uint8_t fill : { 0, 0x3e }) {
+        fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
+        if (test_rollback(params, model, fill) != 0) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -698,30 +728,75 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) {
+    // extract our own --models DIR option before handing the rest to the common arg parser
+    std::string models_dir;
+    std::vector<char *> filtered_argv;
+    filtered_argv.push_back(argv[0]);
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--models") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s : --models requires a directory argument\n", __func__);
+                return 1;
+            }
+            models_dir = argv[i + 1];
+            i++;
+        } else {
+            filtered_argv.push_back(argv[i]);
+        }
+    }
+    filtered_argv.push_back(nullptr);
+    const int fargc = (int) filtered_argv.size() - 1;
+
+    // in --models mode there is no single model; set a placeholder so the common parser's
+    // "--model is required" check passes (each model is set individually inside the loop)
+    if (!models_dir.empty()) {
+        params.model.path = models_dir;
+    }
+
+    if (!common_params_parse(fargc, filtered_argv.data(), params, LLAMA_EXAMPLE_COMMON)) {
         return 1;
     }
 
     ggml_backend_load_all();
 
-    common_init_result_ptr llama_init = common_init_from_params(params);
-    llama_model * model = llama_init->model();
-    if (model == nullptr) {
-        fprintf(stderr, "%s : failed to init model\n", __func__);
-        return 1;
-    }
-
-    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
-        fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
-        return 0;
-    }
-
-    for (uint8_t fill : { 0, 0x3e }) {
-        fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
-        if (test_rollback(params, model, fill) != 0) {
+    if (!models_dir.empty()) {
+        // run the rollback suite over every dummy model in the directory; models that
+        // are not recurrent/hybrid are skipped inside run_rollback_tests_for_model
+        if (!std::filesystem::exists(models_dir) || !std::filesystem::is_directory(models_dir)) {
+            fprintf(stderr, "%s : models directory '%s' does not exist\n", __func__, models_dir.c_str());
             return 1;
         }
+
+        std::vector<std::string> models;
+        for (const auto & entry : std::filesystem::directory_iterator(models_dir)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gguf") {
+                models.push_back(entry.path().string());
+            }
+        }
+        std::sort(models.begin(), models.end());
+
+        if (models.empty()) {
+            fprintf(stderr, "%s : no .gguf models found in '%s'\n", __func__, models_dir.c_str());
+            return 1;
+        }
+
+        fprintf(stderr, "%s : running rollback tests over %zu models in '%s'\n", __func__, models.size(), models_dir.c_str());
+
+        size_t n_fail = 0;
+        for (const auto & model_path : models) {
+            fprintf(stderr, "\n================================================================\n");
+            fprintf(stderr, "%s : model %s\n", __func__, model_path.c_str());
+            if (!run_rollback_tests_for_model(model_path, params)) {
+                n_fail++;
+            }
+        }
+
+        fprintf(stderr, "\n================================================================\n");
+        fprintf(stderr, "%s : summary: %zu failed (of %zu)\n", __func__, n_fail, models.size());
+
+        return n_fail == 0 ? 0 : 1;
     }
 
-    return 0;
+    // single-model mode
+    return run_rollback_tests_for_model(params.model.path, params) ? 0 : 1;
 }
