@@ -86,6 +86,8 @@ llama-cli -m model.gguf -sm tensor -ctk f16 -ctv f16
 - `--flash-attn off` or (`--flash-attn auto` resolving to `off` when it isn't supported) is a hard error.
 - KV cache types must be non-quantized: `f32`, `f16`, or `bf16`. Support for quantized KV cache is not implemented and trying to use it will result in an error.
 - Mark this configuration as experimental in your tooling: validate output quality before deploying.
+- `--no-kv-offload` works in this mode: the host-resident cache is split by attention head like the rest. Two limits: a backend without a native 2d copy (CPU, Metal) pays one transfer per cache cell, and Gemma 4 is less accurate this way (perplexity 235.03 with a host cache versus 227.23 with a device cache), so keep the cache on the devices for that architecture.
+- A recurrent or hybrid model always keeps its recurrent state on the devices in this mode, even with `--no-recurrent-state-offload`. The linear-attention op writes the state back together with its output, so the two do not agree on a host-resident state.
 - `--split-mode tensor`is not implemented for all architectures. The following will fail with *"LLAMA_SPLIT_MODE_TENSOR not implemented for architecture '...'"*:
 
   - **MoE / hybrid:** Grok, MPT, OLMoE, DeepSeek2, GLM-DSA, Nemotron-H, Nemotron-H-MoE, Granite-Hybrid, LFM2-MoE, Minimax-M2, Mistral4, Kimi-Linear, Jamba, Falcon-H1
