@@ -1863,7 +1863,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_buffer_t src_buf = input->view_src ? input->view_src->buffer : input->buffer;
                     struct ggml_backend_sched_ranges rg;
                     ggml_backend_sched_input_ranges(input, &rg);
-                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf);
+                    // a meta backend writes a whole contiguous tensor, it cannot take one range per stream
+                    const bool ranged = rg.n > 1 && src_buf != NULL && ggml_backend_buffer_is_host(src_buf) && !ggml_backend_is_meta(split_backend);
 
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
