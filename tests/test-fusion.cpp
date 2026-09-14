@@ -123,6 +123,9 @@ static bool is_quantized(const std::string & path) {
     if (idx < 0) {
         return false;
     }
+    if (gguf_get_kv_type(ctx.get(), idx) != GGUF_TYPE_UINT32) {
+        throw std::runtime_error("invalid general.file_type type: " + path);
+    }
     const uint32_t ftype = gguf_get_val_u32(ctx.get(), idx);
     return ftype != LLAMA_FTYPE_ALL_F32 && ftype != LLAMA_FTYPE_MOSTLY_F16 && ftype != LLAMA_FTYPE_MOSTLY_BF16;
 }

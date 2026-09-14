@@ -6,10 +6,8 @@
 #include "arg.h"
 #include "common.h"
 #include "ggml-backend.h"
-#include "gguf.h"
 #include "llama.h"
 
-#include "../src/llama-arch.h"
 #include "../src/llama-io.h"
 #include "../src/llama-memory.h"
 
@@ -694,19 +692,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     return 0;
 }
 
-static llm_arch read_model_arch(const std::string & path) {
-    gguf_init_params gparams = { /*.no_alloc = */ true, /*.ctx = */ nullptr };
-    gguf_context_ptr ctx(gguf_init_from_file(path.c_str(), gparams));
-    if (!ctx) {
-        return LLM_ARCH_UNKNOWN;
-    }
-    const int64_t idx = gguf_find_key(ctx.get(), "general.architecture");
-    if (idx < 0) {
-        return LLM_ARCH_UNKNOWN;
-    }
-    return llm_arch_from_string(gguf_get_val_str(ctx.get(), idx));
-}
-
 static bool run_rollback_tests_for_model(const std::string & model_path, common_params params) {
     params.model.path = model_path;
 
@@ -752,17 +737,21 @@ int main(int argc, char ** argv) {
     }
 
     // -m DIR: test every recurrent/hybrid model in the directory, an unreadable model counts as failed
+    // a vocab-only load gives the architecture without loading the weights
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only = true;
+
     std::vector<std::string> models;
     size_t n_unreadable = 0;
     for (const auto & file : fs_list(params.model.path, false)) {
         if (!string_ends_with(file.name, ".gguf")) {
             continue;
         }
-        const llm_arch arch = read_model_arch(file.path);
-        if (arch == LLM_ARCH_UNKNOWN) {
-            fprintf(stderr, "%s : cannot read architecture of '%s'\n", __func__, file.path.c_str());
+        llama_model_ptr model(llama_model_load_from_file(file.path.c_str(), mparams));
+        if (!model) {
+            fprintf(stderr, "%s : cannot read '%s'\n", __func__, file.path.c_str());
             n_unreadable++;
-        } else if (llm_arch_is_recurrent(arch) || llm_arch_is_hybrid(arch)) {
+        } else if (llama_model_is_recurrent(model.get()) || llama_model_is_hybrid(model.get())) {
             models.push_back(file.path);
         }
     }
