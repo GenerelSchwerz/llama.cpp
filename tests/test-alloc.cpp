@@ -2120,6 +2120,7 @@ static void test_transport_stops_after_backend_failure() {
     GGML_ASSERT(deliveries == 0);
 }
 
+// only the ggml meta backend is reached through its simple backends, another device of the meta type stays ordered
 static void test_transport_excludes_meta() {
     dummy_backend meta = dummy_backend_init(SIZE_MAX, 8, true, GGML_BACKEND_DEVICE_TYPE_META, "CUDA", false);
     dummy_backend cpu  = dummy_backend_init(SIZE_MAX, 8, true);
