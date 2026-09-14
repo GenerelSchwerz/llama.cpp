@@ -29,7 +29,7 @@ if (MUSAToolkit_FOUND)
     list(APPEND GGML_HEADERS_MUSA "../../include/ggml-cuda.h")
     list(APPEND GGML_HEADERS_MUSA "../ggml-musa/mudnn.cuh")
 
-    file(GLOB   GGML_SOURCES_MUSA "../ggml-cuda/*.cu")
+    file(GLOB   GGML_SOURCES_MUSA CONFIGURE_DEPENDS "../ggml-cuda/*.cu")
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_MUSA ${SRCS})
     file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
