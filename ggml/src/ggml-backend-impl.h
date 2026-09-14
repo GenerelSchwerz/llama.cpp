@@ -101,6 +101,9 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // a meta backend without a communicator, for moving data on streams of its own: a graph it computes reduces through copies
+    GGML_API ggml_backend_t ggml_backend_meta_init_transfer(ggml_backend_dev_t meta_dev);
+
     // temporary workaround to statically allocate tensors from a context in a deduplicated way:
     GGML_API struct ggml_backend_buffer * ggml_backend_meta_alloc_ctx_tensors_from_buft(struct ggml_context * ctx, ggml_backend_buffer_type_t buft);
 
