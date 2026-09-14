@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -918,91 +919,71 @@ static std::vector<float> get_logits(
     return ret;
 }
 
-enum class parallel_seq_result {
-    ok,
-    fail,
-    skip,
-};
-
-// Decode two independent sequences in a single parallel batch and compare each one's
-// logits against decoding it alone. A mismatch means one sequence's slot leaked into
-// the other's - the kind of bug a KV-cache / tensor-split change can introduce.
-// Only meaningful for decode-only archs: encoder-decoder cross-attention is a distinct
-// path that a decode-time KV-cache/tensor-split change would not affect.
-static parallel_seq_result test_parallel_seq_isolation(
-        llama_model * model, const std::vector<llama_token> & tokens, const uint32_t n_vocab) {
+// decode two sequences in one batch, compare each with a decode of it alone
+// logits_a: logits of tokens decoded alone with the same device config
+static bool test_parallel_seqs(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_a, bool encode) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_tokens = tokens.size();
 
-    // n_ctx scales with n_seq_max so every sequence gets the same per-sequence KV
-    // budget whether it is alone or sharing a context; leaving n_ctx on auto (0) picks
-    // a total that does not always divide evenly, which shifts SWA/ISWA cache sizing
-    // and makes the isolation check compare non-equivalent configurations.
+    // same per-sequence n_ctx as the reference context
     const auto make_cparams = [&](uint32_t n_seq_max) {
         llama_context_params cparams = llama_context_default_params();
-        cparams.n_ctx           = 256 * n_seq_max;
+        cparams.n_ctx           = n_seq_max*llama_model_n_ctx_train(model);
         cparams.n_threads       = 4;
         cparams.n_threads_batch = 4;
         cparams.n_seq_max       = n_seq_max;
-        cparams.n_ubatch        = 64;
+        if (!encode) {
+            cparams.n_ubatch = 64;
+        }
         return cparams;
     };
 
     llama_context_ptr ctx_par(llama_init_from_model(model, make_cparams(2)));
-    llama_context_ptr ctx_a(llama_init_from_model(model, make_cparams(1)));
     llama_context_ptr ctx_b(llama_init_from_model(model, make_cparams(1)));
-    if (!ctx_par || !ctx_a || !ctx_b) {
-        // some archs/backends do not support a second parallel slot in this configuration
-        return parallel_seq_result::skip;
+    if (!ctx_par || !ctx_b) {
+        return false;
     }
 
-    // seq 1 replays the same tokens rotated by one position, so the two slots carry
-    // different content and any cross-talk between them is visible in the logits
     std::vector<llama_token> tokens_b(n_tokens);
     for (uint32_t i = 0; i < n_tokens; i++) {
         tokens_b[i] = tokens[(i + 1) % n_tokens];
     }
 
     llama_batch batch_par = llama_batch_init(2*n_tokens, 0, 1);
+    llama_batch batch_b   = llama_batch_init(n_tokens, 0, 1);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
         common_batch_add(batch_par, tokens[pos],   pos, {0}, true);
         common_batch_add(batch_par, tokens_b[pos], pos, {1}, true);
+        common_batch_add(batch_b,   tokens_b[pos], pos, {0}, true);
     }
-    const bool ok_par = llama_decode(ctx_par.get(), batch_par) == 0;
+    bool ok = true;
+    if (encode) {
+        ok = llama_encode(ctx_par.get(), batch_par) == 0 && llama_encode(ctx_b.get(), batch_b) == 0;
+    }
+    ok = ok && llama_decode(ctx_par.get(), batch_par) == 0 && llama_decode(ctx_b.get(), batch_b) == 0;
     llama_batch_free(batch_par);
-    if (!ok_par) {
-        return parallel_seq_result::fail;
-    }
-
-    llama_batch batch_a = llama_batch_init(n_tokens, 0, 1);
-    llama_batch batch_b = llama_batch_init(n_tokens, 0, 1);
-    for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch_a, tokens[pos],   pos, {0}, true);
-        common_batch_add(batch_b, tokens_b[pos], pos, {0}, true);
-    }
-    const bool ok_ref = llama_decode(ctx_a.get(), batch_a) == 0 && llama_decode(ctx_b.get(), batch_b) == 0;
-    llama_batch_free(batch_a);
     llama_batch_free(batch_b);
-    if (!ok_ref) {
-        return parallel_seq_result::fail;
+    if (!ok) {
+        return false;
     }
 
-    constexpr float eps = 1e-5f;
+    std::vector<float> logits_par_a;
+    std::vector<float> logits_par_b;
+    std::vector<float> logits_b;
     for (uint32_t i = 0; i < n_tokens; i++) {
         const float * l_par_a = llama_get_logits_ith(ctx_par.get(), 2*i);
         const float * l_par_b = llama_get_logits_ith(ctx_par.get(), 2*i + 1);
-        const float * l_ref_a = llama_get_logits_ith(ctx_a.get(), i);
-        const float * l_ref_b = llama_get_logits_ith(ctx_b.get(), i);
-        if (l_par_a == nullptr || l_par_b == nullptr || l_ref_a == nullptr || l_ref_b == nullptr) {
-            return parallel_seq_result::fail;
+        const float * l_b     = llama_get_logits_ith(ctx_b.get(), i);
+        if (l_par_a == nullptr || l_par_b == nullptr || l_b == nullptr) {
+            return false;
         }
-        for (uint32_t j = 0; j < n_vocab; j++) {
-            if (std::fabs(l_par_a[j] - l_ref_a[j]) > eps || std::fabs(l_par_b[j] - l_ref_b[j]) > eps) {
-                return parallel_seq_result::fail;
-            }
-        }
+        logits_par_a.insert(logits_par_a.end(), l_par_a, l_par_a + n_vocab);
+        logits_par_b.insert(logits_par_b.end(), l_par_b, l_par_b + n_vocab);
+        logits_b.insert(logits_b.end(), l_b, l_b + n_vocab);
     }
 
-    return parallel_seq_result::ok;
+    // ubatch splits differ from the reference, so use the NMSE limit of the CPU comparison; NaN fails
+    return nmse(logits_a, logits_par_a) <= 1e-4 && nmse(logits_b, logits_par_b) <= 1e-4;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -1152,6 +1133,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         }
     }, &ud);
 
+    bool ok = true;
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
@@ -1182,27 +1164,21 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
 
-            // also quantize the dummy model, so quant-specific load/inference bugs
-            // surface in the same generalized test suite as the F16 models.
-            // FIXME: skip archs with pre-existing bugs unrelated to this suite, until
-            // someone investigates:
-            //  - BAILINGMOE3, KIMI_K3: ggml-cpu repack GGML_ASSERT(ne13 == 1) on a
-            //    quantized grouped-expert MUL_MAT_ID, hit by the rollback test's batch shapes
-            //  - QWEN4EXP: ~1e-5 dirty-ctx logit mismatch under rollback replay
-            const bool quant_known_broken = arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_QWEN4EXP;
-            if (!quant_known_broken) {
-                const std::string path_q4_0 = dir + "/" + llm_arch_name(arch) + (moe ? "-moe-q4_0.gguf" : "-dense-q4_0.gguf");
-                llama_model_quantize_params qparams = llama_model_quantize_default_params();
-                qparams.ftype   = LLAMA_FTYPE_MOSTLY_Q4_0;
-                qparams.nthread = 1;
-                if (llama_model_quantize(path.c_str(), path_q4_0.c_str(), &qparams) != 0) {
-                    LOG_INF("%s: %s model (%s) could not be quantized to Q4_0, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
-                }
+            const std::string path_q4_0 = dir + "/" + llm_arch_name(arch) + (moe ? "-moe-q4_0.gguf" : "-dense-q4_0.gguf");
+            LOG_INF("%s: Quantizing %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path_q4_0.c_str());
+            llama_model_quantize_params qparams = llama_model_quantize_default_params();
+            qparams.ftype   = LLAMA_FTYPE_MOSTLY_Q4_0;
+            qparams.nthread = 1;
+            if (llama_model_quantize(path.c_str(), path_q4_0.c_str(), &qparams) != 0) {
+                LOG_ERR("%s: failed to quantize %s\n", __func__, path.c_str());
+                // a failed quantization can leave a file with an invalid header
+                std::filesystem::remove(path_q4_0);
+                ok = false;
             }
         }
     }
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
-    return 0;
+    return ok ? 0 : 1;
 }
 
 static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
@@ -1340,16 +1316,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
 
-                        // encoder-decoder archs use a distinct cross-attention path that is not
-                        // what a decode-time KV-cache/tensor-split change would affect.
-                        // FIXME: gemma3n's ISWA cache produces occasional cross-sequence
-                        // divergence with n_seq_max > 1; needs its own investigation.
-                        if (!encode && arch != LLM_ARCH_GEMMA3N) {
-                            const parallel_seq_result parallel_res = test_parallel_seq_isolation(
-                                model_and_ctx_dev.first.get(), tokens, llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx_dev.first.get())));
-                            if (parallel_res == parallel_seq_result::ok) {
-                                status_parallel = "\033[1;32mOK\033[0m";
-                            } else if (parallel_res == parallel_seq_result::fail) {
+                        // FIXME: T5 kq_b does not broadcast over KV streams, so context init with n_seq_max > 1 aborts
+                        if (arch != LLM_ARCH_T5) {
+                            status_parallel = "\033[1;32mOK\033[0m";
+                            if (!test_parallel_seqs(model_and_ctx_dev.first.get(), tokens, logits_dev, encode)) {
                                 all_ok = false;
                                 status_parallel = "\033[1;31mFAIL\033[0m";
                             }

@@ -220,12 +220,11 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
-    # Test recurrent/hybrid state rollback across all architectures, using the generated
-    # dummy models; non-recurrent models are skipped inside the test binary
+    # Test recurrent/hybrid state rollback on all generated recurrent/hybrid dummy models
     llama_test(
         test-recurrent-state-rollback
         LABEL main
-        ARGS --models "${MODEL_DIR}"
+        ARGS -m "${MODEL_DIR}"
     )
     set_tests_properties(test-recurrent-state-rollback PROPERTIES
         FIXTURES_REQUIRED generate-models
