@@ -15,6 +15,7 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
 #include <set>
 #include <utility>
@@ -518,8 +519,10 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     }
 #endif
 
-    llama_context * ctx_src = make_ctx(params, model, fill);
-    llama_context * ctx_dst = make_ctx(params, model, fill);
+    llama_context_ptr ctx_src_owner(make_ctx(params, model, fill));
+    llama_context_ptr ctx_dst_owner(make_ctx(params, model, fill));
+    llama_context * ctx_src = ctx_src_owner.get();
+    llama_context * ctx_dst = ctx_dst_owner.get();
     if (ctx_src == nullptr || ctx_dst == nullptr) {
         fprintf(stderr, "%s : failed to init contexts\n", __func__);
         return 1;
@@ -527,8 +530,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
 
     if (llama_n_rs_seq(ctx_src) == 0) {
         fprintf(stderr, "%s : skipping because n_rs_seq is disabled\n", __func__);
-        llama_free(ctx_src);
-        llama_free(ctx_dst);
         return 0;
     }
 
@@ -542,8 +543,6 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     constexpr uint32_t n_rollback = 3;
     if (n_rs_seq < n_rollback) {
         fprintf(stderr, "%s : skipping because n_rs_seq is too small\n", __func__);
-        llama_free(ctx_src);
-        llama_free(ctx_dst);
         return 0;
     }
     if (tokens.empty()) {
@@ -573,8 +572,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     ckpt.load_tgt(ctx_dst, 0, 0);
 
     constexpr float eps = 1e-5f;
+    // the dirty-ctx check below loads ckpt, so it compares with the replay right after ckpt
     std::vector<std::vector<float>> logits_src_replay(n_rollback);
-    const auto replay_and_compare = [&](const char * mode) {
+    const auto replay_and_compare = [&](const char * mode, bool keep_logits) {
         for (uint32_t i = 0; i < n_rollback; ++i) {
             const llama_pos pos = rollback_pos + i;
             if (!decode_one(ctx_src, tokens[pos], pos) ||
@@ -590,7 +590,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
                 return false;
             }
 
-            logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            if (keep_logits) {
+                logits_src_replay[i].assign(logits_src, logits_src + n_vocab);
+            }
             for (int token = 0; token < n_vocab; ++token) {
                 if (logit_diff(logits_src[token], logits_dst[token]) > eps) {
                     fprintf(stderr, "%s : %s logits mismatch at position %d, token %d (%g != %g)\n",
@@ -601,7 +603,7 @@ static int test_rollback(const common_params & params, llama_model * model, uint
         }
         return true;
     };
-    if (!replay_and_compare("full")) {
+    if (!replay_and_compare("full", true)) {
         return 1;
     }
 
@@ -616,14 +618,15 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     ckpt_partial.update_tgt(ctx_src, 0, partial_flags);
     ckpt_partial.load_tgt(ctx_dst, 0, partial_flags);
 
-    if (!replay_and_compare("partial")) {
+    if (!replay_and_compare("partial", false)) {
         return 1;
     }
 
     // Repeat the load into a context that already has its own rollback state:
     // groups 1..n_rs_seq hold a different prompt's history, and rs_idx[0] is
     // non-zero at load time. The restore must wipe that state and still match.
-    llama_context * ctx_dirty = make_ctx(params, model, fill);
+    llama_context_ptr ctx_dirty_owner(make_ctx(params, model, fill));
+    llama_context * ctx_dirty = ctx_dirty_owner.get();
     if (ctx_dirty == nullptr) {
         fprintf(stderr, "%s : failed to init dirty ctx\n", __func__);
         return 1;
@@ -670,9 +673,9 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     }
 
     fprintf(stderr, "%s : recurrent rollback checkpoint restored successfully\n", __func__);
-    llama_free(ctx_src);
-    llama_free(ctx_dst);
-    llama_free(ctx_dirty);
+    ctx_src_owner.reset();
+    ctx_dst_owner.reset();
+    ctx_dirty_owner.reset();
 
     if (!test_multi_seq_split_replay(params, model, n_vocab, fill)) {
         return 1;
@@ -687,6 +690,31 @@ static int test_rollback(const common_params & params, llama_model * model, uint
     }
 
     return 0;
+}
+
+static bool run_rollback_tests_for_model(const std::string & model_path, common_params params) {
+    params.model.path = model_path;
+
+    common_init_result_ptr llama_init = common_init_from_params(params, true);
+    llama_model * model = llama_init->model();
+    if (model == nullptr) {
+        fprintf(stderr, "%s : failed to init model '%s'\n", __func__, model_path.c_str());
+        return false;
+    }
+
+    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
+        fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
+        return true;
+    }
+
+    for (uint8_t fill : { 0, 0x3e }) {
+        fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
+        if (test_rollback(params, model, fill) != 0) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 int main(int argc, char ** argv) {
@@ -704,24 +732,51 @@ int main(int argc, char ** argv) {
 
     ggml_backend_load_all();
 
-    common_init_result_ptr llama_init = common_init_from_params(params);
-    llama_model * model = llama_init->model();
-    if (model == nullptr) {
-        fprintf(stderr, "%s : failed to init model\n", __func__);
+    if (!std::filesystem::is_directory(params.model.path)) {
+        return run_rollback_tests_for_model(params.model.path, params) ? 0 : 1;
+    }
+
+    // -m DIR: test every recurrent/hybrid model in the directory, an unreadable model counts as failed
+    // a vocab-only load gives the architecture without loading the weights
+    llama_model_params mparams = llama_model_default_params();
+    mparams.vocab_only = true;
+
+    std::vector<std::string> models;
+    size_t n_unreadable = 0;
+    for (const auto & file : fs_list(params.model.path, false)) {
+        if (!string_ends_with(file.name, ".gguf")) {
+            continue;
+        }
+        llama_model_ptr model(llama_model_load_from_file(file.path.c_str(), mparams));
+        if (!model) {
+            fprintf(stderr, "%s : cannot read '%s'\n", __func__, file.path.c_str());
+            n_unreadable++;
+        } else if (llama_model_is_recurrent(model.get()) || llama_model_is_hybrid(model.get())) {
+            models.push_back(file.path);
+        }
+    }
+    std::sort(models.begin(), models.end());
+
+    if (models.empty()) {
+        fprintf(stderr, "%s : no recurrent or hybrid models found in '%s'\n", __func__, params.model.path.c_str());
         return 1;
     }
 
-    if (!llama_model_is_recurrent(model) && !llama_model_is_hybrid(model)) {
-        fprintf(stderr, "%s : skipping for non-recurrent model\n", __func__);
-        return 0;
+    fprintf(stderr, "%s : testing %zu recurrent/hybrid models:\n", __func__, models.size());
+    for (const auto & model_path : models) {
+        fprintf(stderr, "  %s\n", model_path.c_str());
     }
 
-    for (uint8_t fill : { 0, 0x3e }) {
-        fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
-        if (test_rollback(params, model, fill) != 0) {
-            return 1;
+    size_t n_fail = 0;
+    for (size_t i = 0; i < models.size(); i++) {
+        fprintf(stderr, "\n%s : [%zu/%zu] model %s\n", __func__, i + 1, models.size(), models[i].c_str());
+        if (!run_rollback_tests_for_model(models[i], params)) {
+            fprintf(stderr, "%s : FAILED %s\n", __func__, models[i].c_str());
+            n_fail++;
         }
     }
 
-    return 0;
+    fprintf(stderr, "\n%s : %zu tested, %zu failed, %zu unreadable\n", __func__, models.size(), n_fail, n_unreadable);
+
+    return n_fail == 0 && n_unreadable == 0 ? 0 : 1;
 }
