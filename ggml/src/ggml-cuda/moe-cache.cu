@@ -14521,9 +14521,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
         return buffer;
     }
 
+    std::unique_ptr<void, decltype(&cudaFreeHost)> allocation(ptr, cudaFreeHost);
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    if (buffer == nullptr) {
+        return nullptr;
+    }
     buffer->buft             = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_moe_cached_buffer_free_buffer;
+    allocation.release();
     return buffer;
 }
 
