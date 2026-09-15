@@ -1749,8 +1749,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
         ggml_backend_reg_t buft_reg = ggml_backend_dev_backend_reg(dev);
-        auto is_moe_cache_buft_fn = (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
-                buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME);
+        auto is_moe_cache_buft_fn = buft_reg != nullptr ?
+            (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
+                buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
         const bool is_moe_cache_buft = is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
         if (ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
             GGML_ASSERT(!ml.no_alloc);
