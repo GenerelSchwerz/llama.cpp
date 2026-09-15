@@ -1397,6 +1397,7 @@ void llm_graph_result::reset() {
     inputs.clear();
     inp_token_tensors.clear();
     fused_nodes.clear();
+    moe_regions.clear();
 
     buf_compute_meta.resize(ggml_tensor_overhead()*max_nodes + ggml_graph_overhead_custom(max_nodes, false));
 
@@ -1515,6 +1516,76 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
 
 void llm_graph_result::add_fused_node(llm_graph_fused_node result) {
     fused_nodes.push_back(result);
+}
+
+static bool is_metadata_view(const ggml_tensor * tensor) {
+    return tensor->op == GGML_OP_VIEW || tensor->op == GGML_OP_RESHAPE || tensor->op == GGML_OP_PERMUTE ||
+           tensor->op == GGML_OP_TRANSPOSE;
+}
+
+void llm_graph_result::add_moe_region(int32_t       layer,
+                                      ggml_tensor * down,
+                                      ggml_tensor * route,
+                                      ggml_tensor * first,
+                                      ggml_tensor * output,
+                                      bool          external_route) {
+    llm_graph_moe_region region;
+    region.layer          = layer;
+    region.down           = down;
+    region.route          = route;
+    region.output         = output;
+    region.external_route = external_route;
+    std::unordered_set<ggml_tensor *> local;
+    // The builder supplies its first new tensor. Never collect input ancestors.
+    for (auto * tensor = first; tensor; tensor = ggml_get_next_tensor(get_ctx(), tensor)) {
+        if (tensor->op != GGML_OP_NONE) {
+            region.operations.push_back(tensor);
+            local.insert(tensor);
+        }
+    }
+    for (auto * tensor : region.operations) {
+        for (auto * src : tensor->src) {
+            if (src && local.count(src) == 0 &&
+                std::find(region.inputs.begin(), region.inputs.end(), src) == region.inputs.end()) {
+                region.inputs.push_back(src);
+            }
+        }
+    }
+    moe_regions.push_back(std::move(region));
+}
+
+bool llm_graph_moe_region::place(ggml_backend_sched_t sched, ggml_backend_t owner) {
+    if (!owner || external_route || !route || route->op != GGML_OP_VIEW || !route->src[0] ||
+        route->src[0]->op != GGML_OP_ARGSORT) {
+        return false;
+    }
+    const std::unordered_set<ggml_tensor *> local(operations.begin(), operations.end());
+    if (local.count(route) == 0 || local.count(route->src[0]) == 0 || local.count(output) == 0) {
+        return false;
+    }
+    // Validate the complete region before changing any scheduler assignment.
+    for (auto * node : operations) {
+        if (is_metadata_view(node)) {
+            continue;  // A boundary view must remain with its external source.
+        }
+        if (!ggml_backend_supports_op(owner, node) || node->buffer != nullptr) {
+            return false;
+        }
+        for (auto * src : node->src) {
+            auto * buffer = src ? (src->view_src ? src->view_src->buffer : src->buffer) : nullptr;
+            if (buffer && ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                !ggml_backend_supports_buft(owner, ggml_backend_buffer_get_type(buffer))) {
+                return false;  // An incompatible weight can cut the local route into a new split.
+            }
+        }
+    }
+    for (auto * node : operations) {
+        if (!is_metadata_view(node)) {
+            ggml_backend_sched_set_tensor_backend(sched, node, owner);
+        }
+    }
+    backend = owner;
+    return true;
 }
 
 void llm_graph_result::set_params(const llm_graph_params & params) {
@@ -2093,6 +2164,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
 
+    ggml_tensor * ffn_input = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
@@ -2229,7 +2302,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
-    cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+    cur = ffn_input;
 
     if (weight_before_ffn) {
         // repeat cur to [n_embd, n_expert_used, n_tokens]
@@ -2425,6 +2498,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     cb(moe_out, "ffn_moe_out", il);
+
+    res->add_moe_region(il, down_exps, selected_experts, ffn_input, moe_out, selected_experts_in != nullptr);
 
     return moe_out;
 }

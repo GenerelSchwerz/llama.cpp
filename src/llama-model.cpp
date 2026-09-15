@@ -1854,6 +1854,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    build_moe_sources();
+
     if (ml.no_alloc) {
         return true;
     }
@@ -1873,7 +1875,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    build_moe_sources();
     if (params.moe_expert_cache_host_pinned_size > 0) {
         std::vector<ggml_backend_moe_candidate_group_v2> groups;
         std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
@@ -2340,10 +2341,12 @@ void llama_model::build_moe_sources() {
         }
         return &result.back();
     };
-    for (const auto & layer : layers) {
+    for (size_t il = 0; il < layers.size(); ++il) {
+        const auto & layer = layers[il];
         auto * group = append(GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, layer.ffn_gate_inp != nullptr,
             layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps, layer.ffn_down_exps);
         if (group) {
+            group->layer = static_cast<int32_t>(il);
             auto add = [&](ggml_tensor * tensor, uint32_t role, uint32_t status) {
                 if (tensor) {
                     group->banks.push_back({tensor, role, status});
@@ -2360,8 +2363,11 @@ void llama_model::build_moe_sources() {
             add(layer.ffn_up_exps_in_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
             add(layer.ffn_down_exps_in_s, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_INPUT_SCALE, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_INPUT_SCALE);
         }
-        append(GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, true,
-            layer.ffn_gate_chexps, layer.ffn_up_chexps, nullptr, layer.ffn_down_chexps);
+        auto * chunk = append(GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_CHUNK, true, layer.ffn_gate_chexps,
+                              layer.ffn_up_chexps, nullptr, layer.ffn_down_chexps);
+        if (chunk) {
+            chunk->layer = static_cast<int32_t>(il);
+        }
     }
     pimpl->moe_sources = std::move(result);
 }

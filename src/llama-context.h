@@ -34,6 +34,7 @@ struct llama_speculative_grouped_intent_test_access {
     static bool matches_ubatch(
         llama_context_type context_type, const llama_ubatch & ubatch, uint32_t row_semantics);
     static bool backend_supported(ggml_backend_t backend);
+    static bool                               graph_supported(ggml_backend_sched_t sched, ggml_cgraph * gf);
     static uint32_t flags(uint32_t cache_slots, bool backend_supported);
     static llama_speculative_execution_policy policy(
         const llama_batch & batch, uint32_t cache_slots, bool backend_supported);
@@ -334,6 +335,9 @@ public:
 
 private:
     void place_sampled_inputs(llm_graph_result * res);
+    void            refresh_moe_layer_owners();
+    void            place_moe_regions(llm_graph_result * res);
+    bool            moe_graph_supports_required_grouped(ggml_cgraph * gf) const;
     void finish_compute(int64_t n_tokens, int64_t elapsed_us);
     void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch);
     void reset_sched_workspace();
@@ -485,6 +489,7 @@ private:
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
     std::vector<std::pair<ggml_backend_t, ggml_backend_moe_candidate_replace_v2_t>> moe_candidate_replace_fns;
     bool moe_required_grouped_execution_supported = false;
+    std::vector<ggml_backend_t> moe_layer_owners;
     uint64_t graph_execution_owner_namespace = 0;
     uint64_t graph_execution_owner_generation = 1;
     bool moe_candidate_refresh_pending = true;

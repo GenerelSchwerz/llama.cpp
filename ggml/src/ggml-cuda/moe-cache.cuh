@@ -453,7 +453,7 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t completed_max = 0;
     uint64_t admitted_banks = 0;
     uint64_t fallback = 0;
-    uint64_t rollback = 0;
+    uint64_t rollback              = 0;  // Reserved legacy field; no graph-output rollback is implemented.
     uint64_t host_staged_calls = 0;
     uint64_t host_staged_ops = 0;
     uint64_t host_staged_split_ops = 0;
@@ -463,6 +463,14 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t finish_error = 0;
     uint64_t h2d_banks = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t decode_grouped        = 0;
+    uint64_t decode_legacy         = 0;
+    // Final readers submitted; completed counts successful completion-event recording, not a host wait.
+    uint64_t submitted             = 0;
+    // Group dispatches begun, before reader submission.
+    uint64_t direct                = 0;
+    uint64_t captures              = 0;
+    uint64_t replays               = 0;
 };
 
 struct ggml_cuda_moe_legacy_debug_telemetry {

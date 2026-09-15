@@ -1524,6 +1524,10 @@ void test_candidate_producer() {
 
     llama_adapter_loras loras;
     model->build_moe_sources();
+    CHECK(model->moe_sources().size() == 4);
+    for (int32_t layer = 0; layer < 4; ++layer) {
+        CHECK(model->moe_sources()[layer].layer == layer);
+    }
     llama_moe_candidate_snapshot produced(*model, loras);
     const auto & snapshot = produced.get();
     CHECK(snapshot.magic == GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC);

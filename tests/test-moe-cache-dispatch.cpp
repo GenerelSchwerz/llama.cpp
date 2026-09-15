@@ -636,7 +636,8 @@ static void test_active_grouped_dispatch_staged_legacy() {
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 0 && telemetry.plan_calls == 0);
     CHECK(telemetry.calls == 0 && telemetry.ready == 0 && telemetry.completed == 0 && telemetry.admitted_banks == 0);
-    CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    CHECK(telemetry.decode_grouped == 0 && telemetry.decode_legacy == 1 && telemetry.fallback == 1);
+    CHECK(telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     CHECK(telemetry.h2d_banks == 0 && telemetry.h2d_bytes == 0);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
 }

@@ -403,10 +403,15 @@ if (GGML_CUDA AND NOT GGML_BACKEND_DL AND TARGET ggml-cuda AND (NOT WIN32 OR NOT
         test-moe-cache-dispatch.cpp
         test-moe-cache-mmid.cpp
         test-moe-cache-staging.cpp
+        test-moe-cache-multigpu.cpp
     )
     target_compile_features(test-moe-cache PRIVATE cxx_std_17)
     target_link_libraries(test-moe-cache PRIVATE llama ggml-cuda ggml-base CUDA::cudart)
     target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
     add_test(NAME test-moe-cache COMMAND test-moe-cache)
+    add_test(NAME test-moe-cache-layer COMMAND test-moe-cache --grouped-layer-only)
+    set_tests_properties(test-moe-cache-layer PROPERTIES LABELS "main")
+    add_test(NAME test-moe-cache-multigpu COMMAND test-moe-cache --grouped-multigpu-only)
+    set_tests_properties(test-moe-cache-multigpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "main;multigpu")
     set_property(TEST test-moe-cache PROPERTY LABELS "main")
 endif()
