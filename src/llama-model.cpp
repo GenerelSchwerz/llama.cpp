@@ -348,6 +348,9 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
 }
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && params.moe_expert_cache_slots > 0) {
+        throw std::runtime_error("MoE expert caching does not support tensor split; use --split-mode layer or --moe-expert-cache-size 0");
+    }
     llama_model * model = llama_model_mapping(arch, params);
 
     if (model != nullptr) {

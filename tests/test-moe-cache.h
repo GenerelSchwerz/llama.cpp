@@ -681,6 +681,7 @@ void test_active_grouped_nvfp4_scales();
 void test_prefill_resident_biases();
 
 void test_active_grouped_dispatch();
+void test_moe_tensor_split_rejection();
 
 void test_cached_mmid_fusion_decline();
 

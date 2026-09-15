@@ -5,6 +5,24 @@
 #include "../src/llama-model.h"
 #include "../src/llama-vocab.h"
 
+void test_moe_tensor_split_rejection() {
+    auto params = llama_model_default_params();
+    params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+    params.moe_expert_cache_slots = 8;
+    bool rejected = false;
+    try {
+        llama_model_free(llama_model_create(LLM_ARCH_DEEPSEEK4, params));
+    } catch (const std::runtime_error & error) {
+        rejected = std::string(error.what()).find("MoE expert caching does not support tensor split") != std::string::npos;
+    }
+    CHECK(rejected);
+    params.moe_expert_cache_slots = 0;
+    llama_model * model = llama_model_create(LLM_ARCH_DEEPSEEK4, params);
+    CHECK(model != nullptr);
+    llama_model_free(model);
+    fprintf(stderr, "test-moe-cache: unsupported tensor/cache combination rejected before weights OK\n");
+}
+
 struct mtp_batch_fixture {
     std::vector<float> embd;
     std::vector<llama_pos> pos;
