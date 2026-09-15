@@ -472,6 +472,12 @@ struct moe_cache_tensor_decode_stats {
 };
 
 struct moe_grouped_decode_debug_stats {
+    std::atomic<uint64_t> decode_grouped{ 0 };
+    std::atomic<uint64_t> decode_legacy{ 0 };
+    std::atomic<uint64_t> submitted{ 0 };
+    std::atomic<uint64_t> direct{ 0 };
+    std::atomic<uint64_t> captures{ 0 };
+    std::atomic<uint64_t> replays{ 0 };
     moe_grouped_decode_debug_stats() {
         for (auto & value : covered) {
             value.store(0, std::memory_order_relaxed);
@@ -480,6 +486,9 @@ struct moe_grouped_decode_debug_stats {
             value.store(0, std::memory_order_relaxed);
         }
         for (auto & value : completed_by_group) {
+            value.store(0, std::memory_order_relaxed);
+        }
+        for (auto & value : submitted_by_group) {
             value.store(0, std::memory_order_relaxed);
         }
     }
@@ -503,6 +512,7 @@ struct moe_grouped_decode_debug_stats {
     std::array<std::atomic<uint64_t>, (GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS + 63) / 64> covered;
     std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> ready_by_group;
     std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> completed_by_group;
+    std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS>             submitted_by_group;
     std::atomic<uint64_t *> device_transfers{nullptr};
     std::atomic<bool> device_transfers_failed{false};
 };
@@ -539,12 +549,13 @@ static moe_cache_owner_telemetry & moe_cache_owner_telemetry_state() {
 
 static void moe_cache_add_telemetry(moe_cache_telemetry & dst, moe_cache_telemetry && src);
 static bool moe_grouped_has_activity(const ggml_cuda_moe_grouped_debug_telemetry & telemetry) {
-    return telemetry.covered != 0 || telemetry.plan_calls != 0 || telemetry.plan_compiles != 0 || telemetry.plan_reuses != 0 ||
-        telemetry.calls != 0 || telemetry.ready != 0 || telemetry.completed != 0 || telemetry.admitted_banks != 0 ||
-        telemetry.fallback != 0 || telemetry.rollback != 0 || telemetry.host_staged_calls != 0 ||
-        telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 || telemetry.strategy_switches != 0 ||
-        telemetry.required_unsupported != 0 || telemetry.prepare_error != 0 || telemetry.finish_error != 0 ||
-        telemetry.h2d_banks != 0 || telemetry.h2d_bytes != 0;
+    return telemetry.covered != 0 || telemetry.plan_calls != 0 || telemetry.plan_compiles != 0 ||
+           telemetry.plan_reuses != 0 || telemetry.calls != 0 || telemetry.ready != 0 || telemetry.completed != 0 ||
+           telemetry.admitted_banks != 0 || telemetry.fallback != 0 || telemetry.rollback != 0 ||
+           telemetry.host_staged_calls != 0 || telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 ||
+           telemetry.strategy_switches != 0 || telemetry.required_unsupported != 0 || telemetry.prepare_error != 0 ||
+           telemetry.finish_error != 0 || telemetry.h2d_banks != 0 || telemetry.h2d_bytes != 0 ||
+           telemetry.decode_grouped != 0 || telemetry.decode_legacy != 0 || telemetry.submitted != 0;
 }
 
 static void moe_grouped_add_telemetry(
@@ -4730,11 +4741,27 @@ struct ggml_cuda_moe_grouped_context::impl {
         result.required_unsupported = take(stats->required_unsupported);
         result.prepare_error = take(stats->prepare_error);
         result.finish_error = take(stats->finish_error);
+        result.decode_grouped        = take(stats->decode_grouped);
+        result.decode_legacy         = take(stats->decode_legacy);
+        result.submitted             = take(stats->submitted);
+        result.direct                = take(stats->direct);
+        result.captures              = take(stats->captures);
+        result.replays               = take(stats->replays);
         uint64_t ready_min = UINT64_MAX;
         uint64_t completed_min = UINT64_MAX;
         for (uint32_t group_index = 0; group_index < GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS; ++group_index) {
             const uint64_t ready = take(stats->ready_by_group[group_index]);
             const uint64_t completed = take(stats->completed_by_group[group_index]);
+            const uint64_t submitted = take(stats->submitted_by_group[group_index]);
+            if ((ready || submitted || completed) && group_index < table.groups.size()) {
+                const auto & group = table.groups[group_index];
+                GGML_LOG_INFO(
+                    "moe-grouped-owner-group: owner=%p device=%d physical=%d generation=%llu semantic_group=%u "
+                    "domain=%u ready=%llu submitted=%llu completed=%llu\n",
+                    (void *) this, device, device >= 0 ? ggml_cuda_info().devices[device].physical_device : -1,
+                    (unsigned long long) state.generation, group.semantic_group_index, group.domain,
+                    (unsigned long long) ready, (unsigned long long) submitted, (unsigned long long) completed);
+            }
             if (group_index < registered) {
                 ready_min = std::min(ready_min, ready);
                 completed_min = std::min(completed_min, completed);
@@ -4772,6 +4799,23 @@ struct ggml_cuda_moe_grouped_context::impl {
                     result.h2d_bytes = 0;
                 }
             }
+        }
+        if (moe_grouped_has_activity(result)) {
+            ggml_backend_dev_props props{};
+            if (owner && owner->iface.get_props) {
+                ggml_backend_dev_get_props(owner, &props);
+            }
+            GGML_LOG_INFO(
+                "moe-grouped-owner: owner=%p device=%d physical=%d pci=%s generation=%llu decode_grouped=%llu "
+                "decode_legacy=%llu direct=%llu captures=%llu replays=%llu ready=%llu submitted=%llu completed=%llu "
+                "prepare_error=%llu finish_error=%llu\n",
+                (void *) this, device, device >= 0 ? ggml_cuda_info().devices[device].physical_device : -1,
+                props.device_id ? props.device_id : "unknown", (unsigned long long) state.generation,
+                (unsigned long long) result.decode_grouped, (unsigned long long) result.decode_legacy,
+                (unsigned long long) result.direct, (unsigned long long) result.captures,
+                (unsigned long long) result.replays, (unsigned long long) result.ready,
+                (unsigned long long) result.submitted, (unsigned long long) result.completed,
+                (unsigned long long) result.prepare_error, (unsigned long long) result.finish_error);
         }
         return result;
     }
@@ -9164,6 +9208,18 @@ void ggml_cuda_moe_grouped_context::compile_graph_plan(
         mixed_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY :
         decode_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED :
         decode_legacy_certificate ? GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY : GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR;
+    if (impl_->debug_stats() != nullptr) {
+        for (const auto & record : plan->groups_) {
+            const auto & candidate = impl_->table.groups[record.candidate.group_index];
+            GGML_LOG_INFO(
+                "moe-grouped-plan: owner=%p device=%d physical=%d generation=%llu semantic_group=%u domain=%u "
+                "outcome=%u reason=%u\n",
+                (void *) impl_.get(), impl_->device,
+                impl_->device >= 0 ? ggml_cuda_info().devices[impl_->device].physical_device : -1,
+                (unsigned long long) plan->registry_generation_, candidate.semantic_group_index, candidate.domain,
+                (unsigned) plan->outcome_, record.reason);
+        }
+    }
     if (decode_legacy_certificate) {
         GGML_LOG_DEBUG("moe-cache: grouped decode selected legacy: groups=%u\n", legacy_groups);
         if (impl_->fallback_notice_generation.exchange(
@@ -10147,6 +10203,27 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
     size_t legacy_capacity = 0;
     size_t resource_capacity = 0;
     bool has_barrier = false;
+    const auto                                                                       record_dispatch   = [&]() {
+        if (debug == nullptr) {
+            return;
+        }
+        const auto outcome = execution->plan_->outcome_;
+        if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && mode != GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY) {
+            debug->decode_grouped.fetch_add(n_groups, std::memory_order_relaxed);
+            if (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY) {
+                debug->replays.fetch_add(n_groups, std::memory_order_relaxed);
+            } else if (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {
+                debug->captures.fetch_add(n_groups, std::memory_order_relaxed);
+            } else {
+                debug->direct.fetch_add(n_groups, std::memory_order_relaxed);
+            }
+        } else if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY ||
+                   (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+                    mode == GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY)) {
+            debug->decode_legacy.fetch_add(n_groups, std::memory_order_relaxed);
+            debug->fallback.fetch_add(n_groups, std::memory_order_relaxed);
+        }
+    };
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         if (execution->dispatch_active_ || execution->owner_ != this || execution->plan_ == nullptr ||
@@ -10300,6 +10377,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             }
             execution->dispatch_mode_ = mode;
             execution->dispatch_active_ = true;
+            record_dispatch();
             return true;
         }
     }
@@ -10518,6 +10596,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
         impl_->authority_transition_pending = false;
         execution->dispatch_mode_ = mode;
         execution->dispatch_active_ = true;
+        record_dispatch();
     }
     impl_->resource_cv.notify_all();
     return true;
@@ -11107,6 +11186,12 @@ bool ggml_cuda_moe_grouped_context::finish_graph_group(
     if (group->defer_completion) {
         return true;
     }
+    if (debug != nullptr) {
+        debug->submitted.fetch_add(1, std::memory_order_relaxed);
+        if (group->key.candidate.group_index < debug->submitted_by_group.size()) {
+            debug->submitted_by_group[group->key.candidate.group_index].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     ggml_cuda_moe_grouped_decode_acquisition decode;
     decode.transaction = group->transaction;
     if (!finish_decode(decode, stream)) {
@@ -11151,6 +11236,12 @@ bool ggml_cuda_moe_grouped_context::finish_host_staged_group(
         return false;
     }
 
+    if (debug != nullptr) {
+        debug->submitted.fetch_add(1, std::memory_order_relaxed);
+        if (group->key.candidate.group_index < debug->submitted_by_group.size()) {
+            debug->submitted_by_group[group->key.candidate.group_index].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     bool finished = false;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -11198,6 +11289,12 @@ bool ggml_cuda_moe_grouped_context::finish_graph_dispatch(ggml_cuda_moe_graph_ex
         const bool host_staged = group.authority.authority() == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED;
         if (grouped && ((group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE && group.defer_completion) ||
                 group.state == GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_REPLAY)) {
+            if (debug != nullptr) {
+                debug->submitted.fetch_add(1, std::memory_order_relaxed);
+                if (group.key.candidate.group_index < debug->submitted_by_group.size()) {
+                    debug->submitted_by_group[group.key.candidate.group_index].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             ggml_cuda_moe_grouped_decode_acquisition decode;
             decode.transaction = group.transaction;
             if (!finish_decode(decode, group.stream)) {
@@ -13458,6 +13555,12 @@ static void moe_grouped_add_telemetry(
     dst.finish_error += src.finish_error;
     dst.h2d_banks += src.h2d_banks;
     dst.h2d_bytes += src.h2d_bytes;
+    dst.decode_grouped += src.decode_grouped;
+    dst.decode_legacy += src.decode_legacy;
+    dst.submitted += src.submitted;
+    dst.direct += src.direct;
+    dst.captures += src.captures;
+    dst.replays += src.replays;
 }
 
 static void moe_cache_add_telemetry(moe_cache_telemetry & dst, moe_cache_telemetry && src) {

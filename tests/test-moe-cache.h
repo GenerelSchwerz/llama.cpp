@@ -49,6 +49,9 @@ bool grouped_frequency_enabled();
 
 void test_speculative_grouped_intent_splits();
 
+int  test_grouped_multigpu();
+void test_grouped_layer_placement();
+
 void test_speculative_required_grouped_backend_capability(int device);
 
 struct ggml_cuda_moe_grouped_context_test_access {

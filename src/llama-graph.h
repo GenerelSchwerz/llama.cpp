@@ -930,6 +930,21 @@ struct llm_graph_fused_node {
     int il;
 };
 
+struct llm_graph_moe_region {
+    int32_t                    layer          = -1;
+    uint32_t                   semantic_group = UINT32_MAX;
+    uint32_t                   domain         = 0;
+    ggml_tensor *              down           = nullptr;
+    ggml_tensor *              route          = nullptr;
+    ggml_tensor *              output         = nullptr;
+    bool                       external_route = false;
+    std::vector<ggml_tensor *> operations;
+    std::vector<ggml_tensor *> inputs;
+    ggml_backend_t             backend = nullptr;
+
+    bool place(ggml_backend_sched_t sched, ggml_backend_t owner);
+};
+
 class llm_graph_result {
 public:
     llm_graph_result(int64_t max_nodes);
@@ -969,6 +984,17 @@ public:
 
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
+    void add_moe_region(int32_t       layer,
+                        ggml_tensor * down,
+                        ggml_tensor * route,
+                        ggml_tensor * first,
+                        ggml_tensor * output,
+                        bool          external_route);
+
+    std::vector<llm_graph_moe_region> & get_moe_regions() { return moe_regions; }
+
+    const std::vector<llm_graph_moe_region> & get_moe_regions() const { return moe_regions; }
+
     void set_params(const llm_graph_params & params);
 
     // important graph nodes
@@ -1000,6 +1026,7 @@ public:
 
 private:
     std::vector<ggml_tensor *> inp_token_tensors;
+    std::vector<llm_graph_moe_region> moe_regions;
 
     // keep a copy of the previous graph parameters
     // we will use this to determine whether the graph can be reused by comparing them with the new parameters

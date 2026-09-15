@@ -28,6 +28,8 @@ The cache setting is inherited by a separately loaded speculative draft model un
 
 All CUDA devices can consume the cache buffer type and cache resources are owned by the CUDA backend context for the device that executes a layer, so normal layer-split placement can use device-local caches. The cache override is not a CUDA split buffer: row- and tensor-split sharding of matched expert weights is not implemented or covered by this fork's cache tests. Use layer split or a single GPU when that distinction matters.
 
+Stage A explicitly places complete eligible grouped regions on their layer owner before runtime/reserve scheduling. See [grouped MoE multi-GPU validation](moe-grouped-multigpu.md) for the physical two-device fixture, no-P2P transfer path, owner-local diagnostics and hardware validation status.
+
 The server prints and resets aggregate cache statistics at request timing boundaries and model unload. With parallel requests, this is a process-wide reset boundary rather than strict per-request attribution.
 
 ### Internal backend integration

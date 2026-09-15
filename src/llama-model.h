@@ -29,6 +29,7 @@ struct llama_moe_source_group {
     uint32_t domain;
     bool route_present;
     std::vector<llama_moe_source_bank> banks;
+    int32_t                            layer = -1;
 };
 
 // available models

@@ -1915,10 +1915,12 @@ static void test_active_grouped_stream_coherence_fallback(int device) {
     CHECK(active_grouped_legacy_op_count(candidate_backend.get()) == legacy_before + candidate.banks.size());
     const auto fallback_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(fallback_telemetry.registered == 1 && fallback_telemetry.covered == 1 && fallback_telemetry.plan_calls == 1 &&
-        fallback_telemetry.plan_compiles + fallback_telemetry.plan_reuses == 1 &&
-        fallback_telemetry.calls == 0 && fallback_telemetry.ready == 0 && fallback_telemetry.completed == 0 &&
-        fallback_telemetry.admitted_banks == 0 && fallback_telemetry.fallback == 0 && fallback_telemetry.rollback == 0 &&
-        fallback_telemetry.prepare_error == 0 && fallback_telemetry.finish_error == 0);
+          fallback_telemetry.plan_compiles + fallback_telemetry.plan_reuses == 1 && fallback_telemetry.calls == 0 &&
+          fallback_telemetry.ready == 0 && fallback_telemetry.completed == 0 &&
+          fallback_telemetry.admitted_banks == 0 && fallback_telemetry.fallback == 1 &&
+          fallback_telemetry.decode_legacy == 1 && fallback_telemetry.decode_grouped == 0 &&
+          fallback_telemetry.submitted == 0 && fallback_telemetry.rollback == 0 &&
+          fallback_telemetry.prepare_error == 0 && fallback_telemetry.finish_error == 0);
     ggml_cuda_graph_capture_state_for_test invalidated = {};
     CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated));
     CHECK(stale_graph != 0 && stale_instance != 0 && stale_fingerprint != 0 &&
