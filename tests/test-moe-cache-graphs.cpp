@@ -32,12 +32,12 @@ static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * t
     return bytes;
 }
 
-void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim) {
+void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim, bool pageable) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr backend(ggml_backend_cuda_init(device));
     CHECK(backend != nullptr);
-    auto buft = ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
+    auto buft = pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
     CHECK(buft != nullptr);
     auto graph = build_active_grouped_dispatch_graph(
         backend.get(), buft, GGML_TYPE_Q4_0,
@@ -295,7 +295,7 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
     if (n_dim == 1024) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::host_copy_jobs(*context, key) != 0);
     }
-    if (host_budget != 0) {
+    if (host_budget != 0 || pageable) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
         CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
         std::vector<std::shared_ptr<void>> pending_leases;
@@ -316,7 +316,7 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
             std::this_thread::yield();
         }
 
-        const bool replace_pending = host_budget == 393216;
+        const bool replace_pending = host_budget == 393216 || pageable;
         std::thread replace_pending_thread;
         if (replace_pending) {
             replace_pending_thread = std::thread([&] {

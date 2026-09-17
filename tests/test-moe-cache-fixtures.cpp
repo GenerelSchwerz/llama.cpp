@@ -237,6 +237,18 @@ std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t 
     return bytes;
 }
 
+ggml_backend_buffer_type_t pageable_cached_buffer_type() {
+    static ggml_backend_buffer_type buft = *ggml_backend_cuda_moe_cached_buffer_type();
+    buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t size) {
+        auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        if (buffer != nullptr) {
+            buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
+        }
+        return buffer;
+    };
+    return &buft;
+}
+
 #ifdef __linux__
 static void file_mmap_cached_buffer_free(ggml_backend_buffer_t buffer) {
     CHECK(munmap(buffer->context, buffer->size) == 0);

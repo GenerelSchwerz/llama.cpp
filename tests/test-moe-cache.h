@@ -489,6 +489,10 @@ void test_grouped_graph_mixed_phase();
 
 std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t salt);
 
+ggml_backend_buffer_type_t pageable_cached_buffer_type();
+void test_active_grouped_materialization();
+void test_pageable_separate_draft_lifecycle();
+
 #ifdef __linux__
 ggml_backend_buffer_type_t file_mmap_cached_buffer_type();
 #endif
@@ -630,7 +634,7 @@ void check_active_grouped_contract(
         bool auxiliary_first = false,
         bool expect_compact_mmvq = false);
 
-void test_grouped_graph_replay_lifecycle(int device, size_t host_budget = 0, size_t expected_host_nodes = 0, uint32_t n_dim = 256);
+void test_grouped_graph_replay_lifecycle(int device, size_t host_budget = 0, size_t expected_host_nodes = 0, uint32_t n_dim = 256, bool pageable = false);
 
 std::vector<float> run_active_grouped_dispatch(
         ggml_backend_t backend,

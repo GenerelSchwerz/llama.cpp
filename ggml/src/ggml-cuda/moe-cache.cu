@@ -49,6 +49,7 @@ namespace {
 static constexpr uint64_t MOE_CACHE_MM_SAMPLE_RATE = 64;
 static constexpr uint64_t MOE_ORIGINAL_DIRECT_AUX_MAX_BYTES = 4 * 1024;
 static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
+static constexpr size_t MOE_PAGEABLE_STAGING_HEADROOM = 64 * 1024 * 1024;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
 
 static bool moe_host_reserve_size(size_t limit, size_t bytes, size_t & reserved) {
@@ -4358,6 +4359,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t prefill_resident_auxiliary_bytes = 0;
         bool prefill_resident_auxiliary = false;
         std::array<ggml_cuda_moe_grouped_bank_descriptor, 3> slot_auxiliaries;
+        std::vector<ggml_cuda_moe_grouped_bank_descriptor> original_auxiliaries;
         std::vector<ggml_cuda_moe_grouped_bank_descriptor> banks;
     };
 
@@ -4472,6 +4474,11 @@ struct ggml_cuda_moe_grouped_context::impl {
                     (void) cudaFree(data);
                 }
             }
+            for (float * data : original_auxiliary_data) {
+                if (data != nullptr) {
+                    (void) cudaFree(data);
+                }
+            }
             if (slot_for_expert != nullptr) {
                 (void) cudaFree(slot_for_expert);
             }
@@ -4517,6 +4524,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         std::array<float *, 3> auxiliary_data = {};
         std::array<size_t, 3> auxiliary_n_values = {};
         std::array<float *, 3> prefill_auxiliary_data = {};
+        std::array<float *, 3> original_auxiliary_data = {};
+        bool original_auxiliary_pending = false;
         const ggml_tensor * prefill_auxiliary_pending_node = nullptr;
         const float * prefill_auxiliary_pending_source = nullptr;
         cudaStream_t prefill_auxiliary_pending_stream = nullptr;
@@ -4574,6 +4583,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         bool prefill_resident_auxiliary = false;
         std::array<moe_candidate_bank_record, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> banks;
         std::array<moe_candidate_bank_record, 3> slot_auxiliaries;
+        std::vector<moe_candidate_bank_record> original_auxiliaries;
     };
 
     struct group_authority_record {
@@ -4624,6 +4634,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     std::condition_variable resource_cv;
     ggml_cuda_moe_candidate_registry_state state;
     moe_candidate_table table;
+    std::shared_ptr<moe_host_budget> pageable_sources;
     legacy_record_map legacy_records;
     graph_coverage_map graph_coverages;
     resource_slots resources;
@@ -5146,6 +5157,14 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
             input.slot_auxiliaries[auxiliary_index] = *auxiliary;
         }
+        for (const auto & bank : group.banks) {
+            if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE) {
+                input.original_auxiliaries.push_back(bank);
+            }
+        }
+        if (input.original_auxiliaries.size() > 3) {
+            return false;
+        }
         return input.n_banks != 0;
     }
 
@@ -5186,6 +5205,9 @@ struct ggml_cuda_moe_grouped_context::impl {
             snapshot.prefill_resident_auxiliary_bytes = input.prefill_resident_auxiliary_bytes;
             for (uint32_t i = 0; i < input.n_slot_auxiliaries; ++i) {
                 snapshot.slot_auxiliaries[i] = make_descriptor(input.slot_auxiliaries[i]);
+            }
+            for (const auto & auxiliary : input.original_auxiliaries) {
+                snapshot.original_auxiliaries.push_back(make_descriptor(auxiliary));
             }
             snapshot.banks.reserve(input.n_banks);
             for (uint32_t i = 0; i < input.n_banks; ++i) {
@@ -5243,6 +5265,18 @@ struct ggml_cuda_moe_grouped_context::impl {
             return false;
         }
         const auto & group = table.groups[candidate.group_index];
+        size_t original_index = 0;
+        for (const auto & bank : group.banks) {
+            if (bank.info.movement == GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE) {
+                if (original_index >= snapshot.original_auxiliaries.size() ||
+                        !descriptor_matches_record(snapshot.original_auxiliaries[original_index++], bank)) {
+                    return false;
+                }
+            }
+        }
+        if (original_index != snapshot.original_auxiliaries.size()) {
+            return false;
+        }
         uint32_t n_slot_banks = 0;
         uint32_t n_scales = 0;
         uint32_t n_biases = 0;
@@ -5345,6 +5379,105 @@ struct ggml_cuda_moe_grouped_context::impl {
 #endif
     }
 
+    std::shared_ptr<moe_host_budget> make_pageable_sources(const moe_candidate_table & candidates) const {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_UNUSED(candidates);
+        return nullptr;
+#else
+        if (device < 0 || device >= ggml_cuda_info().device_count || getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+            return nullptr;
+        }
+        moe_grouped_device_scope device_scope(device);
+        std::unordered_map<const ggml_tensor *, moe_host_source> sources;
+        size_t reserved = 0;
+        for (const auto & group : candidates.groups) {
+            uint32_t n_banks = 0;
+            if (!moe_candidate_structural_group(group, &n_banks, nullptr, nullptr)) {
+                continue;
+            }
+            size_t tile_bytes = 0;
+            uint32_t n_experts = 0;
+            for (uint32_t i = 0; i < n_banks; ++i) {
+                const auto & bank = *moe_candidate_base_slot_bank(group, i);
+                if (moe_host_budget_for(bank.buft) != nullptr ||
+                        device_alias(device, bank.buffer_base, bank.data_offset, bank.info.source_data, false, false, nullptr, nullptr, bank.info.tensor)) {
+                    continue;
+                }
+                cudaPointerAttributes attributes = {};
+                const auto error = cudaPointerGetAttributes(&attributes, bank.info.source_data);
+                if (error != cudaSuccess) {
+                    (void) cudaGetLastError();
+                }
+                if ((error != cudaSuccess && error != cudaErrorInvalidValue) ||
+                        (error == cudaSuccess && attributes.type != cudaMemoryTypeUnregistered && attributes.type != cudaMemoryTypeHost)) {
+                    continue;
+                }
+                if (bank.info.expert_stride > SIZE_MAX - tile_bytes) {
+                    throw std::bad_alloc();
+                }
+                tile_bytes += bank.info.expert_stride;
+                n_experts = bank.ne[2];
+                sources.emplace(bank.info.tensor, moe_host_source{nullptr, static_cast<const char *>(bank.info.source_data),
+                    static_cast<size_t>(bank.info.byte_extent), static_cast<size_t>(bank.info.expert_stride), true});
+            }
+            if (tile_bytes == 0) {
+                continue;
+            }
+            size_t plan_bytes = 0, control_offset = 0, staging_offset = 0, allocation_bytes = 0;
+            if (!moe_grouped_plan_size(candidates.n_slots, n_experts, &plan_bytes) ||
+                    !moe_grouped_staging_layout(plan_bytes, tile_bytes, moe_early_router_enabled(), control_offset, staging_offset, allocation_bytes) ||
+                    !moe_host_reserve_size(SIZE_MAX - MOE_PAGEABLE_STAGING_HEADROOM, allocation_bytes, reserved)) {
+                throw std::bad_alloc();
+            }
+        }
+        if (sources.empty()) {
+            return nullptr;
+        }
+        auto result = std::shared_ptr<moe_host_budget>(new moe_host_budget(reserved + MOE_PAGEABLE_STAGING_HEADROOM),
+            [](moe_host_budget * budget) { budget->release(); });
+        result->staging_reserved = reserved;
+        result->sources = std::move(sources);
+        for (auto & entry : result->sources) {
+            entry.second.owner = result.get();
+        }
+        result->configured = true;
+        result->copy_worker.start();
+        GGML_LOG_INFO("moe-cache-host: device=%d pageable_sources=%zu staging_reserved=%zu limit=%zu\n",
+            device, result->sources.size(), reserved, result->limit);
+        return result;
+#endif
+    }
+
+    const moe_host_source * source_for(const ggml_tensor * tensor) const {
+        if (const auto * source = moe_host_source_for(tensor)) {
+            return source;
+        }
+        if (pageable_sources == nullptr || tensor == nullptr) {
+            return nullptr;
+        }
+        const auto found = pageable_sources->sources.find(tensor);
+        return found != pageable_sources->sources.end() && found->second.data == tensor->data &&
+            found->second.size == ggml_nbytes(tensor) && found->second.expert_stride == tensor->nb[2] ? &found->second : nullptr;
+    }
+
+    static bool host_readable(const void * data) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_UNUSED(data);
+        return false;
+#else
+        if (data == nullptr) {
+            return false;
+        }
+        cudaPointerAttributes attributes = {};
+        const auto error = cudaPointerGetAttributes(&attributes, data);
+        if (error != cudaSuccess) {
+            (void) cudaGetLastError();
+        }
+        return error == cudaErrorInvalidValue || (error == cudaSuccess &&
+            (attributes.type == cudaMemoryTypeUnregistered || attributes.type == cudaMemoryTypeHost));
+#endif
+    }
+
     bool group_source_mapped(const moe_candidate_group_record & group) const {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         GGML_UNUSED(group);
@@ -5363,15 +5496,18 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (bank == nullptr || !moe_candidate_record_matches(*bank, bank->info.tensor) ||
                     bank->info.expert_stride % sizeof(uint4) != 0 ||
                     reinterpret_cast<uintptr_t>(bank->info.source_data) % alignof(uint4) != 0 ||
-                    (moe_host_source_for(bank->info.tensor) == nullptr &&
+                    (source_for(bank->info.tensor) == nullptr &&
                         !device_alias(device, bank->buffer_base, bank->data_offset, bank->info.source_data, false, false, nullptr, nullptr, bank->info.tensor))) {
                 return false;
             }
         }
-        for (uint32_t auxiliary_index = 0; auxiliary_index < n_scales + n_biases; ++auxiliary_index) {
-            const auto * auxiliary = moe_candidate_slot_auxiliary_bank(group, auxiliary_index);
-            if (auxiliary == nullptr || !moe_candidate_record_matches(*auxiliary, auxiliary->info.tensor) ||
-                    !device_alias(device, auxiliary->buffer_base, auxiliary->data_offset, auxiliary->info.source_data, true, true, nullptr, nullptr, auxiliary->info.tensor)) {
+        for (const auto & auxiliary : group.banks) {
+            if (auxiliary.info.movement != GGML_CUDA_MOE_CANDIDATE_MOVEMENT_PERMANENT_CANDIDATE) {
+                continue;
+            }
+            if (!moe_candidate_record_matches(auxiliary, auxiliary.info.tensor) ||
+                    (!device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.info.source_data, true, true, nullptr, nullptr, auxiliary.info.tensor) &&
+                        !host_readable(auxiliary.info.source_data))) {
                 return false;
             }
         }
@@ -5497,14 +5633,46 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         moe_grouped_device_scope device_scope(device);
+        auto result = std::make_unique<grouped_device_resource>(device);
+        result->n_experts = n_experts;
+        result->bank_data.resize(snapshot.banks.size(), nullptr);
+        if (snapshot.original_auxiliaries.size() > result->original_auxiliary_data.size()) {
+            return nullptr;
+        }
+        // One exact original-ID shadow per auxiliary, bounded by the candidate inventory.
+        for (size_t i = 0; i < snapshot.original_auxiliaries.size(); ++i) {
+            const auto & auxiliary = snapshot.original_auxiliaries[i];
+            if (!descriptor_matches(auxiliary) || auxiliary.byte_extent == 0 || auxiliary.byte_extent > SIZE_MAX) {
+                return nullptr;
+            }
+            if (device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
+                    true, true, nullptr, nullptr, auxiliary.tensor)) {
+                continue;
+            }
+            if (!host_readable(auxiliary.source_data) ||
+                    !moe_grouped_cuda_success(cudaMalloc(&result->original_auxiliary_data[i], auxiliary.byte_extent))) {
+                return nullptr;
+            }
+            const bool copied = moe_grouped_cuda_success(cudaMemcpyAsync(result->original_auxiliary_data[i],
+                auxiliary.source_data, auxiliary.byte_extent, cudaMemcpyHostToDevice, compute_stream));
+            const bool ready = moe_grouped_cuda_success(cudaStreamSynchronize(compute_stream));
+            if (!copied || !ready) {
+                return nullptr;
+            }
+        }
         std::array<moe_grouped_device_auxiliary, 3> device_auxiliaries = {};
         std::array<bool, 3> auxiliary_host_alias = {};
         for (uint32_t i = 0; i < snapshot.n_slot_auxiliaries; ++i) {
             const auto & auxiliary = snapshot.slot_auxiliaries[i];
             const void * alias_data = nullptr;
+            for (size_t j = 0; j < snapshot.original_auxiliaries.size(); ++j) {
+                if (snapshot.original_auxiliaries[j].tensor == auxiliary.tensor) {
+                    alias_data = result->original_auxiliary_data[j];
+                }
+            }
             if (!descriptor_matches(auxiliary) ||
-                    !device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
-                        true, true, &alias_data, &auxiliary_host_alias[i], auxiliary.tensor) ||
+                    (alias_data == nullptr && !device_alias(device, auxiliary.buffer_base, auxiliary.data_offset, auxiliary.source_data,
+                        true, true, &alias_data, &auxiliary_host_alias[i], auxiliary.tensor)) ||
                     auxiliary.type != GGML_TYPE_F32 || !ggml_is_contiguous(auxiliary.tensor)) {
                 return nullptr;
             }
@@ -5519,21 +5687,13 @@ struct ggml_cuda_moe_grouped_context::impl {
             device_auxiliaries[i].n_values = n_values;
         }
 
-        std::unique_ptr<grouped_device_resource> result;
-        try {
-            result = std::make_unique<grouped_device_resource>(device);
-            result->n_experts = n_experts;
-            result->bank_data.resize(snapshot.banks.size(), nullptr);
-        } catch (const std::bad_alloc &) {
-            return nullptr;
-        }
         if (!moe_grouped_plan_size(snapshot.n_slots, n_experts, &result->plan_bytes)) {
             return nullptr;
         }
 
         size_t staging_bytes = 0;
         for (const auto & bank : snapshot.banks) {
-            const auto * source = moe_host_source_for(bank.tensor);
+            const auto * source = source_for(bank.tensor);
             if (source == nullptr) {
                 continue;
             }
@@ -5580,7 +5740,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                     (uintptr_t) bank.source_data % alignof(uint4) != 0) {
                 return nullptr;
             }
-            const auto * source = moe_host_source_for(bank.tensor);
+            const auto * source = source_for(bank.tensor);
             if (source != nullptr && source->device_alias == nullptr) {
                 auto & materialization = *result->materialization;
                 materialization.sources[i] = source;
@@ -5933,6 +6093,7 @@ struct ggml_cuda_moe_grouped_context::impl {
             std::lock_guard<std::mutex> lock(mutex);
             (void) reset_group_authorities(0);
             table = {};
+            pageable_sources.reset();
             if (state.generation == UINT64_MAX) {
                 state = {};
                 state.generation = UINT64_MAX;
@@ -5954,6 +6115,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     int32_t publish(moe_candidate_table && replacement) {
         std::lock_guard<std::mutex> lifecycle_lock(resource_lifecycle_mutex);
         moe_candidate_set_prefill_resident_policy(replacement, prefill_resident_auxiliary_budget);
+        auto sources = make_pageable_sources(replacement);
         legacy_record_map retired_legacy;
         resource_slots retired;
         uint32_t old_registered_groups = 0;
@@ -5983,6 +6145,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 const uint64_t generation = state.generation == UINT64_MAX ? UINT64_MAX : state.generation + 1;
                 group_authorities = {};
                 table = {};
+                pageable_sources.reset();
                 state = {};
                 state.generation = generation;
                 state.rejection = GGML_CUDA_MOE_CANDIDATE_REJECT_GENERATION_EXHAUSTED;
@@ -5992,6 +6155,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 const bool reset = reset_group_authorities(static_cast<uint32_t>(replacement.groups.size()));
                 GGML_ASSERT(reset);
                 table = std::move(replacement);
+                pageable_sources = std::move(sources);
                 state = {};
                 state.generation = generation;
                 state.logical_signature = table.logical_signature;
@@ -11443,6 +11607,7 @@ void ggml_cuda_moe_grouped_context::shutdown() {
     }
     impl::retire_resources(std::move(retired));
     impl_->retire_legacy_records(std::move(retired_legacy));
+    impl_->pageable_sources.reset();
     lifecycle_lock.unlock();
     {
         auto & telemetry = moe_cache_owner_telemetry_state();
