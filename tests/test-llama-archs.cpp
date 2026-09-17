@@ -1134,7 +1134,7 @@ static std::vector<float> get_logits(
 
 // decode two sequences in one batch, compare each with a decode of it alone
 // logits_a: logits of tokens decoded alone with the same device config
-static bool test_parallel_seqs(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_a, bool encode) {
+static bool test_parallel_seqs(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_a, bool encode, bool offload_kqv) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_tokens = tokens.size();
 
@@ -1145,6 +1145,7 @@ static bool test_parallel_seqs(llama_model * model, const std::vector<llama_toke
         cparams.n_threads       = 4;
         cparams.n_threads_batch = 4;
         cparams.n_seq_max       = n_seq_max;
+        cparams.offload_kqv     = offload_kqv;
         if (!encode) {
             cparams.n_ubatch = 64;
         }
@@ -1553,9 +1554,10 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         }
 
                         // FIXME: T5 kq_b does not broadcast over KV streams, so context init with n_seq_max > 1 aborts
-                        if (arch != LLM_ARCH_T5) {
+                        // a multi-stream row spreads the reference over several sequences, so it does not match one sequence at pos 0..n-1
+                        if (arch != LLM_ARCH_T5 && dc.kvc.n_seq_max == 1) {
                             status_parallel = "\033[1;32mOK\033[0m";
-                            if (!test_parallel_seqs(model_and_ctx_dev.first.get(), tokens, logits_dev, encode)) {
+                            if (!test_parallel_seqs(model_and_ctx_dev.first.get(), tokens, logits_dev, encode, dc.kvc.offload_kqv)) {
                                 all_ok = false;
                                 status_parallel = "\033[1;31mFAIL\033[0m";
                             }
