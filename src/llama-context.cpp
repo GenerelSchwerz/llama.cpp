@@ -580,12 +580,19 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
 
         ggml_tensor probe = *op;
         ggml_gated_delta_net_set_snapshots(
-                &probe, (int32_t) std::min<int64_t>(n_tokens, n_snapshots - 1), -1, true);
+                &probe, (int32_t) std::min<int64_t>(n_tokens, n_snapshots - 1), -1, true, 0);
         if (!ggml_backend_dev_supports_op(device, &probe)) {
             return false;
         }
 
-        ggml_gated_delta_net_set_snapshots(&probe, 0, 0, false);
+        if (n_tokens > n_snapshots - 1 && n_snapshots > 2) {
+            ggml_gated_delta_net_set_snapshots(&probe, 1, -1, true, n_snapshots - 2);
+            if (!ggml_backend_dev_supports_op(device, &probe)) {
+                return false;
+            }
+        }
+
+        ggml_gated_delta_net_set_snapshots(&probe, 0, 0, false, 0);
         return ggml_backend_dev_supports_op(device, &probe);
     };
 
@@ -4256,11 +4263,11 @@ bool llama_recurrent_sparse_snapshots_supported(const llama_context * ctx) {
     return ctx != nullptr && ctx->recurrent_sparse_snapshots_supported();
 }
 
-bool llama_recurrent_set_sparse_snapshot_mode(llama_context * ctx, bool enabled, int32_t selected_token) {
+bool llama_recurrent_set_sparse_snapshot_mode(llama_context * ctx, bool enabled, int32_t selected_token, int32_t n_leading) {
     if (ctx == nullptr || ctx->get_memory() == nullptr || (enabled && !ctx->recurrent_sparse_snapshots_supported())) {
         return false;
     }
-    return ctx->get_memory()->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+    return ctx->get_memory()->recurrent_set_sparse_snapshot_mode(enabled, selected_token, n_leading);
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

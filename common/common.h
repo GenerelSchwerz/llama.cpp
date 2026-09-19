@@ -386,6 +386,7 @@ struct common_params_speculative {
     common_params_speculative_ngram_cache ngram_cache;
 
     int32_t rs_planes = 0; // total target recurrent planes for draft-mtp or draft-dflash (0 = draft.n_max + 1)
+    int32_t rs_planes_lead = -1; // capped planes that keep the states after the first draft tokens (-1 = auto)
 
     bool has_dft() const {
         return !draft.mparams.empty();
@@ -393,6 +394,18 @@ struct common_params_speculative {
 
     bool is_rs_capped() const {
         return rs_planes > 0 && int64_t(rs_planes) < int64_t(draft.n_max) + 1;
+    }
+
+    int32_t get_rs_planes_lead() const {
+        if (!is_rs_capped()) {
+            return 0;
+        }
+        if (rs_planes_lead >= 0) {
+            return rs_planes_lead;
+        }
+        // DFlash rejects most drafts early, so keep one plane for full acceptance and the rest for the first tokens
+        const bool has_dflash = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
+        return has_dflash ? rs_planes - 2 : 0;
     }
 
     bool has_synth() const {

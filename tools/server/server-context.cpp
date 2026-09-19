@@ -1285,9 +1285,10 @@ private:
 
         if (has_spec && llama_n_rs_seq(ctx_tgt) > 0) {
             const uint32_t total_planes = llama_n_rs_seq(ctx_tgt) + 1;
-            const uint32_t direct_rollback = capped_rs ? total_planes - 2 : total_planes - 1;
-            SRV_INF("recurrent-plane policy: draft depth = %d, total planes = %u, direct rollback horizon = %u, full-shape GPU replay = %s\n",
-                    params_base.speculative.draft.n_max, total_planes, direct_rollback,
+            const int32_t n_lead = params_base.speculative.get_rs_planes_lead();
+            const uint32_t n_trail = capped_rs ? total_planes - 1 - n_lead : total_planes - 1;
+            SRV_INF("recurrent-plane policy: draft depth = %d, total planes = %u, leading planes = %d, trailing planes = %u, full-shape GPU replay = %s\n",
+                    params_base.speculative.draft.n_max, total_planes, n_lead, n_trail,
                     capped_rs ? "enabled" : "disabled");
         }
 
@@ -3894,7 +3895,8 @@ private:
         bool snapshot_mode_restored = true;
         queue_tasks.yield_to_queue([&]() {
             bool snapshot_mode_enabled = false;
-            if (sparse_snapshots && !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token)) {
+            const int32_t n_lead = selected_token < 0 ? params_base.speculative.get_rs_planes_lead() : 0;
+            if (sparse_snapshots && !llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, true, selected_token, n_lead)) {
                 snapshot_mode_restored = false;
                 return;
             }
@@ -3906,12 +3908,12 @@ private:
                 }
             } catch (...) {
                 if (snapshot_mode_enabled) {
-                    snapshot_mode_restored = llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1);
+                    snapshot_mode_restored = llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1, 0);
                 }
                 throw;
             }
             if (snapshot_mode_enabled) {
-                snapshot_mode_restored = llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1);
+                snapshot_mode_restored = llama_recurrent_set_sparse_snapshot_mode(ctx_tgt, false, -1, 0);
             }
         });
 
@@ -4187,8 +4189,15 @@ private:
                     GGML_ASSERT(accepted.size() >= 1);
 
                     const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
-                    const uint32_t direct_horizon = llama_n_rs_seq(ctx_tgt) > 0 ? llama_n_rs_seq(ctx_tgt) - 1 : 0;
-                    const bool use_gpu_replay = slot.spec_replay.gpu_snapshots_armed() && n_rollback > direct_horizon;
+                    bool use_gpu_replay = false;
+                    if (slot.spec_replay.gpu_snapshots_armed()) {
+                        // same plane layout as the sparse snapshot graph: leading states, trailing states, input state
+                        const uint32_t n_planes = llama_n_rs_seq(ctx_tgt) + 1;
+                        const uint32_t n_tokens = slot.spec_draft.size() + 1;
+                        const uint32_t n_lead = n_tokens > n_planes - 1 ? params_base.speculative.get_rs_planes_lead() : 0;
+                        const uint32_t n_trail = std::min(n_tokens, n_planes - 1) - n_lead;
+                        use_gpu_replay = n_rollback >= n_trail && accepted.size() - 1 >= n_lead;
+                    }
 
                     if (use_gpu_replay) {
                         const uint32_t n_accepted = accepted.size() - 1;
@@ -4206,9 +4215,10 @@ private:
                         return;
                     }
 
-                    const bool use_ckpt_tgt =
-                        ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
-                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt));
+                    // with capped planes, a rollback without replay selects a kept plane
+                    const bool use_ckpt_tgt = !slot.spec_replay.gpu_snapshots_armed() &&
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                        (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_rollback > llama_n_rs_seq(ctx_tgt)));
 
                     // check for partial draft acceptance
                     if (n_rollback > 0) {

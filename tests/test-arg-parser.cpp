@@ -288,6 +288,31 @@ static void test(void) {
         }
     }
 
+    struct rs_lead_case {
+        std::vector<std::string> args;
+        bool valid;
+        int32_t lead;
+    };
+    const rs_lead_case rs_lead_cases[] = {
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4" }, true, 2 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7" }, true, 0 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4" }, true, 0 },
+        { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4", "--spec-draft-rs-planes-lead", "2" }, true, 2 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4", "--spec-draft-rs-planes-lead", "0" }, true, 0 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4", "--spec-draft-rs-planes-lead", "3" }, false, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "8", "--spec-draft-rs-planes-lead", "1" }, false, -1 },
+        { { "--spec-type", "draft-dflash", "--spec-draft-n-max", "7", "--spec-draft-rs-planes", "4", "--spec-draft-rs-planes-lead", "-2" }, false, -1 },
+    };
+    for (const auto & test_case : rs_lead_cases) {
+        params = common_params();
+        argv = { "binary_name" };
+        argv.insert(argv.end(), test_case.args.begin(), test_case.args.end());
+        assert(test_case.valid == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SERVER));
+        if (test_case.valid) {
+            assert(params.speculative.get_rs_planes_lead() == test_case.lead);
+        }
+    }
+
     params = common_params();
     params.model.path = "model_file.gguf";
 

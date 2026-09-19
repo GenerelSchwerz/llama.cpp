@@ -37,9 +37,15 @@ class llama_memory_hybrid_iswa_context;
 struct llama_recurrent_snapshot_mode {
     bool sparse = false;
     int32_t selected_token = -1;
+    int32_t n_leading = 0;
+
+    // leading token states that a sparse verification of n_tokens keeps in K planes
+    int64_t leading(int64_t n_tokens, int64_t K) const {
+        return sparse && selected_token < 0 && n_tokens > K - 1 ? n_leading : 0;
+    }
 
     bool operator==(const llama_recurrent_snapshot_mode & other) const {
-        return sparse == other.sparse && selected_token == other.selected_token;
+        return sparse == other.sparse && selected_token == other.selected_token && n_leading == other.n_leading;
     }
 };
 

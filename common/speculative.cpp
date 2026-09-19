@@ -2348,6 +2348,14 @@ void common_validate_speculative_params(
                 params.draft.n_ubatch, target_ubatch_raw));
     }
 
+    if (params.rs_planes_lead < -1) {
+        throw std::invalid_argument("spec-draft-rs-planes-lead must be -1 (auto) or >= 0");
+    }
+
+    if (params.rs_planes_lead > 0 && !params.is_rs_capped()) {
+        throw std::invalid_argument("spec-draft-rs-planes-lead requires spec-draft-rs-planes below spec-draft-n-max + 1");
+    }
+
     if (params.rs_planes == 0) {
         return;
     }
@@ -2377,6 +2385,12 @@ void common_validate_speculative_params(
                        type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
                        type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
             });
+    if (params.is_rs_capped() && params.rs_planes_lead > params.rs_planes - 2) {
+        throw std::invalid_argument(string_format(
+                "spec-draft-rs-planes-lead must be in [0, %d] for spec-draft-rs-planes=%d, one plane keeps the newest state",
+                params.rs_planes - 2, params.rs_planes));
+    }
+
     if (params.is_rs_capped() && n_recurrent_modes > 1) {
         throw std::invalid_argument(
                 "spec-draft-rs-planes cannot be combined with another speculative mode that requires recurrent rollback");

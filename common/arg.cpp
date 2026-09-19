@@ -4215,6 +4215,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_RS_PLANES"));
     add_opt(common_arg(
+        {"--spec-draft-rs-planes-lead"}, "N",
+        "capped recurrent planes that keep the states after the first draft tokens; the others keep the newest states (default: -1, auto: spec-draft-rs-planes - 2 for draft-dflash, 0 for draft-mtp)",
+        [](common_params & params, int value) {
+            params.speculative.rs_planes_lead = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_RS_PLANES_LEAD"));
+    add_opt(common_arg(
         {"--spec-draft-ubatch-size", "--ubatch-size-draft", "-ubd"}, "N",
         "physical maximum batch size for the draft context (default: 0, inherit target ubatch); "
         "draft-mtp requires 0 or the target ubatch",

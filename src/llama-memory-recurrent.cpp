@@ -518,13 +518,15 @@ bool llama_memory_recurrent::recurrent_sparse_snapshots_supported() const {
     return n_rs_seq > 0 && !ctxs_bufs.empty() && graph_supports_sparse_snapshots;
 }
 
-bool llama_memory_recurrent::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
-    if (selected_token < -1) {
+bool llama_memory_recurrent::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token, int32_t n_leading) {
+    // at least one trailing plane must keep the final state
+    if (selected_token < -1 || n_leading < 0 || (n_leading > 0 && (!enabled || selected_token >= 0 || n_leading + 2 > (int32_t) n_rs_seq + 1))) {
         return false;
     }
     next_snapshot_mode = {
         /*.sparse =*/ enabled,
         /*.selected_token =*/ enabled ? selected_token : -1,
+        /*.n_leading =*/ n_leading,
     };
     return true;
 }
@@ -1460,10 +1462,14 @@ bool llama_memory_recurrent_context::apply() {
             GGML_ASSERT((uint32_t) snapshot_mode.selected_token < ubatch.n_seq_tokens);
             plane_positions[0] = ubatch.pos[i + snapshot_mode.selected_token];
         } else {
-            const uint32_t n_written = std::min(ubatch.n_seq_tokens, n_planes - 1);
-            for (uint32_t plane = 0; plane < n_written; ++plane) {
+            const uint32_t n_leading = (uint32_t) snapshot_mode.leading(ubatch.n_seq_tokens, n_planes);
+            const uint32_t n_trailing = std::min(ubatch.n_seq_tokens, n_planes - 1) - n_leading;
+            for (uint32_t plane = 0; plane < n_trailing; ++plane) {
                 const int32_t token = (int32_t) ubatch.n_seq_tokens - 1 - (int32_t) plane;
                 plane_positions[plane] = ubatch.pos[i + token];
+            }
+            for (uint32_t token = 0; token < n_leading; ++token) {
+                plane_positions[n_planes - 2 - token] = ubatch.pos[i + token];
             }
             plane_positions[n_planes - 1] = ubatch.pos[i] - 1;
         }
