@@ -4702,9 +4702,10 @@ struct test_gated_delta_net : public test_case {
     const int32_t trailing_snapshots;
     const int32_t selected_token;
     const bool    reserve_input;
+    const int32_t leading_snapshots;
 
     std::string vars() override {
-        return VARS_TO_STR12(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, trailing_snapshots, selected_token, reserve_input);
+        return VARS_TO_STR13(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, trailing_snapshots, selected_token, reserve_input, leading_snapshots);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -4715,10 +4716,10 @@ struct test_gated_delta_net : public test_case {
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
             int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1,
-            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false)
+            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false, int32_t leading_snapshots = 0)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
           v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), trailing_snapshots(trailing_snapshots),
-          selected_token(selected_token), reserve_input(reserve_input) {}
+          selected_token(selected_token), reserve_input(reserve_input), leading_snapshots(leading_snapshots) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -4749,7 +4750,7 @@ struct test_gated_delta_net : public test_case {
         k = ggml_l2_norm(ctx, k, 1e-6f);
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         if (trailing_snapshots >= 0) {
-            ggml_gated_delta_net_set_snapshots(out, trailing_snapshots, selected_token, reserve_input);
+            ggml_gated_delta_net_set_snapshots(out, trailing_snapshots, selected_token, reserve_input, leading_snapshots);
             if (mode == MODE_SUPPORT) {
                 return out;
             }
@@ -4846,11 +4847,12 @@ static bool test_gated_delta_net_rejection() {
     ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     GGML_ASSERT(cpu != nullptr);
 
-    const auto set_params = [&](int32_t k, int32_t trailing, int32_t selected, int32_t reserve) {
+    const auto set_params = [&](int32_t k, int32_t trailing, int32_t selected, int32_t reserve, int32_t leading) {
         memcpy(out->op_params + 0, &k,        sizeof(k));
         memcpy(out->op_params + 1, &trailing, sizeof(trailing));
         memcpy(out->op_params + 2, &selected, sizeof(selected));
         memcpy(out->op_params + 3, &reserve,  sizeof(reserve));
+        memcpy(out->op_params + 4, &leading,  sizeof(leading));
     };
     const auto rejects_op = [&](ggml_tensor * op, const char * name) {
         if (ggml_backend_dev_supports_op(cpu, op)) {
@@ -4891,20 +4893,24 @@ static bool test_gated_delta_net_rejection() {
         int32_t trailing;
         int32_t selected;
         int32_t reserve;
+        int32_t leading;
         const char * name;
     };
     const malformed_params malformed[] = {
-        { 0, 0, -1, 0, "K" },
-        { 3, 3, -1, 0, "K geometry" },
-        { 4, 5, -1, 0, "trailing snapshots" },
-        { 4, 0,  4, 0, "selected token" },
-        { 4, 1,  1, 0, "selected and trailing snapshots" },
-        { 4, 3, -1, 2, "reserve input value" },
-        { 4, 4, -1, 1, "reserve input geometry" },
-        { 4, 2, -1, 1, "reserve input trailing count" },
+        { 0, 0, -1, 0, 0, "K" },
+        { 3, 3, -1, 0, 0, "K geometry" },
+        { 4, 5, -1, 0, 0, "trailing snapshots" },
+        { 4, 0,  4, 0, 0, "selected token" },
+        { 4, 1,  1, 0, 0, "selected and trailing snapshots" },
+        { 4, 3, -1, 2, 0, "reserve input value" },
+        { 4, 4, -1, 1, 0, "reserve input geometry" },
+        { 4, 2, -1, 1, 0, "reserve input trailing count" },
+        { 4, 3, -1, 0, 1, "leading snapshots without reserved input" },
+        { 4, 2, -1, 1, 2, "reserve input leading count" },
+        { 4, 1, -1, 1, -1, "negative leading snapshots" },
     };
     for (const auto & test_params : malformed) {
-        set_params(test_params.k, test_params.trailing, test_params.selected, test_params.reserve);
+        set_params(test_params.k, test_params.trailing, test_params.selected, test_params.reserve, test_params.leading);
         if (!rejects(test_params.name)) {
             return false;
         }
@@ -4923,9 +4929,9 @@ static bool test_gated_delta_net_rejection() {
         memcpy(k1_out->op_params + 3, &reserve,  sizeof(reserve));
     };
     const malformed_params malformed_k1[] = {
-        { 1, 0, -1, 0, "K=1 trailing snapshots" },
-        { 1, 0,  0, 0, "K=1 selected token" },
-        { 1, 1, -1, 1, "K=1 reserve input" },
+        { 1, 0, -1, 0, 0, "K=1 trailing snapshots" },
+        { 1, 0,  0, 0, 0, "K=1 selected token" },
+        { 1, 1, -1, 1, 0, "K=1 reserve input" },
     };
     for (const auto & test_params : malformed_k1) {
         set_k1_params(test_params.trailing, test_params.selected, test_params.reserve);
@@ -4934,7 +4940,7 @@ static bool test_gated_delta_net_rejection() {
         }
     }
 
-    set_params(4, 4, -1, 0);
+    set_params(4, 4, -1, 0, 0);
     if (!rejects_change(out->ne[1], out->ne[1] + 1, "output geometry")) {
         return false;
     }
@@ -5196,7 +5202,7 @@ static int test_gated_delta_net_rpc_client(const char * endpoint, int marker_fd)
     }
     ggml_tensor probe = *out;
     for (int mode = 0; mode < 3; ++mode) {
-        ggml_gated_delta_net_set_snapshots(&probe, mode == 2 ? 0 : 3, mode == 2 ? 0 : -1, mode == 1);
+        ggml_gated_delta_net_set_snapshots(&probe, mode == 2 ? 0 : 3, mode == 2 ? 0 : -1, mode == 1, 0);
         if (ggml_backend_supports_op(backend.get(), &probe)) {
             fprintf(stderr, "RPC GDN wire test: unsupported snapshot mode %d was accepted\n", mode);
             return 9;
@@ -5314,12 +5320,13 @@ struct test_gated_delta_net_fused_cache : public test_case {
     const int32_t trailing_snapshots;
     const int32_t selected_token;
     const bool    reserve_input;
+    const int32_t leading_snapshots;
 
     ggml_tensor * state_cpy         = nullptr;
     ggml_tensor * reserve_state_cpy = nullptr;
 
     std::string vars() override {
-        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, K, trailing_snapshots, selected_token, reserve_input);
+        return VARS_TO_STR9(head_count, head_size, n_seq_tokens, n_seqs, K, trailing_snapshots, selected_token, reserve_input, leading_snapshots);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -5345,10 +5352,10 @@ struct test_gated_delta_net_fused_cache : public test_case {
     test_gated_delta_net_fused_cache(
             int64_t head_count = 4, int64_t head_size = 16,
             int64_t n_seq_tokens = 4, int64_t n_seqs = 1, int64_t K = 3,
-            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false)
+            int32_t trailing_snapshots = -1, int32_t selected_token = -1, bool reserve_input = false, int32_t leading_snapshots = 0)
         : head_count(head_count), head_size(head_size),
           n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K), trailing_snapshots(trailing_snapshots),
-          selected_token(selected_token), reserve_input(reserve_input) {
+          selected_token(selected_token), reserve_input(reserve_input), leading_snapshots(leading_snapshots) {
         GGML_ASSERT(K > 0);
     }
 
@@ -5371,7 +5378,7 @@ struct test_gated_delta_net_fused_cache : public test_case {
 
         ggml_tensor * gdn_out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         if (trailing_snapshots >= 0) {
-            ggml_gated_delta_net_set_snapshots(gdn_out, trailing_snapshots, selected_token, reserve_input);
+            ggml_gated_delta_net_set_snapshots(gdn_out, trailing_snapshots, selected_token, reserve_input, leading_snapshots);
         }
 
         const int64_t D                   = head_size * head_size * head_count;
@@ -5398,7 +5405,7 @@ struct test_gated_delta_net_fused_cache : public test_case {
         const int64_t n_written = trailing_snapshots < 0 ? std::min(n_seq_tokens, K) : selected_token >= 0 ? 1 : trailing_snapshots;
         state_cpy = copy_snapshots(0, n_written, "state_cpy");
         if (reserve_input) {
-            reserve_state_cpy = copy_snapshots(K - 1, 1, "reserve_state_cpy");
+            reserve_state_cpy = copy_snapshots(K - 1 - leading_snapshots, leading_snapshots + 1, "reserve_state_cpy");
         }
 
         return ggml_view_4d(
@@ -11735,8 +11742,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 16, 1, 2, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 8, 1, 1, false, false, 4, 0, 3, false));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 8, 1, 1, false, false, 4, 3, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 8, 2, 1, false, false, 5, 1, -1, true, 3));
     test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 8, 1, 4, 0, 3, false));
     test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 8, 1, 4, 3, -1, true));
+    test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 8, 2, 4, 1, -1, true, 2));
     test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 1, 1, 4, 1, -1, true));
     test_cases.emplace_back(new test_gated_delta_net_fused_cache(4, 32, 2, 1, 4, 2, -1, true));
 

@@ -2651,7 +2651,8 @@ extern "C" {
     // By default, slot 0 is the final state and up to min(n_tokens, K) trailing states are written most-recent first.
     // For K > 1, trailing-only mode accepts (trailing_snapshots, selected_token, reserve_input) == ([0, K], -1, false) and writes up to min(n_tokens, trailing_snapshots) states most-recent first.
     // Selected-token mode requires (trailing_snapshots, selected_token, reserve_input) == (0, [0, n_tokens), false) and writes only the state after selected_token to slot 0.
-    // Reserved-input mode requires (trailing_snapshots, selected_token, reserve_input) == (min(n_tokens, K - 1), -1, true) and writes the input state to slot K - 1 and trailing states most-recent first from slot 0.
+    // Reserved-input mode requires (trailing_snapshots + leading_snapshots, selected_token, reserve_input) == (min(n_tokens, K - 1), -1, true) and writes the input state to slot K - 1, trailing states most-recent first from slot 0, and the state after token t < leading_snapshots to slot K - 2 - t.
+    // Other modes require leading_snapshots == 0.
     // State slots not selected by these modes stay untouched.
     // K == 1 requires (trailing_snapshots, selected_token, reserve_input) == (1, -1, false) and writes the final state to slot 0.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
@@ -2668,7 +2669,8 @@ extern "C" {
             struct ggml_tensor * tensor,
             int32_t              trailing_snapshots,
             int32_t              selected_token,
-            bool                 reserve_input);
+            bool                 reserve_input,
+            int32_t              leading_snapshots);
 
     GGML_API bool ggml_gated_delta_net_has_default_snapshot_params(
             const struct ggml_tensor * tensor);

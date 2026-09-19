@@ -65,7 +65,8 @@ gated_delta_net_cuda(const float * q,
                                      int           K,
                                      int           trailing_snapshots,
                                      int           selected_token,
-                                     bool          reserve_input) {
+                                     bool          reserve_input,
+                                     int           leading_snapshots) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -192,11 +193,14 @@ gated_delta_net_cuda(const float * q,
 
         if constexpr (keep_rs_t) {
             // Slots not selected by the snapshot parameters are caller-owned.
-            const int target_slot = selected_token >= 0
+            int target_slot = selected_token >= 0
                     ? (t == selected_token ? 0 : -1)
                     : (int) n_tokens - 1 - t;
             const int snapshot_slots = selected_token >= 0 ? 1 : trailing_snapshots;
-            if (target_slot >= 0 && target_slot < snapshot_slots) {
+            if (target_slot >= snapshot_slots) {
+                target_slot = t < leading_snapshots ? K - 2 - t : -1;
+            }
+            if (target_slot >= 0) {
                 float * curr_state = state + target_slot * state_slot_stride;
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
@@ -227,7 +231,7 @@ static void launch_gated_delta_net(
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
-        int trailing_snapshots, int selected_token, bool reserve_input, cudaStream_t stream) {
+        int trailing_snapshots, int selected_token, bool reserve_input, int leading_snapshots, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -244,21 +248,21 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots);
             break;
         }
         case 128: {
@@ -266,7 +270,7 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots);
             break;
         }
         default:
@@ -344,6 +348,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const int trailing_snapshots = ggml_get_op_params_i32(dst, 1);
     const int selected_token = ggml_get_op_params_i32(dst, 2);
     const bool reserve_input = ggml_get_op_params_i32(dst, 3) != 0;
+    const int leading_snapshots = ggml_get_op_params_i32(dst, 4);
     const bool keep_rs = K > 1;
 
     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
@@ -359,24 +364,24 @@ static void ggml_cuda_op_gated_delta_net_impl(
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input, stream);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input, stream);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots, stream);
         }
     } else {
         if (keep_rs) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input, stream);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K,
-                trailing_snapshots, selected_token, reserve_input, stream);
+                trailing_snapshots, selected_token, reserve_input, leading_snapshots, stream);
         }
     }
 }

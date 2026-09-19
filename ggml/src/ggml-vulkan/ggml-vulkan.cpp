@@ -2016,6 +2016,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t trailing_snapshots;
     int32_t selected_token;
     uint32_t reserve_input;
+    uint32_t leading_snapshots;
 };
 static_assert(sizeof(vk_op_gated_delta_net_push_constants) <= 128);
 
@@ -13311,6 +13312,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const int32_t trailing_snapshots = ggml_get_op_params_i32(dst, 1);
     const int32_t selected_token = ggml_get_op_params_i32(dst, 2);
     const uint32_t reserve_input = ggml_get_op_params_i32(dst, 3) != 0;
+    const int32_t leading_snapshots = ggml_get_op_params_i32(dst, 4);
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
@@ -13322,6 +13324,7 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         (uint32_t) trailing_snapshots,
         selected_token,
         reserve_input,
+        (uint32_t) leading_snapshots,
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
