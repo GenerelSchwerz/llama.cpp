@@ -237,6 +237,18 @@ std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t 
     return bytes;
 }
 
+ggml_backend_buffer_type_t pageable_cached_buffer_type() {
+    static ggml_backend_buffer_type buft = *ggml_backend_cuda_moe_cached_buffer_type();
+    buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t size) {
+        auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+        if (buffer != nullptr) {
+            buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
+        }
+        return buffer;
+    };
+    return &buft;
+}
+
 #ifdef __linux__
 static void file_mmap_cached_buffer_free(ggml_backend_buffer_t buffer) {
     CHECK(munmap(buffer->context, buffer->size) == 0);
@@ -414,6 +426,19 @@ active_grouped_dispatch_graph build_active_grouped_dispatch_graph_types(
             up_bias = add_bias(ff_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS, "test_active_up_bias");
         }
         down_bias = add_bias(n_dim, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS, "test_active_down_bias");
+    } else if (shared_banks != nullptr) {
+        result.biases = shared_banks->biases;
+        result.bias_roles = shared_banks->bias_roles;
+        CHECK(result.biases.size() == result.bias_roles.size());
+        for (size_t i = 0; i < result.biases.size(); ++i) {
+            switch (result.bias_roles[i]) {
+                case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_BIAS:    gate_bias = result.biases[i]; break;
+                case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_BIAS:      up_bias = result.biases[i]; break;
+                case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_BIAS: gate_up_bias = result.biases[i]; break;
+                case GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS:    down_bias = result.biases[i]; break;
+                default: CHECK(false);
+            }
+        }
     }
     if (shared_banks != nullptr) {
         result.gate_scale = shared_banks->gate_scale;

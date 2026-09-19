@@ -32,16 +32,16 @@ static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * t
     return bytes;
 }
 
-void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim) {
+void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim, bool pageable) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr backend(ggml_backend_cuda_init(device));
     CHECK(backend != nullptr);
-    auto buft = ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
+    auto buft = pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
     CHECK(buft != nullptr);
     auto graph = build_active_grouped_dispatch_graph(
         backend.get(), buft, GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 1, 8, 2, n_dim);
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, pageable, 1, 8, 2, n_dim);
     ggml_backend_cuda_moe_cached_free_buffer_type(buft);
     initialize_active_grouped_dispatch_graph(graph, 177);
     if (host_budget != 0) {
@@ -113,6 +113,9 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
     CHECK(direct.dispatch_mode() == GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT);
     run_callbacks(direct, previous_stream);
     CHECK(context->finish_graph_dispatch(&direct));
+    if (pageable) {
+        CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == ggml_nbytes(graph.down_scale));
+    }
 
     ggml_cuda_moe_graph_execution capture;
     prepare_execution(capture, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNCHANGED, stream);
@@ -295,7 +298,7 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
     if (n_dim == 1024) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::host_copy_jobs(*context, key) != 0);
     }
-    if (host_budget != 0) {
+    if (host_budget != 0 || pageable) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
         CHECK(ggml_cuda_moe_grouped_context_test_access::attach_prepack(*context, key, stream));
         std::vector<std::shared_ptr<void>> pending_leases;
@@ -316,7 +319,7 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
             std::this_thread::yield();
         }
 
-        const bool replace_pending = host_budget == 393216;
+        const bool replace_pending = host_budget == 393216 || pageable;
         std::thread replace_pending_thread;
         if (replace_pending) {
             replace_pending_thread = std::thread([&] {
@@ -343,6 +346,9 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
         }
         const bool retained = lease_released.load(std::memory_order_acquire) && !pending_witness.expired();
         const bool shutdown_waited = !shutdown_done.load(std::memory_order_acquire);
+        if (pageable) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == ggml_nbytes(graph.down_scale));
+        }
         pending_barrier.released.store(true, std::memory_order_release);
         release_pending.join();
         if (replace_pending_thread.joinable()) {
@@ -350,6 +356,9 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
         }
         shutdown_pending.join();
         CHECK(retained && shutdown_waited && pending_witness.expired());
+        if (pageable) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+        }
         fprintf(stderr, "test-moe-cache: prepack cross-stream teardown replaced=%d retained=1 waited=1 OK\n", replace_pending);
     }
     CUDA_OK(cudaStreamSynchronize(previous_stream));

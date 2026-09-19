@@ -3801,6 +3801,25 @@ static bool ggml_cuda_compute_forward(
         ggml_backend_cuda_context & ctx,
         struct ggml_tensor * dst,
         ggml_cuda_moe_graph_execution * execution) {
+    if (execution != nullptr && ctx.moe_grouped_context != nullptr &&
+            execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+            (dst->op == GGML_OP_REPEAT || dst->op == GGML_OP_ADD_ID)) {
+        const float * source = nullptr;
+        if (!ctx.moe_grouped_context->original_auxiliary_source(*execution, dst, ctx.stream(), &source)) {
+            return false;
+        }
+        const int index = dst->op == GGML_OP_REPEAT ? 0 : 1;
+        ggml_tensor source_view = *dst->src[index];
+        ggml_tensor dst_view = *dst;
+        source_view.data = const_cast<float *>(source);
+        dst_view.src[index] = &source_view;
+        if (dst->op == GGML_OP_REPEAT) {
+            ggml_cuda_op_repeat(ctx, &dst_view);
+        } else {
+            ggml_cuda_op_add_id(ctx, &dst_view);
+        }
+        return true;
+    }
     switch (dst->op) {
         case GGML_OP_CUSTOM:
             return ggml_cuda_staged_input_compute(ctx, dst);
@@ -6598,7 +6617,8 @@ static bool ggml_cuda_graph_evaluate_and_capture(
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                     if (moe_execution != nullptr &&
-                            (moe_execution->find_group(node, nullptr) != nullptr || moe_execution->rejects_cached_mmid(node))) {
+                            (moe_execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED ||
+                                moe_execution->find_group(node, nullptr) != nullptr || moe_execution->rejects_cached_mmid(node))) {
                         GGML_ASSERT(!use_cuda_graph && !cuda_graph_update_required);
                         return false;
                     }
@@ -6683,12 +6703,16 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, ui
 }
 #endif // USE_CUDA_GRAPH
 
-static void ggml_cuda_graph_invalidate_moe_capture(ggml_cuda_graph * graph) {
+static void ggml_cuda_graph_invalidate_moe_capture(ggml_cuda_graph * graph, bool reset_properties = false) {
     if (graph == nullptr) {
         return;
     }
 #ifdef USE_CUDA_GRAPH
     graph->warmup_complete = false;
+    if (reset_properties) {
+        graph->uid = 0;
+        graph->node_props.clear();
+    }
     if (graph->moe_resource_fingerprint != 0) {
         if (graph->instance != nullptr) {
             CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
@@ -6701,7 +6725,9 @@ static void ggml_cuda_graph_invalidate_moe_capture(ggml_cuda_graph * graph) {
         graph->moe_resource_witnesses.clear();
     }
 #endif
+    GGML_UNUSED(reset_properties);
     graph->moe_resource_fingerprint = 0;
+    graph->moe_registry_generation = 0;
 }
 
 #ifdef USE_CUDA_GRAPH
@@ -6816,6 +6842,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * coverage_nodes = nullptr;
     uint32_t coverage_mmid_count = 0;
 
+    if (graph != nullptr && graph->moe_resource_fingerprint != 0 && cuda_ctx->moe_grouped_context != nullptr &&
+            graph->moe_registry_generation != cuda_ctx->moe_grouped_context->state().generation) {
+        ggml_cuda_graph_invalidate_moe_capture(graph, true);
+    }
+
 #ifdef USE_CUDA_GRAPH
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
@@ -6854,21 +6885,21 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             cgraph, cgraph->uid, moe_property_hint, plan, &moe_execution, coverage_epoch, coverage_nodes,
             coverage_mmid_count, coverage_mmid_fingerprint);
         if (prepare_result == GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE) {
-            ggml_cuda_graph_invalidate_moe_capture(graph);
+            ggml_cuda_graph_invalidate_moe_capture(graph, true);
             return required_here ? required_failure("plan preparation failed") : GGML_STATUS_FAILED;
         }
         prepared_plan = *plan;
     }
     if (required_here) {
         if (prepared_plan == nullptr || !ggml_cuda_moe_required_grouped_plan_ready(*prepared_plan, moe_execution)) {
-            ggml_cuda_graph_invalidate_moe_capture(graph);
+            ggml_cuda_graph_invalidate_moe_capture(graph, true);
             return required_failure("grouped plan unavailable");
         }
         const auto & diagnostics = prepared_plan->coverage_diagnostics();
         if (coverage_epoch == 0 || coverage_nodes != cgraph->nodes || coverage_mmid_fingerprint == 0 ||
                 diagnostics.cached_mmid == 0 || coverage_mmid_count != diagnostics.cached_mmid ||
                 diagnostics.counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REGISTERED] != diagnostics.cached_mmid) {
-            ggml_cuda_graph_invalidate_moe_capture(graph);
+            ggml_cuda_graph_invalidate_moe_capture(graph, true);
             return required_failure("incomplete cached MMID coverage");
         }
     }
@@ -6883,9 +6914,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         use_cuda_graph = false;
         cuda_graph_update_required = false;
     };
-    const auto force_moe_direct = [&]() {
+    const auto force_moe_direct = [&](bool reset_properties = false) {
         set_moe_direct();
-        ggml_cuda_graph_invalidate_moe_capture(graph);
+        ggml_cuda_graph_invalidate_moe_capture(graph, reset_properties);
     };
     bool retain_grouped_capture = false;
     bool update_grouped_capture = false;
@@ -6951,12 +6982,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
     if (moe_dispatch) {
         if (!moe_execution.resolve_streams(ggml_cuda_moe_graph_stream, cuda_ctx)) {
-            force_moe_direct();
+            force_moe_direct(true);
             return required_here ? required_failure("stream resolution failed") : GGML_STATUS_FAILED;
         }
         const auto outcome = moe_execution.outcome();
         if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && !moe_execution.has_coherent_grouped_streams()) {
-            force_moe_direct();
+            force_moe_direct(required_here);
             if (required_here) {
                 return required_failure("incoherent grouped streams");
             }
@@ -6972,13 +7003,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (validate_resources && !cuda_ctx->moe_grouped_context->graph_resource_fingerprint(
                         moe_execution, cuda_ctx->stream(), &moe_resource_fingerprint,
                         use_cuda_graph ? &moe_resource_leases : nullptr)) {
-                    force_moe_direct();
+                    force_moe_direct(required_here);
                     if (required_here) {
                         return required_failure("grouped resource validation failed");
                     }
                 } else if (graph != nullptr && graph->moe_resource_fingerprint != 0 &&
                         graph->moe_resource_fingerprint != moe_resource_fingerprint) {
-                    force_moe_direct();
+                    force_moe_direct(required_here);
                     if (required_here) {
                         return required_failure("grouped resource fingerprint changed");
                     }
@@ -7013,7 +7044,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             force_moe_direct();
         }
         if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
-            force_moe_direct();
+            force_moe_direct(true);
             return required_here ? required_failure("grouped dispatch admission failed") : GGML_STATUS_FAILED;
         }
         if ((moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE ||
@@ -7022,16 +7053,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     &moe_execution, moe_dispatch_mode, moe_resource_fingerprint,
                     moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY ? &graph->moe_resource_witnesses : nullptr)) {
             if (!cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution)) {
-                force_moe_direct();
+                force_moe_direct(true);
                 return required_here ? required_failure("capture activation cleanup failed") : GGML_STATUS_FAILED;
             }
-            force_moe_direct();
+            force_moe_direct(required_here);
             if (required_here) {
                 return required_failure("capture activation failed");
             }
             moe_dispatch_mode = GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT;
             if (!cuda_ctx->moe_grouped_context->begin_graph_dispatch(&moe_execution, moe_dispatch_mode)) {
-                force_moe_direct();
+                force_moe_direct(true);
                 return GGML_STATUS_FAILED;
             }
         }
@@ -7057,12 +7088,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     if (graph_evaluated && moe_dispatch_mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {
         graph->moe_resource_fingerprint = moe_resource_fingerprint;
+        graph->moe_registry_generation = prepared_plan->registry_generation();
         graph->moe_resource_witnesses = std::move(moe_resource_witnesses);
     }
 
     const bool dispatch_finished = !moe_dispatch || cuda_ctx->moe_grouped_context->finish_graph_dispatch(&moe_execution);
     if (!graph_evaluated || !dispatch_finished) {
-        force_moe_direct();
+        force_moe_direct(true);
         return required_here ? required_failure(
             !graph_evaluated ? "grouped evaluator failed" : "grouped finalization failed") : GGML_STATUS_FAILED;
     }

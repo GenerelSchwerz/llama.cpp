@@ -933,6 +933,11 @@ public:
     bool finish_graph_dispatch(ggml_cuda_moe_graph_execution * execution);
     void configure_early_router(const ggml_cgraph * graph, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream, bool capture, ggml_backend_cuda_context & parent);
     void launch_early_router(const ggml_tensor * node, ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
+    bool original_auxiliary_source(
+            const ggml_cuda_moe_graph_execution & execution,
+            const ggml_tensor * node,
+            ggml_cuda_moe_stream_t stream,
+            const float ** source) const;
     bool prefill_add_id_source(
             const ggml_cuda_moe_graph_execution & execution,
             const ggml_tensor * node,
@@ -988,6 +993,9 @@ private:
             uint64_t * cross_stream_waits,
             uint64_t * pending_declines) const;
     bool set_prefill_resident_budget_for_test(size_t byte_budget);
+    bool set_original_auxiliary_budget_for_test(size_t byte_budget);
+    size_t original_auxiliary_bytes_for_test() const;
+    void fail_device_resource_allocation_for_test(uint32_t stage);
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;

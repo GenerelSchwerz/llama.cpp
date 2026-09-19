@@ -506,8 +506,8 @@ static void test_active_grouped_dispatch_case(
         {type, type, type}, layout, n_slots, original_direct_down_scale, test_owner_concurrency);
 }
 
-static void test_active_grouped_materialization_eligibility() {
-#ifdef __linux__
+static void test_active_grouped_materialization_case(
+        ggml_backend_buffer_type_t buft, uint32_t layout, uint32_t domain, uint32_t semantics, uint32_t rows, ggml_type type) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
@@ -515,14 +515,11 @@ static void test_active_grouped_materialization_eligibility() {
     ggml_backend_ptr pageable_backend(ggml_backend_cuda_init(0));
     CHECK(reference_backend != nullptr && pinned_backend != nullptr && pageable_backend != nullptr);
     auto reference = build_active_grouped_dispatch_graph(
-        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true);
+        reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout, false, rows);
     auto pinned = build_active_grouped_dispatch_graph(
-        pinned_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true);
+        pinned_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), type, layout, false, rows);
     auto pageable = build_active_grouped_dispatch_graph(
-        pageable_backend.get(), file_mmap_cached_buffer_type(), GGML_TYPE_Q4_0,
-        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true);
+        pageable_backend.get(), buft, type, layout, false, rows);
     initialize_active_grouped_dispatch_graphs({&reference, &pinned, &pageable});
 
     cudaPointerAttributes attributes = {};
@@ -537,9 +534,15 @@ static void test_active_grouped_materialization_eligibility() {
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(
         reference_backend.get(), &disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     register_active_grouped_dispatch(
-        pinned_backend.get(), pinned, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+        pinned_backend.get(), pinned, layout, 12);
     register_active_grouped_dispatch(
-        pageable_backend.get(), pageable, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+        pageable_backend.get(), pageable, layout, 12);
+    for (auto * graph : {pinned.graph, pageable.graph}) {
+        candidate_stamp_execution(graph, domain, semantics, rows,
+            semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ? rows : 1, 0,
+            domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN && semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT ?
+                GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE : GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+    }
 
     const auto check_plan = [](
             ggml_backend_t backend,
@@ -566,15 +569,23 @@ static void test_active_grouped_materialization_eligibility() {
         CHECK(unknown.outcome() == expected_outcome && unknown.find_group(graph.down_output, nullptr) != nullptr);
     };
     check_plan(pinned_backend.get(), pinned, GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED, false);
-    check_plan(pageable_backend.get(), pageable, GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY, true);
+    check_plan(pageable_backend.get(), pageable, GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED, false);
 
-    const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-    const auto pinned_output = run_active_grouped_dispatch(pinned_backend.get(), pinned, 2, true);
-    const auto pageable_output = run_active_grouped_dispatch(pageable_backend.get(), pageable, 0, false);
-    CHECK(pinned_output == expected && pageable_output == expected);
-    CHECK(active_grouped_legacy_op_count(reference_backend.get()) == reference.banks.size());
-    CHECK(active_grouped_legacy_op_count(pinned_backend.get()) == 0);
-    CHECK(active_grouped_legacy_op_count(pageable_backend.get()) == pageable.banks.size());
+    for (uint32_t pass = 0; pass < 6; ++pass) {
+        set_active_grouped_dispatch_logits({&reference, &pinned, &pageable}, pass / 2);
+        std::vector<float> expected(ggml_nelements(reference.output));
+        std::vector<float> actual(expected.size());
+        CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_tensor_get(reference.output, expected.data(), 0, ggml_nbytes(reference.output));
+        for (auto * backend : {pinned_backend.get(), pageable_backend.get()}) {
+            auto & graph = backend == pinned_backend.get() ? pinned : pageable;
+            CHECK(ggml_backend_graph_compute(backend, graph.graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(graph.output, actual.data(), 0, ggml_nbytes(graph.output));
+            check_active_grouped_exact_output(expected, actual);
+            CHECK(active_grouped_legacy_op_count(backend, true) == 0);
+            CHECK(active_grouped_legacy_op_count(backend, false) == 0);
+        }
+    }
 
     auto * pinned_context = ggml_cuda_moe_grouped_context_for_test(pinned_backend.get());
     auto * pageable_context = ggml_cuda_moe_grouped_context_for_test(pageable_backend.get());
@@ -584,21 +595,212 @@ static void test_active_grouped_materialization_eligibility() {
     CHECK(pinned_context->find_down_group_key(pinned.down, &pinned_key));
     CHECK(pageable_context->find_down_group_key(pageable.down, &pageable_key));
     CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*pinned_context, pinned_key));
-    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*pageable_context, pageable_key));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*pageable_context, pageable_key));
     const auto pageable_telemetry =
         ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*pageable_context);
-    CHECK(pageable_telemetry.registered == 1 && pageable_telemetry.covered == 0);
-    CHECK(pageable_telemetry.calls == 0 && pageable_telemetry.ready == 0 && pageable_telemetry.completed == 0);
+    CHECK(pageable_telemetry.registered == 1 && pageable_telemetry.covered == 1);
+    CHECK(pageable_telemetry.decode_grouped == 6 && pageable_telemetry.decode_legacy == 0);
+    CHECK(pageable_telemetry.ready > 0 && pageable_telemetry.completed == pageable_telemetry.ready);
+    CHECK(pageable_telemetry.fallback == 0 && pageable_telemetry.required_unsupported == 0);
+    CHECK(pageable_telemetry.h2d_bytes > 0);
     CHECK(pageable_telemetry.prepare_error == 0 && pageable_telemetry.finish_error == 0);
-    check_active_grouped_legacy_caches(pageable_backend.get(), pageable, true);
     for (ggml_tensor * bank : pinned.banks) {
         CHECK(!pinned_context->acquire_legacy_cache(bank));
     }
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
-    fprintf(stderr, "test-moe-cache: grouped mapped-source eligibility OK\n");
-#else
-    fprintf(stderr, "test-moe-cache: grouped mapped-source eligibility SKIP\n");
+    fprintf(stderr, "test-moe-cache: pageable grouped layout=%u type=%s domain=%u rows=%u semantics=%u reason=0 outcome=1 fallback=0 exact OK\n",
+        layout, ggml_type_name(type), domain, rows, semantics);
+}
+
+void test_pageable_separate_draft_lifecycle() {
+    // Small, independent model inventories with identical tensor names: target IQ3,
+    // separate MTP Q4_K/Q6_K, and the reported 16/8 slot budgets. Exercise graph
+    // reuse beyond 1050 steps without loading a large model or allocating its KV.
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    constexpr uint32_t layout = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE;
+    constexpr uint32_t steps = 1100;
+    constexpr uint32_t experts = 128;
+    std::array<ggml_backend_ptr, 4> backends;
+    for (auto & backend : backends) {
+        backend.reset(ggml_backend_cuda_init(0));
+        CHECK(backend != nullptr);
+    }
+    auto target_reference = build_active_grouped_dispatch_graph(
+        backends[0].get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_IQ3_XXS, layout, false, 4, experts, 8);
+    auto target = build_active_grouped_dispatch_graph(
+        backends[1].get(), pageable_cached_buffer_type(), GGML_TYPE_IQ3_XXS, layout, false, 4, experts, 8);
+    const std::array<ggml_type, 3> draft_types = {GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
+    auto draft_reference = build_active_grouped_dispatch_graph_types(
+        backends[2].get(), ggml_backend_cuda_moe_cached_buffer_type(), draft_types, layout, false, false, 1, experts, 8);
+    auto draft = build_active_grouped_dispatch_graph_types(
+        backends[3].get(), pageable_cached_buffer_type(), draft_types, layout, false, false, 1, experts, 8);
+    auto draft_batch_reference = build_active_grouped_dispatch_graph_types(
+        backends[2].get(), ggml_backend_cuda_moe_cached_buffer_type(), draft_types, layout, false, false, 4, experts, 8, 256, &draft_reference);
+    auto draft_batch = build_active_grouped_dispatch_graph_types(
+        backends[3].get(), pageable_cached_buffer_type(), draft_types, layout, false, false, 4, experts, 8, 256, &draft);
+    initialize_active_grouped_dispatch_graphs({&target_reference, &target});
+    initialize_active_grouped_dispatch_graphs({&draft_reference, &draft});
+    initialize_active_grouped_dispatch_graphs({&draft_batch_reference, &draft_batch});
+    for (size_t bank = 0; bank < target.banks.size(); ++bank) {
+        CHECK(target.banks[bank] != draft.banks[bank]);
+        CHECK(strcmp(target.banks[bank]->name, draft.banks[bank]->name) == 0);
+    }
+
+    void * registered_base = ggml_backend_buffer_get_base(draft.weight_buffer.get());
+    const size_t registered_size = ggml_backend_buffer_get_size(draft.weight_buffer.get());
+    const bool registered = ggml_backend_cuda_register_host_buffer(registered_base, registered_size);
+    // REGISTER_HOST is an attempt, not a promise (e.g. read-only registration
+    // is unsupported on some drivers). Verify the actual source classification.
+    cudaPointerAttributes attributes = {};
+    CUDA_OK(cudaPointerGetAttributes(&attributes, registered_base));
+    CHECK(attributes.type == (registered ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
+    if (getenv("GGML_CUDA_REGISTER_HOST") != nullptr) {
+        fprintf(stderr, "test-moe-cache: REGISTER_HOST requested, actual registered=%d; validating that source path\n", registered);
+    }
+    register_active_grouped_dispatch(backends[0].get(), target_reference, layout, 16);
+    register_active_grouped_dispatch(backends[1].get(), target, layout, 16);
+    register_active_grouped_dispatch(backends[2].get(), draft_reference, layout, 8);
+    register_active_grouped_dispatch(backends[3].get(), draft, layout, 8);
+    const auto stamp = [](active_grouped_dispatch_graph & graph, uint32_t domain, uint64_t owner, uint64_t generation) {
+        candidate_stamp_execution(graph.graph, domain,
+            domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE :
+                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,
+            graph.n_rows, 1, 0, GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        graph.graph->execution_certificate.owner_namespace = owner;
+        graph.graph->execution_certificate.owner_generation = generation;
+    };
+    stamp(target_reference, GGML_GRAPH_EXECUTION_DOMAIN_MAIN, 701, 1);
+    stamp(target, GGML_GRAPH_EXECUTION_DOMAIN_MAIN, 702, 1);
+    stamp(draft_reference, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 801, 1);
+    stamp(draft, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 802, 1);
+    stamp(draft_batch_reference, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 801, 1);
+    stamp(draft_batch, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 802, 1);
+    // The reported generic diagnostic is also emitted for missing MMID inventory
+    // certification, even with pinned experts. It must remain a strict failure.
+    CHECK(ggml_backend_graph_compute(backends[2].get(), draft_reference.graph) == GGML_STATUS_FAILED);
+    CHECK(active_grouped_legacy_op_count(backends[2].get(), true) == 0);
+    CHECK(active_grouped_legacy_op_count(backends[2].get(), false) == 0);
+    for (size_t index = 0; index < backends.size(); ++index) {
+        auto * context = ggml_cuda_moe_grouped_context_for_test(backends[index].get());
+        CHECK(context != nullptr);
+        auto * graph = index == 0 ? &target_reference : index == 1 ? &target : index == 2 ? &draft_reference : &draft;
+        (void) candidate_certify_graph(*context, graph->graph);
+        if (index >= 2) {
+            (void) candidate_certify_graph(*context, index == 2 ? draft_batch_reference.graph : draft_batch.graph);
+        }
+    }
+
+    auto * target_context = ggml_cuda_moe_grouped_context_for_test(backends[1].get());
+    auto * draft_context = ggml_cuda_moe_grouped_context_for_test(backends[3].get());
+    CHECK(target_context != nullptr && draft_context != nullptr);
+    const auto target_generation = target_context->state().generation;
+    const auto draft_generation = draft_context->state().generation;
+    ggml_backend_buffer_ptr relocated;
+    uint64_t completions = 0;
+    const auto check_telemetry = [&](ggml_backend_t backend, uint64_t expected, uint64_t host_staged) {
+        auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(telemetry.decode_grouped == expected && telemetry.decode_legacy == 0);
+        CHECK(telemetry.ready == expected && telemetry.completed == expected);
+        CHECK(telemetry.host_staged_calls == host_staged && telemetry.host_staged_ops == 3 * host_staged);
+        CHECK(host_staged == expected || telemetry.h2d_bytes > 0);
+        CHECK(telemetry.fallback == 0 && telemetry.required_unsupported == 0);
+        CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+        CHECK(active_grouped_legacy_op_count(backend, true) == 0 && active_grouped_legacy_op_count(backend, false) == 0);
+        completions += telemetry.completed;
+    };
+    for (uint32_t step = 0; step < steps; ++step) {
+        if (step == 1050) {
+            check_telemetry(backends[3].get(), step, 26);
+            // Simulate a lazy/source rebind followed by candidate publication.
+            // The old captured lease remains valid until the backend retires it.
+            relocated.reset(ggml_backend_buft_alloc_buffer(pageable_cached_buffer_type(), registered_size));
+            CHECK(relocated != nullptr);
+            auto * new_base = static_cast<char *>(ggml_backend_buffer_get_base(relocated.get()));
+            memcpy(new_base, registered_base, registered_size);
+            for (auto * bank : draft.banks) {
+                const auto offset = static_cast<char *>(bank->data) - static_cast<char *>(registered_base);
+                bank->data = new_base + offset;
+                bank->buffer = relocated.get();
+            }
+            register_active_grouped_dispatch(backends[3].get(), draft, layout, 8);
+            CHECK(draft_context->state().generation == draft_generation + 1);
+            CHECK(target_context->state().generation == target_generation);
+            stamp(draft, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 802, 2);
+            stamp(draft_batch, GGML_GRAPH_EXECUTION_DOMAIN_MTP, 802, 2);
+            (void) candidate_certify_graph(*draft_context, draft.graph);
+            (void) candidate_certify_graph(*draft_context, draft_batch.graph);
+        }
+        auto & active_draft = step >= 1024 && step < 1050 ? draft_batch : draft;
+        auto & active_reference = step >= 1024 && step < 1050 ? draft_batch_reference : draft_reference;
+        const std::array<std::pair<active_grouped_dispatch_graph *, active_grouped_dispatch_graph *>, 2> pairs = {{
+            {&target_reference, &target}, {&active_reference, &active_draft},
+        }};
+        for (const auto & pair : pairs) {
+            const bool is_target = pair.second == &target;
+            set_active_grouped_dispatch_logits({pair.first, pair.second}, (step / 2) % 3);
+            std::vector<float> expected(ggml_nelements(pair.first->output)), actual(expected.size());
+            CHECK(ggml_backend_graph_compute(backends[is_target ? 0 : 2].get(), pair.first->graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(pair.first->output, expected.data(), 0, ggml_nbytes(pair.first->output));
+            CHECK(ggml_backend_graph_compute(backends[is_target ? 1 : 3].get(), pair.second->graph) == GGML_STATUS_SUCCESS);
+            ggml_backend_tensor_get(pair.second->output, actual.data(), 0, ggml_nbytes(pair.second->output));
+            check_active_grouped_exact_output(expected, actual);
+            if (step == 2 || step == 1049 || step == steps - 1) {
+                ggml_cuda_graph_capture_state_for_test state = {};
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(backends[is_target ? 1 : 3].get(), pair.second->graph, &state));
+                // A row union larger than the slot budget uses the existing
+                // explicit grouped HOST_STAGED strategy (direct, not legacy).
+                if (state.capture_available && !is_target && pair.second->n_rows == 1) {
+                    CHECK(state.instance != 0 && state.warmup_complete && state.moe_resource_fingerprint != 0);
+                } else {
+                    CHECK(state.graph == 0 && state.instance == 0);
+                }
+                const auto coverage = candidate_certify_graph(is_target ? *target_context : *draft_context, pair.second->graph);
+                ggml_cuda_moe_graph_plan plan;
+                ggml_cuda_moe_graph_execution execution;
+                (is_target ? target_context : draft_context)->compile_graph_plan(pair.second->graph, step + 1,
+                    &plan, &execution, coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint);
+                CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+                CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 0));
+            }
+        }
+    }
+    check_telemetry(backends[1].get(), steps, steps);
+    check_telemetry(backends[3].get(), steps - 1050, 0);
+    CHECK(completions == 2 * steps);
+    if (registered) {
+        ggml_backend_synchronize(backends[3].get());
+        ggml_backend_cuda_unregister_host_buffer(registered_base);
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: separate IQ3 target / Q4_K-Q6_K MTP 16/8 slots steps=%u registered=%d shape/rebind reason=0 outcome=1 fallback=0 exact OK\n",
+        steps, registered);
+}
+
+void test_active_grouped_materialization() {
+    std::vector<ggml_backend_buffer_type_t> sources = {pageable_cached_buffer_type()};
+#ifdef __linux__
+    sources.push_back(file_mmap_cached_buffer_type());
 #endif
+    for (auto buft : sources) {
+        for (auto layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {
+            for (auto domain : {GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+                for (uint32_t rows : {1u, 4u}) {
+                    test_active_grouped_materialization_case(buft, layout, domain,
+                        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows, GGML_TYPE_Q4_0);
+                }
+                test_active_grouped_materialization_case(buft, layout, domain,
+                    domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE : GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,
+                    4, GGML_TYPE_Q4_0);
+            }
+        }
+        for (auto type : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4}) {
+            test_active_grouped_materialization_case(buft, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+                GGML_GRAPH_EXECUTION_DOMAIN_MTP, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, 4, type);
+        }
+    }
+    test_pageable_separate_draft_lifecycle();
 }
 
 static void test_active_grouped_dispatch_staged_legacy() {
@@ -1089,10 +1291,206 @@ static void check_active_grouped_scale_shadows(
     }
 }
 
+void test_pageable_auxiliaries() {
+    const bool old_debug = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    for (uint32_t kind = 0; kind < 5; ++kind) {
+        const bool nvfp4 = kind == 0;
+        const bool bias = kind >= 2;
+        const uint32_t layout = kind == 0 || kind == 2 ? GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE :
+            kind == 4 ? GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED : GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP;
+        const ggml_type type = nvfp4 ? GGML_TYPE_NVFP4 : GGML_TYPE_Q4_0;
+        for (uint32_t domain : {GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT, GGML_GRAPH_EXECUTION_DOMAIN_MTP}) {
+            for (uint32_t rows : {1u, 4u}) {
+                constexpr uint32_t slots = 4;
+                const bool host_staged = rows * 2 > slots;
+                ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+                ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+                CHECK(reference_backend && backend);
+                const auto build = [&](ggml_backend_t owner, ggml_backend_buffer_type_t buft) {
+                    return build_active_grouped_dispatch_graph_types(owner, buft, {type, type, type}, layout,
+                        kind == 1, nvfp4, rows, 8, 2, 256, nullptr, false, bias, 0, bias);
+                };
+                auto reference = build(reference_backend.get(), ggml_backend_cuda_moe_cached_buffer_type());
+                auto candidate = build(backend.get(), pageable_cached_buffer_type());
+                initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+                std::vector<ggml_tensor *> auxiliaries = candidate.biases;
+                if (nvfp4) {
+                    auxiliaries = {candidate.gate_scale, candidate.up_scale, candidate.down_scale};
+                } else if (!bias) {
+                    auxiliaries = {candidate.down_scale};
+                }
+                size_t bytes = 0;
+                for (const auto * tensor : auxiliaries) {
+                    cudaPointerAttributes attributes = {};
+                    CUDA_OK(cudaPointerGetAttributes(&attributes, tensor->data));
+                    CHECK(attributes.type == cudaMemoryTypeUnregistered);
+                    bytes += ggml_nbytes(tensor);
+                }
+                const auto publish = [&](ggml_backend_t owner, active_grouped_dispatch_graph & graph) {
+                    if (nvfp4) {
+                        CHECK(replace_active_grouped_nvfp4_dispatch_v2(owner, graph, slots) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                    } else {
+                        register_active_grouped_dispatch(owner, graph, layout, slots);
+                    }
+                    const bool main_direct = domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN && rows == 1;
+                    candidate_stamp_execution(graph.graph, domain,
+                        main_direct ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT :
+                            domain == GGML_GRAPH_EXECUTION_DOMAIN_MAIN ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE :
+                                GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,
+                        rows, 1, 0, main_direct ? 0 : GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+                    (void) candidate_certify_graph(*ggml_cuda_moe_grouped_context_for_test(owner), graph.graph);
+                };
+                publish(reference_backend.get(), reference);
+                publish(backend.get(), candidate);
+                auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+                CHECK(context != nullptr);
+                CHECK(ggml_cuda_moe_grouped_context_test_access::set_original_auxiliary_budget(*context, bytes));
+                for (uint32_t pass = 0; pass < 6; ++pass) {
+                    set_active_grouped_dispatch_logits({&reference, &candidate}, pass / 2);
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+                    check_active_grouped_exact_output(active_grouped_tensor_values(reference.output), active_grouped_tensor_values(candidate.output));
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == bytes);
+                }
+                ggml_cuda_graph_capture_state_for_test capture = {};
+                CHECK(ggml_cuda_graph_capture_state_query_for_test(backend.get(), candidate.graph, &capture));
+                if (capture.capture_available && !host_staged) {
+                    CHECK(capture.instance != 0 && capture.moe_resource_fingerprint != 0);
+                } else {
+                    CHECK(capture.instance == 0);
+                }
+                const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+                CHECK(telemetry.decode_grouped == 6 && telemetry.decode_legacy == 0 && telemetry.completed == 6);
+                CHECK(telemetry.host_staged_calls == (host_staged ? 6 : 0));
+                CHECK(telemetry.direct == (capture.capture_available && !host_staged ? 1 : 6));
+                CHECK(telemetry.captures == (capture.capture_available && !host_staged ? 1 : 0));
+                CHECK(telemetry.replays == (capture.capture_available && !host_staged ? 4 : 0));
+                CHECK(telemetry.fallback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+                CHECK(active_grouped_legacy_op_count(backend.get(), true) == 0 && active_grouped_legacy_op_count(backend.get(), false) == 0);
+
+                const bool relocate = domain == GGML_GRAPH_EXECUTION_DOMAIN_MTP && rows == 1 && (kind == 0 || kind == 1 || kind == 3);
+                cudaStream_t lease_stream = nullptr;
+                std::vector<std::shared_ptr<void>> leases;
+                std::weak_ptr<void> witness;
+                std::shared_ptr<ggml_cuda_moe_graph_plan> lease_plan;
+                ggml_cuda_moe_graph_execution lease_execution;
+                uint64_t old_fingerprint = 0;
+                if (relocate) {
+                    CUDA_OK(cudaStreamCreateWithFlags(&lease_stream, cudaStreamNonBlocking));
+                    const auto coverage = candidate_certify_graph(*context, candidate.graph);
+                    CHECK(context->prepare_graph_execution(candidate.graph, candidate.graph->uid,
+                        GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &lease_plan, &lease_execution,
+                        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) != GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE);
+                    CHECK(lease_execution.resolve_streams(candidate_test_graph_stream, lease_stream));
+                    CHECK(context->graph_resource_fingerprint(lease_execution, lease_stream, &old_fingerprint, &leases));
+                    CHECK(leases.size() == 1);
+                    witness = leases[0];
+                }
+                // In-place edits require synchronized republication, even at the same address.
+                ggml_backend_synchronize(backend.get());
+                ggml_backend_synchronize(reference_backend.get());
+                auto * changed = auxiliaries.back();
+                auto * expected_changed = bias ? reference.biases.back() : reference.down_scale;
+                auto values = active_grouped_tensor_values(changed);
+                const auto old_output = active_grouped_tensor_values(candidate.output);
+                ggml_backend_buffer_ptr relocated;
+                if (relocate) {
+                    relocated.reset(ggml_backend_buft_alloc_buffer(pageable_cached_buffer_type(), ggml_nbytes(changed)));
+                    CHECK(relocated != nullptr);
+                    changed->buffer = relocated.get();
+                    changed->data = ggml_backend_buffer_get_base(relocated.get());
+                    for (auto * node = ggml_get_first_tensor(candidate.nodes.get()); node != nullptr; node = ggml_get_next_tensor(candidate.nodes.get(), node)) {
+                        if (node->view_src == changed) {
+                            node->buffer = changed->buffer;
+                            node->data = static_cast<char *>(changed->data) + node->view_offs;
+                        }
+                    }
+                }
+                for (auto & value : values) {
+                    value += 0.125f;
+                }
+                ggml_backend_tensor_set(changed, values.data(), 0, ggml_nbytes(changed));
+                ggml_backend_tensor_set(expected_changed, values.data(), 0, ggml_nbytes(expected_changed));
+                publish(reference_backend.get(), reference);
+                publish(backend.get(), candidate);
+                if (relocate) {
+                    CHECK(!witness.expired());
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == bytes);
+                    // The old lease occupies the whole budget; a new generation cannot overcommit it.
+                    CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_FAILED);
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == bytes);
+                    CHECK(active_grouped_legacy_op_count(backend.get(), true) == 0 && active_grouped_legacy_op_count(backend.get(), false) == 0);
+                    leases.clear();
+                    CHECK(witness.expired());
+                    CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+                }
+                for (uint32_t pass = 0; pass < 3; ++pass) {
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+                    check_active_grouped_exact_output(active_grouped_tensor_values(reference.output), active_grouped_tensor_values(candidate.output));
+                }
+                CHECK(active_grouped_tensor_values(candidate.output) != old_output);
+                if (relocate) {
+                    const auto coverage = candidate_certify_graph(*context, candidate.graph);
+                    CHECK(context->prepare_graph_execution(candidate.graph, candidate.graph->uid,
+                        GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &lease_plan, &lease_execution,
+                        coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) != GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE);
+                    CHECK(lease_execution.resolve_streams(candidate_test_graph_stream, lease_stream));
+                    uint64_t fingerprint = 0;
+                    CHECK(context->graph_resource_fingerprint(lease_execution, lease_stream, &fingerprint));
+                    CHECK(fingerprint != old_fingerprint);
+                    CUDA_OK(cudaStreamDestroy(lease_stream));
+                }
+                context->shutdown();
+                CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+                fprintf(stderr, "test-moe-cache: pageable auxiliary kind=%u domain=%u rows=%u staged=%d exact/rebind OK\n",
+                    kind, domain, rows, host_staged);
+            }
+        }
+    }
+    for (uint32_t failure = 0; failure <= 3; ++failure) {
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        CHECK(backend);
+        auto candidate = build_active_grouped_dispatch_graph_types(backend.get(), pageable_cached_buffer_type(),
+            {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4}, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, true);
+        initialize_active_grouped_dispatch_graph(candidate, 157);
+        CHECK(replace_active_grouped_nvfp4_dispatch_v2(backend.get(), candidate, 4) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+        CHECK(context != nullptr);
+        if (failure == 0) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::set_original_auxiliary_budget(*context, 1));
+        } else {
+            ggml_cuda_moe_grouped_context_test_access::fail_device_resource_allocation(*context, failure);
+        }
+        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MTP, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL,
+            1, 1, 0, GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        (void) candidate_certify_graph(*context, candidate.graph);
+        const auto sentinel = active_grouped_tensor_sentinel(candidate.output);
+        CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_FAILED);
+        ggml_backend_synchronize(backend.get());
+        CHECK(active_grouped_tensor_values(candidate.output) == sentinel);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+        CHECK(active_grouped_legacy_op_count(backend.get(), true) == 0 && active_grouped_legacy_op_count(backend.get(), false) == 0);
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(telemetry.fallback == 0 && telemetry.decode_legacy == 0 && telemetry.required_unsupported != 0);
+        CHECK(replace_active_grouped_nvfp4_dispatch_v2(backend.get(), candidate, 4) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::set_original_auxiliary_budget(*context, 1024));
+        (void) candidate_certify_graph(*context, candidate.graph);
+        CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend.get());
+        context->shutdown();
+        CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+        fprintf(stderr, "test-moe-cache: pageable auxiliary failure=%u clean required decline/recovery OK\n", failure);
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug);
+}
+
 void test_active_grouped_nvfp4_scales() {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
-    {
+    for (uint32_t source_mode : {0u, 1u, 2u}) {
+        auto buft = source_mode == 0 ? ggml_backend_cuda_moe_cached_buffer_type() : pageable_cached_buffer_type();
         constexpr uint32_t n_slots = 4;
         ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
         ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(0));
@@ -1102,10 +1500,34 @@ void test_active_grouped_nvfp4_scales() {
             {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4},
             GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, true, 1);
         auto candidate = build_active_grouped_dispatch_graph_types(
-            candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(),
+            candidate_backend.get(), source_mode == 2 ? buft : ggml_backend_cuda_moe_cached_buffer_type(),
             {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4},
             GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, true, 1);
+        ggml_backend_buffer_ptr pageable_experts;
+        if (source_mode == 1) {
+            // Keep original-ID scales mapped; only expert slabs use the pageable transport.
+            size_t bytes = 0;
+            const size_t alignment = ggml_backend_buft_get_alignment(buft);
+            for (const auto * bank : candidate.banks) {
+                bytes += GGML_PAD(ggml_nbytes(bank), alignment);
+            }
+            pageable_experts.reset(ggml_backend_buft_alloc_buffer(buft, bytes));
+            CHECK(pageable_experts != nullptr);
+            auto * data = static_cast<char *>(ggml_backend_buffer_get_base(pageable_experts.get()));
+            for (auto * bank : candidate.banks) {
+                bank->buffer = pageable_experts.get();
+                bank->data = data;
+                data += GGML_PAD(ggml_nbytes(bank), alignment);
+            }
+        }
         initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+        if (source_mode == 2) {
+            for (const auto * scale : {candidate.gate_scale, candidate.up_scale, candidate.down_scale}) {
+                cudaPointerAttributes attributes = {};
+                CUDA_OK(cudaPointerGetAttributes(&attributes, scale->data));
+                CHECK(attributes.type == cudaMemoryTypeUnregistered);
+            }
+        }
         const auto disabled = candidate_snapshot(n_slots, nullptr, 0);
         CHECK(ggml_backend_cuda_moe_candidate_replace_v1(reference_backend.get(), &disabled) ==
             GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -1810,8 +2232,9 @@ void test_prefill_resident_biases() {
 }
 
 void test_active_grouped_dispatch() {
+    test_pageable_auxiliaries();
     test_prefill_resident_biases();
-    test_active_grouped_materialization_eligibility();
+    test_active_grouped_materialization();
     test_active_grouped_dispatch_case(
         GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12, false, true);
     test_active_grouped_dispatch_case(

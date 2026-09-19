@@ -490,12 +490,17 @@ static void test_grouped_decode_type(
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT,
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
     };
+    const uint32_t ungated_roles[] = {
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT,
+        GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
+    };
     for (uint32_t bank = 0; bank < n_banks; ++bank) {
         const int64_t ne0 = type == GGML_TYPE_Q4_K ? 256 : type == GGML_TYPE_Q4_0 ? 32 : 64;
         const int64_t ne1 = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && bank == 0 ? 2 * ne0 : ne0;
         weights[bank] = fixture.weight(type, ne0, ne1);
         banks[bank].tensor = weights[bank];
-        banks[bank].role = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? separate_roles[bank] : fused_roles[bank];
+        banks[bank].role = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? separate_roles[bank] :
+            layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED ? ungated_roles[bank] : fused_roles[bank];
         CHECK(weights[bank]->nb[2] == ggml_row_size(type, ne0) * ne1);
         for (uint32_t expert = 0; expert < grouped_decode_fixture::N_EXPERTS; ++expert) {
             auto * expert_data = static_cast<uint8_t *>(weights[bank]->data) + expert * weights[bank]->nb[2];
@@ -601,13 +606,6 @@ static void test_grouped_decode_type(
 
     const int32_t first_ids[] = {3, 1, 3, 6};
     CUDA_OK(cudaMemcpyAsync(ids->data, first_ids, sizeof(first_ids), cudaMemcpyHostToDevice, stream));
-    if (!pinned && host_budget == 0) {
-        CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_FALLBACK);
-        CUDA_OK(cudaStreamSynchronize(stream));
-        CUDA_OK(cudaStreamDestroy(wrong_stream));
-        CUDA_OK(cudaStreamDestroy(stream));
-        return;
-    }
     CHECK(registry.prepare_decode(key, stream, &decode) == GGML_CUDA_MOE_GROUPED_DECODE_READY);
     CHECK(decode.n_banks == n_banks && decode.n_slots == n_slots && decode.layout == layout);
     CUDA_OK(cudaStreamSynchronize(stream));
@@ -1265,6 +1263,11 @@ void test_grouped_decode(int device) {
             for (uint32_t n_slots : {12u, 48u}) {
                 test_grouped_decode_type(device, type, layout, true, n_slots);
             }
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
+        for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {
+            test_grouped_decode_type(device, type, layout, false, 12);
         }
     }
     test_grouped_decode_type(device, GGML_TYPE_NVFP4, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, true, 12, true);

@@ -63,6 +63,21 @@ int main(int argc, char ** argv) {
     const bool gemma_q4_parity_only = argc == 2 && strcmp(argv[1], "--gemma-q4-parity-only") == 0;
     const bool prefill_resident_only = argc == 2 && strcmp(argv[1], "--prefill-resident-only") == 0;
     test_moe_cache_proc_api();
+    if (argc == 2 && strcmp(argv[1], "--pageable-aux-only") == 0) {
+        test_pageable_auxiliaries();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--pageable-draft-lifecycle-only") == 0) {
+        test_pageable_separate_draft_lifecycle();
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "--materialization-only") == 0) {
+        int dev = 0;
+        CUDA_OK(cudaGetDevice(&dev));
+        test_active_grouped_materialization();
+        test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
+        return 0;
+    }
     if (prefill_resident_only) {
         test_prefill_resident_biases();
         return 0;
@@ -156,6 +171,7 @@ int main(int argc, char ** argv) {
     }
     test_grouped_decode(dev);
     test_grouped_graph_replay_lifecycle(dev);
+    test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
     test_grouped_graph_replay_lifecycle(dev, 262144, 2);
     test_grouped_graph_replay_lifecycle(dev, 393216, 1);
     test_grouped_graph_replay_lifecycle(dev, 4 * 1024 * 1024, 2, 1024);
