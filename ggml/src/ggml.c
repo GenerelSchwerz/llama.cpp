@@ -6450,6 +6450,7 @@ bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
     const int32_t trailing_snapshots = ggml_get_op_params_i32(tensor, 1);
     const int32_t selected_token     = ggml_get_op_params_i32(tensor, 2);
     const int32_t reserve_input      = ggml_get_op_params_i32(tensor, 3);
+    const int32_t leading_snapshots  = ggml_get_op_params_i32(tensor, 4);
 
     if (!ggml_are_same_shape(q, k)) {
         return false;
@@ -6494,10 +6495,12 @@ bool ggml_gated_delta_net_validate(const struct ggml_tensor * tensor) {
     }
     if (trailing_snapshots < 0 || trailing_snapshots > K ||
         selected_token < -1 || selected_token >= n_tokens ||
+        leading_snapshots < 0 || leading_snapshots > K ||
         (K == 1 && (trailing_snapshots != 1 || selected_token != -1 || reserve_input != 0)) ||
         (selected_token >= 0 && trailing_snapshots > 0) ||
         (reserve_input != 0 && reserve_input != 1) ||
-        (reserve_input == 1 && (selected_token >= 0 || K <= 1 || trailing_snapshots != MIN(n_tokens, K - 1)))) {
+        (reserve_input == 0 && leading_snapshots != 0) ||
+        (reserve_input == 1 && (selected_token >= 0 || K <= 1 || trailing_snapshots + leading_snapshots != MIN(n_tokens, K - 1)))) {
         return false;
     }
 
@@ -6556,7 +6559,7 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
-    ggml_gated_delta_net_set_snapshots(result, (int32_t) K, -1, false);
+    ggml_gated_delta_net_set_snapshots(result, (int32_t) K, -1, false, 0);
 
     return result;
 }
@@ -6565,7 +6568,8 @@ void ggml_gated_delta_net_set_snapshots(
         struct ggml_tensor * tensor,
         int32_t              trailing_snapshots,
         int32_t              selected_token,
-        bool                 reserve_input) {
+        bool                 reserve_input,
+        int32_t              leading_snapshots) {
     GGML_ASSERT(tensor != NULL && tensor->op == GGML_OP_GATED_DELTA_NET);
 
     const int32_t K = ggml_get_op_params_i32(tensor, 0);
@@ -6574,12 +6578,14 @@ void ggml_gated_delta_net_set_snapshots(
     GGML_ASSERT(selected_token >= -1 && selected_token < n_tokens);
     GGML_ASSERT(!(selected_token >= 0 && trailing_snapshots > 0));
     GGML_ASSERT(!reserve_input || selected_token < 0);
-    GGML_ASSERT(!reserve_input || (K > 1 && trailing_snapshots == MIN(n_tokens, K - 1)));
+    GGML_ASSERT(leading_snapshots >= 0 && (reserve_input || leading_snapshots == 0));
+    GGML_ASSERT(!reserve_input || (K > 1 && trailing_snapshots + leading_snapshots == MIN(n_tokens, K - 1)));
     GGML_ASSERT(K != 1 || (trailing_snapshots == 1 && selected_token == -1 && !reserve_input));
 
     ggml_set_op_params_i32(tensor, 1, trailing_snapshots);
     ggml_set_op_params_i32(tensor, 2, selected_token);
     ggml_set_op_params_i32(tensor, 3, reserve_input ? 1 : 0);
+    ggml_set_op_params_i32(tensor, 4, leading_snapshots);
 }
 
 bool ggml_gated_delta_net_has_default_snapshot_params(
@@ -6588,7 +6594,8 @@ bool ggml_gated_delta_net_has_default_snapshot_params(
 
     return ggml_get_op_params_i32(tensor, 1) == ggml_get_op_params_i32(tensor, 0) &&
            ggml_get_op_params_i32(tensor, 2) == -1 &&
-           ggml_get_op_params_i32(tensor, 3) == 0;
+           ggml_get_op_params_i32(tensor, 3) == 0 &&
+           ggml_get_op_params_i32(tensor, 4) == 0;
 }
 
 // ggml_lightning_indexer

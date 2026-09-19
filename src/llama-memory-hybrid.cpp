@@ -149,8 +149,8 @@ bool llama_memory_hybrid::recurrent_sparse_snapshots_supported() const {
     return mem_recr->recurrent_sparse_snapshots_supported();
 }
 
-bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token) {
-    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token);
+bool llama_memory_hybrid::recurrent_set_sparse_snapshot_mode(bool enabled, int32_t selected_token, int32_t n_leading) {
+    return mem_recr->recurrent_set_sparse_snapshot_mode(enabled, selected_token, n_leading);
 }
 
 void llama_memory_hybrid::clear(bool data) {

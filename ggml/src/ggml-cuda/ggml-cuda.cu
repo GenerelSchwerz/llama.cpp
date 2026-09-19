@@ -2822,6 +2822,7 @@ static int ggml_cuda_try_gdn_cache_fusion(
     const int32_t       trailing  = ggml_get_op_params_i32(gdn, 1);
     const int32_t       selected  = ggml_get_op_params_i32(gdn, 2);
     const bool          reserve   = ggml_get_op_params_i32(gdn, 3) != 0;
+    const int32_t       leading   = ggml_get_op_params_i32(gdn, 4);
     const int64_t       n_written = selected >= 0 ? 1 : reserve ? trailing : std::min<int64_t>(n_tokens, K);
 
     // snapshot tail starts right after the attention scores
@@ -2869,11 +2870,12 @@ static int ggml_cuda_try_gdn_cache_fusion(
     if (reserve) {
         const ggml_tensor * reserve_cpy = nullptr;
         int reserve_cpy_idx = 0;
-        if (!find_cpy(cpy_idx + 1, &reserve_cpy, &reserve_cpy_idx) || !match_cpy(reserve_cpy, K - 1, 1)) {
+        // the leading states and the input state share one contiguous cpy
+        if (!find_cpy(cpy_idx + 1, &reserve_cpy, &reserve_cpy_idx) || !match_cpy(reserve_cpy, K - 1 - leading, leading + 1)) {
             return 0;
         }
         const ggml_tensor * reserve_dst = reserve_cpy->src[1];
-        if ((float *) reserve_dst->data != fused_state_cpy.data + (K - 1) * fused_state_cpy.slot_stride ||
+        if ((float *) reserve_dst->data != fused_state_cpy.data + (K - 1 - leading) * fused_state_cpy.slot_stride ||
             reserve_dst->nb[2] != dst->nb[2]) {
             return 0;
         }

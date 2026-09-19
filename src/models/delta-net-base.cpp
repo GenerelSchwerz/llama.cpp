@@ -523,9 +523,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
         if (sparse && selected >= 0) {
             copy_state(selected + 1, 0);
         } else if (sparse) {
-            const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1);
+            const int64_t n_leading = snapshot_mode.leading(n_seq_tokens, K);
+            const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1) - n_leading;
             for (int64_t t = 0; t < n_trailing; ++t) {
                 copy_state(n_seq_tokens - n_trailing + t + 1, n_trailing - 1 - t);
+            }
+            for (int64_t t = 0; t < n_leading; ++t) {
+                copy_state(t + 1, K - 2 - t);
             }
             copy_state(0, K - 1);
         } else {
@@ -582,9 +586,11 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
 
     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
     ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
+    const int64_t n_leading = snapshot_mode.leading(n_seq_tokens, K);
     if (sparse) {
         GGML_ASSERT(selected < n_seq_tokens);
-        ggml_gated_delta_net_set_snapshots(gdn_out, selected >= 0 ? 0 : (int32_t) std::min<int64_t>(n_seq_tokens, K - 1), selected, selected < 0);
+        const int32_t n_trailing = selected >= 0 ? 0 : (int32_t) (std::min<int64_t>(n_seq_tokens, K - 1) - n_leading);
+        ggml_gated_delta_net_set_snapshots(gdn_out, n_trailing, selected, selected < 0, (int32_t) n_leading);
     }
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
@@ -622,9 +628,9 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     };
 
     if (sparse && selected < 0) {
-        const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1);
+        const int64_t n_trailing = std::min<int64_t>(n_seq_tokens, K - 1) - n_leading;
         copy_snapshots(0, n_trailing);
-        copy_snapshots(K - 1, 1);
+        copy_snapshots(K - 1 - n_leading, n_leading + 1);
     } else {
         copy_snapshots(0, sparse ? 1 : std::min<int64_t>(n_seq_tokens, K));
     }

@@ -340,7 +340,7 @@ static bool test_sparse_selected_then_trailing(const common_params & params, lla
             common_batch_add(split_batch, (11*pos + 38) % n_vocab, pos, { 1 }, pos == 4);
         }
 
-        const bool mode_ok = llama_recurrent_set_sparse_snapshot_mode(ctx_split, true, -1);
+        const bool mode_ok = llama_recurrent_set_sparse_snapshot_mode(ctx_split, true, -1, 0);
         const int split_ret = mode_ok ? llama_decode(ctx_split, split_batch) : 0;
         llama_batch_free(split_batch);
         if (!mode_ok || split_ret == 0) {
@@ -373,9 +373,9 @@ static bool test_sparse_selected_then_trailing(const common_params & params, lla
         if (ctx_normal == nullptr || ctx_ref == nullptr) {
             return fail("normal transition context init");
         }
-        if (!llama_recurrent_set_sparse_snapshot_mode(ctx_normal, true, -1) ||
+        if (!llama_recurrent_set_sparse_snapshot_mode(ctx_normal, true, -1, 0) ||
             !decode_ranges(ctx_normal, { { 0, 0 } }, 4) ||
-            !llama_recurrent_set_sparse_snapshot_mode(ctx_normal, false, -1)) {
+            !llama_recurrent_set_sparse_snapshot_mode(ctx_normal, false, -1, 0)) {
             return fail("sparse-to-normal setup");
         }
 
@@ -406,7 +406,7 @@ static bool test_sparse_selected_then_trailing(const common_params & params, lla
         fprintf(stderr, "%s : sparse-to-normal rollback matched reference output\n", __func__);
     }
 
-    if (!llama_recurrent_set_sparse_snapshot_mode(ctx, true, -1)) {
+    if (!llama_recurrent_set_sparse_snapshot_mode(ctx, true, -1, 0)) {
         return fail("enable trailing mode");
     }
     if (!decode_ranges(ctx, { { 0, 0 }, { 1, 0 } }, 4) || !decode_ranges(ctx, { { 0, 4 }, { 1, 4 } }, 5)) {
@@ -416,14 +416,14 @@ static bool test_sparse_selected_then_trailing(const common_params & params, lla
     const std::pair<llama_seq_id, int32_t> selected_cases[] = { { 0, 2 }, { 1, 1 } };
     for (const auto & [seq_id, selected] : selected_cases) {
         if (!llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 4, -1) ||
-            !llama_recurrent_set_sparse_snapshot_mode(ctx, true, selected) ||
+            !llama_recurrent_set_sparse_snapshot_mode(ctx, true, selected, 0) ||
             !decode_ranges(ctx, { { (uint32_t) seq_id, 4 } }, 5) ||
             !llama_memory_seq_rm(llama_get_memory(ctx), seq_id, 5 + selected, -1)) {
             return fail(seq_id == 0 ? "sequence 0 selected replay" : "sequence 1 selected replay");
         }
     }
 
-    if (!llama_recurrent_set_sparse_snapshot_mode(ctx, true, -1) || !decode_ranges(ctx, { { 0, 7 }, { 1, 6 } }, 3)) {
+    if (!llama_recurrent_set_sparse_snapshot_mode(ctx, true, -1, 0) || !decode_ranges(ctx, { { 0, 7 }, { 1, 6 } }, 3)) {
         return fail("selected-to-trailing co-batch");
     }
     if (!llama_memory_seq_rm(llama_get_memory(ctx), 0, 7, -1) ||
@@ -481,7 +481,7 @@ static bool test_sparse_short_trailing_gaps(const common_params & params, llama_
             return false;
         }
 
-        const bool ok = llama_recurrent_set_sparse_snapshot_mode(ctx_sparse, true, -1) &&
+        const bool ok = llama_recurrent_set_sparse_snapshot_mode(ctx_sparse, true, -1, 0) &&
             decode_range(ctx_sparse, 0, 3) && decode_range(ctx_sparse, 3, trailing) &&
             decode_range(ctx_ref, 0, (uint32_t) rollback_pos + 1) &&
             llama_memory_seq_rm(llama_get_memory(ctx_sparse), 0, rollback_pos + 1, -1) &&

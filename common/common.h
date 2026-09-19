@@ -385,14 +385,27 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    int32_t mtp_rs_planes = 0; // total target recurrent planes (0 = draft.n_max + 1)
+    int32_t rs_planes = 0; // total target recurrent planes for draft-mtp or draft-dflash (0 = draft.n_max + 1)
+    int32_t rs_planes_lead = -1; // capped planes that keep the states after the first draft tokens (-1 = auto)
 
     bool has_dft() const {
         return !draft.mparams.empty();
     }
 
-    bool is_mtp_rs_capped() const {
-        return mtp_rs_planes > 0 && int64_t(mtp_rs_planes) < int64_t(draft.n_max) + 1;
+    bool is_rs_capped() const {
+        return rs_planes > 0 && int64_t(rs_planes) < int64_t(draft.n_max) + 1;
+    }
+
+    int32_t get_rs_planes_lead() const {
+        if (!is_rs_capped()) {
+            return 0;
+        }
+        if (rs_planes_lead >= 0) {
+            return rs_planes_lead;
+        }
+        // DFlash rejects most drafts early, so keep one plane for full acceptance and the rest for the first tokens
+        const bool has_dflash = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != types.end();
+        return has_dflash ? rs_planes - 2 : 0;
     }
 
     bool has_synth() const {
@@ -404,9 +417,11 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        const bool has_mtp = std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
-        if (has_mtp && mtp_rs_planes > 0) {
-            return uint32_t(mtp_rs_planes - 1);
+        const bool can_cap = std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH;
+        });
+        if (can_cap && rs_planes > 0) {
+            return uint32_t(rs_planes - 1);
         }
 
         return needs_rs_seq ? uint32_t(std::max(0, draft.n_max)) : 0u;

@@ -160,20 +160,20 @@ static std::unique_ptr<llama_grammar> build_grammar(const std::string & grammar_
 static void test_speculative_replay_state_transitions() {
     server_speculative_replay_state state;
 
-    assert_equals(false, state.mtp_gpu_snapshots_armed());
-    assert_equals(false, state.mtp_gpu_replay_pending());
+    assert_equals(false, state.gpu_snapshots_armed());
+    assert_equals(false, state.gpu_replay_pending());
     assert_equals(false, state.excludes_replayed_token_from_acceptance());
 
-    state.arm_mtp_gpu_snapshots();
-    state.arm_mtp_gpu_snapshots();
-    assert_equals(true, state.mtp_gpu_snapshots_armed());
-    state.discard_mtp_gpu_snapshot_arm();
-    assert_equals(false, state.mtp_gpu_snapshots_armed());
+    state.arm_gpu_snapshots();
+    state.arm_gpu_snapshots();
+    assert_equals(true, state.gpu_snapshots_armed());
+    state.discard_gpu_snapshot_arm();
+    assert_equals(false, state.gpu_snapshots_armed());
 
     state.begin_checkpoint_replay();
     state.begin_checkpoint_replay();
     assert_equals(true, state.excludes_replayed_token_from_acceptance());
-    state.discard_mtp_gpu_snapshot_arm();
+    state.discard_gpu_snapshot_arm();
     assert_equals(true, state.excludes_replayed_token_from_acceptance());
     state.finish_verification();
     assert_equals(false, state.excludes_replayed_token_from_acceptance());
@@ -185,15 +185,15 @@ static void test_speculative_replay_state_transitions() {
     common_sampler_ptr sampler(common_sampler_init(sampler_model.get(), sampler_params));
     common_sampler * sampler_ptr = sampler.get();
 
-    state.arm_mtp_gpu_snapshots();
-    state.begin_mtp_gpu_replay(expected_tokens, std::move(sampler), 2);
+    state.arm_gpu_snapshots();
+    state.begin_gpu_replay(expected_tokens, std::move(sampler), 2);
     const bool sampler_moved = sampler == nullptr;
-    const bool replay_pending = state.mtp_gpu_replay_pending();
-    const uint32_t selected_token = state.mtp_gpu_replay_selected_token();
+    const bool replay_pending = state.gpu_replay_pending();
+    const uint32_t selected_token = state.gpu_replay_selected_token();
 
     llama_tokens replayed_tokens = { 99 };
     common_sampler_ptr replayed_sampler;
-    const uint32_t accepted = state.consume_mtp_gpu_replay(replayed_tokens, replayed_sampler);
+    const uint32_t accepted = state.consume_gpu_replay(replayed_tokens, replayed_sampler);
     const bool sampler_transferred = replayed_sampler.get() == sampler_ptr;
     state.reset();
 
@@ -203,12 +203,12 @@ static void test_speculative_replay_state_transitions() {
     assert_equals(true, replayed_tokens == expected_tokens);
     assert_equals(true, sampler_transferred);
     assert_equals(uint32_t(2), accepted);
-    assert_equals(false, state.mtp_gpu_replay_pending());
-    assert_equals(false, state.mtp_gpu_snapshots_armed());
+    assert_equals(false, state.gpu_replay_pending());
+    assert_equals(false, state.gpu_snapshots_armed());
 
-    state.arm_mtp_gpu_snapshots();
+    state.arm_gpu_snapshots();
     state.reset();
-    assert_equals(false, state.mtp_gpu_snapshots_armed());
+    assert_equals(false, state.gpu_snapshots_armed());
 }
 
 static void test_speculative_replay_failure_slot_scope() {
@@ -232,7 +232,7 @@ static void test_speculative_replay_failure_slot_scope() {
     for (const auto & test : cases) {
         std::array<server_speculative_replay_state, 5> states;
         for (auto & state : states) {
-            state.arm_mtp_gpu_snapshots();
+            state.arm_gpu_snapshots();
         }
         for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
             if (server_sparse_batch_slot_is_affected(
@@ -241,7 +241,7 @@ static void test_speculative_replay_failure_slot_scope() {
             }
         }
         for (size_t slot_id = 0; slot_id < states.size(); ++slot_id) {
-            assert_equals(test.affected[slot_id], !states[slot_id].mtp_gpu_snapshots_armed());
+            assert_equals(test.affected[slot_id], !states[slot_id].gpu_snapshots_armed());
         }
     }
 }

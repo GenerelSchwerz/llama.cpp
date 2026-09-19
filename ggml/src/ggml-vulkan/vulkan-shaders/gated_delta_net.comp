@@ -35,6 +35,7 @@ layout(push_constant) uniform Parameters {
     uint trailing_snapshots;
     int selected_token;
     uint reserve_input;
+    uint leading_snapshots;
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -182,9 +183,13 @@ void main() {
 
         if (K > 1u) {
             const bool selected = selected_token >= 0;
-            const uint target_slot = selected ? 0u : n_tokens - 1u - t;
+            uint target_slot = selected ? 0u : n_tokens - 1u - t;
             const uint snapshot_slots = selected ? 1u : trailing_snapshots;
-            if ((!selected || t == uint(selected_token)) && target_slot < snapshot_slots) {
+            const bool leading = !selected && target_slot >= snapshot_slots && t < leading_snapshots;
+            if (leading) {
+                target_slot = K - 2u - t;
+            }
+            if ((!selected || t == uint(selected_token)) && (target_slot < snapshot_slots || leading)) {
                 const uint slot_base = s_off + uint(target_slot) * state_size_per_snap + state_out_base;
                 [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                     data_dst[slot_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
