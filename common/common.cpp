@@ -1402,6 +1402,15 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        auto set_early_router_fn = (ggml_backend_moe_early_router_set_enabled_t) ggml_backend_reg_get_proc_address(
+                reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME);
+        if (set_early_router_fn != nullptr) {
+            set_early_router_fn(params.moe_early_router);
+        }
+    }
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());

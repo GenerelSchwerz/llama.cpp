@@ -15,6 +15,7 @@ extern "C" {
 #define GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_is_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME "ggml_backend_moe_cache_buffer_from_host_ptr"
 #define GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME "ggml_backend_moe_cache_set_debug"
+#define GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME "ggml_backend_moe_early_router_set_enabled"
 #define GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME "ggml_backend_moe_cache_log_and_reset_stats"
 
 typedef ggml_backend_buffer_type_t (*ggml_backend_moe_cache_buffer_type_t)(void);
@@ -24,6 +25,7 @@ typedef bool (*ggml_backend_moe_cache_is_buffer_type_t)(ggml_backend_buffer_type
 typedef ggml_backend_buffer_t (*ggml_backend_moe_cache_buffer_from_host_ptr_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
 // Experimental logging remains process-wide, including retired backend counters.
 typedef void (*ggml_backend_moe_cache_set_debug_t)(bool enabled);
+typedef void (*ggml_backend_moe_early_router_set_enabled_t)(bool enabled);
 typedef void (*ggml_backend_moe_cache_log_and_reset_stats_t)(void);
 
 #define GGML_BACKEND_MOE_CANDIDATE_REPLACE_V1_PROC_NAME "ggml_backend_moe_candidate_replace_v1"

@@ -1078,6 +1078,7 @@ ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_bac
 void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail);
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 bool ggml_backend_cuda_moe_get_debug_mm(void);
+void ggml_backend_cuda_moe_early_router_set_enabled(bool enabled);
 void ggml_backend_cuda_moe_log_and_reset_stats(void);
 
 // Set before the first graph submission to this backend.

@@ -259,6 +259,11 @@ static void test(void) {
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_expert_cache_host_pinned_size == 0);
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-early-router"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_early_router);
+
     params.n_moe_expert_cache_slots = 40;
     assert(params.speculative.draft.n_moe_expert_cache_slots == 0);
     assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 40);

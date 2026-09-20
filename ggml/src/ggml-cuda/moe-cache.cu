@@ -52,6 +52,7 @@ static constexpr size_t MOE_PREFILL_RESIDENT_AUX_BUDGET = 32 * 1024 * 1024;
 static constexpr size_t MOE_PAGEABLE_STAGING_HEADROOM = 64 * 1024 * 1024;
 static constexpr size_t MOE_ORIGINAL_AUX_BUDGET = 32 * 1024 * 1024;
 static std::atomic<bool> g_moe_cache_mm_debug{false};
+static std::atomic<bool> g_moe_early_router_enabled{false};
 
 static bool moe_host_reserve_size(size_t limit, size_t bytes, size_t & reserved) {
     size_t rounded = 0;
@@ -3927,7 +3928,7 @@ struct moe_router_program {
 };
 
 static bool moe_early_router_enabled() {
-    static const bool enabled = [] {
+    static const bool env_enabled = [] {
         const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER");
         if (value == nullptr || strcmp(value, "1") != 0) {
             return false;
@@ -3947,7 +3948,7 @@ static bool moe_early_router_enabled() {
         }
         return true;
     }();
-    return enabled;
+    return g_moe_early_router_enabled.load(std::memory_order_relaxed) || env_enabled;
 }
 
 static __global__ void moe_early_router_scores(
@@ -14229,6 +14230,11 @@ void ggml_backend_cuda_moe_set_debug_mm(bool enabled) {
 extern "C"
 bool ggml_backend_cuda_moe_get_debug_mm(void) {
     return g_moe_cache_mm_debug.load(std::memory_order_relaxed);
+}
+
+extern "C"
+void ggml_backend_cuda_moe_early_router_set_enabled(bool enabled) {
+    g_moe_early_router_enabled.store(enabled, std::memory_order_relaxed);
 }
 
 static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {

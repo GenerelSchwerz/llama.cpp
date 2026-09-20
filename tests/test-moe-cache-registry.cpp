@@ -2205,6 +2205,7 @@ void test_moe_cache_proc_api() {
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_cache_set_slots") == nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
+    CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_decode_boundary_overlap") != nullptr);
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
