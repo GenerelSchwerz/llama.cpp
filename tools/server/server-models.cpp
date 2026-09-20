@@ -7,6 +7,7 @@
 #include "build-info.h"
 #include "preset.h"
 #include "download.h"
+#include "hf-cache.h"
 #include "http.h"
 #include "subproc.h"
 
@@ -677,19 +678,19 @@ void server_models::load_models() {
     // Phase 1: load presets from all sources - pure I/O, no lock needed
     // 1. cached models
     common_presets cached_models = ctx_preset.load_from_cache();
-    SRV_INF("Loaded %zu cached model presets\n", cached_models.size());
+    SRV_TRC("Loaded %zu cached model presets from %s\n", cached_models.size(), hf_cache::get_cache_path().c_str());
     // 2. local models from --models-dir
     common_presets local_models;
     if (!base_params.models_dir.empty()) {
         local_models = ctx_preset.load_from_models_dir(base_params.models_dir);
-        SRV_INF("Loaded %zu local model presets from %s\n", local_models.size(), base_params.models_dir.c_str());
+        SRV_TRC("Loaded %zu local model presets from %s\n", local_models.size(), base_params.models_dir.c_str());
     }
     // 3. custom-path models from presets
     common_preset global = {};
     common_presets custom_presets = {};
     if (!base_params.models_preset.empty()) {
         custom_presets = ctx_preset.load_from_ini(base_params.models_preset, global);
-        SRV_INF("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
+        SRV_TRC("Loaded %zu custom model presets from %s\n", custom_presets.size(), base_params.models_preset.c_str());
     }
 
     // cascade, apply global preset first
@@ -762,8 +763,6 @@ void server_models::load_models() {
     }
 
     // Helpers that read `mapping` - must be called while holding the lock.
-    std::unordered_set<std::string> custom_names;
-    for (const auto & [name, preset] : custom_presets) custom_names.insert(name);
     auto join_set = [](const std::set<std::string> & s) {
         std::string result;
         for (const auto & v : s) {
@@ -773,13 +772,19 @@ void server_models::load_models() {
         return result;
     };
     auto log_available_models = [&]() {
-        SRV_INF("Available models (%zu) (*: custom preset)\n", mapping.size());
-        for (const auto & [name, inst] : mapping) {
-            bool has_custom = custom_names.find(name) != custom_names.end();
-            std::string info;
-            if (!inst.meta.aliases.empty()) info += " (aliases: " + join_set(inst.meta.aliases) + ")";
-            if (!inst.meta.tags.empty())    info += " [tags: "    + join_set(inst.meta.tags)    + "]";
-            SRV_INF("  %c %s%s\n", has_custom ? '*' : ' ', name.c_str(), info.c_str());
+        SRV_INF("Available models (%zu):\n", mapping.size());
+        if (mapping.empty()) {
+            SRV_INF("%s", "  no models found on the system (visit https://llama.app/models for suggestions)\n");
+        } else {
+            for (const auto & [name, inst] : mapping) {
+                const std::string source = server_model_source_to_string(inst.meta.source);
+
+                std::string info;
+                if (!inst.meta.aliases.empty()) info += " (aliases: " + join_set(inst.meta.aliases) + ")";
+                if (!inst.meta.tags.empty())    info += " [tags: "    + join_set(inst.meta.tags)    + "]";
+
+                SRV_INF("  [%10s] %s%s\n", source.c_str(), name.c_str(), info.c_str());
+            }
         }
     };
     auto apply_stop_timeout = [&]() {
@@ -1129,7 +1134,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // exceeding models_max. Without this, the window between unload_lru()
     // releasing its lock and this lock_guard acquiring allows multiple
     // threads to each observe capacity and all proceed to load.
-    if (base_params.models_max > 0) {
+    // Download workers do not use models_max slots.
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL && base_params.models_max > 0) {
         size_t count_active = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
@@ -1786,7 +1792,10 @@ void server_child::notify_to_router(const std::string & state, const json & payl
     std::lock_guard<std::mutex> lk(mtx_stdout);
     common_log_pause(common_log_main());
     fflush(stdout);
-    fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    // the router matches the command on a line prefix, so the leading newline
+    // closes whatever the logger left open on the shared pipe, down to the
+    // trailing color reset that carries no newline of its own
+    fprintf(stdout, "\n%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
     fflush(stdout);
     common_log_resume(common_log_main());
 }

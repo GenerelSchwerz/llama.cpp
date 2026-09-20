@@ -15,6 +15,8 @@
 #include <limits>
 #include <cstring>
 #include <type_traits>
+#include <chrono>
+#include <thread>
 
 #ifdef _WIN32
 // windows.h defines min and max as macros, which breaks std::min and std::max
@@ -1194,6 +1196,11 @@ json oaicompat_chat_params_parse(
         } else if (!response_type.empty() && response_type != "text") {
             throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
         }
+    }
+
+    // an absent or empty schema means any object
+    if (json_schema.is_object() && json_schema.empty()) {
+        json_schema["type"] = "object";
     }
 
     // get input files
