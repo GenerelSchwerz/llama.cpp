@@ -755,8 +755,11 @@ llama_context * llama_context::shared_workspace_peer() const {
 void llama_context::reset_sched_workspace() {
     sched.reset();
     cparams.flash_attn_causal_prefix_supported = false;
-    gf_res_prev.reset();
+    for (auto & res : gf_res_prev) {
+        res.reset();
+    }
     gf_res_reserve.reset();
+    gf_res_prev_active = nullptr;
     sched_buffer_generation = 0;
     sched_shrink_generation = 0;
     sched_buffers_shared = false;
@@ -791,9 +794,12 @@ void llama_context::prepare_sched_reserve(const sched_reserve_plan & plan) {
     if (generation != sched_buffer_generation) {
         synchronize();
         ggml_backend_sched_reset(sched.get());
-        if (gf_res_prev) {
-            gf_res_prev->reset();
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
         }
+        gf_res_prev_active = nullptr;
         sched_buffer_generation = generation;
         sched_need_reserve = true;
     }
@@ -858,10 +864,10 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     if (sched_resizable) {
-        if (!gf_res_prev) {
-            gf_res_prev.reset(new llm_graph_result(max_nodes));
-        } else {
-            gf_res_prev->reset();
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
         }
         if (!gf_res_reserve) {
             gf_res_reserve.reset(new llm_graph_result(max_nodes));
@@ -869,9 +875,12 @@ void llama_context::sched_reserve(uint32_t n_tokens_req, uint32_t n_kv_req) {
             gf_res_reserve->reset();
         }
     } else {
-        gf_res_prev.reset(new llm_graph_result(max_nodes));
+        for (auto & res : gf_res_prev) {
+            res.reset();
+        }
         gf_res_reserve.reset(new llm_graph_result(max_nodes));
     }
+    gf_res_prev_active = nullptr;
 
     auto create_sched = [&](bool pipeline_parallel) {
         sched.reset(ggml_backend_sched_new(
@@ -1221,10 +1230,14 @@ bool llama_context::memory_update(bool optimize, uint32_t n_tokens_req) {
             sched_reserve(n_tokens_req);
         }
 
-        // reset the previous graph result to make sure that it won't be reused
-        // TODO: change the mctx->apply() to return information if a graph reserve is needed
-        //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        // reset the previous graph results to make sure that they won't be reused
+        // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
+        for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1747,14 +1760,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = gf_res_prev.get();
+    auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1767,6 +1780,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1789,6 +1803,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        gf_res_prev_active = res;
     }
 
     // set the input data for the input tensors
@@ -2750,6 +2766,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     if (model.arch == LLM_ARCH_KIMI_K3) {
         // the n_tokens*40 budget below is exhausted at ubatch 3840
         res = std::max<uint32_t>(n_tokens * 160, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_HRM_TEXT) {
+        // the 128-slot looped graph needs roughly one stack per token budget
+        res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
@@ -2797,6 +2816,14 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+}
+
+llm_graph_result * llama_context::get_gf_res_prev() {
+    auto & res = gf_res_prev[n_outputs > 0];
+    if (!res) {
+        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    return res.get();
 }
 
 // pack sampler outputs into as few sequences as possible before using sequences without samplers
@@ -2868,8 +2895,13 @@ ggml_cgraph * llama_context::graph_reserve(
 
     ggml_backend_sched_reset(sched.get());
 
-    // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
+    for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3964,10 +3996,12 @@ void llama_context::opt_epoch_iter(
                 break;
             }
 
-            auto * res = gf_res_prev.get();
+            auto * res = get_gf_res_prev();
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
+            // the optimizer graph is allocated outside sched, so the next decode must rebuild
+            gf_res_prev_active = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);
