@@ -26,6 +26,7 @@ void test_moe_tensor_split_rejection() {
 }
 
 struct mtp_batch_fixture {
+    std::vector<llama_token> token;
     std::vector<float> embd;
     std::vector<llama_pos> pos;
     std::vector<int32_t> n_seq_id;
@@ -34,6 +35,7 @@ struct mtp_batch_fixture {
     std::vector<int8_t> output;
 
     void add(llama_seq_id sequence, llama_pos position) {
+        token.push_back(0);
         embd.push_back((float) embd.size());
         pos.push_back(position);
         n_seq_id.push_back(1);
@@ -59,6 +61,13 @@ struct mtp_batch_fixture {
         result.n_seq_id = n_seq_id.data();
         result.seq_id = seq_id.data();
         result.logits = output.data();
+        return result;
+    }
+
+    llama_batch token_batch() {
+        llama_batch result = batch();
+        result.token = token.data();
+        result.embd = nullptr;
         return result;
     }
 };
@@ -122,6 +131,24 @@ void test_speculative_grouped_intent_splits() {
     discontinuous.add(0, 12);
     CHECK(llama_speculative_grouped_intent_test_access::classify_batch(discontinuous.batch()) ==
         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID);
+
+    mtp_batch_fixture target_verification;
+    for (llama_seq_id sequence = 0; sequence < 4; ++sequence) {
+        target_verification.add_span(sequence, 40 + 10 * sequence, 4);
+    }
+    llama_vocab vocab;
+    llama_vocab_test_access::add_dummy_token(vocab);
+    llama_batch_allocr balloc(1);
+    CHECK(balloc.init(target_verification.token_batch(), vocab, nullptr, 0, 4, false));
+    const llama_ubatch equal = balloc.split_equal(512, true, 0);
+    CHECK(llama_speculative_grouped_intent_test_access::matches_target_verification_ubatch(equal, 4));
+    balloc.split_reset();
+    const llama_ubatch unified = balloc.split_simple(512);
+    CHECK(unified.n_seq_tokens == 1 && unified.n_seqs == unified.n_tokens && unified.n_seqs_unq == 4);
+    CHECK(llama_speculative_grouped_intent_test_access::matches_target_verification_ubatch(unified, 4));
+    balloc.split_reset();
+    CHECK(!llama_speculative_grouped_intent_test_access::matches_target_verification_ubatch(
+        balloc.split_simple(5), 4));
     fprintf(stderr, "test-moe-cache: speculative intent split lifecycle OK\n");
 }
 

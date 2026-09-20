@@ -304,26 +304,35 @@ static bool target_verification_intent_valid(
 static bool ubatch_has_target_verification_spans(const llama_ubatch & ubatch, uint32_t span) {
     if (span <= 1 || ubatch.n_tokens == 0 || ubatch.n_tokens % span != 0 || ubatch.token == nullptr ||
             ubatch.embd != nullptr || ubatch.pos == nullptr || ubatch.output == nullptr || ubatch.n_seq_id == nullptr ||
-            ubatch.seq_id == nullptr || ubatch.seq_id_unq == nullptr || ubatch.n_seq_tokens != span ||
-            ubatch.n_seqs != ubatch.n_tokens / span || ubatch.n_seqs_unq != ubatch.n_seqs) {
+            ubatch.seq_id == nullptr || ubatch.seq_id_unq == nullptr) {
         return false;
     }
-    for (uint32_t sequence = 0; sequence < ubatch.n_seqs; ++sequence) {
+    const uint32_t n_sequences = ubatch.n_tokens / span;
+    const bool equal_shape = ubatch.n_seq_tokens == span && ubatch.n_seqs == n_sequences;
+    const bool simple_shape = ubatch.n_seq_tokens == 1 && ubatch.n_seqs == ubatch.n_tokens;
+    if ((!equal_shape && !simple_shape) || ubatch.n_seqs_unq != n_sequences) {
+        return false;
+    }
+    std::array<uint8_t, LLAMA_MAX_SEQ> listed = {};
+    for (uint32_t sequence = 0; sequence < ubatch.n_seqs_unq; ++sequence) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[sequence];
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || listed[seq_id]) {
+            return false;
+        }
+        listed[seq_id] = 1;
+    }
+    std::array<uint8_t, LLAMA_MAX_SEQ> seen = {};
+    for (uint32_t sequence = 0; sequence < n_sequences; ++sequence) {
         const uint32_t first = sequence * span;
-        if (ubatch.n_seq_id[first] != 1 || ubatch.seq_id[first] == nullptr ||
-                ubatch.seq_id[first][0] != ubatch.seq_id_unq[sequence]) {
+        if (ubatch.n_seq_id[first] != 1 || ubatch.seq_id[first] == nullptr) {
             return false;
         }
         const llama_seq_id seq_id = ubatch.seq_id[first][0];
-        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ) {
+        if (seq_id < 0 || seq_id >= LLAMA_MAX_SEQ || !listed[seq_id] || seen[seq_id]) {
             return false;
         }
+        seen[seq_id] = 1;
         const llama_pos pos = ubatch.pos[first];
-        for (uint32_t previous = 0; previous < sequence; ++previous) {
-            if (ubatch.seq_id_unq[previous] == seq_id) {
-                return false;
-            }
-        }
         for (uint32_t offset = 0; offset < span; ++offset) {
             const uint32_t row = first + offset;
             if (ubatch.n_seq_id[row] != 1 || ubatch.seq_id[row] == nullptr || ubatch.seq_id[row][0] != seq_id ||
@@ -419,6 +428,17 @@ bool llama_speculative_grouped_intent_test_access::matches_ubatch(
     execution_intent.domain = speculative_execution_domain(context_type);
     execution_intent.row_semantics = row_semantics;
     return ubatch_matches_graph_execution_intent(context_type, 1, ubatch, execution_intent);
+}
+
+bool llama_speculative_grouped_intent_test_access::matches_target_verification_ubatch(
+        const llama_ubatch & ubatch,
+        uint32_t verification_span) {
+    llama_graph_execution_intent execution_intent;
+    execution_intent.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+    execution_intent.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+    execution_intent.verification_span = verification_span;
+    return ubatch_matches_graph_execution_intent(
+        LLAMA_CONTEXT_TYPE_DEFAULT, 1, ubatch, execution_intent);
 }
 
 bool llama_speculative_grouped_intent_test_access::backend_supported(ggml_backend_t backend) {

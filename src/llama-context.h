@@ -34,6 +34,7 @@ struct llama_speculative_grouped_intent_test_access {
     static bool matches_ubatch(const llama_ubatch & ubatch, uint32_t row_semantics);
     static bool matches_ubatch(
         llama_context_type context_type, const llama_ubatch & ubatch, uint32_t row_semantics);
+    static bool matches_target_verification_ubatch(const llama_ubatch & ubatch, uint32_t verification_span);
     static bool backend_supported(ggml_backend_t backend);
     static bool                               graph_supported(ggml_backend_sched_t sched, ggml_cgraph * gf);
     static uint32_t flags(uint32_t cache_slots, bool backend_supported);
