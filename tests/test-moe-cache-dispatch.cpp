@@ -1113,6 +1113,19 @@ static void test_active_grouped_inventory_reuse_case(ggml_type second_type, bool
     for (int32_t node_index = 0; node_index < second.graph->n_nodes; ++node_index) {
         graph->nodes[tail_index + node_index] = second.graph->nodes[node_index];
     }
+    candidate_set_route_tokens({ second.logits, second.ids, second.ids },
+                               { second.gate_output, second.up_output, second.down_output }, 0);
+    candidate_rebuild_graph_uses(graph);
+    const auto empty_coverage = candidate_certify_graph(*context, graph);
+    CHECK(empty_coverage.mmid_count == first.banks.size());
+    CHECK(context->prepare_graph_execution(graph, graph->uid, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &plan, &execution,
+                                           empty_coverage.epoch, empty_coverage.nodes, empty_coverage.mmid_count,
+                                           empty_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+    CHECK(execution.find(first.down_output, nullptr) && !execution.find(second.down_output, nullptr));
+
+    candidate_set_route_tokens({ second.logits, second.ids, second.ids },
+                               { second.gate_output, second.up_output, second.down_output }, 1);
     candidate_rebuild_graph_uses(graph);
     const auto updated_coverage = candidate_certify_graph(*context, graph);
     CHECK(!context->bind_graph_plan(
