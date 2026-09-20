@@ -293,6 +293,8 @@ static void test_active_grouped_dispatch_types_case(
         CHECK(zero_activity_replacement.registered == 1 && zero_activity_replacement.covered == 0);
         CHECK(zero_activity_replacement.plan_calls == 0 && zero_activity_replacement.calls == 0);
         CHECK(zero_activity_replacement.ready == 0 && zero_activity_replacement.completed == 0);
+        CHECK(zero_activity_replacement.reset_generation_replace == 1 &&
+            zero_activity_replacement.reset_generation_reject == 0);
 
         cudaStream_t stream = nullptr;
         cudaStream_t wrong_stream = nullptr;
@@ -384,6 +386,8 @@ static void test_active_grouped_dispatch_types_case(
         CHECK(replacement_telemetry.ready_min == 1 && replacement_telemetry.ready_max == 1);
         CHECK(replacement_telemetry.completed_min == 1 && replacement_telemetry.completed_max == 1);
         CHECK(replacement_telemetry.h2d_banks == 4 * first.banks.size());
+        CHECK(replacement_telemetry.reset_generation_replace == 1 &&
+            replacement_telemetry.reset_generation_reject == 0);
         CHECK(replacement_telemetry.required_unsupported >= 1);
 
         CHECK(run_active_grouped_dispatch(first_backend.get(), first, 4, false) == first_output);
@@ -393,6 +397,8 @@ static void test_active_grouped_dispatch_types_case(
         CHECK(disabled_telemetry.registered == 1 && disabled_telemetry.covered == 1);
         CHECK(disabled_telemetry.plan_calls == 1 && disabled_telemetry.calls == 1);
         CHECK(disabled_telemetry.ready == 1 && disabled_telemetry.completed == 1);
+        CHECK(disabled_telemetry.reset_generation_replace == 1 &&
+            disabled_telemetry.reset_generation_reject == 0);
         register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
         CHECK(run_active_grouped_dispatch(first_backend.get(), first, 2, false) == first_output);
         const ggml_backend_moe_candidate_group_v1 rejected_group = {
@@ -405,6 +411,8 @@ static void test_active_grouped_dispatch_types_case(
         CHECK(rejected_telemetry.plan_calls == 1 && rejected_telemetry.calls == 1);
         CHECK(rejected_telemetry.ready == 1 && rejected_telemetry.completed == 1);
         CHECK(rejected_telemetry.h2d_banks == 2 * first.banks.size());
+        CHECK(rejected_telemetry.reset_generation_replace == 0 &&
+            rejected_telemetry.reset_generation_reject == 1);
         register_active_grouped_dispatch(first_backend.get(), first, layout, n_slots);
         ggml_cuda_moe_grouped_context::log_and_reset_legacy_stats();
         const int32_t shutdown_routes[] = {3, 5};

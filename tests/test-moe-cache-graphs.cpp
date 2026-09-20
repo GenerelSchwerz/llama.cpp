@@ -1,5 +1,10 @@
 #include "test-moe-cache.h"
 
+static uint64_t grouped_source_bytes(const ggml_cuda_moe_grouped_debug_telemetry & telemetry) {
+    return telemetry.source_direct_registered_bytes + telemetry.source_pageable_staged_bytes +
+        telemetry.source_mapped_bytes + telemetry.source_device_bytes + telemetry.source_prepack_bytes;
+}
+
 static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * tensor, uint32_t salt) {
     CHECK(tensor->type == GGML_TYPE_Q4_K && tensor->ne[0] > 0 && tensor->ne[1] > 0 && tensor->ne[2] > 0);
     CHECK(tensor->nb[2] == ggml_row_size(tensor->type, tensor->ne[0]) * tensor->ne[1] &&
@@ -244,6 +249,13 @@ void test_grouped_graph_replay_lifecycle(
     const auto replay_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(replay_telemetry.calls == 4 && replay_telemetry.ready == 4 && replay_telemetry.completed == 4);
     CHECK(replay_telemetry.admitted_banks == 4 * graph.banks.size());
+    CHECK(grouped_source_bytes(replay_telemetry) == replay_telemetry.h2d_bytes);
+    CHECK((replay_telemetry.vacant_fills + replay_telemetry.replacement_fills +
+        replay_telemetry.invalidation_refills) * graph.banks.size() == replay_telemetry.h2d_banks);
+    CHECK(replay_telemetry.reset_generation_replace == 1 && replay_telemetry.reset_generation_reject == 0);
+    if (pageable) {
+        CHECK(replay_telemetry.source_pageable_staged_bytes == replay_telemetry.h2d_bytes);
+    }
     CHECK(replay_telemetry.prepare_error == 0 && replay_telemetry.finish_error == 0);
 
     coverage = candidate_certify_graph(*context, graph.graph);
@@ -298,6 +310,9 @@ void test_grouped_graph_replay_lifecycle(
     CHECK(context->find_down_group_key(graph.down, &key));
     CHECK(ggml_cuda_moe_grouped_context_test_access::get_clock_bound(*context, key, &clock_bound));
     CHECK(clock_bound == 2);
+    const auto refresh_telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(refresh_telemetry.reset_clock == 1);
+    CHECK(grouped_source_bytes(refresh_telemetry) == refresh_telemetry.h2d_bytes);
     if (n_dim == 1024) {
         CHECK(ggml_cuda_moe_grouped_context_test_access::host_copy_jobs(*context, key) != 0);
     }
@@ -905,6 +920,9 @@ static void test_active_grouped_multirow_graph_modes_case(
     CHECK(telemetry.admitted_banks == executed_passes * candidate.banks.size());
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
     CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    CHECK(telemetry.populated_slots > 0 && telemetry.populated_slots <= telemetry.slot_capacity &&
+        telemetry.populated_payload_bytes > 0 &&
+        telemetry.populated_payload_bytes <= telemetry.payload_capacity_bytes);
 
     if (capture_available) {
         ggml_backend_buffer_ptr output_buffer(ggml_backend_alloc_buffer(candidate_backend.get(), ggml_nbytes(candidate.output)));
@@ -1345,6 +1363,12 @@ static bool test_active_grouped_q4k_eviction_refill_case(int device, uint32_t pr
     }
     CHECK(telemetry.h2d_bytes == total_misses * bytes_per_expert && telemetry.fallback == 0 &&
         telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    CHECK(telemetry.vacant_fills == n_slots && telemetry.replacement_fills == total_misses - n_slots &&
+        telemetry.invalidation_refills == 0);
+    CHECK(grouped_source_bytes(telemetry) == telemetry.h2d_bytes);
+    CHECK(telemetry.populated_slots == n_slots && telemetry.slot_capacity == n_slots &&
+        telemetry.populated_payload_bytes == telemetry.payload_capacity_bytes &&
+        telemetry.populated_payload_bytes >= n_slots * bytes_per_expert);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
     fprintf(stderr, capture_available ?
         "test-moe-cache: active grouped Q4_K cache132 B%u/B5 eviction/refill capture exact OK\n" :
@@ -1684,6 +1708,8 @@ static void test_active_grouped_speculative_route_limit_transition(
         telemetry.host_staged_split_ops <= telemetry.host_staged_ops &&
         telemetry.strategy_switches == (sequential_fits ? 0 : 2) &&
         telemetry.required_unsupported == 0);
+    CHECK(telemetry.reset_host_staged_handoff == (sequential_fits ? 0 : 1));
+    CHECK(sequential_fits || telemetry.invalidation_refills != 0);
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     if (domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT) {
         const uint64_t legacy_before = active_grouped_legacy_op_count(candidate_backend.get());
@@ -1976,7 +2002,32 @@ static void test_active_grouped_stream_coherence_fallback(int device) {
     fprintf(stderr, "test-moe-cache: grouped stream coherence fallback/capture recovery OK\n");
 }
 
+static void test_active_grouped_first_decode_occupancy(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr backend(ggml_backend_cuda_init(device));
+    CHECK(backend != nullptr);
+    ggml_backend_cuda_set_decode_boundary_overlap(backend.get(), true);
+    auto graph = build_active_grouped_dispatch_graph(
+        backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 2, 8, 2);
+    initialize_active_grouped_dispatch_graph(graph, 177);
+    register_active_grouped_dispatch(
+        backend.get(), graph, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 12);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+    CHECK(context != nullptr);
+    (void) candidate_certify_graph(*context, graph.graph);
+    (void) run_active_grouped_dispatch(backend.get(), graph, 0, false);
+    const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(telemetry.calls == 1 && telemetry.ready == 1 && telemetry.completed == 1);
+    CHECK(telemetry.h2d_banks > 0 && telemetry.h2d_banks % graph.banks.size() == 0);
+    CHECK(telemetry.populated_slots == telemetry.h2d_banks / graph.banks.size() &&
+        telemetry.populated_slots > 0 && telemetry.slot_capacity == 12);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+}
+
 void test_active_grouped_multirow_graph_modes(int device) {
+    test_active_grouped_first_decode_occupancy(device);
     test_active_grouped_lookup_routes(device);
     test_active_grouped_multirow_graph_modes_case(device, 2);
     test_active_grouped_multirow_graph_modes_case(device, 3);

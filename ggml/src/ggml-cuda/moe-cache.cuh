@@ -463,6 +463,23 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t finish_error = 0;
     uint64_t h2d_banks = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t vacant_fills = 0;
+    uint64_t replacement_fills = 0;
+    uint64_t invalidation_refills = 0;
+    uint64_t source_direct_registered_bytes = 0;
+    uint64_t source_pageable_staged_bytes = 0;
+    uint64_t source_mapped_bytes = 0;
+    uint64_t source_device_bytes = 0;
+    uint64_t source_prepack_bytes = 0;
+    uint64_t populated_slots = 0;
+    uint64_t slot_capacity = 0;
+    uint64_t populated_payload_bytes = 0;
+    uint64_t payload_capacity_bytes = 0;
+    uint64_t reset_generation_replace = 0;
+    uint64_t reset_generation_reject = 0;
+    uint64_t reset_clock = 0;
+    uint64_t reset_legacy_handoff = 0;
+    uint64_t reset_host_staged_handoff = 0;
     uint64_t decode_grouped        = 0;
     uint64_t decode_legacy         = 0;
     // Final readers submitted; completed counts successful completion-event recording, not a host wait.

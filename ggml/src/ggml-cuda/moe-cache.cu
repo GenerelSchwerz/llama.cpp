@@ -474,6 +474,36 @@ struct moe_cache_tensor_decode_stats {
     moe_cache_reuse_hist reuse_hist = {};
 };
 
+enum moe_grouped_source_path : uint32_t {
+    MOE_GROUPED_SOURCE_DIRECT_REGISTERED = 0,
+    MOE_GROUPED_SOURCE_PAGEABLE_STAGED,
+    MOE_GROUPED_SOURCE_MAPPED,
+    MOE_GROUPED_SOURCE_DEVICE,
+    MOE_GROUPED_SOURCE_PATH_COUNT,
+};
+
+enum moe_grouped_transfer_counter : uint32_t {
+    MOE_GROUPED_TRANSFER_BANKS = 0,
+    MOE_GROUPED_TRANSFER_BYTES,
+    MOE_GROUPED_TRANSFER_VACANT_FILLS,
+    MOE_GROUPED_TRANSFER_REPLACEMENT_FILLS,
+    MOE_GROUPED_TRANSFER_INVALIDATION_REFILLS,
+    MOE_GROUPED_TRANSFER_DIRECT_REGISTERED_BYTES,
+    MOE_GROUPED_TRANSFER_PAGEABLE_STAGED_BYTES,
+    MOE_GROUPED_TRANSFER_MAPPED_BYTES,
+    MOE_GROUPED_TRANSFER_DEVICE_BYTES,
+    MOE_GROUPED_TRANSFER_PREPACK_BYTES,
+    MOE_GROUPED_TRANSFER_COUNTER_COUNT,
+};
+
+enum moe_grouped_reset_reason : uint32_t {
+    MOE_GROUPED_RESET_GENERATION_REPLACE = 0,
+    MOE_GROUPED_RESET_GENERATION_REJECT,
+    MOE_GROUPED_RESET_CLOCK,
+    MOE_GROUPED_RESET_LEGACY_HANDOFF,
+    MOE_GROUPED_RESET_HOST_STAGED_HANDOFF,
+};
+
 struct moe_grouped_decode_debug_stats {
     std::atomic<uint64_t> decode_grouped{ 0 };
     std::atomic<uint64_t> decode_legacy{ 0 };
@@ -518,6 +548,11 @@ struct moe_grouped_decode_debug_stats {
     std::array<std::atomic<uint64_t>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS>             submitted_by_group;
     std::atomic<uint64_t *> device_transfers{nullptr};
     std::atomic<bool> device_transfers_failed{false};
+    std::atomic<uint64_t> reset_generation_replace{0};
+    std::atomic<uint64_t> reset_generation_reject{0};
+    std::atomic<uint64_t> reset_clock{0};
+    std::atomic<uint64_t> reset_legacy_handoff{0};
+    std::atomic<uint64_t> reset_host_staged_handoff{0};
 };
 
 struct moe_cache_telemetry {
@@ -558,6 +593,7 @@ static bool moe_grouped_has_activity(const ggml_cuda_moe_grouped_debug_telemetry
            telemetry.host_staged_calls != 0 || telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 ||
            telemetry.strategy_switches != 0 || telemetry.required_unsupported != 0 || telemetry.prepare_error != 0 ||
            telemetry.finish_error != 0 || telemetry.h2d_banks != 0 || telemetry.h2d_bytes != 0 ||
+           telemetry.vacant_fills != 0 || telemetry.replacement_fills != 0 || telemetry.invalidation_refills != 0 ||
            telemetry.decode_grouped != 0 || telemetry.decode_legacy != 0 || telemetry.submitted != 0;
 }
 
@@ -2643,6 +2679,7 @@ struct moe_grouped_device_bank {
     const char * source;
     char * data;
     size_t expert_stride;
+    uint32_t source_path = MOE_GROUPED_SOURCE_DEVICE;
     bool staged = false;
 };
 
@@ -3125,6 +3162,16 @@ static __device__ void moe_grouped_plan_fail(moe_grouped_decode_plan * plan, moe
 static __global__ void moe_grouped_set_clock(uint64_t * clock, uint64_t value) {
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         *clock = value;
+    }
+}
+
+static __global__ void moe_grouped_mark_invalidated_slots(
+        const uint8_t * occupied_slot,
+        uint8_t * invalidated_slot,
+        uint32_t n_slots) {
+    const uint32_t slot = blockIdx.x * blockDim.x + threadIdx.x;
+    if (slot < n_slots) {
+        invalidated_slot[slot] |= occupied_slot[slot];
     }
 }
 
@@ -4230,6 +4277,8 @@ static __global__ void moe_grouped_gather_decode(
         uint32_t plan_capacity,
         const moe_grouped_decode_plan * plan,
         uint64_t * transfer_counters,
+        uint8_t * occupied_slot,
+        uint8_t * invalidated_slot,
         const moe_prepack_control * control = nullptr,
         uint32_t first_miss = 0,
         uint32_t miss_count = UINT32_MAX) {
@@ -4239,10 +4288,56 @@ static __global__ void moe_grouped_gather_decode(
     const uint32_t n_misses = min(miss_count, plan->n_misses - first_miss);
     if constexpr (debug_transfers) {
         if (blockIdx.x == 0 && threadIdx.x == 0) {
-            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[0]),
+            const int32_t * miss_slots = moe_grouped_plan_array_ptr(
+                plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
+            uint64_t vacant_fills = 0;
+            uint64_t replacement_fills = 0;
+            uint64_t invalidation_refills = 0;
+            uint64_t source_bytes[MOE_GROUPED_SOURCE_PATH_COUNT] = {};
+            uint64_t prepack_bytes = 0;
+            for (uint32_t local_miss = 0; local_miss < n_misses; ++local_miss) {
+                const uint32_t miss = first_miss + local_miss;
+                const int32_t slot = miss_slots[miss];
+                if (occupied_slot[slot] != 0) {
+                    ++replacement_fills;
+                } else if (invalidated_slot != nullptr && invalidated_slot[slot] != 0) {
+                    ++invalidation_refills;
+                    invalidated_slot[slot] = 0;
+                } else {
+                    ++vacant_fills;
+                }
+                occupied_slot[slot] = 1;
+                if (control != nullptr && control->adopted[local_miss] != nullptr) {
+                    prepack_bytes += words_per_miss * sizeof(uint4);
+                    continue;
+                }
+                for (uint32_t bank = 0; bank < n_banks; ++bank) {
+                    const uint32_t path = banks[bank].source_path;
+                    if (path < MOE_GROUPED_SOURCE_PATH_COUNT) {
+                        source_bytes[path] += banks[bank].expert_stride;
+                    }
+                }
+            }
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_BANKS]),
                 static_cast<unsigned long long>(n_misses) * n_banks);
-            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[1]),
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_BYTES]),
                 static_cast<unsigned long long>(n_misses) * words_per_miss * sizeof(uint4));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_VACANT_FILLS]),
+                static_cast<unsigned long long>(vacant_fills));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_REPLACEMENT_FILLS]),
+                static_cast<unsigned long long>(replacement_fills));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_INVALIDATION_REFILLS]),
+                static_cast<unsigned long long>(invalidation_refills));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_DIRECT_REGISTERED_BYTES]),
+                static_cast<unsigned long long>(source_bytes[MOE_GROUPED_SOURCE_DIRECT_REGISTERED]));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_PAGEABLE_STAGED_BYTES]),
+                static_cast<unsigned long long>(source_bytes[MOE_GROUPED_SOURCE_PAGEABLE_STAGED]));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_MAPPED_BYTES]),
+                static_cast<unsigned long long>(source_bytes[MOE_GROUPED_SOURCE_MAPPED]));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_DEVICE_BYTES]),
+                static_cast<unsigned long long>(source_bytes[MOE_GROUPED_SOURCE_DEVICE]));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_PREPACK_BYTES]),
+                static_cast<unsigned long long>(prepack_bytes));
         }
     }
     const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
@@ -4499,6 +4594,12 @@ struct ggml_cuda_moe_grouped_context::impl {
             if (expert_for_slot != nullptr) {
                 (void) cudaFree(expert_for_slot);
             }
+            if (invalidated_slot != nullptr) {
+                (void) cudaFree(invalidated_slot);
+            }
+            if (occupied_slot != nullptr) {
+                (void) cudaFree(occupied_slot);
+            }
             if (last_used != nullptr) {
                 (void) cudaFree(last_used);
             }
@@ -4548,6 +4649,8 @@ struct ggml_cuda_moe_grouped_context::impl {
         uint64_t prefill_auxiliary_pending_declines = 0;
         int32_t * slot_for_expert = nullptr;
         int32_t * expert_for_slot = nullptr;
+        uint8_t * invalidated_slot = nullptr;
+        uint8_t * occupied_slot = nullptr;
         uint64_t * last_used = nullptr;
         uint32_t * expert_frequency = nullptr;
         uint64_t * expert_frequency_epoch = nullptr;
@@ -4640,6 +4743,8 @@ struct ggml_cuda_moe_grouped_context::impl {
     using legacy_record_list = std::vector<std::unique_ptr<legacy_record>>;
     using terminal_legacy_records = std::array<std::unique_ptr<legacy_record>, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS>;
     using resource_slots = std::vector<std::shared_ptr<grouped_resource>>;
+    using telemetry_resource_snapshot =
+        std::vector<std::pair<std::shared_ptr<grouped_resource>, grouped_device_resource *>>;
     using graph_coverage_map = std::unordered_map<graph_coverage_key, graph_coverage_record, graph_coverage_key_hash>;
 
     ggml_backend_dev_t owner;
@@ -4730,8 +4835,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         if (result == nullptr) {
             moe_grouped_device_scope device_scope(device);
-            if (!moe_grouped_cuda_success(cudaMalloc(&result, 2 * sizeof(uint64_t))) ||
-                    !moe_grouped_cuda_success(cudaMemset(result, 0, 2 * sizeof(uint64_t)))) {
+            if (!moe_grouped_cuda_success(cudaMalloc(&result, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t))) ||
+                    !moe_grouped_cuda_success(cudaMemset(
+                        result, 0, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t)))) {
                 if (result != nullptr) {
                     (void) cudaFree(result);
                 }
@@ -4744,7 +4850,51 @@ struct ggml_cuda_moe_grouped_context::impl {
 #endif
     }
 
-    ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_locked(uint32_t registered) {
+    void record_reset(moe_grouped_reset_reason reason) {
+        auto * stats = debug_stats();
+        if (stats == nullptr) {
+            return;
+        }
+        switch (reason) {
+            case MOE_GROUPED_RESET_GENERATION_REPLACE:
+                stats->reset_generation_replace.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case MOE_GROUPED_RESET_GENERATION_REJECT:
+                stats->reset_generation_reject.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case MOE_GROUPED_RESET_CLOCK:
+                stats->reset_clock.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case MOE_GROUPED_RESET_LEGACY_HANDOFF:
+                stats->reset_legacy_handoff.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case MOE_GROUPED_RESET_HOST_STAGED_HANDOFF:
+                stats->reset_host_staged_handoff.fetch_add(1, std::memory_order_relaxed);
+                break;
+        }
+    }
+
+    telemetry_resource_snapshot snapshot_resources_for_telemetry() const {
+        telemetry_resource_snapshot result;
+        std::lock_guard<std::mutex> lock(mutex);
+        try {
+            result.reserve(resources.size());
+            for (const auto & resource : resources) {
+                if (resource != nullptr && resource->device != nullptr) {
+                    // The retained grouped_resource owns an install-once device resource, so the raw device
+                    // pointer remains valid after releasing mutex while D2H occupancy copies may block.
+                    result.emplace_back(resource, resource->device.get());
+                }
+            }
+        } catch (const std::bad_alloc &) {
+            result.clear();
+        }
+        return result;
+    }
+
+    ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry_locked(
+            uint32_t registered,
+            const telemetry_resource_snapshot & telemetry_resources) {
         ggml_cuda_moe_grouped_debug_telemetry result;
         result.registered = registered;
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -4776,6 +4926,11 @@ struct ggml_cuda_moe_grouped_context::impl {
         result.direct                = take(stats->direct);
         result.captures              = take(stats->captures);
         result.replays               = take(stats->replays);
+        result.reset_generation_replace = take(stats->reset_generation_replace);
+        result.reset_generation_reject = take(stats->reset_generation_reject);
+        result.reset_clock = take(stats->reset_clock);
+        result.reset_legacy_handoff = take(stats->reset_legacy_handoff);
+        result.reset_host_staged_handoff = take(stats->reset_host_staged_handoff);
         uint64_t ready_min = UINT64_MAX;
         uint64_t completed_min = UINT64_MAX;
         for (uint32_t group_index = 0; group_index < GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS; ++group_index) {
@@ -4818,16 +4973,66 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         uint64_t * transfers = stats->device_transfers.load(std::memory_order_acquire);
         if (transfers != nullptr) {
-            uint64_t counters[2] = {};
+            uint64_t counters[MOE_GROUPED_TRANSFER_COUNTER_COUNT] = {};
             moe_grouped_device_scope device_scope(device);
             if (moe_grouped_cuda_success(cudaMemcpy(counters, transfers, sizeof(counters), cudaMemcpyDeviceToHost))) {
-                result.h2d_banks = counters[0];
-                result.h2d_bytes = counters[1];
+                result.h2d_banks = counters[MOE_GROUPED_TRANSFER_BANKS];
+                result.h2d_bytes = counters[MOE_GROUPED_TRANSFER_BYTES];
+                result.vacant_fills = counters[MOE_GROUPED_TRANSFER_VACANT_FILLS];
+                result.replacement_fills = counters[MOE_GROUPED_TRANSFER_REPLACEMENT_FILLS];
+                result.invalidation_refills = counters[MOE_GROUPED_TRANSFER_INVALIDATION_REFILLS];
+                result.source_direct_registered_bytes = counters[MOE_GROUPED_TRANSFER_DIRECT_REGISTERED_BYTES];
+                result.source_pageable_staged_bytes = counters[MOE_GROUPED_TRANSFER_PAGEABLE_STAGED_BYTES];
+                result.source_mapped_bytes = counters[MOE_GROUPED_TRANSFER_MAPPED_BYTES];
+                result.source_device_bytes = counters[MOE_GROUPED_TRANSFER_DEVICE_BYTES];
+                result.source_prepack_bytes = counters[MOE_GROUPED_TRANSFER_PREPACK_BYTES];
                 if (!moe_grouped_cuda_success(cudaMemset(transfers, 0, sizeof(counters)))) {
                     result.h2d_banks = 0;
                     result.h2d_bytes = 0;
+                    result.vacant_fills = 0;
+                    result.replacement_fills = 0;
+                    result.invalidation_refills = 0;
+                    result.source_direct_registered_bytes = 0;
+                    result.source_pageable_staged_bytes = 0;
+                    result.source_mapped_bytes = 0;
+                    result.source_device_bytes = 0;
+                    result.source_prepack_bytes = 0;
                 }
             }
+        }
+        try {
+            moe_grouped_device_scope device_scope(device);
+            for (const auto & entry : telemetry_resources) {
+                const auto & resource = entry.first;
+                const auto * device_resource = entry.second;
+                if (resource == nullptr || device_resource == nullptr || device_resource->occupied_slot == nullptr) {
+                    continue;
+                }
+                std::vector<uint8_t> occupied(resource->snapshot.n_slots);
+                if (!moe_grouped_cuda_success(cudaMemcpy(
+                        occupied.data(), device_resource->occupied_slot,
+                        occupied.size() * sizeof(occupied[0]), cudaMemcpyDeviceToHost))) {
+                    continue;
+                }
+                uint64_t bytes_per_slot = 0;
+                for (const auto & bank : resource->snapshot.banks) {
+                    bytes_per_slot += bank.expert_stride;
+                }
+                for (uint32_t i = 0; i < resource->snapshot.n_slot_auxiliaries; ++i) {
+                    bytes_per_slot += device_resource->auxiliary_n_values[i] * sizeof(float);
+                }
+                const uint64_t populated = std::count_if(
+                    occupied.begin(), occupied.end(), [](uint8_t value) { return value != 0; });
+                result.populated_slots += populated;
+                result.slot_capacity += resource->snapshot.n_slots;
+                result.populated_payload_bytes += populated * bytes_per_slot;
+                result.payload_capacity_bytes += resource->snapshot.n_slots * bytes_per_slot;
+            }
+        } catch (const std::bad_alloc &) {
+            result.populated_slots = 0;
+            result.slot_capacity = 0;
+            result.populated_payload_bytes = 0;
+            result.payload_capacity_bytes = 0;
         }
         if (moe_grouped_has_activity(result)) {
             ggml_backend_dev_props props{};
@@ -4837,23 +5042,42 @@ struct ggml_cuda_moe_grouped_context::impl {
             GGML_LOG_INFO(
                 "moe-grouped-owner: owner=%p device=%d physical=%d pci=%s generation=%llu decode_grouped=%llu "
                 "decode_legacy=%llu direct=%llu captures=%llu replays=%llu ready=%llu submitted=%llu completed=%llu "
-                "prepare_error=%llu finish_error=%llu\n",
+                "prepare_error=%llu finish_error=%llu populated_slots=%llu/%llu populated_payload_bytes=%llu/%llu "
+                "vacant_fills=%llu replacement_fills=%llu invalidation_refills=%llu "
+                "source_direct_registered_bytes=%llu source_pageable_staged_bytes=%llu source_mapped_bytes=%llu "
+                "source_device_bytes=%llu source_prepack_bytes=%llu reset_generation_replace=%llu "
+                "reset_generation_reject=%llu reset_clock=%llu reset_legacy_handoff=%llu reset_host_staged_handoff=%llu\n",
                 (void *) this, device, device >= 0 ? ggml_cuda_info().devices[device].physical_device : -1,
                 props.device_id ? props.device_id : "unknown", (unsigned long long) state.generation,
                 (unsigned long long) result.decode_grouped, (unsigned long long) result.decode_legacy,
                 (unsigned long long) result.direct, (unsigned long long) result.captures,
                 (unsigned long long) result.replays, (unsigned long long) result.ready,
                 (unsigned long long) result.submitted, (unsigned long long) result.completed,
-                (unsigned long long) result.prepare_error, (unsigned long long) result.finish_error);
+                (unsigned long long) result.prepare_error, (unsigned long long) result.finish_error,
+                (unsigned long long) result.populated_slots, (unsigned long long) result.slot_capacity,
+                (unsigned long long) result.populated_payload_bytes, (unsigned long long) result.payload_capacity_bytes,
+                (unsigned long long) result.vacant_fills, (unsigned long long) result.replacement_fills,
+                (unsigned long long) result.invalidation_refills,
+                (unsigned long long) result.source_direct_registered_bytes,
+                (unsigned long long) result.source_pageable_staged_bytes,
+                (unsigned long long) result.source_mapped_bytes,
+                (unsigned long long) result.source_device_bytes,
+                (unsigned long long) result.source_prepack_bytes,
+                (unsigned long long) result.reset_generation_replace,
+                (unsigned long long) result.reset_generation_reject,
+                (unsigned long long) result.reset_clock,
+                (unsigned long long) result.reset_legacy_handoff,
+                (unsigned long long) result.reset_host_staged_handoff);
         }
         return result;
     }
 
     ggml_cuda_moe_grouped_debug_telemetry take_grouped_debug_telemetry(uint32_t registered) {
+        const auto telemetry_resources = snapshot_resources_for_telemetry();
         std::lock_guard<std::mutex> lock(telemetry_mutex);
         auto result = retired_telemetry.grouped;
         retired_telemetry.grouped = {};
-        moe_grouped_add_telemetry(result, take_grouped_debug_telemetry_locked(registered));
+        moe_grouped_add_telemetry(result, take_grouped_debug_telemetry_locked(registered, telemetry_resources));
         return result;
     }
 
@@ -4862,13 +5086,29 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (grouped_debug.load(std::memory_order_acquire) == nullptr) {
             return;
         }
-        const auto sample = take_grouped_debug_telemetry_locked(registered);
+        const telemetry_resource_snapshot no_resources;
+        auto sample = take_grouped_debug_telemetry_locked(registered, no_resources);
+        sample.populated_slots = 0;
+        sample.slot_capacity = 0;
+        sample.populated_payload_bytes = 0;
+        sample.payload_capacity_bytes = 0;
+        retired_telemetry.grouped.reset_generation_replace += sample.reset_generation_replace;
+        retired_telemetry.grouped.reset_generation_reject += sample.reset_generation_reject;
+        retired_telemetry.grouped.reset_clock += sample.reset_clock;
+        retired_telemetry.grouped.reset_legacy_handoff += sample.reset_legacy_handoff;
+        retired_telemetry.grouped.reset_host_staged_handoff += sample.reset_host_staged_handoff;
+        sample.reset_generation_replace = 0;
+        sample.reset_generation_reject = 0;
+        sample.reset_clock = 0;
+        sample.reset_legacy_handoff = 0;
+        sample.reset_host_staged_handoff = 0;
         if (moe_grouped_has_activity(sample)) {
             moe_grouped_add_telemetry(retired_telemetry.grouped, sample);
         }
     }
 
     moe_cache_telemetry take_owner_telemetry(uint32_t registered) {
+        const auto telemetry_resources = snapshot_resources_for_telemetry();
         std::lock_guard<std::mutex> lock(telemetry_mutex);
         moe_cache_telemetry result;
         moe_cache_telemetry retired = std::move(retired_telemetry);
@@ -4877,7 +5117,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             moe_cache_add_telemetry(result, std::move(retired));
         } catch (...) {
         }
-        moe_grouped_add_telemetry(result.grouped, take_grouped_debug_telemetry_locked(registered));
+        moe_grouped_add_telemetry(
+            result.grouped, take_grouped_debug_telemetry_locked(registered, telemetry_resources));
         for (int phase = 0; phase < 2; ++phase) {
             ggml_cuda_moe_add_phase_stats(result.phase_stats[phase], moe_cache_take_op_stats(legacy_op_stats[phase], true));
         }
@@ -5875,6 +6116,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         for (uint32_t i = 0; i < snapshot.banks.size(); ++i) {
             const auto & bank = snapshot.banks[i];
             const void * alias_data = nullptr;
+            bool host_alias = false;
             if (bank.expert_stride % sizeof(uint4) != 0 ||
                     (uintptr_t) bank.source_data % alignof(uint4) != 0) {
                 return nullptr;
@@ -5886,9 +6128,15 @@ struct ggml_cuda_moe_grouped_context::impl {
                 materialization.destinations[i] = static_cast<char *>(materialization.storage.payload) + next_staging;
                 alias_data = static_cast<const char *>(materialization.storage.payload_alias) + next_staging;
                 next_staging += source->expert_stride * materialization.storage.tiles;
+                device_banks[i].source_path = MOE_GROUPED_SOURCE_PAGEABLE_STAGED;
                 device_banks[i].staged = true;
-            } else if (!device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data, false, false, &alias_data, nullptr, bank.tensor)) {
-                return nullptr;
+            } else {
+                if (!device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data,
+                        false, false, &alias_data, &host_alias, bank.tensor)) {
+                    return nullptr;
+                }
+                device_banks[i].source_path = source != nullptr ? MOE_GROUPED_SOURCE_DIRECT_REGISTERED :
+                    host_alias ? MOE_GROUPED_SOURCE_MAPPED : MOE_GROUPED_SOURCE_DEVICE;
             }
             if (bank.expert_stride > SIZE_MAX / snapshot.n_slots) {
                 return nullptr;
@@ -5937,6 +6185,15 @@ struct ggml_cuda_moe_grouped_context::impl {
                     !moe_grouped_cuda_success(cudaMalloc(&result->device_auxiliaries,
                         snapshot.n_slot_auxiliaries * sizeof(moe_grouped_device_auxiliary)))) ||
                 !moe_grouped_cuda_success(cudaEventCreateWithFlags(&result->completion, cudaEventDisableTiming))) {
+            return nullptr;
+        }
+        if (moe_cache_mm_debug_enabled() &&
+                (!moe_grouped_cuda_success(cudaMalloc(&result->invalidated_slot, snapshot.n_slots * sizeof(uint8_t))) ||
+                    !moe_grouped_cuda_success(cudaMalloc(&result->occupied_slot, snapshot.n_slots * sizeof(uint8_t))) ||
+                    !moe_grouped_cuda_success(cudaMemsetAsync(
+                        result->invalidated_slot, 0, snapshot.n_slots * sizeof(uint8_t), compute_stream)) ||
+                    !moe_grouped_cuda_success(cudaMemsetAsync(
+                        result->occupied_slot, 0, snapshot.n_slots * sizeof(uint8_t), compute_stream)))) {
             return nullptr;
         }
         bool prefill_resident = prefill_resident_certified && snapshot.prefill_resident_auxiliary &&
@@ -6019,10 +6276,14 @@ struct ggml_cuda_moe_grouped_context::impl {
         return nullptr;
     }
 
-    bool cold_reset_grouped_resource(grouped_resource & resource, cudaStream_t compute_stream) const {
+    bool cold_reset_grouped_resource(
+            grouped_resource & resource,
+            cudaStream_t compute_stream,
+            moe_grouped_reset_reason reason) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
         GGML_UNUSED(resource);
         GGML_UNUSED(compute_stream);
+        GGML_UNUSED(reason);
         return false;
 #else
         if (resource.device == nullptr || compute_stream == nullptr) {
@@ -6033,6 +6294,19 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (device_resource.has_completion && device_resource.completion_stream != compute_stream &&
                 !moe_grouped_cuda_success(cudaStreamWaitEvent(compute_stream, device_resource.completion, 0))) {
             return false;
+        }
+        if (device_resource.invalidated_slot != nullptr) {
+            constexpr uint32_t threads = 256;
+            moe_grouped_mark_invalidated_slots<<<
+                (resource.snapshot.n_slots + threads - 1) / threads, threads, 0, compute_stream>>>(
+                    device_resource.occupied_slot, device_resource.invalidated_slot, resource.snapshot.n_slots);
+            if (!moe_grouped_cuda_success(cudaGetLastError())) {
+                return false;
+            }
+            if (!moe_grouped_cuda_success(cudaMemsetAsync(
+                    device_resource.occupied_slot, 0, resource.snapshot.n_slots * sizeof(uint8_t), compute_stream))) {
+                return false;
+            }
         }
         for (uint32_t i = 0; i < resource.snapshot.n_slot_auxiliaries; ++i) {
             if (!moe_grouped_cuda_success(cudaMemsetAsync(
@@ -6063,6 +6337,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         device_resource.has_completion = true;
         device_resource.completion_stream = compute_stream;
         resource.legacy_dirty = false;
+        record_reset(reason);
         return true;
 #endif
     }
@@ -6152,7 +6427,8 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
         }
         if (stable != nullptr) {
-            const bool reset = cold_reset_grouped_resource(*stable, compute_stream);
+            const bool reset = cold_reset_grouped_resource(
+                *stable, compute_stream, MOE_GROUPED_RESET_CLOCK);
             std::lock_guard<std::mutex> lock(mutex);
             const uint32_t group_index = acquisition.candidate.group_index;
             if (group_index < resources.size() && resources[group_index] == stable &&
@@ -6202,6 +6478,7 @@ struct ggml_cuda_moe_grouped_context::impl {
         prospective->device->set_serial(++next_device_resource_serial);
         resources[group_index] = std::move(prospective);
         refreshing[group_index] = 0;
+        record_reset(MOE_GROUPED_RESET_CLOCK);
         return true;
     }
 
@@ -6229,6 +6506,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         retire_resources(std::move(retired));
         retire_legacy_records(std::move(retired_legacy));
+        if (old_registered_groups != 0) {
+            record_reset(MOE_GROUPED_RESET_GENERATION_REJECT);
+        }
         fold_grouped_debug_telemetry(old_registered_groups);
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -6279,6 +6559,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         retire_resources(std::move(retired));
         retire_legacy_records(std::move(retired_legacy));
+        if (old_registered_groups != 0) {
+            record_reset(MOE_GROUPED_RESET_GENERATION_REPLACE);
+        }
         fold_grouped_debug_telemetry(old_registered_groups);
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -8715,8 +8998,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
             reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
         CUDA_CHECK(cudaGetLastError());
-        auto * debug = impl_->grouped_debug.load(std::memory_order_acquire);
-        uint64_t * transfer_counters = debug != nullptr ? debug->device_transfers.load(std::memory_order_acquire) : nullptr;
+        auto * debug = impl_->debug_stats();
+        uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
+            debug->device_transfers.load(std::memory_order_acquire) : nullptr;
         const uint32_t transfer_blocks = moe_grouped_transfer_blocks(
             impl_->device, device.words_per_miss, device.auxiliary_values_per_miss, n_routes);
         if (device.materialization != nullptr) {
@@ -8736,12 +9020,14 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                        device.occupied_slot, device.invalidated_slot,
                         materialization.device_control, miss, tile_capacity);
                 } else {
                     moe_grouped_gather_decode<false><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                        nullptr, nullptr,
                         materialization.device_control, miss, tile_capacity);
                 }
                 CUDA_CHECK(cudaGetLastError());
@@ -8751,12 +9037,14 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                device.occupied_slot, device.invalidated_slot,
                 nullptr);
         } else {
             moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                nullptr, nullptr,
                 nullptr);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -10729,6 +11017,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
     struct grouped_reset {
         std::shared_ptr<impl::grouped_resource> resource;
         cudaStream_t stream;
+        moe_grouped_reset_reason reason;
     };
     struct host_staging_transition {
         ggml_cuda_moe_cache * cache;
@@ -10814,7 +11103,9 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                 }
                 if (resource != nullptr && resource->device != nullptr &&
                         (resource->legacy_dirty || current_authority == GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED)) {
-                    grouped_resets.push_back({resource, execution->groups_[record_index].stream});
+                    grouped_resets.push_back({resource, execution->groups_[record_index].stream,
+                        resource->legacy_dirty ? MOE_GROUPED_RESET_LEGACY_HANDOFF :
+                            MOE_GROUPED_RESET_HOST_STAGED_HANDOFF});
                 }
                 if (resource != nullptr && resource->device != nullptr &&
                         current_authority != desired[record_index]) {
@@ -10848,7 +11139,7 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
     }
     for (const auto & reset : grouped_resets) {
         if (transition_ok) {
-            transition_ok = impl_->cold_reset_grouped_resource(*reset.resource, reset.stream);
+            transition_ok = impl_->cold_reset_grouped_resource(*reset.resource, reset.stream, reset.reason);
         }
     }
     for (const auto & transition : host_staging_transitions) {
@@ -13974,6 +14265,23 @@ static void moe_grouped_add_telemetry(
     dst.finish_error += src.finish_error;
     dst.h2d_banks += src.h2d_banks;
     dst.h2d_bytes += src.h2d_bytes;
+    dst.vacant_fills += src.vacant_fills;
+    dst.replacement_fills += src.replacement_fills;
+    dst.invalidation_refills += src.invalidation_refills;
+    dst.source_direct_registered_bytes += src.source_direct_registered_bytes;
+    dst.source_pageable_staged_bytes += src.source_pageable_staged_bytes;
+    dst.source_mapped_bytes += src.source_mapped_bytes;
+    dst.source_device_bytes += src.source_device_bytes;
+    dst.source_prepack_bytes += src.source_prepack_bytes;
+    dst.populated_slots += src.populated_slots;
+    dst.slot_capacity += src.slot_capacity;
+    dst.populated_payload_bytes += src.populated_payload_bytes;
+    dst.payload_capacity_bytes += src.payload_capacity_bytes;
+    dst.reset_generation_replace += src.reset_generation_replace;
+    dst.reset_generation_reject += src.reset_generation_reject;
+    dst.reset_clock += src.reset_clock;
+    dst.reset_legacy_handoff += src.reset_legacy_handoff;
+    dst.reset_host_staged_handoff += src.reset_host_staged_handoff;
     dst.decode_grouped += src.decode_grouped;
     dst.decode_legacy += src.decode_legacy;
     dst.submitted += src.submitted;
@@ -14261,7 +14569,7 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
 
     if (moe_cache_mm_debug_enabled()) {
         GGML_LOG(
-            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu\n",
+            "moe-grouped-decode: registered=%llu covered=%llu plan_calls=%llu plan_compiles=%llu plan_reuses=%llu calls=%llu ready=%llu ready_min=%llu ready_max=%llu completed=%llu completed_min=%llu completed_max=%llu admitted_banks=%llu fallback=%llu rollback=%llu host_calls=%llu host_ops=%llu host_split_ops=%llu strategy_switches=%llu required_unsupported=%llu prepare_error=%llu finish_error=%llu h2d_banks=%llu h2d_bytes=%llu vacant_fills=%llu replacement_fills=%llu invalidation_refills=%llu populated_slots=%llu slot_capacity=%llu populated_payload_bytes=%llu payload_capacity_bytes=%llu source_direct_registered_bytes=%llu source_pageable_staged_bytes=%llu source_mapped_bytes=%llu source_device_bytes=%llu source_prepack_bytes=%llu reset_generation_replace=%llu reset_generation_reject=%llu reset_clock=%llu reset_legacy_handoff=%llu reset_host_staged_handoff=%llu\n",
             (unsigned long long) grouped.registered,
             (unsigned long long) grouped.covered,
             (unsigned long long) grouped.plan_calls,
@@ -14285,7 +14593,24 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             (unsigned long long) grouped.prepare_error,
             (unsigned long long) grouped.finish_error,
             (unsigned long long) grouped.h2d_banks,
-            (unsigned long long) grouped.h2d_bytes);
+            (unsigned long long) grouped.h2d_bytes,
+            (unsigned long long) grouped.vacant_fills,
+            (unsigned long long) grouped.replacement_fills,
+            (unsigned long long) grouped.invalidation_refills,
+            (unsigned long long) grouped.populated_slots,
+            (unsigned long long) grouped.slot_capacity,
+            (unsigned long long) grouped.populated_payload_bytes,
+            (unsigned long long) grouped.payload_capacity_bytes,
+            (unsigned long long) grouped.source_direct_registered_bytes,
+            (unsigned long long) grouped.source_pageable_staged_bytes,
+            (unsigned long long) grouped.source_mapped_bytes,
+            (unsigned long long) grouped.source_device_bytes,
+            (unsigned long long) grouped.source_prepack_bytes,
+            (unsigned long long) grouped.reset_generation_replace,
+            (unsigned long long) grouped.reset_generation_reject,
+            (unsigned long long) grouped.reset_clock,
+            (unsigned long long) grouped.reset_legacy_handoff,
+            (unsigned long long) grouped.reset_host_staged_handoff);
         const moe_cache_proc_snapshot proc = moe_cache_get_proc_delta();
         const double h2d_mib = (double) mm.h2d_copy_bytes / 1024.0 / 1024.0;
         const double h2d_enqueue_ms = (double) mm.h2d_enqueue_time_us / 1000.0;
