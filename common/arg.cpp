@@ -2869,7 +2869,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
         {"--moe-expert-cache-host-pinned-mb"}, "N",
-        "MoE expert cache: model-wide pinned host budget in MiB, including source weights and staging. 0 keeps full pinning (default).",
+        "MoE expert cache: model-wide pinned host budget in MiB, including source weights and staging. "
+        "0 tries full pinning, then automatically registers complete groups after pageable fallback (default).",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

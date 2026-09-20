@@ -60,7 +60,7 @@ struct GGML_CUDA_MOE_HOST_HIDDEN moe_host_copy_worker {
 };
 
 struct GGML_CUDA_MOE_HOST_HIDDEN moe_host_budget {
-    explicit moe_host_budget(size_t limit);
+    explicit moe_host_budget(size_t limit, bool automatic = false);
 
     ~moe_host_budget();
 
@@ -69,7 +69,8 @@ struct GGML_CUDA_MOE_HOST_HIDDEN moe_host_budget {
 
     ggml_backend_buffer_type type = {};
     std::atomic<size_t> references{1};
-    const size_t limit;
+    size_t limit;
+    const bool automatic;
     size_t source_bytes = 0;
     size_t staging_reserved = 0;
     size_t staging_bytes = 0;
@@ -108,5 +109,6 @@ GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_round_size(size_t size, size_t & rounded
 GGML_CUDA_MOE_HOST_HIDDEN moe_host_budget * moe_host_budget_for(ggml_backend_buffer_type_t buft);
 GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group);
 GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_buffer_is_read_only(ggml_backend_buffer_t buffer);
+GGML_CUDA_MOE_HOST_HIDDEN bool moe_host_buffer_auto_pin(ggml_backend_buffer_t buffer);
 
 #undef GGML_CUDA_MOE_HOST_HIDDEN

@@ -5408,8 +5408,11 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         moe_grouped_device_scope device_scope(device);
         std::unordered_map<const ggml_tensor *, moe_host_source> sources;
+        std::vector<std::vector<const ggml_tensor *>> automatic_groups(candidates.groups.size());
+        size_t automatic_source_limit = 0;
         size_t reserved = 0;
-        for (const auto & group : candidates.groups) {
+        for (uint32_t group_index = 0; group_index < candidates.groups.size(); ++group_index) {
+            const auto & group = candidates.groups[group_index];
             uint32_t n_banks = 0;
             if (!moe_candidate_structural_group(group, &n_banks, nullptr, nullptr)) {
                 continue;
@@ -5418,8 +5421,11 @@ struct ggml_cuda_moe_grouped_context::impl {
             uint32_t n_experts = 0;
             for (uint32_t i = 0; i < n_banks; ++i) {
                 const auto & bank = *moe_candidate_base_slot_bank(group, i);
-                if (moe_host_budget_for(bank.buft) != nullptr ||
-                        device_alias(device, bank.buffer_base, bank.data_offset, bank.info.source_data, false, false, nullptr, nullptr, bank.info.tensor)) {
+                const bool automatic = moe_host_buffer_auto_pin(bank.info.tensor->buffer);
+                const bool registered_here = automatic && pageable_sources != nullptr && pageable_sources->automatic &&
+                    pageable_sources->sources.find(bank.info.tensor) != pageable_sources->sources.end();
+                if (moe_host_budget_for(bank.buft) != nullptr || (!registered_here &&
+                        device_alias(device, bank.buffer_base, bank.data_offset, bank.info.source_data, false, false, nullptr, nullptr, bank.info.tensor))) {
                     continue;
                 }
                 cudaPointerAttributes attributes = {};
@@ -5437,7 +5443,23 @@ struct ggml_cuda_moe_grouped_context::impl {
                 tile_bytes += bank.info.expert_stride;
                 n_experts = bank.ne[2];
                 sources.emplace(bank.info.tensor, moe_host_source{nullptr, static_cast<const char *>(bank.info.source_data),
-                    static_cast<size_t>(bank.info.byte_extent), static_cast<size_t>(bank.info.expert_stride), true});
+                    static_cast<size_t>(bank.info.byte_extent), static_cast<size_t>(bank.info.expert_stride), !automatic});
+                if (automatic) {
+                    const size_t page = moe_host_page_size();
+                    const uintptr_t begin = reinterpret_cast<uintptr_t>(bank.info.source_data);
+                    if (page == 0 || bank.info.byte_extent > UINTPTR_MAX - begin ||
+                            begin + bank.info.byte_extent > UINTPTR_MAX - (page - 1)) {
+                        throw std::bad_alloc();
+                    }
+                    const uintptr_t aligned_begin = begin - begin % page;
+                    const uintptr_t aligned_end = (begin + bank.info.byte_extent + page - 1) / page * page;
+                    const size_t registration_bytes = aligned_end - aligned_begin;
+                    if (registration_bytes > SIZE_MAX - automatic_source_limit) {
+                        throw std::bad_alloc();
+                    }
+                    automatic_source_limit += registration_bytes;
+                    automatic_groups[group_index].push_back(bank.info.tensor);
+                }
             }
             if (tile_bytes == 0) {
                 continue;
@@ -5452,17 +5474,79 @@ struct ggml_cuda_moe_grouped_context::impl {
         if (sources.empty()) {
             return nullptr;
         }
-        auto result = std::shared_ptr<moe_host_budget>(new moe_host_budget(reserved + MOE_PAGEABLE_STAGING_HEADROOM),
+        if (reserved > SIZE_MAX - MOE_PAGEABLE_STAGING_HEADROOM) {
+            throw std::bad_alloc();
+        }
+        const size_t staging_limit = reserved + MOE_PAGEABLE_STAGING_HEADROOM;
+        bool automatic = automatic_source_limit != 0;
+        if (automatic && pageable_sources != nullptr && pageable_sources->automatic) {
+            bool reusable = sources.size() == pageable_sources->sources.size();
+            for (const auto & entry : sources) {
+                const auto found = pageable_sources->sources.find(entry.first);
+                reusable = reusable && found != pageable_sources->sources.end() &&
+                    found->second.data == entry.second.data && found->second.size == entry.second.size &&
+                    found->second.expert_stride == entry.second.expert_stride;
+            }
+            if (reusable) {
+                std::lock_guard<std::mutex> lock(pageable_sources->mutex);
+                if (pageable_sources->source_bytes > SIZE_MAX - staging_limit) {
+                    throw std::bad_alloc();
+                }
+                pageable_sources->limit = std::max(pageable_sources->limit, pageable_sources->source_bytes + staging_limit);
+                pageable_sources->staging_reserved = std::max(pageable_sources->staging_reserved, reserved);
+                GGML_LOG_INFO("moe-cache-host: device=%d reusing automatic registrations source=%zu staging_reserved=%zu limit=%zu\n",
+                    device, pageable_sources->source_bytes, pageable_sources->staging_reserved, pageable_sources->limit);
+                return pageable_sources;
+            }
+            GGML_LOG_WARN("moe-cache-host: automatic source set changed while registrations are active; using staged sources for this generation\n");
+            automatic = false;
+        }
+        void * staging_guard_data = nullptr;
+        if (automatic) {
+            const cudaError_t error = cudaMallocHost(&staging_guard_data, staging_limit);
+            if (error != cudaSuccess) {
+                GGML_LOG_WARN("moe-cache-host: automatic source registration disabled: cannot reserve %zu bytes of pinned staging: %s\n",
+                    staging_limit, cudaGetErrorString(error));
+                (void) cudaGetLastError();
+                automatic = false;
+            }
+        }
+        std::unique_ptr<void, decltype(&cudaFreeHost)> staging_guard(staging_guard_data, cudaFreeHost);
+        if (automatic && automatic_source_limit > SIZE_MAX - staging_limit) {
+            throw std::bad_alloc();
+        }
+        const size_t limit = staging_limit + (automatic ? automatic_source_limit : 0);
+        auto result = std::shared_ptr<moe_host_budget>(new moe_host_budget(limit, automatic),
             [](moe_host_budget * budget) { budget->release(); });
         result->staging_reserved = reserved;
         result->sources = std::move(sources);
         for (auto & entry : result->sources) {
             entry.second.owner = result.get();
         }
+        size_t automatic_direct_groups = 0;
+        size_t automatic_total_groups = 0;
+        if (automatic) {
+            for (uint32_t group_index = 0; group_index < automatic_groups.size(); ++group_index) {
+                if (automatic_groups[group_index].empty()) {
+                    continue;
+                }
+                std::vector<moe_host_source *> group_sources;
+                group_sources.reserve(automatic_groups[group_index].size());
+                for (const auto * tensor : automatic_groups[group_index]) {
+                    const auto found = result->sources.find(tensor);
+                    if (found != result->sources.end()) {
+                        group_sources.push_back(&found->second);
+                    }
+                }
+                ++automatic_total_groups;
+                automatic_direct_groups += moe_host_register(*result, group_sources, false, group_index);
+            }
+        }
+        staging_guard.reset();
         result->configured = true;
         result->copy_worker.start();
-        GGML_LOG_INFO("moe-cache-host: device=%d pageable_sources=%zu staging_reserved=%zu limit=%zu\n",
-            device, result->sources.size(), reserved, result->limit);
+        GGML_LOG_INFO("moe-cache-host: device=%d pageable_sources=%zu staging_reserved=%zu limit=%zu auto_direct_groups=%zu auto_total_groups=%zu\n",
+            device, result->sources.size(), reserved, result->limit, automatic_direct_groups, automatic_total_groups);
         return result;
 #endif
     }

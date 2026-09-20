@@ -644,7 +644,9 @@ void check_active_grouped_contract(
         bool auxiliary_first = false,
         bool expect_compact_mmvq = false);
 
-void test_grouped_graph_replay_lifecycle(int device, size_t host_budget = 0, size_t expected_host_nodes = 0, uint32_t n_dim = 256, bool pageable = false);
+void test_grouped_graph_replay_lifecycle(
+        int device, size_t host_budget = 0, size_t expected_host_nodes = 0, uint32_t n_dim = 256,
+        bool pageable = false, bool automatic = false);
 
 std::vector<float> run_active_grouped_dispatch(
         ggml_backend_t backend,

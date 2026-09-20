@@ -1075,6 +1075,7 @@ void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t bu
 bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);
 ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
+void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail);
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 bool ggml_backend_cuda_moe_get_debug_mm(void);
 void ggml_backend_cuda_moe_log_and_reset_stats(void);

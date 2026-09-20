@@ -104,7 +104,7 @@ void moe_host_copy_worker::stop() {
     }
 }
 
-moe_host_budget::moe_host_budget(size_t limit) : limit(limit) {}
+moe_host_budget::moe_host_budget(size_t limit, bool automatic) : limit(limit), automatic(automatic) {}
 
 moe_host_budget::~moe_host_budget() {
     copy_worker.stop();
@@ -249,6 +249,8 @@ moe_host_allocation::~moe_host_allocation() {
 
 namespace {
 
+static std::atomic<bool> g_fail_full_pinning_for_test{false};
+
 // ---------------------------------------------------------------------------
 // ggml buffer type: CUDA_MoE_Cached
 //
@@ -269,13 +271,19 @@ struct moe_host_buffer {
     moe_host_budget * owner;
     ggml_backend_buffer_t backing;
     bool read_only;
+    bool auto_pin;
 };
 
 static void moe_host_buffer_free(ggml_backend_buffer_t buffer) {
     auto * context = static_cast<moe_host_buffer *>(buffer->context);
     auto * owner = context->owner;
+    auto * backing = context->backing;
     delete context;
-    owner->release();
+    if (owner != nullptr) {
+        owner->release();
+    } else {
+        ggml_backend_buffer_free(backing);
+    }
 }
 
 static void * moe_host_buffer_base(ggml_backend_buffer_t buffer) {
@@ -286,24 +294,29 @@ static void moe_host_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_buffer_clear(static_cast<moe_host_buffer *>(buffer->context)->backing, value);
 }
 
-static ggml_backend_buffer_t moe_host_buffer_wrap(ggml_backend_buffer_type_t buft, ggml_backend_buffer_t backing, bool read_only) {
+static ggml_backend_buffer_t moe_host_buffer_wrap(
+        ggml_backend_buffer_type_t buft, ggml_backend_buffer_t backing, bool read_only, bool auto_pin = false) {
     if (backing == nullptr) {
         return nullptr;
     }
     auto * owner = moe_host_budget_for(buft);
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> storage(backing, ggml_backend_buffer_free);
-    std::unique_ptr<moe_host_buffer> context(new moe_host_buffer{owner, backing, read_only});
+    std::unique_ptr<moe_host_buffer> context(new moe_host_buffer{owner, backing, read_only, auto_pin});
     auto iface = backing->iface;
     iface.free_buffer = moe_host_buffer_free;
     iface.get_base = moe_host_buffer_base;
     iface.clear = moe_host_buffer_clear;
-    owner->retain();
+    if (owner != nullptr) {
+        owner->retain();
+    }
     ggml_backend_buffer_t result = nullptr;
     try {
         result = ggml_backend_buffer_init(buft, iface, context.get(), backing->size);
         if (result != nullptr) {
-            std::lock_guard<std::mutex> lock(owner->mutex);
-            owner->backing.push_back(backing);
+            if (owner != nullptr) {
+                std::lock_guard<std::mutex> lock(owner->mutex);
+                owner->backing.push_back(backing);
+            }
             storage.release();
             context.release();
             return result;
@@ -314,7 +327,9 @@ static ggml_backend_buffer_t moe_host_buffer_wrap(ggml_backend_buffer_type_t buf
             ggml_backend_buffer_free(result);
         }
     }
-    owner->release();
+    if (owner != nullptr) {
+        owner->release();
+    }
     return nullptr;
 }
 
@@ -326,11 +341,14 @@ static void * ggml_cuda_moe_cached_pinned_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
+    if (g_fail_full_pinning_for_test.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
     void * ptr = nullptr;
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s; using pageable cached fallback\n",
+        GGML_LOG_WARN("%s: failed to allocate %.2f MiB of pinned memory: %s; using pageable fallback with automatic group registration\n",
                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return nullptr;
     }
@@ -347,11 +365,22 @@ static ggml_backend_buffer_t ggml_backend_cuda_moe_cached_buffer_type_alloc_buff
     void * ptr = ggml_cuda_moe_cached_pinned_malloc(size);
 
     if (ptr == nullptr) {
-        // Keep CUDA cache dispatch and the CPU backing's deallocator.
         ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
-        if (buffer != nullptr) {
-            buffer->buft = buft;
+        if (buffer == nullptr) {
+            return nullptr;
         }
+        if (getenv("GGML_CUDA_NO_PINNED") == nullptr) {
+            auto * wrapped = moe_host_buffer_wrap(buft, buffer, false, true);
+            if (wrapped != nullptr) {
+                return wrapped;
+            }
+            buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+            if (buffer == nullptr) {
+                return nullptr;
+            }
+        }
+        // Keep CUDA cache dispatch and the CPU backing's deallocator.
+        buffer->buft = buft;
         return buffer;
     }
 
@@ -381,6 +410,16 @@ static bool ggml_backend_cuda_moe_cached_buffer_type_is_host(ggml_backend_buffer
 
 bool moe_host_buffer_is_read_only(ggml_backend_buffer_t buffer) {
     return static_cast<const moe_host_buffer *>(buffer->context)->read_only;
+}
+
+bool moe_host_buffer_auto_pin(ggml_backend_buffer_t buffer) {
+    return buffer != nullptr && buffer->iface.free_buffer == moe_host_buffer_free &&
+        static_cast<const moe_host_buffer *>(buffer->context)->auto_pin;
+}
+
+extern "C"
+void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail) {
+    g_fail_full_pinning_for_test.store(fail, std::memory_order_relaxed);
 }
 
 extern "C"

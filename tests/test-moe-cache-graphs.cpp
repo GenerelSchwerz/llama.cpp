@@ -32,16 +32,19 @@ static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * t
     return bytes;
 }
 
-void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim, bool pageable) {
+void test_grouped_graph_replay_lifecycle(
+        int device, size_t host_budget, size_t expected_host_nodes, uint32_t n_dim, bool pageable, bool automatic) {
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     ggml_backend_ptr backend(ggml_backend_cuda_init(device));
     CHECK(backend != nullptr);
     auto buft = pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
     CHECK(buft != nullptr);
+    ggml_cuda_moe_cache_fail_full_pinning_for_test(automatic);
     auto graph = build_active_grouped_dispatch_graph(
         backend.get(), buft, GGML_TYPE_Q4_0,
         GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, pageable, 1, 8, 2, n_dim);
+    ggml_cuda_moe_cache_fail_full_pinning_for_test(false);
     ggml_backend_cuda_moe_cached_free_buffer_type(buft);
     initialize_active_grouped_dispatch_graph(graph, 177);
     if (host_budget != 0) {
@@ -365,7 +368,8 @@ void test_grouped_graph_replay_lifecycle(int device, size_t host_budget, size_t 
     CUDA_OK(cudaStreamDestroy(previous_stream));
     CUDA_OK(cudaStreamDestroy(stream));
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
-    fprintf(stderr, "test-moe-cache: grouped graph replay lifecycle host_budget=%zu host_nodes=%zu OK\n", host_budget, host_nodes);
+    fprintf(stderr, "test-moe-cache: grouped graph replay lifecycle host_budget=%zu host_nodes=%zu automatic=%d OK\n",
+        host_budget, host_nodes, automatic);
 }
 
 void test_early_grouped_graphs() {
