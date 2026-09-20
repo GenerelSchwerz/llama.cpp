@@ -1772,9 +1772,9 @@ void llama_context::place_moe_regions(llm_graph_result * res) {
             continue;
         }
         const bool placed = region.place(sched.get(), owner);
-        LLAMA_LOG_DEBUG("moe-placement: layer=%d semantic_group=%u domain=%u owner=%s placed=%d operations=%zu\n",
-                        region.layer, region.semantic_group, region.domain, ggml_backend_name(owner), placed,
-                        region.operations.size());
+        LLAMA_LOG_INFO("moe-placement: layer=%d semantic_group=%u domain=%u owner=%s placed=%d operations=%zu\n",
+                       region.layer, region.semantic_group, region.domain, ggml_backend_name(owner), placed,
+                       region.operations.size());
     }
 }
 

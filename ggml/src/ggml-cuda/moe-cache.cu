@@ -12377,7 +12377,7 @@ static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
     c->stream_mem_ops_supported = probe_ok;
     if (!probe_ok) {
         (void) cudaGetLastError();
-        GGML_LOG_DEBUG("moe-cache: stream memory operations unavailable; using event staging\n");
+        GGML_LOG_INFO("moe-cache: stream memory operations unavailable; using event staging\n");
     }
 #endif
 
