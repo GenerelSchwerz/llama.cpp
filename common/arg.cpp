@@ -4244,8 +4244,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
     add_opt(common_arg(
         {"--spec-draft-moe-expert-cache-size"}, "N",
-        "MoE expert cache size for the draft model; 0 disables the draft cache "
-        "(default: inherit --moe-expert-cache-size)",
+        "MoE expert cache size for the draft model; 0 disables the draft cache (default: 0)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

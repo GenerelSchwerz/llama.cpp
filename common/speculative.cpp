@@ -2906,9 +2906,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;
         result.tensor_buft_overrides = params_spec.tensor_buft_overrides;
-        if (params_spec.n_moe_expert_cache_slots >= 0) {
-            result.n_moe_expert_cache_slots = params_spec.n_moe_expert_cache_slots;
-        }
+        result.n_moe_expert_cache_slots = params_spec.n_moe_expert_cache_slots;
         if (result.n_moe_expert_cache_slots == 0) {
             result.moe_expert_cache_host_pinned_size = 0;
         }
