@@ -1294,6 +1294,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.moe_expert_cache_host_pinned_size > 0) {
+        COM_INF("%s: MoE expert cache host-pinned budget = %.2f MiB (%zu bytes)\n", __func__,
+            params.moe_expert_cache_host_pinned_size / (1024.0 * 1024.0),
+            params.moe_expert_cache_host_pinned_size);
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
