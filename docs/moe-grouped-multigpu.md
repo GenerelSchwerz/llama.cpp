@@ -54,11 +54,13 @@ Production-like named fixtures also verify route-ID publication across mixed bou
 
 Tiny synthetic GGUF loader fixtures cover target-only and target+MTP contexts with both mixed directions, all-ordinary, all-cache, and full-slot placement. They compare target and MTP logits with the all-ordinary control. These are integration/correctness checks, not throughput measurements.
 
-## Step 4 local qualification (2026-09-21)
+## Step 4 qualification (2026-09-21)
 
 The RTX 5070 Ti local run passed the complete focused MoE CTest set, including placement, strict joint measurement, cache selector, full cache suite, and grouped layer fixture. The registered physical multi-GPU test skipped because the host exposes one CUDA device. Focused graph-disabled, fusion-disabled, registry-lifetime, grouped-decode, and cached-fusion runs also passed; logs are retained under `build-telemetry/step4-evidence` in the local worktree.
 
-The remote asymmetric no-P2P host was offline during this qualification. Physical two-owner mixed placement and a remote real-model target/MTP run therefore remain explicit gates; this local result does not inherit older physical evidence for the newly expanded cases. Step 5 performance experiments have not begun.
+The physical fixture then passed on the remote RTX 4070 plus RTX 3060 host with peer access unavailable in both directions. Mixed cached/ordinary placement ran in both directions, boundary copies matched exactly through host fallback, and the eligible owner completed eight grouped dispatches with no legacy/fallback/error activity. The retained remote log is `build-p3/step4-evidence/multigpu-01.log`.
+
+A remote Ornith 1.5 35B MTP1 run then placed target layer 0 in an eight-slot residual cache, kept the remaining 40 target layers and MTP context ordinary, and offloaded all 42 model layers across both GPUs. The coherent 128-token completion accepted 42 of 84 drafts. The target cache completed 85 grouped decodes with zero legacy dispatches, fallbacks, prepare/finish errors, or route-ID synchronizations; teardown was clean. Artifacts are retained under `build-p3/step4-evidence/real-target-cache-mtp-ordinary`. Throughput from this shared-machine correctness run is not a performance result. Step 5 performance experiments have not begun.
 
 ## Local validation (2026-09-15)
 

@@ -1,6 +1,6 @@
 # Priority 2: a measured, owner-local MoE placement frontier
 
-Status: Steps 1-3 are implemented. Step 4 is locally qualified as described below; its physical two-GPU gate remains deferred because the remote host was unavailable on 2026-09-21. Step 5 has not begun, so this branch makes no new placement-performance claim. Prepared on 2026-09-20 for `moe-cache-multi-gpu`. Initial inspection used `edb542798b6577451722281fb0288f944f47a1e1`; during the task HEAD advanced to `d50dcda11a0db15635f825172b4591a6408e4a70`. The complete intervening diff was reviewed: six lines in `common/common.cpp` log the positive host-pin budget at info level, with no placement/accounting change. The recorded Qwen measurements remain specifically `edb542798`.
+Status: Steps 1-3 are implemented. Step 4 is qualified locally and on the remote physical two-GPU no-P2P host as described below. Step 5 has not begun, so this branch makes no new placement-performance claim. Prepared on 2026-09-20 for `moe-cache-multi-gpu`. Initial inspection used `edb542798b6577451722281fb0288f944f47a1e1`; during the task HEAD advanced to `d50dcda11a0db15635f825172b4591a6408e4a70`. The complete intervening diff was reviewed: six lines in `common/common.cpp` log the positive host-pin budget at info level, with no placement/accounting change. The recorded Qwen measurements remain specifically `edb542798`.
 
 Review revision: the implementation contracts, first experiment manifest, and callback protocol below refine this guide without replacing its source-pinned analysis or acceptance criteria. They permit local, reversible engineering choices and bounded exploration. This revision performs no implementation or model tests.
 
@@ -345,7 +345,11 @@ This work exposed a legacy route-publication defect rather than a grouped-refill
 
 On the local RTX 5070 Ti, the complete focused MoE CTest set passed. The physical multi-GPU test returned its registered skip because only one CUDA device was present. Graph-enabled, graph-disabled, fusion-disabled, registry-lifetime, grouped-decode, and cached-fusion focused runs passed. Named production-like mixed and all-cache fixtures recorded zero route-ID synchronizations with fusion enabled; fusion-disabled controls used the expected copy path. The target/MTP fixtures proved placement and numerical equivalence but did not add a separate target/MTP synchronization counter assertion. Fault injection does not yet create an actual in-flight producer whose consumer aborts; the guarded recovery remains covered by code review rather than a dedicated fault fixture.
 
-These results qualify the local persistent/residual integration boundary. They do not substitute for the deferred physical no-P2P two-GPU fixture, a real-model target/MTP run on that host, or Step 5's matched placement frontier.
+The physical fixture also passed on the remote RTX 4070 plus RTX 3060 host with peer access unavailable in both directions. It exercised mixed cached/ordinary placement in both directions, exact host-fallback boundary copies, eight grouped dispatches on the eligible owner, and zero legacy/fallback/error activity. The retained log is `build-p3/step4-evidence/multigpu-01.log` in the remote worktree.
+
+A remote Ornith 1.5 35B MTP1 run then exercised a cached target layer beside 40 ordinary target layers and an ordinary MTP context. All 42 model layers were GPU-offloaded across both physical owners. The request produced a coherent 128-token completion; MTP accepted 42 of 84 drafts. The cached target layer completed 85 grouped decodes with zero legacy dispatches, fallbacks, prepare/finish errors, or route-ID synchronizations. The runner reported clean process, port, and GPU teardown. Artifacts are retained under `build-p3/step4-evidence/real-target-cache-mtp-ordinary` in the remote worktree. The observed throughput is not a performance claim because a standing audio workload shared the machine.
+
+These results qualify the persistent/residual integration boundary on the tested CUDA systems. They do not substitute for Step 5's matched placement frontier.
 
 ### D2. First experiment manifest: ten adaptive configurations
 
