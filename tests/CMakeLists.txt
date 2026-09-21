@@ -217,6 +217,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-speculative-limits
     )
 
+    llama_test(
+        test-llama-archs
+        NAME test-moe-joint-measurement
+        ARGS --test-moe-joint-measurement
+    )
+    set_tests_properties(test-moe-joint-measurement PROPERTIES LABELS "main;moe-cache")
+    target_link_libraries(test-llama-archs PRIVATE vendor::hash)
+
     if (GGML_CUDA)
         llama_test(
             test-llama-archs
@@ -234,7 +242,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-moe-placement PROPERTIES
             LABELS "main;moe-cache"
             SKIP_RETURN_CODE 77)
-        target_link_libraries(test-llama-archs PRIVATE vendor::hash)
     endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

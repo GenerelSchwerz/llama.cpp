@@ -21,10 +21,10 @@
 #include "../src/llama-model-saver.h"
 #include "../src/llama-model.h"
 
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -33,8 +33,8 @@
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
@@ -83,7 +83,7 @@ static void usage(char ** argv) {
     printf(
         "Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] "
         "[--test-live-context-workspace] [--test-speculative-limits] [--test-moe-cache-selector] "
-        "[--test-moe-placement]\n",
+        "[--test-moe-placement] [--test-moe-joint-measurement]\n",
         argv[0]);
 }
 
@@ -2727,6 +2727,353 @@ static int test_moe_placement_report(const size_t seed) {
     return ok ? 0 : 1;
 }
 
+struct joint_probe_sampler_counters {
+    int clones      = 0;
+    int clone_frees = 0;
+};
+
+struct joint_probe_sampler_state {
+    joint_probe_sampler_counters * counters            = nullptr;
+    bool                           backend_initialized = false;
+    bool                           clone               = false;
+};
+
+static const char * joint_probe_sampler_name(const llama_sampler *) {
+    return "joint-probe-ownership";
+}
+
+static void joint_probe_sampler_apply(llama_sampler *, llama_token_data_array *) {}
+
+static llama_sampler * joint_probe_sampler_clone(const llama_sampler * sampler) {
+    const auto * source = static_cast<const joint_probe_sampler_state *>(sampler->ctx);
+    auto *       clone  = new joint_probe_sampler_state{ source->counters, false, true };
+    ++clone->counters->clones;
+    return llama_sampler_init(sampler->iface, clone);
+}
+
+static void joint_probe_sampler_free(llama_sampler * sampler) {
+    auto * state = static_cast<joint_probe_sampler_state *>(sampler->ctx);
+    if (state->clone) {
+        ++state->counters->clone_frees;
+    }
+    delete state;
+}
+
+static bool joint_probe_sampler_backend_init(llama_sampler * sampler, ggml_backend_buffer_type_t, uint32_t) {
+    static_cast<joint_probe_sampler_state *>(sampler->ctx)->backend_initialized = true;
+    return true;
+}
+
+static void joint_probe_sampler_backend_apply(llama_sampler *, ggml_context *, ggml_cgraph *, llama_sampler_data *) {}
+
+static llama_sampler_i joint_probe_sampler_i = {
+    /* .name              = */ joint_probe_sampler_name,
+    /* .accept            = */ nullptr,
+    /* .apply             = */ joint_probe_sampler_apply,
+    /* .reset             = */ nullptr,
+    /* .clone             = */ joint_probe_sampler_clone,
+    /* .free              = */ joint_probe_sampler_free,
+    /* .backend_init      = */ joint_probe_sampler_backend_init,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ joint_probe_sampler_backend_apply,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
+};
+
+static int test_moe_joint_measurement(const size_t seed) {
+    bool       ok    = true;
+    const auto check = [&](bool condition, const char * message) {
+        if (!condition) {
+            fprintf(stderr, "test-moe-joint-measurement: %s\n", message);
+            ok = false;
+        }
+    };
+
+    const auto nonce        = std::to_string(seed) + "-" + std::to_string(reinterpret_cast<uintptr_t>(&ok));
+    const auto temp         = std::filesystem::temp_directory_path();
+    const auto target_path  = temp / ("llama-joint-target-" + nonce + ".gguf");
+    const auto mtp_path     = temp / ("llama-joint-mtp-" + nonce + ".gguf");
+    const auto partial_path = temp / ("llama-joint-partial-" + nonce + ".gguf");
+
+    ggml_backend_dev_t cpu_devices[] = { nullptr };
+    auto               load_params   = llama_model_default_params();
+    load_params.devices              = cpu_devices;
+    load_params.progress_callback    = silent_model_load_progress;
+
+    auto            target_metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true);
+    size_t          target_seed     = seed;
+    llama_model_ptr target(
+        llama_model_init_from_user(target_metadata.get(), set_tensor_data, &target_seed, load_params));
+    auto mtp_metadata        = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true);
+    auto mtp_params          = load_params;
+    mtp_params.load_mtp      = true;
+    size_t          mtp_seed = seed;
+    llama_model_ptr mtp(llama_model_init_from_user(mtp_metadata.get(), set_tensor_data, &mtp_seed, mtp_params));
+    check(target != nullptr && mtp != nullptr, "failed to build source fixtures");
+
+    const auto save_fixture = [&](const std::filesystem::path & path, gguf_context * metadata, llama_model * model,
+                                  bool partial) {
+        if (model == nullptr) {
+            return;
+        }
+        llama_model_saver saver(LLM_ARCH_QWEN35MOE, nullptr);
+        gguf_set_kv(saver.gguf_ctx, metadata);
+        if (partial) {
+            saver.add_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, true);
+        }
+        for (const auto & [name, tensor] : model->tensors_by_name) {
+            if (partial && (name == "token_embd.weight" || name == "output.weight" || name == "output_norm.weight")) {
+                continue;
+            }
+            saver.add_tensor(tensor);
+        }
+        saver.save(path.string());
+    };
+    save_fixture(target_path, target_metadata.get(), target.get(), false);
+    save_fixture(mtp_path, mtp_metadata.get(), mtp.get(), false);
+    save_fixture(partial_path, mtp_metadata.get(), mtp.get(), true);
+
+    const auto make_component = [&](const std::filesystem::path & path, bool load_mtp) {
+        common_joint_component_request component;
+        component.path_model        = path.string();
+        component.mparams           = llama_model_default_params();
+        component.mparams.devices   = cpu_devices;
+        component.mparams.load_mtp  = load_mtp;
+        component.cparams           = llama_context_default_params();
+        component.cparams.n_ctx     = 32;
+        component.cparams.n_batch   = 32;
+        component.cparams.n_ubatch  = 16;
+        component.cparams.n_seq_max = 1;
+        return component;
+    };
+    const auto make_request = [&](const std::filesystem::path & path, bool load_mtp) {
+        common_joint_measurement_request request;
+        request.target              = make_component(path, load_mtp);
+        request.host_capacity_bytes = size_t(8) * 1024 * 1024 * 1024;
+        request.host_margin_bytes   = 64 * 1024 * 1024;
+        return request;
+    };
+    const auto find_component = [](const common_joint_measurement & measurement, common_joint_role role) {
+        return std::find_if(measurement.components.begin(), measurement.components.end(),
+                            [role](const auto & component) { return component.role == role; });
+    };
+
+    joint_probe_sampler_counters sampler_counters;
+    auto *            original_sampler_state = new joint_probe_sampler_state{ &sampler_counters, false, false };
+    llama_sampler_ptr sampler_chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(sampler_chain.get(), llama_sampler_init(&joint_probe_sampler_i, original_sampler_state));
+    llama_sampler_seq_config sampler_config = { 0, sampler_chain.get() };
+
+    auto target_only_request                            = make_request(target_path, false);
+    target_only_request.target.sampler_configuration_id = "joint-probe-ownership-v1";
+    target_only_request.target.cparams.samplers         = &sampler_config;
+    target_only_request.target.cparams.n_samplers       = 1;
+    std::vector<float> target_split(llama_max_devices(), 0.0f);
+    target_split[0]                                 = 1.0f;
+    target_only_request.target.mparams.tensor_split = target_split.data();
+    const auto        target_devices_ptr            = target_only_request.target.mparams.devices;
+    const auto        target_split_ptr              = target_only_request.target.mparams.tensor_split;
+    const auto        target_ctx                    = target_only_request.target.cparams.n_ctx;
+    ggml_log_callback logger_before                 = nullptr;
+    void *            logger_data_before            = nullptr;
+    llama_log_get(&logger_before, &logger_data_before);
+    const auto        target_only_a     = common_measure_joint_configuration(target_only_request);
+    const auto        target_only_b     = common_measure_joint_configuration(target_only_request);
+    ggml_log_callback logger_after      = nullptr;
+    void *            logger_data_after = nullptr;
+    llama_log_get(&logger_after, &logger_data_after);
+    check(target_only_a.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+              target_only_a.capacity == COMMON_JOINT_CAPACITY_WITHIN_LIMITS && target_only_a.admission_qualified,
+          "target-only measurement did not qualify");
+    check(!target_only_a.configuration_id.empty() && target_only_a.configuration_id == target_only_b.configuration_id &&
+              target_only_a.configuration_record == target_only_b.configuration_record,
+          "repeated target probes were not deterministic");
+    check(target_only_request.target.mparams.devices == target_devices_ptr &&
+              target_only_request.target.mparams.tensor_split == target_split_ptr && target_split[0] == 1.0f &&
+              target_only_request.target.mparams.devices[0] == nullptr &&
+              target_only_request.target.cparams.n_ctx == target_ctx,
+          "joint measurement mutated borrowed input parameters");
+    check(!original_sampler_state->backend_initialized && sampler_counters.clones == 2 &&
+              sampler_counters.clone_frees == sampler_counters.clones,
+          "joint measurement mutated the caller sampler or leaked a successful-probe clone");
+    auto       no_sampler_request = make_request(target_path, false);
+    const auto no_sampler         = common_measure_joint_configuration(no_sampler_request);
+    check(no_sampler.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+              no_sampler.configuration_id != target_only_a.configuration_id,
+          "sampler presence was omitted from configuration identity");
+    auto unidentified_sampler_request = target_only_request;
+    unidentified_sampler_request.target.sampler_configuration_id.clear();
+    const auto unidentified_sampler = common_measure_joint_configuration(unidentified_sampler_request);
+    check(unidentified_sampler.completeness == COMMON_JOINT_COMPLETENESS_INCOMPLETE &&
+              !unidentified_sampler.admission_qualified && unidentified_sampler.configuration_id.empty() &&
+              !original_sampler_state->backend_initialized && sampler_counters.clone_frees == sampler_counters.clones,
+          "sampler-backed measurement without semantic identity was treated as resolved");
+    auto changed_sampler_request                            = target_only_request;
+    changed_sampler_request.target.sampler_configuration_id = "joint-probe-ownership-v2";
+    check(
+        common_measure_joint_configuration(changed_sampler_request).configuration_id != target_only_a.configuration_id,
+        "sampler semantic identity was omitted from configuration identity");
+    check(logger_before == logger_after && logger_data_before == logger_data_after,
+          "joint measurement did not restore the global logger");
+    try {
+        const auto round_trip = common_json::parse(common_joint_measurement_json(target_only_a));
+        check(round_trip.at("configuration_id").get<std::string>() == target_only_a.configuration_id &&
+                  round_trip.at("admission_qualified").get<bool>(),
+              "joint JSON did not round-trip");
+    } catch (const std::exception &) {
+        check(false, "joint JSON was not parseable");
+    }
+    const auto host_owner = std::find_if(target_only_a.owners.begin(), target_only_a.owners.end(),
+                                         [](const auto & owner) { return owner.host; });
+    check(host_owner != target_only_a.owners.end(), "target-only measurement omitted the host owner");
+    if (host_owner != target_only_a.owners.end()) {
+        auto at_upper                = target_only_request;
+        at_upper.host_capacity_bytes = host_owner->required_upper_bytes + at_upper.host_margin_bytes;
+        const auto within            = common_measure_joint_configuration(at_upper);
+        check(within.capacity == COMMON_JOINT_CAPACITY_WITHIN_LIMITS && within.admission_qualified,
+              "upper-bound capacity boundary was not admitted");
+        if (host_owner->required_lower_bytes > 0) {
+            auto below_lower                = target_only_request;
+            below_lower.host_capacity_bytes = host_owner->required_lower_bytes + below_lower.host_margin_bytes - 1;
+            const auto exceeds              = common_measure_joint_configuration(below_lower);
+            check(exceeds.capacity == COMMON_JOINT_CAPACITY_EXCEEDS_LIMITS && !exceeds.admission_qualified,
+                  "lower-bound capacity boundary was not rejected");
+        }
+        if (host_owner->required_lower_bytes < host_owner->required_upper_bytes) {
+            auto between                = target_only_request;
+            between.host_capacity_bytes = host_owner->required_lower_bytes + between.host_margin_bytes;
+            const auto ambiguous        = common_measure_joint_configuration(between);
+            check(ambiguous.capacity == COMMON_JOINT_CAPACITY_UNKNOWN && !ambiguous.admission_qualified,
+                  "lower/upper capacity interval was not reported as unknown");
+        }
+        check(within.configuration_id != target_only_a.configuration_id,
+              "explicit capacity envelope was omitted from configuration identity");
+    }
+    auto changed_context                   = target_only_request;
+    changed_context.target.cparams.n_batch = 16;
+    check(common_measure_joint_configuration(changed_context).configuration_id != target_only_a.configuration_id,
+          "context geometry was omitted from configuration identity");
+
+    auto shared_request                                 = make_request(mtp_path, true);
+    shared_request.target.cparams.phase_aware_workspace = true;
+    auto shared_mtp                                     = make_component(mtp_path, true);
+    shared_mtp.role                                     = COMMON_JOINT_ROLE_MTP;
+    shared_mtp.sharing                                  = COMMON_JOINT_SHARING_TARGET_MODEL;
+    shared_request.extras.push_back(shared_mtp);
+    const auto shared       = common_measure_joint_configuration(shared_request);
+    const auto shared_extra = find_component(shared, COMMON_JOINT_ROLE_MTP);
+    check(shared.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE && shared.admission_qualified &&
+              shared_extra != shared.components.end() && shared_extra->shared_model_bytes_deduplicated > 0,
+          "fully shared target/MTP accounting failed");
+    check(std::any_of(shared.owners.begin(), shared.owners.end(),
+                      [](const auto & owner) {
+                          return owner.bound == COMMON_JOINT_BOUND_UPPER_ESTIMATE &&
+                                 owner.required_lower_bytes < owner.required_upper_bytes;
+                      }),
+          "phase-aware shared workspace did not retain a conservative bound");
+
+    auto separate_request = make_request(target_path, false);
+    auto separate_draft   = make_component(target_path, false);
+    separate_draft.role   = COMMON_JOINT_ROLE_DRAFT;
+    separate_request.extras.push_back(separate_draft);
+    const auto separate       = common_measure_joint_configuration(separate_request);
+    const auto separate_extra = find_component(separate, COMMON_JOINT_ROLE_DRAFT);
+    check(separate.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE && separate_extra != separate.components.end() &&
+              separate_extra->shared_model_bytes_deduplicated == 0 && separate_extra->sharing_records.empty(),
+          "separate draft accounting was deduplicated");
+
+    auto partial_request = make_request(target_path, false);
+    auto partial_mtp     = make_component(partial_path, true);
+    partial_mtp.role     = COMMON_JOINT_ROLE_MTP;
+    partial_mtp.sharing  = COMMON_JOINT_SHARING_BORROW_TARGET;
+    partial_request.extras.push_back(partial_mtp);
+    const auto partial       = common_measure_joint_configuration(partial_request);
+    const auto partial_extra = find_component(partial, COMMON_JOINT_ROLE_MTP);
+    const bool partial_ok = partial.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE && partial.admission_qualified &&
+                            partial_extra != partial.components.end() &&
+                            partial_extra->shared_tensor_payload_bytes > 0 && !partial_extra->sharing_records.empty() &&
+                            partial_extra->shared_model_bytes_deduplicated == 0 &&
+                            std::all_of(partial_extra->sharing_records.begin(), partial_extra->sharing_records.end(),
+                                        [](const auto & record) { return !record.owner_canonical_id.empty(); });
+    check(partial_ok, "resolvable partial sharing did not produce a precise owned ledger");
+    check(partial.configuration_id != separate.configuration_id,
+          "sharing relationship was omitted from joint configuration identity");
+
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu != nullptr) {
+        ggml_backend_dev_t gpu_devices[] = { gpu, nullptr };
+        auto               gpu_component = [&](const std::filesystem::path & path, bool load_mtp) {
+            auto component                 = make_component(path, load_mtp);
+            component.mparams.devices      = gpu_devices;
+            component.mparams.n_gpu_layers = 99;
+            return component;
+        };
+        auto gpu_partial_request                    = make_request(target_path, false);
+        gpu_partial_request.target                  = gpu_component(target_path, false);
+        gpu_partial_request.observe_device_capacity = true;
+        auto gpu_partial_mtp                        = gpu_component(partial_path, true);
+        gpu_partial_mtp.role                        = COMMON_JOINT_ROLE_MTP;
+        gpu_partial_mtp.sharing                     = COMMON_JOINT_SHARING_BORROW_TARGET;
+        gpu_partial_request.extras.push_back(gpu_partial_mtp);
+        const auto gpu_partial       = common_measure_joint_configuration(gpu_partial_request);
+        const auto gpu_partial_extra = find_component(gpu_partial, COMMON_JOINT_ROLE_MTP);
+
+        auto gpu_full_request   = make_request(target_path, false);
+        gpu_full_request.target = gpu_component(target_path, false);
+        auto gpu_full_mtp       = gpu_component(mtp_path, true);
+        gpu_full_mtp.role       = COMMON_JOINT_ROLE_MTP;
+        gpu_full_request.extras.push_back(gpu_full_mtp);
+        const auto gpu_full       = common_measure_joint_configuration(gpu_full_request);
+        const auto gpu_full_extra = find_component(gpu_full, COMMON_JOINT_ROLE_MTP);
+        const auto model_bytes    = [](const common_joint_component_measurement & component) {
+            size_t result = 0;
+            for (const auto & owner : component.owners) {
+                result += owner.memory.model;
+            }
+            return result;
+        };
+        const bool gpu_partial_ok =
+            gpu_partial.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+            gpu_partial_extra != gpu_partial.components.end() && gpu_full_extra != gpu_full.components.end() &&
+            gpu_partial_extra->shared_tensor_payload_bytes > 0 && model_bytes(*gpu_partial_extra) > 0 &&
+            model_bytes(*gpu_partial_extra) < model_bytes(*gpu_full_extra);
+        check(gpu_partial_ok, "resolved partial sharing did not retain unique head bytes and exclude borrowed storage");
+    }
+
+    auto required_failure_request                            = make_request(target_path, false);
+    required_failure_request.target.sampler_configuration_id = "joint-probe-ownership-v1";
+    required_failure_request.target.cparams.samplers         = &sampler_config;
+    required_failure_request.target.cparams.n_samplers       = 1;
+    auto missing = make_component(temp / ("missing-joint-" + nonce + ".gguf"), false);
+    missing.role = COMMON_JOINT_ROLE_DRAFT;
+    required_failure_request.extras.push_back(missing);
+    const auto required_failure = common_measure_joint_configuration(required_failure_request);
+    check(required_failure.completeness == COMMON_JOINT_COMPLETENESS_ERROR && !required_failure.admission_qualified &&
+              required_failure.configuration_id.empty(),
+          "failed required extra became a target-only success");
+    check(!original_sampler_state->backend_initialized && sampler_counters.clone_frees == sampler_counters.clones,
+          "failed joint measurement mutated the caller sampler or leaked a probe clone");
+    missing.required              = false;
+    auto optional_failure_request = make_request(target_path, false);
+    optional_failure_request.extras.push_back(missing);
+    const auto optional_failure = common_measure_joint_configuration(optional_failure_request);
+    check(optional_failure.completeness == COMMON_JOINT_COMPLETENESS_INCOMPLETE &&
+              !optional_failure.admission_qualified && optional_failure.components.size() == 2 &&
+              optional_failure.configuration_id.empty(),
+          "failed optional extra was hidden or relabeled");
+    llama_log_get(&logger_after, &logger_data_after);
+    check(logger_before == logger_after && logger_data_before == logger_data_after,
+          "failed joint probe did not restore the global logger");
+
+    for (const auto & path : { target_path, mtp_path, partial_path }) {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+    }
+    fprintf(stderr, "test-moe-joint-measurement: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -2994,6 +3341,7 @@ int main(int argc, char ** argv) {
     bool run_speculative_limits = false;
     bool run_moe_cache_selector = false;
     bool run_moe_placement = false;
+    bool run_moe_joint_measurement = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -3059,9 +3407,13 @@ int main(int argc, char ** argv) {
             run_moe_placement = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-moe-joint-measurement") == 0) {
+            run_moe_joint_measurement = true;
+            continue;
+        }
     }
     if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector ||
-            run_moe_placement) {
+        run_moe_placement || run_moe_joint_measurement) {
         common_log_set_verbosity_thold(verbosity);
     }
     printf("%s: using seed %zu\n", __func__, seed);
@@ -3090,6 +3442,9 @@ int main(int argc, char ** argv) {
         }
         if (run_moe_placement) {
             return test_moe_placement_report(seed);
+        }
+        if (run_moe_joint_measurement) {
+            return test_moe_joint_measurement(seed);
         }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);

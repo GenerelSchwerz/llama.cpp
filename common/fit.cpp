@@ -1,24 +1,28 @@
 #include "fit.h"
 
+#include "../src/llama-ext.h"
 #include "common.h"
+#include "hash/hash.h"
 #include "json.h"
 #include "log.h"
-
-#include "../src/llama-ext.h"
-#include "hash/hash.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <array>
 #include <cassert>
 #include <cctype>
+#include <cinttypes>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
-#include <cinttypes>
-#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 static const char * common_moe_mode_name(llama_moe_placement_mode mode) {
@@ -31,11 +35,12 @@ static const char * common_moe_mode_name(llama_moe_placement_mode mode) {
     return "unknown";
 }
 
-static common_json common_moe_configuration_record(
-        const llama_moe_placement_report & report,
-        const llama_model_params & mparams,
-        const llama_context_params & cparams,
-        const common_params * runtime_params) {
+static common_json common_moe_configuration_record(const llama_moe_placement_report & report,
+                                                   const llama_model_params &         mparams,
+                                                   const llama_context_params &       cparams,
+                                                   const common_params *              runtime_params,
+                                                   const std::string &                sampler_configuration_id,
+                                                   const char *                       role) {
     GGML_UNUSED(mparams);
     common_json model = common_json::object();
     common_json model_allocations = common_json::array();
@@ -114,6 +119,26 @@ static common_json common_moe_configuration_record(
     context["phase_aware_workspace"] = cparams.phase_aware_workspace;
     context["live_context_workspace"] = cparams.live_context_workspace;
     context["decode_boundary_overlap"] = cparams.decode_boundary_overlap;
+    common_json sampler                = common_json::object();
+    sampler["configuration_id"] =
+        cparams.n_samplers == 0 ? common_json_value(nullptr) : common_json_value(sampler_configuration_id);
+    common_json                             sampler_sequences = common_json::array();
+    std::map<const llama_sampler *, size_t> sampler_aliases;
+    for (size_t i = 0; i < cparams.n_samplers; ++i) {
+        const auto & config = cparams.samplers[i];
+        size_t       alias  = 0;
+        if (config.sampler != nullptr) {
+            auto [it, inserted] = sampler_aliases.emplace(config.sampler, sampler_aliases.size());
+            GGML_UNUSED(inserted);
+            alias = it->second + 1;
+        }
+        sampler_sequences.push_back({
+            { "sampler_alias", alias         },
+            { "seq_id",        config.seq_id }
+        });
+    }
+    sampler["sequences"] = std::move(sampler_sequences);
+    context["samplers"]  = std::move(sampler);
 
     const auto env_present = [](const char * name) { return std::getenv(name) != nullptr; };
     const auto env_int = [](const char * name, int fallback) {
@@ -200,7 +225,7 @@ static common_json common_moe_configuration_record(
     configuration["model"] = std::move(model);
     configuration["override_provenance"] = std::move(override_provenance);
     configuration["placement"] = common_json::parse(report.placement_record);
-    configuration["role"] = "target";
+    configuration["role"]                = role;
     configuration["runtime"] = std::move(runtime);
     return configuration;
 }
@@ -210,7 +235,7 @@ std::string common_moe_placement_report_json(
         const llama_model_params & mparams,
         const llama_context_params & cparams,
         const common_params * runtime_params) {
-    common_json configuration = common_moe_configuration_record(report, mparams, cparams, runtime_params);
+    common_json configuration = common_moe_configuration_record(report, mparams, cparams, runtime_params, "", "target");
     const std::string configuration_record = configuration.dump();
     const std::string configuration_id = hash_sha256_hex(configuration_record.data(), configuration_record.size());
 
@@ -406,6 +431,985 @@ std::string common_moe_placement_report_human(
         out << "    shared_tensor " << tensor.name << " bytes=" << tensor.tensor_bytes
             << " relation=" << tensor.storage_relation << " owner="
             << (tensor.resolved_storage_available ? tensor.owner_canonical_id : "unknown") << '\n';
+    }
+    return out.str();
+}
+
+static const char * common_joint_role_name(common_joint_role role) {
+    switch (role) {
+        case COMMON_JOINT_ROLE_TARGET:
+            return "target";
+        case COMMON_JOINT_ROLE_DRAFT:
+            return "draft";
+        case COMMON_JOINT_ROLE_MTP:
+            return "mtp";
+    }
+    return "unknown";
+}
+
+static const char * common_joint_sharing_name(common_joint_sharing sharing) {
+    switch (sharing) {
+        case COMMON_JOINT_SHARING_NONE:
+            return "none";
+        case COMMON_JOINT_SHARING_BORROW_TARGET:
+            return "borrow_target";
+        case COMMON_JOINT_SHARING_TARGET_MODEL:
+            return "target_model";
+    }
+    return "unknown";
+}
+
+static const char * common_joint_completeness_name(common_joint_completeness completeness) {
+    switch (completeness) {
+        case COMMON_JOINT_COMPLETENESS_COMPLETE:
+            return "complete";
+        case COMMON_JOINT_COMPLETENESS_INCOMPLETE:
+            return "incomplete";
+        case COMMON_JOINT_COMPLETENESS_ERROR:
+            return "error";
+    }
+    return "error";
+}
+
+static const char * common_joint_capacity_name(common_joint_capacity capacity) {
+    switch (capacity) {
+        case COMMON_JOINT_CAPACITY_WITHIN_LIMITS:
+            return "within_limits";
+        case COMMON_JOINT_CAPACITY_EXCEEDS_LIMITS:
+            return "exceeds_limits";
+        case COMMON_JOINT_CAPACITY_UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+static const char * common_joint_bound_name(common_joint_bound bound) {
+    switch (bound) {
+        case COMMON_JOINT_BOUND_EXACT_ESTIMATE:
+            return "exact_estimate";
+        case COMMON_JOINT_BOUND_UPPER_ESTIMATE:
+            return "upper_estimate";
+        case COMMON_JOINT_BOUND_UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+static bool checked_add_size(size_t & dst, size_t value) {
+    if (value > SIZE_MAX - dst) {
+        return false;
+    }
+    dst += value;
+    return true;
+}
+
+static bool checked_add_memory(common_joint_memory & dst, const common_joint_memory & value) {
+    dst.staging_available = dst.staging_available && value.staging_available;
+    return checked_add_size(dst.model, value.model) && checked_add_size(dst.context, value.context) &&
+           checked_add_size(dst.compute, value.compute) && checked_add_size(dst.staging, value.staging);
+}
+
+static bool memory_total(const common_joint_memory & memory, size_t & total) {
+    total = 0;
+    return checked_add_size(total, memory.model) && checked_add_size(total, memory.context) &&
+           checked_add_size(total, memory.compute) && checked_add_size(total, memory.staging);
+}
+
+struct common_owned_model_params {
+    llama_model_params                            params;
+    std::vector<ggml_backend_dev_t>               devices;
+    std::vector<float>                            tensor_split;
+    std::vector<std::string>                      override_patterns;
+    std::vector<llama_model_tensor_buft_override> overrides;
+    std::vector<llama_model_kv_override>          kv_overrides;
+    std::vector<llama_model_layer_range>          cache_ranges;
+    std::vector<size_t>                           cache_budgets;
+
+    explicit common_owned_model_params(const llama_model_params & source) : params(source) {
+        if (source.devices != nullptr) {
+            for (size_t i = 0; i < llama_max_devices() && source.devices[i] != nullptr; ++i) {
+                devices.push_back(source.devices[i]);
+            }
+            devices.push_back(nullptr);
+        }
+        if (source.tensor_split != nullptr) {
+            tensor_split.assign(source.tensor_split, source.tensor_split + llama_max_devices());
+        }
+        if (source.tensor_buft_overrides != nullptr) {
+            const size_t max_overrides = llama_max_tensor_buft_overrides();
+            for (size_t i = 0; i < max_overrides && source.tensor_buft_overrides[i].pattern != nullptr; ++i) {
+                override_patterns.emplace_back(source.tensor_buft_overrides[i].pattern);
+            }
+            overrides.reserve(override_patterns.size() + 1);
+            for (size_t i = 0; i < override_patterns.size(); ++i) {
+                overrides.push_back({ override_patterns[i].c_str(), source.tensor_buft_overrides[i].buft });
+            }
+            overrides.push_back({ nullptr, nullptr });
+        }
+        if (source.kv_overrides != nullptr) {
+            constexpr size_t max_kv_overrides = 4096;
+            size_t           i                = 0;
+            for (; i < max_kv_overrides && source.kv_overrides[i].key[0] != '\0'; ++i) {
+                kv_overrides.push_back(source.kv_overrides[i]);
+            }
+            if (i == max_kv_overrides) {
+                throw std::runtime_error("unterminated model metadata override array");
+            }
+            kv_overrides.push_back({});
+        }
+        if (source.moe_expert_cache_layer_ranges != nullptr && source.n_moe_expert_cache_layer_ranges > 0) {
+            cache_ranges.assign(source.moe_expert_cache_layer_ranges,
+                                source.moe_expert_cache_layer_ranges + source.n_moe_expert_cache_layer_ranges);
+        }
+        if (source.moe_expert_cache_byte_budgets != nullptr && source.n_moe_expert_cache_byte_budgets > 0) {
+            cache_budgets.assign(source.moe_expert_cache_byte_budgets,
+                                 source.moe_expert_cache_byte_budgets + source.n_moe_expert_cache_byte_budgets);
+        }
+        params.devices                         = devices.empty() ? nullptr : devices.data();
+        params.tensor_split                    = tensor_split.empty() ? nullptr : tensor_split.data();
+        params.tensor_buft_overrides           = overrides.empty() ? nullptr : overrides.data();
+        params.kv_overrides                    = kv_overrides.empty() ? nullptr : kv_overrides.data();
+        params.moe_expert_cache_layer_ranges   = cache_ranges.empty() ? nullptr : cache_ranges.data();
+        params.n_moe_expert_cache_layer_ranges = cache_ranges.size();
+        params.moe_expert_cache_byte_budgets   = cache_budgets.empty() ? nullptr : cache_budgets.data();
+        params.n_moe_expert_cache_byte_budgets = cache_budgets.size();
+        params.progress_callback               = nullptr;
+        params.progress_callback_user_data     = nullptr;
+        params.model_shared                    = nullptr;
+        params.no_alloc                        = true;
+    }
+};
+
+struct common_owned_context_params {
+    llama_context_params                  params;
+    std::vector<llama_sampler_ptr>        owned_samplers;
+    std::vector<llama_sampler_seq_config> samplers;
+
+    explicit common_owned_context_params(const llama_context_params & source) : params(source) {
+        if (source.samplers != nullptr && source.n_samplers != 0) {
+            owned_samplers.reserve(source.n_samplers);
+            samplers.reserve(source.n_samplers);
+            std::unordered_map<const llama_sampler *, llama_sampler *> clones;
+            for (size_t i = 0; i < source.n_samplers; ++i) {
+                const auto & source_config = source.samplers[i];
+                if (source_config.sampler == nullptr) {
+                    samplers.push_back(source_config);
+                    continue;
+                }
+                auto [it, inserted] = clones.emplace(source_config.sampler, nullptr);
+                if (inserted) {
+                    llama_sampler_ptr clone(llama_sampler_clone(source_config.sampler));
+                    if (clone == nullptr) {
+                        throw std::runtime_error("failed to clone context sampler");
+                    }
+                    it->second = clone.get();
+                    owned_samplers.push_back(std::move(clone));
+                }
+                samplers.push_back({ source_config.seq_id, it->second });
+            }
+        }
+        params.samplers            = samplers.empty() ? nullptr : samplers.data();
+        params.n_samplers          = samplers.size();
+        params.cb_eval             = nullptr;
+        params.cb_eval_user_data   = nullptr;
+        params.abort_callback      = nullptr;
+        params.abort_callback_data = nullptr;
+        params.ctx_other           = nullptr;
+    }
+};
+
+struct common_scoped_log_filter {
+    ggml_log_callback callback  = nullptr;
+    void *            user_data = nullptr;
+    ggml_log_level    min_level;
+
+    explicit common_scoped_log_filter(ggml_log_level level) : min_level(level) {
+        llama_log_get(&callback, &user_data);
+        llama_log_set(
+            [](ggml_log_level message_level, const char * text, void * opaque) {
+                const auto *         self = static_cast<const common_scoped_log_filter *>(opaque);
+                const ggml_log_level effective =
+                    message_level >= self->min_level ? message_level : GGML_LOG_LEVEL_DEBUG;
+                self->callback(effective, text, self->user_data);
+            },
+            this);
+    }
+
+    ~common_scoped_log_filter() { llama_log_set(callback, user_data); }
+};
+
+struct common_joint_probe_owner {
+    common_joint_component_owner owner;
+    ggml_backend_dev_t           device         = nullptr;
+    uint32_t                     selected_index = UINT32_MAX;
+};
+
+static bool common_joint_collect_component(llama_model *                           model,
+                                           llama_context *                         context,
+                                           const llama_moe_placement_report &      placement,
+                                           bool                                    deduct_model,
+                                           common_joint_component_measurement &    component,
+                                           std::vector<common_joint_probe_owner> & probe_owners) {
+    std::unordered_map<ggml_backend_dev_t, const llama_moe_placement_owner *> selected;
+    const int32_t                                                             n_devices = llama_model_n_devices(model);
+    if (n_devices < 0 || placement.owners.size() != static_cast<size_t>(n_devices)) {
+        component.diagnostics.push_back("resolved placement owner count does not match the model device list");
+        return false;
+    }
+    for (int32_t i = 0; i < n_devices; ++i) {
+        selected.emplace(llama_model_get_device(model, i), &placement.owners[i]);
+    }
+
+    std::map<std::string, common_joint_probe_owner> by_owner;
+    for (const auto & allocation : placement.model_allocations) {
+        if (!allocation.bytes_available) {
+            component.diagnostics.push_back("resolved model allocation size is unavailable");
+            return false;
+        }
+        common_joint_probe_owner resolved;
+        const bool               host =
+            allocation.owner_canonical_id.empty() || allocation.resolved_class.find("host") != std::string::npos;
+        if (host) {
+            resolved.owner.canonical_id  = "host";
+            resolved.owner.identity_kind = "process_host";
+            resolved.owner.backend       = "CPU";
+            resolved.owner.name          = "Host";
+            resolved.owner.host          = true;
+            resolved.device              = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        } else {
+            const auto owner = std::find_if(placement.owners.begin(), placement.owners.end(), [&](const auto & value) {
+                return value.canonical_id == allocation.owner_canonical_id;
+            });
+            if (owner == placement.owners.end()) {
+                component.diagnostics.push_back("resolved model allocation owner is absent from physical placement");
+                return false;
+            }
+            resolved.owner.canonical_id  = owner->canonical_id;
+            resolved.owner.identity_kind = owner->identity_kind;
+            resolved.owner.backend       = owner->backend;
+            resolved.owner.name          = owner->name;
+            resolved.selected_index      = owner->selected_index;
+            resolved.device              = llama_model_get_device(model, owner->selected_index);
+        }
+        auto & aggregate = by_owner[resolved.owner.canonical_id];
+        if (aggregate.owner.canonical_id.empty()) {
+            aggregate = resolved;
+        } else if (aggregate.device != resolved.device || aggregate.owner.host != resolved.owner.host) {
+            component.diagnostics.push_back("canonical model owner maps to conflicting runtime devices");
+            return false;
+        }
+        if (deduct_model) {
+            if (!checked_add_size(component.shared_model_bytes_deduplicated, allocation.bytes)) {
+                component.diagnostics.push_back("shared-model deduction overflow");
+                return false;
+            }
+        } else if (!checked_add_size(aggregate.owner.memory.model, allocation.bytes)) {
+            component.diagnostics.push_back("model allocation accounting overflow");
+            return false;
+        }
+        if (!deduct_model && host && placement.uses_mmap && !allocation.current_allocation &&
+            !checked_add_size(aggregate.owner.lower_bound_excluded_bytes, allocation.bytes)) {
+            component.diagnostics.push_back("mapped-host lower-bound accounting overflow");
+            return false;
+        }
+        aggregate.owner.provenance = allocation.provenance;
+    }
+    const llama_memory_breakdown breakdown = llama_get_memory_breakdown(context);
+    for (const auto & [buft, memory] : breakdown) {
+        common_joint_probe_owner resolved;
+        if (ggml_backend_buft_is_host(buft)) {
+            resolved.owner.canonical_id  = "host";
+            resolved.owner.identity_kind = "process_host";
+            resolved.owner.backend       = "CPU";
+            resolved.owner.name          = "Host";
+            resolved.owner.host          = true;
+            resolved.device              = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        } else {
+            ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+            const auto         found  = selected.find(device);
+            if (device == nullptr || found == selected.end()) {
+                component.diagnostics.push_back(
+                    "memory buffer owner is absent from the resolved physical device mapping");
+                return false;
+            }
+            const auto & owner           = *found->second;
+            resolved.owner.canonical_id  = owner.canonical_id;
+            resolved.owner.identity_kind = owner.identity_kind;
+            resolved.owner.backend       = owner.backend;
+            resolved.owner.name          = owner.name;
+            resolved.device              = device;
+            resolved.selected_index      = owner.selected_index;
+        }
+        auto & aggregate = by_owner[resolved.owner.canonical_id];
+        if (aggregate.owner.canonical_id.empty()) {
+            aggregate = resolved;
+        } else if (aggregate.device != resolved.device || aggregate.owner.host != resolved.owner.host) {
+            component.diagnostics.push_back("canonical owner identity maps to conflicting runtime devices");
+            return false;
+        }
+        common_joint_memory addition = { 0, memory.context, memory.compute, 0, true };
+        if (!checked_add_memory(aggregate.owner.memory, addition)) {
+            component.diagnostics.push_back("component memory accounting overflow");
+            return false;
+        }
+    }
+    size_t         staging_bytes     = 0;
+    const uint32_t staging_ctx_mask  = component.role == COMMON_JOINT_ROLE_MTP ? 2u : 1u;
+    bool           staging_available = true;
+    for (const auto & owner : placement.owners) {
+        if ((owner.active_cache_context_mask & staging_ctx_mask) == 0) {
+            continue;
+        }
+        if (!owner.mandatory_host_staging_available) {
+            staging_available = false;
+            continue;
+        }
+        const size_t required = component.role == COMMON_JOINT_ROLE_MTP ? owner.mandatory_host_staging_mtp_bytes :
+                                                                          owner.mandatory_host_staging_default_bytes;
+        if (!checked_add_size(staging_bytes, required)) {
+            component.diagnostics.push_back("component host-staging accounting overflow");
+            return false;
+        }
+    }
+    if (!staging_available) {
+        auto & host = by_owner["host"];
+        if (host.owner.canonical_id.empty()) {
+            host.owner.canonical_id  = "host";
+            host.owner.identity_kind = "process_host";
+            host.owner.backend       = "CPU";
+            host.owner.name          = "Host";
+            host.owner.host          = true;
+            host.device              = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        }
+        host.owner.memory.staging_available = false;
+        host.owner.provenance               = "backend_memory_breakdown_includes_unclassified_host_staging";
+    } else if (staging_bytes != 0) {
+        auto & host = by_owner["host"];
+        if (host.owner.canonical_id.empty() || host.owner.memory.context < staging_bytes) {
+            component.diagnostics.push_back("host staging exceeds the backend context-memory breakdown");
+            return false;
+        }
+        host.owner.memory.context -= staging_bytes;
+        host.owner.memory.staging = staging_bytes;
+        host.owner.provenance     = "placement_manifest_mandatory_host_staging";
+    }
+    for (auto & [id, owner] : by_owner) {
+        component.owners.push_back(owner.owner);
+        probe_owners.push_back(std::move(owner));
+    }
+    return true;
+}
+
+static common_json common_joint_memory_json(const common_joint_memory & memory) {
+    common_json result      = common_json::object();
+    result["model_bytes"]   = memory.model;
+    result["context_bytes"] = memory.context;
+    result["compute_bytes"] = memory.compute;
+    result["staging_bytes"] = memory.staging_available ? common_json_value(memory.staging) : common_json_value(nullptr);
+    size_t total            = 0;
+    result["total_bytes"]   = memory_total(memory, total) ? common_json_value(total) : common_json_value(nullptr);
+    return result;
+}
+
+common_joint_measurement common_measure_joint_configuration(const common_joint_measurement_request & request) {
+    common_joint_measurement result;
+    if (request.target.role != COMMON_JOINT_ROLE_TARGET || request.target.path_model.empty()) {
+        result.diagnostics.push_back("joint measurement requires a non-empty target model");
+        return result;
+    }
+
+    try {
+        common_scoped_log_filter  log_filter(request.log_level);
+        common_owned_model_params target_params(request.target.mparams);
+        llama_model_ptr           target_model(
+            llama_model_load_from_file(request.target.path_model.c_str(), target_params.params));
+        if (!target_model) {
+            result.diagnostics.push_back("failed to load required target metadata probe");
+            return result;
+        }
+        common_owned_context_params target_context_params(request.target.cparams);
+        llama_context_params &      target_cparams = target_context_params.params;
+        llama_context_ptr           target_context(llama_init_from_model(target_model.get(), target_cparams));
+        if (!target_context) {
+            result.diagnostics.push_back("failed to create required target context probe");
+            return result;
+        }
+        target_cparams.n_ctx = llama_n_ctx(target_context.get());
+
+        std::vector<common_joint_probe_owner> all_probe_owners;
+        std::vector<ggml_backend_dev_t>       target_devices;
+        const int32_t                         n_target_devices = llama_model_n_devices(target_model.get());
+        for (int32_t i = 0; i < n_target_devices; ++i) {
+            target_devices.push_back(llama_model_get_device(target_model.get(), i));
+        }
+        const auto                         target_placement = llama_model_moe_placement(target_model.get());
+        std::map<std::string, std::string> target_storage_owners;
+        for (const auto & owner : target_placement.owners) {
+            target_storage_owners.emplace(owner.canonical_id, owner.identity_kind);
+        }
+        for (const auto & allocation : target_placement.model_allocations) {
+            if (!allocation.owner_canonical_id.empty()) {
+                target_storage_owners.emplace(allocation.owner_canonical_id, allocation.owner_identity_kind);
+            }
+            if (allocation.owner_canonical_id.empty() && allocation.resolved_class.find("host") != std::string::npos) {
+                target_storage_owners.emplace("host", "process_host");
+            }
+        }
+
+        auto measure_component = [&](const common_joint_component_request & spec, llama_model * model,
+                                     llama_context * context, const llama_model_params & effective_mparams,
+                                     const llama_context_params & effective_cparams, bool deduct_model) {
+            common_joint_component_measurement component;
+            component.role                    = spec.role;
+            component.sharing                 = spec.sharing;
+            component.required                = spec.required;
+            const auto placement              = llama_model_moe_placement(model);
+            component.model_identity          = placement.model_identity;
+            component.model_identity_kind     = placement.model_identity_kind;
+            component.placement_id            = placement.placement_id;
+            component.placement_identity_kind = placement.placement_identity_kind;
+            bool sharing_resolved             = true;
+            for (const auto & shared : placement.shared_tensors) {
+                if (!checked_add_size(component.shared_tensor_payload_bytes, shared.tensor_bytes)) {
+                    component.diagnostics.push_back("shared tensor payload accounting overflow");
+                    component.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                    return component;
+                }
+                std::string owner_id       = shared.owner_canonical_id;
+                std::string owner_kind     = shared.owner_identity_kind;
+                std::string provenance     = shared.storage_provenance;
+                bool        owner_resolved = shared.resolved_storage_available && !owner_id.empty();
+                if (!owner_resolved && spec.sharing == COMMON_JOINT_SHARING_BORROW_TARGET &&
+                    shared.storage_relation == "borrowed_model_shared" &&
+                    shared.resolved_class.find("host") != std::string::npos &&
+                    target_storage_owners.count("host") != 0) {
+                    owner_id   = "host";
+                    owner_kind = "process_host";
+                    provenance += "+joint_process_host_normalization";
+                    owner_resolved = true;
+                }
+                component.sharing_records.push_back({
+                    shared.name,
+                    owner_id,
+                    owner_kind,
+                    shared.tensor_bytes,
+                    shared.storage_relation,
+                    provenance,
+                });
+                if (!owner_resolved) {
+                    sharing_resolved = false;
+                    component.diagnostics.push_back("shared tensor ownership is unresolved: " + shared.name);
+                } else if (spec.sharing == COMMON_JOINT_SHARING_BORROW_TARGET) {
+                    const auto target_owner = target_storage_owners.find(owner_id);
+                    if (target_owner == target_storage_owners.end() || target_owner->second != owner_kind) {
+                        sharing_resolved = false;
+                        component.diagnostics.push_back("shared tensor owner does not match target storage: " +
+                                                        shared.name);
+                    }
+                }
+            }
+            if (spec.sharing == COMMON_JOINT_SHARING_TARGET_MODEL) {
+                component.sharing_provenance = "same_model_model_bytes_deduplicated";
+            } else if (!placement.shared_tensors.empty()) {
+                component.sharing_provenance = "resolved_borrowed_aliases_excluded_from_unique_model_buffers";
+            } else {
+                component.sharing_provenance = "no_resolved_model_sharing";
+            }
+            if (!common_joint_collect_component(model, context, placement, deduct_model, component, all_probe_owners)) {
+                component.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                return component;
+            }
+            const bool mapped_host_upper =
+                std::any_of(component.owners.begin(), component.owners.end(),
+                            [](const auto & owner) { return owner.lower_bound_excluded_bytes != 0; });
+            component.bound             = !sharing_resolved ? COMMON_JOINT_BOUND_UNKNOWN :
+                                          mapped_host_upper ? COMMON_JOINT_BOUND_UPPER_ESTIMATE :
+                                                              COMMON_JOINT_BOUND_EXACT_ESTIMATE;
+            component.memory_provenance = !sharing_resolved ?
+                                              "no_alloc_estimate_with_unresolved_borrowed_alias_ownership" :
+                                          mapped_host_upper ? "no_alloc_estimate_with_mapped_host_model_upper" :
+                                                              "no_alloc_backend_allocation_size_estimate";
+            const bool sampler_identity_resolved =
+                effective_cparams.n_samplers == 0 || !spec.sampler_configuration_id.empty();
+            if (!sampler_identity_resolved) {
+                component.diagnostics.push_back(
+                    "sampler-backed context requires a stable sampler configuration identity");
+            }
+            if (sampler_identity_resolved) {
+                const common_json configuration = common_moe_configuration_record(
+                    placement, effective_mparams, effective_cparams, request.runtime_params,
+                    spec.sampler_configuration_id, common_joint_role_name(spec.role));
+                component.configuration_record = configuration.dump();
+                component.configuration_id =
+                    hash_sha256_hex(component.configuration_record.data(), component.configuration_record.size());
+            }
+            component.completeness = sharing_resolved && sampler_identity_resolved ?
+                                         COMMON_JOINT_COMPLETENESS_COMPLETE :
+                                         COMMON_JOINT_COMPLETENESS_INCOMPLETE;
+            return component;
+        };
+
+        result.components.push_back(measure_component(request.target, target_model.get(), target_context.get(),
+                                                      target_params.params, target_cparams, false));
+        if (result.components.back().completeness != COMMON_JOINT_COMPLETENESS_COMPLETE) {
+            result.completeness = result.components.back().completeness;
+            result.diagnostics.push_back("required target measurement is not complete");
+            for (const auto & diagnostic : result.components.back().diagnostics) {
+                result.diagnostics.push_back(std::string("target: ") + diagnostic);
+            }
+            return result;
+        }
+
+        for (const auto & extra : request.extras) {
+            common_joint_component_measurement component;
+            component.role     = extra.role;
+            component.sharing  = extra.sharing;
+            component.required = extra.required;
+            try {
+                common_owned_context_params extra_context_params(extra.cparams);
+                llama_context_params &      extra_cparams = extra_context_params.params;
+                extra_cparams.n_ctx                       = target_cparams.n_ctx;
+                extra_cparams.ctx_other                   = target_context.get();
+                if (extra.role == COMMON_JOINT_ROLE_MTP) {
+                    extra_cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                } else if (extra.role == COMMON_JOINT_ROLE_DRAFT) {
+                    extra_cparams.ctx_type = LLAMA_CONTEXT_TYPE_DRAFT;
+                }
+
+                if (extra.sharing == COMMON_JOINT_SHARING_TARGET_MODEL) {
+                    llama_context_ptr extra_context(llama_init_from_model(target_model.get(), extra_cparams));
+                    if (!extra_context) {
+                        throw std::runtime_error("failed to create shared target-model context probe");
+                    }
+                    component = measure_component(extra, target_model.get(), extra_context.get(), target_params.params,
+                                                  extra_cparams, true);
+                } else {
+                    if (extra.path_model.empty()) {
+                        throw std::runtime_error("separate extra model path is empty");
+                    }
+                    common_owned_model_params extra_params(extra.mparams);
+                    if (extra.sharing == COMMON_JOINT_SHARING_BORROW_TARGET) {
+                        extra_params.params.model_shared = target_model.get();
+                    }
+                    llama_model_ptr extra_model(
+                        llama_model_load_from_file(extra.path_model.c_str(), extra_params.params));
+                    if (!extra_model) {
+                        throw std::runtime_error("failed to load extra model metadata probe");
+                    }
+                    llama_context_ptr extra_context(llama_init_from_model(extra_model.get(), extra_cparams));
+                    if (!extra_context) {
+                        throw std::runtime_error("failed to create extra context probe");
+                    }
+                    component = measure_component(extra, extra_model.get(), extra_context.get(), extra_params.params,
+                                                  extra_cparams, false);
+                }
+            } catch (const std::exception & error) {
+                component.completeness =
+                    extra.required ? COMMON_JOINT_COMPLETENESS_ERROR : COMMON_JOINT_COMPLETENESS_INCOMPLETE;
+                component.diagnostics.push_back(error.what());
+            }
+            result.components.push_back(std::move(component));
+        }
+
+        result.completeness = COMMON_JOINT_COMPLETENESS_COMPLETE;
+        for (const auto & component : result.components) {
+            if (component.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE) {
+                continue;
+            }
+            if (component.required && component.completeness == COMMON_JOINT_COMPLETENESS_ERROR) {
+                result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+            } else if (result.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE) {
+                result.completeness = COMMON_JOINT_COMPLETENESS_INCOMPLETE;
+            }
+            for (const auto & diagnostic : component.diagnostics) {
+                result.diagnostics.push_back(std::string(common_joint_role_name(component.role)) + ": " + diagnostic);
+            }
+        }
+
+        std::map<std::string, common_joint_owner_measurement> owners;
+        std::map<std::string, ggml_backend_dev_t>             owner_devices;
+        std::map<std::string, uint32_t>                       target_selected_indices;
+        std::map<std::string, size_t>                         target_compute;
+        std::map<std::string, size_t>                         shared_mtp_compute;
+        for (size_t ci = 0; ci < result.components.size(); ++ci) {
+            for (const auto & owner : result.components[ci].owners) {
+                auto & aggregate = owners[owner.canonical_id];
+                if (aggregate.canonical_id.empty()) {
+                    aggregate.canonical_id  = owner.canonical_id;
+                    aggregate.identity_kind = owner.identity_kind;
+                    aggregate.backend       = owner.backend;
+                    aggregate.name          = owner.name;
+                    aggregate.host          = owner.host;
+                } else if (aggregate.identity_kind != owner.identity_kind || aggregate.host != owner.host) {
+                    result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                    result.diagnostics.push_back("conflicting physical owner identity across components");
+                    continue;
+                }
+                if (!checked_add_memory(aggregate.memory, owner.memory)) {
+                    result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                    result.diagnostics.push_back("joint owner memory accounting overflow");
+                }
+                if (!checked_add_size(aggregate.lower_bound_excluded_bytes, owner.lower_bound_excluded_bytes)) {
+                    result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                    result.diagnostics.push_back("joint lower-bound exclusion overflow");
+                }
+                if (result.components[ci].role == COMMON_JOINT_ROLE_TARGET) {
+                    target_compute[owner.canonical_id] = owner.memory.compute;
+                } else if (result.components[ci].role == COMMON_JOINT_ROLE_MTP &&
+                           result.components[ci].sharing == COMMON_JOINT_SHARING_TARGET_MODEL) {
+                    shared_mtp_compute[owner.canonical_id] = owner.memory.compute;
+                }
+            }
+        }
+        for (const auto & probe_owner : all_probe_owners) {
+            if (!probe_owner.owner.host) {
+                auto [it, inserted] = owner_devices.emplace(probe_owner.owner.canonical_id, probe_owner.device);
+                if (!inserted && it->second != probe_owner.device) {
+                    result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                    result.diagnostics.push_back("physical owner maps to conflicting backend device handles");
+                }
+            }
+        }
+        if (!result.components.empty()) {
+            for (const auto & probe_owner : all_probe_owners) {
+                if (std::find(target_devices.begin(), target_devices.end(), probe_owner.device) ==
+                    target_devices.end()) {
+                    continue;
+                }
+                target_selected_indices.emplace(probe_owner.owner.canonical_id, probe_owner.selected_index);
+            }
+        }
+
+        std::map<std::string, common_joint_device_limit> explicit_limits;
+        for (const auto & limit : request.device_limits) {
+            if (limit.canonical_id.empty() || !explicit_limits.emplace(limit.canonical_id, limit).second) {
+                result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                result.diagnostics.push_back("joint device limits contain an empty or duplicate canonical owner");
+            }
+        }
+        const bool possible_shared_workspace =
+            request.target.cparams.phase_aware_workspace &&
+            std::any_of(request.extras.begin(), request.extras.end(), [](const auto & extra) {
+                return extra.role == COMMON_JOINT_ROLE_MTP && extra.sharing == COMMON_JOINT_SHARING_TARGET_MODEL;
+            });
+
+        bool any_device           = false;
+        bool any_unknown_capacity = false;
+        bool any_exceeded         = false;
+        for (auto & [id, owner] : owners) {
+            size_t upper = 0;
+            if (!memory_total(owner.memory, upper)) {
+                result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                result.diagnostics.push_back("joint memory total overflow");
+            }
+            owner.required_upper_bytes = upper;
+            owner.required_lower_bytes = upper - owner.lower_bound_excluded_bytes;
+            owner.bound                = owner.lower_bound_excluded_bytes == 0 ? COMMON_JOINT_BOUND_EXACT_ESTIMATE :
+                                                                                 COMMON_JOINT_BOUND_UPPER_ESTIMATE;
+            owner.memory_provenance    = owner.lower_bound_excluded_bytes == 0 ?
+                                             "no_alloc_backend_allocation_size_estimate" :
+                                             "no_alloc_mapped_host_model_lower_excluded_upper_included";
+            if (possible_shared_workspace) {
+                const size_t target_value       = target_compute[id];
+                const size_t mtp_value          = shared_mtp_compute[id];
+                const size_t possible_deduction = std::min(target_value, mtp_value);
+                owner.required_lower_bytes -= possible_deduction;
+                if (possible_deduction > 0) {
+                    owner.bound             = COMMON_JOINT_BOUND_UPPER_ESTIMATE;
+                    owner.memory_provenance = "no_alloc_conservative_independent_workspace_upper";
+                }
+            }
+            any_device = true;
+            if (!owner.host) {
+                const auto selected = target_selected_indices.find(id);
+                owner.margin_bytes  = selected != target_selected_indices.end() &&
+                                              selected->second < request.target_device_margins.size() ?
+                                          request.target_device_margins[selected->second] :
+                                          request.default_device_margin;
+            }
+            const auto explicit_limit = explicit_limits.find(id);
+            const auto device         = owner_devices.find(id);
+            if (explicit_limit != explicit_limits.end()) {
+                owner.capacity_available  = explicit_limit->second.capacity_available;
+                owner.capacity_bytes      = explicit_limit->second.capacity_bytes;
+                owner.total_bytes         = explicit_limit->second.capacity_bytes;
+                owner.margin_bytes        = explicit_limit->second.margin_bytes;
+                owner.capacity_provenance = explicit_limit->second.provenance;
+            } else if (owner.host && request.host_capacity_bytes.has_value()) {
+                owner.capacity_available  = true;
+                owner.capacity_bytes      = *request.host_capacity_bytes;
+                owner.total_bytes         = *request.host_capacity_bytes;
+                owner.margin_bytes        = request.host_margin_bytes;
+                owner.capacity_provenance = request.host_capacity_provenance;
+            } else if (request.observe_device_capacity) {
+                ggml_backend_dev_t capacity_device = nullptr;
+                if (owner.host) {
+                    capacity_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                } else if (device != owner_devices.end()) {
+                    capacity_device = device->second;
+                }
+                if (capacity_device != nullptr) {
+                    size_t free  = 0;
+                    size_t total = 0;
+                    ggml_backend_dev_memory(capacity_device, &free, &total);
+                    if (free != 0 || total != 0) {
+                        owner.capacity_available  = true;
+                        owner.capacity_bytes      = free;
+                        owner.total_bytes         = total;
+                        owner.capacity_provenance = "backend_current_free_observation";
+                    }
+                }
+            }
+            if (owner.required_upper_bytes > static_cast<size_t>(INT64_MAX) ||
+                owner.required_lower_bytes > static_cast<size_t>(INT64_MAX) ||
+                owner.capacity_bytes > static_cast<size_t>(INT64_MAX) ||
+                owner.margin_bytes > static_cast<size_t>(INT64_MAX)) {
+                result.completeness = COMMON_JOINT_COMPLETENESS_ERROR;
+                result.diagnostics.push_back("capacity arithmetic exceeds signed reporting range");
+            } else if (owner.capacity_available) {
+                const size_t usable =
+                    owner.margin_bytes <= owner.capacity_bytes ? owner.capacity_bytes - owner.margin_bytes : 0;
+                owner.slack_bytes        = owner.required_upper_bytes <= usable ?
+                                               static_cast<int64_t>(usable - owner.required_upper_bytes) :
+                                               -static_cast<int64_t>(owner.required_upper_bytes - usable);
+                const bool lower_exceeds = owner.required_lower_bytes > usable;
+                any_exceeded             = any_exceeded || lower_exceeds;
+                any_unknown_capacity = any_unknown_capacity || (!lower_exceeds && owner.required_upper_bytes > usable);
+            } else {
+                any_unknown_capacity      = true;
+                owner.capacity_provenance = "unavailable";
+            }
+            result.owners.push_back(std::move(owner));
+        }
+        if (any_exceeded) {
+            result.capacity = COMMON_JOINT_CAPACITY_EXCEEDS_LIMITS;
+        } else if (!any_device || any_unknown_capacity) {
+            result.capacity = COMMON_JOINT_CAPACITY_UNKNOWN;
+        } else {
+            result.capacity = COMMON_JOINT_CAPACITY_WITHIN_LIMITS;
+        }
+
+        bool        all_components_identified = result.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE;
+        common_json canonical                 = common_json::object();
+        common_json components                = common_json::array();
+        for (const auto & component : result.components) {
+            if (component.configuration_record.empty()) {
+                all_components_identified = false;
+                continue;
+            }
+            common_json entry      = common_json::object();
+            entry["configuration"] = common_json::parse(component.configuration_record);
+            entry["required"]      = component.required;
+            entry["role"]          = common_joint_role_name(component.role);
+            entry["sharing"]       = common_joint_sharing_name(component.sharing);
+            components.push_back(std::move(entry));
+        }
+        common_json limits = common_json::array();
+        for (const auto & owner : result.owners) {
+            common_json limit          = common_json({
+                { "canonical_id", owner.canonical_id },
+                { "margin_bytes", owner.margin_bytes },
+            });
+            const auto  explicit_limit = explicit_limits.find(owner.canonical_id);
+            if (explicit_limit != explicit_limits.end()) {
+                limit["capacity_bytes"]      = explicit_limit->second.capacity_available ?
+                                                   common_json_value(explicit_limit->second.capacity_bytes) :
+                                                   common_json_value(nullptr);
+                limit["capacity_provenance"] = explicit_limit->second.provenance;
+            } else if (owner.host && request.host_capacity_bytes.has_value()) {
+                limit["capacity_bytes"]      = *request.host_capacity_bytes;
+                limit["capacity_provenance"] = request.host_capacity_provenance;
+            }
+            limits.push_back(std::move(limit));
+        }
+        canonical["components"]     = std::move(components);
+        canonical["device_limits"]  = std::move(limits);
+        canonical["schema_version"] = result.schema_version;
+        if (all_components_identified) {
+            result.configuration_record = canonical.dump();
+            result.configuration_id =
+                hash_sha256_hex(result.configuration_record.data(), result.configuration_record.size());
+        } else {
+            result.diagnostics.push_back("joint configuration identity unavailable because a component was unresolved");
+        }
+        result.admission_qualified = result.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+                                     result.capacity == COMMON_JOINT_CAPACITY_WITHIN_LIMITS &&
+                                     !result.configuration_id.empty();
+    } catch (const std::exception & error) {
+        result.completeness        = COMMON_JOINT_COMPLETENESS_ERROR;
+        result.capacity            = COMMON_JOINT_CAPACITY_UNKNOWN;
+        result.admission_qualified = false;
+        result.diagnostics.push_back(error.what());
+    }
+    return result;
+}
+
+common_joint_measurement common_measure_joint_configuration(const common_params & params,
+                                                            ggml_log_level        log_level,
+                                                            bool                  observe_device_capacity) {
+    common_params                    target_params = params;
+    common_joint_measurement_request request;
+    request.target.path_model       = params.model.path;
+    request.target.mparams          = common_model_params_to_llama(target_params);
+    request.target.cparams          = common_context_params_to_llama(target_params);
+    request.target.role             = COMMON_JOINT_ROLE_TARGET;
+    request.target.required         = true;
+    request.target_device_margins   = params.fit_params_target;
+    request.default_device_margin   = params.fit_params_target.empty() ? 0 : params.fit_params_target.front();
+    request.log_level               = log_level;
+    request.observe_device_capacity = observe_device_capacity;
+    request.runtime_params          = &params;
+
+    const bool has_draft = params.speculative.has_dft();
+    const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    std::optional<common_params> draft_params;
+    if (has_draft || spec_mtp) {
+        draft_params.emplace(common_base_params_to_speculative(params));
+        common_joint_component_request extra;
+        extra.path_model       = has_draft ? draft_params->model.path : params.model.path;
+        extra.mparams          = common_model_params_to_llama(*draft_params);
+        extra.cparams          = common_context_params_to_llama(*draft_params);
+        extra.cparams.n_rs_seq = 0;
+        extra.role             = spec_mtp ? COMMON_JOINT_ROLE_MTP : COMMON_JOINT_ROLE_DRAFT;
+        extra.sharing          = has_draft ? COMMON_JOINT_SHARING_BORROW_TARGET : COMMON_JOINT_SHARING_TARGET_MODEL;
+        extra.required         = true;
+        request.extras.push_back(std::move(extra));
+    }
+    return common_measure_joint_configuration(request);
+}
+
+std::string common_joint_measurement_json(const common_joint_measurement & measurement) {
+    common_json root         = common_json::object();
+    root["schema_version"]   = measurement.schema_version;
+    root["report_kind"]      = "moe_joint_measurement";
+    root["configuration_id"] = measurement.configuration_id.empty() ? common_json_value(nullptr) :
+                                                                      common_json_value(measurement.configuration_id);
+    if (measurement.configuration_record.empty()) {
+        root["configuration"] = nullptr;
+    } else {
+        root["configuration"] = common_json::parse(measurement.configuration_record);
+    }
+    root["measurement_completeness"] = common_joint_completeness_name(measurement.completeness);
+    root["capacity_assessment"]      = common_joint_capacity_name(measurement.capacity);
+    root["admission_qualified"]      = measurement.admission_qualified;
+    root["diagnostics"]              = measurement.diagnostics;
+    common_json components           = common_json::array();
+    for (const auto & component : measurement.components) {
+        common_json item                 = common_json::object();
+        item["role"]                     = common_joint_role_name(component.role);
+        item["sharing"]                  = common_joint_sharing_name(component.sharing);
+        item["required"]                 = component.required;
+        item["measurement_completeness"] = common_joint_completeness_name(component.completeness);
+        item["configuration_id"] = component.configuration_id.empty() ? common_json_value(nullptr) :
+                                                                        common_json_value(component.configuration_id);
+        if (component.configuration_record.empty()) {
+            item["configuration"] = nullptr;
+        } else {
+            item["configuration"] = common_json::parse(component.configuration_record);
+        }
+        item["model_identity"] =
+            component.model_identity.empty() ? common_json_value(nullptr) : common_json_value(component.model_identity);
+        item["model_identity_kind"] = component.model_identity_kind.empty() ?
+                                          common_json_value(nullptr) :
+                                          common_json_value(component.model_identity_kind);
+        item["placement_id"] =
+            component.placement_id.empty() ? common_json_value(nullptr) : common_json_value(component.placement_id);
+        item["placement_identity_kind"]         = component.placement_identity_kind.empty() ?
+                                                      common_json_value(nullptr) :
+                                                      common_json_value(component.placement_identity_kind);
+        item["shared_model_bytes_deduplicated"] = component.shared_model_bytes_deduplicated;
+        item["shared_tensor_payload_bytes"]     = component.shared_tensor_payload_bytes;
+        item["sharing_provenance"]              = component.sharing_provenance;
+        item["bound"]                           = common_joint_bound_name(component.bound);
+        item["memory_provenance"]               = component.memory_provenance;
+        item["diagnostics"]                     = component.diagnostics;
+        common_json sharing                     = common_json::array();
+        for (const auto & record : component.sharing_records) {
+            sharing.push_back(common_json({
+                { "tensor_name",          record.tensor_name          },
+                { "owner_canonical_id",   record.owner_canonical_id   },
+                { "owner_identity_kind",  record.owner_identity_kind  },
+                { "tensor_payload_bytes", record.tensor_payload_bytes },
+                { "relation",             record.relation             },
+                { "provenance",           record.provenance           },
+            }));
+        }
+        item["sharing_records"] = std::move(sharing);
+        common_json owners      = common_json::array();
+        for (const auto & owner : component.owners) {
+            owners.push_back(common_json({
+                { "canonical_id",               owner.canonical_id                     },
+                { "identity_kind",              owner.identity_kind                    },
+                { "backend",                    owner.backend                          },
+                { "name",                       owner.name                             },
+                { "host",                       owner.host                             },
+                { "lower_bound_excluded_bytes", owner.lower_bound_excluded_bytes       },
+                { "memory",                     common_joint_memory_json(owner.memory) },
+                { "provenance",                 owner.provenance                       },
+            }));
+        }
+        item["owners"] = std::move(owners);
+        components.push_back(std::move(item));
+    }
+    root["components"] = std::move(components);
+    common_json owners = common_json::array();
+    for (const auto & owner : measurement.owners) {
+        common_json item                   = common_json::object();
+        item["canonical_id"]               = owner.canonical_id;
+        item["identity_kind"]              = owner.identity_kind;
+        item["backend"]                    = owner.backend;
+        item["name"]                       = owner.name;
+        item["host"]                       = owner.host;
+        item["memory"]                     = common_joint_memory_json(owner.memory);
+        item["required_lower_bytes"]       = owner.required_lower_bytes;
+        item["required_upper_bytes"]       = owner.required_upper_bytes;
+        item["lower_bound_excluded_bytes"] = owner.lower_bound_excluded_bytes;
+        item["bound"]                      = common_joint_bound_name(owner.bound);
+        item["memory_provenance"]          = owner.memory_provenance;
+        item["capacity_bytes"] =
+            owner.capacity_available ? common_json_value(owner.capacity_bytes) : common_json_value(nullptr);
+        item["total_bytes"] =
+            owner.capacity_available ? common_json_value(owner.total_bytes) : common_json_value(nullptr);
+        item["margin_bytes"] = owner.margin_bytes;
+        item["slack_bytes"] =
+            owner.capacity_available ? common_json_value(owner.slack_bytes) : common_json_value(nullptr);
+        item["capacity_provenance"] = owner.capacity_provenance;
+        owners.push_back(std::move(item));
+    }
+    root["owners"] = std::move(owners);
+    return root.dump();
+}
+
+std::string common_joint_measurement_human(const common_joint_measurement & measurement) {
+    std::ostringstream out;
+    out << "MoE joint measurement "
+        << (measurement.configuration_id.empty() ? "unresolved" : measurement.configuration_id) << '\n'
+        << "  status: " << common_joint_completeness_name(measurement.completeness)
+        << "; capacity: " << common_joint_capacity_name(measurement.capacity)
+        << "; admission: " << (measurement.admission_qualified ? "qualified" : "not-qualified") << '\n';
+    for (const auto & component : measurement.components) {
+        out << "  " << common_joint_role_name(component.role) << " required=" << (component.required ? "yes" : "no")
+            << " sharing=" << common_joint_sharing_name(component.sharing)
+            << " status=" << common_joint_completeness_name(component.completeness)
+            << " placement=" << (component.placement_id.empty() ? "unknown" : component.placement_id) << '\n';
+    }
+    for (const auto & owner : measurement.owners) {
+        size_t     total           = 0;
+        const bool total_available = memory_total(owner.memory, total);
+        out << "  owner " << owner.canonical_id << " bytes=" << (total_available ? std::to_string(total) : "overflow")
+            << " model=" << owner.memory.model << " context=" << owner.memory.context
+            << " compute=" << owner.memory.compute << " staging=" << owner.memory.staging
+            << " bound=" << common_joint_bound_name(owner.bound) << " margin=" << owner.margin_bytes << " slack=";
+        if (owner.capacity_available) {
+            out << owner.slack_bytes;
+        } else {
+            out << "unknown";
+        }
+        out << '\n';
+    }
+    for (const auto & diagnostic : measurement.diagnostics) {
+        out << "  diagnostic: " << diagnostic << '\n';
     }
     return out.str();
 }
