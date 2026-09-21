@@ -220,8 +220,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(
         test-llama-archs
         NAME test-moe-joint-measurement
-        ARGS --test-moe-joint-measurement
+        ARGS --test-moe-joint-measurement --fit-tool $<TARGET_FILE:llama-fit-params>
     )
+    add_dependencies(test-llama-archs llama-fit-params)
     set_tests_properties(test-moe-joint-measurement PROPERTIES LABELS "main;moe-cache")
     target_link_libraries(test-llama-archs PRIVATE vendor::hash)
 

@@ -1,11 +1,11 @@
-#include "llama.h"
 #include "../src/llama-ext.h"
-
 #include "arg.h"
 #include "common.h"
 #include "fit.h"
+#include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cinttypes>
 
 #if defined(_MSC_VER)
@@ -24,11 +24,33 @@ int llama_fit_params(int argc, char ** argv) {
         return 1;
     }
 
+    const bool has_model_backed_spec =
+        params.speculative.has_dft() || std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                                                  COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (has_model_backed_spec && !params.fit_moe_joint_report_json) {
+        fprintf(stderr, "%s: model-backed speculative arguments require --fit-moe-joint-report-json\n", __func__);
+        return 1;
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    if (params.fit_moe_joint_report_json) {
+        // This mode is strict and machine-facing. It measures the frozen
+        // target plus every active model-backed speculative component.
+        common_log_flush(common_log_main());
+        llama_log_set([](ggml_log_level, const char * text, void *) { fputs(text, stderr); }, nullptr);
+        const auto measurement = common_measure_joint_configuration(
+            params, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR, true);
+        const std::string output = common_joint_measurement_json(measurement);
+        fwrite(output.data(), 1, output.size(), stdout);
+        fputc('\n', stdout);
+        fflush(stdout);
+        return measurement.admission_qualified ? 0 : 2;
+    }
 
     if (params.fit_moe_report != 0) {
         if (params.model.path.empty()) {

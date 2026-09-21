@@ -1527,7 +1527,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     auto add_opt = [&](common_arg arg) {
         // download only exposes the handful of args explicitly tagged for it
         const bool inherit_common = ex != LLAMA_EXAMPLE_DOWNLOAD;
-        if ((arg.in_example(ex) || (inherit_common && arg.in_example(LLAMA_EXAMPLE_COMMON))) && !arg.is_exclude(ex)) {
+        // The strict fit report measures the active model-backed speculative
+        // arrangement, so fit-params must be able to express that arrangement.
+        const bool fit_spec       = ex == LLAMA_EXAMPLE_FIT_PARAMS && arg.is_spec;
+        if ((arg.in_example(ex) || fit_spec || (inherit_common && arg.in_example(LLAMA_EXAMPLE_COMMON))) &&
+            !arg.is_exclude(ex)) {
             ctx_arg.options.push_back(std::move(arg));
         }
     };
@@ -3100,26 +3104,33 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
-    add_opt(common_arg(
-        {"--fit-moe-report"},
-        "print a human-readable resolved MoE placement ledger and exit",
-        [](common_params & params) {
-            if (params.fit_moe_report == 2) {
-                throw std::runtime_error("--fit-moe-report conflicts with --fit-moe-report-json");
-            }
-            params.fit_moe_report = 1;
-        }
-    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}));
-    add_opt(common_arg(
-        {"--fit-moe-report-json"},
-        "emit one tool-only resolved MoE placement JSON object on stdout and exit",
-        [](common_params & params) {
-            if (params.fit_moe_report == 1) {
-                throw std::runtime_error("--fit-moe-report-json conflicts with --fit-moe-report");
-            }
-            params.fit_moe_report = 2;
-        }
-    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}));
+    add_opt(common_arg({ "--fit-moe-report" }, "print a human-readable resolved MoE placement ledger and exit",
+                       [](common_params & params) {
+                           if (params.fit_moe_report == 2 || params.fit_moe_joint_report_json) {
+                               throw std::runtime_error("--fit-moe-report conflicts with another fit report mode");
+                           }
+                           params.fit_moe_report = 1;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_FIT_PARAMS }));
+    add_opt(common_arg({ "--fit-moe-report-json" },
+                       "emit one tool-only resolved MoE placement JSON object on stdout and exit",
+                       [](common_params & params) {
+                           if (params.fit_moe_report == 1 || params.fit_moe_joint_report_json) {
+                               throw std::runtime_error("--fit-moe-report-json conflicts with another fit report mode");
+                           }
+                           params.fit_moe_report = 2;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_FIT_PARAMS }));
+    add_opt(common_arg({ "--fit-moe-joint-report-json" },
+                       "strictly measure the target plus active draft/MTP configuration and emit one JSON object",
+                       [](common_params & params) {
+                           if (params.fit_moe_report != 0) {
+                               throw std::runtime_error(
+                                   "--fit-moe-joint-report-json conflicts with another fit report mode");
+                           }
+                           params.fit_moe_joint_report_json = true;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_FIT_PARAMS }));
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "

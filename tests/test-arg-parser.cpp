@@ -231,7 +231,26 @@ static void test(void) {
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
     assert(params.fit_moe_report == 2);
     params = common_params();
+    argv   = { "binary_name", "-m", "model_file.gguf", "--fit-moe-joint-report-json" };
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    assert(params.fit_moe_joint_report_json);
+    params = common_params();
+    argv   = { "binary_name", "-m",          "model_file.gguf", "--fit-moe-joint-report-json", "-md",
+               "draft.gguf",  "--spec-type", "draft-mtp",       "--spec-draft-n-max",          "1" };
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    assert(params.fit_moe_joint_report_json && params.speculative.draft.mparams.path == "draft.gguf" &&
+           params.speculative.draft.n_max == 1);
+    params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report", "--fit-moe-report-json"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    params = common_params();
+    argv   = { "binary_name", "-m", "model_file.gguf", "--fit-moe-report-json", "--fit-moe-joint-report-json" };
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    params = common_params();
+    argv   = { "binary_name", "-m", "model_file.gguf", "--fit-moe-joint-report-json", "--fit-moe-report-json" };
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    params = common_params();
+    argv   = { "binary_name", "-m", "model_file.gguf", "--fit-moe-joint-report-json", "--fit-moe-report" };
     assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
     params = common_params();
     params.model.path = "abc.gguf";

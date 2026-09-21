@@ -29,13 +29,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <locale>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if !defined(_WIN32)
+#    include <sys/wait.h>
+#endif
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -2781,7 +2786,7 @@ static llama_sampler_i joint_probe_sampler_i = {
     /* .copy_state        = */ nullptr,
 };
 
-static int test_moe_joint_measurement(const size_t seed) {
+static int test_moe_joint_measurement(const size_t seed, const std::string & fit_tool) {
     bool       ok    = true;
     const auto check = [&](bool condition, const char * message) {
         if (!condition) {
@@ -3066,6 +3071,72 @@ static int test_moe_joint_measurement(const size_t seed) {
     check(logger_before == logger_after && logger_data_before == logger_data_after,
           "failed joint probe did not restore the global logger");
 
+#if !defined(_WIN32)
+    if (!fit_tool.empty()) {
+        const auto quote = [](const std::string & value) {
+            std::string result = "'";
+            for (const char c : value) {
+                result += c == '\'' ? "'\\''" : std::string(1, c);
+            }
+            return result + "'";
+        };
+        const auto stdout_path = temp / ("llama-joint-tool-out-" + nonce + ".json");
+        const auto stderr_path = temp / ("llama-joint-tool-err-" + nonce + ".log");
+        const auto read_file   = [](const std::filesystem::path & path) {
+            std::ifstream input(path, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+        };
+        const auto run_tool = [&](const std::string & args) {
+            const std::string command =
+                quote(fit_tool) + " " + args + " >" + quote(stdout_path.string()) + " 2>" + quote(stderr_path.string());
+            const int status = std::system(command.c_str());
+            return std::make_tuple(status == -1 ? -1 : WEXITSTATUS(status), read_file(stdout_path),
+                                   read_file(stderr_path));
+        };
+
+        const std::string common_args = " -ngl 0 -c 32 -b 32 -ub 16 -fit off";
+        const auto [qualified_status, qualified_stdout, qualified_stderr] =
+            run_tool("--fit-moe-joint-report-json -m " + quote(mtp_path.string()) +
+                     " --spec-type draft-mtp --spec-draft-n-max 1" + common_args);
+        GGML_UNUSED(qualified_stderr);
+        try {
+            const auto output = common_json::parse(qualified_stdout);
+            check(qualified_status == 0 && std::count(qualified_stdout.begin(), qualified_stdout.end(), '\n') == 1 &&
+                      output.at("admission_qualified").get<bool>() && output.at("components").size() == 2,
+                  "strict fit executable did not emit one qualified target/MTP JSON object");
+        } catch (const std::exception &) {
+            check(false, "strict fit executable stdout was not one JSON object");
+        }
+
+        const auto missing_path = temp / ("missing-tool-joint-" + nonce + ".gguf");
+        const auto [failed_status, failed_stdout, failed_stderr] =
+            run_tool("--fit-moe-joint-report-json -m " + quote(target_path.string()) + " -md " +
+                     quote(missing_path.string()) + " --spec-type draft-mtp --spec-draft-n-max 1" + common_args);
+        GGML_UNUSED(failed_stderr);
+        try {
+            const auto output = common_json::parse(failed_stdout);
+            check(failed_status == 2 && !output.at("admission_qualified").get<bool>() &&
+                      output.at("measurement_completeness").get<std::string>() == "error",
+                  "failed required draft did not produce strict unqualified JSON");
+        } catch (const std::exception &) {
+            check(false, "failed strict fit executable stdout was not JSON");
+        }
+
+        const auto [legacy_status, legacy_stdout, legacy_stderr] =
+            run_tool("-m " + quote(target_path.string()) + " -md " + quote(mtp_path.string()) +
+                     " --spec-type draft-mtp --spec-draft-n-max 1" + common_args);
+        check(legacy_status == 1 && legacy_stdout.empty() &&
+                  legacy_stderr.find("require --fit-moe-joint-report-json") != std::string::npos,
+              "legacy fit silently accepted model-backed speculative arguments");
+
+        std::error_code error;
+        std::filesystem::remove(stdout_path, error);
+        std::filesystem::remove(stderr_path, error);
+    }
+#else
+    GGML_UNUSED(fit_tool);
+#endif
+
     for (const auto & path : { target_path, mtp_path, partial_path }) {
         std::error_code error;
         std::filesystem::remove(path, error);
@@ -3341,7 +3412,8 @@ int main(int argc, char ** argv) {
     bool run_speculative_limits = false;
     bool run_moe_cache_selector = false;
     bool run_moe_placement = false;
-    bool run_moe_joint_measurement = false;
+    bool        run_moe_joint_measurement   = false;
+    std::string fit_tool;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -3411,6 +3483,10 @@ int main(int argc, char ** argv) {
             run_moe_joint_measurement = true;
             continue;
         }
+        if (strcmp(argv[i], "--fit-tool") == 0 && i + 1 < argc) {
+            fit_tool = argv[++i];
+            continue;
+        }
     }
     if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector ||
         run_moe_placement || run_moe_joint_measurement) {
@@ -3444,7 +3520,7 @@ int main(int argc, char ** argv) {
             return test_moe_placement_report(seed);
         }
         if (run_moe_joint_measurement) {
-            return test_moe_joint_measurement(seed);
+            return test_moe_joint_measurement(seed, fit_tool);
         }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);
