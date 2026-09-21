@@ -9,6 +9,7 @@ constexpr int n_dim     = 256;
 constexpr int n_experts = 8;
 constexpr int n_used    = 2;
 constexpr int n_slots   = 4;
+constexpr size_t bounded_host_budget = 2 * 1024 * 1024;
 
 ggml_graph_execution_certificate layer_certificate(bool required = false) {
     ggml_graph_execution_certificate certificate{};
@@ -669,7 +670,7 @@ void test_grouped_layer_placement() {
     int device = 0;
     CUDA_OK(cudaGetDevice(&device));
     run_layers({ device }, 0);
-    run_layers({ device }, 512 * 1024);
+    run_layers({ device }, bounded_host_budget);
     run_layers({ device }, 0, true);
     run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_K);
     run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED);
@@ -726,7 +727,7 @@ int test_grouped_multigpu() {
     const bool debug = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
     run_layers({ 0, 1 }, 0);
-    run_layers({ 0, 1 }, 512 * 1024);
+    run_layers({ 0, 1 }, bounded_host_budget);
     run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, true);
     run_layers({ 0, 1 }, 0, true);
     run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_K);
