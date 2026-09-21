@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_moe_placement_report;
 
 struct llama_moe_source_bank {
     ggml_tensor * tensor;
@@ -39,6 +40,13 @@ struct llama_moe_cache_memory {
 
     size_t device_bytes(uint32_t slots) const;
 };
+
+// Identifies which live execution contexts consume an MoE source group.
+// Bit 0 is DEFAULT and bit 1 is MTP. Router-layer uses of n_layer_nextn are
+// ordinary DEFAULT execution, while an all-nextn model shares its groups.
+uint32_t llama_moe_placement_context_mask(
+    bool load_mtp, uint32_t n_layer_nextn, int32_t router_layer,
+    uint32_t n_trunk_layers, int32_t group_layer);
 
 // available models
 enum llm_type {
@@ -776,14 +784,32 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    bool is_no_alloc() const;
     int32_t moe_expert_cache_slots() const;
     int32_t moe_expert_cache_slots(ggml_backend_dev_t dev) const;
     bool moe_expert_cache_enabled() const;
     const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & moe_expert_cache_memory() const;
     std::map<ggml_backend_buffer_type_t, size_t> moe_expert_cache_memory_breakdown(enum llama_context_type ctx_type) const;
+    std::map<ggml_backend_dev_t, size_t> moe_expert_cache_host_staging(enum llama_context_type ctx_type) const;
     void build_moe_sources();
     void finalize_moe_expert_cache();
     const std::vector<llama_moe_source_group> & moe_sources() const;
+    llama_moe_placement_report                   moe_placement() const;
+    void record_tensor_override_resolution(
+        std::string tensor_name, uint32_t origin, int32_t index, std::string pattern,
+        std::string requested_buft, std::string selected_buft, std::string resolved_buft,
+        std::string resolved_owner_canonical_id, std::string resolved_owner_identity_kind,
+        std::string resolved_owner_backend, bool resolved_is_host);
+    void record_shared_tensor(
+        std::string tensor_name, size_t tensor_bytes, int32_t type,
+        std::array<int64_t, GGML_MAX_DIMS> ne, std::array<size_t, GGML_MAX_DIMS> nb,
+        std::string resolved_buft, std::string resolved_class,
+        std::string owner_canonical_id, std::string owner_identity_kind,
+        std::string owner_backend, bool resolved_storage_available,
+        bool current_storage_available, std::string storage_provenance);
+    void record_artifact_source(size_t file_size, int64_t modification_time, bool modification_time_available);
+    void record_resolved_load_strategy(
+        bool uses_mmap, std::string direct_io_state, bool uses_mlock, bool has_lazy_tensors);
 
     void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;
     void prefetch_rows(const ggml_tensor * tensor, const ggml_tensor * indices) const;

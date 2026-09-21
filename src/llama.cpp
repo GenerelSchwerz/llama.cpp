@@ -322,6 +322,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         // layer selector opts into residual placement: user overrides win and
         // the cache catches only the selected layers left over.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
+        std::vector<uint32_t> effective_override_origins;
         std::vector<std::string> moe_layer_patterns;
         struct moe_buffer_type_owner {
             ggml_backend_buffer_type_t type = nullptr;
@@ -333,6 +334,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
         } moe_buffer_type;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
+        const uint32_t * effective_override_origins_ptr = nullptr;
         if ((params.moe_expert_cache_byte_budgets == nullptr) !=
                 (params.n_moe_expert_cache_byte_budgets == 0)) {
             throw std::runtime_error("invalid MoE cache byte budgets");
@@ -389,6 +391,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                 if (params.tensor_buft_overrides) {
                     for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
                         effective_overrides.push_back(*o);
+                        effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_USER);
                         had_user_overrides = true;
                     }
                 }
@@ -420,10 +423,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                             layer <= static_cast<uint64_t>(range.last); ++layer) {
                         moe_layer_patterns.push_back("blk\\." + std::to_string(layer) + MOE_EXPS_PATTERN);
                         effective_overrides.push_back({moe_layer_patterns.back().c_str(), buft});
+                        effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR);
                     }
                 }
             } else {
                 effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
+                effective_override_origins.push_back(llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY);
                 append_user_overrides();
             }
             if (had_user_overrides && !residual) {
@@ -431,11 +436,16 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                                "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
             }
             effective_overrides.push_back({nullptr, nullptr});
+            if (effective_override_origins.size() + 1 != effective_overrides.size()) {
+                throw std::runtime_error("internal MoE placement provenance mismatch");
+            }
             effective_overrides_ptr = effective_overrides.data();
+            effective_override_origins_ptr = effective_override_origins.data();
         }
 
         llama_model_loader ml(metadata, set_tensor_data, set_tensor_data_ud, fname, splits, file, params.load_mode,
-            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr);
+            params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, effective_overrides_ptr,
+            effective_override_origins_ptr);
 
         ml.lazy.mode    = params.lazy_mode;
         ml.model_shared = params.model_shared;
@@ -496,6 +506,39 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
+        std::unordered_set<std::string> moe_source_names;
+        for (const auto & group : model->moe_sources()) {
+            for (const auto & bank : group.banks) {
+                if (bank.tensor != nullptr) {
+                    moe_source_names.insert(bank.tensor->name);
+                }
+            }
+        }
+        for (const auto & [tensor_name, resolution] : ml.tensor_override_resolutions) {
+            if (moe_source_names.count(tensor_name) == 0) {
+                continue;
+            }
+            model->record_tensor_override_resolution(
+                tensor_name, resolution.origin, resolution.index, resolution.pattern,
+                resolution.requested_buft, resolution.selected_buft, resolution.resolved_buft,
+                resolution.resolved_owner_canonical_id, resolution.resolved_owner_identity_kind,
+                resolution.resolved_owner_backend, resolution.resolved_is_host);
+        }
+        for (const auto & [tensor_name, borrowed] : ml.borrowed_tensors) {
+            model->record_shared_tensor(
+                tensor_name, borrowed.tensor_bytes, borrowed.type, borrowed.ne, borrowed.nb,
+                borrowed.resolved_buft, borrowed.resolved_class, borrowed.owner_canonical_id,
+                borrowed.owner_identity_kind, borrowed.owner_backend, borrowed.resolved_storage_available,
+                borrowed.current_storage_available, borrowed.storage_provenance);
+        }
+        for (const auto & source : ml.artifact_sources) {
+            model->record_artifact_source(
+                source.file_size, source.modification_time, source.modification_time_available);
+        }
+        const bool uses_mlock = params.load_mode == LLAMA_LOAD_MODE_MLOCK ||
+            params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+        model->record_resolved_load_strategy(
+            ml.use_mmap, ml.resolved_direct_io_state(), uses_mlock, ml.lazy.any_resolved());
 
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {

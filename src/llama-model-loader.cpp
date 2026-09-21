@@ -11,12 +11,41 @@
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
 #include <regex>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
+
+static void describe_resolved_buft(
+        llama_model_loader::tensor_override_resolution & resolution,
+        ggml_backend_buffer_type_t buft) {
+    resolution.resolved_buft = ggml_backend_buft_name(buft);
+    resolution.resolved_is_host = ggml_backend_buft_is_host(buft);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        resolution.resolved_owner_identity_kind = "unavailable";
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    resolution.resolved_owner_backend = reg != nullptr ? ggml_backend_reg_name(reg) : "";
+    ggml_backend_dev_props props = {};
+    ggml_backend_dev_get_props(dev, &props);
+    const std::string physical_id = props.device_id != nullptr ? props.device_id : "";
+    size_t registry_index = 0;
+    const size_t n_devices = ggml_backend_dev_count();
+    for (; registry_index < n_devices && ggml_backend_dev_get(registry_index) != dev; ++registry_index) {
+    }
+    const std::string fallback = std::string(ggml_backend_dev_name(dev)) + "\n" +
+        ggml_backend_dev_description(dev) + "\nregistry:" +
+        (registry_index < n_devices ? std::to_string(registry_index) : "unknown");
+    const std::string value = !physical_id.empty() ? physical_id : fallback;
+    resolution.resolved_owner_identity_kind = !physical_id.empty() ? "physical" : "runtime_name_unverified";
+    resolution.resolved_owner_canonical_id = std::to_string(resolution.resolved_owner_backend.size()) + ":" +
+        resolution.resolved_owner_backend + ":" + std::to_string(value.size()) + ":" + value;
+}
 
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
@@ -541,7 +570,8 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const uint32_t * param_tensor_buft_override_origins_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -555,9 +585,24 @@ llama_model_loader::llama_model_loader(
     }
 
     tensor_buft_overrides = param_tensor_buft_overrides_p;
+    tensor_buft_override_origins = param_tensor_buft_override_origins_p;
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+
+    const auto record_artifact = [&](const std::string * path) {
+        artifact_source source;
+        source.file_size = files.back()->size();
+        if (path != nullptr) {
+            std::error_code ec;
+            const auto stamp = std::filesystem::last_write_time(*path, ec);
+            if (!ec) {
+                source.modification_time = stamp.time_since_epoch().count();
+                source.modification_time_available = true;
+            }
+        }
+        artifact_sources.push_back(source);
+    };
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -577,6 +622,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        record_artifact(&fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +691,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                record_artifact(&splits[idx]);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -696,6 +743,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        record_artifact(nullptr);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1102,6 +1150,8 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
         return false;
     }
 
+    resolved_any = true;
+
     if (w) {
         ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
@@ -1113,8 +1163,19 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+std::string llama_model_loader::resolved_direct_io_state() const {
+    const size_t direct_files = std::count_if(files.begin(), files.end(), [](const auto & file) {
+        return file->has_direct_io();
+    });
+    if (direct_files == 0) {
+        return "none";
+    }
+    return direct_files == files.size() ? "all" : "mixed";
+}
+
 // declared in llama-model.h, which this file does not include
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+bool llama_internal_model_no_alloc(const llama_model * model);
 
 struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
     // checked first so no other tensor in any model pays a metadata lookup
@@ -1172,6 +1233,26 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
     LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
 
     // not counted in n_created/size_data: not in this file, neither allocated nor freed here
+    borrowed_tensor_resolution borrowed;
+    borrowed.tensor_bytes = ggml_nbytes(src);
+    borrowed.type = static_cast<int32_t>(src->type);
+    std::copy(std::begin(src->ne), std::end(src->ne), borrowed.ne.begin());
+    std::copy(std::begin(src->nb), std::end(src->nb), borrowed.nb.begin());
+    if (src->buffer != nullptr) {
+        tensor_override_resolution resolution;
+        describe_resolved_buft(resolution, ggml_backend_buffer_get_type(src->buffer));
+        borrowed.resolved_buft = resolution.resolved_buft;
+        borrowed.resolved_class = resolution.resolved_is_host ? "ordinary_host" :
+            "ordinary_" + resolution.resolved_owner_backend + "_device";
+        borrowed.owner_canonical_id = resolution.resolved_owner_canonical_id;
+        borrowed.owner_identity_kind = resolution.resolved_owner_identity_kind;
+        borrowed.owner_backend = resolution.resolved_owner_backend;
+        borrowed.resolved_storage_available = true;
+        borrowed.current_storage_available = !llama_internal_model_no_alloc(model_shared);
+        borrowed.storage_provenance = borrowed.current_storage_available ?
+            "borrowed_model_shared_current_buffer" : "borrowed_model_shared_resolved_estimate";
+    }
+    borrowed_tensors.emplace(name, borrowed);
     return src;
 }
 
@@ -1270,7 +1351,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        const auto record_resolution = [&](tensor_override_resolution resolution) {
+            const auto [it, inserted] = tensor_override_resolutions.emplace(tn.str(), resolution);
+            if (!inserted && !(it->second == resolution)) {
+                throw std::runtime_error(format("conflicting placement provenance for tensor %s", tn.str().c_str()));
+            }
+        };
+
         if (is_lazy) {
+            tensor_override_resolution resolution;
+            resolution.origin = TENSOR_OVERRIDE_DEFAULT;
+            resolution.selected_buft = ggml_backend_buft_name(lazy_read::buft());
+            describe_resolved_buft(resolution, lazy_read::buft());
+            record_resolution(std::move(resolution));
             return lazy_read::buft();
         }
 
@@ -1292,6 +1385,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        tensor_override_resolution resolution;
+        resolution.origin = TENSOR_OVERRIDE_DEFAULT;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1316,6 +1411,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                             ggml_backend_buft_name(buft));
+                    const size_t index = static_cast<size_t>(overrides - tensor_buft_overrides);
+                    if (index > INT32_MAX) {
+                        throw std::runtime_error("too many tensor buffer overrides for placement provenance");
+                    }
+                    resolution.origin = tensor_buft_override_origins != nullptr ?
+                        tensor_buft_override_origins[index] : TENSOR_OVERRIDE_USER;
+                    resolution.index = static_cast<int32_t>(index);
+                    resolution.pattern = overrides->pattern;
+                    resolution.requested_buft = ggml_backend_buft_name(overrides->buft);
                     break;
                 }
             }
@@ -1327,6 +1431,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
         }
+        resolution.selected_buft = ggml_backend_buft_name(buft);
 
         // avoid using a host buffer when using mmap
         auto * buft_dev = ggml_backend_buft_get_device(buft);
@@ -1337,6 +1442,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
             buft = ggml_backend_dev_buffer_type(cpu_dev);
         }
+        describe_resolved_buft(resolution, buft);
+        record_resolution(std::move(resolution));
 
         if (buft != buft_list->front().second) {
             if (n_tensors_moved == 0) {

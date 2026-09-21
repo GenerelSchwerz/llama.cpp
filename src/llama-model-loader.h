@@ -10,6 +10,7 @@
 #include "ggml-cpp.h"
 
 #include <cstddef>
+#include <array>
 #include <cstring>
 #include <map>
 #include <set>
@@ -30,6 +31,36 @@ enum llama_fver {
 const char * llama_file_version_name(llama_fver version);
 
 struct llama_model_loader {
+    enum tensor_override_origin : uint32_t {
+        TENSOR_OVERRIDE_DEFAULT,
+        TENSOR_OVERRIDE_USER,
+        TENSOR_OVERRIDE_CACHE_LEGACY,
+        TENSOR_OVERRIDE_CACHE_SELECTOR,
+    };
+
+    struct tensor_override_resolution {
+        uint32_t origin = TENSOR_OVERRIDE_DEFAULT;
+        int32_t index = -1;
+        std::string pattern;
+        std::string requested_buft;
+        std::string selected_buft;
+        std::string resolved_buft;
+        std::string resolved_owner_canonical_id;
+        std::string resolved_owner_identity_kind;
+        std::string resolved_owner_backend;
+        bool        resolved_is_host = false;
+
+        bool operator==(const tensor_override_resolution & other) const {
+            return origin == other.origin && index == other.index && pattern == other.pattern &&
+                   requested_buft == other.requested_buft && selected_buft == other.selected_buft &&
+                   resolved_buft == other.resolved_buft &&
+                   resolved_owner_canonical_id == other.resolved_owner_canonical_id &&
+                   resolved_owner_identity_kind == other.resolved_owner_identity_kind &&
+                   resolved_owner_backend == other.resolved_owner_backend &&
+                   resolved_is_host == other.resolved_is_host;
+        }
+    };
+
     // Holds information on a model weight
     struct llama_tensor_weight {
         uint16_t  idx; // source file index
@@ -89,6 +120,7 @@ struct llama_model_loader {
     struct lazy_read {
         // set by the caller before the create_tensor() calls
         enum llama_lazy_mode mode = LLAMA_LAZY_MODE_OFF;
+        bool resolved_any = false;
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
@@ -96,6 +128,10 @@ struct llama_model_loader {
 
         bool any() const {
             return !ranges.empty();
+        }
+
+        bool any_resolved() const {
+            return resolved_any;
         }
 
         bool has(const ggml_tensor * t) const {
@@ -131,6 +167,31 @@ struct llama_model_loader {
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
+    const uint32_t * tensor_buft_override_origins;
+    std::unordered_map<std::string, tensor_override_resolution> tensor_override_resolutions;
+    struct borrowed_tensor_resolution {
+        size_t tensor_bytes = 0;
+        int32_t type = 0;
+        std::array<int64_t, GGML_MAX_DIMS> ne = {};
+        std::array<size_t, GGML_MAX_DIMS> nb = {};
+        std::string resolved_buft;
+        std::string resolved_class;
+        std::string owner_canonical_id;
+        std::string owner_identity_kind;
+        std::string owner_backend;
+        bool        resolved_storage_available = false;
+        bool        current_storage_available = false;
+        std::string storage_provenance;
+    };
+    std::unordered_map<std::string, borrowed_tensor_resolution> borrowed_tensors;
+
+    struct artifact_source {
+        size_t  file_size = 0;
+        int64_t modification_time = 0;
+        bool    modification_time_available = false;
+    };
+    std::vector<artifact_source> artifact_sources;
+    std::string resolved_direct_io_state() const;
 
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
@@ -188,7 +249,8 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        const uint32_t * param_tensor_buft_override_origins_p = nullptr);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type

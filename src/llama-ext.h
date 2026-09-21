@@ -6,8 +6,159 @@
 
 #include "llama.h"
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <map>
+#include <string>
+#include <vector>
+
+enum llama_moe_placement_mode {
+    LLAMA_MOE_PLACEMENT_ORDINARY_CPU,
+    LLAMA_MOE_PLACEMENT_ORDINARY_DEVICE,
+    LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE,
+    LLAMA_MOE_PLACEMENT_MIXED,
+};
+
+enum llama_moe_placement_reason {
+    LLAMA_MOE_PLACEMENT_DEFAULT,
+    LLAMA_MOE_PLACEMENT_USER_OVERRIDE,
+    LLAMA_MOE_PLACEMENT_CACHE_LEGACY,
+    LLAMA_MOE_PLACEMENT_CACHE_SELECTOR,
+};
+
+struct llama_moe_placement_bank {
+    std::string name;
+    uint32_t    role          = 0;
+    uint32_t    status        = 0;
+    int32_t     type          = 0;
+    uint64_t    expert_stride = 0;
+    uint64_t    tensor_bytes  = 0;
+    llama_moe_placement_mode mode = LLAMA_MOE_PLACEMENT_ORDINARY_CPU;
+    llama_moe_placement_reason reason = LLAMA_MOE_PLACEMENT_DEFAULT;
+    int32_t owner_index = -1;
+    std::string owner_id;
+    std::string owner_name;
+    std::string owner_canonical_id;
+    std::string owner_identity_kind;
+    std::string owner_backend;
+    std::string actual_buft;
+    bool        actual_buft_available = false;
+    std::string resolved_class;
+    int32_t winning_override_index = -1;
+    std::string winning_override_pattern;
+    std::string requested_buft;
+    std::string selected_buft;
+    std::string resolved_buft;
+    size_t      allocation_estimate = 0;
+    bool        allocation_estimate_available = false;
+    std::string allocation_provenance;
+};
+
+struct llama_moe_placement_group {
+    uint32_t                              semantic_index   = 0;
+    int32_t                               layer            = -1;
+    uint32_t                              layout           = 0;
+    uint32_t                              domain           = 0;
+    uint32_t                              n_experts        = 0;
+    uint32_t                              top_k            = 0;
+    uint32_t                              context_use_mask = 0;
+    bool                                  route_present    = false;
+    llama_moe_placement_mode              mode             = LLAMA_MOE_PLACEMENT_ORDINARY_CPU;
+    int32_t                               owner_index      = -1;
+    std::string                           owner_id;
+    std::string                           owner_name;
+    std::string                           owner_canonical_id;
+    std::string                           placement_reason;
+    int32_t                               cache_owner_index = -1;
+    std::string                           cache_owner_canonical_id;
+    size_t                                ordinary_allocation_estimate = 0;
+    std::string                           ordinary_allocation_provenance;
+    size_t                                cache_fixed_bytes    = 0;
+    size_t                                cache_per_slot_bytes = 0;
+    size_t                                cache_fixed_default_bytes = 0;
+    size_t                                cache_per_slot_default_bytes = 0;
+    size_t                                cache_fixed_mtp_bytes = 0;
+    size_t                                cache_per_slot_mtp_bytes = 0;
+    std::string                           cache_sizing_provenance;
+    std::vector<llama_moe_placement_bank> banks;
+};
+
+struct llama_moe_placement_owner {
+    uint32_t    selected_index = 0;
+    std::string id;
+    std::string name;
+    std::string description;
+    std::string backend;
+    std::string canonical_id;
+    std::string identity_kind;
+    int32_t     slots                     = 0;
+    size_t      cache_byte_cap            = 0;
+    uint32_t    active_groups             = 0;
+    uint32_t    active_context_mask       = 0;
+    uint32_t    active_cache_groups       = 0;
+    uint32_t    active_cache_context_mask = 0;
+    size_t      cache_group_fixed_bytes   = 0;
+    size_t      cache_group_per_slot_bytes = 0;
+    size_t      cache_context_fixed_bytes = 0;
+    size_t      cache_fixed_bytes         = 0;
+    size_t      cache_per_slot_bytes      = 0;
+    size_t      ordinary_allocation_estimate = 0;
+    size_t      mandatory_host_staging_default_bytes = 0;
+    size_t      mandatory_host_staging_mtp_bytes = 0;
+    bool        mandatory_host_staging_available = false;
+    std::string mandatory_host_staging_provenance;
+};
+
+struct llama_moe_shared_tensor {
+    std::string name;
+    size_t      tensor_bytes = 0;
+    int32_t     type = 0;
+    std::array<int64_t, GGML_MAX_DIMS> ne = {};
+    std::array<size_t, GGML_MAX_DIMS>  nb = {};
+    std::string resolved_buft;
+    std::string resolved_class;
+    std::string owner_canonical_id;
+    std::string owner_identity_kind;
+    std::string owner_backend;
+    std::string storage_relation;
+    bool        resolved_storage_available = false;
+    bool        current_storage_available = false;
+    std::string storage_provenance;
+};
+
+struct llama_moe_model_allocation {
+    std::string resolved_class;
+    std::string owner_canonical_id;
+    std::string owner_identity_kind;
+    std::string owner_backend;
+    size_t      bytes = 0;
+    bool        bytes_available = false;
+    bool        current_allocation = false;
+    std::string provenance;
+};
+
+struct llama_moe_placement_report {
+    uint32_t                               schema_version = 1;
+    std::string                            model_identity_kind;
+    std::string                            model_identity;
+    std::string                            model_identity_record;
+    // Canonical identity of resolved model-side placement only. Context/KV,
+    // target/draft pairing, runtime environment, and measurements belong in a
+    // later full configuration identity and are intentionally not implied here.
+    std::string                            placement_record;
+    std::string                            placement_id;
+    std::string                            placement_identity_kind;
+    bool                                   uses_mmap = false;
+    std::string                            direct_io_state = "none";
+    bool                                   uses_mlock = false;
+    bool                                   has_lazy_tensors = false;
+    size_t                                 mandatory_host_staging_bytes = 0;
+    std::vector<llama_moe_placement_group> groups;
+    std::vector<llama_moe_placement_owner> owners;
+    std::vector<llama_moe_shared_tensor>   shared_tensors;
+    std::vector<llama_moe_model_allocation> model_allocations;
+};
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -118,6 +269,10 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+
+// Returns an owned, read-only view of the model's resolved MoE placement.
+// The result contains no tensor, buffer, graph, or backend pointers.
+LLAMA_API llama_moe_placement_report llama_model_moe_placement(const struct llama_model * model);
 
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
