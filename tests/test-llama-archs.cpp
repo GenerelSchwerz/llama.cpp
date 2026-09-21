@@ -1713,13 +1713,13 @@ static int test_moe_cache_selector_precedence(const size_t seed) {
     static const char * layer_zero_up      = "blk\\.0\\.ffn_up_(ch|)exps";
 
     auto make_params = [&](const llama_model_layer_range * ranges, size_t n_ranges,
-                           const llama_model_tensor_buft_override * overrides) {
+                           const llama_model_tensor_buft_override * overrides, int32_t slots = 4) {
         llama_model_params params              = llama_model_default_params();
         params.devices                         = devices;
         params.n_gpu_layers                    = 99;
         params.split_mode                      = LLAMA_SPLIT_MODE_LAYER;
         params.progress_callback               = silent_model_load_progress;
-        params.moe_expert_cache_slots          = 4;
+        params.moe_expert_cache_slots          = slots;
         params.moe_expert_cache_layer_ranges   = ranges;
         params.n_moe_expert_cache_layer_ranges = n_ranges;
         params.tensor_buft_overrides           = overrides;
@@ -1829,6 +1829,210 @@ static int test_moe_cache_selector_precedence(const size_t seed) {
             fprintf(stderr, "test-moe-cache-selector: explicit GPU placement mismatch\n");
             ok = false;
         }
+    }
+
+    static const char * layer_one_experts = "blk\\.1\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    static const char * both_layer_experts = "blk\\.[01]\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    llama_model_tensor_buft_override gpu_layer_one[] = {
+        { layer_one_experts, ggml_backend_dev_buffer_type(cache_dev) },
+        { nullptr,           nullptr                                 }
+    };
+    llama_model_tensor_buft_override gpu_both_layers[] = {
+        { both_layer_experts, ggml_backend_dev_buffer_type(cache_dev) },
+        { nullptr,            nullptr                                 }
+    };
+    llama_model_tensor_buft_override cpu_both_layers[] = {
+        { both_layer_experts, ggml_backend_cpu_buffer_type() },
+        { nullptr,            nullptr                        }
+    };
+
+    auto execution_vocab_model =
+        expect_load("execution vocabulary", moe_metadata.get(), make_params(both_layers, 1, nullptr), true);
+    if (!execution_vocab_model) {
+        return 1;
+    }
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(execution_vocab_model.get()));
+    const auto execution_tokens = get_tokens(4, n_vocab, seed + 41);
+    const auto run_execution = [&](const char * label, llama_model_params params,
+                                   std::array<bool, 2> expected_cached) {
+        auto model = expect_load(label, moe_metadata.get(), params, true);
+        if (!model) {
+            return std::vector<float>();
+        }
+        for (int layer = 0; layer < 2; ++layer) {
+            if (layer_cached(*model, layer) != expected_cached[layer]) {
+                fprintf(stderr, "test-moe-cache-selector: %s layer %d runtime placement mismatch\n", label, layer);
+                ok = false;
+            }
+        }
+        llama_context_params cparams = llama_context_default_params();
+        cparams.n_ctx                = 32;
+        cparams.n_batch              = 8;
+        cparams.n_ubatch             = 8;
+        cparams.n_threads            = 4;
+        cparams.n_threads_batch      = 4;
+        llama_context_ptr context(llama_init_from_model(model.get(), cparams));
+        if (!context) {
+            fprintf(stderr, "test-moe-cache-selector: %s context creation failed\n", label);
+            ok = false;
+            return std::vector<float>();
+        }
+        auto logits = get_logits(model.get(), context.get(), execution_tokens);
+        llama_synchronize(context.get());
+        if (logits.empty() || !std::all_of(logits.begin(), logits.end(), [](float value) {
+                return std::isfinite(value);
+            })) {
+            fprintf(stderr, "test-moe-cache-selector: %s produced invalid output\n", label);
+            ok = false;
+        }
+        return logits;
+    };
+
+    const auto ordinary_device = run_execution(
+        "execute entirely ordinary device", make_params(both_layers, 1, gpu_both_layers), { false, false });
+    const auto ordinary_host = run_execution(
+        "execute ordinary host control", make_params(both_layers, 1, cpu_both_layers), { false, false });
+    const double control_nmse = ordinary_device.empty() || ordinary_host.empty() ? INFINITY :
+        nmse(ordinary_device, ordinary_host);
+    const double mixed_tolerance = std::max(1e-6, 4.0 * control_nmse);
+    if (!std::isfinite(control_nmse) || control_nmse > 1e-4) {
+        fprintf(stderr, "test-moe-cache-selector: ordinary control NMSE %.9g exceeds qualification bound\n",
+                control_nmse);
+        ok = false;
+    }
+    const auto check_execution = [&](const char * label, const std::vector<float> & actual) {
+        const double error = ordinary_device.empty() || actual.empty() ? INFINITY : nmse(ordinary_device, actual);
+        fprintf(stderr, "test-moe-cache-selector: %-28s nmse=%.9g tolerance=%.9g\n", label, error,
+                mixed_tolerance);
+        if (!std::isfinite(error) || error > mixed_tolerance) {
+            ok = false;
+        }
+    };
+    check_execution("ordinary/cache", run_execution(
+        "execute ordinary/cache", make_params(both_layers, 1, gpu_override), { false, true }));
+    check_execution("cache/ordinary", run_execution(
+        "execute cache/ordinary", make_params(both_layers, 1, gpu_layer_one), { true, false }));
+    check_execution("all cache", run_execution(
+        "execute all cache", make_params(both_layers, 1, nullptr), { true, true }));
+    check_execution("full-slot cache", run_execution(
+        "execute full-slot cache", make_params(both_layers, 1, nullptr, 8), { true, true }));
+
+    {
+        gguf_context_ptr mtp_metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true, 8, 2, 2);
+        const llama_model_layer_range routed_layers[] = {
+            { 1, 2 },
+        };
+        static const char * target_experts = "blk\\.1\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+        static const char * mtp_experts    = "blk\\.2\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+        static const char * routed_experts = "blk\\.[12]\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+        llama_model_tensor_buft_override target_ordinary[] = {
+            { target_experts, ggml_backend_dev_buffer_type(cache_dev) },
+            { nullptr,        nullptr                                 },
+        };
+        llama_model_tensor_buft_override mtp_ordinary[] = {
+            { mtp_experts, ggml_backend_dev_buffer_type(cache_dev) },
+            { nullptr,     nullptr                                 },
+        };
+        llama_model_tensor_buft_override all_ordinary[] = {
+            { routed_experts, ggml_backend_dev_buffer_type(cache_dev) },
+            { nullptr,        nullptr                                 },
+        };
+
+        auto make_mtp_params = [&](const llama_model_tensor_buft_override * overrides, int32_t slots = 4) {
+            auto params              = make_params(routed_layers, 1, overrides, slots);
+            params.load_mtp          = true;
+            return params;
+        };
+        struct target_mtp_output {
+            std::vector<float> target;
+            std::vector<float> mtp;
+        };
+        const auto routed_layer_cached = [&](const llama_model & model, int layer) {
+            const auto & block = model.layers.at(layer);
+            const ggml_tensor * banks[] = {
+                block.ffn_gate_exps, block.ffn_up_exps, block.ffn_down_exps, block.ffn_gate_up_exps,
+            };
+            bool saw_bank = false;
+            for (const auto * bank : banks) {
+                if (bank != nullptr) {
+                    saw_bank = true;
+                    if (!is_cached(bank)) {
+                        return false;
+                    }
+                }
+            }
+            return saw_bank;
+        };
+        const auto run_target_mtp = [&](const char * label, llama_model_params params,
+                                        std::array<bool, 2> expected_cached) {
+            target_mtp_output output;
+            auto model = expect_load(label, mtp_metadata.get(), params, true);
+            if (!model) {
+                return output;
+            }
+            if (routed_layer_cached(*model, 1) != expected_cached[0] ||
+                routed_layer_cached(*model, 2) != expected_cached[1]) {
+                fprintf(stderr,
+                        "test-moe-cache-selector: %s target/MTP placement mismatch actual=%d,%d expected=%d,%d\n",
+                        label, routed_layer_cached(*model, 1), routed_layer_cached(*model, 2),
+                        expected_cached[0], expected_cached[1]);
+                print_layer_bufts(*model, 1);
+                print_layer_bufts(*model, 2);
+                ok = false;
+            }
+            llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
+            llama_context_ptr mtp = make_phase_workspace_context(
+                model.get(), LLAMA_CONTEXT_TYPE_MTP, target.get());
+            if (!target || !mtp) {
+                fprintf(stderr, "test-moe-cache-selector: %s target/MTP context creation failed\n", label);
+                ok = false;
+                return output;
+            }
+            const uint32_t vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+            output.target = get_logits(model.get(), target.get(), get_tokens(4, vocab, seed + 51));
+            llama_batch mtp_batch = make_mtp_batch(1, llama_model_n_embd_out(model.get()), 0, vocab, seed + 52);
+            if (llama_decode(mtp.get(), mtp_batch) != 0) {
+                fprintf(stderr, "test-moe-cache-selector: %s MTP decode failed\n", label);
+                ok = false;
+            } else {
+                llama_synchronize(mtp.get());
+                const float * logits = llama_get_logits_ith(mtp.get(), 0);
+                if (logits != nullptr) {
+                    output.mtp.assign(logits, logits + vocab);
+                }
+            }
+            llama_batch_free(mtp_batch);
+            if (output.target.empty() || output.mtp.empty() ||
+                !std::all_of(output.target.begin(), output.target.end(), [](float value) { return std::isfinite(value); }) ||
+                !std::all_of(output.mtp.begin(), output.mtp.end(), [](float value) { return std::isfinite(value); })) {
+                fprintf(stderr, "test-moe-cache-selector: %s target/MTP output invalid\n", label);
+                ok = false;
+            }
+            return output;
+        };
+
+        const auto ordinary = run_target_mtp(
+            "target+MTP all ordinary", make_mtp_params(all_ordinary), { false, false });
+        const auto check_target_mtp = [&](const char * label, const target_mtp_output & actual) {
+            const double target_error = ordinary.target.empty() || actual.target.empty() ? INFINITY :
+                nmse(ordinary.target, actual.target);
+            const double mtp_error = ordinary.mtp.empty() || actual.mtp.empty() ? INFINITY :
+                nmse(ordinary.mtp, actual.mtp);
+            fprintf(stderr, "test-moe-cache-selector: %-28s target_nmse=%.9g mtp_nmse=%.9g\n",
+                    label, target_error, mtp_error);
+            if (!std::isfinite(target_error) || !std::isfinite(mtp_error) ||
+                target_error > 1e-6 || mtp_error > 1e-6) {
+                ok = false;
+            }
+        };
+        check_target_mtp("target ordinary/MTP cache", run_target_mtp(
+            "target ordinary/MTP cache", make_mtp_params(target_ordinary), { false, true }));
+        check_target_mtp("target cache/MTP ordinary", run_target_mtp(
+            "target cache/MTP ordinary", make_mtp_params(mtp_ordinary), { true, false }));
+        check_target_mtp("target+MTP all cache", run_target_mtp(
+            "target+MTP all cache", make_mtp_params(nullptr), { true, true }));
+        check_target_mtp("target+MTP full-slot", run_target_mtp(
+            "target+MTP full-slot", make_mtp_params(nullptr, 8), { true, true }));
     }
 
     {

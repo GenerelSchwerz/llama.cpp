@@ -10,6 +10,7 @@ constexpr int n_experts = 8;
 constexpr int n_used    = 2;
 constexpr int n_slots   = 4;
 constexpr size_t bounded_host_budget = 2 * 1024 * 1024;
+constexpr uint32_t all_cached_layers = (1u << 2) - 1;
 
 ggml_graph_execution_certificate layer_certificate(bool required = false) {
     ggml_graph_execution_certificate certificate{};
@@ -29,7 +30,10 @@ ggml_graph_execution_certificate layer_certificate(bool required = false) {
 struct layer_fixture {
     ggml_context_ptr                                  weights;
     ggml_backend_buffer_ptr                           weight_buffer;
+    std::vector<ggml_backend_buffer_ptr>              ordinary_buffers;
     ggml_backend_buffer_type_t                        buft = nullptr;
+    uint32_t                                           cached_layers = all_cached_layers;
+    uint32_t                                           cache_slots   = n_slots;
     llm_graph_result                                  result{ 256 };
     ggml_tensor *                                     input      = nullptr;
     ggml_tensor *                                     logits[2]  = {};
@@ -43,17 +47,39 @@ struct layer_fixture {
     std::vector<ggml_backend_moe_candidate_group_v2>  groups;
     std::vector<ggml_backend_moe_candidate_tensor_v2> tensors;
 
-    explicit layer_fixture(size_t host_budget, uint32_t layout, ggml_type type, bool pageable = false) {
+    explicit layer_fixture(size_t host_budget, uint32_t layout, ggml_type type, bool pageable = false,
+                           const std::array<int, 2> & ordinary_devices = { 0, 0 },
+                           uint32_t cache_layer_mask = all_cached_layers, uint32_t slots = n_slots, bool named_weights = false) :
+        cached_layers(cache_layer_mask), cache_slots(slots) {
         weights.reset(ggml_init({ 32 * ggml_tensor_overhead(), nullptr, true }));
         CHECK(weights != nullptr);
         buft = pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_bounded_buffer_type(host_budget);
         CHECK(buft != nullptr);
         for (int layer = 0; layer < 2; ++layer) {
+            const bool cached = (cached_layers & (1u << layer)) != 0;
+            const auto ordinary = [&](ggml_tensor * tensor) {
+                if (cached) {
+                    return;
+                }
+                auto * ordinary_buft = ggml_backend_cuda_buffer_type(ordinary_devices[layer]);
+                auto buffer = ggml_backend_buft_alloc_buffer(ordinary_buft, ggml_backend_buft_get_alloc_size(ordinary_buft, tensor));
+                CHECK(buffer != nullptr);
+                ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                CHECK(ggml_backend_tensor_alloc(buffer, tensor, ggml_backend_buffer_get_base(buffer)) == GGML_STATUS_SUCCESS);
+                ordinary_buffers.emplace_back(buffer);
+            };
             groups.push_back({ layout, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0 });
             const auto bank = [&](uint32_t role, int rows) {
                 auto * tensor = ggml_new_tensor_3d(weights.get(), type, n_dim, rows, n_experts);
+                if (named_weights) {
+                    const char * name = role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT ? "gate_up" :
+                        role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT ? "gate" :
+                        role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT ? "up" : "down";
+                    ggml_format_name(tensor, "blk.%d.ffn_%s_exps.weight", layer, name);
+                }
                 tensors.push_back({ tensor, (uint32_t) layer, role, GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE,
-                                    GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER, 0 });
+                                    cached ? static_cast<uint32_t>(GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) : 0u, 0 });
+                ordinary(tensor);
                 return tensor;
             };
             if (layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP) {
@@ -68,12 +94,16 @@ struct layer_fixture {
             if (pageable) {
                 down_bias[layer] = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, n_dim, n_experts);
                 tensors.push_back({down_bias[layer], (uint32_t) layer, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_BIAS,
-                    GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS, GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER, 0});
+                    GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS,
+                    cached ? static_cast<uint32_t>(GGML_BACKEND_MOE_CANDIDATE_TENSOR_V2_FLAG_CACHED_BUFFER) : 0u, 0});
+                ordinary(down_bias[layer]);
             }
         }
         weight_buffer.reset(ggml_backend_alloc_ctx_tensors_from_buft(weights.get(), buft));
-        CHECK(weight_buffer != nullptr);
-        ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        if (weight_buffer != nullptr) {
+            ggml_backend_buffer_set_usage(weight_buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        }
+        CHECK(weight_buffer != nullptr || !ordinary_buffers.empty());
         size_t salt = 101;
         for (auto * tensor = ggml_get_first_tensor(weights.get()); tensor;
              tensor        = ggml_get_next_tensor(weights.get(), tensor)) {
@@ -128,7 +158,7 @@ struct layer_fixture {
     }
 
     ggml_backend_moe_candidate_snapshot_v2 manifest() const {
-        return candidate_snapshot_v2(n_slots, groups.data(), groups.size(), tensors.data(), tensors.size());
+        return candidate_snapshot_v2(cache_slots, groups.data(), groups.size(), tensors.data(), tensors.size());
     }
 
     void set_inputs(int iteration) {
@@ -225,8 +255,18 @@ void run_layers(const std::vector<int> & devices,
                 bool                     split_route = false,
                 uint32_t                 layout      = GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP,
                 ggml_type                type        = GGML_TYPE_Q4_0,
-                bool                     pageable    = false) {
-    layer_fixture                 fixture(host_budget, layout, type, pageable);
+                bool                     pageable    = false,
+                uint32_t                 cached_layers = all_cached_layers,
+                uint32_t                 cache_slots   = n_slots,
+                bool                     named_weights = false) {
+    int physical_devices = 0;
+    CUDA_OK(cudaGetDeviceCount(&physical_devices));
+    std::array<int, 2> ordinary_devices = {};
+    for (int layer = 0; layer < 2; ++layer) {
+        const int device = devices[layer % devices.size()];
+        ordinary_devices[layer] = device < physical_devices ? device : 0;
+    }
+    layer_fixture                 fixture(host_budget, layout, type, pageable, ordinary_devices, cached_layers, cache_slots, named_weights);
     std::vector<ggml_backend_ptr> owners;
     std::vector<ggml_backend_t>   backends;
     for (int device : devices) {
@@ -234,8 +274,6 @@ void run_layers(const std::vector<int> & devices,
         CHECK(owners.back() != nullptr);
         backends.push_back(owners.back().get());
     }
-    int physical_devices = 0;
-    CUDA_OK(cudaGetDeviceCount(&physical_devices));
     const bool virtual_devices = std::any_of(devices.begin(), devices.end(), [&](int device) { return device >= physical_devices; });
     if (devices.size() == 2 && devices[0] != devices[1] && devices[0] < physical_devices && devices[1] < physical_devices) {
         test_boundary_copy(backends[0], backends[1], devices[0], devices[1]);
@@ -294,7 +332,7 @@ void run_layers(const std::vector<int> & devices,
             for (auto * node : region.operations) {
                 CHECK(ggml_backend_sched_get_tensor_backend(sched.get(), node) == nullptr);
             }
-            region.output->buffer = fixture.weight_buffer.get();
+            region.output->buffer = fixture.down[layer]->buffer;
             CHECK(!region.place(sched.get(), owner));
             region.output->buffer = nullptr;
             for (auto * node : region.operations) {
@@ -323,8 +361,8 @@ void run_layers(const std::vector<int> & devices,
         } else {
             CHECK(ggml_backend_sched_alloc_graph(sched.get(), fixture.result.get_gf()));
         }
-        fprintf(stderr, "test-moe-cache: layer fixture devices=%zu splits=%d host_budget=%zu\n", devices.size(),
-                ggml_backend_sched_get_n_splits(sched.get()), host_budget);
+        fprintf(stderr, "test-moe-cache: layer fixture devices=%zu splits=%d host_budget=%zu cached_layers=0x%x slots=%u\n",
+                devices.size(), ggml_backend_sched_get_n_splits(sched.get()), host_budget, cached_layers, cache_slots);
         for (int layer = 0; layer < 2; ++layer) {
             if (affinity) {
                 CHECK(ggml_backend_sched_get_tensor_backend(sched.get(), fixture.output[layer]) ==
@@ -348,7 +386,7 @@ void run_layers(const std::vector<int> & devices,
         }
     };
     const auto enabled  = fixture.manifest();
-    const auto disabled = candidate_snapshot_v2(n_slots, nullptr, 0, nullptr, 0);
+    const auto disabled = candidate_snapshot_v2(cache_slots, nullptr, 0, nullptr, 0);
     const auto publish  = [&](const ggml_backend_moe_candidate_snapshot_v2 & snapshot) {
         ggml_backend_sched_synchronize(sched.get());
         for (size_t i = 0; i < devices.size(); ++i) {
@@ -356,14 +394,39 @@ void run_layers(const std::vector<int> & devices,
                   GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         }
     };
-    const auto compute = [&](int iteration) {
+    using layer_outputs = std::array<std::vector<float>, 2>;
+    const auto compute = [&](int iteration, layer_outputs * outputs = nullptr) {
         fixture.set_inputs(iteration);
         const auto certificate = layer_certificate();
         CHECK(ggml_backend_sched_graph_compute_async_ext(sched.get(), fixture.result.get_gf(), &certificate) ==
               GGML_STATUS_SUCCESS);
         ggml_backend_sched_synchronize(sched.get());
+        if (outputs != nullptr) {
+            for (int layer = 0; layer < 2; ++layer) {
+                (*outputs)[layer] = active_grouped_tensor_values(fixture.output[layer]);
+            }
+        }
         return active_grouped_tensor_values(fixture.output[1]);
     };
+    std::vector<layer_outputs> ordinary_expected;
+    if (cached_layers != 0 && cached_layers != all_cached_layers) {
+        // Use ordinary device weights to check both legacy and grouped cache execution.
+        layer_fixture ordinary(0, layout, type, pageable, ordinary_devices, 0, cache_slots, named_weights);
+        ggml_backend_sched_ptr ordinary_sched(ggml_backend_sched_new(backends.data(), nullptr, backends.size(), 256, true, true));
+        CHECK(ordinary_sched != nullptr);
+        for (int layer = 0; layer < 2; ++layer) {
+            CHECK(ordinary.result.get_moe_regions()[layer].place(ordinary_sched.get(), backends[layer % devices.size()]));
+        }
+        CHECK(ggml_backend_sched_alloc_graph(ordinary_sched.get(), ordinary.result.get_gf()));
+        for (int iteration = 0; iteration < 8; ++iteration) {
+            ordinary.set_inputs(iteration);
+            CHECK(ggml_backend_sched_graph_compute(ordinary_sched.get(), ordinary.result.get_gf()) == GGML_STATUS_SUCCESS);
+            ordinary_expected.emplace_back();
+            for (int layer = 0; layer < 2; ++layer) {
+                ordinary_expected.back()[layer] = active_grouped_tensor_values(ordinary.output[layer]);
+            }
+        }
+    }
     if (devices.size() == 2) {
         allocate(true, true);
         for (int layer = 0; layer < 2; ++layer) {
@@ -374,16 +437,20 @@ void run_layers(const std::vector<int> & devices,
     }
     ggml_backend_buffer_ptr reference_auxiliaries;
     std::array<void *, 2> pageable_bias_data = {};
+    std::array<ggml_backend_buffer_t, 2> pageable_bias_buffers = {};
     if (pageable) {
         const size_t size = ggml_nbytes(fixture.down_bias[0]);
         reference_auxiliaries.reset(ggml_backend_buft_alloc_buffer(ggml_backend_cuda_moe_cached_buffer_type(), 2 * size));
         CHECK(reference_auxiliaries != nullptr);
         for (int layer = 0; layer < 2; ++layer) {
             auto * bias = fixture.down_bias[layer];
+            std::vector<char> bytes(size);
+            ggml_backend_tensor_get(bias, bytes.data(), 0, size);
             pageable_bias_data[layer] = bias->data;
+            pageable_bias_buffers[layer] = bias->buffer;
             bias->data = static_cast<char *>(ggml_backend_buffer_get_base(reference_auxiliaries.get())) + layer * size;
             bias->buffer = reference_auxiliaries.get();
-            memcpy(bias->data, pageable_bias_data[layer], size);
+            memcpy(bias->data, bytes.data(), size);
         }
     }
     publish(disabled);
@@ -393,13 +460,43 @@ void run_layers(const std::vector<int> & devices,
     // The legacy reference uses physical GPU 0; its raw CUDA ordinal API does not emulate devices.
     allocate(true, false, virtual_devices);
     std::vector<std::vector<float>> expected;
+    std::vector<layer_outputs> expected_layers;
     for (int iteration = 0; iteration < 8; ++iteration) {
-        expected.push_back(compute(iteration));
+        expected_layers.emplace_back();
+        expected.push_back(compute(iteration, &expected_layers.back()));
+        if (!ordinary_expected.empty()) {
+            for (int layer = 0; layer < 2; ++layer) {
+                check_active_grouped_exact_output(ordinary_expected[iteration][layer], expected_layers.back()[layer]);
+            }
+        }
+    }
+    for (size_t i = 0; i < devices.size(); ++i) {
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::legacy_debug_telemetry(
+            *ggml_cuda_moe_grouped_context_for_test(backends[i]), true);
+        fprintf(stderr, "test-moe-cache: route publication cached_layers=0x%x owner=%zu slots=%u named=%d ops=%llu reused_ids=%llu d2h_syncs=%llu publications=%zu\n",
+            cached_layers, i, cache_slots, named_weights, (unsigned long long) telemetry.ops,
+            (unsigned long long) telemetry.ids_cache_hits, (unsigned long long) telemetry.ids_d2h_sync_count,
+            ggml_cuda_moe_ids_cache_count_for_test(backends[i]));
+        if (cached_layers == 0) {
+            CHECK(ggml_cuda_moe_ids_cache_count_for_test(backends[i]) == 0);
+        }
+        const char * disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION");
+        if (named_weights && cached_layers != 0 && !split_route && !virtual_devices &&
+                (!disable_fusion || std::atoi(disable_fusion) == 0)) {
+            CHECK(telemetry.ids_d2h_sync_count == 0);
+        }
+        if (!split_route && !virtual_devices && (!disable_fusion || std::atoi(disable_fusion) == 0)) {
+            size_t expected_publications = 0;
+            for (int layer = 0; layer < 2; ++layer) {
+                expected_publications += (cached_layers & (1u << layer)) != 0 && layer % devices.size() == i;
+            }
+            CHECK(ggml_cuda_moe_ids_cache_count_for_test(backends[i]) == expected_publications);
+        }
     }
     if (pageable) {
         for (int layer = 0; layer < 2; ++layer) {
             fixture.down_bias[layer]->data = pageable_bias_data[layer];
-            fixture.down_bias[layer]->buffer = fixture.weight_buffer.get();
+            fixture.down_bias[layer]->buffer = pageable_bias_buffers[layer];
         }
     }
     publish(enabled);
@@ -411,7 +508,12 @@ void run_layers(const std::vector<int> & devices,
         legacy_before.push_back(active_grouped_legacy_op_count(backends[i]));
     }
     for (int iteration = 0; iteration < 8; ++iteration) {
-        check_active_grouped_exact_output(expected[iteration], compute(iteration));
+        layer_outputs actual;
+        const auto final = compute(iteration, &actual);
+        check_active_grouped_exact_output(expected[iteration], final);
+        for (int layer = 0; layer < 2; ++layer) {
+            check_active_grouped_exact_output(expected_layers[iteration][layer], actual[layer]);
+        }
     }
     for (size_t i = 0; i < devices.size(); ++i) {
         auto * context = ggml_cuda_moe_grouped_context_for_test(backends[i]);
@@ -425,13 +527,14 @@ void run_layers(const std::vector<int> & devices,
         CHECK(telemetry.fallback == telemetry.decode_legacy);
         uint64_t expected_completed = 0;
         for (int layer = 0; layer < 2; ++layer) {
-            if (layer % devices.size() == i && !(split_route && layer == 1)) {
+            if ((cached_layers & (1u << layer)) && layer % devices.size() == i &&
+                !(split_route && layer == 1)) {
                 expected_completed += 8;
             }
         }
         CHECK(telemetry.completed == expected_completed && telemetry.decode_grouped == expected_completed);
         CHECK(telemetry.ready == expected_completed);
-        if (!fallback_owner) {
+        if (!fallback_owner && expected_completed > 0) {
             CHECK(active_grouped_legacy_op_count(backends[i]) == legacy_before[i]);
             if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {
                 CHECK(telemetry.captures > 0 && telemetry.replays > 0);
@@ -441,13 +544,20 @@ void run_layers(const std::vector<int> & devices,
         }
         CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
         CHECK(telemetry.submitted == telemetry.completed);
+        if (cached_layers == 0) {
+            CHECK(telemetry.admitted_banks == 0 && telemetry.h2d_banks == 0 && telemetry.h2d_bytes == 0);
+        }
         for (int layer = 0; layer < 2; ++layer) {
             ggml_cuda_moe_candidate_group_key key;
-            CHECK(context->find_down_group_key(fixture.down[layer], &key));
-            ggml_cuda_moe_candidate_group_info info;
-            CHECK(context->get_group(key, &info) && info.semantic_group_index == (uint32_t) layer);
-            if (layer % devices.size() != i) {
-                CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+            if (cached_layers & (1u << layer)) {
+                CHECK(context->find_down_group_key(fixture.down[layer], &key));
+                ggml_cuda_moe_candidate_group_info info;
+                CHECK(context->get_group(key, &info) && info.semantic_group_index == (uint32_t) layer);
+                if (layer % devices.size() != i) {
+                    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+                }
+            } else {
+                CHECK(!context->find_down_group_key(fixture.down[layer], &key));
             }
         }
     }
@@ -466,7 +576,7 @@ void run_layers(const std::vector<int> & devices,
             for (size_t i = 0; i < devices.size(); ++i) {
                 const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(
                     *ggml_cuda_moe_grouped_context_for_test(backends[i]));
-                CHECK(telemetry.submitted == (i == 0 ? 1 : 0) && telemetry.completed == telemetry.submitted);
+                CHECK(telemetry.submitted == (i == 0 && (cached_layers & 1u) ? 1 : 0) && telemetry.completed == telemetry.submitted);
                 CHECK(telemetry.fallback == 0);
             }
         }
@@ -508,16 +618,24 @@ void run_layers(const std::vector<int> & devices,
         backends[i]->iface.graph_compute = probe.delegates[i];
     }
     active_probe = nullptr;
-    if (!split_route && !virtual_devices) {
-        if (devices.size() == 2) {
-            owners[0].reset();
+    int survivor_layer = -1;
+    for (int layer = 0; layer < 2; ++layer) {
+        if ((cached_layers & (1u << layer)) &&
+            (survivor_layer < 0 || layer % devices.size() == devices.size() - 1)) {
+            survivor_layer = layer;
         }
-        auto *                        survivor = backends[devices.size() - 1];
+    }
+    if (!split_route && !virtual_devices && survivor_layer >= 0) {
+        const size_t survivor_owner = survivor_layer % devices.size();
+        if (devices.size() == 2) {
+            owners[1 - survivor_owner].reset();
+        }
+        auto *                        survivor = backends[survivor_owner];
         active_grouped_dispatch_graph shared;
         shared.n_experts = n_experts;
         shared.n_used    = n_used;
         for (const auto & bank : fixture.tensors) {
-            if (bank.group_index == 1) {
+            if (bank.group_index == (uint32_t) survivor_layer) {
                 if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
                     shared.banks.push_back(const_cast<ggml_tensor *>(bank.tensor));
                     shared.roles.push_back(bank.role);
@@ -535,16 +653,16 @@ void run_layers(const std::vector<int> & devices,
         ggml_backend_tensor_set(graph.input, input.data(), 0, input.size());
         set_active_grouped_dispatch_logits({ &graph }, 0);
         if (pageable) {
-            fixture.down_bias[1]->data = static_cast<char *>(ggml_backend_buffer_get_base(reference_auxiliaries.get())) +
-                ggml_nbytes(fixture.down_bias[1]);
-            fixture.down_bias[1]->buffer = reference_auxiliaries.get();
+            fixture.down_bias[survivor_layer]->data = static_cast<char *>(ggml_backend_buffer_get_base(reference_auxiliaries.get())) +
+                survivor_layer * ggml_nbytes(fixture.down_bias[survivor_layer]);
+            fixture.down_bias[survivor_layer]->buffer = reference_auxiliaries.get();
         }
         CHECK(ggml_backend_cuda_moe_candidate_replace_v2(survivor, &disabled) ==
               GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         const auto reference = run_active_grouped_dispatch(survivor, graph, 0);
         if (pageable) {
-            fixture.down_bias[1]->data = pageable_bias_data[1];
-            fixture.down_bias[1]->buffer = fixture.weight_buffer.get();
+            fixture.down_bias[survivor_layer]->data = pageable_bias_data[survivor_layer];
+            fixture.down_bias[survivor_layer]->buffer = pageable_bias_buffers[survivor_layer];
         }
         CHECK(ggml_backend_cuda_moe_candidate_replace_v2(survivor, &enabled) ==
               GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
@@ -553,7 +671,7 @@ void run_layers(const std::vector<int> & devices,
         (void) ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
         const auto legacy_before = active_grouped_legacy_op_count(survivor);
         const auto capability =
-            native_mmid_capability(devices.back(), graph.banks[0], graph.n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
+            native_mmid_capability(devices[survivor_owner], graph.banks[0], graph.n_rows, GGML_CUDA_MMID_MAPPING_DIRECT);
         const char * disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION");
         // F3 writes the GLU result directly and leaves the gate/up sentinels intact.
         const bool   f3_skipped =
@@ -562,7 +680,7 @@ void run_layers(const std::vector<int> & devices,
             capability.selection == GGML_CUDA_MMID_CONSUMER_MMVQ && graph.banks[0]->type == graph.banks[1]->type &&
             ggml_are_same_shape(graph.banks[0], graph.banks[1]) && ggml_are_same_stride(graph.banks[0], graph.banks[1]);
         fprintf(stderr, "test-moe-cache: survivor device=%d layout=%u type=%s generation=%llu f3_skipped=%d\n",
-                devices.back(), layout, ggml_type_name(type), (unsigned long long) context->state().generation,
+                devices[survivor_owner], layout, ggml_type_name(type), (unsigned long long) context->state().generation,
                 f3_skipped);
         for (int pass = 0; pass < 3; ++pass) {
             check_active_grouped_exact_output(reference, run_active_grouped_dispatch(survivor, graph, 0, f3_skipped));
@@ -674,6 +792,15 @@ void test_grouped_layer_placement() {
     run_layers({ device }, 0, true);
     run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_K);
     run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED);
+    run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false, 1u << 0);
+    run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false, 1u << 1);
+    run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false, 0);
+    run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false,
+               all_cached_layers, n_experts);
+    for (uint32_t mask : {1u, 2u, all_cached_layers}) {
+        run_layers({ device }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false,
+                   mask, n_slots, true);
+    }
     test_shared_source_owners(device, 0);
     test_shared_source_owners(device, 1024 * 1024);
     test_shared_source_owners(device, 0, true);
@@ -728,6 +855,8 @@ int test_grouped_multigpu() {
     ggml_backend_cuda_moe_set_debug_mm(true);
     run_layers({ 0, 1 }, 0);
     run_layers({ 0, 1 }, bounded_host_budget);
+    run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false, 1u << 1);
+    run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, false, 1u << 0);
     run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_TYPE_Q4_0, true);
     run_layers({ 0, 1 }, 0, true);
     run_layers({ 0, 1 }, 0, false, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_TYPE_Q4_K);

@@ -2183,6 +2183,8 @@ void test_candidate_registry(bool benchmark) {
 }
 
 void test_moe_route_publication_lifetime() {
+    constexpr int N_DIM = 32;
+    constexpr int N_OUTPUT = 8;
     constexpr int N_EXPERTS = 64;
     constexpr int N_USED = 6;
     constexpr int N_ROUTES = 2 * GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS;
@@ -2198,8 +2200,26 @@ void test_moe_route_publication_lifetime() {
     ggml_tensor * storage = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, N_EXPERTS, N_ROUTES);
     ggml_cgraph * graph = ggml_new_graph_custom(ctx.get(), 32, false);
     ggml_build_forward_expand(graph, weights);
+    const int n_router_nodes = ggml_graph_n_nodes(graph);
+    ggml_tensor * bank = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, N_DIM, N_OUTPUT, N_EXPERTS);
+    ggml_set_name(bank, "blk.0.ffn_up_exps.weight");
+    auto * cached_buft = ggml_backend_cuda_moe_cached_buffer_type();
+    ggml_backend_buffer_ptr cached(ggml_backend_buft_alloc_buffer(cached_buft, ggml_backend_buft_get_alloc_size(cached_buft, bank)));
+    CHECK(cached != nullptr);
+    CHECK(ggml_backend_tensor_alloc(cached.get(), bank, ggml_backend_buffer_get_base(cached.get())) == GGML_STATUS_SUCCESS);
+    ggml_tensor * input = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, N_DIM, 1, 1);
+    ggml_tensor * output = ggml_mul_mat_id(ctx.get(), bank, input, ids);
+    ggml_build_forward_expand(graph, output);
     ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
     CHECK(buffer != nullptr);
+    std::vector<float> bank_values(N_DIM * N_OUTPUT * N_EXPERTS);
+    for (int expert = 0; expert < N_EXPERTS; ++expert) {
+        std::fill_n(bank_values.data() + expert * N_DIM * N_OUTPUT, N_DIM * N_OUTPUT, (float) expert);
+    }
+    ggml_backend_tensor_set(bank, bank_values.data(), 0, ggml_nbytes(bank));
+    std::array<float, N_DIM> input_values;
+    input_values.fill(1.0f);
+    ggml_backend_tensor_set(input, input_values.data(), 0, sizeof(input_values));
     std::array<float, N_EXPERTS> values;
     float sum = 0.0f;
     for (int i = 0; i < N_EXPERTS; ++i) {
@@ -2207,6 +2227,11 @@ void test_moe_route_publication_lifetime() {
         sum += std::exp(values[i]);
     }
     ggml_backend_tensor_set(logits, values.data(), 0, sizeof(values));
+    auto router_only = ggml_graph_view(graph, 0, n_router_nodes);
+    for (int pass = 0; pass < 3; ++pass) {
+        CHECK(ggml_backend_graph_compute(backend.get(), &router_only) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_cuda_moe_ids_cache_count_for_test(backend.get()) == 0);
+    }
     for (int i = 0; i < N_ROUTES; ++i) {
         ids->view_src->data = static_cast<char *>(storage->data) + i * storage->nb[1];
         ids->data = ids->view_src->data;
@@ -2219,6 +2244,12 @@ void test_moe_route_publication_lifetime() {
         for (int route = 0; route < N_USED; ++route) {
             CHECK(std::abs(actual[route] - std::exp(values[N_EXPERTS - route - 1]) / sum) < 1e-6f);
         }
+        const auto actual_output = active_grouped_tensor_values(output);
+        for (int route = 0; route < N_USED; ++route) {
+            for (int row = 0; row < N_OUTPUT; ++row) {
+                CHECK(actual_output[route * N_OUTPUT + row] == (float) (N_DIM * (N_EXPERTS - route - 1)));
+            }
+        }
     }
     ggml_backend_ptr other(ggml_backend_cuda_init(0));
     CHECK(other != nullptr && ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 0);
@@ -2227,6 +2258,24 @@ void test_moe_route_publication_lifetime() {
     CHECK(ggml_backend_cuda_moe_candidate_replace_v1(other.get(), &snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(ggml_backend_graph_compute(other.get(), graph) == GGML_STATUS_SUCCESS);
     CHECK(ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 1);
+    // A rebuilt graph safely reuses the producer-owned slot instead of consuming the bounded table.
+    graph->uid = ggml_graph_next_uid();
+    CHECK(ggml_backend_graph_compute(other.get(), graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 1);
+    CHECK(ggml_backend_graph_compute(other.get(), graph) == GGML_STATUS_SUCCESS);
+    CHECK(ggml_cuda_moe_ids_cache_count_for_test(other.get()) == 1);
+    std::array<int32_t, N_USED> imported_ids;
+    std::iota(imported_ids.begin(), imported_ids.end(), 0);
+    ggml_backend_tensor_set(ids, imported_ids.data(), 0, sizeof(imported_ids));
+    auto consumer_only = ggml_graph_view(graph, ggml_graph_n_nodes(graph) - 1, ggml_graph_n_nodes(graph));
+    consumer_only.uid = graph->uid;
+    CHECK(ggml_backend_graph_compute(other.get(), &consumer_only) == GGML_STATUS_SUCCESS);
+    const auto imported_output = active_grouped_tensor_values(output);
+    for (int route = 0; route < N_USED; ++route) {
+        for (int row = 0; row < N_OUTPUT; ++row) {
+            CHECK(imported_output[route * N_OUTPUT + row] == (float) (N_DIM * route));
+        }
+    }
     other.reset();
     CHECK(ggml_cuda_moe_ids_cache_count_for_test(backend.get()) == GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS);
     CHECK(ggml_backend_graph_compute(backend.get(), graph) == GGML_STATUS_SUCCESS);

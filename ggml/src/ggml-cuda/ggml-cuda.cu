@@ -2315,6 +2315,7 @@ struct ggml_cuda_moe_ids_cache_state {
     size_t nb0 = 0;
     size_t nb1 = 0;
     size_t nb2 = 0;
+    uint64_t dispatch_id = 0;
 
     struct published_entry {
         int32_t * host_ids = nullptr;
@@ -2322,22 +2323,29 @@ struct ggml_cuda_moe_ids_cache_state {
         uint32_t * host_ready = nullptr;
         uint32_t * device_ready = nullptr;
         size_t count = 0;
+        uint64_t dispatch_id = 0;
+        bool unconsumed = false;
+        bool readable = false;
     };
     struct published_key {
+        // Scratch addresses can alias distinct route producers in the same dispatch.
+        const ggml_tensor * tensor;
         const void * data;
         cudaStream_t stream;
 
         bool operator==(const published_key & other) const {
-            return data == other.data && stream == other.stream;
+            return tensor == other.tensor && data == other.data && stream == other.stream;
         }
     };
     struct published_key_hash {
         size_t operator()(const published_key & key) const {
             size_t h = std::hash<const void *>{}(key.data);
+            h ^= std::hash<const void *>{}(key.tensor) + 0x9e3779b9 + (h << 6) + (h >> 2);
             h ^= std::hash<void *>{}((void *) key.stream) + 0x9e3779b9 + (h << 6) + (h >> 2);
             return h;
         }
     };
+    // Keep mapped addresses stable for retained CUDA graphs until backend stream teardown.
     std::unordered_map<published_key, published_entry, published_key_hash> published;
 
     void clear_published() {
@@ -2530,6 +2538,8 @@ static void ggml_cuda_moe_ready_clear(uint32_t * ready) {
 
 static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         ggml_backend_cuda_context & ctx,
+        const ggml_cgraph * graph,
+        int next_node,
         const ggml_tensor * ids) {
     const size_t count = (size_t) ids->ne[0];
     if (ctx.moe_grouped_context == nullptr || ctx.moe_grouped_context->state().n_slots == 0 || ids->ne[1] * ids->ne[2] != 1 ||
@@ -2537,9 +2547,23 @@ static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         return {};
     }
 
-    auto & ggml_cuda_moe_ids_cache = ggml_cuda_moe_ids_cache_get(ctx);
+    // Only the next cached MMID can consume this host publication.
+    const ggml_tensor * consumer = nullptr;
+    for (int i = next_node; i < graph->n_nodes; ++i) {
+        const ggml_tensor * node = graph->nodes[i];
+        if (node->op == GGML_OP_MUL_MAT_ID && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            consumer = node;
+            break;
+        }
+    }
+    if (consumer == nullptr || consumer->src[2] != ids || consumer->src[0] == nullptr ||
+            consumer->src[0]->buffer == nullptr ||
+            !ggml_backend_buft_is_cuda_moe_cached(consumer->src[0]->buffer->buft)) {
+        return {};
+    }
 
-    const ggml_cuda_moe_ids_cache_state::published_key key{ids->data, ctx.stream()};
+    auto & ggml_cuda_moe_ids_cache = ggml_cuda_moe_ids_cache_get(ctx);
+    const ggml_cuda_moe_ids_cache_state::published_key key{ids, ids->data, ctx.stream()};
     auto & published = ggml_cuda_moe_ids_cache.published;
     if (published.find(key) == published.end() && published.size() >= ggml_cuda_moe_ids_cache_state::MAX_PUBLISHED) {
         return {};
@@ -2571,6 +2595,11 @@ static ggml_cuda_moe_ids_publish ggml_cuda_moe_prepare_ids_publish(
         entry.count = count;
         ggml_cuda_moe_ready_clear(entry.host_ready);
     }
+    // A failed/skipped consumer can leave this producer's previous publication in flight.
+    // Do not clear its flag here: that older producer can still set it after this call.
+    entry.readable = !entry.unconsumed;
+    entry.unconsumed = true;
+    entry.dispatch_id = ggml_cuda_moe_ids_cache.dispatch_id;
     return {entry.device_ids, entry.device_ready};
 }
 
@@ -2638,12 +2667,15 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
             result.nb2 = ids->nb[2];
         }
 
-        const ggml_cuda_moe_ids_cache_state::published_key published_key{ids->data, ctx.stream()};
+        const ggml_cuda_moe_ids_cache_state::published_key published_key{ids, ids->data, ctx.stream()};
         auto published = ggml_cuda_moe_ids_cache.published.find(published_key);
+        // A retained allocation is not evidence that this dispatch produced these IDs.
         const bool can_use_published = ids->ne[1] * ids->ne[2] == 1 && published != ggml_cuda_moe_ids_cache.published.end() &&
-            published->second.count == (size_t) ids->ne[0] && target->size() == published->second.count*sizeof(int32_t);
+            published->second.count == (size_t) ids->ne[0] && target->size() == published->second.count*sizeof(int32_t) &&
+            published->second.dispatch_id == ggml_cuda_moe_ids_cache.dispatch_id &&
+            published->second.unconsumed;
         bool ready = false;
-        if (can_use_published) {
+        if (can_use_published && published->second.readable) {
             const int64_t spin_start_us = ggml_time_us();
             do {
                 for (int spin = 0; spin < 1024; ++spin) {
@@ -2671,6 +2703,7 @@ static ggml_cuda_moe_ids_host ggml_cuda_moe_read_ids(
         }
         if (can_use_published) {
             ggml_cuda_moe_ready_clear(published->second.host_ready);
+            published->second.unconsumed = false;
         }
         result.d2h_time_us = (uint64_t) (ggml_time_us() - start_us);
         result.bytes = target;
@@ -5562,7 +5595,7 @@ static int ggml_cuda_try_fuse(
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
-                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, cgraph, i + ops.size(), ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
@@ -5579,7 +5612,7 @@ static int ggml_cuda_try_fuse(
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
                     const ggml_cuda_moe_ids_publish publish = grouped_device_ids ?
-                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, ids);
+                        ggml_cuda_moe_ids_publish{} : ggml_cuda_moe_prepare_ids_publish(*cuda_ctx, cgraph, i + ops.size(), ids);
                     ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args, publish.ids, publish.ready);
                     return ops.size() - 1;
                 }
@@ -6804,6 +6837,10 @@ static bool ggml_cuda_graph_has_cached_buffer_mmid(const ggml_cgraph * cgraph) {
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    if (cgraph != nullptr && cuda_ctx->moe_ids_cache != nullptr) {
+        ++cuda_ctx->moe_ids_cache->dispatch_id;
+        ggml_cuda_moe_ids_cache_clear_pending(*cuda_ctx->moe_ids_cache);
+    }
 
     const bool required_requested = cgraph != nullptr &&
         (cgraph->execution_certificate.flags & GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED) != 0;

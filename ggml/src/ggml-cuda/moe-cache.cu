@@ -8156,6 +8156,7 @@ ggml_cuda_moe_legacy_debug_telemetry ggml_cuda_moe_grouped_context::legacy_debug
     result.overflow_ops = stats.overflow_ops.load(std::memory_order_relaxed);
     result.unique_experts_max = stats.unique_experts_max.load(std::memory_order_relaxed);
     result.ids_cache_hits = stats.ids_cache_hits.load(std::memory_order_relaxed);
+    result.ids_d2h_sync_count = stats.ids_d2h_sync_count.load(std::memory_order_relaxed);
     return result;
 }
 

@@ -516,6 +516,7 @@ struct ggml_cuda_moe_legacy_debug_telemetry {
     uint64_t overflow_ops = 0;
     uint64_t unique_experts_max = 0;
     uint64_t ids_cache_hits = 0;
+    uint64_t ids_d2h_sync_count = 0;
 };
 
 enum ggml_cuda_moe_graph_property_hint : uint32_t {
