@@ -1294,6 +1294,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.moe_expert_cache_host_pinned_size > 0) {
+        COM_INF("%s: MoE expert cache host-pinned budget = %.2f MiB (%zu bytes)\n", __func__,
+            params.moe_expert_cache_host_pinned_size / (1024.0 * 1024.0),
+            params.moe_expert_cache_host_pinned_size);
+    }
+
     if (params.fit_params) {
         if (params.n_moe_expert_cache_slots > 0) {
             COM_WRN("%s", "--fit does not account for MoE expert cache pools; set -fit off and size --moe-expert-cache-size manually\n");
