@@ -30,6 +30,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <numeric>
 #include <regex>
 #include <set>
@@ -280,6 +281,94 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         static std::list<std::string> buft_overrides;
         buft_overrides.push_back(tensor_name);
         overrides.push_back({buft_overrides.back().c_str(), buft_list.at(buffer_type)});
+    }
+}
+
+static uint64_t parse_nonnegative_uint64(const std::string & value) {
+    if (value.empty()) {
+        throw std::invalid_argument("expected a nonnegative integer");
+    }
+
+    uint64_t result = 0;
+    for (const char c : value) {
+        if (c < '0' || c > '9') {
+            throw std::invalid_argument("expected a nonnegative integer");
+        }
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (result > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            throw std::invalid_argument("integer value is too large");
+        }
+        result = result * 10 + digit;
+    }
+    return result;
+}
+
+static std::vector<llama_model_layer_range> parse_moe_cache_layer_ranges(const std::string & value) {
+    std::vector<llama_model_layer_range> result;
+    size_t begin = 0;
+    while (begin <= value.size()) {
+        const size_t end = value.find(',', begin);
+        const std::string item = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        if (item.empty()) {
+            throw std::invalid_argument("MoE cache layer ranges must not contain empty items");
+        }
+
+        const size_t dash = item.find('-');
+        if (dash != std::string::npos && item.find('-', dash + 1) != std::string::npos) {
+            throw std::invalid_argument("invalid MoE cache layer range");
+        }
+
+        const uint64_t first = parse_nonnegative_uint64(dash == std::string::npos ? item : item.substr(0, dash));
+        const uint64_t last = dash == std::string::npos ? first : parse_nonnegative_uint64(item.substr(dash + 1));
+        if (first > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) ||
+            last > static_cast<uint64_t>(std::numeric_limits<int32_t>::max()) || first > last) {
+            throw std::invalid_argument("invalid MoE cache layer range");
+        }
+
+        for (const auto & existing : result) {
+            if (first <= static_cast<uint64_t>(existing.last) &&
+                    last >= static_cast<uint64_t>(existing.first)) {
+                throw std::invalid_argument("MoE cache layer ranges must not overlap or duplicate layers");
+            }
+        }
+
+        result.push_back({static_cast<int32_t>(first), static_cast<int32_t>(last)});
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return result;
+}
+
+static std::vector<size_t> parse_moe_cache_byte_budgets(const std::string & value) {
+    constexpr uint64_t mib = 1024ull * 1024ull;
+    const uint64_t max_mib = static_cast<uint64_t>(std::numeric_limits<size_t>::max()) / mib;
+    std::vector<size_t> result;
+    size_t begin = 0;
+    while (begin <= value.size()) {
+        const size_t end = value.find(',', begin);
+        const std::string item = value.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        const uint64_t value_mib = parse_nonnegative_uint64(item);
+        if (value_mib > max_mib) {
+            throw std::invalid_argument("MoE cache byte budget is too large");
+        }
+        result.push_back(static_cast<size_t>(value_mib * mib));
+        if (end == std::string::npos) {
+            break;
+        }
+        begin = end + 1;
+    }
+    return result;
+}
+
+static void validate_moe_cache_arguments(const common_params & params) {
+    if (!params.moe_expert_cache_byte_budgets.empty() && params.n_moe_expert_cache_slots != 0) {
+        throw std::invalid_argument("--moe-expert-cache-mib conflicts with a nonzero --moe-expert-cache-size");
+    }
+    if (!params.speculative.draft.moe_expert_cache_byte_budgets.empty() &&
+        params.speculative.draft.n_moe_expert_cache_slots != 0) {
+        throw std::invalid_argument("--spec-draft-moe-expert-cache-mib conflicts with a nonzero --spec-draft-moe-expert-cache-size");
     }
 }
 
@@ -876,6 +965,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+    validate_moe_cache_arguments(params);
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2868,6 +2958,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_SIZE"));
     add_opt(common_arg(
+        {"--moe-expert-cache-layers"}, "N[,N-M,...]",
+        "select the MoE expert layers eligible for caching; absent means all matching expert tensors",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_layer_ranges = parse_moe_cache_layer_ranges(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_LAYERS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-mib"}, "MiB[,MiB,...]",
+        "per-device MoE expert cache budget in MiB; one value broadcasts across selected devices",
+        [](common_params & params, const std::string & value) {
+            params.moe_expert_cache_byte_budgets = parse_moe_cache_byte_budgets(value);
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_MIB"));
+    add_opt(common_arg(
         {"--moe-expert-cache-host-pinned-mb"}, "N",
         "MoE expert cache: model-wide pinned host budget in MiB, including source weights and staging. "
         "0 tries full pinning, then automatically registers complete groups after pageable fallback (default).",
@@ -4261,6 +4365,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
       .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_SIZE"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-expert-cache-layers"}, "N[,N-M,...]",
+        "select the draft MoE expert layers eligible for caching; absent means all matching expert tensors",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.moe_expert_cache_layer_ranges = parse_moe_cache_layer_ranges(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_LAYERS"));
+    add_opt(common_arg(
+        {"--spec-draft-moe-expert-cache-mib"}, "MiB[,MiB,...]",
+        "per-device draft MoE expert cache budget in MiB; one value broadcasts across selected devices",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.moe_expert_cache_byte_budgets = parse_moe_cache_byte_budgets(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI})
+      .set_env("LLAMA_ARG_SPEC_DRAFT_MOE_EXPERT_CACHE_MIB"));
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",

@@ -1467,7 +1467,14 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
-            slot.moe_cache_enabled = params_base.n_moe_expert_cache_slots > 0;
+            const bool target_moe_cache_enabled = params_base.n_moe_expert_cache_slots > 0 ||
+                std::any_of(params_base.moe_expert_cache_byte_budgets.begin(),
+                    params_base.moe_expert_cache_byte_budgets.end(), [](size_t bytes) { return bytes > 0; });
+            const bool draft_moe_cache_enabled = params_base.speculative.draft.n_moe_expert_cache_slots > 0 ||
+                std::any_of(params_base.speculative.draft.moe_expert_cache_byte_budgets.begin(),
+                    params_base.speculative.draft.moe_expert_cache_byte_budgets.end(),
+                    [](size_t bytes) { return bytes > 0; });
+            slot.moe_cache_enabled = target_moe_cache_enabled || draft_moe_cache_enabled;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();

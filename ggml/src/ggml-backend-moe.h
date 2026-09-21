@@ -10,6 +10,8 @@ extern "C" {
 
 #define GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_bounded_buffer_type"
+#define GGML_BACKEND_MOE_STAGING_SIZE_V1_PROC_NAME "ggml_backend_moe_staging_size_v1"
+#define GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME "ggml_backend_moe_device_size_v1"
 #define GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_free_buffer_type"
 #define GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME "ggml_backend_moe_cache_configure_sources"
 #define GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME "ggml_backend_moe_cache_is_buffer_type"
@@ -87,7 +89,79 @@ enum {
     GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS = 512,
     GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS  = 16,
     GGML_BACKEND_MOE_CANDIDATE_MAX_TENSORS_V2 = 16384,
+    GGML_BACKEND_MOE_EARLY_ROUTER_MAX_ROUTES = 32,
 };
+
+enum ggml_backend_moe_staging_family_v1 {
+    GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED     = 1u << 0,
+    GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY      = 1u << 1,
+    GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED = 1u << 2,
+};
+
+enum ggml_backend_moe_staging_flag_v1 {
+    GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL = 1u << 0,
+};
+
+struct ggml_backend_moe_staging_query_v1 {
+    uint32_t struct_size;
+    uint32_t n_slots;
+    uint32_t n_experts;
+    uint32_t top_k;
+    uint32_t n_banks;
+    uint32_t staged_bank_mask;
+    uint32_t family_mask;
+    uint32_t flags;
+    uint64_t bank_expert_strides[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+};
+
+struct ggml_backend_moe_staging_size_v1 {
+    uint32_t struct_size;
+    uint32_t reserved32;
+    uint64_t grouped_min_bytes;
+    uint64_t legacy_min_bytes;
+    uint64_t host_staged_min_bytes;
+    uint64_t optional_growth_max_bytes;
+    uint64_t prepack_tile_bytes;
+};
+
+typedef bool (*ggml_backend_moe_staging_size_v1_t)(
+    const struct ggml_backend_moe_staging_query_v1 * query,
+    struct ggml_backend_moe_staging_size_v1 * result);
+
+enum ggml_backend_moe_device_size_flag_v1 {
+    GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG = 1u << 0,
+};
+
+struct ggml_backend_moe_device_size_query_v1 {
+    uint32_t struct_size;
+    uint32_t n_slots;
+    uint32_t n_experts;
+    uint32_t n_banks;
+    uint32_t n_slot_auxiliaries;
+    uint32_t flags;
+    uint32_t early_width;
+    uint32_t early_experts;
+    uint32_t early_top_k;
+    uint32_t early_hc_rank;
+    uint64_t slot_auxiliary_values;
+    uint64_t original_shadow_bytes;
+    uint64_t prefill_copy_bytes;
+    uint64_t bank_expert_strides[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+    int64_t bank_ne0[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+    int32_t bank_types[GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS];
+};
+
+struct ggml_backend_moe_device_size_v1 {
+    uint32_t struct_size;
+    uint32_t reserved32;
+    uint64_t group_fixed_bytes;
+    uint64_t group_per_slot_bytes;
+    uint64_t context_fixed_bytes;
+};
+
+typedef bool (*ggml_backend_moe_device_size_v1_t)(
+    const struct ggml_backend_moe_device_size_query_v1 * query,
+    struct ggml_backend_moe_device_size_v1 * result);
 
 struct ggml_backend_moe_candidate_bank_v1 {
     const struct ggml_tensor * tensor;

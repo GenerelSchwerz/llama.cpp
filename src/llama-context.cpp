@@ -1683,10 +1683,15 @@ void llama_context::refresh_moe_candidates() {
     try {
         const llama_moe_candidate_snapshot candidates(model, *loras);
         for (const auto & endpoint : moe_candidate_replace_fns) {
-            const int32_t result = endpoint.second(endpoint.first, &candidates.get());
+            auto owner_candidates = candidates.get();
+            owner_candidates.n_slots = std::max(
+                model.moe_expert_cache_slots(ggml_backend_get_device(endpoint.first)), 0);
+            const int32_t result = endpoint.second(endpoint.first, &owner_candidates);
             if (result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED &&
                     result != GGML_BACKEND_MOE_CANDIDATE_REPLACE_REJECTED) {
-                endpoint.second(endpoint.first, &disabled);
+                auto owner_disabled = disabled;
+                owner_disabled.n_slots = owner_candidates.n_slots;
+                endpoint.second(endpoint.first, &owner_disabled);
             }
         }
     } catch (...) {
@@ -5131,6 +5136,9 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
     for (const auto & [buft, size] : model.memory_breakdown()) {
         ret[buft].model += size;
+    }
+    for (const auto & [buft, size] : model.moe_expert_cache_memory_breakdown(cparams.ctx_type)) {
+        ret[buft].context += size;
     }
     if (memory) {
         for (const auto & [buft, size] : memory->memory_breakdown()) {

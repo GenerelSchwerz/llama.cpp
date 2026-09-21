@@ -32,6 +32,14 @@ struct llama_moe_source_group {
     int32_t                            layer = -1;
 };
 
+struct llama_moe_cache_memory {
+    size_t fixed_device_bytes = 0;
+    size_t per_slot_device_bytes = 0;
+    uint32_t max_slots = 0;
+
+    size_t device_bytes(uint32_t slots) const;
+};
+
 // available models
 enum llm_type {
     LLM_TYPE_UNKNOWN,
@@ -769,7 +777,12 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
     int32_t moe_expert_cache_slots() const;
+    int32_t moe_expert_cache_slots(ggml_backend_dev_t dev) const;
+    bool moe_expert_cache_enabled() const;
+    const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & moe_expert_cache_memory() const;
+    std::map<ggml_backend_buffer_type_t, size_t> moe_expert_cache_memory_breakdown(enum llama_context_type ctx_type) const;
     void build_moe_sources();
+    void finalize_moe_expert_cache();
     const std::vector<llama_moe_source_group> & moe_sources() const;
 
     void prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows) const;

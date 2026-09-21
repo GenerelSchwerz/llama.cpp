@@ -463,6 +463,10 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t finish_error = 0;
     uint64_t h2d_banks = 0;
     uint64_t h2d_bytes = 0;
+    uint64_t route_accesses = 0;
+    uint64_t unique_accesses = 0;
+    uint64_t cache_hits = 0;
+    uint64_t cache_misses = 0;
     uint64_t vacant_fills = 0;
     uint64_t replacement_fills = 0;
     uint64_t invalidation_refills = 0;
@@ -475,6 +479,19 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t slot_capacity = 0;
     uint64_t populated_payload_bytes = 0;
     uint64_t payload_capacity_bytes = 0;
+    uint64_t payload_allocation_bytes = 0;
+    uint64_t slot_auxiliary_bytes = 0;
+    uint64_t fixed_auxiliary_bytes = 0;
+    uint64_t metadata_bytes = 0;
+    uint64_t host_staging_bytes = 0;
+    uint64_t prefetch_calls = 0;
+    uint64_t prefetch_proposed_bytes = 0;
+    uint64_t prefetch_copied_bytes = 0;
+    uint64_t prefetch_used_bytes = 0;
+    uint64_t prefetch_wrong_bytes = 0;
+    uint64_t prefetch_late_bytes = 0;
+    uint64_t prefetch_dropped_bytes = 0;
+    uint64_t demand_materialized_bytes = 0;
     uint64_t reset_generation_replace = 0;
     uint64_t reset_generation_reject = 0;
     uint64_t reset_clock = 0;
@@ -482,6 +499,8 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t reset_host_staged_handoff = 0;
     uint64_t decode_grouped        = 0;
     uint64_t decode_legacy         = 0;
+    uint64_t decode_grouped_by_domain[4] = {};
+    uint64_t decode_legacy_by_domain[4] = {};
     // Final readers submitted; completed counts successful completion-event recording, not a host wait.
     uint64_t submitted             = 0;
     // Group dispatches begun, before reader submission.
@@ -1088,6 +1107,13 @@ struct ggml_cuda_moe_cache;
 
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_buffer_type(void);
 ggml_backend_buffer_type_t ggml_backend_cuda_moe_cached_bounded_buffer_type(size_t bytes);
+bool ggml_backend_cuda_moe_staging_size_v1(
+    const struct ggml_backend_moe_staging_query_v1 * query,
+    struct ggml_backend_moe_staging_size_v1 * result);
+
+bool ggml_backend_cuda_moe_device_size_v1(
+    const struct ggml_backend_moe_device_size_query_v1 * query,
+    struct ggml_backend_moe_device_size_v1 * result);
 void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t buft);
 bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);

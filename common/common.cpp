@@ -1295,9 +1295,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
-        if (params.n_moe_expert_cache_slots > 0) {
-            COM_WRN("%s", "--fit does not account for MoE expert cache pools; set -fit off and size --moe-expert-cache-size manually\n");
-        }
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1709,6 +1706,10 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 struct llama_model_params common_model_params_to_llama(common_params & params) {
     auto mparams = llama_model_default_params();
 
+    if (!params.moe_expert_cache_byte_budgets.empty() && params.n_moe_expert_cache_slots != 0) {
+        throw std::invalid_argument("MoE cache byte budgets conflict with a nonzero slot count");
+    }
+
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
     }
@@ -1738,6 +1739,13 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
         GGML_ASSERT(params.tensor_buft_overrides.back().pattern == nullptr && "Tensor buffer overrides not terminated with empty pattern");
         mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
     }
+
+    mparams.moe_expert_cache_layer_ranges = params.moe_expert_cache_layer_ranges.empty()
+            ? nullptr : params.moe_expert_cache_layer_ranges.data();
+    mparams.n_moe_expert_cache_layer_ranges = params.moe_expert_cache_layer_ranges.size();
+    mparams.moe_expert_cache_byte_budgets = params.moe_expert_cache_byte_budgets.empty()
+            ? nullptr : params.moe_expert_cache_byte_budgets.data();
+    mparams.n_moe_expert_cache_byte_budgets = params.moe_expert_cache_byte_budgets.size();
 
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;

@@ -340,6 +340,8 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
     int32_t n_moe_expert_cache_slots = 0; // MoE expert cache slots for the draft model; 0 = off
+    std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
+    std::vector<size_t> moe_expert_cache_byte_budgets;
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
@@ -541,6 +543,8 @@ struct common_params {
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
     int32_t n_moe_expert_cache_slots = 0; // --moe-expert-cache-size: GPU LRU cache for MoE experts; 0 = off
     size_t moe_expert_cache_host_pinned_size = 0;
+    std::vector<llama_model_layer_range> moe_expert_cache_layer_ranges;
+    std::vector<size_t> moe_expert_cache_byte_budgets;
     bool moe_early_router = false;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)

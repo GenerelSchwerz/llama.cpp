@@ -493,6 +493,10 @@ enum moe_grouped_transfer_counter : uint32_t {
     MOE_GROUPED_TRANSFER_MAPPED_BYTES,
     MOE_GROUPED_TRANSFER_DEVICE_BYTES,
     MOE_GROUPED_TRANSFER_PREPACK_BYTES,
+    MOE_GROUPED_TRANSFER_ROUTE_ACCESSES,
+    MOE_GROUPED_TRANSFER_UNIQUE_ACCESSES,
+    MOE_GROUPED_TRANSFER_CACHE_HITS,
+    MOE_GROUPED_TRANSFER_CACHE_MISSES,
     MOE_GROUPED_TRANSFER_COUNTER_COUNT,
 };
 
@@ -507,11 +511,19 @@ enum moe_grouped_reset_reason : uint32_t {
 struct moe_grouped_decode_debug_stats {
     std::atomic<uint64_t> decode_grouped{ 0 };
     std::atomic<uint64_t> decode_legacy{ 0 };
+    std::array<std::atomic<uint64_t>, 4> decode_grouped_by_domain;
+    std::array<std::atomic<uint64_t>, 4> decode_legacy_by_domain;
     std::atomic<uint64_t> submitted{ 0 };
     std::atomic<uint64_t> direct{ 0 };
     std::atomic<uint64_t> captures{ 0 };
     std::atomic<uint64_t> replays{ 0 };
     moe_grouped_decode_debug_stats() {
+        for (auto & value : decode_grouped_by_domain) {
+            value.store(0, std::memory_order_relaxed);
+        }
+        for (auto & value : decode_legacy_by_domain) {
+            value.store(0, std::memory_order_relaxed);
+        }
         for (auto & value : covered) {
             value.store(0, std::memory_order_relaxed);
         }
@@ -593,6 +605,8 @@ static bool moe_grouped_has_activity(const ggml_cuda_moe_grouped_debug_telemetry
            telemetry.host_staged_calls != 0 || telemetry.host_staged_ops != 0 || telemetry.host_staged_split_ops != 0 ||
            telemetry.strategy_switches != 0 || telemetry.required_unsupported != 0 || telemetry.prepare_error != 0 ||
            telemetry.finish_error != 0 || telemetry.h2d_banks != 0 || telemetry.h2d_bytes != 0 ||
+           telemetry.route_accesses != 0 || telemetry.unique_accesses != 0 || telemetry.cache_hits != 0 ||
+           telemetry.cache_misses != 0 || telemetry.prefetch_calls != 0 || telemetry.prefetch_copied_bytes != 0 ||
            telemetry.vacant_fills != 0 || telemetry.replacement_fills != 0 || telemetry.invalidation_refills != 0 ||
            telemetry.decode_grouped != 0 || telemetry.decode_legacy != 0 || telemetry.submitted != 0;
 }
@@ -2709,6 +2723,205 @@ static bool moe_grouped_staging_layout(size_t plan_bytes, size_t payload_bytes, 
     return true;
 }
 
+static bool moe_staging_size_v1(
+        const ggml_backend_moe_staging_query_v1 & query,
+        ggml_backend_moe_staging_size_v1 & result) {
+    constexpr uint32_t family_mask =
+        GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED |
+        GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY |
+        GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED;
+    constexpr uint32_t flag_mask = GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL;
+    if (query.struct_size != sizeof(query) || result.struct_size != sizeof(result) ||
+            query.n_slots == 0 || query.n_experts == 0 || query.top_k == 0 ||
+            query.n_banks == 0 || query.n_banks > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS ||
+            (query.staged_bank_mask >> query.n_banks) != 0 || query.staged_bank_mask == 0 ||
+            (query.family_mask & ~family_mask) != 0 || query.family_mask == 0 ||
+            (query.flags & ~flag_mask) != 0) {
+        return false;
+    }
+    const auto add = [](uint64_t & dst, size_t value) {
+        if (value > UINT64_MAX - dst) {
+            return false;
+        }
+        dst += value;
+        return true;
+    };
+    const auto rounded = [](size_t bytes, size_t & value) {
+        return bytes != 0 && moe_host_round_size(bytes, value);
+    };
+
+    result.reserved32 = 0;
+    result.grouped_min_bytes = 0;
+    result.legacy_min_bytes = 0;
+    result.host_staged_min_bytes = 0;
+    result.optional_growth_max_bytes = 0;
+    result.prepack_tile_bytes = 0;
+
+    size_t payload = 0;
+    for (uint32_t bank = 0; bank < query.n_banks; ++bank) {
+        if ((query.staged_bank_mask & (uint32_t{1} << bank)) == 0) {
+            continue;
+        }
+        const uint64_t stride64 = query.bank_expert_strides[bank];
+        if (stride64 == 0 || stride64 > SIZE_MAX || stride64 > SIZE_MAX - payload) {
+            return false;
+        }
+        const size_t stride = static_cast<size_t>(stride64);
+        payload += stride;
+        size_t one = 0, two = 0;
+        if (!rounded(stride, one) || stride > SIZE_MAX / 2 || !rounded(2 * stride, two) || two < one) {
+            return false;
+        }
+        if ((query.family_mask & GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY) != 0 &&
+                (!add(result.legacy_min_bytes, one) || !add(result.optional_growth_max_bytes, two - one))) {
+            return false;
+        }
+        if ((query.family_mask & GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED) != 0 &&
+                (!add(result.host_staged_min_bytes, one) || !add(result.optional_growth_max_bytes, two - one))) {
+            return false;
+        }
+    }
+
+    if ((query.family_mask & GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED) != 0) {
+        size_t plan_bytes = 0, control_offset = 0, staging_offset = 0, allocation_bytes = 0;
+        const bool prediction = (query.flags & GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL) != 0;
+        if (!moe_grouped_plan_size(query.n_slots, query.n_experts, &plan_bytes) ||
+                !moe_grouped_staging_layout(plan_bytes, payload, prediction,
+                    control_offset, staging_offset, allocation_bytes)) {
+            return false;
+        }
+        size_t minimum = 0;
+        if (!rounded(allocation_bytes, minimum)) {
+            return false;
+        }
+        result.grouped_min_bytes = minimum;
+        const uint32_t tiles = std::min(query.top_k, query.n_slots);
+        if (tiles > 1) {
+            if (payload > (SIZE_MAX - staging_offset) / tiles) {
+                return false;
+            }
+            size_t maximum = 0;
+            if (!rounded(staging_offset + payload * tiles, maximum) || maximum < minimum ||
+                    !add(result.optional_growth_max_bytes, maximum - minimum)) {
+                return false;
+            }
+        }
+        if (prediction) {
+            if (payload > UINT64_MAX / query.top_k) {
+                return false;
+            }
+            result.prepack_tile_bytes = static_cast<uint64_t>(payload) * query.top_k;
+        }
+    }
+    return true;
+}
+
+static size_t moe_grouped_device_auxiliary_size();
+
+static bool moe_device_size_v1(
+        const ggml_backend_moe_device_size_query_v1 & query,
+        ggml_backend_moe_device_size_v1 & result) {
+    constexpr uint32_t flag_mask = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+    if (query.struct_size != sizeof(query) || result.struct_size != sizeof(result) ||
+            query.n_banks > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS ||
+            query.n_slot_auxiliaries > 3 || (query.flags & ~flag_mask) != 0 ||
+            (query.n_banks != 0 && (query.n_slots == 0 || query.n_experts == 0))) {
+        return false;
+    }
+    const auto add = [](uint64_t & dst, uint64_t value) {
+        if (value > UINT64_MAX - dst) {
+            return false;
+        }
+        dst += value;
+        return true;
+    };
+    const auto mul = [](uint64_t a, uint64_t b, uint64_t & value) {
+        if (a != 0 && b > UINT64_MAX / a) {
+            return false;
+        }
+        value = a * b;
+        return true;
+    };
+
+    result.reserved32 = 0;
+    result.group_fixed_bytes = 0;
+    result.group_per_slot_bytes = 0;
+    result.context_fixed_bytes = 0;
+
+    if (query.n_banks != 0) {
+        size_t plan_one = 0, plan_two = 0;
+        if (!moe_grouped_plan_size(1, query.n_experts, &plan_one) ||
+                !moe_grouped_plan_size(2, query.n_experts, &plan_two) || plan_two < plan_one) {
+            return false;
+        }
+        const uint64_t plan_per_slot = plan_two - plan_one;
+        const uint64_t plan_fixed = plan_one - plan_per_slot;
+        if (!add(result.group_fixed_bytes, plan_fixed) ||
+                !add(result.group_fixed_bytes, query.original_shadow_bytes) ||
+                !add(result.group_fixed_bytes, query.prefill_copy_bytes) ||
+                !add(result.group_fixed_bytes, 2 * sizeof(uint64_t)) ||
+                !add(result.group_fixed_bytes, uint64_t(query.n_banks) * sizeof(moe_grouped_device_bank)) ||
+                !add(result.group_fixed_bytes, uint64_t(query.n_slot_auxiliaries) * moe_grouped_device_auxiliary_size()) ||
+                !add(result.group_per_slot_bytes, plan_per_slot) ||
+                !add(result.group_per_slot_bytes, sizeof(int32_t) + sizeof(uint64_t))) {
+            return false;
+        }
+        uint64_t expert_metadata = 0;
+        if (!mul(query.n_experts, sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t), expert_metadata) ||
+                !add(result.group_fixed_bytes, expert_metadata)) {
+            return false;
+        }
+        uint64_t auxiliary_per_slot = 0;
+        if (!mul(query.slot_auxiliary_values, sizeof(float), auxiliary_per_slot) ||
+                !add(result.group_per_slot_bytes, auxiliary_per_slot)) {
+            return false;
+        }
+        if ((query.flags & GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG) != 0 &&
+                !add(result.group_per_slot_bytes, 2 * sizeof(uint8_t))) {
+            return false;
+        }
+        for (uint32_t bank = 0; bank < query.n_banks; ++bank) {
+            if (query.bank_expert_strides[bank] == 0 || query.bank_expert_strides[bank] > SIZE_MAX ||
+                    query.bank_ne0[bank] <= 0 || query.bank_ne0[bank] > INT32_MAX ||
+                    query.bank_types[bank] < 0 || query.bank_types[bank] >= GGML_TYPE_COUNT) {
+                return false;
+            }
+            const auto type = static_cast<ggml_type>(query.bank_types[bank]);
+            const size_t padding = moe_cache_quantized_source_padding(type, query.bank_ne0[bank]);
+            if (!add(result.group_fixed_bytes, padding) ||
+                    !add(result.group_per_slot_bytes, query.bank_expert_strides[bank])) {
+                return false;
+            }
+        }
+    }
+
+    if ((query.flags & GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG) != 0 &&
+            !add(result.context_fixed_bytes, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t))) {
+        return false;
+    }
+    if (query.early_width != 0 || query.early_experts != 0 || query.early_top_k != 0 || query.early_hc_rank != 0) {
+        if (query.early_width == 0 || query.early_experts == 0 || query.early_top_k == 0) {
+            return false;
+        }
+        uint64_t bytes = 5 * sizeof(uint64_t);
+        uint64_t term = 0;
+        if (!mul(query.early_width, sizeof(float), term) || !add(bytes, term) ||
+                !mul(query.early_experts, sizeof(float) + sizeof(int32_t), term) || !add(bytes, term) ||
+                !mul(query.early_top_k, sizeof(int32_t), term) || !add(bytes, term)) {
+            return false;
+        }
+        if (query.early_hc_rank != 0 &&
+                (!mul(query.early_hc_rank, sizeof(float), term) || !add(bytes, term) ||
+                 !mul(query.early_width, 2 * sizeof(float), term) || !add(bytes, term))) {
+            return false;
+        }
+        if (!add(result.context_fixed_bytes, bytes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct moe_prepack_request {
     uint64_t resource = 0;
     uint32_t top_k = 0;
@@ -2720,6 +2933,15 @@ struct moe_prepack_request {
 struct moe_host_prepack {
     enum state { FREE, QUEUED, COPYING, READY, ADOPTED };
     enum rank_counter { COPIED_BYTES, ADOPTED_BYTES, WRONG_BYTES, LATE_BYTES, N_RANK_COUNTERS };
+    struct interval_stats {
+        uint64_t published = 0;
+        uint64_t callbacks = 0;
+        uint64_t copied_bytes = 0;
+        uint64_t adopted_bytes = 0;
+        uint64_t wrong_bytes = 0;
+        uint64_t late_bytes = 0;
+        uint64_t dropped_bytes = 0;
+    };
     struct tile {
         state status = FREE;
         moe_prepack_request request;
@@ -2761,13 +2983,13 @@ struct moe_host_prepack {
         if (worker.joinable()) {
             worker.join();
         }
-        fprintf(stderr, "moe-prepack: published=%llu dropped=%llu dropped_bytes=%llu callbacks=%llu adopted_bytes=%llu wrong_bytes=%llu late_bytes=%llu copied_bytes=%llu demand_bytes=%llu peak_tiles=%u\n",
+        fprintf(stderr, "moe-prepack-remaining-interval: published=%llu dropped_lifetime=%llu dropped_bytes=%llu callbacks=%llu adopted_bytes=%llu wrong_bytes=%llu late_bytes=%llu copied_bytes=%llu demand_bytes_lifetime=%llu peak_tiles_lifetime=%u\n",
             (unsigned long long) published, (unsigned long long) dropped.load(), (unsigned long long) dropped_bytes.load(), (unsigned long long) callbacks.load(),
             (unsigned long long) adopted_bytes, (unsigned long long) wrong_bytes, (unsigned long long) late_bytes,
             (unsigned long long) copied_bytes, (unsigned long long) demand_bytes.load(), peak_tiles);
         for (uint32_t rank = 0; rank < MOE_PREPACK_ROUTES; ++rank) {
             if (proposed_by_rank[rank].load() != 0) {
-                fprintf(stderr, "moe-prepack-rank: rank=%u proposed_bytes=%llu copied_bytes=%llu adopted_bytes=%llu wrong_bytes=%llu late_bytes=%llu\n", rank,
+                fprintf(stderr, "moe-prepack-rank-lifetime: rank=%u proposed_bytes=%llu copied_bytes=%llu adopted_bytes=%llu wrong_bytes=%llu late_bytes=%llu\n", rank,
                     (unsigned long long) proposed_by_rank[rank].load(), (unsigned long long) rank_bytes[rank][COPIED_BYTES],
                     (unsigned long long) rank_bytes[rank][ADOPTED_BYTES], (unsigned long long) rank_bytes[rank][WRONG_BYTES],
                     (unsigned long long) rank_bytes[rank][LATE_BYTES]);
@@ -2785,6 +3007,24 @@ struct moe_host_prepack {
 
     void close_admission() {
         admission_closed.store(true, std::memory_order_release);
+    }
+
+    interval_stats take_interval_stats() {
+        std::lock_guard<std::mutex> lock(mutex);
+        interval_stats result;
+        result.published = published;
+        result.callbacks = callbacks.exchange(0, std::memory_order_relaxed);
+        result.copied_bytes = copied_bytes;
+        result.adopted_bytes = adopted_bytes;
+        result.wrong_bytes = wrong_bytes;
+        result.late_bytes = late_bytes;
+        result.dropped_bytes = dropped_bytes.exchange(0, std::memory_order_relaxed);
+        published = 0;
+        copied_bytes = 0;
+        adopted_bytes = 0;
+        wrong_bytes = 0;
+        late_bytes = 0;
+        return result;
     }
 
     void start() {
@@ -3008,9 +3248,16 @@ struct moe_grouped_materialization {
         bool predict = false;
     };
 
-    moe_grouped_materialization(moe_host_budget * owner, size_t control_bytes, size_t tile_stride, uint32_t capacity, uint32_t n_experts, uint32_t top_k) :
+    moe_grouped_materialization(
+            moe_host_budget * owner,
+            size_t control_bytes,
+            size_t tile_stride,
+            uint32_t capacity,
+            uint32_t n_experts,
+            uint32_t top_k,
+            std::atomic<uint64_t> * demand_materialized_bytes) :
         storage(owner, control_bytes + tile_stride, tile_stride, std::min(top_k, capacity), false, false, control_bytes), capacity(capacity), n_experts(n_experts), copies(capacity),
-        copy_spans(static_cast<size_t>(storage.tiles) * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
+        copy_spans(static_cast<size_t>(storage.tiles) * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS), demand_materialized_bytes(demand_materialized_bytes) {
         for (uint32_t i = 0; i < capacity; ++i) {
             copies[i] = {this, i, {}, false};
         }
@@ -3054,6 +3301,7 @@ struct moe_grouped_materialization {
     std::vector<moe_host_copy_span> copy_spans;
     std::vector<std::unique_ptr<copy>> prediction_copies;
     std::atomic<moe_host_prepack *> prepack{nullptr};
+    std::atomic<uint64_t> * demand_materialized_bytes = nullptr;
     moe_prepack_control * control = nullptr;
     const moe_prepack_control * device_control = nullptr;
     uint64_t serial = 0;
@@ -3084,6 +3332,9 @@ static void CUDART_CB moe_grouped_materialize(void * opaque) {
     size_t copy_bytes = 0;
     const size_t n_spans = materialization.prepare_copy(experts + copy.miss, count, copy_bytes);
     GGML_ASSERT(moe_host_copy_spans(materialization.storage.owner->copy_worker, materialization.copy_spans.data(), n_spans, copy_bytes));
+    if (materialization.demand_materialized_bytes != nullptr) {
+        materialization.demand_materialized_bytes->fetch_add(copy_bytes, std::memory_order_relaxed);
+    }
     if (prepack != nullptr) {
         prepack->demand_bytes.fetch_add(copy_bytes, std::memory_order_relaxed);
     }
@@ -3094,6 +3345,10 @@ struct moe_grouped_device_auxiliary {
     float * data;
     size_t n_values;
 };
+
+static size_t moe_grouped_device_auxiliary_size() {
+    return sizeof(moe_grouped_device_auxiliary);
+}
 
 static __device__ uint32_t moe_grouped_effective_frequency(
         uint32_t frequency,
@@ -4282,7 +4537,22 @@ static __global__ void moe_grouped_gather_decode(
         const moe_prepack_control * control = nullptr,
         uint32_t first_miss = 0,
         uint32_t miss_count = UINT32_MAX) {
-    if (plan->status != MOE_GROUPED_PLAN_READY || first_miss >= plan->n_misses) {
+    if (plan->status != MOE_GROUPED_PLAN_READY) {
+        return;
+    }
+    if constexpr (debug_transfers) {
+        if (blockIdx.x == 0 && threadIdx.x == 0 && first_miss == 0) {
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_ROUTE_ACCESSES]),
+                static_cast<unsigned long long>(plan->n_routes));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_UNIQUE_ACCESSES]),
+                static_cast<unsigned long long>(plan->n_unique));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_CACHE_HITS]),
+                static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_CACHE_MISSES]),
+                static_cast<unsigned long long>(plan->n_misses));
+        }
+    }
+    if (first_miss >= plan->n_misses) {
         return;
     }
     const uint32_t n_misses = min(miss_count, plan->n_misses - first_miss);
@@ -4779,6 +5049,7 @@ struct ggml_cuda_moe_grouped_context::impl {
     bool fail_borrowed_cache_init_after_probe_for_test = false;
     std::atomic<uint32_t> split_staging_poison_calls_for_test{0};
     std::atomic<bool> fail_host_staged_evaluator_for_test{false};
+    mutable std::atomic<uint64_t> demand_materialized_bytes{0};
     moe_cache_op_phase_stats legacy_op_stats[2];
     moe_cache_telemetry retired_telemetry;
     std::atomic<moe_grouped_decode_debug_stats *> grouped_debug{nullptr};
@@ -4922,6 +5193,10 @@ struct ggml_cuda_moe_grouped_context::impl {
         result.finish_error = take(stats->finish_error);
         result.decode_grouped        = take(stats->decode_grouped);
         result.decode_legacy         = take(stats->decode_legacy);
+        for (uint32_t domain = 0; domain < 4; ++domain) {
+            result.decode_grouped_by_domain[domain] = take(stats->decode_grouped_by_domain[domain]);
+            result.decode_legacy_by_domain[domain] = take(stats->decode_legacy_by_domain[domain]);
+        }
         result.submitted             = take(stats->submitted);
         result.direct                = take(stats->direct);
         result.captures              = take(stats->captures);
@@ -4986,6 +5261,10 @@ struct ggml_cuda_moe_grouped_context::impl {
                 result.source_mapped_bytes = counters[MOE_GROUPED_TRANSFER_MAPPED_BYTES];
                 result.source_device_bytes = counters[MOE_GROUPED_TRANSFER_DEVICE_BYTES];
                 result.source_prepack_bytes = counters[MOE_GROUPED_TRANSFER_PREPACK_BYTES];
+                result.route_accesses = counters[MOE_GROUPED_TRANSFER_ROUTE_ACCESSES];
+                result.unique_accesses = counters[MOE_GROUPED_TRANSFER_UNIQUE_ACCESSES];
+                result.cache_hits = counters[MOE_GROUPED_TRANSFER_CACHE_HITS];
+                result.cache_misses = counters[MOE_GROUPED_TRANSFER_CACHE_MISSES];
                 if (!moe_grouped_cuda_success(cudaMemset(transfers, 0, sizeof(counters)))) {
                     result.h2d_banks = 0;
                     result.h2d_bytes = 0;
@@ -4997,7 +5276,30 @@ struct ggml_cuda_moe_grouped_context::impl {
                     result.source_mapped_bytes = 0;
                     result.source_device_bytes = 0;
                     result.source_prepack_bytes = 0;
+                    result.route_accesses = 0;
+                    result.unique_accesses = 0;
+                    result.cache_hits = 0;
+                    result.cache_misses = 0;
                 }
+            }
+        }
+        if (host_prepack != nullptr) {
+            const auto prefetch = host_prepack->take_interval_stats();
+            result.prefetch_calls = prefetch.callbacks;
+            result.prefetch_copied_bytes = prefetch.copied_bytes;
+            result.prefetch_used_bytes = prefetch.adopted_bytes;
+            result.prefetch_wrong_bytes = prefetch.wrong_bytes;
+            result.prefetch_late_bytes = prefetch.late_bytes;
+            result.prefetch_dropped_bytes = prefetch.dropped_bytes;
+        }
+        result.demand_materialized_bytes = demand_materialized_bytes.exchange(0, std::memory_order_relaxed);
+        if (!early.empty() && early[0]->initialized) {
+            uint64_t prediction[5] = {};
+            moe_grouped_device_scope device_scope(device);
+            if (moe_grouped_cuda_success(cudaMemcpy(
+                    prediction, early[0]->counters, sizeof(prediction), cudaMemcpyDeviceToHost)) &&
+                    moe_grouped_cuda_success(cudaMemset(early[0]->counters, 0, sizeof(prediction)))) {
+                result.prefetch_proposed_bytes = prediction[0];
             }
         }
         try {
@@ -5005,34 +5307,67 @@ struct ggml_cuda_moe_grouped_context::impl {
             for (const auto & entry : telemetry_resources) {
                 const auto & resource = entry.first;
                 const auto * device_resource = entry.second;
-                if (resource == nullptr || device_resource == nullptr || device_resource->occupied_slot == nullptr) {
+                if (resource == nullptr || device_resource == nullptr) {
                     continue;
                 }
-                std::vector<uint8_t> occupied(resource->snapshot.n_slots);
-                if (!moe_grouped_cuda_success(cudaMemcpy(
-                        occupied.data(), device_resource->occupied_slot,
-                        occupied.size() * sizeof(occupied[0]), cudaMemcpyDeviceToHost))) {
-                    continue;
-                }
-                uint64_t bytes_per_slot = 0;
+                uint64_t payload_per_slot = 0;
+                uint64_t payload_allocation = 0;
                 for (const auto & bank : resource->snapshot.banks) {
-                    bytes_per_slot += bank.expert_stride;
+                    payload_per_slot += bank.expert_stride;
+                    payload_allocation += resource->snapshot.n_slots * bank.expert_stride +
+                        moe_cache_quantized_source_padding(bank.type, bank.ne[0]);
                 }
+                uint64_t auxiliary_per_slot = 0;
                 for (uint32_t i = 0; i < resource->snapshot.n_slot_auxiliaries; ++i) {
-                    bytes_per_slot += device_resource->auxiliary_n_values[i] * sizeof(float);
+                    auxiliary_per_slot += device_resource->auxiliary_n_values[i] * sizeof(float);
                 }
-                const uint64_t populated = std::count_if(
-                    occupied.begin(), occupied.end(), [](uint8_t value) { return value != 0; });
-                result.populated_slots += populated;
+                result.payload_capacity_bytes += resource->snapshot.n_slots * payload_per_slot;
+                result.payload_allocation_bytes += payload_allocation;
+                result.slot_auxiliary_bytes += resource->snapshot.n_slots * auxiliary_per_slot;
+                result.fixed_auxiliary_bytes += device_resource->original_auxiliary_bytes;
+                for (uint32_t i = 0; i < resource->snapshot.n_slot_auxiliaries; ++i) {
+                    if (device_resource->prefill_auxiliary_data[i] != nullptr) {
+                        result.fixed_auxiliary_bytes += resource->snapshot.slot_auxiliaries[i].byte_extent;
+                    }
+                }
+                result.metadata_bytes += device_resource->n_experts * (sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t)) +
+                    resource->snapshot.n_slots * (sizeof(int32_t) + sizeof(uint64_t)) +
+                    2 * sizeof(uint64_t) + device_resource->plan_bytes +
+                    resource->snapshot.banks.size() * sizeof(moe_grouped_device_bank) +
+                    resource->snapshot.n_slot_auxiliaries * sizeof(moe_grouped_device_auxiliary) +
+                    (device_resource->invalidated_slot != nullptr ? resource->snapshot.n_slots * sizeof(uint8_t) : 0) +
+                    (device_resource->occupied_slot != nullptr ? resource->snapshot.n_slots * sizeof(uint8_t) : 0);
                 result.slot_capacity += resource->snapshot.n_slots;
-                result.populated_payload_bytes += populated * bytes_per_slot;
-                result.payload_capacity_bytes += resource->snapshot.n_slots * bytes_per_slot;
+                if (device_resource->occupied_slot != nullptr) {
+                    std::vector<uint8_t> occupied(resource->snapshot.n_slots);
+                    if (moe_grouped_cuda_success(cudaMemcpy(
+                            occupied.data(), device_resource->occupied_slot,
+                            occupied.size() * sizeof(occupied[0]), cudaMemcpyDeviceToHost))) {
+                        const uint64_t populated = std::count_if(
+                            occupied.begin(), occupied.end(), [](uint8_t value) { return value != 0; });
+                        result.populated_slots += populated;
+                        result.populated_payload_bytes += populated * payload_per_slot;
+                    }
+                }
+            }
+            // The host budget owns all three retained staging families:
+            // grouped materialization, legacy per-bank staging, and grouped
+            // host-staged per-bank caches (plus optional prepack growth).
+            // Sampling the owner avoids undercounting or double counting them.
+            if (pageable_sources != nullptr) {
+                std::lock_guard<std::mutex> budget_lock(pageable_sources->mutex);
+                result.host_staging_bytes = pageable_sources->staging_bytes;
             }
         } catch (const std::bad_alloc &) {
             result.populated_slots = 0;
             result.slot_capacity = 0;
             result.populated_payload_bytes = 0;
             result.payload_capacity_bytes = 0;
+            result.payload_allocation_bytes = 0;
+            result.slot_auxiliary_bytes = 0;
+            result.fixed_auxiliary_bytes = 0;
+            result.metadata_bytes = 0;
+            result.host_staging_bytes = 0;
         }
         if (moe_grouped_has_activity(result)) {
             ggml_backend_dev_props props{};
@@ -5041,21 +5376,43 @@ struct ggml_cuda_moe_grouped_context::impl {
             }
             GGML_LOG_INFO(
                 "moe-grouped-owner: owner=%p device=%d physical=%d pci=%s generation=%llu decode_grouped=%llu "
-                "decode_legacy=%llu direct=%llu captures=%llu replays=%llu ready=%llu submitted=%llu completed=%llu "
+                "decode_legacy=%llu grouped_main=%llu grouped_draft=%llu grouped_mtp=%llu "
+                "legacy_main=%llu legacy_draft=%llu legacy_mtp=%llu direct=%llu captures=%llu replays=%llu "
+                "ready=%llu submitted=%llu completed=%llu "
                 "prepare_error=%llu finish_error=%llu populated_slots=%llu/%llu populated_payload_bytes=%llu/%llu "
-                "vacant_fills=%llu replacement_fills=%llu invalidation_refills=%llu "
+                "payload_allocation_bytes=%llu slot_auxiliary_bytes=%llu fixed_auxiliary_bytes=%llu "
+                "metadata_bytes=%llu host_staging_bytes=%llu route_accesses=%llu unique_accesses=%llu "
+                "cache_hits=%llu cache_misses=%llu vacant_fills=%llu replacement_fills=%llu invalidation_refills=%llu "
                 "source_direct_registered_bytes=%llu source_pageable_staged_bytes=%llu source_mapped_bytes=%llu "
-                "source_device_bytes=%llu source_prepack_bytes=%llu reset_generation_replace=%llu "
+                "source_device_bytes=%llu source_prepack_bytes=%llu prefetch_calls=%llu "
+                "prefetch_proposed_bytes=%llu prefetch_copied_bytes=%llu prefetch_used_bytes=%llu "
+                "prefetch_wrong_bytes=%llu prefetch_late_bytes=%llu prefetch_dropped_bytes=%llu "
+                "demand_materialized_bytes=%llu reset_generation_replace=%llu "
                 "reset_generation_reject=%llu reset_clock=%llu reset_legacy_handoff=%llu reset_host_staged_handoff=%llu\n",
                 (void *) this, device, device >= 0 ? ggml_cuda_info().devices[device].physical_device : -1,
                 props.device_id ? props.device_id : "unknown", (unsigned long long) state.generation,
                 (unsigned long long) result.decode_grouped, (unsigned long long) result.decode_legacy,
+                (unsigned long long) result.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MAIN],
+                (unsigned long long) result.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_DRAFT],
+                (unsigned long long) result.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MTP],
+                (unsigned long long) result.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MAIN],
+                (unsigned long long) result.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_DRAFT],
+                (unsigned long long) result.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MTP],
                 (unsigned long long) result.direct, (unsigned long long) result.captures,
                 (unsigned long long) result.replays, (unsigned long long) result.ready,
                 (unsigned long long) result.submitted, (unsigned long long) result.completed,
                 (unsigned long long) result.prepare_error, (unsigned long long) result.finish_error,
                 (unsigned long long) result.populated_slots, (unsigned long long) result.slot_capacity,
                 (unsigned long long) result.populated_payload_bytes, (unsigned long long) result.payload_capacity_bytes,
+                (unsigned long long) result.payload_allocation_bytes,
+                (unsigned long long) result.slot_auxiliary_bytes,
+                (unsigned long long) result.fixed_auxiliary_bytes,
+                (unsigned long long) result.metadata_bytes,
+                (unsigned long long) result.host_staging_bytes,
+                (unsigned long long) result.route_accesses,
+                (unsigned long long) result.unique_accesses,
+                (unsigned long long) result.cache_hits,
+                (unsigned long long) result.cache_misses,
                 (unsigned long long) result.vacant_fills, (unsigned long long) result.replacement_fills,
                 (unsigned long long) result.invalidation_refills,
                 (unsigned long long) result.source_direct_registered_bytes,
@@ -5063,6 +5420,14 @@ struct ggml_cuda_moe_grouped_context::impl {
                 (unsigned long long) result.source_mapped_bytes,
                 (unsigned long long) result.source_device_bytes,
                 (unsigned long long) result.source_prepack_bytes,
+                (unsigned long long) result.prefetch_calls,
+                (unsigned long long) result.prefetch_proposed_bytes,
+                (unsigned long long) result.prefetch_copied_bytes,
+                (unsigned long long) result.prefetch_used_bytes,
+                (unsigned long long) result.prefetch_wrong_bytes,
+                (unsigned long long) result.prefetch_late_bytes,
+                (unsigned long long) result.prefetch_dropped_bytes,
+                (unsigned long long) result.demand_materialized_bytes,
                 (unsigned long long) result.reset_generation_replace,
                 (unsigned long long) result.reset_generation_reject,
                 (unsigned long long) result.reset_clock,
@@ -5092,6 +5457,11 @@ struct ggml_cuda_moe_grouped_context::impl {
         sample.slot_capacity = 0;
         sample.populated_payload_bytes = 0;
         sample.payload_capacity_bytes = 0;
+        sample.payload_allocation_bytes = 0;
+        sample.slot_auxiliary_bytes = 0;
+        sample.fixed_auxiliary_bytes = 0;
+        sample.metadata_bytes = 0;
+        sample.host_staging_bytes = 0;
         retired_telemetry.grouped.reset_generation_replace += sample.reset_generation_replace;
         retired_telemetry.grouped.reset_generation_reject += sample.reset_generation_reject;
         retired_telemetry.grouped.reset_clock += sample.reset_clock;
@@ -6098,7 +6468,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 throw std::bad_alloc();
             }
             result->materialization = std::make_unique<moe_grouped_materialization>(result->source_owner,
-                staging_offset, staging_bytes, snapshot.n_slots, n_experts, top_k);
+                staging_offset, staging_bytes, snapshot.n_slots, n_experts, top_k, &demand_materialized_bytes);
             if (result->materialization->storage.data == nullptr) {
                 return nullptr;
             }
@@ -7116,7 +7486,7 @@ bool ggml_cuda_moe_grouped_context::early_hc_for_test() {
 bool ggml_cuda_moe_grouped_context::prepack_for_test() {
     {
         moe_host_budget owner(0);
-        moe_grouped_materialization materialization(nullptr, 0, 0, 3, 5, 3);
+        moe_grouped_materialization materialization(nullptr, 0, 0, 3, 5, 3, nullptr);
         materialization.copy_spans.resize(3 * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS);
         moe_prepack_control control = {};
         materialization.control = &control;
@@ -7287,7 +7657,7 @@ bool ggml_cuda_moe_grouped_context::prepack_for_test() {
     executor.visit(11, 1028, nullptr, 0, request, control);
     valid &= executor.published == published && executor.queued() == nullptr && control.adopted[0] == nullptr;
 
-    moe_grouped_materialization materialization(nullptr, 0, 0, 1, experts, top_k);
+    moe_grouped_materialization materialization(nullptr, 0, 0, 1, experts, top_k, nullptr);
     materialization.serial = 29;
     std::atomic<bool> finished{false};
     bool publication_valid = true;
@@ -10832,8 +11202,12 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
             return;
         }
         const auto outcome = execution->plan_->outcome_;
+        const uint32_t domain = execution->plan_->execution_certificate_.domain;
         if (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && mode != GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY) {
             debug->decode_grouped.fetch_add(n_groups, std::memory_order_relaxed);
+            if (domain < debug->decode_grouped_by_domain.size()) {
+                debug->decode_grouped_by_domain[domain].fetch_add(n_groups, std::memory_order_relaxed);
+            }
             if (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY) {
                 debug->replays.fetch_add(n_groups, std::memory_order_relaxed);
             } else if (mode == GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE) {
@@ -10845,6 +11219,9 @@ bool ggml_cuda_moe_grouped_context::begin_graph_dispatch(
                    (outcome == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
                     mode == GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY)) {
             debug->decode_legacy.fetch_add(n_groups, std::memory_order_relaxed);
+            if (domain < debug->decode_legacy_by_domain.size()) {
+                debug->decode_legacy_by_domain[domain].fetch_add(n_groups, std::memory_order_relaxed);
+            }
             debug->fallback.fetch_add(n_groups, std::memory_order_relaxed);
         }
     };
@@ -12148,6 +12525,9 @@ void ggml_cuda_moe_grouped_context::shutdown() {
                 CUDA_CHECK(cudaEventSynchronize(resource->device->completion));
             }
         }
+        // Fold executor counters while the prepack executor and its device counters
+        // are still alive. clear_early() destroys both.
+        impl_->fold_grouped_debug_telemetry(registered_groups);
         impl_->clear_early();
     }
     impl::retire_resources(std::move(retired));
@@ -14265,6 +14645,10 @@ static void moe_grouped_add_telemetry(
     dst.finish_error += src.finish_error;
     dst.h2d_banks += src.h2d_banks;
     dst.h2d_bytes += src.h2d_bytes;
+    dst.route_accesses += src.route_accesses;
+    dst.unique_accesses += src.unique_accesses;
+    dst.cache_hits += src.cache_hits;
+    dst.cache_misses += src.cache_misses;
     dst.vacant_fills += src.vacant_fills;
     dst.replacement_fills += src.replacement_fills;
     dst.invalidation_refills += src.invalidation_refills;
@@ -14277,6 +14661,19 @@ static void moe_grouped_add_telemetry(
     dst.slot_capacity += src.slot_capacity;
     dst.populated_payload_bytes += src.populated_payload_bytes;
     dst.payload_capacity_bytes += src.payload_capacity_bytes;
+    dst.payload_allocation_bytes += src.payload_allocation_bytes;
+    dst.slot_auxiliary_bytes += src.slot_auxiliary_bytes;
+    dst.fixed_auxiliary_bytes += src.fixed_auxiliary_bytes;
+    dst.metadata_bytes += src.metadata_bytes;
+    dst.host_staging_bytes += src.host_staging_bytes;
+    dst.prefetch_calls += src.prefetch_calls;
+    dst.prefetch_proposed_bytes += src.prefetch_proposed_bytes;
+    dst.prefetch_copied_bytes += src.prefetch_copied_bytes;
+    dst.prefetch_used_bytes += src.prefetch_used_bytes;
+    dst.prefetch_wrong_bytes += src.prefetch_wrong_bytes;
+    dst.prefetch_late_bytes += src.prefetch_late_bytes;
+    dst.prefetch_dropped_bytes += src.prefetch_dropped_bytes;
+    dst.demand_materialized_bytes += src.demand_materialized_bytes;
     dst.reset_generation_replace += src.reset_generation_replace;
     dst.reset_generation_reject += src.reset_generation_reject;
     dst.reset_clock += src.reset_clock;
@@ -14284,6 +14681,10 @@ static void moe_grouped_add_telemetry(
     dst.reset_host_staged_handoff += src.reset_host_staged_handoff;
     dst.decode_grouped += src.decode_grouped;
     dst.decode_legacy += src.decode_legacy;
+    for (uint32_t domain = 0; domain < 4; ++domain) {
+        dst.decode_grouped_by_domain[domain] += src.decode_grouped_by_domain[domain];
+        dst.decode_legacy_by_domain[domain] += src.decode_legacy_by_domain[domain];
+    }
     dst.submitted += src.submitted;
     dst.direct += src.direct;
     dst.captures += src.captures;
@@ -14425,6 +14826,19 @@ void ggml_cuda_moe_record_op_stats(
 }
 
 extern "C"
+bool ggml_backend_cuda_moe_staging_size_v1(
+        const ggml_backend_moe_staging_query_v1 * query,
+        ggml_backend_moe_staging_size_v1 * result) {
+    return query != nullptr && result != nullptr && moe_staging_size_v1(*query, *result);
+}
+
+bool ggml_backend_cuda_moe_device_size_v1(
+        const ggml_backend_moe_device_size_query_v1 * query,
+        ggml_backend_moe_device_size_v1 * result) {
+    return query != nullptr && result != nullptr && moe_device_size_v1(*query, *result);
+}
+
+extern "C"
 bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const ggml_backend_moe_candidate_snapshot_v2 * snapshot) {
     auto * owner = moe_host_budget_for(buft);
     if (owner == nullptr || snapshot == nullptr || snapshot->magic != GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC ||
@@ -14438,7 +14852,6 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
         return false;
     }
     std::vector<std::vector<moe_host_source *>> groups(snapshot->n_groups);
-    std::vector<size_t> group_staging(snapshot->n_groups, 0);
     std::vector<uint32_t> roles(snapshot->n_groups, 0);
     std::vector<bool> complete(snapshot->n_groups, true);
     std::vector<moe_host_source *> auxiliaries;
@@ -14475,11 +14888,9 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
             continue;
         }
         if (record.group_index >= groups.size() || tensor->ne[2] <= 0 || tensor->ne[2] > INT32_MAX ||
-                tensor->nb[2] == 0 || size / tensor->nb[2] != static_cast<uint64_t>(tensor->ne[2]) || size % tensor->nb[2] != 0 ||
-                tensor->nb[2] > SIZE_MAX - group_staging[record.group_index] || !reserve(tensor->nb[2])) {
+                tensor->nb[2] == 0 || size / tensor->nb[2] != static_cast<uint64_t>(tensor->ne[2]) || size % tensor->nb[2] != 0) {
             return false;
         }
-        group_staging[record.group_index] += tensor->nb[2];
         groups[record.group_index].push_back(source);
         roles[record.group_index] |= 1u << record.role;
     }
@@ -14487,14 +14898,30 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
         if (groups[i].empty()) {
             continue;
         }
-        size_t plan_bytes = 0;
         const uint32_t n_experts = groups[i][0]->size / groups[i][0]->expert_stride;
-        size_t control_offset = 0, staging_offset = 0, allocation_bytes = 0;
-        if (!moe_grouped_plan_size(snapshot->n_slots, n_experts, &plan_bytes) ||
-                !moe_grouped_staging_layout(plan_bytes, group_staging[i], moe_early_router_enabled(), control_offset, staging_offset, allocation_bytes)) {
-            return false;
+        ggml_backend_moe_staging_query_v1 query = {};
+        query.struct_size = sizeof(query);
+        query.n_slots = snapshot->n_slots;
+        query.n_experts = n_experts;
+        query.top_k = 1; // mandatory minima are one tile; additional tiles are optional
+        query.n_banks = groups[i].size();
+        query.staged_bank_mask = (uint32_t{1} << query.n_banks) - 1;
+        query.family_mask = GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED |
+            GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY |
+            GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED;
+        // The public flag can enable the early router after model sources are
+        // configured. Reserve its fixed control block now so later activation
+        // cannot invalidate source-admission accounting.
+        query.flags = GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL;
+        for (uint32_t bank = 0; bank < query.n_banks; ++bank) {
+            query.bank_expert_strides[bank] = groups[i][bank]->expert_stride;
         }
-        if (!reserve(allocation_bytes)) {
+        ggml_backend_moe_staging_size_v1 sizing = {};
+        sizing.struct_size = sizeof(sizing);
+        if (!moe_staging_size_v1(query, sizing) ||
+                !reserve(sizing.grouped_min_bytes) ||
+                !reserve(sizing.legacy_min_bytes) ||
+                !reserve(sizing.host_staged_min_bytes)) {
             return false;
         }
         complete[i] = complete[i] && snapshot->groups[i].flags == 0 &&
@@ -14611,6 +15038,45 @@ static void moe_cache_log_telemetry(moe_cache_telemetry telemetry) {
             (unsigned long long) grouped.reset_clock,
             (unsigned long long) grouped.reset_legacy_handoff,
             (unsigned long long) grouped.reset_host_staged_handoff);
+        GGML_LOG(
+            "moe-grouped-paths: decode_grouped=%llu decode_legacy=%llu direct=%llu captures=%llu replays=%llu "
+            "grouped_main=%llu grouped_draft=%llu grouped_mtp=%llu legacy_main=%llu legacy_draft=%llu legacy_mtp=%llu "
+            "route_accesses=%llu unique_accesses=%llu cache_hits=%llu cache_misses=%llu\n",
+            (unsigned long long) grouped.decode_grouped,
+            (unsigned long long) grouped.decode_legacy,
+            (unsigned long long) grouped.direct,
+            (unsigned long long) grouped.captures,
+            (unsigned long long) grouped.replays,
+            (unsigned long long) grouped.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MAIN],
+            (unsigned long long) grouped.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_DRAFT],
+            (unsigned long long) grouped.decode_grouped_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MTP],
+            (unsigned long long) grouped.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MAIN],
+            (unsigned long long) grouped.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_DRAFT],
+            (unsigned long long) grouped.decode_legacy_by_domain[GGML_GRAPH_EXECUTION_DOMAIN_MTP],
+            (unsigned long long) grouped.route_accesses,
+            (unsigned long long) grouped.unique_accesses,
+            (unsigned long long) grouped.cache_hits,
+            (unsigned long long) grouped.cache_misses);
+        GGML_LOG(
+            "moe-grouped-resources: payload_capacity_bytes=%llu payload_allocation_bytes=%llu "
+            "slot_auxiliary_bytes=%llu fixed_auxiliary_bytes=%llu metadata_bytes=%llu host_staging_bytes=%llu\n",
+            (unsigned long long) grouped.payload_capacity_bytes,
+            (unsigned long long) grouped.payload_allocation_bytes,
+            (unsigned long long) grouped.slot_auxiliary_bytes,
+            (unsigned long long) grouped.fixed_auxiliary_bytes,
+            (unsigned long long) grouped.metadata_bytes,
+            (unsigned long long) grouped.host_staging_bytes);
+        GGML_LOG(
+            "moe-grouped-prefetch: calls=%llu proposed_bytes=%llu copied_bytes=%llu used_bytes=%llu "
+            "wrong_bytes=%llu late_bytes=%llu dropped_bytes=%llu demand_materialized_bytes=%llu\n",
+            (unsigned long long) grouped.prefetch_calls,
+            (unsigned long long) grouped.prefetch_proposed_bytes,
+            (unsigned long long) grouped.prefetch_copied_bytes,
+            (unsigned long long) grouped.prefetch_used_bytes,
+            (unsigned long long) grouped.prefetch_wrong_bytes,
+            (unsigned long long) grouped.prefetch_late_bytes,
+            (unsigned long long) grouped.prefetch_dropped_bytes,
+            (unsigned long long) grouped.demand_materialized_bytes);
         const moe_cache_proc_snapshot proc = moe_cache_get_proc_delta();
         const double h2d_mib = (double) mm.h2d_copy_bytes / 1024.0 / 1024.0;
         const double h2d_enqueue_ms = (double) mm.h2d_enqueue_time_us / 1000.0;

@@ -26,6 +26,7 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_MSC_VER)
@@ -317,15 +318,11 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
     try {
-        // If the user enabled the MoE expert cache (--moe-expert-cache-size > 0)
-        // and CUDA is available, *prepend* a tensor_buft_override that routes
-        // every expert tensor to the CUDA_MoE_Cached buffer type. Prepending
-        // matters because the loader's match loop is first-match-wins -- we
-        // need the cache override to catch expert tensors before any earlier
-        // --cpu-moe / --n-cpu-moe overrides do. The vector owns the storage
-        // for the duration of this function, which outlives the loader's use
-        // of the pointer.
+        // Legacy slot mode keeps its first-match cache override. An explicit
+        // layer selector opts into residual placement: user overrides win and
+        // the cache catches only the selected layers left over.
         std::vector<llama_model_tensor_buft_override> effective_overrides;
+        std::vector<std::string> moe_layer_patterns;
         struct moe_buffer_type_owner {
             ggml_backend_buffer_type_t type = nullptr;
             ggml_backend_moe_cache_free_buffer_type_t release = nullptr;
@@ -336,10 +333,25 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             }
         } moe_buffer_type;
         const llama_model_tensor_buft_override * effective_overrides_ptr = params.tensor_buft_overrides;
-        if (params.moe_expert_cache_host_pinned_size > 0 && params.moe_expert_cache_slots <= 0) {
-            throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires --moe-expert-cache-size");
+        if ((params.moe_expert_cache_byte_budgets == nullptr) !=
+                (params.n_moe_expert_cache_byte_budgets == 0)) {
+            throw std::runtime_error("invalid MoE cache byte budgets");
         }
-        if (params.moe_expert_cache_slots > 0) {
+        const bool byte_budget_mode = params.n_moe_expert_cache_byte_budgets != 0;
+        const bool cache_enabled = params.moe_expert_cache_slots > 0 || byte_budget_mode;
+        if (byte_budget_mode && params.moe_expert_cache_slots > 0) {
+            throw std::runtime_error("MoE cache byte budgets conflict with a nonzero slot count");
+        }
+        if (params.moe_expert_cache_host_pinned_size > 0 && !cache_enabled) {
+            throw std::runtime_error("--moe-expert-cache-host-pinned-mb requires an enabled MoE expert cache");
+        }
+        if (params.n_moe_expert_cache_layer_ranges != 0 && params.moe_expert_cache_layer_ranges == nullptr) {
+            throw std::runtime_error("invalid MoE cache layer selector");
+        }
+        if (params.n_moe_expert_cache_layer_ranges != 0 && !cache_enabled) {
+            throw std::runtime_error("MoE cache layer selection requires an enabled MoE expert cache");
+        }
+        if (cache_enabled) {
             ggml_backend_moe_cache_buffer_type_t buffer_type_fn = nullptr;
             ggml_backend_reg_t cache_reg = nullptr;
             for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
@@ -361,8 +373,8 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
                     cache_reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME);
                 moe_buffer_type.release = (ggml_backend_moe_cache_free_buffer_type_t) ggml_backend_reg_get_proc_address(
                     cache_reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME);
-                if (create == nullptr || moe_buffer_type.release == nullptr ||
-                        (moe_buffer_type.type = create(params.moe_expert_cache_host_pinned_size)) == nullptr) {
+                moe_buffer_type.type = create != nullptr ? create(params.moe_expert_cache_host_pinned_size) : nullptr;
+                if (moe_buffer_type.release == nullptr || moe_buffer_type.type == nullptr) {
                     throw std::runtime_error("backend cannot create the bounded MoE host source buffer");
                 }
                 buft = moe_buffer_type.type;
@@ -371,16 +383,50 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             // Kept inline (not pulled from common.h) so libllama keeps no common/ dep.
             static const char * MOE_EXPS_PATTERN =
                 "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
-            effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
-
             bool had_user_overrides = false;
-            if (params.tensor_buft_overrides) {
-                for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
-                    effective_overrides.push_back(*o);
-                    had_user_overrides = true;
+            const bool residual = params.n_moe_expert_cache_layer_ranges != 0;
+            const auto append_user_overrides = [&]() {
+                if (params.tensor_buft_overrides) {
+                    for (const auto * o = params.tensor_buft_overrides; o->pattern != nullptr; ++o) {
+                        effective_overrides.push_back(*o);
+                        had_user_overrides = true;
+                    }
                 }
+            };
+            if (residual) {
+                append_user_overrides();
+                size_t selected_layers = 0;
+                std::unordered_set<int32_t> unique_layers;
+                for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+                    const auto & range = params.moe_expert_cache_layer_ranges[i];
+                    const uint64_t count = range.first >= 0 && range.last >= range.first ?
+                        static_cast<uint64_t>(range.last) - static_cast<uint64_t>(range.first) + 1 : 0;
+                    if (count == 0 || count > 4096 - selected_layers) {
+                        throw std::runtime_error("invalid or excessively large MoE cache layer selector");
+                    }
+                    for (uint64_t layer = static_cast<uint64_t>(range.first);
+                            layer <= static_cast<uint64_t>(range.last); ++layer) {
+                        if (!unique_layers.insert(static_cast<int32_t>(layer)).second) {
+                            throw std::runtime_error("MoE cache layer selector contains duplicate layers");
+                        }
+                    }
+                    selected_layers += static_cast<size_t>(count);
+                }
+                moe_layer_patterns.reserve(selected_layers);
+                effective_overrides.reserve(effective_overrides.size() + selected_layers + 1);
+                for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+                    const auto & range = params.moe_expert_cache_layer_ranges[i];
+                    for (uint64_t layer = static_cast<uint64_t>(range.first);
+                            layer <= static_cast<uint64_t>(range.last); ++layer) {
+                        moe_layer_patterns.push_back("blk\\." + std::to_string(layer) + MOE_EXPS_PATTERN);
+                        effective_overrides.push_back({moe_layer_patterns.back().c_str(), buft});
+                    }
+                }
+            } else {
+                effective_overrides.push_back({MOE_EXPS_PATTERN, buft});
+                append_user_overrides();
             }
-            if (had_user_overrides) {
+            if (had_user_overrides && !residual) {
                 LLAMA_LOG_WARN("--moe-expert-cache-size is set; expert tensors route through "
                                "the GPU LRU cache regardless of --cpu-moe / --n-cpu-moe.\n");
             }
@@ -421,6 +467,14 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             model->load_hparams(ml);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        for (size_t i = 0; i < params.n_moe_expert_cache_layer_ranges; ++i) {
+            const auto & range = params.moe_expert_cache_layer_ranges[i];
+            if (static_cast<uint64_t>(range.last) >= model->hparams.n_layer_all) {
+                throw std::runtime_error(format(
+                    "MoE cache layer selector ends at layer %d, but the model has %u layers",
+                    range.last, model->hparams.n_layer_all));
+            }
         }
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");

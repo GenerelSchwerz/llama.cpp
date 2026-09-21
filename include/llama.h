@@ -333,6 +333,11 @@ extern "C" {
         ggml_backend_buffer_type_t buft;
     };
 
+    struct llama_model_layer_range {
+        int32_t first;
+        int32_t last;
+    };
+
     struct llama_model_params {
         // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         ggml_backend_dev_t * devices;
@@ -375,6 +380,21 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // Optional inclusive, zero-based cache layer ranges. NULL/0 preserves the
+        // legacy all-expert placement behavior. The model copies the borrowed array
+        // during construction. Ranges must be ordered internally, within the loaded
+        // model's layer count, and must not overlap or duplicate layers.
+        const struct llama_model_layer_range * moe_expert_cache_layer_ranges;
+        size_t n_moe_expert_cache_layer_ranges;
+
+        // Optional per-device cache budgets in bytes. NULL/0 uses slot mode. One
+        // element broadcasts to every selected device; otherwise the count must
+        // match the selected device order. The model copies the borrowed array.
+        // Budget mode is mutually exclusive with a positive slot count. A zero
+        // budget does not disable an active owner and cannot hold a cache slot.
+        const size_t * moe_expert_cache_byte_budgets;
+        size_t n_moe_expert_cache_byte_budgets;
     };
 
     struct llama_sampler_seq_config {

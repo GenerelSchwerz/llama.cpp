@@ -27,6 +27,7 @@
 #include "../ggml/src/ggml-backend-moe.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
@@ -352,7 +353,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
 }
 
 llama_model * llama_model_create(llm_arch arch, const llama_model_params & params) {
-    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR && params.moe_expert_cache_slots > 0) {
+    if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR &&
+            (params.moe_expert_cache_slots > 0 || params.n_moe_expert_cache_byte_budgets != 0)) {
         throw std::runtime_error("MoE expert caching does not support tensor split; use --split-mode layer or --moe-expert-cache-size 0");
     }
     llama_model * model = llama_model_mapping(arch, params);
@@ -1210,14 +1212,51 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::vector<llama_model_layer_range> moe_cache_layer_ranges_owned;
+    std::vector<size_t> moe_cache_byte_budgets_owned;
+    std::unordered_set<const ggml_tensor *> moe_cache_tensors;
+    std::map<ggml_backend_dev_t, llama_moe_cache_memory> moe_cache_memory;
+    std::array<std::map<ggml_backend_dev_t, llama_moe_cache_memory>, 2> moe_cache_context_memory;
+    struct moe_cache_staging_group {
+        ggml_backend_dev_t owner;
+        int32_t layer;
+        uint32_t n_experts;
+        uint32_t top_k;
+        uint32_t context_mask;
+        std::vector<uint64_t> bank_expert_strides;
+    };
+    std::vector<moe_cache_staging_group> moe_cache_staging_groups;
+    std::map<ggml_backend_dev_t, int32_t> moe_cache_slots;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
+    if ((params.moe_expert_cache_byte_budgets == nullptr) != (params.n_moe_expert_cache_byte_budgets == 0) ||
+            (params.moe_expert_cache_layer_ranges == nullptr) != (params.n_moe_expert_cache_layer_ranges == 0)) {
+        throw std::runtime_error("invalid MoE expert cache parameter array");
+    }
+    if (params.n_moe_expert_cache_byte_budgets != 0 && params.moe_expert_cache_slots > 0) {
+        throw std::runtime_error("MoE cache byte budgets conflict with a nonzero slot count");
+    }
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.moe_expert_cache_layer_ranges != nullptr && params.n_moe_expert_cache_layer_ranges != 0) {
+        pimpl->moe_cache_layer_ranges_owned.assign(
+            params.moe_expert_cache_layer_ranges,
+            params.moe_expert_cache_layer_ranges + params.n_moe_expert_cache_layer_ranges);
+        this->params.moe_expert_cache_layer_ranges = pimpl->moe_cache_layer_ranges_owned.data();
+    }
+    if (params.moe_expert_cache_byte_budgets != nullptr && params.n_moe_expert_cache_byte_budgets != 0) {
+        pimpl->moe_cache_byte_budgets_owned.assign(
+            params.moe_expert_cache_byte_budgets,
+            params.moe_expert_cache_byte_budgets + params.n_moe_expert_cache_byte_budgets);
+        this->params.moe_expert_cache_byte_budgets = pimpl->moe_cache_byte_budgets_owned.data();
+        // Budget mode uses owner-local slot counts. Keep a positive sentinel for
+        // existing cache-enabled gates; candidate snapshots replace it per owner.
+        this->params.moe_expert_cache_slots = 1;
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1783,6 +1822,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
                 buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
         const bool is_moe_cache_buft = is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
+        if (is_moe_cache_buft) {
+            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
+                    tensor = ggml_get_next_tensor(ctx, tensor)) {
+                pimpl->moe_cache_tensors.insert(tensor);
+            }
+        }
         if (ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
             GGML_ASSERT(!ml.no_alloc);
             auto buffer_from_host_ptr_fn = (ggml_backend_moe_cache_buffer_from_host_ptr_t)
@@ -1886,6 +1931,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     build_moe_sources();
+    finalize_moe_expert_cache();
 
     if (ml.no_alloc) {
         return true;
@@ -1940,12 +1986,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         sources.magic = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_MAGIC;
         sources.abi_version = GGML_BACKEND_MOE_CANDIDATE_SNAPSHOT_V2_VERSION;
         sources.struct_size = sizeof(sources);
-        sources.n_slots = params.moe_expert_cache_slots;
         sources.groups = groups.data();
         sources.n_groups = groups.size();
         sources.tensors = tensors.data();
         sources.n_tensors = tensors.size();
         for (auto buft : owners) {
+            sources.n_slots = 0;
+            for (const auto & entry : pimpl->moe_cache_slots) {
+                sources.n_slots = std::max(sources.n_slots, static_cast<uint32_t>(entry.second));
+            }
             auto reg = ggml_backend_dev_backend_reg(ggml_backend_buft_get_device(buft));
             auto configure = (ggml_backend_moe_cache_configure_sources_t) ggml_backend_reg_get_proc_address(
                 reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME);
@@ -2338,7 +2387,374 @@ bool llama_model::has_tensor_overrides() const {
 }
 
 int32_t llama_model::moe_expert_cache_slots() const {
+    if (!pimpl->moe_cache_byte_budgets_owned.empty() && !pimpl->moe_cache_slots.empty()) {
+        int32_t result = INT32_MAX;
+        for (const auto & entry : pimpl->moe_cache_slots) {
+            result = std::min(result, entry.second);
+        }
+        return result;
+    }
     return params.moe_expert_cache_slots;
+}
+
+size_t llama_moe_cache_memory::device_bytes(uint32_t slots) const {
+    if (per_slot_device_bytes != 0 && slots > (SIZE_MAX - fixed_device_bytes) / per_slot_device_bytes) {
+        throw std::overflow_error("MoE cache memory estimate overflow");
+    }
+    return fixed_device_bytes + slots * per_slot_device_bytes;
+}
+
+int32_t llama_model::moe_expert_cache_slots(ggml_backend_dev_t dev) const {
+    // Preserve the legacy global slot-count contract exactly. Owner-local counts
+    // are only meaningful when byte-budget mode selected them independently.
+    if (pimpl->moe_cache_byte_budgets_owned.empty()) {
+        return params.moe_expert_cache_slots;
+    }
+    const auto found = pimpl->moe_cache_slots.find(dev);
+    return found != pimpl->moe_cache_slots.end() ? found->second : 0;
+}
+
+bool llama_model::moe_expert_cache_enabled() const {
+    return params.moe_expert_cache_slots > 0;
+}
+
+const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & llama_model::moe_expert_cache_memory() const {
+    return pimpl->moe_cache_memory;
+}
+
+std::map<ggml_backend_buffer_type_t, size_t> llama_model::moe_expert_cache_memory_breakdown(
+        enum llama_context_type ctx_type) const {
+    std::map<ggml_backend_buffer_type_t, size_t> result;
+    const size_t context_index = ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+    size_t host_staging = 0;
+    for (const auto & entry : pimpl->moe_cache_context_memory[context_index]) {
+        const auto slots = moe_expert_cache_slots(entry.first);
+        if (slots > 0) {
+            result[ggml_backend_dev_buffer_type(entry.first)] += entry.second.device_bytes(slots);
+        }
+    }
+    if (params.moe_expert_cache_host_pinned_size > 0) {
+        for (const auto & group : pimpl->moe_cache_staging_groups) {
+            if ((group.context_mask & (uint32_t{1} << context_index)) == 0) {
+                continue;
+            }
+            auto * reg = ggml_backend_dev_backend_reg(group.owner);
+            auto staging_size = reg != nullptr ? reinterpret_cast<ggml_backend_moe_staging_size_v1_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_STAGING_SIZE_V1_PROC_NAME)) : nullptr;
+            const int32_t slots = moe_expert_cache_slots(group.owner);
+            if (staging_size == nullptr || slots <= 0 || group.bank_expert_strides.empty() ||
+                    group.bank_expert_strides.size() > GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS) {
+                continue;
+            }
+            ggml_backend_moe_staging_query_v1 query = {};
+            query.struct_size = sizeof(query);
+            query.n_slots = static_cast<uint32_t>(slots);
+            query.n_experts = group.n_experts;
+            query.top_k = group.top_k;
+            query.n_banks = static_cast<uint32_t>(group.bank_expert_strides.size());
+            query.staged_bank_mask = (uint32_t{1} << query.n_banks) - 1;
+            query.family_mask = GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED |
+                GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY |
+                GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED;
+            // The control block can be enabled after model load, so include it in
+            // fit/accounting regardless of the process-global runtime setting.
+            query.flags = GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL;
+            std::copy(group.bank_expert_strides.begin(), group.bank_expert_strides.end(), query.bank_expert_strides);
+            ggml_backend_moe_staging_size_v1 sizing = {};
+            sizing.struct_size = sizeof(sizing);
+            if (!staging_size(&query, &sizing)) {
+                throw std::runtime_error("failed to size MoE cache host staging");
+            }
+            uint64_t staging = sizing.grouped_min_bytes;
+            if (sizing.legacy_min_bytes > UINT64_MAX - staging) {
+                throw std::overflow_error("MoE cache host staging estimate overflow");
+            }
+            staging += sizing.legacy_min_bytes;
+            if (sizing.host_staged_min_bytes > UINT64_MAX - staging) {
+                throw std::overflow_error("MoE cache host staging estimate overflow");
+            }
+            staging += sizing.host_staged_min_bytes;
+            if (staging > SIZE_MAX || static_cast<size_t>(staging) > SIZE_MAX - host_staging) {
+                throw std::overflow_error("MoE cache host staging estimate overflow");
+            }
+            host_staging += static_cast<size_t>(staging);
+        }
+    }
+    if (host_staging != 0) {
+        result[ggml_backend_cpu_buffer_type()] += host_staging;
+    }
+    return result;
+}
+
+void llama_model::finalize_moe_expert_cache() {
+    pimpl->moe_cache_memory.clear();
+    for (auto & memory : pimpl->moe_cache_context_memory) {
+        memory.clear();
+    }
+    pimpl->moe_cache_staging_groups.clear();
+    pimpl->moe_cache_slots.clear();
+    if (!moe_expert_cache_enabled()) {
+        return;
+    }
+
+    const auto add = [](size_t & dst, size_t value) {
+        if (value > SIZE_MAX - dst) {
+            throw std::overflow_error("MoE cache memory estimate overflow");
+        }
+        dst += value;
+    };
+    const auto add64 = [](uint64_t & dst, uint64_t value) {
+        if (value > UINT64_MAX - dst) {
+            throw std::overflow_error("MoE cache memory estimate overflow");
+        }
+        dst += value;
+    };
+    struct context_geometry {
+        uint32_t width = 0;
+        uint32_t experts = 0;
+        uint32_t top_k = 0;
+        uint32_t hc_rank = 0;
+    };
+    std::array<std::map<ggml_backend_dev_t, context_geometry>, 2> context_geometries;
+    const bool mtp_context_active = params.load_mtp && hparams.n_layer_nextn > 0 && hparams.router_layer < 0;
+    const bool disjoint_mtp_layers = mtp_context_active && hparams.n_layer() > 0;
+    std::unordered_set<int32_t> unmatched_selected_layers;
+    for (const auto & range : pimpl->moe_cache_layer_ranges_owned) {
+        for (int64_t layer = range.first; layer <= range.last; ++layer) {
+            unmatched_selected_layers.insert(static_cast<int32_t>(layer));
+        }
+    }
+
+    for (const auto & group : pimpl->moe_sources) {
+        if (group.layer < 0 || static_cast<size_t>(group.layer) >= pimpl->dev_layer.size()) {
+            continue;
+        }
+        uint32_t n_experts = 0;
+        uint32_t base_banks = 0;
+        uint32_t cached_base_banks = 0;
+        for (const auto & bank : group.banks) {
+            const auto * tensor = bank.tensor;
+            if (tensor == nullptr) {
+                continue;
+            }
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                ++base_banks;
+                cached_base_banks += pimpl->moe_cache_tensors.count(tensor) != 0;
+                if (tensor->ne[2] <= 0 || tensor->ne[2] > UINT32_MAX) {
+                    throw std::runtime_error("invalid MoE expert count for cache accounting");
+                }
+                if (n_experts != 0 && n_experts != static_cast<uint32_t>(tensor->ne[2])) {
+                    throw std::runtime_error("inconsistent MoE expert count in cache group");
+                }
+                n_experts = static_cast<uint32_t>(tensor->ne[2]);
+            }
+        }
+        if (cached_base_banks == 0) {
+            continue;
+        }
+        if (cached_base_banks != base_banks || n_experts == 0) {
+            throw std::runtime_error("MoE cache placement must select every routed weight in a layer group");
+        }
+        unmatched_selected_layers.erase(group.layer);
+        ggml_backend_dev_t owner = pimpl->dev_layer[group.layer].dev;
+        if (owner == nullptr || ggml_backend_dev_type(owner) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            if (!pimpl->moe_cache_byte_budgets_owned.empty()) {
+                // Allocation-free fit probes deliberately begin with every layer on
+                // the CPU. Account selected groups as their candidate layer owner is
+                // assigned instead of rejecting that non-executable lower bound.
+                if (params.no_alloc) {
+                    continue;
+                }
+                throw std::runtime_error("MoE cache byte budgets require cached layers to have a GPU owner");
+            }
+            continue;
+        }
+        auto * reg = ggml_backend_dev_backend_reg(owner);
+        auto device_size = reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME)) : nullptr;
+        if (device_size == nullptr) {
+            throw std::runtime_error("MoE cache backend cannot size device allocations");
+        }
+        ggml_backend_moe_device_size_query_v1 query = {};
+        query.struct_size = sizeof(query);
+        query.n_slots = 1;
+        query.n_experts = n_experts;
+        query.flags = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+        std::unordered_set<const ggml_tensor *> slot_auxiliaries;
+        std::unordered_set<const ggml_tensor *> original_shadows;
+        std::unordered_set<const ggml_tensor *> prefill_copies;
+        for (const auto & bank : group.banks) {
+            const auto * tensor = bank.tensor;
+            if (tensor == nullptr) {
+                continue;
+            }
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                if (query.n_banks == GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS || tensor->nb[2] == 0 ||
+                        tensor->ne[0] <= 0 || tensor->ne[0] > INT32_MAX) {
+                    throw std::runtime_error("invalid MoE routed bank for cache accounting");
+                }
+                const uint32_t index = query.n_banks++;
+                query.bank_expert_strides[index] = tensor->nb[2];
+                query.bank_ne0[index] = tensor->ne[0];
+                query.bank_types[index] = tensor->type;
+                continue;
+            }
+            if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) {
+                continue;
+            }
+            if (original_shadows.insert(tensor).second) {
+                add64(query.original_shadow_bytes, ggml_nbytes(tensor));
+            }
+            const bool scalar = ggml_n_dims(tensor) == 1 && tensor->ne[0] == n_experts;
+            const bool vector = ggml_n_dims(tensor) == 2 && tensor->ne[1] == n_experts && tensor->ne[0] > 0;
+            if ((scalar || vector) && slot_auxiliaries.insert(tensor).second) {
+                add64(query.slot_auxiliary_values, scalar ? 1 : static_cast<uint64_t>(tensor->ne[0]));
+                query.n_slot_auxiliaries = std::min<uint32_t>(3, query.n_slot_auxiliaries + 1);
+            }
+            if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_BIAS &&
+                    prefill_copies.insert(tensor).second) {
+                add64(query.prefill_copy_bytes, ggml_nbytes(tensor));
+            }
+        }
+        ggml_backend_moe_device_size_v1 sizing = {};
+        sizing.struct_size = sizeof(sizing);
+        if (!device_size(&query, &sizing) || sizing.group_fixed_bytes > SIZE_MAX ||
+                sizing.group_per_slot_bytes > SIZE_MAX) {
+            throw std::runtime_error("failed to size MoE cache device allocations");
+        }
+        llama_moe_cache_memory group_memory;
+        group_memory.max_slots = n_experts;
+        group_memory.fixed_device_bytes = static_cast<size_t>(sizing.group_fixed_bytes);
+        group_memory.per_slot_device_bytes = static_cast<size_t>(sizing.group_per_slot_bytes);
+
+        const auto merge_memory = [&](llama_moe_cache_memory & memory) {
+            memory.max_slots = memory.max_slots == 0 ? group_memory.max_slots :
+                std::min(memory.max_slots, group_memory.max_slots);
+            add(memory.fixed_device_bytes, group_memory.fixed_device_bytes);
+            add(memory.per_slot_device_bytes, group_memory.per_slot_device_bytes);
+        };
+        const bool use_mtp = mtp_context_active && (!disjoint_mtp_layers ||
+            static_cast<uint32_t>(group.layer) >= hparams.n_layer());
+        const bool use_default = !disjoint_mtp_layers || static_cast<uint32_t>(group.layer) < hparams.n_layer();
+        for (size_t context_index = 0; context_index < 2; ++context_index) {
+            if ((context_index == 0 && !use_default) || (context_index == 1 && !use_mtp)) {
+                continue;
+            }
+            merge_memory(pimpl->moe_cache_memory[owner]);
+            merge_memory(pimpl->moe_cache_context_memory[context_index][owner]);
+            auto & geometry = context_geometries[context_index][owner];
+            const uint32_t top_k = std::max<uint32_t>(1, hparams.n_expert_used(group.layer));
+            if (context_index == 0 && top_k <= GGML_BACKEND_MOE_EARLY_ROUTER_MAX_ROUTES) {
+                const auto * router_input = layers[group.layer].ffn_gate_inp;
+                const uint64_t width = router_input != nullptr && router_input->ne[0] > 0 ?
+                    static_cast<uint64_t>(router_input->ne[0]) : hparams.n_embd;
+                if (width > UINT32_MAX) {
+                    throw std::runtime_error("MoE router width exceeds cache accounting ABI");
+                }
+                geometry.width = std::max(geometry.width, static_cast<uint32_t>(width));
+                geometry.experts = std::max(geometry.experts, n_experts);
+                geometry.top_k = std::max(geometry.top_k, top_k);
+                geometry.hc_rank = std::max(geometry.hc_rank, hparams.hc_low_rank);
+            }
+        }
+
+        if (params.moe_expert_cache_host_pinned_size > 0) {
+            impl::moe_cache_staging_group staging_group = {};
+            staging_group.owner = owner;
+            staging_group.layer = group.layer;
+            staging_group.n_experts = n_experts;
+            staging_group.top_k = std::max<uint32_t>(1, hparams.n_expert_used(group.layer));
+            staging_group.context_mask = (use_default ? 1u : 0u) | (use_mtp ? 2u : 0u);
+            for (const auto & bank : group.banks) {
+                if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE && bank.tensor != nullptr) {
+                    staging_group.bank_expert_strides.push_back(bank.tensor->nb[2]);
+                }
+            }
+            pimpl->moe_cache_staging_groups.push_back(std::move(staging_group));
+        }
+    }
+    for (size_t context_index = 0; context_index < context_geometries.size(); ++context_index) {
+        for (const auto & entry : context_geometries[context_index]) {
+            auto * reg = ggml_backend_dev_backend_reg(entry.first);
+            auto device_size = reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
+                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME)) : nullptr;
+            if (device_size == nullptr) {
+                throw std::runtime_error("MoE cache backend cannot size context allocations");
+            }
+            ggml_backend_moe_device_size_query_v1 query = {};
+            query.struct_size = sizeof(query);
+            query.flags = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+            // Early routing is currently limited to MAIN grouped decode.
+            if (context_index == 0) {
+                query.early_width = entry.second.width;
+                query.early_experts = entry.second.experts;
+                query.early_top_k = entry.second.top_k;
+                query.early_hc_rank = entry.second.hc_rank;
+            }
+            ggml_backend_moe_device_size_v1 sizing = {};
+            sizing.struct_size = sizeof(sizing);
+            if (!device_size(&query, &sizing) || sizing.context_fixed_bytes > SIZE_MAX) {
+                throw std::runtime_error("failed to size MoE cache context allocations");
+            }
+            add(pimpl->moe_cache_memory[entry.first].fixed_device_bytes,
+                static_cast<size_t>(sizing.context_fixed_bytes));
+            add(pimpl->moe_cache_context_memory[context_index][entry.first].fixed_device_bytes,
+                static_cast<size_t>(sizing.context_fixed_bytes));
+        }
+    }
+    if (!unmatched_selected_layers.empty()) {
+        const int32_t layer = *std::min_element(unmatched_selected_layers.begin(), unmatched_selected_layers.end());
+        throw std::runtime_error(format(
+            "MoE cache layer selector includes layer %d, which has no routed expert tensor group", layer));
+    }
+
+    if (pimpl->moe_cache_byte_budgets_owned.empty()) {
+        for (const auto & entry : pimpl->moe_cache_memory) {
+            pimpl->moe_cache_slots[entry.first] = params.moe_expert_cache_slots;
+        }
+    } else {
+        if (pimpl->moe_cache_byte_budgets_owned.size() != 1 &&
+                pimpl->moe_cache_byte_budgets_owned.size() != devices.size()) {
+            throw std::runtime_error("MoE cache byte budget count must be one or match the selected device count");
+        }
+        for (size_t i = 0; i < devices.size(); ++i) {
+            ggml_backend_dev_t dev = devices[i].dev;
+            const auto found = pimpl->moe_cache_memory.find(dev);
+            if (found == pimpl->moe_cache_memory.end()) {
+                continue;
+            }
+            const size_t budget = pimpl->moe_cache_byte_budgets_owned.size() == 1 ?
+                pimpl->moe_cache_byte_budgets_owned[0] : pimpl->moe_cache_byte_budgets_owned[i];
+            const auto & memory = found->second;
+            const size_t available = budget > memory.fixed_device_bytes ? budget - memory.fixed_device_bytes : 0;
+            const uint64_t slots = memory.per_slot_device_bytes != 0 ?
+                std::min<uint64_t>(available / memory.per_slot_device_bytes, memory.max_slots) : 0;
+            if (slots == 0) {
+                throw std::runtime_error("MoE cache byte budget cannot hold one slot on an active device");
+            }
+            pimpl->moe_cache_slots[dev] = static_cast<int32_t>(slots);
+            LLAMA_LOG_INFO("moe-cache-budget: device=%s budget_bytes=%zu slots=%llu fixed_device_bytes=%zu "
+                           "per_slot_device_bytes=%zu\n",
+                           ggml_backend_dev_name(dev), budget, (unsigned long long) slots,
+                           memory.fixed_device_bytes, memory.per_slot_device_bytes);
+        }
+    }
+
+    if (params.moe_expert_cache_host_pinned_size > 0) {
+        size_t mandatory = 0;
+        for (const auto ctx_type : {LLAMA_CONTEXT_TYPE_DEFAULT, LLAMA_CONTEXT_TYPE_MTP}) {
+            for (const auto & entry : moe_expert_cache_memory_breakdown(ctx_type)) {
+                if (ggml_backend_buft_is_host(entry.first)) {
+                    add(mandatory, entry.second);
+                }
+            }
+        }
+        if (mandatory > params.moe_expert_cache_host_pinned_size) {
+            throw std::runtime_error(format(
+                "MoE cache host-pinned budget cannot hold mandatory staging: need %zu bytes, have %zu",
+                mandatory, params.moe_expert_cache_host_pinned_size));
+        }
+    }
 }
 
 void llama_model::build_moe_sources() {
@@ -3000,6 +3416,10 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_expert_cache_layer_ranges =*/ nullptr,
+        /*.n_moe_expert_cache_layer_ranges =*/ 0,
+        /*.moe_expert_cache_byte_budgets =*/ nullptr,
+        /*.n_moe_expert_cache_byte_budgets =*/ 0,
     };
 
     return result;
