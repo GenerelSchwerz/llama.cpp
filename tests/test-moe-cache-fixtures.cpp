@@ -1055,6 +1055,13 @@ void check_active_grouped_debug_telemetry(
         bytes_per_expert += bank->nb[2];
     }
     CHECK(telemetry.h2d_bytes == expected_loaded_experts * bytes_per_expert);
+    CHECK(telemetry.route_accesses == expected_calls * graph.n_rows * graph.n_used);
+    CHECK(telemetry.unique_accesses <= telemetry.route_accesses);
+    CHECK(telemetry.cache_misses == expected_loaded_experts);
+    CHECK(telemetry.cache_hits + telemetry.cache_misses == telemetry.unique_accesses);
+    CHECK(telemetry.payload_capacity_bytes > 0);
+    CHECK(telemetry.payload_allocation_bytes >= telemetry.payload_capacity_bytes);
+    CHECK(telemetry.metadata_bytes > 0);
 
     const auto reset = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(reset.registered == 1 && reset.covered == 0 && reset.plan_calls == 0);
@@ -1062,6 +1069,8 @@ void check_active_grouped_debug_telemetry(
     CHECK(reset.ready_min == 0 && reset.ready_max == 0);
     CHECK(reset.completed_min == 0 && reset.completed_max == 0);
     CHECK(reset.admitted_banks == 0 && reset.h2d_banks == 0 && reset.h2d_bytes == 0);
+    CHECK(reset.route_accesses == 0 && reset.unique_accesses == 0);
+    CHECK(reset.cache_hits == 0 && reset.cache_misses == 0);
 }
 
 void check_active_grouped_legacy_caches(

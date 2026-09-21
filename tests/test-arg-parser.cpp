@@ -264,6 +264,95 @@ static void test(void) {
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_early_router);
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-layers", "0,2-4,7"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_layer_ranges.size() == 3);
+    assert(params.moe_expert_cache_layer_ranges[0].first == 0 && params.moe_expert_cache_layer_ranges[0].last == 0);
+    assert(params.moe_expert_cache_layer_ranges[1].first == 2 && params.moe_expert_cache_layer_ranges[1].last == 4);
+    assert(params.moe_expert_cache_layer_ranges[2].first == 7 && params.moe_expert_cache_layer_ranges[2].last == 7);
+    const auto layer_mparams = common_model_params_to_llama(params);
+    assert(layer_mparams.moe_expert_cache_layer_ranges == params.moe_expert_cache_layer_ranges.data());
+    assert(layer_mparams.n_moe_expert_cache_layer_ranges == 3);
+    const auto default_mparams = llama_model_default_params();
+    assert(default_mparams.moe_expert_cache_layer_ranges == nullptr);
+    assert(default_mparams.n_moe_expert_cache_layer_ranges == 0);
+    assert(default_mparams.moe_expert_cache_byte_budgets == nullptr);
+    assert(default_mparams.n_moe_expert_cache_byte_budgets == 0);
+
+    for (const char * value : {"", ",1", "1,", "1--2", "2-1", "-1", "1-2-3", "1,1", "1-3,3-5", "2147483648"}) {
+        params = common_params();
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-layers", value};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-mib", "64"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_byte_budgets == std::vector<size_t>({size_t{64} * 1024 * 1024}));
+    const auto broadcast_mparams = common_model_params_to_llama(params);
+    assert(broadcast_mparams.moe_expert_cache_byte_budgets == params.moe_expert_cache_byte_budgets.data());
+    assert(broadcast_mparams.n_moe_expert_cache_byte_budgets == 1);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-mib", "64,128,0"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.moe_expert_cache_byte_budgets == std::vector<size_t>({size_t{64} * 1024 * 1024, size_t{128} * 1024 * 1024, 0}));
+
+    for (const char * value : {"", ",1", "1,", "-1", "1.5", "18446744073709551616", "18446744073709551615"}) {
+        params = common_params();
+        argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-mib", value};
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    }
+
+    for (const auto & options : {
+        std::vector<std::string>{"--moe-expert-cache-size", "1", "--moe-expert-cache-mib", "0"},
+        std::vector<std::string>{"--moe-expert-cache-mib", "0", "--moe-expert-cache-size", "1"},
+    }) {
+        params = common_params();
+        argv = {"binary_name", "-m", "model_file.gguf"};
+        argv.insert(argv.end(), options.begin(), options.end());
+        assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    }
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf",
+            "--spec-draft-moe-expert-cache-size", "1", "--spec-draft-moe-expert-cache-mib", "0"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf",
+            "--moe-expert-cache-layers", "1-3",
+            "--moe-expert-cache-mib", "64,128",
+            "--spec-draft-moe-expert-cache-layers", "5,7-8",
+            "--spec-draft-moe-expert-cache-mib", "32"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    assert(params.moe_expert_cache_layer_ranges.size() == 1);
+    assert(params.moe_expert_cache_layer_ranges[0].first == 1 && params.moe_expert_cache_layer_ranges[0].last == 3);
+    assert(params.moe_expert_cache_byte_budgets == std::vector<size_t>({size_t{64} * 1024 * 1024, size_t{128} * 1024 * 1024}));
+    assert(params.speculative.draft.moe_expert_cache_layer_ranges.size() == 2);
+    assert(params.speculative.draft.moe_expert_cache_layer_ranges[0].first == 5 && params.speculative.draft.moe_expert_cache_layer_ranges[0].last == 5);
+    assert(params.speculative.draft.moe_expert_cache_layer_ranges[1].first == 7 && params.speculative.draft.moe_expert_cache_layer_ranges[1].last == 8);
+    assert(params.speculative.draft.moe_expert_cache_byte_budgets == std::vector<size_t>({size_t{32} * 1024 * 1024}));
+    const auto mtp_like = common_base_params_to_speculative(params);
+    assert(mtp_like.moe_expert_cache_byte_budgets == params.moe_expert_cache_byte_budgets);
+    params.speculative.draft.mparams.path = "draft.gguf";
+    const auto independent_draft = common_base_params_to_speculative(params);
+    assert(independent_draft.moe_expert_cache_layer_ranges.size() == 2);
+    assert(independent_draft.moe_expert_cache_layer_ranges[0].first == 5 && independent_draft.moe_expert_cache_layer_ranges[0].last == 5);
+    assert(independent_draft.moe_expert_cache_layer_ranges[1].first == 7 && independent_draft.moe_expert_cache_layer_ranges[1].last == 8);
+    assert(independent_draft.moe_expert_cache_byte_budgets == params.speculative.draft.moe_expert_cache_byte_budgets);
+
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-mib", "0"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
+    params.speculative.draft.mparams.path = "draft.gguf";
+    params.moe_expert_cache_host_pinned_size = size_t{32} * 1024 * 1024;
+    const auto zero_budget_draft = common_base_params_to_speculative(params);
+    assert(zero_budget_draft.moe_expert_cache_byte_budgets.empty());
+    assert(zero_budget_draft.moe_expert_cache_host_pinned_size == 0);
+    params.speculative.draft.mparams.path.clear();
+
+    params.moe_expert_cache_byte_budgets.clear();
     params.n_moe_expert_cache_slots = 40;
     assert(params.speculative.draft.n_moe_expert_cache_slots == 0);
     assert(common_base_params_to_speculative(params).n_moe_expert_cache_slots == 40);

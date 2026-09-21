@@ -5,6 +5,7 @@
 #include "../src/llama-model.h"
 #include "../src/llama-vocab.h"
 
+#include <limits>
 #include <stdexcept>
 
 void test_moe_tensor_split_rejection() {
@@ -19,9 +20,48 @@ void test_moe_tensor_split_rejection() {
     }
     CHECK(rejected);
     params.moe_expert_cache_slots = 0;
+    const size_t budget = 64 * 1024 * 1024;
+    params.moe_expert_cache_byte_budgets = &budget;
+    params.n_moe_expert_cache_byte_budgets = 1;
+    rejected = false;
+    try {
+        llama_model_free(llama_model_create(LLM_ARCH_DEEPSEEK4, params));
+    } catch (const std::runtime_error & error) {
+        rejected = std::string(error.what()).find("MoE expert caching does not support tensor split") != std::string::npos;
+    }
+    CHECK(rejected);
+    params.moe_expert_cache_byte_budgets = nullptr;
+    params.n_moe_expert_cache_byte_budgets = 0;
     llama_model * model = llama_model_create(LLM_ARCH_DEEPSEEK4, params);
     CHECK(model != nullptr);
     llama_model_free(model);
+
+    params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+    params.moe_expert_cache_slots = 8;
+    model = llama_model_create(LLM_ARCH_DEEPSEEK4, params);
+    CHECK(model != nullptr);
+    CHECK(model->moe_expert_cache_slots(nullptr) == 8);
+    llama_model_free(model);
+
+    llama_moe_cache_memory memory = {};
+    memory.fixed_device_bytes = 100;
+    memory.per_slot_device_bytes = 20;
+    memory.max_slots = 8;
+    CHECK(memory.device_bytes(3) == 160);
+    // max_slots caps automatic byte-budget derivation; legacy slot mode still
+    // accounts for the exact user-requested allocation.
+    CHECK(memory.device_bytes(9) == 280);
+
+    memory.fixed_device_bytes = std::numeric_limits<size_t>::max() - 5;
+    memory.per_slot_device_bytes = 6;
+    memory.max_slots = 1;
+    rejected = false;
+    try {
+        (void) memory.device_bytes(1);
+    } catch (const std::overflow_error &) {
+        rejected = true;
+    }
+    CHECK(rejected);
     fprintf(stderr, "test-moe-cache: unsupported tensor/cache combination rejected before weights OK\n");
 }
 
@@ -2199,6 +2239,12 @@ void test_moe_cache_proc_api() {
     CHECK(reg != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME) != nullptr);
+    auto staging_size = reinterpret_cast<ggml_backend_moe_staging_size_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_STAGING_SIZE_V1_PROC_NAME));
+    CHECK(staging_size != nullptr);
+    auto device_size = reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME));
+    CHECK(device_size != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) != nullptr);
@@ -2208,5 +2254,70 @@ void test_moe_cache_proc_api() {
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_LOG_AND_RESET_STATS_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_set_decode_boundary_overlap") != nullptr);
+
+    ggml_backend_moe_staging_query_v1 query = {};
+    query.struct_size = sizeof(query);
+    query.n_slots = 8;
+    query.n_experts = 16;
+    query.top_k = 4;
+    query.n_banks = 2;
+    query.staged_bank_mask = 0x3;
+    query.family_mask = GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED |
+        GGML_BACKEND_MOE_STAGING_FAMILY_V1_LEGACY |
+        GGML_BACKEND_MOE_STAGING_FAMILY_V1_HOST_STAGED;
+    query.flags = GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL;
+    query.bank_expert_strides[0] = 1000;
+    query.bank_expert_strides[1] = 2000;
+    ggml_backend_moe_staging_size_v1 sizing = {};
+    sizing.struct_size = sizeof(sizing);
+    CHECK(staging_size(&query, &sizing));
+    CHECK(sizing.grouped_min_bytes > 0);
+    CHECK(sizing.legacy_min_bytes > 0);
+    CHECK(sizing.host_staged_min_bytes == sizing.legacy_min_bytes);
+    CHECK(sizing.optional_growth_max_bytes > 0);
+    CHECK(sizing.prepack_tile_bytes == 12000);
+
+    query.family_mask = GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED;
+    sizing = {};
+    sizing.struct_size = sizeof(sizing);
+    CHECK(staging_size(&query, &sizing));
+    CHECK(sizing.grouped_min_bytes > 0 && sizing.legacy_min_bytes == 0 && sizing.host_staged_min_bytes == 0);
+    query.bank_expert_strides[0] = UINT64_MAX;
+    CHECK(!staging_size(&query, &sizing));
+
+    ggml_backend_moe_device_size_query_v1 device_query = {};
+    device_query.struct_size = sizeof(device_query);
+    device_query.n_slots = 8;
+    device_query.n_experts = 16;
+    device_query.n_banks = 1;
+    device_query.n_slot_auxiliaries = 1;
+    device_query.flags = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+    device_query.slot_auxiliary_values = 2;
+    device_query.original_shadow_bytes = 100;
+    device_query.prefill_copy_bytes = 200;
+    device_query.bank_expert_strides[0] = 1000;
+    device_query.bank_ne0[0] = 32;
+    device_query.bank_types[0] = GGML_TYPE_F32;
+    ggml_backend_moe_device_size_v1 device_sizing = {};
+    device_sizing.struct_size = sizeof(device_sizing);
+    CHECK(device_size(&device_query, &device_sizing));
+    CHECK(device_sizing.group_fixed_bytes >= 300);
+    CHECK(device_sizing.group_per_slot_bytes > 1000);
+    CHECK(device_sizing.context_fixed_bytes > 0);
+
+    device_query = {};
+    device_query.struct_size = sizeof(device_query);
+    device_query.flags = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+    device_query.early_width = 4096;
+    device_query.early_experts = 256;
+    device_query.early_top_k = 8;
+    device_query.early_hc_rank = 512;
+    device_sizing = {};
+    device_sizing.struct_size = sizeof(device_sizing);
+    CHECK(device_size(&device_query, &device_sizing));
+    CHECK(device_sizing.group_fixed_bytes == 0 && device_sizing.group_per_slot_bytes == 0);
+    CHECK(device_sizing.context_fixed_bytes > 4096 * sizeof(float));
+    device_query.early_top_k = 0;
+    CHECK(!device_size(&device_query, &device_sizing));
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");
 }

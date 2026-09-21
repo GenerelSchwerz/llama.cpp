@@ -119,9 +119,9 @@ int main(int argc, char ** argv) {
         int dev = 0;
         CUDA_OK(cudaGetDevice(&dev));
         test_grouped_graph_replay_lifecycle(dev);
-        test_grouped_graph_replay_lifecycle(dev, 262144, 2);
-        test_grouped_graph_replay_lifecycle(dev, 393216, 1);
-        test_grouped_graph_replay_lifecycle(dev, 4 * 1024 * 1024, 2, 1024);
+        test_grouped_graph_replay_lifecycle(dev, 393216, 2);
+        test_grouped_graph_replay_lifecycle(dev, 524288, 1);
+        test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);
         return 0;
     }
     if (grouped_nvfp4_only) {
@@ -179,9 +179,9 @@ int main(int argc, char ** argv) {
     test_grouped_graph_replay_lifecycle(dev);
     test_grouped_graph_replay_lifecycle(dev, 0, 1, 256, true);
     test_grouped_graph_replay_lifecycle(dev, 0, 0, 256, false, true);
-    test_grouped_graph_replay_lifecycle(dev, 262144, 2);
-    test_grouped_graph_replay_lifecycle(dev, 393216, 1);
-    test_grouped_graph_replay_lifecycle(dev, 4 * 1024 * 1024, 2, 1024);
+    test_grouped_graph_replay_lifecycle(dev, 393216, 2);
+    test_grouped_graph_replay_lifecycle(dev, 524288, 1);
+    test_grouped_graph_replay_lifecycle(dev, 6 * 1024 * 1024, 2, 1024);
     test_strided_copy_graph_update(dev, false);
     test_strided_copy_graph_update(dev, true);
     test_active_grouped_multirow_graph_modes(dev);

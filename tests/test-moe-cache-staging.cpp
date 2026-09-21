@@ -564,7 +564,7 @@ static void test_grouped_decode_type(
         }
 #endif
         for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
-            const bool budget_admits = mixed ? group_index == 0 : host_budget >= 65536;
+            const bool budget_admits = mixed ? group_index == 0 : host_budget >= 49152;
             const bool direct = budget_admits && (pinned || read_only_supported);
             for (uint32_t bank = 0; bank < n_banks; ++bank) {
                 cudaPointerAttributes attributes = {};
@@ -1253,10 +1253,12 @@ void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, true, 12);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
     for (bool allocated : {false, true}) {
-        for (size_t budget : {size_t{16384}, size_t{20480}, size_t{65536}}) {
+        // Three staging families remain live for a pageable group. Keep one
+        // minimum-only case and two cases with enough room for direct sources.
+        for (size_t budget : {size_t{32768}, size_t{49152}, size_t{65536}}) {
             test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, budget);
         }
-        test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, 53248, true);
+        test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, 81920, true);
     }
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
         for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {

@@ -337,7 +337,7 @@ void test_grouped_graph_replay_lifecycle(
             std::this_thread::yield();
         }
 
-        const bool replace_pending = host_budget == 393216 || pageable;
+        const bool replace_pending = host_budget == 524288 || pageable;
         std::thread replace_pending_thread;
         if (replace_pending) {
             replace_pending_thread = std::thread([&] {
