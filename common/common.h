@@ -982,6 +982,13 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
 
+// Apply model metadata and vocabulary-dependent adjustments that affect the
+// sampler chain before common_sampler_init(). This is shared by normal runtime
+// context creation and allocation-only configuration probes.
+void common_params_sampling_prepare(
+        const struct llama_model * model,
+        common_params_sampling &   params);
+
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
 

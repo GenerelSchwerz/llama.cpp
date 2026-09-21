@@ -11,6 +11,7 @@
 #include "llama-cpp.h"
 #include "llama.h"
 #include "log.h"
+#include "sampling.h"
 #include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
@@ -2863,6 +2864,26 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
         return std::find_if(measurement.components.begin(), measurement.components.end(),
                             [role](const auto & component) { return component.role == role; });
     };
+    const auto component_memory = [](const common_joint_component_measurement & component) {
+        std::map<std::string, std::array<size_t, 5>> result;
+        for (const auto & owner : component.owners) {
+            result[owner.canonical_id] = {
+                owner.memory.model,
+                owner.memory.context,
+                owner.memory.compute,
+                owner.memory.staging,
+                owner.memory.staging_available ? size_t(1) : size_t(0),
+            };
+        }
+        return result;
+    };
+    const auto sampler_count = [](const common_joint_component_measurement & component) {
+        if (component.configuration_record.empty()) {
+            return size_t(0);
+        }
+        return common_json::parse(component.configuration_record)
+            .at("context").at("samplers").at("sequences").size();
+    };
 
     joint_probe_sampler_counters sampler_counters;
     auto *            original_sampler_state = new joint_probe_sampler_state{ &sampler_counters, false, false };
@@ -2921,6 +2942,71 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
         "sampler semantic identity was omitted from configuration identity");
     check(logger_before == logger_after && logger_data_before == logger_data_after,
           "joint measurement did not restore the global logger");
+
+    common_params wrapped_target_params;
+    wrapped_target_params.model.path               = target_path.string();
+    wrapped_target_params.devices                  = { nullptr };
+    wrapped_target_params.n_ctx                    = 32;
+    wrapped_target_params.n_batch                  = 32;
+    wrapped_target_params.n_ubatch                 = 16;
+    wrapped_target_params.n_parallel               = 1;
+    wrapped_target_params.n_gpu_layers             = 0;
+    wrapped_target_params.sampling.backend_sampling = true;
+    const auto wrapped_target_params_before = wrapped_target_params;
+    const auto wrapped_target = common_measure_joint_configuration(wrapped_target_params);
+    const auto wrapped_target_repeat = common_measure_joint_configuration(wrapped_target_params);
+    const auto wrapped_target_component = find_component(wrapped_target, COMMON_JOINT_ROLE_TARGET);
+
+    auto explicit_target_sampling = wrapped_target_params.sampling;
+    common_params_sampling_prepare(target.get(), explicit_target_sampling);
+    common_sampler_ptr explicit_target_sampler(common_sampler_init(target.get(), explicit_target_sampling));
+    llama_sampler_seq_config explicit_target_config = { 0, common_sampler_get(explicit_target_sampler.get()) };
+    auto explicit_target_request = make_request(target_path, false);
+    explicit_target_request.target.cparams.samplers = &explicit_target_config;
+    explicit_target_request.target.cparams.n_samplers = 1;
+    explicit_target_request.target.sampler_configuration_id = "explicit-target-runtime-equivalent-v1";
+    const auto explicit_target = common_measure_joint_configuration(explicit_target_request);
+    const auto explicit_target_component = find_component(explicit_target, COMMON_JOINT_ROLE_TARGET);
+    check(wrapped_target.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+              wrapped_target_component != wrapped_target.components.end() &&
+              explicit_target_component != explicit_target.components.end() &&
+              sampler_count(*wrapped_target_component) == 1 &&
+              component_memory(*wrapped_target_component) == component_memory(*explicit_target_component),
+          "common-params wrapper omitted or mismeasured target backend sampling");
+    check(!wrapped_target.configuration_id.empty() &&
+              wrapped_target.configuration_id == wrapped_target_repeat.configuration_id &&
+              wrapped_target.configuration_record == wrapped_target_repeat.configuration_record,
+          "wrapper-generated target sampler identity was not stable");
+    auto changed_wrapped_target_params = wrapped_target_params;
+    changed_wrapped_target_params.sampling.top_k++;
+    const auto changed_wrapped_target = common_measure_joint_configuration(changed_wrapped_target_params);
+    check(changed_wrapped_target.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+              changed_wrapped_target.configuration_id != wrapped_target.configuration_id,
+          "target sampler semantics were omitted from wrapper configuration identity");
+    check(wrapped_target_params.model.path == wrapped_target_params_before.model.path &&
+              wrapped_target_params.devices == wrapped_target_params_before.devices &&
+              wrapped_target_params.n_ctx == wrapped_target_params_before.n_ctx &&
+              wrapped_target_params.n_batch == wrapped_target_params_before.n_batch &&
+              wrapped_target_params.n_ubatch == wrapped_target_params_before.n_ubatch &&
+              wrapped_target_params.n_parallel == wrapped_target_params_before.n_parallel &&
+              wrapped_target_params.sampling.backend_sampling ==
+                  wrapped_target_params_before.sampling.backend_sampling &&
+              wrapped_target_params.sampling.top_k == wrapped_target_params_before.sampling.top_k &&
+              wrapped_target_params.sampling.logit_bias.size() ==
+                  wrapped_target_params_before.sampling.logit_bias.size() &&
+              wrapped_target_params.sampling.logit_bias_eog.size() ==
+                  wrapped_target_params_before.sampling.logit_bias_eog.size(),
+          "common-params wrapper mutated caller target sampling parameters");
+    auto invalid_wrapped_target_params = wrapped_target_params;
+    invalid_wrapped_target_params.sampling.penalty_repeat = 0.0f;
+    const auto invalid_wrapped_target = common_measure_joint_configuration(invalid_wrapped_target_params);
+    check(invalid_wrapped_target.completeness == COMMON_JOINT_COMPLETENESS_ERROR &&
+              !invalid_wrapped_target.admission_qualified && invalid_wrapped_target.configuration_id.empty() &&
+              std::any_of(invalid_wrapped_target.diagnostics.begin(), invalid_wrapped_target.diagnostics.end(),
+                          [](const std::string & diagnostic) {
+                              return diagnostic.find("target backend sampler probe") != std::string::npos;
+                          }),
+          "target sampler preparation failure escaped its structured error result");
     try {
         const auto round_trip = common_json::parse(common_joint_measurement_json(target_only_a));
         check(round_trip.at("configuration_id").get<std::string>() == target_only_a.configuration_id &&
@@ -2977,6 +3063,70 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
                                  owner.required_lower_bytes < owner.required_upper_bytes;
                       }),
           "phase-aware shared workspace did not retain a conservative bound");
+
+    common_params wrapped_mtp_params;
+    wrapped_mtp_params.model.path    = mtp_path.string();
+    wrapped_mtp_params.devices       = { nullptr };
+    wrapped_mtp_params.n_ctx         = 32;
+    wrapped_mtp_params.n_batch       = 32;
+    wrapped_mtp_params.n_ubatch      = 16;
+    wrapped_mtp_params.n_parallel    = 1;
+    wrapped_mtp_params.n_gpu_layers  = 0;
+    wrapped_mtp_params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+    wrapped_mtp_params.speculative.draft.n_max = 1;
+    wrapped_mtp_params.speculative.draft.backend_sampling = true;
+    const auto wrapped_mtp = common_measure_joint_configuration(wrapped_mtp_params);
+    const auto wrapped_mtp_component = find_component(wrapped_mtp, COMMON_JOINT_ROLE_MTP);
+
+    llama_sampler_ptr explicit_mtp_sampler(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+    llama_sampler_chain_add(explicit_mtp_sampler.get(), llama_sampler_init_top_k(10));
+    llama_sampler_seq_config explicit_mtp_config = { 0, explicit_mtp_sampler.get() };
+    auto explicit_mtp_target_params = wrapped_mtp_params;
+    common_joint_measurement_request explicit_mtp_request;
+    explicit_mtp_request.target.path_model = mtp_path.string();
+    explicit_mtp_request.target.mparams = common_model_params_to_llama(explicit_mtp_target_params);
+    explicit_mtp_request.target.cparams = common_context_params_to_llama(explicit_mtp_target_params);
+    explicit_mtp_request.target.role = COMMON_JOINT_ROLE_TARGET;
+    explicit_mtp_request.target.required = true;
+    auto explicit_mtp_draft_params = common_base_params_to_speculative(explicit_mtp_target_params);
+    common_joint_component_request explicit_mtp_component_request;
+    explicit_mtp_component_request.path_model = mtp_path.string();
+    explicit_mtp_component_request.mparams = common_model_params_to_llama(explicit_mtp_draft_params);
+    explicit_mtp_component_request.cparams = common_context_params_to_llama(explicit_mtp_draft_params);
+    explicit_mtp_component_request.cparams.n_rs_seq = 0;
+    explicit_mtp_component_request.role = COMMON_JOINT_ROLE_MTP;
+    explicit_mtp_component_request.sharing = COMMON_JOINT_SHARING_TARGET_MODEL;
+    explicit_mtp_component_request.required = true;
+    explicit_mtp_component_request.cparams.samplers = &explicit_mtp_config;
+    explicit_mtp_component_request.cparams.n_samplers = 1;
+    explicit_mtp_component_request.sampler_configuration_id = "explicit-mtp-top-k-10-v1";
+    explicit_mtp_request.extras.push_back(explicit_mtp_component_request);
+    const auto explicit_mtp = common_measure_joint_configuration(explicit_mtp_request);
+    const auto explicit_mtp_component = find_component(explicit_mtp, COMMON_JOINT_ROLE_MTP);
+    check(wrapped_mtp.completeness == COMMON_JOINT_COMPLETENESS_COMPLETE &&
+              wrapped_mtp_component != wrapped_mtp.components.end() &&
+              explicit_mtp_component != explicit_mtp.components.end() &&
+              sampler_count(*wrapped_mtp_component) == 1 &&
+              component_memory(*wrapped_mtp_component) == component_memory(*explicit_mtp_component),
+          "common-params wrapper omitted or mismeasured default MTP backend sampling");
+    const auto wrapped_mtp_repeat = common_measure_joint_configuration(wrapped_mtp_params);
+    check(!wrapped_mtp.configuration_id.empty() &&
+              wrapped_mtp.configuration_id == wrapped_mtp_repeat.configuration_id &&
+              wrapped_mtp.configuration_record == wrapped_mtp_repeat.configuration_record,
+          "wrapper-generated MTP sampler identity was not stable");
+
+    auto unsupported_backend_draft = wrapped_mtp_params;
+    unsupported_backend_draft.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 };
+    unsupported_backend_draft.speculative.draft.mparams.path = target_path.string();
+    const auto unsupported_backend = common_measure_joint_configuration(unsupported_backend_draft);
+    check(unsupported_backend.completeness == COMMON_JOINT_COMPLETENESS_ERROR &&
+              !unsupported_backend.admission_qualified && unsupported_backend.configuration_id.empty() &&
+              std::any_of(unsupported_backend.diagnostics.begin(), unsupported_backend.diagnostics.end(),
+                          [](const std::string & diagnostic) {
+                              return diagnostic.find("does not yet represent this draft backend sampler") !=
+                                     std::string::npos;
+                          }),
+          "unrepresented draft backend sampler was treated as qualified");
 
     auto separate_request = make_request(target_path, false);
     auto separate_draft   = make_component(target_path, false);
@@ -3097,12 +3247,16 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
         const std::string common_args = " -ngl 0 -c 32 -b 32 -ub 16 -fit off";
         const auto [qualified_status, qualified_stdout, qualified_stderr] =
             run_tool("--fit-moe-joint-report-json -m " + quote(mtp_path.string()) +
-                     " --spec-type draft-mtp --spec-draft-n-max 1" + common_args);
+                     " --spec-type draft-mtp --spec-draft-n-max 1 -bs" + common_args);
         GGML_UNUSED(qualified_stderr);
         try {
             const auto output = common_json::parse(qualified_stdout);
             check(qualified_status == 0 && std::count(qualified_stdout.begin(), qualified_stdout.end(), '\n') == 1 &&
-                      output.at("admission_qualified").get<bool>() && output.at("components").size() == 2,
+                      output.at("admission_qualified").get<bool>() && output.at("components").size() == 2 &&
+                      output.at("components").at(0).at("configuration").at("context")
+                          .at("samplers").at("sequences").size() == 1 &&
+                      output.at("components").at(1).at("configuration").at("context")
+                          .at("samplers").at("sequences").size() == 1,
                   "strict fit executable did not emit one qualified target/MTP JSON object");
         } catch (const std::exception &) {
             check(false, "strict fit executable stdout was not one JSON object");

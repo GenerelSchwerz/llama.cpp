@@ -5,6 +5,7 @@
 #include "hash/hash.h"
 #include "json.h"
 #include "log.h"
+#include "sampling.h"
 #include "speculative.h"
 
 #include <algorithm>
@@ -15,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <locale>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1244,6 +1246,218 @@ common_joint_measurement common_measure_joint_configuration(const common_joint_m
     return result;
 }
 
+struct common_joint_sampler_bundle {
+    // Model-dependent sampler implementations may retain vocabulary pointers.
+    // Keep their allocation-only model alive until the measurement has cloned
+    // and destroyed every sampler attachment.
+    llama_model_ptr                          model;
+    std::vector<common_sampler_ptr>        common;
+    std::vector<llama_sampler_ptr>         raw;
+    std::vector<llama_sampler_seq_config>  configs;
+};
+
+static std::string common_joint_float(float value) {
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::hexfloat << value;
+    return out.str();
+}
+
+static std::string common_joint_sampling_configuration_id(
+        const common_params_sampling & params,
+        const char *                   kind,
+        uint32_t                       n_seq) {
+    common_json record = common_json::object();
+    record["kind"]                    = kind;
+    record["n_seq"]                   = n_seq;
+    record["seed"]                    = params.seed;
+    record["n_prev"]                  = params.n_prev;
+    record["n_probs"]                 = params.n_probs;
+    record["min_keep"]                = params.min_keep;
+    record["top_k"]                   = params.top_k;
+    record["top_p"]                   = common_joint_float(params.top_p);
+    record["min_p"]                   = common_joint_float(params.min_p);
+    record["xtc_probability"]         = common_joint_float(params.xtc_probability);
+    record["xtc_threshold"]           = common_joint_float(params.xtc_threshold);
+    record["typ_p"]                   = common_joint_float(params.typ_p);
+    record["temp"]                    = common_joint_float(params.temp);
+    record["dynatemp_range"]          = common_joint_float(params.dynatemp_range);
+    record["dynatemp_exponent"]       = common_joint_float(params.dynatemp_exponent);
+    record["penalty_last_n"]          = params.penalty_last_n;
+    record["penalty_repeat"]          = common_joint_float(params.penalty_repeat);
+    record["penalty_freq"]            = common_joint_float(params.penalty_freq);
+    record["penalty_present"]         = common_joint_float(params.penalty_present);
+    record["dry_multiplier"]          = common_joint_float(params.dry_multiplier);
+    record["dry_base"]                = common_joint_float(params.dry_base);
+    record["dry_allowed_length"]      = params.dry_allowed_length;
+    record["dry_penalty_last_n"]      = params.dry_penalty_last_n;
+    record["adaptive_target"]         = common_joint_float(params.adaptive_target);
+    record["adaptive_decay"]          = common_joint_float(params.adaptive_decay);
+    record["mirostat"]                = params.mirostat;
+    record["top_n_sigma"]             = common_joint_float(params.top_n_sigma);
+    record["mirostat_tau"]            = common_joint_float(params.mirostat_tau);
+    record["mirostat_eta"]            = common_joint_float(params.mirostat_eta);
+    record["ignore_eos"]              = params.ignore_eos;
+    record["no_perf"]                 = params.no_perf;
+    record["timing_per_token"]        = params.timing_per_token;
+    record["user_sampling_config"]    = params.user_sampling_config;
+    record["dry_sequence_breakers"]   = params.dry_sequence_breakers;
+    record["grammar_type"]            = static_cast<int32_t>(params.grammar.type);
+    record["grammar"]                 = params.grammar.grammar;
+    record["grammar_lazy"]            = params.grammar_lazy;
+    record["generation_prompt"]       = params.generation_prompt;
+    record["reasoning_budget_tokens"] = params.reasoning_budget_tokens;
+    record["reasoning_budget_start"]  = params.reasoning_budget_start;
+    common_json reasoning_budget_end = common_json::array();
+    for (const auto & sequence : params.reasoning_budget_end) {
+        reasoning_budget_end.push_back(sequence);
+    }
+    record["reasoning_budget_end"]    = std::move(reasoning_budget_end);
+    record["reasoning_budget_forced"] = params.reasoning_budget_forced;
+    record["reasoning_budget_message"] = params.reasoning_budget_message;
+    record["reasoning_control"]        = params.reasoning_control;
+    record["backend_sampling"]         = params.backend_sampling;
+
+    common_json samplers = common_json::array();
+    for (const auto sampler : params.samplers) {
+        samplers.push_back(static_cast<int32_t>(sampler));
+    }
+    record["samplers"] = std::move(samplers);
+
+    common_json triggers = common_json::array();
+    for (const auto & trigger : params.grammar_triggers) {
+        triggers.push_back({
+            { "type",  static_cast<int32_t>(trigger.type) },
+            { "value", trigger.value                       },
+            { "token", trigger.token                       },
+        });
+    }
+    record["grammar_triggers"] = std::move(triggers);
+
+    common_json preserved = common_json::array();
+    for (const auto token : params.preserved_tokens) {
+        preserved.push_back(token);
+    }
+    record["preserved_tokens"] = std::move(preserved);
+
+    const auto encode_biases = [](const std::vector<llama_logit_bias> & biases) {
+        common_json result = common_json::array();
+        for (const auto & bias : biases) {
+            result.push_back({
+                { "token", bias.token                    },
+                { "bias",  common_joint_float(bias.bias) },
+            });
+        }
+        return result;
+    };
+    record["logit_bias"]     = encode_biases(params.logit_bias);
+    record["logit_bias_eog"] = encode_biases(params.logit_bias_eog);
+
+    const std::string serialized = record.dump();
+    return hash_sha256_hex(serialized.data(), serialized.size());
+}
+
+static bool common_joint_attach_target_samplers(
+        common_params &                         params,
+        common_joint_component_request &        target,
+        common_joint_sampler_bundle &           bundle,
+        std::string &                           error) {
+    if (!params.sampling.backend_sampling) {
+        return true;
+    }
+
+    try {
+        common_owned_model_params sampler_model_params(target.mparams);
+        bundle.model.reset(llama_model_load_from_file(target.path_model.c_str(), sampler_model_params.params));
+        if (!bundle.model) {
+            error = "failed to load target sampler configuration probe";
+            return false;
+        }
+
+        common_params_sampling_prepare(bundle.model.get(), params.sampling);
+        bundle.common.reserve(target.cparams.n_seq_max);
+        bundle.configs.reserve(target.cparams.n_seq_max);
+        for (llama_seq_id seq = 0; seq < static_cast<llama_seq_id>(target.cparams.n_seq_max); ++seq) {
+            common_sampler_ptr sampler(common_sampler_init(bundle.model.get(), params.sampling));
+            if (!sampler) {
+                error = "failed to initialize target backend sampler probe";
+                return false;
+            }
+            bundle.configs.push_back({ seq, common_sampler_get(sampler.get()) });
+            bundle.common.push_back(std::move(sampler));
+        }
+        if (!params.sampling.backend_sampling) {
+            bundle.configs.clear();
+            bundle.common.clear();
+            bundle.model.reset();
+            return true;
+        }
+
+        target.cparams.samplers   = bundle.configs.data();
+        target.cparams.n_samplers = bundle.configs.size();
+        target.sampler_configuration_id =
+            common_joint_sampling_configuration_id(params.sampling, "target_common_sampler", target.cparams.n_seq_max);
+        return true;
+    } catch (const std::exception & exception) {
+        error = std::string("failed to prepare target backend sampler probe: ") + exception.what();
+        return false;
+    }
+}
+
+static bool common_joint_attach_draft_samplers(
+        const common_params &                   params,
+        common_joint_component_request &        extra,
+        common_joint_sampler_bundle &           bundle,
+        std::string &                           error) {
+    if (!params.speculative.draft.backend_sampling) {
+        return true;
+    }
+
+    const auto has_type = [&](common_speculative_type type) {
+        return std::find(params.speculative.types.begin(), params.speculative.types.end(), type) !=
+               params.speculative.types.end();
+    };
+    if (!has_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP)) {
+        if (has_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) ||
+            has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+            has_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) {
+            error = "strict joint measurement does not yet represent this draft backend sampler";
+            return false;
+        }
+        // The simple draft implementation samples on the CPU and does not
+        // attach a sampler to its backend context.
+        return true;
+    }
+
+    try {
+        bundle.raw.reserve(extra.cparams.n_seq_max);
+        bundle.configs.reserve(extra.cparams.n_seq_max);
+        for (llama_seq_id seq = 0; seq < static_cast<llama_seq_id>(extra.cparams.n_seq_max); ++seq) {
+            llama_sampler_ptr chain(llama_sampler_chain_init(llama_sampler_chain_default_params()));
+            if (!chain) {
+                error = "failed to initialize draft backend sampler probe";
+                return false;
+            }
+            llama_sampler_chain_add(chain.get(), llama_sampler_init_top_k(10));
+            bundle.configs.push_back({ seq, chain.get() });
+            bundle.raw.push_back(std::move(chain));
+        }
+        common_params_sampling draft_sampling;
+        draft_sampling.no_perf          = false;
+        draft_sampling.top_k            = 10;
+        draft_sampling.samplers          = { COMMON_SAMPLER_TYPE_TOP_K };
+        draft_sampling.backend_sampling = true;
+        extra.cparams.samplers   = bundle.configs.data();
+        extra.cparams.n_samplers = bundle.configs.size();
+        extra.sampler_configuration_id =
+            common_joint_sampling_configuration_id(draft_sampling, "draft_top_k_10", extra.cparams.n_seq_max);
+        return true;
+    } catch (const std::exception & exception) {
+        error = std::string("failed to prepare draft backend sampler probe: ") + exception.what();
+        return false;
+    }
+}
+
 common_joint_measurement common_measure_joint_configuration(const common_params & params,
                                                             ggml_log_level        log_level,
                                                             bool                  observe_device_capacity) {
@@ -1258,14 +1472,23 @@ common_joint_measurement common_measure_joint_configuration(const common_params 
     request.default_device_margin   = params.fit_params_target.empty() ? 0 : params.fit_params_target.front();
     request.log_level               = log_level;
     request.observe_device_capacity = observe_device_capacity;
-    request.runtime_params          = &params;
+    request.runtime_params          = &target_params;
+
+    common_joint_sampler_bundle target_samplers;
+    std::string                 sampler_error;
+    if (!common_joint_attach_target_samplers(target_params, request.target, target_samplers, sampler_error)) {
+        common_joint_measurement result;
+        result.diagnostics.push_back(std::move(sampler_error));
+        return result;
+    }
 
     const bool has_draft = params.speculative.has_dft();
     const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
                                      COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     std::optional<common_params> draft_params;
+    common_joint_sampler_bundle draft_samplers;
     if (has_draft || spec_mtp) {
-        draft_params.emplace(common_base_params_to_speculative(params));
+        draft_params.emplace(common_base_params_to_speculative(target_params));
         common_joint_component_request extra;
         extra.path_model       = has_draft ? draft_params->model.path : params.model.path;
         extra.mparams          = common_model_params_to_llama(*draft_params);
@@ -1274,6 +1497,11 @@ common_joint_measurement common_measure_joint_configuration(const common_params 
         extra.role             = spec_mtp ? COMMON_JOINT_ROLE_MTP : COMMON_JOINT_ROLE_DRAFT;
         extra.sharing          = has_draft ? COMMON_JOINT_SHARING_BORROW_TARGET : COMMON_JOINT_SHARING_TARGET_MODEL;
         extra.required         = true;
+        if (!common_joint_attach_draft_samplers(target_params, extra, draft_samplers, sampler_error)) {
+            common_joint_measurement result;
+            result.diagnostics.push_back(std::move(sampler_error));
+            return result;
+        }
         request.extras.push_back(std::move(extra));
     }
     return common_measure_joint_configuration(request);

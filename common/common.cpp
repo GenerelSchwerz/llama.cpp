@@ -1272,6 +1272,32 @@ static void common_init_sampler_from_model(
     get_float(llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_MIROSTAT_ETA),    sparams.mirostat_eta,    common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_MIROSTAT_ETA);
 }
 
+void common_params_sampling_prepare(
+        const llama_model *       model,
+        common_params_sampling & sparams) {
+    common_init_sampler_from_model(model, sparams);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    if (sparams.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
+        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
+        sparams.ignore_eos = false;
+    }
+
+    sparams.logit_bias_eog.clear();
+    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
+        if (llama_vocab_is_eog(vocab, i)) {
+            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
+            sparams.logit_bias_eog.push_back({i, -INFINITY});
+        }
+    }
+
+    if (sparams.ignore_eos) {
+        sparams.logit_bias.insert(
+                sparams.logit_bias.end(),
+                sparams.logit_bias_eog.begin(), sparams.logit_bias_eog.end());
+    }
+}
+
 struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
@@ -1347,8 +1373,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         llama_adapter_lora_ptr lora;
@@ -1367,29 +1391,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
     }
 
-    // updates params.sampling
-    // TODO: fix naming
-    common_init_sampler_from_model(model, params.sampling);
-
-    if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
-        COM_WRN("%s", "vocab does not have an EOS token, ignoring --ignore-eos\n");
-        params.sampling.ignore_eos = false;
-    }
-
-    // initialize once
-    for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
-        if (llama_vocab_is_eog(vocab, i)) {
-            COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
-            params.sampling.logit_bias_eog.push_back({i, -INFINITY});
-        }
-    }
-
-    if (params.sampling.ignore_eos) {
-        // add EOG biases to the active set of logit biases
-        params.sampling.logit_bias.insert(
-                params.sampling.logit_bias.end(),
-                params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
-    }
+    common_params_sampling_prepare(model, params.sampling);
 
     // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);

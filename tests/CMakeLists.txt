@@ -217,12 +217,23 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-speculative-limits
     )
 
+    set(MOE_JOINT_MEASUREMENT_ARGS --test-moe-joint-measurement)
+    # The tools directory is added after tests, so use the same build guards
+    # as the fit-params target rather than TARGET, which is not available yet.
+    if (LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+        list(APPEND MOE_JOINT_MEASUREMENT_ARGS
+            --fit-tool $<TARGET_FILE:llama-fit-params>
+        )
+    endif()
+
     llama_test(
         test-llama-archs
         NAME test-moe-joint-measurement
-        ARGS --test-moe-joint-measurement --fit-tool $<TARGET_FILE:llama-fit-params>
+        ARGS ${MOE_JOINT_MEASUREMENT_ARGS}
     )
-    add_dependencies(test-llama-archs llama-fit-params)
+    if (LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN)
+        add_dependencies(test-llama-archs llama-fit-params)
+    endif()
     set_tests_properties(test-moe-joint-measurement PROPERTIES LABELS "main;moe-cache")
     target_link_libraries(test-llama-archs PRIVATE vendor::hash)
 
