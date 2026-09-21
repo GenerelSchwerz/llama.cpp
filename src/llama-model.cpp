@@ -2549,13 +2549,15 @@ void llama_model::finalize_moe_expert_cache() {
                 n_experts = static_cast<uint32_t>(tensor->ne[2]);
             }
         }
+        if (base_banks != 0) {
+            unmatched_selected_layers.erase(group.layer);
+        }
         if (cached_base_banks == 0) {
             continue;
         }
         if (cached_base_banks != base_banks || n_experts == 0) {
             throw std::runtime_error("MoE cache placement must select every routed weight in a layer group");
         }
-        unmatched_selected_layers.erase(group.layer);
         ggml_backend_dev_t owner = pimpl->dev_layer[group.layer].dev;
         if (owner == nullptr || ggml_backend_dev_type(owner) == GGML_BACKEND_DEVICE_TYPE_CPU) {
             if (!pimpl->moe_cache_byte_budgets_owned.empty()) {

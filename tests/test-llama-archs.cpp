@@ -1,12 +1,13 @@
-#include "common.h"
-#include "log.h"
-#include "ggml-backend.h"
 #include "../ggml/src/ggml-backend-impl.h"
+#include "../ggml/src/ggml-backend-moe.h"
+#include "common.h"
+#include "ggml-backend.h"
+#include "ggml-cpp.h"
 #include "ggml.h"
 #include "gguf.h"
-#include "ggml-cpp.h"
-#include "llama.h"
 #include "llama-cpp.h"
+#include "llama.h"
+#include "log.h"
 #include "speculative.h"
 
 // TODO: replace with #include "llama-ext.h" in the future
@@ -15,12 +16,13 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-memory-hybrid-idx.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-model.h"
 
 #include <cinttypes>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <cstdint>
 #include <filesystem>
 #include <random>
 #include <stdexcept>
@@ -71,7 +73,10 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] [--test-live-context-workspace] [--test-speculative-limits]\n", argv[0]);
+    printf(
+        "Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] "
+        "[--test-live-context-workspace] [--test-speculative-limits] [--test-moe-cache-selector]\n",
+        argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1648,6 +1653,197 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
+static int test_moe_cache_selector_precedence(const size_t seed) {
+    ggml_backend_dev_t         cache_dev  = nullptr;
+    ggml_backend_buffer_type_t cache_buft = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto               get_cache_buft =
+            reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_buffer_type_t>(
+                                 ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME)) :
+                             nullptr;
+        if (get_cache_buft != nullptr) {
+            cache_dev  = dev;
+            cache_buft = get_cache_buft();
+            break;
+        }
+    }
+    if (cache_dev == nullptr || cache_buft == nullptr) {
+        fprintf(stderr, "test-moe-cache-selector: SKIP (no backend with MoE cache support)\n");
+        return 77;
+    }
+
+    gguf_context_ptr              moe_metadata   = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+    gguf_context_ptr              dense_metadata = get_gguf_ctx(LLM_ARCH_LLAMA, false);
+    ggml_backend_dev_t            devices[]      = { cache_dev, nullptr };
+    const llama_model_layer_range both_layers[]  = {
+        { 0, 1 }
+    };
+    const llama_model_layer_range layer_zero[] = {
+        { 0, 0 }
+    };
+    const llama_model_layer_range missing_layer[] = {
+        { 2, 2 }
+    };
+    static const char * layer_zero_experts = "blk\\.0\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+    static const char * layer_zero_up      = "blk\\.0\\.ffn_up_(ch|)exps";
+
+    auto make_params = [&](const llama_model_layer_range * ranges, size_t n_ranges,
+                           const llama_model_tensor_buft_override * overrides) {
+        llama_model_params params              = llama_model_default_params();
+        params.devices                         = devices;
+        params.n_gpu_layers                    = 99;
+        params.split_mode                      = LLAMA_SPLIT_MODE_LAYER;
+        params.progress_callback               = silent_model_load_progress;
+        params.moe_expert_cache_slots          = 4;
+        params.moe_expert_cache_layer_ranges   = ranges;
+        params.n_moe_expert_cache_layer_ranges = n_ranges;
+        params.tensor_buft_overrides           = overrides;
+        return params;
+    };
+    auto load = [&](gguf_context * metadata, llama_model_params params) {
+        size_t tensor_seed = seed;
+        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_seed, params));
+    };
+    const auto is_cached = [&](const ggml_tensor * tensor) {
+        return tensor != nullptr && tensor->buffer != nullptr &&
+               ggml_backend_buffer_get_type(tensor->buffer) == cache_buft;
+    };
+    const auto uses_buft = [&](const ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return false;
+        }
+        return ggml_backend_buffer_get_type(tensor->buffer) == buft;
+    };
+    const auto layer_cached = [&](const llama_model & model, int layer) {
+        const auto & block = model.layers.at(layer);
+        return is_cached(block.ffn_gate_exps) && is_cached(block.ffn_up_exps) && is_cached(block.ffn_down_exps);
+    };
+    const auto layer_uses_buft = [&](const llama_model & model, int layer, ggml_backend_buffer_type_t buft) {
+        const auto & block = model.layers.at(layer);
+        return uses_buft(block.ffn_gate_exps, buft) && uses_buft(block.ffn_up_exps, buft) &&
+               uses_buft(block.ffn_down_exps, buft);
+    };
+    const auto layer_is_host = [&](const llama_model & model, int layer) {
+        const auto & block   = model.layers.at(layer);
+        const auto   is_host = [](const ggml_tensor * tensor) {
+            return tensor != nullptr && tensor->buffer != nullptr &&
+                   ggml_backend_buft_is_host(ggml_backend_buffer_get_type(tensor->buffer));
+        };
+        return is_host(block.ffn_gate_exps) && is_host(block.ffn_up_exps) && is_host(block.ffn_down_exps);
+    };
+    const auto print_layer_bufts = [&](const llama_model & model, int layer) {
+        const auto & block = model.layers.at(layer);
+        const auto   name  = [](const ggml_tensor * tensor) {
+            return tensor != nullptr && tensor->buffer != nullptr ?
+                       ggml_backend_buft_name(ggml_backend_buffer_get_type(tensor->buffer)) :
+                       "none";
+        };
+        fprintf(stderr, "test-moe-cache-selector: layer=%d gate=%s up=%s down=%s\n", layer, name(block.ffn_gate_exps),
+                name(block.ffn_up_exps), name(block.ffn_down_exps));
+    };
+
+    bool       ok          = true;
+    const auto expect_load = [&](const char * label, gguf_context * metadata, llama_model_params params,
+                                 bool expected) {
+        llama_model_ptr model = load(metadata, params);
+        fprintf(stderr, "test-moe-cache-selector: %-28s loaded=%d expected=%d\n", label, model != nullptr, expected);
+        if ((model != nullptr) != expected) {
+            ok = false;
+        }
+        return model;
+    };
+
+    {
+        auto model = expect_load("selected baseline", moe_metadata.get(), make_params(both_layers, 1, nullptr), true);
+        if (model &&
+            (!layer_cached(*model, 0) || !layer_cached(*model, 1) || model->moe_expert_cache_memory().empty())) {
+            fprintf(stderr, "test-moe-cache-selector: baseline placement mismatch\n");
+            ok = false;
+        }
+    }
+
+    llama_model_tensor_buft_override cpu_override[] = {
+        { layer_zero_experts, ggml_backend_cpu_buffer_type() },
+        { nullptr,            nullptr                        }
+    };
+    {
+        auto model =
+            expect_load("selected explicit CPU", moe_metadata.get(), make_params(both_layers, 1, cpu_override), true);
+        if (model && (layer_cached(*model, 0) || !layer_is_host(*model, 0) || !layer_cached(*model, 1) ||
+                      model->moe_expert_cache_memory().empty())) {
+            fprintf(stderr, "test-moe-cache-selector: explicit CPU placement mismatch\n");
+            print_layer_bufts(*model, 0);
+            print_layer_bufts(*model, 1);
+            ok = false;
+        }
+    }
+
+    std::vector<llama_model_tensor_buft_override> ncmoe_overrides;
+    llm_add_n_cpu_ffn_overrides(1, LLM_FFN_EXPS_REGEX, ncmoe_overrides);
+    ncmoe_overrides.push_back({ nullptr, nullptr });
+    {
+        auto model = expect_load("selected -ncmoe 1", moe_metadata.get(),
+                                 make_params(both_layers, 1, ncmoe_overrides.data()), true);
+        if (model && (layer_cached(*model, 0) || !layer_is_host(*model, 0) || !layer_cached(*model, 1))) {
+            fprintf(stderr, "test-moe-cache-selector: -ncmoe placement mismatch\n");
+            print_layer_bufts(*model, 0);
+            print_layer_bufts(*model, 1);
+            ok = false;
+        }
+    }
+
+    llama_model_tensor_buft_override gpu_override[] = {
+        { layer_zero_experts, ggml_backend_dev_buffer_type(cache_dev) },
+        { nullptr,            nullptr                                 }
+    };
+    {
+        auto model =
+            expect_load("selected explicit GPU", moe_metadata.get(), make_params(both_layers, 1, gpu_override), true);
+        if (model && (layer_cached(*model, 0) || !layer_uses_buft(*model, 0, ggml_backend_dev_buffer_type(cache_dev)) ||
+                      !layer_cached(*model, 1))) {
+            fprintf(stderr, "test-moe-cache-selector: explicit GPU placement mismatch\n");
+            ok = false;
+        }
+    }
+
+    {
+        auto model =
+            expect_load("zero active cache groups", moe_metadata.get(), make_params(layer_zero, 1, cpu_override), true);
+        ggml_backend_buffer_type_t device_buft = ggml_backend_dev_buffer_type(cache_dev);
+        if (model && (layer_cached(*model, 0) || !layer_is_host(*model, 0) || layer_cached(*model, 1) ||
+                      !layer_uses_buft(*model, 1, device_buft) || !model->moe_expert_cache_memory().empty())) {
+            fprintf(stderr, "test-moe-cache-selector: zero-active placement mismatch\n");
+            print_layer_bufts(*model, 0);
+            print_layer_bufts(*model, 1);
+            ok = false;
+        }
+    }
+
+    llama_model_tensor_buft_override partial_override[] = {
+        { layer_zero_up, ggml_backend_cpu_buffer_type() },
+        { nullptr,       nullptr                        }
+    };
+    (void) expect_load("partial selected group", moe_metadata.get(), make_params(layer_zero, 1, partial_override),
+                       false);
+    (void) expect_load("nonexistent selected layer", moe_metadata.get(), make_params(missing_layer, 1, nullptr), false);
+    (void) expect_load("dense-only selected layer", dense_metadata.get(), make_params(layer_zero, 1, nullptr), false);
+
+    {
+        auto model =
+            expect_load("selector-free legacy", moe_metadata.get(), make_params(nullptr, 0, cpu_override), true);
+        if (model && (!layer_cached(*model, 0) || !layer_cached(*model, 1))) {
+            fprintf(stderr, "test-moe-cache-selector: legacy precedence changed\n");
+            ok = false;
+        }
+    }
+
+    fprintf(stderr, "test-moe-cache-selector: %s on %s\n", ok ? "PASS" : "FAIL",
+            ggml_backend_dev_description(cache_dev));
+    return ok ? 0 : 1;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -1913,6 +2109,7 @@ int main(int argc, char ** argv) {
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
     bool run_speculative_limits = false;
+    bool        run_moe_cache_selector      = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -1970,8 +2167,12 @@ int main(int argc, char ** argv) {
             run_speculative_limits = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-moe-cache-selector") == 0) {
+            run_moe_cache_selector = true;
+            continue;
+        }
     }
-    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits) {
+    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector) {
         common_log_set_verbosity_thold(verbosity);
     }
     printf("%s: using seed %zu\n", __func__, seed);
@@ -1994,6 +2195,9 @@ int main(int argc, char ** argv) {
         if (run_speculative_limits) {
             test_speculative_limits(seed);
             return 0;
+        }
+        if (run_moe_cache_selector) {
+            return test_moe_cache_selector_precedence(seed);
         }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);

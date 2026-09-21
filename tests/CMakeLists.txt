@@ -217,6 +217,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --test-speculative-limits
     )
 
+    if (GGML_CUDA)
+        llama_test(
+            test-llama-archs
+            NAME test-moe-cache-selector
+            ARGS --test-moe-cache-selector
+        )
+        set_tests_properties(test-moe-cache-selector PROPERTIES
+            LABELS "main;moe-cache"
+            SKIP_RETURN_CODE 77)
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
