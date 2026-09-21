@@ -1,17 +1,414 @@
 #include "fit.h"
 
+#include "common.h"
 #include "json.h"
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "hash/hash.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
+#include <cctype>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <sstream>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
 #include <string>
 #include <vector>
+
+static const char * common_moe_mode_name(llama_moe_placement_mode mode) {
+    switch (mode) {
+        case LLAMA_MOE_PLACEMENT_ORDINARY_CPU:    return "ordinary_cpu";
+        case LLAMA_MOE_PLACEMENT_ORDINARY_DEVICE: return "ordinary_device";
+        case LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE:  return "residual_cache";
+        case LLAMA_MOE_PLACEMENT_MIXED:           return "mixed";
+    }
+    return "unknown";
+}
+
+static common_json common_moe_configuration_record(
+        const llama_moe_placement_report & report,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const common_params * runtime_params) {
+    GGML_UNUSED(mparams);
+    common_json model = common_json::object();
+    common_json model_allocations = common_json::array();
+    std::vector<const llama_moe_model_allocation *> ordered_allocations;
+    ordered_allocations.reserve(report.model_allocations.size());
+    for (const auto & allocation : report.model_allocations) {
+        ordered_allocations.push_back(&allocation);
+    }
+    std::sort(ordered_allocations.begin(), ordered_allocations.end(), [](const auto * lhs, const auto * rhs) {
+        if (lhs->owner_canonical_id != rhs->owner_canonical_id) {
+            return lhs->owner_canonical_id < rhs->owner_canonical_id;
+        }
+        return lhs->resolved_class < rhs->resolved_class;
+    });
+    for (const auto * allocation : ordered_allocations) {
+        common_json item = common_json::object();
+        item["bytes"] = allocation->bytes_available ? common_json_value(allocation->bytes) : common_json_value(nullptr);
+        item["owner_canonical_id"] = allocation->owner_canonical_id;
+        item["owner_identity_kind"] = allocation->owner_identity_kind;
+        item["resolved_class"] = allocation->resolved_class;
+        model_allocations.push_back(std::move(item));
+    }
+    model["allocations"] = std::move(model_allocations);
+    model["identity"] = report.model_identity;
+    model["identity_kind"] = report.model_identity_kind;
+    model["placement_id"] = report.placement_id;
+
+    common_json override_provenance = common_json::array();
+    for (const auto & group : report.groups) {
+        for (const auto & bank : group.banks) {
+            common_json item = common_json::object();
+            item["bank"] = bank.name;
+            item["group"] = group.semantic_index;
+            item["origin"] = static_cast<int32_t>(bank.reason);
+            item["requested_buft"] = bank.requested_buft;
+            item["resolved_buft"] = bank.resolved_buft;
+            item["selected_buft"] = bank.selected_buft;
+            item["winning_override_index"] = bank.winning_override_index;
+            override_provenance.push_back(std::move(item));
+        }
+    }
+
+    common_json context = common_json::object();
+    context["n_ctx"] = cparams.n_ctx;
+    context["n_batch"] = cparams.n_batch;
+    context["n_ubatch"] = cparams.n_ubatch;
+    context["n_seq_max"] = cparams.n_seq_max;
+    context["n_rs_seq"] = cparams.n_rs_seq;
+    context["n_outputs_max"] = cparams.n_outputs_max;
+    context["n_outputs_max_per_seq"] = cparams.n_outputs_max_per_seq;
+    context["kv_gpu_layers"] = cparams.kv_gpu_layers;
+    context["n_threads"] = cparams.n_threads;
+    context["n_threads_batch"] = cparams.n_threads_batch;
+    context["ctx_type"] = static_cast<int32_t>(cparams.ctx_type);
+    context["rope_scaling_type"] = static_cast<int32_t>(cparams.rope_scaling_type);
+    context["pooling_type"] = static_cast<int32_t>(cparams.pooling_type);
+    context["attention_type"] = static_cast<int32_t>(cparams.attention_type);
+    context["flash_attn_type"] = static_cast<int32_t>(cparams.flash_attn_type);
+    context["rope_freq_base"] = cparams.rope_freq_base;
+    context["rope_freq_scale"] = cparams.rope_freq_scale;
+    context["yarn_ext_factor"] = cparams.yarn_ext_factor;
+    context["yarn_attn_factor"] = cparams.yarn_attn_factor;
+    context["yarn_beta_fast"] = cparams.yarn_beta_fast;
+    context["yarn_beta_slow"] = cparams.yarn_beta_slow;
+    context["yarn_orig_ctx"] = cparams.yarn_orig_ctx;
+    context["type_k"] = static_cast<int32_t>(cparams.type_k);
+    context["type_v"] = static_cast<int32_t>(cparams.type_v);
+    context["embeddings"] = cparams.embeddings;
+    context["offload_kqv"] = cparams.offload_kqv;
+    context["no_perf"] = cparams.no_perf;
+    context["op_offload"] = cparams.op_offload;
+    context["swa_full"] = cparams.swa_full;
+    context["kv_unified"] = cparams.kv_unified;
+    context["kv_cpu_pinned"] = cparams.kv_cpu_pinned;
+    context["recurrent_state_offload"] = cparams.recurrent_state_offload;
+    context["phase_aware_workspace"] = cparams.phase_aware_workspace;
+    context["live_context_workspace"] = cparams.live_context_workspace;
+    context["decode_boundary_overlap"] = cparams.decode_boundary_overlap;
+
+    const auto env_present = [](const char * name) { return std::getenv(name) != nullptr; };
+    const auto env_int = [](const char * name, int fallback) {
+        const char * value = std::getenv(name);
+        return value != nullptr ? std::atoi(value) : fallback;
+    };
+    const auto env_string = [](const char * name, const char * fallback) {
+        const char * value = std::getenv(name);
+        return std::string(value != nullptr ? value : fallback);
+    };
+    bool early_router_env = env_string("GGML_CUDA_MOE_EARLY_ROUTER", "0") == "1" &&
+        env_string("GGML_CUDA_MOE_EARLY_ROUTER_LOOKAHEAD", "1") == "1";
+    for (const char * suffix : {
+             "NATIVE", "COPY_ENGINE", "COPY_MAILBOX", "COPY_POLL", "COPY_BATCH", "COPY_SPLIT",
+             "COPY_READY_ONLY", "COPY_BANKS", "COPY_DEBUG", "STAGE_BLOCKS"}) {
+        const std::string name = std::string("GGML_CUDA_MOE_EARLY_ROUTER_") + suffix;
+        const char * value = std::getenv(name.c_str());
+        early_router_env = early_router_env && (value == nullptr || std::string(value) == "0");
+    }
+    common_json environment = common_json::object();
+    const std::string allreduce = env_string("GGML_CUDA_ALLREDUCE",
+#if defined(__linux__)
+        "nccl"
+#else
+        "internal"
+#endif
+    );
+    environment["allreduce"] = allreduce == "nccl" || allreduce == "internal" || allreduce == "none" ?
+        allreduce : "none";
+    std::string cublas_compute_type = env_string("GGML_CUDA_CUBLAS_COMPUTE_TYPE", "auto");
+    std::transform(cublas_compute_type.begin(), cublas_compute_type.end(), cublas_compute_type.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (cublas_compute_type == "fp32") {
+        cublas_compute_type = "f32";
+    } else if (cublas_compute_type == "fp16") {
+        cublas_compute_type = "f16";
+    } else if (cublas_compute_type != "auto" && cublas_compute_type != "f32" &&
+               cublas_compute_type != "f16" && cublas_compute_type != "bf16") {
+        cublas_compute_type = "auto";
+    }
+    environment["cublas_compute_type"] = cublas_compute_type;
+    environment["disable_fusion"] = env_int("GGML_CUDA_DISABLE_FUSION", 0) != 0;
+    environment["disable_graphs"] = env_present("GGML_CUDA_DISABLE_GRAPHS");
+    environment["enable_unified_memory"] = env_present("GGML_CUDA_ENABLE_UNIFIED_MEMORY");
+    environment["graph_optimization"] = env_int("GGML_CUDA_GRAPH_OPT", 0) == 1;
+    environment["graph_profile"] = env_present("GGML_CUDA_GRAPH_PROFILE");
+    environment["moe_early_router_env"] = early_router_env;
+    environment["moe_frequency"] = env_int("GGML_CUDA_MOE_FREQUENCY", 1) != 0;
+    environment["no_pinned"] = env_present("GGML_CUDA_NO_PINNED");
+    environment["op_offload_min_batch"] = env_int("GGML_OP_OFFLOAD_MIN_BATCH", 32);
+    environment["p2p"] = env_present("GGML_CUDA_P2P");
+    environment["pdl"] = env_int("GGML_CUDA_PDL", 1) != 0;
+    environment["register_host"] = env_present("GGML_CUDA_REGISTER_HOST");
+
+    common_json runtime = common_json::object();
+    if (runtime_params != nullptr) {
+        runtime["backend_sampling"] = runtime_params->sampling.backend_sampling;
+        runtime["decode_overlap"] = runtime_params->decode_overlap;
+        runtime["moe_early_router"] = runtime_params->moe_early_router || early_router_env;
+        runtime["ple_prefetch"] = runtime_params->ple_prefetch;
+        runtime["sampling_seed"] = runtime_params->sampling.seed;
+        runtime["sampling_temperature"] = runtime_params->sampling.temp;
+        runtime["sampling_top_k"] = runtime_params->sampling.top_k;
+        runtime["sampling_top_p"] = runtime_params->sampling.top_p;
+        runtime["spec_draft_backend_sampling"] = runtime_params->speculative.draft.backend_sampling;
+        runtime["spec_draft_kv_gpu_layers"] = runtime_params->speculative.draft.kv_gpu_layers;
+        runtime["spec_draft_n_max"] = runtime_params->speculative.draft.n_max;
+        runtime["spec_draft_n_min"] = runtime_params->speculative.draft.n_min;
+        runtime["spec_draft_n_ubatch"] = runtime_params->speculative.draft.n_ubatch;
+        runtime["spec_draft_p_min"] = runtime_params->speculative.draft.p_min;
+        runtime["spec_draft_p_split"] = runtime_params->speculative.draft.p_split;
+        common_json spec_types = common_json::array();
+        for (const auto type : runtime_params->speculative.types) {
+            spec_types.push_back(static_cast<int32_t>(type));
+        }
+        runtime["speculative_types"] = std::move(spec_types);
+    } else {
+        runtime["moe_early_router"] = early_router_env;
+    }
+
+    common_json configuration = common_json::object();
+    configuration["context"] = std::move(context);
+    configuration["environment"] = std::move(environment);
+    configuration["model"] = std::move(model);
+    configuration["override_provenance"] = std::move(override_provenance);
+    configuration["placement"] = common_json::parse(report.placement_record);
+    configuration["role"] = "target";
+    configuration["runtime"] = std::move(runtime);
+    return configuration;
+}
+
+std::string common_moe_placement_report_json(
+        const llama_moe_placement_report & report,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const common_params * runtime_params) {
+    common_json configuration = common_moe_configuration_record(report, mparams, cparams, runtime_params);
+    const std::string configuration_record = configuration.dump();
+    const std::string configuration_id = hash_sha256_hex(configuration_record.data(), configuration_record.size());
+
+    common_json owners = common_json::array();
+    for (const auto & owner : report.owners) {
+        common_json item = common_json::object();
+        item["selected_index"] = owner.selected_index;
+        item["canonical_id"] = owner.canonical_id;
+        item["identity_kind"] = owner.identity_kind;
+        item["backend"] = owner.backend;
+        item["name"] = owner.name;
+        item["description"] = owner.description;
+        item["slots"] = owner.slots;
+        item["cache_byte_cap"] = owner.cache_byte_cap;
+        item["active_groups"] = owner.active_groups;
+        item["active_context_mask"] = owner.active_context_mask;
+        item["active_cache_groups"] = owner.active_cache_groups;
+        item["active_cache_context_mask"] = owner.active_cache_context_mask;
+        item["cache_fixed_bytes"] = owner.cache_fixed_bytes;
+        item["cache_per_slot_bytes"] = owner.cache_per_slot_bytes;
+        item["mandatory_host_staging_default_bytes"] = owner.mandatory_host_staging_available ?
+            common_json_value(owner.mandatory_host_staging_default_bytes) : common_json_value(nullptr);
+        item["mandatory_host_staging_mtp_bytes"] = owner.mandatory_host_staging_available ?
+            common_json_value(owner.mandatory_host_staging_mtp_bytes) : common_json_value(nullptr);
+        item["mandatory_host_staging_provenance"] = owner.mandatory_host_staging_available ?
+            common_json_value(owner.mandatory_host_staging_provenance) : common_json_value(nullptr);
+        owners.push_back(std::move(item));
+    }
+
+    common_json groups = common_json::array();
+    for (const auto & group : report.groups) {
+        common_json item = common_json::object();
+        item["semantic_index"] = group.semantic_index;
+        item["layer"] = group.layer;
+        item["layout"] = group.layout;
+        item["domain"] = group.domain;
+        item["n_experts"] = group.n_experts;
+        item["top_k"] = group.top_k;
+        item["context_use_mask"] = group.context_use_mask;
+        item["mode"] = common_moe_mode_name(group.mode);
+        item["owner_canonical_id"] = group.owner_canonical_id.empty() ?
+            common_json_value(nullptr) : common_json_value(group.owner_canonical_id);
+        item["cache_owner_canonical_id"] = group.cache_owner_canonical_id.empty() ?
+            common_json_value(nullptr) : common_json_value(group.cache_owner_canonical_id);
+        item["placement_reason"] = group.placement_reason;
+        item["ordinary_allocation_estimate"] = group.ordinary_allocation_estimate;
+        item["ordinary_allocation_provenance"] = group.ordinary_allocation_provenance;
+        item["cache_fixed_bytes"] = group.cache_fixed_bytes;
+        item["cache_per_slot_bytes"] = group.cache_per_slot_bytes;
+        item["cache_sizing_provenance"] = group.cache_sizing_provenance.empty() ?
+            common_json_value(nullptr) : common_json_value(group.cache_sizing_provenance);
+        common_json banks = common_json::array();
+        for (const auto & bank : group.banks) {
+            common_json bank_json = common_json::object();
+            bank_json["name"] = bank.name;
+            bank_json["role"] = bank.role;
+            bank_json["status"] = bank.status;
+            bank_json["type"] = bank.type;
+            bank_json["expert_stride"] = bank.expert_stride;
+            bank_json["tensor_bytes"] = bank.tensor_bytes;
+            bank_json["mode"] = common_moe_mode_name(bank.mode);
+            bank_json["owner_canonical_id"] = bank.owner_canonical_id.empty() ?
+                common_json_value(nullptr) : common_json_value(bank.owner_canonical_id);
+            bank_json["owner_identity_kind"] = bank.owner_identity_kind;
+            bank_json["resolved_class"] = bank.resolved_class;
+            bank_json["actual_buft"] = bank.actual_buft_available ?
+                common_json_value(bank.actual_buft) : common_json_value(nullptr);
+            bank_json["winning_override_index"] = bank.winning_override_index;
+            bank_json["winning_override_pattern_redacted"] = bank.winning_override_index >= 0;
+            bank_json["requested_buft"] = bank.requested_buft;
+            bank_json["selected_buft"] = bank.selected_buft;
+            bank_json["resolved_buft"] = bank.resolved_buft;
+            banks.push_back(std::move(bank_json));
+        }
+        item["banks"] = std::move(banks);
+        groups.push_back(std::move(item));
+    }
+
+    common_json allocations = common_json::array();
+    for (const auto & allocation : report.model_allocations) {
+        common_json item = common_json::object();
+        item["resolved_class"] = allocation.resolved_class;
+        item["owner_canonical_id"] = allocation.owner_canonical_id;
+        item["owner_identity_kind"] = allocation.owner_identity_kind;
+        item["owner_backend"] = allocation.owner_backend;
+        item["bytes"] = allocation.bytes_available ? common_json_value(allocation.bytes) : common_json_value(nullptr);
+        item["current_allocation"] = allocation.current_allocation;
+        item["provenance"] = allocation.provenance;
+        allocations.push_back(std::move(item));
+    }
+
+    common_json shared = common_json::array();
+    for (const auto & tensor : report.shared_tensors) {
+        common_json item = common_json::object();
+        item["name"] = tensor.name;
+        item["tensor_bytes"] = tensor.tensor_bytes;
+        item["type"] = tensor.type;
+        item["resolved_class"] = tensor.resolved_storage_available ?
+            common_json_value(tensor.resolved_class) : common_json_value(nullptr);
+        item["owner_canonical_id"] = tensor.resolved_storage_available ?
+            common_json_value(tensor.owner_canonical_id) : common_json_value(nullptr);
+        item["owner_identity_kind"] = tensor.resolved_storage_available ?
+            common_json_value(tensor.owner_identity_kind) : common_json_value(nullptr);
+        item["storage_relation"] = tensor.storage_relation;
+        item["current_storage"] = tensor.current_storage_available;
+        item["storage_provenance"] = tensor.storage_provenance;
+        shared.push_back(std::move(item));
+    }
+
+    common_json root = common_json::object();
+    root["schema_version"] = report.schema_version;
+    root["report_kind"] = "moe_placement";
+    root["configuration_id"] = configuration_id;
+    root["configuration"] = std::move(configuration);
+    root["placement_id"] = report.placement_id;
+    root["placement_identity_kind"] = report.placement_identity_kind;
+    root["model_identity"] = report.model_identity;
+    root["model_identity_kind"] = report.model_identity_kind;
+    root["measurement_completeness"] = "incomplete";
+    root["capacity_assessment"] = "unknown";
+    root["diagnostics"] = common_json::array({"runtime observations and capacity limits were not measured"});
+    root["owners"] = std::move(owners);
+    root["groups"] = std::move(groups);
+    root["model_allocations"] = std::move(allocations);
+    root["shared_tensors"] = std::move(shared);
+    return root.dump();
+}
+
+std::string common_moe_placement_report_human(
+        const llama_moe_placement_report & report,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const common_params * runtime_params) {
+    const common_json machine = common_json::parse(
+        common_moe_placement_report_json(report, mparams, cparams, runtime_params));
+    std::ostringstream out;
+    out << "MoE placement " << machine.at("configuration_id").get<std::string>() << '\n'
+        << "  placement: " << report.placement_id << " (" << report.placement_identity_kind << ")\n"
+        << "  model: " << report.model_identity << " (" << report.model_identity_kind << ")\n"
+        << "  role: target\n"
+        << "  status: incomplete; capacity unknown (runtime observations not measured)\n"
+        << "  owners: " << report.owners.size() << ", groups: " << report.groups.size() << '\n';
+    for (const auto & owner : report.owners) {
+        out << "    [" << owner.selected_index << "] " << owner.name
+            << " id=" << owner.canonical_id << " slots=" << owner.slots
+            << " cache=" << owner.cache_fixed_bytes << "+" << owner.cache_per_slot_bytes << "/slot"
+            << " active_groups=" << owner.active_groups << " cached_groups=" << owner.active_cache_groups
+            << " staging=";
+        if (owner.mandatory_host_staging_available) {
+            out << owner.mandatory_host_staging_default_bytes << "+" << owner.mandatory_host_staging_mtp_bytes;
+        } else {
+            out << "unknown";
+        }
+        out << '\n';
+    }
+    struct group_summary {
+        size_t count = 0;
+        int32_t first_layer = std::numeric_limits<int32_t>::max();
+        int32_t last_layer = std::numeric_limits<int32_t>::min();
+        size_t cache_fixed = 0;
+        size_t cache_per_slot = 0;
+        size_t ordinary_estimate = 0;
+    };
+    std::map<std::string, group_summary> summaries;
+    for (const auto & group : report.groups) {
+        const std::string owner = group.owner_canonical_id.empty() ? "mixed/unowned" : group.owner_canonical_id;
+        const std::string cache_owner = group.cache_owner_canonical_id.empty() ? "none" : group.cache_owner_canonical_id;
+        const std::string key = std::string(common_moe_mode_name(group.mode)) + "|" + owner + "|" +
+            cache_owner + "|" + std::to_string(group.context_use_mask);
+        auto & summary = summaries[key];
+        ++summary.count;
+        summary.first_layer = std::min(summary.first_layer, group.layer);
+        summary.last_layer = std::max(summary.last_layer, group.layer);
+        summary.cache_fixed += group.cache_fixed_bytes;
+        summary.cache_per_slot += group.cache_per_slot_bytes;
+        summary.ordinary_estimate += group.ordinary_allocation_estimate;
+    }
+    for (const auto & [key, summary] : summaries) {
+        out << "    group_set " << key << " layers=" << summary.first_layer << '-' << summary.last_layer
+            << " count=" << summary.count << " cache=" << summary.cache_fixed << '+'
+            << summary.cache_per_slot << "/slot ordinary_estimate=" << summary.ordinary_estimate << '\n';
+    }
+    for (const auto & allocation : report.model_allocations) {
+        out << "    model_buffer " << allocation.resolved_class << " bytes=";
+        if (allocation.bytes_available) {
+            out << allocation.bytes;
+        } else {
+            out << "unknown";
+        }
+        out << " provenance=" << allocation.provenance << '\n';
+    }
+    for (const auto & tensor : report.shared_tensors) {
+        out << "    shared_tensor " << tensor.name << " bytes=" << tensor.tensor_bytes
+            << " relation=" << tensor.storage_relation << " owner="
+            << (tensor.resolved_storage_available ? tensor.owner_canonical_id : "unknown") << '\n';
+    }
+    return out.str();
+}
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:

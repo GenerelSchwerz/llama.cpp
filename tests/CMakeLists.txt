@@ -226,6 +226,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         set_tests_properties(test-moe-cache-selector PROPERTIES
             LABELS "main;moe-cache"
             SKIP_RETURN_CODE 77)
+        llama_test(
+            test-llama-archs
+            NAME test-moe-placement
+            ARGS --test-moe-placement
+        )
+        set_tests_properties(test-moe-placement PROPERTIES
+            LABELS "main;moe-cache"
+            SKIP_RETURN_CODE 77)
+        target_link_libraries(test-llama-archs PRIVATE vendor::hash)
     endif()
 
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")

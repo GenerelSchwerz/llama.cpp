@@ -3,7 +3,11 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <string>
 #include <vector>
+
+struct llama_moe_placement_report;
+struct common_params;
 
 enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
@@ -44,6 +48,19 @@ void common_fit_print(
                llama_context_params * cparams);
 
 void common_memory_breakdown_print(const llama_context * ctx);
+
+// Formats the owned model-side placement snapshot without observing or
+// synchronizing live backend work. JSON is a single compact object.
+std::string common_moe_placement_report_json(
+        const llama_moe_placement_report & report,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const common_params * runtime_params = nullptr);
+std::string common_moe_placement_report_human(
+        const llama_moe_placement_report & report,
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const common_params * runtime_params = nullptr);
 
 struct common_device_memory_data {
     int64_t total;

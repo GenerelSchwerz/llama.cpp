@@ -30,6 +30,39 @@ int llama_fit_params(int argc, char ** argv) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    if (params.fit_moe_report != 0) {
+        if (params.model.path.empty()) {
+            LOG_ERR("%s: --fit-moe-report requires a local model path\n", __func__);
+            return 1;
+        }
+        if (params.fit_moe_report == 2) {
+            // Keep stdout machine-clean. Loader diagnostics remain available on
+            // stderr and are never embedded into the JSON object.
+            common_log_flush(common_log_main());
+            llama_log_set([](ggml_log_level, const char * text, void *) {
+                fputs(text, stderr);
+            }, nullptr);
+        }
+        llama_model_params probe_params = mparams;
+        probe_params.no_alloc = true;
+        llama_model * model = llama_model_load_from_file(params.model.path.c_str(), probe_params);
+        if (model == nullptr) {
+            fprintf(stderr, "%s: failed to collect MoE placement\n", __func__);
+            return 1;
+        }
+        const auto report = llama_model_moe_placement(model);
+        const std::string output = params.fit_moe_report == 2 ?
+            common_moe_placement_report_json(report, mparams, cparams, &params) :
+            common_moe_placement_report_human(report, mparams, cparams, &params);
+        llama_model_free(model);
+        fwrite(output.data(), 1, output.size(), stdout);
+        if (output.empty() || output.back() != '\n') {
+            fputc('\n', stdout);
+        }
+        fflush(stdout);
+        return 0;
+    }
+
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,

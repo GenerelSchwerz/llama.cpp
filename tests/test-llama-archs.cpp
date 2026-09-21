@@ -1,10 +1,13 @@
 #include "../ggml/src/ggml-backend-impl.h"
 #include "../ggml/src/ggml-backend-moe.h"
 #include "common.h"
+#include "fit.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "hash/hash.h"
+#include "json.h"
 #include "llama-cpp.h"
 #include "llama.h"
 #include "log.h"
@@ -21,13 +24,17 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <locale>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
@@ -75,7 +82,8 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 static void usage(char ** argv) {
     printf(
         "Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] "
-        "[--test-live-context-workspace] [--test-speculative-limits] [--test-moe-cache-selector]\n",
+        "[--test-live-context-workspace] [--test-speculative-limits] [--test-moe-cache-selector] "
+        "[--test-moe-placement]\n",
         argv[0]);
 }
 
@@ -90,7 +98,10 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const bool mtp = false) {
+static gguf_context_ptr get_gguf_ctx(
+        const llm_arch arch, const bool moe, const bool mtp = false,
+        uint32_t n_expert = 2, uint32_t n_expert_used = 2, int32_t n_layer_base = -1,
+        uint32_t n_vocab_override = 0) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -100,6 +111,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
+    if (n_vocab_override != 0) {
+        n_vocab = n_vocab_override;
+    }
+    if (n_layer_base >= 0) {
+        n_layer = static_cast<uint32_t>(n_layer_base);
+    }
     if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
@@ -145,7 +162,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_layer = 8; // 1 layer per stack x 2 h-cycles x (3 l-cycles + 1) cache slots
     }
 
-    GGML_ASSERT(!mtp || arch == LLM_ARCH_QWEN35);
+    GGML_ASSERT(!mtp || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
     const uint32_t n_layer_all = n_layer + (mtp ? 1 : 0);
 
     uint32_t n_head_kv = n_head;
@@ -162,7 +179,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_EMBEDDING_LENGTH,          n_embd);
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer_all);
-    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, std::min<uint32_t>(1, n_layer));
     if (mtp) {
         ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
     }
@@ -376,8 +393,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, n_ff / 2);  // distinct from n_ff so a saver key-clobber surfaces on reload
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,       n_ff);
         ms.add_kv(LLM_KV_INTERLEAVE_MOE_LAYER_STEP,  uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_COUNT,               uint32_t(2));
-        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          uint32_t(2));
+        ms.add_kv(LLM_KV_EXPERT_COUNT,               n_expert);
+        ms.add_kv(LLM_KV_EXPERT_USED_COUNT,          n_expert_used);
         ms.add_kv(LLM_KV_EXPERT_SHARED_COUNT,        uint32_t(1));
         ms.add_kv(LLM_KV_EXPERT_GATING_FUNC,         arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(4) : uint32_t(2)); // sqrtsoftplus : sigmoid
         ms.add_kv(LLM_KV_EXPERT_GROUP_SCALE,         1.0f);
@@ -1844,6 +1861,872 @@ static int test_moe_cache_selector_precedence(const size_t seed) {
     return ok ? 0 : 1;
 }
 
+static int test_moe_placement_report(const size_t seed) {
+    ggml_backend_dev_t cache_dev = nullptr;
+    std::vector<ggml_backend_dev_t> cache_devs;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        auto get_cache_buft = reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_buffer_type_t>(
+            ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME)) : nullptr;
+        if (get_cache_buft != nullptr) {
+            cache_devs.push_back(dev);
+            if (cache_dev == nullptr) {
+                cache_dev = dev;
+            }
+        }
+    }
+    if (cache_dev == nullptr) {
+        fprintf(stderr, "test-moe-placement: SKIP (no backend with MoE cache support)\n");
+        return 77;
+    }
+
+    bool ok = true;
+    const auto check = [&](bool condition, const char * message) {
+        if (!condition) {
+            fprintf(stderr, "test-moe-placement: %s\n", message);
+            ok = false;
+        }
+    };
+    check(llama_moe_placement_context_mask(false, 1, -1, 2, 0) == 1 &&
+              llama_moe_placement_context_mask(true, 1, 0, 2, 0) == 1,
+          "ordinary/router context-use classification mismatch");
+    check(llama_moe_placement_context_mask(true, 1, -1, 2, 0) == 1 &&
+              llama_moe_placement_context_mask(true, 1, -1, 2, 2) == 2,
+          "disjoint target/MTP context-use classification mismatch");
+    check(llama_moe_placement_context_mask(true, 1, -1, 0, 0) == 3,
+          "shared MTP-only context-use classification mismatch");
+    ggml_backend_dev_t devices[] = { cache_dev, nullptr };
+    const llama_model_layer_range both_layers[] = {{0, 1}};
+    const llama_model_layer_range split_layers[] = {{0, 0}, {1, 1}};
+    const llama_model_layer_range layer_zero[] = {{0, 0}};
+    const llama_model_layer_range layer_one[] = {{1, 1}};
+    auto make_params = [&](const llama_model_layer_range * ranges, size_t n_ranges,
+                           const llama_model_tensor_buft_override * overrides, bool mtp = false,
+                           size_t host_pin = 0, int32_t slots = 2) {
+        llama_model_params params = llama_model_default_params();
+        params.devices = devices;
+        params.n_gpu_layers = 99;
+        params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.progress_callback = silent_model_load_progress;
+        params.moe_expert_cache_slots = slots;
+        params.moe_expert_cache_layer_ranges = ranges;
+        params.n_moe_expert_cache_layer_ranges = n_ranges;
+        params.tensor_buft_overrides = overrides;
+        params.load_mtp = mtp;
+        params.moe_expert_cache_host_pinned_size = host_pin;
+        return params;
+    };
+    const auto load = [&](gguf_context * metadata, llama_model_params params, size_t tensor_seed) {
+        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_seed, params));
+    };
+    const auto group_at = [&](const llama_moe_placement_report & report, int32_t layer) {
+        return std::find_if(report.groups.begin(), report.groups.end(), [&](const auto & group) {
+            return group.layer == layer && group.domain == GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY;
+        });
+    };
+    const auto check_hashes = [&](const llama_moe_placement_report & report) {
+        check(report.model_identity.size() == 64 && report.placement_id.size() == 64,
+              "identity digest length mismatch");
+        check(report.placement_identity_kind == "physical" ||
+                  report.placement_identity_kind == "runtime_unverified",
+              "placement identity stability is not explicit");
+        check(report.direct_io_state == "none" || report.direct_io_state == "all" ||
+                  report.direct_io_state == "mixed",
+              "resolved DirectIO state is invalid");
+        check(hash_sha256_hex(report.model_identity_record.data(), report.model_identity_record.size()) ==
+                  report.model_identity,
+              "model identity does not match retained record");
+        check(hash_sha256_hex(report.placement_record.data(), report.placement_record.size()) ==
+                  report.placement_id,
+              "placement identity does not match retained record");
+        check(report.model_identity_record.find("/home/") == std::string::npos &&
+                  report.placement_record.find("0x") == std::string::npos,
+              "identity contains a path or pointer-like value");
+        try {
+            (void) common_json::parse(report.model_identity_record);
+            (void) common_json::parse(report.placement_record);
+        } catch (const std::exception &) {
+            check(false, "identity record is not valid JSON");
+        }
+    };
+
+    llama_moe_placement_report retained;
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(both_layers, 1, nullptr), seed);
+        check(model != nullptr, "baseline model failed to load");
+        if (model) {
+            retained = llama_model_moe_placement(model.get());
+            check_hashes(retained);
+            check(retained.model_identity_kind == "layout_unverified", "virtual model identity is not explicit");
+            check(retained.groups.size() == 2 && retained.owners.size() == 1,
+                  "baseline inventory cardinality mismatch");
+            size_t group_fixed = 0;
+            size_t group_per_slot = 0;
+            for (const auto & group : retained.groups) {
+                check(group.mode == LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE && group.context_use_mask == 1,
+                      "baseline group placement mismatch");
+                for (const auto & bank : group.banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.reason == LLAMA_MOE_PLACEMENT_CACHE_SELECTOR &&
+                                  bank.winning_override_index >= 0 && !bank.winning_override_pattern.empty() &&
+                                  bank.requested_buft == bank.selected_buft && bank.selected_buft == bank.resolved_buft,
+                              "cache-selector provenance mismatch");
+                    }
+                }
+                group_fixed += group.cache_fixed_bytes;
+                group_per_slot += group.cache_per_slot_bytes;
+            }
+            check(retained.owners[0].active_groups == 2 && retained.owners[0].active_context_mask == 1 &&
+                      retained.owners[0].active_cache_groups == 2 &&
+                      retained.owners[0].active_cache_context_mask == 1 &&
+                      retained.owners[0].cache_group_fixed_bytes == group_fixed &&
+                      retained.owners[0].cache_group_per_slot_bytes == group_per_slot &&
+                      retained.owners[0].cache_fixed_bytes == group_fixed + retained.owners[0].cache_context_fixed_bytes,
+                  "baseline owner ledger mismatch");
+            check(!retained.model_allocations.empty() &&
+                      std::all_of(retained.model_allocations.begin(), retained.model_allocations.end(), [](const auto & allocation) {
+                          return allocation.bytes_available && allocation.current_allocation && allocation.bytes > 0 &&
+                                 allocation.provenance == "backend_packed_buffer_current";
+                      }),
+                  "current packed model-buffer ledger is incomplete");
+            check(std::any_of(retained.model_allocations.begin(), retained.model_allocations.end(), [](const auto & allocation) {
+                      return allocation.resolved_class == "moe_cache_source_host" &&
+                             allocation.owner_backend == "CPU";
+                  }),
+                  "host-backed MoE source storage was attributed to CUDA device memory");
+            const auto report_mparams = make_params(both_layers, 1, nullptr);
+            const auto report_cparams = llama_context_default_params();
+            const std::string machine_text =
+                common_moe_placement_report_json(retained, report_mparams, report_cparams);
+            const common_json machine = common_json::parse(machine_text);
+            const std::string configuration_id = machine.at("configuration_id").get<std::string>();
+            check(configuration_id.size() == 64 && machine.at("placement_id").get<std::string>() == retained.placement_id &&
+                      machine.at("measurement_completeness").get<std::string>() == "incomplete" &&
+                      machine.at("capacity_assessment").get<std::string>() == "unknown",
+                  "tool JSON report identity or unknown-state contract mismatch");
+            check(machine_text.find(retained.groups[0].banks[0].winning_override_pattern) == std::string::npos,
+                  "tool JSON leaked a raw override pattern");
+            check(common_moe_placement_report_human(retained, report_mparams, report_cparams).find(configuration_id) !=
+                      std::string::npos,
+                  "human and JSON report views disagree on configuration identity");
+            float split_a[] = {1.0f};
+            float split_b[] = {2.0f};
+            auto equivalent_mparams_a = report_mparams;
+            auto equivalent_mparams_b = report_mparams;
+            equivalent_mparams_a.tensor_split = split_a;
+            equivalent_mparams_b.tensor_split = split_b;
+            equivalent_mparams_b.n_gpu_layers = 1;
+            const auto equivalent_config_a = common_json::parse(
+                common_moe_placement_report_json(retained, equivalent_mparams_a, report_cparams));
+            const auto equivalent_config_b = common_json::parse(
+                common_moe_placement_report_json(retained, equivalent_mparams_b, report_cparams));
+            check(equivalent_config_a.at("configuration_id").get<std::string>() ==
+                      equivalent_config_b.at("configuration_id").get<std::string>(),
+                  "raw split ratio or GPU-layer spelling changed resolved configuration identity");
+            common_params runtime_a;
+            common_params runtime_b;
+            runtime_b.moe_early_router = true;
+            const auto runtime_config_a = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_a));
+            const auto runtime_config_b = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_b));
+            check(runtime_config_a.at("configuration_id").get<std::string>() !=
+                      runtime_config_b.at("configuration_id").get<std::string>(),
+                  "effective early-router control was omitted from configuration identity");
+            common_params runtime_spec = runtime_a;
+            runtime_spec.speculative.draft.p_min += 0.125f;
+            runtime_spec.speculative.draft.p_split += 0.125f;
+            runtime_spec.speculative.draft.n_ubatch += 1;
+            runtime_spec.speculative.draft.kv_gpu_layers += 1;
+            const auto runtime_config_spec = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_spec));
+            check(runtime_config_a.at("configuration_id").get<std::string>() !=
+                      runtime_config_spec.at("configuration_id").get<std::string>(),
+                  "effective speculative controls were omitted from configuration identity");
+#if !defined(_WIN32)
+            const char * old_allreduce = std::getenv("GGML_CUDA_ALLREDUCE");
+            const char * old_compute = std::getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+            const std::string saved_allreduce = old_allreduce != nullptr ? old_allreduce : "";
+            const std::string saved_compute = old_compute != nullptr ? old_compute : "";
+            const bool had_allreduce = old_allreduce != nullptr;
+            const bool had_compute = old_compute != nullptr;
+            unsetenv("GGML_CUDA_ALLREDUCE");
+            unsetenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+            const auto env_default = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_a));
+            setenv("GGML_CUDA_ALLREDUCE",
+#if defined(__linux__)
+                "nccl",
+#else
+                "internal",
+#endif
+                1);
+            setenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE", "auto", 1);
+            const auto env_explicit_default = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_a));
+            setenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE", "F32", 1);
+            const auto env_f32 = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_a));
+            setenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE", "fp32", 1);
+            const auto env_fp32 = common_json::parse(
+                common_moe_placement_report_json(retained, report_mparams, report_cparams, &runtime_a));
+            check(env_default.at("configuration_id").get<std::string>() ==
+                      env_explicit_default.at("configuration_id").get<std::string>(),
+                  "implicit and explicit platform defaults produced different configuration identities");
+            check(env_f32.at("configuration_id").get<std::string>() ==
+                      env_fp32.at("configuration_id").get<std::string>() &&
+                      env_f32.at("configuration_id").get<std::string>() !=
+                          env_default.at("configuration_id").get<std::string>(),
+                  "cuBLAS compute-type aliases were not normalized");
+            had_allreduce ? setenv("GGML_CUDA_ALLREDUCE", saved_allreduce.c_str(), 1) :
+                unsetenv("GGML_CUDA_ALLREDUCE");
+            had_compute ? setenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE", saved_compute.c_str(), 1) :
+                unsetenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+#endif
+        }
+    }
+    check(retained.groups.size() == 2 && !retained.groups[0].banks.empty() &&
+              !retained.groups[0].banks[0].name.empty() && !retained.model_identity_record.empty() &&
+              !retained.placement_record.empty(),
+          "owned report did not survive model and metadata destruction");
+
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto equivalent = load(metadata.get(), make_params(split_layers, 2, nullptr), seed + 1);
+        auto reseeded = load(metadata.get(), make_params(both_layers, 1, nullptr), seed + 2);
+        check(equivalent && reseeded, "equivalent placement reload failed");
+        if (equivalent && reseeded) {
+            const auto equivalent_report = llama_model_moe_placement(equivalent.get());
+            const auto reseeded_report = llama_model_moe_placement(reseeded.get());
+            check(equivalent_report.placement_record == retained.placement_record &&
+                      equivalent_report.placement_id == retained.placement_id,
+                  "equivalent selectors changed configuration identity");
+            check(reseeded_report.model_identity == retained.model_identity,
+                  "virtual tensor payload seed changed explicitly layout-only identity");
+        }
+    }
+    {
+        llama_model_tensor_buft_override nonmatching[] = {
+            {"/home/private/token=this_pattern_matches_nothing", ggml_backend_cpu_buffer_type()},
+            {nullptr, nullptr},
+        };
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(both_layers, 1, nonmatching), seed);
+        check(model != nullptr, "nonmatching override identity control failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            check(report.placement_record == retained.placement_record && report.placement_id == retained.placement_id,
+                  "raw nonmatching override changed resolved placement identity");
+            check(report.placement_record.find("/home/private") == std::string::npos &&
+                      report.placement_record.find("token=") == std::string::npos,
+                  "raw override text leaked into placement identity");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto params = make_params(both_layers, 1, nullptr);
+        params.no_alloc = true;
+        auto model = load(metadata.get(), params, seed);
+        check(model != nullptr, "allocation-free placement probe failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            check(report.placement_record == retained.placement_record && report.placement_id == retained.placement_id,
+                  "allocation-free probe changed resolved placement identity");
+            for (const auto & group : report.groups) {
+                for (const auto & bank : group.banks) {
+                    check(!bank.actual_buft_available,
+                          "allocation-free probe reported an actual runtime buffer");
+                }
+            }
+            check(!report.model_allocations.empty() &&
+                      std::all_of(report.model_allocations.begin(), report.model_allocations.end(), [](const auto & allocation) {
+                          return allocation.bytes_available && !allocation.current_allocation && allocation.bytes > 0 &&
+                                 allocation.provenance == "backend_packed_context_size_estimate";
+                      }),
+                  "allocation-free probe omitted its packed whole-buffer estimate");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true);
+        llama_model_params source_params = llama_model_default_params();
+        source_params.progress_callback = silent_model_load_progress;
+        auto source = load(metadata.get(), source_params, seed);
+        const auto path = std::filesystem::temp_directory_path() /
+            ("llama-moe-placement-lazy-" + std::to_string(reinterpret_cast<uintptr_t>(metadata.get())) + ".gguf");
+        check(source != nullptr, "lazy strategy source failed to load");
+        if (source) {
+            llama_model_save_to_file(source.get(), path.string().c_str());
+        }
+        auto params = make_params(nullptr, 0, nullptr);
+        params.lazy_mode = LLAMA_LAZY_MODE_ON;
+        llama_model_ptr real(source ? llama_model_load_from_file(path.string().c_str(), params) : nullptr);
+        auto probe_params = params;
+        probe_params.no_alloc = true;
+        llama_model_ptr probe(source ? llama_model_load_from_file(path.string().c_str(), probe_params) : nullptr);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        check(real != nullptr && probe != nullptr, "lazy strategy identity fixture failed to load");
+        if (real && probe) {
+            const auto real_report = llama_model_moe_placement(real.get());
+            const auto probe_report = llama_model_moe_placement(probe.get());
+            check(real_report.has_lazy_tensors && probe_report.has_lazy_tensors &&
+                      real_report.placement_id == probe_report.placement_id,
+                  "real and allocation-free lazy strategy identities diverged");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        llama_model_params source_params = llama_model_default_params();
+        source_params.progress_callback = silent_model_load_progress;
+        auto source = load(metadata.get(), source_params, seed);
+        const auto path = std::filesystem::temp_directory_path() /
+            ("llama-moe-placement-mlock-" + std::to_string(reinterpret_cast<uintptr_t>(metadata.get())) + ".gguf");
+        check(source != nullptr, "mlock strategy source failed to load");
+        if (source) {
+            llama_model_save_to_file(source.get(), path.string().c_str());
+        }
+        auto unlocked_params = make_params(both_layers, 1, nullptr);
+        auto locked_params = unlocked_params;
+        locked_params.load_mode = LLAMA_LOAD_MODE_MLOCK;
+        llama_model_ptr unlocked(source ? llama_model_load_from_file(path.string().c_str(), unlocked_params) : nullptr);
+        llama_model_ptr locked(source ? llama_model_load_from_file(path.string().c_str(), locked_params) : nullptr);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        check(unlocked != nullptr && locked != nullptr, "mlock strategy identity fixture failed to load");
+        if (unlocked && locked) {
+            const auto unlocked_report = llama_model_moe_placement(unlocked.get());
+            const auto locked_report = llama_model_moe_placement(locked.get());
+            check(!unlocked_report.uses_mlock && locked_report.uses_mlock &&
+                      locked_report.placement_id != unlocked_report.placement_id,
+                  "mlock strategy was omitted from resolved placement identity");
+        }
+    }
+    llama_moe_placement_report default_ordinary;
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true, false, 2, 1);
+        auto model = load(metadata.get(), make_params(both_layers, 1, nullptr), seed);
+        check(model != nullptr, "top-k identity control failed to load");
+        if (model) {
+            check(llama_model_moe_placement(model.get()).model_identity != retained.model_identity,
+                  "top-k change did not change weak model identity");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true, false, 2, 2, -1, 160);
+        auto model = load(metadata.get(), make_params(both_layers, 1, nullptr), seed);
+        check(model != nullptr, "non-MoE layout identity control failed to load");
+        if (model) {
+            check(llama_model_moe_placement(model.get()).model_identity != retained.model_identity,
+                  "non-MoE tensor-layout change did not change weak model identity");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(both_layers, 1, nullptr, false, 0, 3), seed);
+        check(model != nullptr, "slot-count identity control failed to load");
+        if (model) {
+            check(llama_model_moe_placement(model.get()).placement_id != retained.placement_id,
+                  "slot-count change did not change configuration identity");
+        }
+    }
+    struct grouped_numpunct : std::numpunct<char> {
+        char do_thousands_sep() const override { return '_'; }
+        std::string do_grouping() const override { return "\3"; }
+    };
+    {
+        const std::locale old_locale = std::locale();
+        try {
+            std::locale::global(std::locale(old_locale, new grouped_numpunct));
+            gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+            auto model = load(metadata.get(), make_params(both_layers, 1, nullptr), seed);
+            check(model != nullptr, "locale identity control failed to load");
+            if (model) {
+                check(llama_model_moe_placement(model.get()).placement_record == retained.placement_record,
+                      "canonical serialization depends on the process locale");
+            }
+            std::locale::global(old_locale);
+        } catch (...) {
+            std::locale::global(old_locale);
+            throw;
+        }
+    }
+
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_one, 1, nullptr), seed);
+        check(model != nullptr, "default placement provenance failed to load");
+        if (model) {
+            default_ordinary = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(default_ordinary, 0);
+            check(group0 != default_ordinary.groups.end() && group0->mode == LLAMA_MOE_PLACEMENT_ORDINARY_DEVICE,
+                  "default ordinary placement summary mismatch");
+            if (group0 != default_ordinary.groups.end()) {
+                for (const auto & bank : group0->banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.reason == LLAMA_MOE_PLACEMENT_DEFAULT && bank.winning_override_index == -1 &&
+                                  bank.winning_override_pattern.empty() && bank.requested_buft.empty() &&
+                                  bank.selected_buft == bank.resolved_buft && bank.resolved_buft == bank.actual_buft,
+                              "default bank provenance mismatch");
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        llama_model_tensor_buft_override same_device_override[] = {
+            {"(?!/home/private/token=)blk\\.0\\.ffn_gate_exps", ggml_backend_dev_buffer_type(cache_dev)},
+            {nullptr, nullptr},
+        };
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_one, 1, same_device_override), seed);
+        check(model != nullptr, "same-placement mixed-provenance control failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(report, 0);
+            check(group0 != report.groups.end() && group0->mode == LLAMA_MOE_PLACEMENT_ORDINARY_DEVICE &&
+                      group0->placement_reason == "mixed",
+                  "provenance-only difference was misreported as mixed placement");
+            check(report.placement_id == default_ordinary.placement_id,
+                  "provenance-only difference changed resolved placement identity");
+            check(report.placement_record.find("/home/private") == std::string::npos &&
+                      report.placement_record.find("token=") == std::string::npos,
+                  "winning override text leaked into placement identity");
+            const auto cparams = llama_context_default_params();
+            const std::string default_json = common_moe_placement_report_json(
+                default_ordinary, make_params(layer_one, 1, nullptr), cparams);
+            const std::string override_json = common_moe_placement_report_json(
+                report, make_params(layer_one, 1, same_device_override), cparams);
+            check(common_json::parse(default_json).at("configuration_id").get<std::string>() !=
+                      common_json::parse(override_json).at("configuration_id").get<std::string>() &&
+                      override_json.find("/home/private") == std::string::npos &&
+                      override_json.find("token=") == std::string::npos,
+                  "winning override provenance was omitted or leaked raw pattern text");
+        }
+    }
+
+    const char * layer_zero_all = "blk\\.0\\.ffn_(gate|up|down)_exps";
+    llama_model_tensor_buft_override cpu_layer_zero[] = {
+        {layer_zero_all, ggml_backend_cpu_buffer_type()},
+        {nullptr, nullptr},
+    };
+    llama_moe_placement_report cpu_ordinary;
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_one, 1, cpu_layer_zero), seed);
+        check(model != nullptr, "CPU override provenance failed to load");
+        if (model) {
+            cpu_ordinary = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(cpu_ordinary, 0);
+            check(cpu_ordinary.model_identity == retained.model_identity,
+                  "resolved placement changed weak model identity");
+            check(group0 != cpu_ordinary.groups.end() && group0->mode == LLAMA_MOE_PLACEMENT_ORDINARY_CPU,
+                  "CPU override placement summary mismatch");
+            if (group0 != cpu_ordinary.groups.end()) {
+                for (const auto & bank : group0->banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.reason == LLAMA_MOE_PLACEMENT_USER_OVERRIDE &&
+                                  bank.winning_override_index == 0 &&
+                                  bank.winning_override_pattern == cpu_layer_zero[0].pattern &&
+                                  bank.requested_buft == ggml_backend_buft_name(ggml_backend_cpu_buffer_type()) &&
+                                  bank.selected_buft == bank.resolved_buft &&
+                                  bank.resolved_buft == bank.actual_buft,
+                              "CPU override bank provenance mismatch");
+                    }
+                }
+            }
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto params = make_params(layer_one, 1, cpu_layer_zero);
+        params.no_alloc = true;
+        auto model = load(metadata.get(), params, seed);
+        check(model != nullptr, "allocation-free CPU override probe failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(report, 0);
+            check(report.placement_id == cpu_ordinary.placement_id &&
+                      group0 != report.groups.end() && group0->mode == LLAMA_MOE_PLACEMENT_ORDINARY_CPU,
+                  "allocation-free CPU override placement mismatch");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_zero, 1, cpu_layer_zero), seed);
+        check(model != nullptr, "zero-active owner placement failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            check(report.owners.size() == 1 && report.owners[0].active_cache_groups == 0 &&
+                      report.owners[0].active_cache_context_mask == 0 && report.owners[0].cache_fixed_bytes == 0 &&
+                      report.owners[0].cache_per_slot_bytes == 0,
+                  "zero-active owner was omitted or charged cache resources");
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        llama_model_params source_params = llama_model_default_params();
+        source_params.progress_callback = silent_model_load_progress;
+        auto source = load(metadata.get(), source_params, seed);
+        const auto path = std::filesystem::temp_directory_path() /
+            ("llama-moe-placement-mmap-" + std::to_string(reinterpret_cast<uintptr_t>(metadata.get())) + ".gguf");
+        check(source != nullptr, "mmap provenance source failed to load");
+        if (source) {
+            llama_model_save_to_file(source.get(), path.string().c_str());
+        }
+        auto params = make_params(layer_one, 1, cpu_layer_zero);
+        params.load_mode = LLAMA_LOAD_MODE_MMAP;
+        llama_model_ptr model(source ? llama_model_load_from_file(path.string().c_str(), params) : nullptr);
+        auto probe_params = params;
+        probe_params.no_alloc = true;
+        probe_params.load_mode = LLAMA_LOAD_MODE_AUTO;
+        llama_model_ptr probe(source ? llama_model_load_from_file(path.string().c_str(), probe_params) : nullptr);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        check(model != nullptr, "mmap CPU normalization failed to load");
+        check(probe != nullptr, "mmap allocation-free placement probe failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(report, 0);
+            if (group0 != report.groups.end()) {
+                for (const auto & bank : group0->banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.reason == LLAMA_MOE_PLACEMENT_USER_OVERRIDE &&
+                                  bank.requested_buft == ggml_backend_buft_name(ggml_backend_cpu_buffer_type()) &&
+                                  bank.selected_buft != bank.resolved_buft &&
+                                  bank.resolved_buft == ggml_backend_buft_name(ggml_backend_cpu_buffer_type()) &&
+                                  bank.mode == LLAMA_MOE_PLACEMENT_ORDINARY_CPU && !bank.actual_buft.empty(),
+                              "mmap CPU requested/selected/resolved provenance mismatch");
+                    }
+                }
+            }
+        }
+        if (probe) {
+            const auto probe_report = llama_model_moe_placement(probe.get());
+            check(!probe_report.model_allocations.empty() &&
+                      std::all_of(probe_report.model_allocations.begin(), probe_report.model_allocations.end(),
+                          [](const auto & allocation) {
+                              return allocation.bytes_available && !allocation.current_allocation && allocation.bytes > 0;
+                          }),
+                  "mmap allocation-free probe did not use packed-buffer estimates");
+            if (model) {
+                check(probe_report.placement_id == llama_model_moe_placement(model.get()).placement_id,
+                      "mmap allocation-free probe changed normalized placement identity");
+            }
+        }
+    }
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(nullptr, 0, cpu_layer_zero), seed);
+        check(model != nullptr, "legacy cache provenance failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            for (const auto & group : report.groups) {
+                for (const auto & bank : group.banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.reason == LLAMA_MOE_PLACEMENT_CACHE_LEGACY &&
+                                  bank.winning_override_index == 0 && !bank.winning_override_pattern.empty(),
+                              "legacy cache provenance mismatch");
+                    }
+                }
+            }
+        }
+    }
+
+    const char * layer_zero_gate = "blk\\.0\\.ffn_gate_exps";
+    const char * layer_zero_up_down = "blk\\.0\\.ffn_(up|down)_exps";
+    llama_model_tensor_buft_override mixed_overrides[] = {
+        {layer_zero_gate, ggml_backend_cpu_buffer_type()},
+        {layer_zero_up_down, ggml_backend_dev_buffer_type(cache_dev)},
+        {nullptr, nullptr},
+    };
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_one, 1, mixed_overrides), seed);
+        check(model != nullptr, "mixed ordinary placement failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(report, 0);
+            const auto group1 = group_at(report, 1);
+            check(group0 != report.groups.end() && group0->mode == LLAMA_MOE_PLACEMENT_MIXED &&
+                      group0->owner_index == -1 && group0->cache_fixed_bytes == 0 &&
+                      group1 != report.groups.end() && group1->mode == LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE,
+                  "mixed group summary is misleading");
+            if (group0 != report.groups.end()) {
+                bool saw_host = false;
+                bool saw_device = false;
+                for (const auto & bank : group0->banks) {
+                    if (bank.status != GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        continue;
+                    }
+                    check(bank.reason == LLAMA_MOE_PLACEMENT_USER_OVERRIDE && bank.winning_override_index >= 0 &&
+                              !bank.winning_override_pattern.empty() && !bank.requested_buft.empty() &&
+                              !bank.selected_buft.empty() && bank.resolved_buft == bank.actual_buft,
+                          "mixed bank provenance mismatch");
+                    check(bank.allocation_estimate_available && bank.allocation_estimate > 0 &&
+                              bank.allocation_provenance == "buffer_type_alloc_size_estimate",
+                          "mixed bank allocation provenance mismatch");
+                    saw_host = saw_host || bank.mode == LLAMA_MOE_PLACEMENT_ORDINARY_CPU;
+                    saw_device = saw_device || bank.mode == LLAMA_MOE_PLACEMENT_ORDINARY_DEVICE;
+                }
+                check(saw_host && saw_device, "mixed fixture did not preserve both ordinary placements");
+            }
+        }
+    }
+
+    {
+        const char * layer_zero_experts = "blk\\.0\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
+        llama_model_tensor_buft_override cpu_override[] = {
+            {layer_zero_experts, ggml_backend_cpu_buffer_type()},
+            {nullptr, nullptr},
+        };
+        const llama_model_layer_range layer_zero[] = {{0, 0}};
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_zero, 1, cpu_override), seed);
+        check(model != nullptr, "zero-active-owner fixture failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            check(report.owners.size() == 1 && report.owners[0].active_cache_groups == 0 &&
+                      report.owners[0].active_cache_context_mask == 0 && report.owners[0].cache_fixed_bytes == 0 &&
+                      report.owners[0].cache_per_slot_bytes == 0,
+                  "zero-active owner was omitted or charged cache bytes");
+        }
+    }
+
+    llama_model_tensor_buft_override overlapping[] = {
+        {"blk\\.0\\.ffn_.*_exps", ggml_backend_cpu_buffer_type()},
+        {layer_zero_gate, ggml_backend_dev_buffer_type(cache_dev)},
+        {nullptr, nullptr},
+    };
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto model = load(metadata.get(), make_params(layer_one, 1, overlapping), seed);
+        check(model != nullptr, "overlapping override fixture failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            const auto group0 = group_at(report, 0);
+            if (group0 != report.groups.end()) {
+                for (const auto & bank : group0->banks) {
+                    if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                        check(bank.winning_override_index == 0 &&
+                                  bank.winning_override_pattern == overlapping[0].pattern,
+                              "first matching override was not retained");
+                    }
+                }
+            }
+        }
+    }
+
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        llama_model_params params = llama_model_default_params();
+        ggml_backend_dev_t cpu_devices[] = {nullptr};
+        params.devices = cpu_devices;
+        params.progress_callback = silent_model_load_progress;
+        auto model = load(metadata.get(), params, seed);
+        check(model != nullptr, "CPU-only control failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            check(report.owners.empty(), "CPU-only control exposed selected accelerator owners");
+            for (const auto & group : report.groups) {
+                check(group.cache_fixed_bytes == 0 && group.cache_per_slot_bytes == 0,
+                      "CPU-only control exposed cache allocation");
+            }
+        }
+    }
+
+    {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true, 2, 2, 2);
+        auto params = make_params(nullptr, 0, nullptr, true, 64u * 1024u * 1024u);
+        auto model = load(metadata.get(), params, seed);
+        check(model != nullptr, "disjoint MTP fixture failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            bool saw_default = false;
+            bool saw_mtp = false;
+            bool saw_shared = false;
+            size_t group_fixed = 0;
+            size_t group_per_slot = 0;
+            for (const auto & group : report.groups) {
+                saw_default = saw_default || group.context_use_mask == 1;
+                saw_mtp = saw_mtp || group.context_use_mask == 2;
+                saw_shared = saw_shared || group.context_use_mask == 3;
+                check(group.cache_fixed_bytes == group.cache_fixed_default_bytes + group.cache_fixed_mtp_bytes &&
+                          group.cache_per_slot_bytes ==
+                              group.cache_per_slot_default_bytes + group.cache_per_slot_mtp_bytes,
+                      "MTP per-context group accounting mismatch");
+                group_fixed += group.cache_fixed_bytes;
+                group_per_slot += group.cache_per_slot_bytes;
+            }
+            check(report.owners.size() == 1 && report.owners[0].cache_group_fixed_bytes == group_fixed &&
+                      report.owners[0].cache_group_per_slot_bytes == group_per_slot &&
+                      report.owners[0].active_cache_context_mask == 3 &&
+                      report.owners[0].mandatory_host_staging_available &&
+                      report.owners[0].mandatory_host_staging_provenance == "backend_staging_size_v1_exact" &&
+                      report.owners[0].mandatory_host_staging_default_bytes > 0 &&
+                      report.owners[0].mandatory_host_staging_mtp_bytes > 0,
+                  "MTP owner or staging ledger mismatch");
+            if (report.owners.size() == 1) {
+                check(report.mandatory_host_staging_bytes ==
+                          report.owners[0].mandatory_host_staging_default_bytes +
+                              report.owners[0].mandatory_host_staging_mtp_bytes,
+                      "MTP report host-staging total mismatch");
+            }
+            check(saw_default && saw_mtp && !saw_shared, "disjoint MTP context masks missing");
+        }
+    }
+
+    {
+        gguf_context_ptr target_metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true);
+        auto target = load(target_metadata.get(), make_params(nullptr, 0, nullptr), seed);
+        check(target != nullptr, "shared-target fixture failed to load target");
+        gguf_context_ptr full_draft_metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true);
+        auto full_draft = load(full_draft_metadata.get(), make_params(nullptr, 0, nullptr, true), seed);
+        check(full_draft != nullptr, "shared-target fixture failed to build full draft");
+        const auto path = std::filesystem::temp_directory_path() /
+            ("llama-moe-placement-shared-" +
+             std::to_string(reinterpret_cast<uintptr_t>(full_draft_metadata.get())) + ".gguf");
+        size_t omitted = 0;
+        if (full_draft) {
+            llama_model_saver saver(LLM_ARCH_QWEN35MOE, nullptr);
+            gguf_set_kv(saver.gguf_ctx, full_draft_metadata.get());
+            saver.add_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS, true);
+            for (const auto & [name, tensor] : full_draft->tensors_by_name) {
+                if (name == "token_embd.weight" || name == "output.weight" || name == "output_norm.weight") {
+                    ++omitted;
+                    continue;
+                }
+                saver.add_tensor(tensor);
+            }
+            saver.save(path.string());
+        }
+        check(omitted == 3, "shared-target fixture did not identify the three borrowable tensors");
+        auto draft_params = make_params(nullptr, 0, nullptr, true);
+        draft_params.model_shared = target.get();
+        llama_model_ptr draft(target && full_draft ?
+            llama_model_load_from_file(path.string().c_str(), draft_params) : nullptr);
+        auto cpu_target_params = make_params(nullptr, 0, nullptr);
+        cpu_target_params.n_gpu_layers = 0;
+        auto cpu_target = load(target_metadata.get(), cpu_target_params, seed);
+        auto cpu_shared_draft_params = draft_params;
+        cpu_shared_draft_params.model_shared = cpu_target.get();
+        llama_model_ptr cpu_shared_draft(cpu_target && full_draft ?
+            llama_model_load_from_file(path.string().c_str(), cpu_shared_draft_params) : nullptr);
+        auto noalloc_target_params = make_params(nullptr, 0, nullptr);
+        noalloc_target_params.no_alloc = true;
+        auto noalloc_target = load(target_metadata.get(), noalloc_target_params, seed);
+        auto noalloc_shared_draft_params = draft_params;
+        noalloc_shared_draft_params.model_shared = noalloc_target.get();
+        llama_model_ptr noalloc_shared_draft(noalloc_target && full_draft ?
+            llama_model_load_from_file(path.string().c_str(), noalloc_shared_draft_params) : nullptr);
+        std::error_code stamp_error;
+        const auto initial_stamp = std::filesystem::last_write_time(path, stamp_error);
+        if (!stamp_error) {
+            std::filesystem::last_write_time(path, initial_stamp + std::chrono::seconds(1), stamp_error);
+        }
+        llama_model_ptr restamped_draft(!stamp_error && target && full_draft ?
+            llama_model_load_from_file(path.string().c_str(), draft_params) : nullptr);
+        std::error_code remove_error;
+        std::filesystem::remove(path, remove_error);
+        check(draft != nullptr && cpu_shared_draft != nullptr && noalloc_shared_draft != nullptr,
+              "shared-target fixture failed to load GPU/CPU owner controls");
+        if (draft) {
+            const auto report = llama_model_moe_placement(draft.get());
+            const auto full_report = llama_model_moe_placement(full_draft.get());
+            check(report.model_identity_kind == "local_unverified" &&
+                      report.model_identity_record.find("\"artifact_sources\":[{") != std::string::npos,
+                  "file-backed draft identity omitted local artifact evidence");
+            check(full_report.model_identity_kind == "layout_unverified",
+                  "virtual full-draft control identity was mislabeled");
+            check(report.placement_id != full_report.placement_id,
+                  "shared storage did not change the resolved placement identity");
+            check(!report.shared_tensors.empty(), "shared-target tensors were omitted from placement inventory");
+            for (const auto & shared : report.shared_tensors) {
+                check(!shared.name.empty() && shared.tensor_bytes > 0 && shared.resolved_storage_available &&
+                          !shared.resolved_class.empty() && !shared.owner_canonical_id.empty() &&
+                          shared.storage_relation == "borrowed_model_shared",
+                      "shared-target tensor inventory is incomplete");
+            }
+            check(report.placement_record.find("shared_tensors") != std::string::npos,
+                  "shared-target ownership is absent from placement identity");
+            if (cpu_shared_draft) {
+                const auto cpu_shared_report = llama_model_moe_placement(cpu_shared_draft.get());
+                check(cpu_shared_report.model_identity == report.model_identity &&
+                          cpu_shared_report.placement_id != report.placement_id,
+                      "borrowed target storage owner did not affect resolved placement identity");
+            }
+            if (restamped_draft) {
+                check(llama_model_moe_placement(restamped_draft.get()).model_identity != report.model_identity,
+                      "file modification stamp did not affect local-unverified model identity");
+            }
+            if (noalloc_shared_draft) {
+                const auto noalloc_shared_report = llama_model_moe_placement(noalloc_shared_draft.get());
+                check(!noalloc_shared_report.shared_tensors.empty() &&
+                          std::all_of(noalloc_shared_report.shared_tensors.begin(),
+                              noalloc_shared_report.shared_tensors.end(), [](const auto & shared) {
+                                  return shared.resolved_storage_available && !shared.current_storage_available &&
+                                         shared.storage_provenance == "borrowed_model_shared_resolved_estimate";
+                              }),
+                      "no-allocation borrowed storage was mislabeled as a current backing");
+            }
+        }
+    }
+
+    if (cache_devs.size() >= 2) {
+        ggml_backend_dev_t multi_devices[] = {cache_devs[0], cache_devs[1], nullptr};
+        float tensor_split[] = {1.0f, 1.0f};
+        const llama_model_layer_range multi_layers[] = {{0, 3}};
+        llama_model_params params = llama_model_default_params();
+        params.devices = multi_devices;
+        params.tensor_split = tensor_split;
+        params.n_gpu_layers = 99;
+        params.split_mode = LLAMA_SPLIT_MODE_LAYER;
+        params.load_mode = LLAMA_LOAD_MODE_NONE;
+        params.progress_callback = silent_model_load_progress;
+        params.moe_expert_cache_slots = 2;
+        params.moe_expert_cache_layer_ranges = multi_layers;
+        params.n_moe_expert_cache_layer_ranges = 1;
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true, false, 2, 2, 4);
+        auto model = load(metadata.get(), params, seed);
+        check(model != nullptr, "multi-owner placement fixture failed to load");
+        if (model) {
+            const auto report = llama_model_moe_placement(model.get());
+            std::unordered_set<std::string> active_owners;
+            for (const auto & group : report.groups) {
+                if (group.mode == LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE) {
+                    active_owners.insert(group.owner_canonical_id);
+                }
+            }
+            check(report.owners.size() == 2 && active_owners.size() == 2,
+                  "multi-owner resolved mapping did not cover both physical owners");
+            for (size_t owner_index = 0; owner_index < report.owners.size(); ++owner_index) {
+                size_t fixed = 0;
+                size_t per_slot = 0;
+                size_t groups = 0;
+                for (const auto & group : report.groups) {
+                    if (group.owner_index == static_cast<int32_t>(owner_index) &&
+                        group.mode == LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE) {
+                        fixed += group.cache_fixed_bytes;
+                        per_slot += group.cache_per_slot_bytes;
+                        ++groups;
+                    }
+                }
+                check(report.owners[owner_index].active_cache_groups == groups &&
+                          report.owners[owner_index].cache_group_fixed_bytes == fixed &&
+                          report.owners[owner_index].cache_group_per_slot_bytes == per_slot,
+                      "multi-owner cache ledger mismatch");
+            }
+        }
+    }
+
+    fprintf(stderr, "test-moe-placement: %s on %s\n", ok ? "PASS" : "FAIL",
+            ggml_backend_dev_description(cache_dev));
+    return ok ? 0 : 1;
+}
+
 static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
@@ -2109,7 +2992,8 @@ int main(int argc, char ** argv) {
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
     bool run_speculative_limits = false;
-    bool        run_moe_cache_selector      = false;
+    bool run_moe_cache_selector = false;
+    bool run_moe_placement = false;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -2171,8 +3055,13 @@ int main(int argc, char ** argv) {
             run_moe_cache_selector = true;
             continue;
         }
+        if (strcmp(argv[i], "--test-moe-placement") == 0) {
+            run_moe_placement = true;
+            continue;
+        }
     }
-    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector) {
+    if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector ||
+            run_moe_placement) {
         common_log_set_verbosity_thold(verbosity);
     }
     printf("%s: using seed %zu\n", __func__, seed);
@@ -2198,6 +3087,9 @@ int main(int argc, char ** argv) {
         }
         if (run_moe_cache_selector) {
             return test_moe_cache_selector_precedence(seed);
+        }
+        if (run_moe_placement) {
+            return test_moe_placement_report(seed);
         }
         if (!out.empty()) {
             return save_models(arch, seed, verbosity, out);

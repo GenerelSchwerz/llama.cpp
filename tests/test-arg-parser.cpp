@@ -222,6 +222,20 @@ static void test(void) {
     assert(params.n_predict == 6789);
     assert(params.n_batch == 9090);
 
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    assert(params.fit_moe_report == 1);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report-json"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    assert(params.fit_moe_report == 2);
+    params = common_params();
+    argv = {"binary_name", "-m", "model_file.gguf", "--fit-moe-report", "--fit-moe-report-json"};
+    assert(!common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_FIT_PARAMS));
+    params = common_params();
+    params.model.path = "abc.gguf";
+
     // --draft cannot be used outside llama-speculative
     argv = {"binary_name", "--spec-draft-n-max", "123"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_SPECULATIVE));
