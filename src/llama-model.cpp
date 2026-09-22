@@ -1855,18 +1855,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             (ggml_backend_moe_cache_is_buffer_type_t) ggml_backend_reg_get_proc_address(
                 buft_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
         const bool is_moe_cache_buft = is_moe_cache_buft_fn != nullptr && is_moe_cache_buft_fn(buft);
-        if (is_moe_cache_buft) {
-            for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
-                    tensor = ggml_get_next_tensor(ctx, tensor)) {
-                const auto resolution = ml.tensor_override_resolutions.find(tensor->name);
-                if (resolution != ml.tensor_override_resolutions.end() &&
-                        (resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY ||
-                         resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR) &&
-                        resolution->second.selected_buft == resolution->second.resolved_buft) {
-                    pimpl->moe_cache_tensor_owners.emplace(tensor, ggml_backend_buft_get_device(buft));
-                }
-            }
-        }
         if (!ml.no_alloc && ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
             auto buffer_from_host_ptr_fn = (ggml_backend_moe_cache_buffer_from_host_ptr_t)
                     ggml_backend_reg_get_proc_address(buft_reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME);
@@ -2053,9 +2041,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+    if (tensor != nullptr && tn.bid >= 0) {
+        const auto resolution = ml.tensor_override_resolutions.find(tn.str());
+        if (resolution != ml.tensor_override_resolutions.end() &&
+                (resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY ||
+                 resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR) &&
+                resolution->second.selected_buft == resolution->second.resolved_buft) {
+            // The shared host buffer identifies its provider, not the layer's execution device.
+            ggml_backend_dev_t owner = pimpl->dev_layer.at(tn.bid).dev;
+            if (ggml_backend_dev_type(owner) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                owner = ggml_backend_buft_get_device(ml.tensor_buft_overrides[resolution->second.index].buft);
+            }
+            pimpl->moe_cache_tensor_owners.emplace(tensor, owner);
+        }
+    }
+    return tensor;
 }
 
 bool llama_model::graph_supports_recurrent_sparse_snapshots() const {

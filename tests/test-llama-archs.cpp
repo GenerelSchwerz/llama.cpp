@@ -2888,7 +2888,7 @@ static int test_moe_placement_report(const size_t seed) {
     if (cache_devs.size() >= 2) {
         ggml_backend_dev_t multi_devices[] = {cache_devs[0], cache_devs[1], nullptr};
         float tensor_split[] = {1.0f, 1.0f};
-        const llama_model_layer_range multi_layers[] = {{0, 3}};
+        const llama_model_layer_range multi_layers[] = {{0, 4}};
         llama_model_params params = llama_model_default_params();
         params.devices = multi_devices;
         params.tensor_split = tensor_split;
@@ -2896,10 +2896,10 @@ static int test_moe_placement_report(const size_t seed) {
         params.split_mode = LLAMA_SPLIT_MODE_LAYER;
         params.load_mode = LLAMA_LOAD_MODE_NONE;
         params.progress_callback = silent_model_load_progress;
-        params.moe_expert_cache_slots = 2;
+        params.moe_expert_cache_slots = 8;
         params.moe_expert_cache_layer_ranges = multi_layers;
         params.n_moe_expert_cache_layer_ranges = 1;
-        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true, false, 2, 2, 4);
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true, false, 8, 2, 5);
         auto model = load(metadata.get(), params, seed);
         check(model != nullptr, "multi-owner placement fixture failed to load");
         if (model) {
@@ -2908,10 +2908,19 @@ static int test_moe_placement_report(const size_t seed) {
             for (const auto & group : report.groups) {
                 if (group.mode == LLAMA_MOE_PLACEMENT_RESIDUAL_CACHE) {
                     active_owners.insert(group.owner_canonical_id);
+                    const char * owner_name = ggml_backend_dev_name(model->dev_layer(group.layer));
+                    for (const auto & bank : group.banks) {
+                        if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
+                            check(bank.owner_name == owner_name,
+                                  "cached expert bank owner differs from its layer execution device");
+                        }
+                    }
                 }
             }
             check(report.owners.size() == 2 && active_owners.size() == 2,
-                  "multi-owner resolved mapping did not cover both physical owners");
+                  "multi-owner resolved mapping did not cover both selected devices");
+            check(model->dev_layer(2) == multi_devices[0] && model->dev_layer(3) == multi_devices[1],
+                  "multi-owner fixture must use an asymmetric 3/2 layer split");
             for (size_t owner_index = 0; owner_index < report.owners.size(); ++owner_index) {
                 size_t fixed = 0;
                 size_t per_slot = 0;
@@ -2928,6 +2937,37 @@ static int test_moe_placement_report(const size_t seed) {
                           report.owners[owner_index].cache_group_fixed_bytes == fixed &&
                           report.owners[owner_index].cache_group_per_slot_bytes == per_slot,
                       "multi-owner cache ledger mismatch");
+            }
+
+            const auto & memory = model->moe_expert_cache_memory();
+            const auto first = memory.find(multi_devices[0]);
+            const auto second = memory.find(multi_devices[1]);
+            check(first != memory.end() && second != memory.end(),
+                  "cache sizing used the host buffer provider instead of both layer owners");
+            if (first != memory.end() && second != memory.end()) {
+                const size_t budgets[] = {first->second.device_bytes(4), second->second.device_bytes(6)};
+                auto budget_params = params;
+                budget_params.moe_expert_cache_slots = 0;
+                budget_params.moe_expert_cache_byte_budgets = budgets;
+                budget_params.n_moe_expert_cache_byte_budgets = 2;
+                // Exercise the implicit cache override as well as the layer selector above.
+                budget_params.moe_expert_cache_layer_ranges = nullptr;
+                budget_params.n_moe_expert_cache_layer_ranges = 0;
+                auto budget_model = load(metadata.get(), budget_params, seed);
+                check(budget_model != nullptr, "multi-owner byte-budget fixture failed to load");
+                if (budget_model) {
+                    check(budget_model->moe_expert_cache_slots(multi_devices[0]) == 4 &&
+                              budget_model->moe_expert_cache_slots(multi_devices[1]) == 6,
+                          "byte budgets did not produce owner-local slot counts");
+                    auto probe_params = budget_params;
+                    probe_params.no_alloc = true;
+                    auto probe = load(metadata.get(), probe_params, seed);
+                    check(probe && probe->moe_expert_cache_slots(multi_devices[0]) == 4 &&
+                              probe->moe_expert_cache_slots(multi_devices[1]) == 6 &&
+                              llama_model_moe_placement(probe.get()).placement_id ==
+                                  llama_model_moe_placement(budget_model.get()).placement_id,
+                          "allocation-free sizing disagreed with the live split owners");
+                }
             }
         }
     }
