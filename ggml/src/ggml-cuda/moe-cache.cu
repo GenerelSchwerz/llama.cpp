@@ -3428,7 +3428,11 @@ static void moe_device_prefetch_wait(cudaStream_t stream, uint32_t * done) {
     CUgraph graph = nullptr;
     const CUgraphNode * dependencies = nullptr;
     size_t count = 0;
+#if CUDA_VERSION >= 13000
     CU_CHECK(cuStreamGetCaptureInfo(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#else
+    CU_CHECK(cuStreamGetCaptureInfo_v3(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
+#endif
     if (status == CU_STREAM_CAPTURE_STATUS_NONE) {
         CU_CHECK(cuStreamWaitValue32(stream, reinterpret_cast<CUdeviceptr>(done), 1, CU_STREAM_WAIT_VALUE_GEQ));
         return;
