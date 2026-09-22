@@ -475,6 +475,7 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t source_mapped_bytes = 0;
     uint64_t source_device_bytes = 0;
     uint64_t source_prepack_bytes = 0;
+    uint64_t source_device_prefetch_bytes = 0;
     uint64_t populated_slots = 0;
     uint64_t slot_capacity = 0;
     uint64_t populated_payload_bytes = 0;
@@ -1010,6 +1011,11 @@ private:
     bool early_hc_for_test();
     bool early_select_for_test();
     bool early_graph_for_test();
+    bool early_geometry_for_test(
+            const ggml_graph_execution_certificate & certificate,
+            uint32_t n_rows,
+            uint32_t top_k,
+            uint32_t * prediction_slots) const;
     uint64_t early_bytes_for_test(uint64_t * calls) const;
     size_t early_program_count_for_test() const;
     bool has_device_resource_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
@@ -1115,6 +1121,9 @@ bool ggml_backend_cuda_moe_staging_size_v1(
 bool ggml_backend_cuda_moe_device_size_v1(
     const struct ggml_backend_moe_device_size_query_v1 * query,
     struct ggml_backend_moe_device_size_v1 * result);
+bool ggml_backend_cuda_moe_device_size_v2(
+    const struct ggml_backend_moe_device_size_query_v2 * query,
+    struct ggml_backend_moe_device_size_v2 * result);
 void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t buft);
 bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t buft, const struct ggml_backend_moe_candidate_snapshot_v2 * snapshot);
 bool ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_type_t buft);

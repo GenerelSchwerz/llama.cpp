@@ -2294,6 +2294,9 @@ void test_moe_cache_proc_api() {
     auto device_size = reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME));
     CHECK(device_size != nullptr);
+    auto device_size_v2 = reinterpret_cast<ggml_backend_moe_device_size_v2_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V2_PROC_NAME));
+    CHECK(device_size_v2 != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) != nullptr);
@@ -2324,7 +2327,7 @@ void test_moe_cache_proc_api() {
     CHECK(sizing.legacy_min_bytes > 0);
     CHECK(sizing.host_staged_min_bytes == sizing.legacy_min_bytes);
     CHECK(sizing.optional_growth_max_bytes > 0);
-    CHECK(sizing.prepack_tile_bytes == 12000);
+    CHECK(sizing.prepack_tile_bytes == 48000);
 
     query.family_mask = GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED;
     sizing = {};
@@ -2366,6 +2369,40 @@ void test_moe_cache_proc_api() {
     CHECK(device_size(&device_query, &device_sizing));
     CHECK(device_sizing.group_fixed_bytes == 0 && device_sizing.group_per_slot_bytes == 0);
     CHECK(device_sizing.context_fixed_bytes > 4096 * sizeof(float));
+    ggml_backend_moe_device_size_query_v2 device_query_v2 = {};
+    device_query_v2.struct_size                           = sizeof(device_query_v2);
+    device_query_v2.flags                                 = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
+    device_query_v2.early_width                           = device_query.early_width;
+    device_query_v2.early_experts                         = device_query.early_experts;
+    device_query_v2.early_top_k                           = device_query.early_top_k;
+    device_query_v2.early_hc_rank                         = device_query.early_hc_rank;
+    device_query_v2.early_route_capacity                  = 48;
+    device_query_v2.early_row_capacity                    = 6;
+    device_query_v2.early_groups                          = 12;
+    device_query_v2.early_expert_bytes                    = 3000;
+    ggml_backend_moe_device_size_v2 device_sizing_v2      = {};
+    device_sizing_v2.struct_size                          = sizeof(device_sizing_v2);
+    CHECK(device_size_v2(&device_query_v2, &device_sizing_v2));
+    const uint64_t early_rows = device_query_v2.early_row_capacity;
+    const uint64_t extra_workspace =
+        uint64_t(device_query_v2.early_route_capacity - device_query_v2.early_top_k) * sizeof(int32_t) +
+        uint64_t(device_query_v2.early_experts) * sizeof(int32_t) +
+        (early_rows - 1) * (uint64_t(device_query_v2.early_width) * 3 * sizeof(float) +
+                            uint64_t(device_query_v2.early_experts) * sizeof(float) +
+                            uint64_t(device_query_v2.early_hc_rank) * sizeof(float));
+    CHECK(device_sizing_v2.context_fixed_bytes ==
+          device_sizing.context_fixed_bytes +
+              2 * device_query_v2.early_route_capacity * device_query_v2.early_expert_bytes +
+              2 * sizeof(uint32_t) + uint64_t(device_query_v2.early_experts) * sizeof(int32_t) +
+              uint64_t(device_query_v2.early_width) * early_rows * sizeof(float) +
+              extra_workspace);
+    CHECK(device_sizing_v2.host_fixed_bytes > 0);
+    device_query_v2.early_route_capacity = 4;
+    device_query_v2.early_row_capacity = 1;
+    CHECK(device_size_v2(&device_query_v2, &device_sizing_v2));
+    device_query_v2.early_route_capacity = 65;
+    device_query_v2.early_row_capacity = 6;
+    CHECK(device_size_v2(&device_query_v2, &device_sizing_v2));
     device_query.early_top_k = 0;
     CHECK(!device_size(&device_query, &device_sizing));
     fprintf(stderr, "test-moe-cache: dynamic backend procedure API OK\n");

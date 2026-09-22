@@ -47,6 +47,8 @@
 
 bool llama_internal_model_no_alloc(const llama_model * model);
 
+static bool is_moe_cache_source_buft(ggml_backend_buffer_type_t buft);
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1243,10 +1245,11 @@ struct llama_model::impl {
     bool resolved_has_lazy_tensors = false;
     std::vector<llama_model_layer_range> moe_cache_layer_ranges_owned;
     std::vector<size_t> moe_cache_byte_budgets_owned;
-    std::unordered_set<const ggml_tensor *> moe_cache_tensors;
+    std::unordered_map<const ggml_tensor *, ggml_backend_dev_t> moe_cache_tensor_owners;
     std::map<ggml_backend_dev_t, llama_moe_cache_memory> moe_cache_memory;
     std::array<std::vector<llama_moe_cache_memory>, 2>                  moe_cache_group_context_memory;
     std::array<std::map<ggml_backend_dev_t, llama_moe_cache_memory>, 2> moe_cache_context_memory;
+    std::array<size_t, 2>                                               moe_cache_context_host_memory = {};
     struct moe_cache_staging_group {
         ggml_backend_dev_t owner;
         int32_t layer;
@@ -1855,7 +1858,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (is_moe_cache_buft) {
             for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
                     tensor = ggml_get_next_tensor(ctx, tensor)) {
-                pimpl->moe_cache_tensors.insert(tensor);
+                const auto resolution = ml.tensor_override_resolutions.find(tensor->name);
+                if (resolution != ml.tensor_override_resolutions.end() &&
+                        (resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY ||
+                         resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR) &&
+                        resolution->second.selected_buft == resolution->second.resolved_buft) {
+                    pimpl->moe_cache_tensor_owners.emplace(tensor, ggml_backend_buft_get_device(buft));
+                }
             }
         }
         if (!ml.no_alloc && ml.use_mmap && use_mmap_buffer && is_moe_cache_buft) {
@@ -2117,11 +2126,14 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             ggml_backend_buffer_t buf = bufs[0].get();
             GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
-            ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+            const auto accounting_buft = is_moe_cache_source_buft(buft) ? ggml_backend_cpu_buffer_type() : buft;
+            ret[accounting_buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
         } else {
             for (const auto & buf : bufs) {
                 // GGML_ASSERT(ggml_backend_buffer_get_base(buf.get()) != nullptr); // multi_buffer does not have a defined base
-                ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+                ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf.get());
+                const auto accounting_buft = is_moe_cache_source_buft(buft) ? ggml_backend_cpu_buffer_type() : buft;
+                ret[accounting_buft] += ggml_backend_buffer_get_size(buf.get());
             }
         }
     }
@@ -2519,6 +2531,12 @@ std::map<ggml_backend_dev_t, size_t> llama_model::moe_expert_cache_host_staging(
         return result;
     }
     const size_t context_index = ctx_type == LLAMA_CONTEXT_TYPE_MTP ? 1 : 0;
+    std::map<ggml_backend_dev_t, uint32_t> prediction_capacity;
+    for (const auto & group : pimpl->moe_cache_staging_groups) {
+        if ((group.context_mask & (uint32_t{1} << context_index)) != 0) {
+            prediction_capacity[group.owner] = std::max(prediction_capacity[group.owner], group.n_experts);
+        }
+    }
     for (const auto & group : pimpl->moe_cache_staging_groups) {
         if ((group.context_mask & (uint32_t{1} << context_index)) == 0) {
             continue;
@@ -2534,7 +2552,7 @@ std::map<ggml_backend_dev_t, size_t> llama_model::moe_expert_cache_host_staging(
         ggml_backend_moe_staging_query_v1 query = {};
         query.struct_size = sizeof(query);
         query.n_slots = static_cast<uint32_t>(slots);
-        query.n_experts = group.n_experts;
+        query.n_experts = prediction_capacity[group.owner];
         query.top_k = group.top_k;
         query.n_banks = static_cast<uint32_t>(group.bank_expert_strides.size());
         query.staged_bank_mask = (uint32_t{1} << query.n_banks) - 1;
@@ -2585,6 +2603,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::moe_expert_cache_memor
         }
         host_staging += bytes;
     }
+    if (pimpl->moe_cache_context_host_memory[context_index] > SIZE_MAX - host_staging) {
+        throw std::overflow_error("MoE cache host memory estimate overflow");
+    }
+    host_staging += pimpl->moe_cache_context_host_memory[context_index];
     if (host_staging != 0) {
         result[ggml_backend_cpu_buffer_type()] += host_staging;
     }
@@ -2607,6 +2629,7 @@ void llama_model::finalize_moe_expert_cache() {
     for (auto & memory : pimpl->moe_cache_context_memory) {
         memory.clear();
     }
+    pimpl->moe_cache_context_host_memory.fill(0);
     pimpl->moe_cache_staging_groups.clear();
     pimpl->moe_cache_slots.clear();
     for (auto & memory : pimpl->moe_cache_group_context_memory) {
@@ -2633,6 +2656,10 @@ void llama_model::finalize_moe_expert_cache() {
         uint32_t experts = 0;
         uint32_t top_k = 0;
         uint32_t hc_rank = 0;
+        uint32_t route_capacity = 0;
+        uint32_t row_capacity   = 0;
+        uint32_t groups       = 0;
+        uint64_t expert_bytes = 0;
     };
     std::array<std::map<ggml_backend_dev_t, context_geometry>, 2> context_geometries;
     std::unordered_set<int32_t> unmatched_selected_layers;
@@ -2650,6 +2677,8 @@ void llama_model::finalize_moe_expert_cache() {
         uint32_t n_experts = 0;
         uint32_t base_banks = 0;
         uint32_t cached_base_banks = 0;
+        uint64_t group_expert_bytes = 0;
+        ggml_backend_dev_t cache_owner = nullptr;
         for (const auto & bank : group.banks) {
             const auto * tensor = bank.tensor;
             if (tensor == nullptr) {
@@ -2657,7 +2686,11 @@ void llama_model::finalize_moe_expert_cache() {
             }
             if (bank.status == GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE) {
                 ++base_banks;
-                cached_base_banks += pimpl->moe_cache_tensors.count(tensor) != 0;
+                ggml_backend_buffer_type_t buft = tensor->buffer != nullptr ?
+                    ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
+                const auto cached_tensor = pimpl->moe_cache_tensor_owners.find(tensor);
+                const bool cached = cached_tensor != pimpl->moe_cache_tensor_owners.end();
+                cached_base_banks += cached;
                 if (tensor->ne[2] <= 0 || tensor->ne[2] > UINT32_MAX) {
                     throw std::runtime_error("invalid MoE expert count for cache accounting");
                 }
@@ -2665,6 +2698,17 @@ void llama_model::finalize_moe_expert_cache() {
                     throw std::runtime_error("inconsistent MoE expert count in cache group");
                 }
                 n_experts = static_cast<uint32_t>(tensor->ne[2]);
+                if (cached) {
+                    ggml_backend_dev_t owner = cached_tensor->second;
+                    if (owner == nullptr || ggml_backend_dev_type(owner) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        throw std::runtime_error(format("MoE cache tensor %s has no accelerator owner (%s)",
+                            tensor->name, buft != nullptr ? ggml_backend_buft_name(buft) : "none"));
+                    }
+                    if (cache_owner != nullptr && cache_owner != owner) {
+                        throw std::runtime_error("MoE cache group spans multiple accelerator owners");
+                    }
+                    cache_owner = owner;
+                }
             }
         }
         if (base_banks != 0) {
@@ -2676,18 +2720,9 @@ void llama_model::finalize_moe_expert_cache() {
         if (cached_base_banks != base_banks || n_experts == 0) {
             throw std::runtime_error("MoE cache placement must select every routed weight in a layer group");
         }
-        ggml_backend_dev_t owner = pimpl->dev_layer[group.layer].dev;
-        if (owner == nullptr || ggml_backend_dev_type(owner) == GGML_BACKEND_DEVICE_TYPE_CPU) {
-            if (!pimpl->moe_cache_byte_budgets_owned.empty()) {
-                // Allocation-free fit probes deliberately begin with every layer on
-                // the CPU. Account selected groups as their candidate layer owner is
-                // assigned instead of rejecting that non-executable lower bound.
-                if (params.no_alloc) {
-                    continue;
-                }
-                throw std::runtime_error("MoE cache byte budgets require cached layers to have a GPU owner");
-            }
-            continue;
+        ggml_backend_dev_t owner = cache_owner;
+        if (owner == nullptr) {
+            throw std::runtime_error("MoE cache placement has no accelerator owner");
         }
         auto * reg = ggml_backend_dev_backend_reg(owner);
         auto device_size = reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
@@ -2715,6 +2750,7 @@ void llama_model::finalize_moe_expert_cache() {
                 }
                 const uint32_t index = query.n_banks++;
                 query.bank_expert_strides[index] = tensor->nb[2];
+                add64(group_expert_bytes, tensor->nb[2]);
                 query.bank_ne0[index] = tensor->ne[0];
                 query.bank_types[index] = tensor->type;
                 continue;
@@ -2765,10 +2801,13 @@ void llama_model::finalize_moe_expert_cache() {
             merge_memory(pimpl->moe_cache_group_context_memory[context_index][group_index]);
             auto & geometry = context_geometries[context_index][owner];
             const uint32_t top_k = std::max<uint32_t>(1, hparams.n_expert_used(group.layer));
-            if (context_index == 0 && top_k <= GGML_BACKEND_MOE_EARLY_ROUTER_MAX_ROUTES) {
+            if (context_index == 0) {
                 const auto * router_input = layers[group.layer].ffn_gate_inp;
-                const uint64_t width = router_input != nullptr && router_input->ne[0] > 0 ?
+                uint64_t width = router_input != nullptr && router_input->ne[0] > 0 ?
                     static_cast<uint64_t>(router_input->ne[0]) : hparams.n_embd;
+                if (hparams.dsv4_hc_mult > 1) {
+                    width = std::max(width, uint64_t(hparams.n_embd) * hparams.dsv4_hc_mult);
+                }
                 if (width > UINT32_MAX) {
                     throw std::runtime_error("MoE router width exceeds cache accounting ABI");
                 }
@@ -2776,6 +2815,29 @@ void llama_model::finalize_moe_expert_cache() {
                 geometry.experts = std::max(geometry.experts, n_experts);
                 geometry.top_k = std::max(geometry.top_k, top_k);
                 geometry.hc_rank = std::max(geometry.hc_rank, hparams.hc_low_rank);
+                const uint32_t slot_bound = pimpl->moe_cache_byte_budgets_owned.empty() ?
+                    static_cast<uint32_t>(params.moe_expert_cache_slots) : n_experts;
+                const uint32_t row_capacity = slot_bound / top_k;
+                uint32_t candidate_k = top_k;
+                if (const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_CANDIDATE_PERCENT")) {
+                    char * end = nullptr;
+                    const unsigned long long percent = strtoull(value, &end, 10);
+                    if (*value != '\0' && end != nullptr && *end == '\0' && percent != 0 && percent <= UINT32_MAX) {
+                        const uint64_t scaled = uint64_t(top_k) * percent;
+                        candidate_k = static_cast<uint32_t>(std::min<uint64_t>(n_experts,
+                            scaled / 100 + (scaled % 100 != 0)));
+                    }
+                }
+                if (row_capacity != 0) {
+                    geometry.row_capacity = std::max(geometry.row_capacity, row_capacity);
+                    geometry.route_capacity = std::max(geometry.route_capacity, static_cast<uint32_t>(
+                        std::min<uint64_t>(n_experts, uint64_t(row_capacity) * candidate_k)));
+                    if (geometry.groups == UINT32_MAX) {
+                        throw std::runtime_error("MoE cache early-router group count overflow");
+                    }
+                    ++geometry.groups;
+                }
+                geometry.expert_bytes = std::max(geometry.expert_bytes, group_expert_bytes);
             }
         }
 
@@ -2797,30 +2859,74 @@ void llama_model::finalize_moe_expert_cache() {
     for (size_t context_index = 0; context_index < context_geometries.size(); ++context_index) {
         for (const auto & entry : context_geometries[context_index]) {
             auto * reg = ggml_backend_dev_backend_reg(entry.first);
-            auto device_size = reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v1_t>(
-                ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME)) : nullptr;
-            if (device_size == nullptr) {
+            auto device_size_v2 =
+                reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v2_t>(ggml_backend_reg_get_proc_address(
+                                     reg, GGML_BACKEND_MOE_DEVICE_SIZE_V2_PROC_NAME)) :
+                                 nullptr;
+            auto device_size_v1 =
+                reg != nullptr ? reinterpret_cast<ggml_backend_moe_device_size_v1_t>(ggml_backend_reg_get_proc_address(
+                                     reg, GGML_BACKEND_MOE_DEVICE_SIZE_V1_PROC_NAME)) :
+                                 nullptr;
+            if (device_size_v2 == nullptr && device_size_v1 == nullptr) {
                 throw std::runtime_error("MoE cache backend cannot size context allocations");
             }
-            ggml_backend_moe_device_size_query_v1 query = {};
+            ggml_backend_moe_device_size_query_v2 query = {};
             query.struct_size = sizeof(query);
             query.flags = GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG;
             // Early routing is currently limited to MAIN grouped decode.
-            if (context_index == 0) {
+            if (context_index == 0 && entry.second.groups != 0) {
                 query.early_width = entry.second.width;
                 query.early_experts = entry.second.experts;
                 query.early_top_k = entry.second.top_k;
                 query.early_hc_rank = entry.second.hc_rank;
+                query.early_route_capacity = entry.second.route_capacity;
+                query.early_row_capacity   = entry.second.row_capacity;
+                query.early_groups         = entry.second.groups;
+                query.early_expert_bytes   = entry.second.expert_bytes;
             }
-            ggml_backend_moe_device_size_v1 sizing = {};
-            sizing.struct_size = sizeof(sizing);
-            if (!device_size(&query, &sizing) || sizing.context_fixed_bytes > SIZE_MAX) {
-                throw std::runtime_error("failed to size MoE cache context allocations");
+            uint64_t context_fixed_bytes = 0;
+            uint64_t context_host_bytes  = 0;
+            if (device_size_v2 != nullptr) {
+                ggml_backend_moe_device_size_v2 sizing = {};
+                sizing.struct_size = sizeof(sizing);
+                if (!device_size_v2(&query, &sizing)) {
+                    throw std::runtime_error("failed to size MoE cache context allocations");
+                }
+                context_fixed_bytes = sizing.context_fixed_bytes;
+                context_host_bytes  = sizing.host_fixed_bytes;
+            } else {
+                ggml_backend_moe_device_size_query_v1 query_v1 = {};
+                query_v1.struct_size = sizeof(query_v1);
+                query_v1.n_slots = query.n_slots;
+                query_v1.n_experts = query.n_experts;
+                query_v1.n_banks = query.n_banks;
+                query_v1.n_slot_auxiliaries = query.n_slot_auxiliaries;
+                query_v1.flags = query.flags;
+                query_v1.early_width = query.early_width;
+                query_v1.early_experts = query.early_experts;
+                query_v1.early_top_k = query.early_top_k;
+                query_v1.early_hc_rank = query.early_hc_rank;
+                query_v1.slot_auxiliary_values = query.slot_auxiliary_values;
+                query_v1.original_shadow_bytes = query.original_shadow_bytes;
+                query_v1.prefill_copy_bytes = query.prefill_copy_bytes;
+                std::copy_n(query.bank_expert_strides, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, query_v1.bank_expert_strides);
+                std::copy_n(query.bank_ne0, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, query_v1.bank_ne0);
+                std::copy_n(query.bank_types, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS, query_v1.bank_types);
+                ggml_backend_moe_device_size_v1 sizing = {};
+                sizing.struct_size = sizeof(sizing);
+                if (!device_size_v1(&query_v1, &sizing)) {
+                    throw std::runtime_error("failed to size MoE cache context allocations");
+                }
+                context_fixed_bytes = sizing.context_fixed_bytes;
+            }
+            if (context_fixed_bytes > SIZE_MAX || context_host_bytes > SIZE_MAX) {
+                throw std::runtime_error("MoE cache context allocation exceeds address space");
             }
             add(pimpl->moe_cache_memory[entry.first].fixed_device_bytes,
-                static_cast<size_t>(sizing.context_fixed_bytes));
+                static_cast<size_t>(context_fixed_bytes));
             add(pimpl->moe_cache_context_memory[context_index][entry.first].fixed_device_bytes,
-                static_cast<size_t>(sizing.context_fixed_bytes));
+                static_cast<size_t>(context_fixed_bytes));
+            add(pimpl->moe_cache_context_host_memory[context_index], static_cast<size_t>(context_host_bytes));
         }
     }
     if (!unmatched_selected_layers.empty()) {
@@ -2864,10 +2970,8 @@ void llama_model::finalize_moe_expert_cache() {
     if (params.moe_expert_cache_host_pinned_size > 0) {
         size_t mandatory = 0;
         for (const auto ctx_type : {LLAMA_CONTEXT_TYPE_DEFAULT, LLAMA_CONTEXT_TYPE_MTP}) {
-            for (const auto & entry : moe_expert_cache_memory_breakdown(ctx_type)) {
-                if (ggml_backend_buft_is_host(entry.first)) {
-                    add(mandatory, entry.second);
-                }
+            for (const auto & entry : moe_expert_cache_host_staging(ctx_type)) {
+                add(mandatory, entry.second);
             }
         }
         if (mandatory > params.moe_expert_cache_host_pinned_size) {
@@ -3292,9 +3396,10 @@ llama_moe_placement_report llama_model::moe_placement() const {
                 bank.tensor_bytes  = ggml_nbytes(tensor);
                 ggml_backend_buffer_type_t buft = tensor->buffer != nullptr ?
                     ggml_backend_buffer_get_type(tensor->buffer) : nullptr;
-                const bool cached = pimpl->moe_cache_tensors.count(tensor) != 0;
-                ggml_backend_dev_t owner = cached && source.layer >= 0 ?
-                    dev_layer(source.layer) : (buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr);
+                const auto cached_tensor = pimpl->moe_cache_tensor_owners.find(tensor);
+                const bool cached = cached_tensor != pimpl->moe_cache_tensor_owners.end();
+                ggml_backend_dev_t owner = cached ? cached_tensor->second :
+                    (buft != nullptr ? ggml_backend_buft_get_device(buft) : nullptr);
                 const auto resolution = pimpl->tensor_override_resolutions.find(tensor->name);
                 bank.actual_buft_available = !params.no_alloc && buft != nullptr;
                 bank.actual_buft = bank.actual_buft_available ? ggml_backend_buft_name(buft) : "";

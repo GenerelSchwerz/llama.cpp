@@ -79,6 +79,14 @@ struct ggml_cuda_moe_grouped_context_test_access {
     static bool early_hc(ggml_cuda_moe_grouped_context & context) {
         return context.early_hc_for_test();
     }
+
+    static bool early_geometry(const ggml_cuda_moe_grouped_context &    context,
+                               const ggml_graph_execution_certificate & certificate,
+                               uint32_t                                 n_rows,
+                               uint32_t                                 top_k,
+                               uint32_t *                               prediction_slots = nullptr) {
+        return context.early_geometry_for_test(certificate, n_rows, top_k, prediction_slots);
+    }
     static bool prepack(ggml_cuda_moe_grouped_context & context) {
         return context.prepack_for_test();
     }

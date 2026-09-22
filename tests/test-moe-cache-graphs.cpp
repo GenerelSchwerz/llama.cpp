@@ -2,7 +2,8 @@
 
 static uint64_t grouped_source_bytes(const ggml_cuda_moe_grouped_debug_telemetry & telemetry) {
     return telemetry.source_direct_registered_bytes + telemetry.source_pageable_staged_bytes +
-        telemetry.source_mapped_bytes + telemetry.source_device_bytes + telemetry.source_prepack_bytes;
+           telemetry.source_mapped_bytes + telemetry.source_device_bytes + telemetry.source_prepack_bytes +
+           telemetry.source_device_prefetch_bytes;
 }
 
 static std::vector<uint8_t> active_grouped_q4k_expert_data(const ggml_tensor * tensor, uint32_t salt) {
@@ -392,6 +393,217 @@ void test_early_grouped_graphs() {
     CHECK(enabled != nullptr && strcmp(enabled, "1") == 0);
     const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
     ggml_backend_cuda_moe_set_debug_mm(true);
+    {
+        ggml_cuda_moe_grouped_context    context(nullptr, 0);
+        ggml_graph_execution_certificate certificate = {};
+        certificate.domain                           = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        certificate.row_semantics                    = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT;
+        certificate.n_rows                           = 1;
+        certificate.n_sequences                      = 1;
+        uint32_t prediction_slots                    = 0;
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 1, 8, &prediction_slots));
+        CHECK(prediction_slots == 8);
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 2, 8));
+
+        certificate.flags         = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+        for (uint32_t rows : { 2u, 3u, 4u }) {
+            certificate.n_rows      = rows;
+            certificate.n_sequences = 1;
+            CHECK(ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, rows, 8,
+                                                                            &prediction_slots));
+            CHECK(prediction_slots == rows * 8);
+        }
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 9, &prediction_slots));
+        CHECK(prediction_slots == 36);
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 3, 8));
+        certificate.n_rows      = 3;
+        certificate.n_sequences = 0;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 3, 8));
+        certificate.n_sequences = 2;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 3, 8));
+        certificate.n_rows      = 4;
+        certificate.n_sequences = 2;
+        CHECK(ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 8, &prediction_slots));
+        CHECK(prediction_slots == 32);
+        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MTP;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 8));
+        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_DRAFT;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 8));
+        certificate.domain        = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 8));
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE;
+        certificate.flags         = GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE;
+        CHECK(!ggml_cuda_moe_grouped_context_test_access::early_geometry(context, certificate, 4, 8));
+        fprintf(stderr,
+                "early-grouped-test: certificate geometry independent=1 mtp1=1 mtp2=1 pageable-dynamic=1 mapped-dynamic=1 "
+                "context-separation=1\n");
+    }
+    bool mapped_adopted = false;
+    for (bool pageable : { true, false }) {
+        for (uint32_t layout :
+             { GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP }) {
+            for (uint32_t rows : { 1u, 2u, 3u }) {
+                constexpr uint32_t n_slots = 6;
+                ggml_backend_ptr   reference_backend(ggml_backend_cuda_init(0));
+                ggml_backend_ptr   candidate_backend(ggml_backend_cuda_init(0));
+                const auto         build = [&](ggml_backend_t backend) {
+                    return build_active_grouped_dispatch_graph_types(
+                        backend, pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_buffer_type(),
+                        { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 }, layout,
+                        layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, rows, 16, 2, 256, nullptr,
+                        false, false, 0, false, false, 0);
+                };
+                auto reference_first  = build(reference_backend.get());
+                auto reference_second = build(reference_backend.get());
+                auto reference_third  = build(reference_backend.get());
+                auto reference_fourth = build(reference_backend.get());
+                auto candidate_first  = build(candidate_backend.get());
+                auto candidate_second = build(candidate_backend.get());
+                auto candidate_third  = build(candidate_backend.get());
+                auto candidate_fourth = build(candidate_backend.get());
+                initialize_active_grouped_dispatch_graphs({ &reference_first, &reference_second, &reference_third,
+                                                            &reference_fourth, &candidate_first, &candidate_second,
+                                                            &candidate_third, &candidate_fourth });
+
+                const auto register_groups = [&](ggml_backend_t                                         backend,
+                                                 const std::array<active_grouped_dispatch_graph *, 4> & sources) {
+                    std::array<std::array<ggml_backend_moe_candidate_bank_v1, 3>, 4> banks  = {};
+                    std::array<ggml_backend_moe_candidate_group_v1, 4>               groups = {};
+                    for (uint32_t group_index = 0; group_index < groups.size(); ++group_index) {
+                        uint32_t n_banks = 0;
+                        for (uint32_t bank = 0; bank < sources[group_index]->banks.size(); ++bank) {
+                            banks[group_index][n_banks++] = { sources[group_index]->banks[bank],
+                                                              sources[group_index]->roles[bank], 0 };
+                        }
+                        if (sources[group_index]->down_scale != nullptr) {
+                            banks[group_index][n_banks++] = { sources[group_index]->down_scale,
+                                                              GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_SCALE, 0 };
+                        }
+                        CHECK(n_banks <= banks[group_index].size());
+                        groups[group_index] = { banks[group_index].data(), n_banks, layout, 0, 0 };
+                    }
+                    const auto snapshot = candidate_snapshot(n_slots, groups.data(), groups.size());
+                    CHECK(ggml_backend_cuda_moe_candidate_replace_v1(backend, &snapshot) ==
+                          GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+                };
+                register_groups(reference_backend.get(),
+                                { &reference_first, &reference_second, &reference_third, &reference_fourth });
+                register_groups(candidate_backend.get(),
+                                { &candidate_first, &candidate_second, &candidate_third, &candidate_fourth });
+
+                ggml_context_ptr reference_graph_context;
+                ggml_context_ptr candidate_graph_context;
+                const auto combine = [&](ggml_context_ptr &                                     graph_context,
+                                         const std::array<active_grouped_dispatch_graph *, 4> & parts, uint32_t domain,
+                                         uint32_t row_semantics, uint32_t n_sequences, uint32_t flags) {
+                    int32_t capacity = 0;
+                    for (const auto * part : parts) {
+                        capacity += part->graph->n_nodes;
+                    }
+                    const ggml_init_params params = {
+                        /* .mem_size = */ ggml_tensor_overhead() * 2 + ggml_graph_overhead_custom(capacity, false),
+                        /* .mem_base = */ nullptr,
+                        /* .no_alloc = */ true,
+                    };
+                    graph_context.reset(ggml_init(params));
+                    CHECK(graph_context != nullptr);
+                    auto * graph = ggml_new_graph_custom(graph_context.get(), capacity, false);
+                    for (const auto * part : parts) {
+                        for (int32_t node = 0; node < part->graph->n_nodes; ++node) {
+                            ggml_graph_add_node(graph, part->graph->nodes[node]);
+                        }
+                    }
+                    candidate_rebuild_graph_uses(graph);
+                    candidate_stamp_execution(graph, domain, row_semantics, rows, n_sequences, 0, flags);
+                    return graph;
+                };
+                auto * reference_graph =
+                    combine(reference_graph_context,
+                            { &reference_first, &reference_second, &reference_third, &reference_fourth },
+                            GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows,
+                            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+                auto * candidate_graph =
+                    combine(candidate_graph_context,
+                            { &candidate_first, &candidate_second, &candidate_third, &candidate_fourth },
+                            GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+                            rows == 1 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT :
+                                        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE,
+                            1,
+                            rows == 1 ? GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE :
+                                        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+                auto * reference_context = ggml_cuda_moe_grouped_context_for_test(reference_backend.get());
+                auto * candidate_context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+                CHECK(reference_context != nullptr && candidate_context != nullptr);
+                (void) candidate_certify_graph(*reference_context, reference_graph);
+                (void) candidate_certify_graph(*candidate_context, candidate_graph);
+                const std::array<active_grouped_dispatch_graph *, 4> reference_layers = {
+                    &reference_first, &reference_second, &reference_third, &reference_fourth
+                };
+                const std::array<active_grouped_dispatch_graph *, 4> candidate_layers = {
+                    &candidate_first, &candidate_second, &candidate_third, &candidate_fourth
+                };
+                for (uint32_t pass = 0; pass < 4; ++pass) {
+                    for (uint32_t layer = 0; layer < reference_layers.size(); ++layer) {
+                        auto *             reference = reference_layers[layer];
+                        auto *             candidate = candidate_layers[layer];
+                        std::vector<float> input(ggml_nelements(reference->input));
+                        for (size_t i = 0; i < input.size(); ++i) {
+                            input[i] = (pass % 2 == 0 ? 1.0f : -1.0f) * std::cos(float(i * 3 + 11));
+                        }
+                        ggml_backend_tensor_set(reference->input, input.data(), 0, ggml_nbytes(reference->input));
+                        ggml_backend_tensor_set(candidate->input, input.data(), 0, ggml_nbytes(candidate->input));
+                    }
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference_graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate_graph) == GGML_STATUS_SUCCESS);
+                    ggml_backend_synchronize(reference_backend.get());
+                    ggml_backend_synchronize(candidate_backend.get());
+                    for (uint32_t layer = 0; layer < reference_layers.size(); ++layer) {
+                        auto *             reference = reference_layers[layer];
+                        auto *             candidate = candidate_layers[layer];
+                        std::vector<float> expected(ggml_nelements(reference->output)), actual(expected.size());
+                        ggml_backend_tensor_get(reference->output, expected.data(), 0, ggml_nbytes(reference->output));
+                        ggml_backend_tensor_get(candidate->output, actual.data(), 0, ggml_nbytes(candidate->output));
+                        check_active_grouped_exact_output(expected, actual);
+                    }
+                }
+                uint64_t       calls = 0;
+                const uint64_t bytes =
+                    ggml_cuda_moe_grouped_context_test_access::early_bytes(*candidate_context, &calls);
+                const auto telemetry =
+                    ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*candidate_context);
+                uint32_t candidate_k = pageable ? 1 : 2;
+                if (const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_CANDIDATE_PERCENT")) {
+                    const uint64_t percent = strtoull(value, nullptr, 10);
+                    candidate_k            = std::min<uint32_t>(16, static_cast<uint32_t>((2 * percent + 99) / 100));
+                }
+                const bool expected_prediction = candidate_k <= 16;
+                fprintf(stderr,
+                        "early-grouped-test: transport=%s layout=%u mode=%s rows=%u groups=4 calls=%llu "
+                        "predicted_bytes=%llu "
+                        "exact-demand=1 capture-replay=1\n",
+                        pageable ? "host-prepack" : "mapped-h2d", layout,
+                        rows == 1 ? "decode" :
+                        rows == 2 ? "mtp1" :
+                                    "mtp2",
+                        rows, (unsigned long long) calls, (unsigned long long) bytes);
+                CHECK(expected_prediction ? calls > 0 && bytes > 0 : calls == 0 && bytes == 0);
+                if (pageable && expected_prediction) {
+                    CHECK(telemetry.source_prepack_bytes + telemetry.prefetch_copied_bytes +
+                              telemetry.prefetch_dropped_bytes >
+                          0);
+                } else if (!pageable) {
+                    CHECK(telemetry.prefetch_calls > 0);
+                    CHECK(telemetry.source_device_prefetch_bytes + telemetry.prefetch_copied_bytes +
+                              telemetry.prefetch_dropped_bytes >
+                          0);
+                    mapped_adopted |= telemetry.source_device_prefetch_bytes > 0;
+                }
+            }
+        }
+    }
+    CHECK(mapped_adopted);
     for (uint32_t rows : {1u, 4u}) {
         for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
                 GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_UNGATED}) {

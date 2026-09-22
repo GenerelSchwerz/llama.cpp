@@ -550,8 +550,9 @@ static void test_grouped_decode_type(
             source_groups.push_back({layout, GGML_BACKEND_MOE_CANDIDATE_DOMAIN_V2_ORDINARY, 0, 0});
             for (uint32_t i = 0; i < groups[group_index].n_banks; ++i) {
                 const auto & bank = groups[group_index].banks[i];
-                sources.push_back({bank.tensor, group_index, bank.role,
-                    i < n_banks ? GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE : GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE, 0, 0});
+                const uint32_t status = i < n_banks ? GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_ROUTED_BASE :
+                    GGML_BACKEND_MOE_CANDIDATE_STATUS_V2_OUTPUT_SCALE;
+                sources.push_back({bank.tensor, group_index, bank.role, status, 0, 0});
             }
         }
         const auto source_snapshot = candidate_snapshot_v2(
