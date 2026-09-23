@@ -8429,6 +8429,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_cached_buffer_from_host_ptr;
     }
+    if (strcmp(name, GGML_BACKEND_MOE_CACHE_WRITABLE_LOAD_DATA_PROC_NAME) == 0) {
+        return (void *) ggml_backend_cuda_moe_cached_writable_load_data;
+    }
     if (strcmp(name, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) == 0) {
         return (void *) ggml_backend_cuda_moe_set_debug_mm;
     }

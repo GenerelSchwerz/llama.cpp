@@ -2301,6 +2301,47 @@ void test_moe_cache_proc_api() {
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_CONFIGURE_SOURCES_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME) != nullptr);
+    auto writable_load_data = reinterpret_cast<ggml_backend_moe_cache_writable_load_data_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_WRITABLE_LOAD_DATA_PROC_NAME));
+    CHECK(writable_load_data != nullptr);
+    auto cache_buft = reinterpret_cast<ggml_backend_moe_cache_buffer_type_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_TYPE_PROC_NAME));
+    ggml_backend_buffer_ptr pinned(ggml_backend_buft_alloc_buffer(cache_buft(), 64));
+    CHECK(pinned != nullptr);
+    auto * pinned_data = static_cast<uint8_t *>(ggml_backend_buffer_get_base(pinned.get()));
+    CHECK(writable_load_data(pinned.get(), pinned_data + 8, 16) == pinned_data + 8);
+    CHECK(writable_load_data(pinned.get(), pinned_data + 60, 8) == nullptr);
+    ggml_backend_buffer_ptr cpu(ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), 64));
+    CHECK(cpu != nullptr);
+    CHECK(writable_load_data(cpu.get(), ggml_backend_buffer_get_base(cpu.get()), 64) == nullptr);
+
+    ggml_cuda_moe_cache_fail_full_pinning_for_test(true);
+    ggml_backend_buffer_ptr pageable(ggml_backend_buft_alloc_buffer(cache_buft(), 64));
+    ggml_cuda_moe_cache_fail_full_pinning_for_test(false);
+    CHECK(pageable != nullptr);
+    auto * pageable_data = ggml_backend_buffer_get_base(pageable.get());
+    CHECK(writable_load_data(pageable.get(), pageable_data, 64) ==
+        (getenv("GGML_CUDA_NO_PINNED") == nullptr ? pageable_data : nullptr));
+
+    auto bounded_buft = reinterpret_cast<ggml_backend_moe_cache_bounded_buffer_type_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BOUNDED_BUFFER_TYPE_PROC_NAME));
+    auto free_buft = reinterpret_cast<ggml_backend_moe_cache_free_buffer_type_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_FREE_BUFFER_TYPE_PROC_NAME));
+    auto from_host_ptr = reinterpret_cast<ggml_backend_moe_cache_buffer_from_host_ptr_t>(
+        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_BUFFER_FROM_HOST_PTR_PROC_NAME));
+    auto * bounded = bounded_buft(1024);
+    CHECK(bounded != nullptr);
+    {
+        ggml_backend_buffer_ptr writable(ggml_backend_buft_alloc_buffer(bounded, 64));
+        CHECK(writable != nullptr);
+        auto * writable_data = ggml_backend_buffer_get_base(writable.get());
+        CHECK(writable_load_data(writable.get(), writable_data, 64) == writable_data);
+        alignas(TENSOR_ALIGNMENT) uint8_t mapped_data[64] = {};
+        ggml_backend_buffer_ptr mapped(from_host_ptr(bounded, mapped_data, sizeof(mapped_data)));
+        CHECK(mapped != nullptr);
+        CHECK(writable_load_data(mapped.get(), mapped_data, sizeof(mapped_data)) == nullptr);
+    }
+    free_buft(bounded);
     CHECK(ggml_backend_reg_get_proc_address(reg, "ggml_backend_moe_cache_set_slots") == nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_SET_DEBUG_PROC_NAME) != nullptr);
     CHECK(ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_ENABLED_PROC_NAME) != nullptr);

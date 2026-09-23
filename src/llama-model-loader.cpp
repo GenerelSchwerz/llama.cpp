@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend-moe.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1783,7 +1784,7 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
-    // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
+    // without mmap, some non-host buffers need a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
         std::stable_sort(tensors.begin(), tensors.end(), [](const ggml_tensor * a, const ggml_tensor * b) {
@@ -1909,13 +1910,28 @@ bool llama_model_loader::load_all_data(
                         buffer_idx %= n_buffers;
                     }
                 } else {
-                    // scoped to one tensor so only one staging buffer is alive at a time
-                    std::vector<no_init<uint8_t>> read_buf(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    auto * dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(cur->buffer));
+                    auto * reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+                    auto writable_load_data = reg != nullptr ? reinterpret_cast<ggml_backend_moe_cache_writable_load_data_t>(
+                        ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_WRITABLE_LOAD_DATA_PROC_NAME)) : nullptr;
+                    void * data = writable_load_data != nullptr ? writable_load_data(cur->buffer, cur->data, n_size) : nullptr;
+                    if (data != nullptr) {
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(data, n_size);
+                        if (check_tensors) {
+                            validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
+                                return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                            }));
+                        }
+                    } else {
+                        // scoped to one tensor so only one staging buffer is alive at a time
+                        std::vector<no_init<uint8_t>> read_buf(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
                     }
                 }
             }
