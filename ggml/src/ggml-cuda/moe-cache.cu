@@ -506,6 +506,16 @@ enum moe_grouped_transfer_counter : uint32_t {
     MOE_GROUPED_TRANSFER_COUNTER_COUNT,
 };
 
+enum moe_grouped_transfer_group_counter : uint32_t {
+    MOE_GROUPED_TRANSFER_GROUP_HITS = 0,
+    MOE_GROUPED_TRANSFER_GROUP_MISSES,
+    MOE_GROUPED_TRANSFER_GROUP_BYTES,
+    MOE_GROUPED_TRANSFER_GROUP_COUNTER_COUNT,
+};
+
+static constexpr uint32_t MOE_GROUPED_TRANSFER_TOTAL_COUNTER_COUNT =
+    MOE_GROUPED_TRANSFER_COUNTER_COUNT + GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS * MOE_GROUPED_TRANSFER_GROUP_COUNTER_COUNT;
+
 enum moe_grouped_reset_reason : uint32_t {
     MOE_GROUPED_RESET_GENERATION_REPLACE = 0,
     MOE_GROUPED_RESET_GENERATION_REJECT,
@@ -2973,7 +2983,7 @@ static bool moe_device_size_v1(
     }
 
     if ((query.flags & GGML_BACKEND_MOE_DEVICE_SIZE_FLAG_V1_DEBUG) != 0 &&
-            !add(result.context_fixed_bytes, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t))) {
+            !add(result.context_fixed_bytes, MOE_GROUPED_TRANSFER_TOTAL_COUNTER_COUNT * sizeof(uint64_t))) {
         return false;
     }
     if (query.early_width != 0 || query.early_experts != 0 || query.early_top_k != 0 || query.early_hc_rank != 0) {
@@ -5118,6 +5128,7 @@ static __global__ void moe_grouped_gather_decode(
         uint32_t plan_capacity,
         const moe_grouped_decode_plan * plan,
         uint64_t * transfer_counters,
+        uint32_t group_index,
         uint8_t * occupied_slot,
         uint8_t * invalidated_slot,
         const moe_prepack_control * control = nullptr,
@@ -5141,6 +5152,12 @@ static __global__ void moe_grouped_gather_decode(
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_CACHE_HITS]),
                 static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_CACHE_MISSES]),
+                static_cast<unsigned long long>(plan->n_misses));
+            uint64_t * group_counters = transfer_counters + MOE_GROUPED_TRANSFER_COUNTER_COUNT +
+                group_index * MOE_GROUPED_TRANSFER_GROUP_COUNTER_COUNT;
+            atomicAdd(reinterpret_cast<unsigned long long *>(&group_counters[MOE_GROUPED_TRANSFER_GROUP_HITS]),
+                static_cast<unsigned long long>(plan->n_unique - plan->n_misses));
+            atomicAdd(reinterpret_cast<unsigned long long *>(&group_counters[MOE_GROUPED_TRANSFER_GROUP_MISSES]),
                 static_cast<unsigned long long>(plan->n_misses));
         }
     }
@@ -5198,6 +5215,10 @@ static __global__ void moe_grouped_gather_decode(
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_BANKS]),
                 static_cast<unsigned long long>(selected_misses) * n_banks);
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_BYTES]),
+                static_cast<unsigned long long>(selected_misses) * words_per_miss * sizeof(uint4));
+            uint64_t * group_counters = transfer_counters + MOE_GROUPED_TRANSFER_COUNTER_COUNT +
+                group_index * MOE_GROUPED_TRANSFER_GROUP_COUNTER_COUNT;
+            atomicAdd(reinterpret_cast<unsigned long long *>(&group_counters[MOE_GROUPED_TRANSFER_GROUP_BYTES]),
                 static_cast<unsigned long long>(selected_misses) * words_per_miss * sizeof(uint4));
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_VACANT_FILLS]),
                 static_cast<unsigned long long>(vacant_fills));
@@ -5840,9 +5861,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         if (result == nullptr) {
             moe_grouped_device_scope device_scope(device);
-            if (!moe_grouped_cuda_success(cudaMalloc(&result, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t))) ||
+            if (!moe_grouped_cuda_success(cudaMalloc(&result, MOE_GROUPED_TRANSFER_TOTAL_COUNTER_COUNT * sizeof(uint64_t))) ||
                     !moe_grouped_cuda_success(cudaMemset(
-                        result, 0, MOE_GROUPED_TRANSFER_COUNTER_COUNT * sizeof(uint64_t)))) {
+                        result, 0, MOE_GROUPED_TRANSFER_TOTAL_COUNTER_COUNT * sizeof(uint64_t)))) {
                 if (result != nullptr) {
                     (void) cudaFree(result);
                 }
@@ -5982,9 +6003,9 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
         uint64_t * transfers = stats->device_transfers.load(std::memory_order_acquire);
         if (transfers != nullptr) {
-            uint64_t counters[MOE_GROUPED_TRANSFER_COUNTER_COUNT] = {};
+            std::array<uint64_t, MOE_GROUPED_TRANSFER_TOTAL_COUNTER_COUNT> counters = {};
             moe_grouped_device_scope device_scope(device);
-            if (moe_grouped_cuda_success(cudaMemcpy(counters, transfers, sizeof(counters), cudaMemcpyDeviceToHost))) {
+            if (moe_grouped_cuda_success(cudaMemcpy(counters.data(), transfers, sizeof(counters), cudaMemcpyDeviceToHost))) {
                 result.h2d_banks = counters[MOE_GROUPED_TRANSFER_BANKS];
                 result.h2d_bytes = counters[MOE_GROUPED_TRANSFER_BYTES];
                 result.vacant_fills = counters[MOE_GROUPED_TRANSFER_VACANT_FILLS];
@@ -6016,6 +6037,23 @@ struct ggml_cuda_moe_grouped_context::impl {
                     result.unique_accesses = 0;
                     result.cache_hits = 0;
                     result.cache_misses = 0;
+                } else {
+                    for (uint32_t group_index = 0; group_index < registered && group_index < table.groups.size(); ++group_index) {
+                        const uint64_t * group_counters = counters.data() + MOE_GROUPED_TRANSFER_COUNTER_COUNT +
+                            group_index * MOE_GROUPED_TRANSFER_GROUP_COUNTER_COUNT;
+                        const uint64_t hits = group_counters[MOE_GROUPED_TRANSFER_GROUP_HITS];
+                        const uint64_t misses = group_counters[MOE_GROUPED_TRANSFER_GROUP_MISSES];
+                        const uint64_t bytes = group_counters[MOE_GROUPED_TRANSFER_GROUP_BYTES];
+                        if (hits || misses || bytes) {
+                            const auto & group = table.groups[group_index];
+                            GGML_LOG_INFO(
+                                "moe-grouped-owner-transfer: owner=%p device=%d physical=%d generation=%llu group=%u semantic_group=%u domain=%u tensor=%s hits=%llu misses=%llu h2d_bytes=%llu\n",
+                                (void *) this, device, device >= 0 ? ggml_cuda_info().devices[device].physical_device : -1,
+                                (unsigned long long) state.generation, group_index, group.semantic_group_index, group.domain,
+                                group.down != nullptr ? group.down->name : "-",
+                                (unsigned long long) hits, (unsigned long long) misses, (unsigned long long) bytes);
+                        }
+                    }
                 }
             }
         }
@@ -10581,6 +10619,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                        key.candidate.group_index,
                         device.occupied_slot, device.invalidated_slot,
                         materialization.device_control, miss, tile_capacity);
                 } else {
@@ -10588,6 +10627,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                        key.candidate.group_index,
                         nullptr, nullptr,
                         materialization.device_control, miss, tile_capacity);
                 }
@@ -10599,6 +10639,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                key.candidate.group_index,
                 device.occupied_slot, device.invalidated_slot,
                 nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr, device_prefetch_job != nullptr ? 1 : 0,
                 device_prefetch_job != nullptr ? impl_->early[0]->positions[lane] : nullptr,
@@ -10620,6 +10661,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
+                    key.candidate.group_index,
                     nullptr, nullptr);
             }
         }
@@ -10633,6 +10675,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
+                    key.candidate.group_index,
                     device.occupied_slot, device.invalidated_slot,
                     nullptr, 0, UINT32_MAX, true, 2, impl_->early[0]->positions[lane],
                     impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
