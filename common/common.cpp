@@ -1733,6 +1733,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+    mparams.moe_early_router = params.moe_early_router;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1759,6 +1760,8 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.moe_early_router_max_rows = mparams.load_mtp ?
+            uint32_t(std::max<int64_t>(1, int64_t(params.speculative.draft.n_max) + 1)) : 1;
 
     return mparams;
 }

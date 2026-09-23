@@ -448,6 +448,9 @@ void test_early_grouped_graphs() {
                 constexpr uint32_t n_slots = 6;
                 ggml_backend_ptr   reference_backend(ggml_backend_cuda_init(0));
                 ggml_backend_ptr   candidate_backend(ggml_backend_cuda_init(0));
+                if (rows == 1) {
+                    ggml_backend_cuda_moe_early_router_set_max_rows(candidate_backend.get(), 3);
+                }
                 const auto         build = [&](ggml_backend_t backend) {
                     return build_active_grouped_dispatch_graph_types(
                         backend, pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_buffer_type(),
@@ -497,7 +500,7 @@ void test_early_grouped_graphs() {
                 ggml_context_ptr candidate_graph_context;
                 const auto combine = [&](ggml_context_ptr &                                     graph_context,
                                          const std::array<active_grouped_dispatch_graph *, 4> & parts, uint32_t domain,
-                                         uint32_t row_semantics, uint32_t n_sequences, uint32_t flags) {
+                                         uint32_t row_semantics, uint32_t graph_rows, uint32_t n_sequences, uint32_t flags) {
                     int32_t capacity = 0;
                     for (const auto * part : parts) {
                         capacity += part->graph->n_nodes;
@@ -516,13 +519,13 @@ void test_early_grouped_graphs() {
                         }
                     }
                     candidate_rebuild_graph_uses(graph);
-                    candidate_stamp_execution(graph, domain, row_semantics, rows, n_sequences, 0, flags);
+                    candidate_stamp_execution(graph, domain, row_semantics, graph_rows, n_sequences, 0, flags);
                     return graph;
                 };
                 auto * reference_graph =
                     combine(reference_graph_context,
                             { &reference_first, &reference_second, &reference_third, &reference_fourth },
-                            GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows,
+                            GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows, rows,
                             GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
                 auto * candidate_graph =
                     combine(candidate_graph_context,
@@ -530,7 +533,7 @@ void test_early_grouped_graphs() {
                             GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
                             rows == 1 ? GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT :
                                         GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE,
-                            1,
+                            rows, 1,
                             rows == 1 ? GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE :
                                         GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
                 auto * reference_context = ggml_cuda_moe_grouped_context_for_test(reference_backend.get());
@@ -599,6 +602,74 @@ void test_early_grouped_graphs() {
                               telemetry.prefetch_dropped_bytes >
                           0);
                     mapped_adopted |= telemetry.source_device_prefetch_bytes > 0;
+                }
+                if (rows == 1 && layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE && expected_prediction) {
+                    uint64_t transition_calls_before = 0;
+                    (void) ggml_cuda_moe_grouped_context_test_access::early_bytes(*candidate_context, &transition_calls_before);
+                    const auto build_next = [&](ggml_backend_t backend, const active_grouped_dispatch_graph & shared) {
+                        return build_active_grouped_dispatch_graph_types(
+                            backend, pageable ? pageable_cached_buffer_type() : ggml_backend_cuda_moe_cached_buffer_type(),
+                            { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 }, layout, false, false,
+                            3, 16, 2, 256, &shared, false, false, 0, false, false, 0);
+                    };
+                    auto reference_next_first  = build_next(reference_backend.get(), reference_first);
+                    auto reference_next_second = build_next(reference_backend.get(), reference_second);
+                    auto reference_next_third  = build_next(reference_backend.get(), reference_third);
+                    auto reference_next_fourth = build_next(reference_backend.get(), reference_fourth);
+                    auto candidate_next_first  = build_next(candidate_backend.get(), candidate_first);
+                    auto candidate_next_second = build_next(candidate_backend.get(), candidate_second);
+                    auto candidate_next_third  = build_next(candidate_backend.get(), candidate_third);
+                    auto candidate_next_fourth = build_next(candidate_backend.get(), candidate_fourth);
+                    const std::array<active_grouped_dispatch_graph *, 4> reference_next = {
+                        &reference_next_first, &reference_next_second, &reference_next_third, &reference_next_fourth
+                    };
+                    const std::array<active_grouped_dispatch_graph *, 4> candidate_next = {
+                        &candidate_next_first, &candidate_next_second, &candidate_next_third, &candidate_next_fourth
+                    };
+                    initialize_active_grouped_dispatch_graphs({ &reference_next_first, &reference_next_second,
+                        &reference_next_third, &reference_next_fourth, &candidate_next_first, &candidate_next_second,
+                        &candidate_next_third, &candidate_next_fourth });
+                    ggml_context_ptr reference_next_context;
+                    ggml_context_ptr candidate_next_context;
+                    auto * reference_next_graph = combine(reference_next_context, reference_next,
+                        GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 3, 3,
+                        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_NONE);
+                    auto * candidate_next_graph = combine(candidate_next_context, candidate_next,
+                        GGML_GRAPH_EXECUTION_DOMAIN_MAIN, GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, 3, 1,
+                        GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+                    (void) candidate_certify_graph(*reference_context, reference_next_graph);
+                    (void) candidate_certify_graph(*candidate_context, candidate_next_graph);
+                    for (uint32_t pass = 0; pass < 4; ++pass) {
+                        for (uint32_t layer = 0; layer < reference_next.size(); ++layer) {
+                            std::vector<float> input(ggml_nelements(reference_next[layer]->input));
+                            for (size_t i = 0; i < input.size(); ++i) {
+                                input[i] = std::sin(float(i * 5 + pass * 7 + 3));
+                            }
+                            ggml_backend_tensor_set(reference_next[layer]->input, input.data(), 0, ggml_nbytes(reference_next[layer]->input));
+                            ggml_backend_tensor_set(candidate_next[layer]->input, input.data(), 0, ggml_nbytes(candidate_next[layer]->input));
+                        }
+                        CHECK(ggml_backend_graph_compute(reference_backend.get(), reference_next_graph) == GGML_STATUS_SUCCESS);
+                        CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate_next_graph) == GGML_STATUS_SUCCESS);
+                        ggml_backend_synchronize(reference_backend.get());
+                        ggml_backend_synchronize(candidate_backend.get());
+                        for (uint32_t layer = 0; layer < reference_next.size(); ++layer) {
+                            std::vector<float> expected(ggml_nelements(reference_next[layer]->output)), actual(expected.size());
+                            ggml_backend_tensor_get(reference_next[layer]->output, expected.data(), 0, ggml_nbytes(reference_next[layer]->output));
+                            ggml_backend_tensor_get(candidate_next[layer]->output, actual.data(), 0, ggml_nbytes(candidate_next[layer]->output));
+                            check_active_grouped_exact_output(expected, actual);
+                        }
+                    }
+                    uint64_t next_calls = 0;
+                    (void) ggml_cuda_moe_grouped_context_test_access::early_bytes(*candidate_context, &next_calls);
+                    fprintf(stderr, "early-grouped-test: persistent-count transport=%s before=%llu after=%llu\n",
+                        pageable ? "host-prepack" : "mapped-h2d", (unsigned long long) transition_calls_before, (unsigned long long) next_calls);
+                    CHECK(next_calls > transition_calls_before);
+                    CHECK(ggml_backend_graph_compute(reference_backend.get(), reference_graph) == GGML_STATUS_SUCCESS);
+                    CHECK(ggml_backend_graph_compute(candidate_backend.get(), candidate_graph) == GGML_STATUS_SUCCESS);
+                    ggml_backend_synchronize(reference_backend.get());
+                    ggml_backend_synchronize(candidate_backend.get());
+                    fprintf(stderr, "early-grouped-test: transport=%s persistent rows=1->3->1 calls=%llu exact-demand=1 capture-replay=1\n",
+                        pageable ? "host-prepack" : "mapped-h2d", (unsigned long long) next_calls);
                 }
             }
         }

@@ -838,7 +838,7 @@ struct ggml_cuda_moe_grouped_context_test_access;
 
 class ggml_cuda_moe_grouped_context {
 public:
-    explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device = -1);
+    explicit ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device = -1, uint32_t max_rows = 1);
     ~ggml_cuda_moe_grouped_context();
 
     ggml_cuda_moe_grouped_context(const ggml_cuda_moe_grouped_context &) = delete;
@@ -1133,6 +1133,7 @@ void ggml_cuda_moe_cache_fail_full_pinning_for_test(bool fail);
 void ggml_backend_cuda_moe_set_debug_mm(bool enabled);
 bool ggml_backend_cuda_moe_get_debug_mm(void);
 void ggml_backend_cuda_moe_early_router_set_enabled(bool enabled);
+void ggml_backend_cuda_moe_early_router_set_max_rows(ggml_backend_t backend, uint32_t max_rows);
 void ggml_backend_cuda_moe_log_and_reset_stats(void);
 
 // Set before the first graph submission to this backend.

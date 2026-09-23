@@ -1018,6 +1018,11 @@ llama_context::llama_context(
                 auto moe_candidate_replace_fn = (ggml_backend_moe_candidate_replace_v2_t) ggml_backend_reg_get_proc_address(
                         reg, GGML_BACKEND_MOE_CANDIDATE_REPLACE_V2_PROC_NAME);
                 if (moe_candidate_replace_fn) {
+                    auto set_max_rows = (ggml_backend_moe_early_router_set_max_rows_t) ggml_backend_reg_get_proc_address(
+                            reg, GGML_BACKEND_MOE_EARLY_ROUTER_SET_MAX_ROWS_PROC_NAME);
+                    if (set_max_rows) {
+                        set_max_rows(backend.get(), model.moe_early_router_max_rows());
+                    }
                     moe_candidate_replace_fns.emplace_back(backend.get(), moe_candidate_replace_fn);
                 }
             }
