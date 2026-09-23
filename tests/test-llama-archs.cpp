@@ -24,6 +24,7 @@
 
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -33,6 +34,7 @@
 #include <fstream>
 #include <locale>
 #include <random>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -42,6 +44,13 @@
 #if !defined(_WIN32)
 #    include <sys/wait.h>
 #endif
+
+static bool arch_matches(const std::string & filter, llm_arch arch) {
+    if (filter.empty()) {
+        return true;
+    }
+    return std::regex_search(llm_arch_name(arch), std::regex(filter));
+}
 
 // normalized mean squared error = mse(a, b) / mse(a, 0)
 static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
@@ -60,24 +69,36 @@ static double nmse(const std::vector<float> & a, const std::vector<float> & b) {
     return mse_a_b / mse_a_0;
 }
 
+struct tensor_data_params {
+    size_t seed;
+    float  stdev;
+};
+
 static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
-    size_t seed = *(const size_t *) userdata;
+    const tensor_data_params & params = *(const tensor_data_params *) userdata;
+    size_t seed = params.seed;
     std::hash<std::string> hasher;
     seed ^= hasher(tensor->name);
     std::mt19937 gen(seed);
-    std::normal_distribution<float> dis(0.0f, 1.0e-2f);
+    std::normal_distribution<float> dis(0.0f, params.stdev);
 
+    // TODO: refactor per-tensor initialization logic in a cleaner way
+
+    // note: Mamba A must be negative (state decay)
+    const bool is_ssm_a = strstr(tensor->name, "ssm_a") != nullptr;
     const int64_t ne = ggml_nelements(tensor);
     if (tensor->type == GGML_TYPE_F32) {
         std::vector<float> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = dis(gen);
+            float val = dis(gen);
+            tmp[i] = is_ssm_a ? -fabsf(val) : val;
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else if (tensor->type == GGML_TYPE_F16) {
         std::vector<ggml_fp16_t> tmp(ne);
         for (int64_t i = 0; i < ne; i++) {
-            tmp[i] = ggml_fp32_to_fp16(dis(gen));
+            float val = dis(gen);
+            tmp[i] = ggml_fp32_to_fp16(is_ssm_a ? -fabsf(val) : val);
         }
         ggml_backend_tensor_set(tensor, tmp.data(), 0, ggml_nbytes(tensor));
     } else {
@@ -86,11 +107,26 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf(
-        "Usage: %s [-a/--arch arch] [-s/--seed seed] [-o/--out dir] [-v N] [-h/--help] [--test-phase-workspace] "
-        "[--test-live-context-workspace] [--test-speculative-limits] [--test-moe-cache-selector] "
-        "[--test-moe-placement] [--test-moe-joint-measurement]\n",
-        argv[0]);
+    LOG("Usage: %s [options]\n\n", argv[0]);
+    LOG("Options:\n");
+    LOG("  -a, --arch <arch|regex>  Run only matching LLM architectures (default: all supported)\n");
+    LOG("  -s, --seed <seed>        Set the random seed for tensor initialization and token generation\n");
+    LOG("  -d, --stdev <stdev>      Set the standard deviation of the tensor initialization distribution (default: 0.1f)\n");
+    LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
+    LOG("  -v <N>                   Set log verbosity level\n");
+    LOG("  --test-phase-workspace   Run phase-aware workspace checks\n");
+    LOG("  --test-live-context-workspace Run live-context workspace checks\n");
+    LOG("  --test-speculative-limits Run speculative limit checks\n");
+    LOG("  --test-moe-cache-selector Run MoE cache selector checks\n");
+    LOG("  --test-moe-placement    Run MoE placement checks\n");
+    LOG("  --test-moe-joint-measurement Run MoE joint measurement checks\n");
+    LOG("  --fit-tool <path>        Fit tool for joint measurement checks\n");
+    LOG("  -h, --help               Show this help message\n\n");
+    LOG("Examples:\n");
+    LOG("  %s\n", argv[0]);
+    LOG("  %s -a qwen35moe\n", argv[0]);
+    LOG("  %s -a deepseek4 -o tests/test-models/\n", argv[0]);
+    LOG("  %s -a cohere2moe -v 5\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -278,8 +314,12 @@ static gguf_context_ptr get_gguf_ctx(
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,        n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,      n_embd_head);
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
-        // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
-        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back((il + 1) % 5 != 0);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else if (arch == LLM_ARCH_COHERE2MOE || arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_SPARK2_5 ||
             arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_GRANITE_SWA || arch == LLM_ARCH_DOTS3NOTE ||
             arch == LLM_ARCH_MAPLE) {
@@ -332,7 +372,11 @@ static gguf_context_ptr get_gguf_ctx(
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
 
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+    // note: using a realistic top-k here makes the results unstable and hard to match between CPU and GPU
+    //       a large value makes things deterministic since all data is selected by the indexer
+    //ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
+
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
@@ -354,13 +398,13 @@ static gguf_context_ptr get_gguf_ctx(
     }
 
     if (arch == LLM_ARCH_DEEPSEEK4) {
-        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         uint32_t(8));
-        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           uint32_t(32));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,            std::vector<uint32_t>({0, 0, 4, 128}));
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,    160000.0f);
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,               uint32_t(4));
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,             1.0e-6f);
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,             std::vector<uint32_t>({0, 0, 4, 128}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,     160000.0f);
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,  uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,              1.0e-6f);
         ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
@@ -421,19 +465,19 @@ static gguf_context_ptr get_gguf_ctx(
     ms.add_kv(LLM_KV_SSM_TIME_STEP_RANK,        n_head);
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
-    ms.add_kv(LLM_KV_KDA_SAFE_GATE,              true);
-    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,       -5.0f);
+    ms.add_kv(LLM_KV_KDA_SAFE_GATE,             true);
+    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);
     if (arch == LLM_ARCH_BAILINGMOE3) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
     }
-    ms.add_kv(LLM_KV_WKV_HEAD_SIZE,             n_embd/n_head);
-    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,         uint32_t(3));
-    ms.add_kv(LLM_KV_RESIDUAL_SCALE,            3.5565588200778455f);
-    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,       uint32_t(12));
-    ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,      4.0f);
+    ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
+    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
+    ms.add_kv(LLM_KV_RESIDUAL_SCALE,              3.5565588200778455f);
+    ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(12));
+    ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
     ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
-    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,      -5.0f);
+    ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
 
     for (uint32_t il = 0; il < n_layer; il++) {
         ggml_tensor t;
@@ -456,7 +500,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 }
 
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
-        struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const std::vector<ggml_backend_dev_t> & devs,
+        struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
+        const std::vector<ggml_backend_dev_t> & devs,
         const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
@@ -474,9 +519,9 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         ctx_params.n_ubatch = 64;
     }
 
-    size_t tmp = seed;
+    tensor_data_params tensor_params = { seed, stdev };
     llama_model_ptr model(gguf_ctx != nullptr ?
-        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tmp, model_params) :
+        llama_model_init_from_user(gguf_ctx, set_tensor_data, &tensor_params, model_params) :
         llama_model_load_from_file_ptr(file, model_params));
     if (!model) {
         throw std::runtime_error("failed to create llama model");
@@ -552,15 +597,15 @@ static llama_context_ptr make_phase_workspace_context(
         llama_model * model, llama_context_type type, llama_context * other = nullptr, uint32_t n_seq_max = 1,
         ggml_backend_sched_eval_callback cb_eval = nullptr, void * cb_eval_user_data = nullptr);
 
-static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed, bool moe = false) {
+static llama_model_ptr make_live_context_workspace_model(llm_arch arch, size_t seed, float stdev, bool moe = false) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
     ggml_backend_dev_t devices[] = { nullptr };
     model_params.devices = devices;
 
-    size_t tensor_seed = seed;
-    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     GGML_ASSERT(model);
     return model;
 }
@@ -579,8 +624,8 @@ static llama_context_params make_live_context_workspace_params() {
     return ctx_params;
 }
 
-static void test_live_context_workspace_reserve(size_t seed) {
-    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_LLAMA, seed);
+static void test_live_context_workspace_reserve(size_t seed, float stdev) {
+    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_LLAMA, seed, stdev);
     llama_context_params ctx_params = make_live_context_workspace_params();
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
@@ -669,8 +714,8 @@ static void test_live_context_workspace_reserve(size_t seed) {
     GGML_ASSERT(llama_trim_transient_memory(ctx.get()) == 0);
 }
 
-static void test_live_context_workspace_iswa_reserve(size_t seed) {
-    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_GEMMA4, seed);
+static void test_live_context_workspace_iswa_reserve(size_t seed, float stdev) {
+    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_GEMMA4, seed, stdev);
     llama_context_params ctx_params = make_live_context_workspace_params();
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
@@ -710,8 +755,8 @@ static void test_live_context_workspace_iswa_reserve(size_t seed) {
     GGML_ASSERT(contraction.n_kv == 256);
 }
 
-static void test_live_context_workspace_indexer_reserve(size_t seed) {
-    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_QWEN4EXP, seed, true);
+static void test_live_context_workspace_indexer_reserve(size_t seed, float stdev) {
+    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_QWEN4EXP, seed, stdev, true);
     llama_context_params ctx_params = make_live_context_workspace_params();
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
@@ -737,8 +782,8 @@ static void test_live_context_workspace_indexer_reserve(size_t seed) {
     assert_reserve(512);
 }
 
-static void test_live_context_workspace_unsupported(size_t seed) {
-    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_MAMBA, seed);
+static void test_live_context_workspace_unsupported(size_t seed, float stdev) {
+    llama_model_ptr model = make_live_context_workspace_model(LLM_ARCH_MAMBA, seed, stdev);
     llama_context_params ctx_params = make_live_context_workspace_params();
 
     llama_context_ptr ctx(llama_init_from_model(model.get(), ctx_params));
@@ -746,7 +791,7 @@ static void test_live_context_workspace_unsupported(size_t seed) {
     GGML_ASSERT(!ctx->get_cparams().live_context_workspace);
 }
 
-static void test_phase_workspace_runtime_reserve(size_t seed) {
+static void test_phase_workspace_runtime_reserve(size_t seed, float stdev) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false);
 
     llama_model_params model_params = llama_model_default_params();
@@ -754,8 +799,8 @@ static void test_phase_workspace_runtime_reserve(size_t seed) {
     ggml_backend_dev_t devices[] = { nullptr };
     model_params.devices = devices;
 
-    size_t tensor_seed = seed;
-    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     GGML_ASSERT(model);
 
     phase_workspace_fail_alloc = false;
@@ -843,7 +888,7 @@ static void test_phase_workspace_runtime_reserve(size_t seed) {
     phase_workspace_alloc_buffer = nullptr;
 }
 
-static void test_phase_workspace_late_pipeline_fallback(size_t seed) {
+static void test_phase_workspace_late_pipeline_fallback(size_t seed, float stdev) {
     std::vector<ggml_backend_dev_t> devices;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -868,8 +913,8 @@ static void test_phase_workspace_late_pipeline_fallback(size_t seed) {
     ggml_backend_dev_t model_devices[] = { devices[0], devices[1], nullptr };
     model_params.devices = model_devices;
 
-    size_t tensor_seed = seed;
-    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     GGML_ASSERT(model);
 
     llama_context_ptr ctx = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
@@ -945,7 +990,7 @@ static llama_context_ptr make_phase_workspace_context(
     return llama_context_ptr(llama_init_from_model(model, params));
 }
 
-static void test_speculative_limits(size_t seed) {
+static void test_speculative_limits(size_t seed, float stdev) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
 
     llama_model_params model_params = llama_model_default_params();
@@ -954,8 +999,8 @@ static void test_speculative_limits(size_t seed) {
     ggml_backend_dev_t devices[] = { nullptr };
     model_params.devices = devices;
 
-    size_t tensor_seed = seed;
-    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     GGML_ASSERT(model);
 
     const uint32_t n_seq = 2;
@@ -1239,7 +1284,7 @@ static void test_speculative_limits(size_t seed) {
     }
 }
 
-static void test_phase_workspace_mtp_lifecycle(size_t seed) {
+static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN35, false, true);
 
     llama_model_params model_params = llama_model_default_params();
@@ -1248,8 +1293,8 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed) {
     ggml_backend_dev_t devices[] = { nullptr };
     model_params.devices = devices;
 
-    size_t tensor_seed = seed;
-    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_seed, model_params));
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tensor_params, model_params));
     GGML_ASSERT(model);
 
     llama_context_ptr target = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
@@ -1390,7 +1435,7 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed) {
     draft.reset();
 }
 
-static void test_phase_workspace_mismatched_placement(size_t seed) {
+static void test_phase_workspace_mismatched_placement(size_t seed, float stdev) {
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -1418,12 +1463,12 @@ static void test_phase_workspace_mismatched_placement(size_t seed) {
     ggml_backend_dev_t draft_devices[] = { nullptr };
     draft_params.devices = draft_devices;
 
-    size_t target_seed = seed;
-    size_t draft_seed = seed;
+    tensor_data_params target_data = { seed, stdev };
+    tensor_data_params draft_data = { seed, stdev };
     llama_model_ptr target_model(llama_model_init_from_user(
-            gguf_ctx.get(), set_tensor_data, &target_seed, target_params));
+            gguf_ctx.get(), set_tensor_data, &target_data, target_params));
     llama_model_ptr draft_model(llama_model_init_from_user(
-            gguf_ctx.get(), set_tensor_data, &draft_seed, draft_params));
+            gguf_ctx.get(), set_tensor_data, &draft_data, draft_params));
     GGML_ASSERT(target_model && draft_model);
 
     llama_context_ptr target = make_phase_workspace_context(target_model.get(), LLAMA_CONTEXT_TYPE_DEFAULT);
@@ -1676,7 +1721,7 @@ static bool arch_supported(const llm_arch arch) {
     return true;
 }
 
-static int test_moe_cache_selector_precedence(const size_t seed) {
+static int test_moe_cache_selector_precedence(const size_t seed, const float stdev) {
     ggml_backend_dev_t         cache_dev  = nullptr;
     ggml_backend_buffer_type_t cache_buft = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -1726,8 +1771,8 @@ static int test_moe_cache_selector_precedence(const size_t seed) {
         return params;
     };
     auto load = [&](gguf_context * metadata, llama_model_params params) {
-        size_t tensor_seed = seed;
-        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_seed, params));
+        tensor_data_params tensor_params = { seed, stdev };
+        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_params, params));
     };
     const auto is_cached = [&](const ggml_tensor * tensor) {
         return tensor != nullptr && tensor->buffer != nullptr &&
@@ -2071,7 +2116,7 @@ static int test_moe_cache_selector_precedence(const size_t seed) {
     return ok ? 0 : 1;
 }
 
-static int test_moe_placement_report(const size_t seed) {
+static int test_moe_placement_report(const size_t seed, const float stdev) {
     ggml_backend_dev_t cache_dev = nullptr;
     std::vector<ggml_backend_dev_t> cache_devs;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -2129,7 +2174,8 @@ static int test_moe_placement_report(const size_t seed) {
         return params;
     };
     const auto load = [&](gguf_context * metadata, llama_model_params params, size_t tensor_seed) {
-        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_seed, params));
+        tensor_data_params tensor_params = { tensor_seed, stdev };
+        return llama_model_ptr(llama_model_init_from_user(metadata, set_tensor_data, &tensor_params, params));
     };
     const auto group_at = [&](const llama_moe_placement_report & report, int32_t layer) {
         return std::find_if(report.groups.begin(), report.groups.end(), [&](const auto & group) {
@@ -3031,7 +3077,7 @@ static llama_sampler_i joint_probe_sampler_i = {
     /* .copy_state        = */ nullptr,
 };
 
-static int test_moe_joint_measurement(const size_t seed, const std::string & fit_tool) {
+static int test_moe_joint_measurement(const size_t seed, const float stdev, const std::string & fit_tool) {
     bool       ok    = true;
     const auto check = [&](bool condition, const char * message) {
         if (!condition) {
@@ -3052,14 +3098,14 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
     load_params.progress_callback    = silent_model_load_progress;
 
     auto            target_metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true);
-    size_t          target_seed     = seed;
+    tensor_data_params target_data = { seed, stdev };
     llama_model_ptr target(
-        llama_model_init_from_user(target_metadata.get(), set_tensor_data, &target_seed, load_params));
+        llama_model_init_from_user(target_metadata.get(), set_tensor_data, &target_data, load_params));
     auto mtp_metadata        = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true);
     auto mtp_params          = load_params;
     mtp_params.load_mtp      = true;
-    size_t          mtp_seed = seed;
-    llama_model_ptr mtp(llama_model_init_from_user(mtp_metadata.get(), set_tensor_data, &mtp_seed, mtp_params));
+    tensor_data_params mtp_data = { seed, stdev };
+    llama_model_ptr mtp(llama_model_init_from_user(mtp_metadata.get(), set_tensor_data, &mtp_data, mtp_params));
     check(target != nullptr && mtp != nullptr, "failed to build source fixtures");
 
     const auto save_fixture = [&](const std::filesystem::path & path, gguf_context * metadata, llama_model * model,
@@ -3543,7 +3589,7 @@ static int test_moe_joint_measurement(const size_t seed, const std::string & fit
     return ok ? 0 : 1;
 }
 
-static int save_models(const llm_arch target_arch, const size_t seed, const int verbosity, const std::string & dir) {
+static int save_models(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const std::string & dir) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -3571,7 +3617,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
         }
-        if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+        if (!arch_matches(arch_filter, arch)) {
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -3592,7 +3638,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
                 continue;
             }
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
-            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {});
+            auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
             const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
@@ -3614,7 +3660,7 @@ static int save_models(const llm_arch target_arch, const size_t seed, const int 
     return ok ? 0 : 1;
 }
 
-static int test_backends(const llm_arch target_arch, const size_t seed, const int verbosity) {
+static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -3679,22 +3725,24 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
     const std::string template_row_res = "%15s %10s|%20s|%20s|\n";
 
     bool all_ok = true;
+    size_t n_tests = 0;
+    size_t n_failed = 0;
     common_log_flush(common_log_main());
-    printf(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Parallel");
-    printf("|");
+    LOG(template_header.c_str(), "Model arch.", "Device", "Config", "NMSE vs. CPU", "Roundtrip", "Parallel");
+    LOG("|");
     for (size_t i = 0; i < max_arch_name_length; i++) {
-        printf("-");
+        LOG("-");
     }
-    printf("|");
+    LOG("|");
     for (size_t i = 0; i < max_device_label_length; i++) {
-        printf("-");
+        LOG("-");
     }
-    printf("|------|---------------|---------|---------|\n");
+    LOG("|------|---------------|---------|---------|\n");
     for (const llm_arch & arch : llm_arch_all()) {
         if (arch == LLM_ARCH_UNKNOWN) {
             continue;
         }
-        if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
+        if (!arch_matches(arch_filter, arch)) {
             continue;
         }
         if (arch == LLM_ARCH_GEMMA4 || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -3721,8 +3769,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
             std::vector<float> logits_cpu;
             for (device_config & dc : dev_configs) {
                 // print test config first; should anything fail during model loading or inference, at least we know which test case caused it
-                printf(template_row_cfg.c_str(),
-                    llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
+                LOG(template_row_cfg.c_str(), llm_arch_name(arch), dc.label.c_str(), config_name.c_str());
                 fflush(stdout);
 
                 std::pair<llama_model_ptr, llama_context_ptr> model_and_ctx_dev;
@@ -3733,19 +3780,22 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                 char nmse_str[12] = {0};
 
                 bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
+                bool test_executed = false;
+                bool test_ok = true;
                 if (!skip) {
                     if (logits_cpu.empty()) {
-                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, {}, LLAMA_SPLIT_MODE_LAYER, encode);
+                        model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llm_arch_supports_sm_tensor(arch)) {
-                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.devs, dc.split_mode, encode);
+                        test_executed = true;
+                        model_and_ctx_dev = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, dc.devs, dc.split_mode, encode);
                         logits_dev = get_logits(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens, encode);
                         const double nmse_val = nmse(logits_cpu, logits_dev);
                         snprintf(nmse_str, sizeof(nmse_str), "(%.2e)", nmse_val);
                         status_nmse = "\033[1;32mOK\033[0m";
                         if (nmse_val > 1e-4) {
-                            all_ok = false;
+                            test_ok = false;
                             status_nmse = "\033[1;31mFAIL\033[0m";
                         }
 
@@ -3753,7 +3803,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         if (arch != LLM_ARCH_T5) {
                             status_parallel = "\033[1;32mOK\033[0m";
                             if (!test_parallel_seqs(model_and_ctx_dev.first.get(), tokens, logits_dev, encode)) {
-                                all_ok = false;
+                                test_ok = false;
                                 status_parallel = "\033[1;31mFAIL\033[0m";
                             }
                         }
@@ -3763,6 +3813,7 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
                     if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                        test_executed = true;
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());
                         ms.add_kv_from_model();
@@ -3770,14 +3821,14 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                         ms.save(file);
                         rewind(file);
 
-                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, dc.devs, dc.split_mode, encode);
+                        auto model_and_ctx_roundtrip = get_model_and_ctx(nullptr, file, seed, stdev, dc.devs, dc.split_mode, encode);
                         const std::vector<float> logits_roundtrip = get_logits(
                             model_and_ctx_roundtrip.first.get(), model_and_ctx_roundtrip.second.get(), tokens, encode);
                         status_roundtrip = "\033[1;32mOK\033[0m";
                         GGML_ASSERT(logits_roundtrip.size() == logits_dev.size());
                         for (size_t i = 0; i < logits_roundtrip.size(); i++) {
                             if (logits_roundtrip[i] != logits_dev[i]) {
-                                all_ok = false;
+                                test_ok = false;
                                 status_roundtrip = "\033[1;31mFAIL\033[0m";
                                 break;
                             }
@@ -3785,12 +3836,29 @@ static int test_backends(const llm_arch target_arch, const size_t seed, const in
                     }
                 }
 
+                if (test_executed) {
+                    n_tests++;
+                    if (!test_ok) {
+                        n_failed++;
+                        all_ok = false;
+                    }
+                }
+
                 // log the results for this test case
-                printf(template_row_res.c_str(),
+                LOG(template_row_res.c_str(),
                     status_nmse.c_str(), nmse_str, status_roundtrip.c_str(), status_parallel.c_str());
             }
         }
     }
+
+    if (n_tests == 0) {
+        LOG("Summary: no tests executed\n");
+    } else if (n_failed == 0) {
+        LOG("Summary: all %zu test(s) passed\n", n_tests);
+    } else {
+        LOG("Summary: %zu test(s) executed, %zu failed\n", n_tests, n_failed);
+    }
+
     llama_log_set(ud.log_old.callback, ud.log_old.user_data);
     return all_ok ? 0 : 1;
 }
@@ -3802,8 +3870,9 @@ int main(int argc, char ** argv) {
 
     std::random_device rd;
 
-    llm_arch arch = LLM_ARCH_UNKNOWN;
+    std::string arch_filter;
     size_t seed = rd();
+    float stdev = 0.1f;
     std::string out;
     bool test_phase_workspace = false;
     bool test_live_context_workspace = false;
@@ -3819,111 +3888,115 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv);
             return 0;
-        }
-        if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
+        } else if (strcmp(argv[i], "--test-phase-workspace") == 0) {
+            test_phase_workspace = true;
+        } else if (strcmp(argv[i], "--test-live-context-workspace") == 0) {
+            test_live_context_workspace = true;
+        } else if (strcmp(argv[i], "--test-speculative-limits") == 0) {
+            run_speculative_limits = true;
+        } else if (strcmp(argv[i], "--test-moe-cache-selector") == 0) {
+            run_moe_cache_selector = true;
+        } else if (strcmp(argv[i], "--test-moe-placement") == 0) {
+            run_moe_placement = true;
+        } else if (strcmp(argv[i], "--test-moe-joint-measurement") == 0) {
+            run_moe_joint_measurement = true;
+        } else if (strcmp(argv[i], "--fit-tool") == 0 && i + 1 < argc) {
+            fit_tool = argv[++i];
+        } else if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
             if (i + 1 < argc) {
                 const std::string arch_name = argv[++i];
-                arch = llm_arch_from_string(arch_name);
-                if (arch == LLM_ARCH_UNKNOWN) {
-                    LOG_ERR("%s: unkown LLM architecture: %s\n", __func__, arch_name.c_str());
-                    return 1;
+                if (llm_arch_from_string(arch_name) != LLM_ARCH_UNKNOWN) {
+                    // exact architecture name
+                    arch_filter = "^" + arch_name + "$";
+                } else {
+                    try {
+                        std::regex re(arch_name);
+                        arch_filter = arch_name;
+                    } catch (const std::regex_error & err) {
+                        LOG_ERR("%s: invalid architecture regex: %s (%s)\n", __func__, arch_name.c_str(), err.what());
+                        return 1;
+                    }
                 }
             } else {
                 usage(argv);
                 return 1;
             }
-        }
-        if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--seed") == 0) {
             if (i + 1 < argc) {
                 seed = std::stoull(argv[++i]);
             } else {
                 usage(argv);
                 return 1;
             }
-        }
-        if (strcmp(argv[i], "-v") == 0) {
+        } else if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--stdev") == 0) {
+            if (i + 1 < argc) {
+                stdev = std::stof(argv[++i]);
+            } else {
+                usage(argv);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-v") == 0) {
             if (i + 1 < argc) {
                 verbosity = std::stoull(argv[++i]);
             } else {
                 usage(argv);
                 return 1;
             }
-        }
-        if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
+        } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--out") == 0) {
             if (i + 1 < argc) {
                 out = argv[++i];
             } else {
                 usage(argv);
                 return 1;
             }
-        }
-        if (strcmp(argv[i], "--test-phase-workspace") == 0) {
-            test_phase_workspace = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--test-live-context-workspace") == 0) {
-            test_live_context_workspace = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--test-speculative-limits") == 0) {
-            run_speculative_limits = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--test-moe-cache-selector") == 0) {
-            run_moe_cache_selector = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--test-moe-placement") == 0) {
-            run_moe_placement = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--test-moe-joint-measurement") == 0) {
-            run_moe_joint_measurement = true;
-            continue;
-        }
-        if (strcmp(argv[i], "--fit-tool") == 0 && i + 1 < argc) {
-            fit_tool = argv[++i];
-            continue;
+        } else {
+            LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
+            usage(argv);
+            return 1;
         }
     }
     if (test_phase_workspace || test_live_context_workspace || run_speculative_limits || run_moe_cache_selector ||
         run_moe_placement || run_moe_joint_measurement) {
         common_log_set_verbosity_thold(verbosity);
     }
-    printf("%s: using seed %zu\n", __func__, seed);
+    if (stdev <= 0.0f) {
+        LOG_ERR("%s: stdev must be > 0\n", __func__);
+        return 1;
+    }
+    LOG_INF("%s: using seed %zu, stdev %f\n", __func__, seed, stdev);
 
     try {
         if (test_phase_workspace) {
-            test_phase_workspace_runtime_reserve(seed);
-            test_phase_workspace_mtp_lifecycle(seed);
-            test_phase_workspace_mismatched_placement(seed);
-            test_phase_workspace_late_pipeline_fallback(seed);
+            test_phase_workspace_runtime_reserve(seed, stdev);
+            test_phase_workspace_mtp_lifecycle(seed, stdev);
+            test_phase_workspace_mismatched_placement(seed, stdev);
+            test_phase_workspace_late_pipeline_fallback(seed, stdev);
             return 0;
         }
         if (test_live_context_workspace) {
-            test_live_context_workspace_reserve(seed);
-            test_live_context_workspace_iswa_reserve(seed);
-            test_live_context_workspace_indexer_reserve(seed);
-            test_live_context_workspace_unsupported(seed);
+            test_live_context_workspace_reserve(seed, stdev);
+            test_live_context_workspace_iswa_reserve(seed, stdev);
+            test_live_context_workspace_indexer_reserve(seed, stdev);
+            test_live_context_workspace_unsupported(seed, stdev);
             return 0;
         }
         if (run_speculative_limits) {
-            test_speculative_limits(seed);
+            test_speculative_limits(seed, stdev);
             return 0;
         }
         if (run_moe_cache_selector) {
-            return test_moe_cache_selector_precedence(seed);
+            return test_moe_cache_selector_precedence(seed, stdev);
         }
         if (run_moe_placement) {
-            return test_moe_placement_report(seed);
+            return test_moe_placement_report(seed, stdev);
         }
         if (run_moe_joint_measurement) {
-            return test_moe_joint_measurement(seed, fit_tool);
+            return test_moe_joint_measurement(seed, stdev, fit_tool);
         }
         if (!out.empty()) {
-            return save_models(arch, seed, verbosity, out);
+            return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch, seed, verbosity);
+        return test_backends(arch_filter, seed, stdev, verbosity);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

@@ -1466,7 +1466,6 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
                 GGML_ASSERT(x->type       == GGML_TYPE_F32);
                 GGML_ASSERT(weights->type == GGML_TYPE_F32);
                 GGML_ASSERT(op->type      == GGML_TYPE_F32);
-                GGML_ASSERT(x->ne[1] == 4);
 
                 ggml_metal_kargs_dsv4_hc_pre args = {
                     /*.n_embd   =*/ (int32_t) x->ne[0],
@@ -2720,9 +2719,12 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_amax = bid_ids;
         bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
 
+        // src1 prec [TAG_GGML_PREC]
+        const bool use_amax = ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+
         // src1 rescale factors, computed before the matmul
         // ref: https://github.com/ggml-org/llama.cpp/pull/26223
-        {
+        if (use_amax) {
             ggml_metal_kargs_mul_mm_id_amax args = {
                 /*.ne00 =*/ ne10,
                 /*.ne01 =*/ ne11,
@@ -2780,17 +2782,17 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_op_concurrency_reset(ctx);
 
-        {
+        if (use_amax) {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id_amax(lib);
 
             ggml_metal_encoder_set_pipeline(enc, pipeline);
             ggml_metal_encoder_set_buffer  (enc, bid_amax, 0);
 
             ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 32, 1, 1);
-        }
 
-        // the next kernel has to wait for the amax data
-        ggml_metal_op_concurrency_reset(ctx);
+            // the next kernel has to wait for the amax data
+            ggml_metal_op_concurrency_reset(ctx);
+        }
 
         {
             auto pipeline = ggml_metal_library_get_pipeline_mul_mm_id(lib, op);
@@ -3582,7 +3584,6 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         auto cfg = use_sparse
                 ? ggml_metal_tuning::fa_vec_baseline_cfg((int) ne00, (int) ne20)
                 : ggml_metal_tuning::fa_vec_pick(
-                          props_dev->device_id,
                           props_dev->gpu_family,
                           (int) op->src[1]->type,
                           (int) ne00, (int) ne20,   // dk, dv (ne00 == dk for FA)
