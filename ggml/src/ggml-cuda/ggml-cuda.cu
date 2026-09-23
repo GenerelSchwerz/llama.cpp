@@ -739,6 +739,10 @@ static uint64_t ggml_backend_cuda_trim_transient_pools(ggml_backend_t backend) {
         }
     }
 
+    // Cached graphs may reference pool mappings released by trim().
+    ggml_cuda_set_device(cuda_ctx->device);
+    cuda_ctx->cuda_graphs.clear();
+
     uint64_t released = 0;
     for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
         for (int stream = 0; stream < GGML_CUDA_MAX_STREAMS; ++stream) {
