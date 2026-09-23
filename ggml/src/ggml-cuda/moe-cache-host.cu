@@ -591,6 +591,17 @@ bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_sourc
         }
         bytes += range.end - range.begin;
     }
+    for (const auto * source : sources) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(source->data);
+        const uintptr_t end = begin + source->size;
+        const auto contains = [begin, end](const moe_host_range & range) {
+            return range.begin <= begin && end <= range.end;
+        };
+        if (std::none_of(owner.registered.begin(), owner.registered.end(), contains) &&
+                std::none_of(ranges.begin(), ranges.end(), contains)) {
+            return decline("source_spans_registrations");
+        }
+    }
     if (bytes > owner.limit - owner.staging_reserved - owner.source_bytes) {
         return decline("source_budget_exhausted");
     }

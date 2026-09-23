@@ -467,9 +467,12 @@ static void test_grouped_decode_type(
         bool mixed = false) {
     grouped_decode_fixture fixture(device, pinned, grouped_decode_fixture::SOURCE_BYTES, grouped_decode_fixture::N_EXPERTS, host_budget);
     ggml_tensor * registration_prefix = nullptr;
-#ifdef __linux__
     if (pinned && host_budget == 65536) {
+#ifdef __linux__
         const long page = sysconf(_SC_PAGESIZE);
+#else
+        const size_t page = 4096;
+#endif
         CHECK(page > 128);
         const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(fixture.source_buffer));
         fixture.source_offset = 2 * static_cast<size_t>(page) - base % page - 128;
@@ -477,7 +480,6 @@ static void test_grouped_decode_type(
         ggml_set_name(registration_prefix, "test.registration_prefix");
         fixture.source_offset += 64 - ggml_nbytes(registration_prefix);
     }
-#endif
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
     std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
@@ -566,11 +568,12 @@ static void test_grouped_decode_type(
 #endif
         for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
             const bool budget_admits = mixed ? group_index == 0 : host_budget >= 49152;
-            const bool direct = budget_admits && (pinned || read_only_supported);
+            const bool direct = budget_admits && (pinned || read_only_supported) && registration_prefix == nullptr;
             for (uint32_t bank = 0; bank < n_banks; ++bank) {
                 cudaPointerAttributes attributes = {};
                 CUDA_OK(cudaPointerGetAttributes(&attributes, groups[group_index].banks[bank].tensor->data));
-                CHECK(attributes.type == (direct ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
+                const bool prefix_registered = registration_prefix != nullptr && group_index == 0 && bank == 0;
+                CHECK(attributes.type == (direct || prefix_registered ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
             }
         }
     }
