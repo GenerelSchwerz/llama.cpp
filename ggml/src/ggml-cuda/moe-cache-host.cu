@@ -334,7 +334,8 @@ static void ggml_backend_cuda_moe_cached_buffer_free_buffer(ggml_backend_buffer_
 #if defined(__linux__) && !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 static ggml_backend_buffer_t ggml_cuda_moe_cached_registered_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count != 1) {
+    int current_device = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1 || cudaGetDevice(&current_device) != cudaSuccess) {
         (void) cudaGetLastError();
         return nullptr;
     }
@@ -346,9 +347,16 @@ static ggml_backend_buffer_t ggml_cuda_moe_cached_registered_buffer(ggml_backend
     cudaError_t err = cudaHostRegister(base, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
     if (err == cudaSuccess) {
         static_cast<moe_host_buffer *>(buffer->context)->registered_base = base;
-        void * alias = nullptr;
-        err = cudaHostGetDevicePointer(&alias, base, 0);
-        if (err == cudaSuccess && alias == base) {
+        bool mapped = true;
+        for (int device = 0; device < device_count; ++device) {
+            void * alias = nullptr;
+            if (cudaSetDevice(device) != cudaSuccess || cudaHostGetDevicePointer(&alias, base, 0) != cudaSuccess || alias != base) {
+                mapped = false;
+                break;
+            }
+        }
+        err = cudaSetDevice(current_device);
+        if (mapped && err == cudaSuccess) {
             return buffer;
         }
     }
