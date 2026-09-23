@@ -2319,6 +2319,20 @@ static int test_moe_placement_report(const size_t seed) {
         }
     }
     {
+        gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN3MOE, true);
+        auto enabled_params = make_params(both_layers, 1, nullptr);
+        enabled_params.moe_early_router = true;
+        enabled_params.moe_early_router_max_rows = 3;
+        auto enabled = load(metadata.get(), enabled_params, seed);
+        check(enabled != nullptr, "early-router placement fixture failed to load");
+        if (enabled) {
+            const auto report = llama_model_moe_placement(enabled.get());
+            check(report.owners.size() == 1 && retained.owners.size() == 1 &&
+                      report.owners[0].cache_fixed_bytes > retained.owners[0].cache_fixed_bytes,
+                  "disabled early routing reserved speculative cache storage");
+        }
+    }
+    {
         llama_model_tensor_buft_override nonmatching[] = {
             {"/home/private/token=this_pattern_matches_nothing", ggml_backend_cpu_buffer_type()},
             {nullptr, nullptr},

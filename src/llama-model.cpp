@@ -2520,6 +2520,10 @@ bool llama_model::moe_expert_cache_enabled() const {
     return params.moe_expert_cache_slots > 0;
 }
 
+uint32_t llama_model::moe_early_router_max_rows() const {
+    return std::max(1u, params.moe_early_router_max_rows);
+}
+
 const std::map<ggml_backend_dev_t, llama_moe_cache_memory> & llama_model::moe_expert_cache_memory() const {
     return pimpl->moe_cache_memory;
 }
@@ -2801,7 +2805,8 @@ void llama_model::finalize_moe_expert_cache() {
             merge_memory(pimpl->moe_cache_group_context_memory[context_index][group_index]);
             auto & geometry = context_geometries[context_index][owner];
             const uint32_t top_k = std::max<uint32_t>(1, hparams.n_expert_used(group.layer));
-            if (context_index == 0) {
+            const char * early_env = getenv("GGML_CUDA_MOE_EARLY_ROUTER");
+            if (context_index == 0 && (params.moe_early_router || (early_env != nullptr && strcmp(early_env, "1") == 0))) {
                 const auto * router_input = layers[group.layer].ffn_gate_inp;
                 uint64_t width = router_input != nullptr && router_input->ne[0] > 0 ?
                     static_cast<uint64_t>(router_input->ne[0]) : hparams.n_embd;
@@ -2817,7 +2822,7 @@ void llama_model::finalize_moe_expert_cache() {
                 geometry.hc_rank = std::max(geometry.hc_rank, hparams.hc_low_rank);
                 const uint32_t slot_bound = pimpl->moe_cache_byte_budgets_owned.empty() ?
                     static_cast<uint32_t>(params.moe_expert_cache_slots) : n_experts;
-                const uint32_t row_capacity = slot_bound / top_k;
+                const uint32_t row_capacity = std::min(slot_bound / top_k, std::max(1u, params.moe_early_router_max_rows));
                 uint32_t candidate_k = top_k;
                 if (const char * value = getenv("GGML_CUDA_MOE_EARLY_ROUTER_CANDIDATE_PERCENT")) {
                     char * end = nullptr;
@@ -4323,10 +4328,12 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.moe_early_router            =*/ false,
         /*.moe_expert_cache_layer_ranges =*/ nullptr,
         /*.n_moe_expert_cache_layer_ranges =*/ 0,
         /*.moe_expert_cache_byte_budgets =*/ nullptr,
         /*.n_moe_expert_cache_byte_budgets =*/ 0,
+        /*.moe_early_router_max_rows   =*/ 1,
     };
 
     return result;

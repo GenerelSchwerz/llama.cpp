@@ -380,6 +380,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool moe_early_router; // reserve cache memory for advisory early routing
 
         // Optional inclusive, zero-based cache layer ranges. NULL/0 preserves the
         // legacy all-expert placement behavior. The model copies the borrowed array
@@ -395,6 +396,7 @@ extern "C" {
         // budget does not disable an active owner and cannot hold a cache slot.
         const size_t * moe_expert_cache_byte_budgets;
         size_t n_moe_expert_cache_byte_budgets;
+        uint32_t moe_early_router_max_rows; // largest target verification row count to reserve
     };
 
     struct llama_sampler_seq_config {

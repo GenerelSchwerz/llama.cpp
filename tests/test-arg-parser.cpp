@@ -296,6 +296,7 @@ static void test(void) {
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-early-router"};
     assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.moe_early_router);
+    assert(common_model_params_to_llama(params).moe_early_router);
 
     params = common_params();
     argv = {"binary_name", "-m", "model_file.gguf", "--moe-expert-cache-layers", "0,2-4,7"};
@@ -308,6 +309,8 @@ static void test(void) {
     assert(layer_mparams.moe_expert_cache_layer_ranges == params.moe_expert_cache_layer_ranges.data());
     assert(layer_mparams.n_moe_expert_cache_layer_ranges == 3);
     const auto default_mparams = llama_model_default_params();
+    assert(!default_mparams.moe_early_router);
+    assert(default_mparams.moe_early_router_max_rows == 1);
     assert(default_mparams.moe_expert_cache_layer_ranges == nullptr);
     assert(default_mparams.n_moe_expert_cache_layer_ranges == 0);
     assert(default_mparams.moe_expert_cache_byte_budgets == nullptr);

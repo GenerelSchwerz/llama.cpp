@@ -1474,6 +1474,7 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
     bool decode_boundary_overlap = false;
+    uint32_t moe_early_router_max_rows = 1;
     std::once_flag moe_grouped_context_once;
     ggml_cuda_moe_grouped_context * moe_grouped_context = nullptr;
     std::vector<std::unique_ptr<ggml_backend_cuda_context>> moe_router_contexts;

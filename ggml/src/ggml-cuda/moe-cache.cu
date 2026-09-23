@@ -3423,29 +3423,10 @@ struct moe_device_prefetch_job {
     std::array<bank, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> banks = {};
 };
 
-static void moe_device_prefetch_wait(cudaStream_t stream, uint32_t * done) {
-    CUstreamCaptureStatus status;
-    CUgraph graph = nullptr;
-    const CUgraphNode * dependencies = nullptr;
-    size_t count = 0;
-    CU_CHECK(cuStreamGetCaptureInfo(stream, &status, nullptr, &graph, &dependencies, nullptr, &count));
-    if (status == CU_STREAM_CAPTURE_STATUS_NONE) {
-        CU_CHECK(cuStreamWaitValue32(stream, reinterpret_cast<CUdeviceptr>(done), 1, CU_STREAM_WAIT_VALUE_GEQ));
-        return;
+static __global__ void moe_device_prefetch_complete(uint32_t * completion, uint32_t lane, uint32_t status) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(completion[lane]).store(status, cuda::memory_order_release);
     }
-    GGML_ASSERT(status == CU_STREAM_CAPTURE_STATUS_ACTIVE);
-    CUstreamBatchMemOpParams operation = {};
-    operation.waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
-    operation.waitValue.address = reinterpret_cast<CUdeviceptr>(done);
-    operation.waitValue.value = 1;
-    operation.waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;
-    CUDA_BATCH_MEM_OP_NODE_PARAMS params = {};
-    CU_CHECK(cuCtxGetCurrent(&params.ctx));
-    params.count = 1;
-    params.paramArray = &operation;
-    CUgraphNode node;
-    CU_CHECK(cuGraphAddBatchMemOpNode(&node, graph, dependencies, count, &params));
-    CU_CHECK(cuStreamUpdateCaptureDependencies_v2(stream, &node, nullptr, 1, CU_STREAM_SET_CAPTURE_DEPENDENCIES));
 }
 
 static bool moe_device_prefetch_supported(int device) {
@@ -3555,9 +3536,8 @@ struct moe_device_prefetch {
                     const auto * job = reinterpret_cast<const moe_device_prefetch_job *>(static_cast<uintptr_t>(job_cookie));
                     request.store(0, cuda::memory_order_release);
                     const auto signal_completion = [&](uint32_t status) {
-                        const bool done_ok = cuStreamWriteValue32(copy_stream,
-                            reinterpret_cast<CUdeviceptr>(copy_done + lane_index), status,
-                            CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS;
+                        moe_device_prefetch_complete<<<1, 1, 0, copy_stream>>>(copy_done, lane_index, status);
+                        const bool done_ok = cudaGetLastError() == cudaSuccess;
                         if (!done_ok) {
                             GGML_ABORT("failed to release MoE device-prefetch dependency");
                         }
@@ -3911,6 +3891,11 @@ static __global__ void moe_grouped_mark_invalidated_slots(
     }
 }
 
+static __device__ bool moe_device_prefetch_ready(uint32_t * completion) {
+    return completion != nullptr &&
+        cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(*completion).load(cuda::memory_order_acquire) == 1;
+}
+
 static __global__ void moe_grouped_plan_decode(
         const int32_t * ids,
         uint32_t n_routes,
@@ -3929,7 +3914,9 @@ static __global__ void moe_grouped_plan_decode(
         uint64_t host_clock_begin,
         uint64_t host_clock_end,
         uint64_t * device_clock,
-        moe_grouped_decode_plan * plan) {
+        moe_grouped_decode_plan * plan,
+        int32_t * prefetch_positions = nullptr,
+        uint32_t * prefetch_completion = nullptr) {
     if (blockIdx.x != 0) {
         return;
     }
@@ -3941,6 +3928,7 @@ static __global__ void moe_grouped_plan_decode(
     __shared__ uint32_t selected_slot;
     __shared__ uint64_t clock_begin;
     __shared__ uint64_t clock_end;
+    __shared__ bool prefetch_ready;
     const uint32_t thread = threadIdx.x;
     int32_t * route_storage = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_STORAGE);
     int32_t * route_unique = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_ROUTE_UNIQUE);
@@ -4257,8 +4245,14 @@ static __global__ void moe_grouped_plan_decode(
             moe_grouped_plan_fail(plan, MOE_GROUPED_PLAN_INVALID_STATE);
         }
         plan->next_clock = clock_begin + plan->n_unique;
+        prefetch_ready = moe_device_prefetch_ready(prefetch_completion);
     }
     __syncthreads();
+    if (prefetch_positions != nullptr && !prefetch_ready) {
+        for (uint32_t expert = thread; expert < n_experts; expert += blockDim.x) {
+            prefetch_positions[expert] = -1;
+        }
+    }
     if (thread == 0) {
         plan->status = MOE_GROUPED_PLAN_READY;
     }
@@ -5056,22 +5050,27 @@ static void moe_early_router_select_launch(
 
 static __global__ void moe_early_router_compact(
         int experts, int32_t * predicted, int32_t * positions, uint32_t prediction_capacity) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) {
+    if (blockIdx.x != 0) {
         return;
     }
     uint32_t count = 0;
-    for (int expert = 0; expert < experts; ++expert) {
-        if (positions[expert] < 0) {
-            continue;
+    for (int first = 0; first < experts; first += WARP_SIZE) {
+        const int expert = first + threadIdx.x;
+        const bool selected = expert < experts && positions[expert] >= 0;
+        const uint32_t selected_mask = __ballot_sync(0xffffffff, selected);
+        const uint32_t rank = count + __popc(selected_mask & ((1u << threadIdx.x) - 1));
+        if (selected) {
+            if (rank < prediction_capacity) {
+                predicted[rank] = expert;
+                positions[expert] = rank;
+            } else {
+                positions[expert] = -1;
+            }
         }
-        if (count == prediction_capacity) {
-            return;
-        }
-        predicted[count] = expert;
-        positions[expert] = count++;
+        count = min(prediction_capacity, count + __popc(selected_mask));
     }
-    while (count < prediction_capacity) {
-        predicted[count++] = -1;
+    for (uint32_t rank = count + threadIdx.x; rank < prediction_capacity; rank += WARP_SIZE) {
+        predicted[rank] = -1;
     }
 }
 
@@ -5080,11 +5079,20 @@ static __global__ void moe_device_prefetch_publish(
         int32_t * experts,
         uint32_t * completion,
         const int32_t * predicted,
+        int32_t * positions,
+        uint32_t n_experts,
         uint32_t count,
         uint32_t route_capacity,
         uint32_t lane_index,
         uint64_t job_cookie) {
     if (threadIdx.x != 0 || count > route_capacity || lane_index >= MOE_DEVICE_PREFETCH_LANES) {
+        return;
+    }
+    auto completion_ref = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>(completion[lane_index]);
+    if (completion_ref.load(cuda::memory_order_acquire) == 0) {
+        for (uint32_t expert = 0; expert < n_experts; ++expert) {
+            positions[expert] = -1;
+        }
         return;
     }
     auto & lane = lanes[lane_index];
@@ -5094,7 +5102,7 @@ static __global__ void moe_device_prefetch_publish(
         experts[size_t(lane_index) * route_capacity + route] = expert;
         valid |= expert >= 0;
     }
-    completion[lane_index] = valid ? 0 : 1;
+    completion_ref.store(valid ? 0 : 1, cuda::memory_order_release);
     if (!valid) {
         return;
     }
@@ -5120,16 +5128,14 @@ static __global__ void moe_grouped_gather_decode(
         uint32_t first_miss = 0,
         uint32_t miss_count = UINT32_MAX,
         bool device_prefetch = false,
-        uint32_t miss_filter = 0,
         const int32_t * prefetch_positions = nullptr,
         const char * prefetch_payload = nullptr,
-        const uint32_t * prefetch_completion = nullptr,
         size_t prefetch_expert_bytes = 0) {
     if (plan->status != MOE_GROUPED_PLAN_READY) {
         return;
     }
     if constexpr (debug_transfers) {
-        if (blockIdx.x == 0 && threadIdx.x == 0 && first_miss == 0 && miss_filter != 2) {
+        if (blockIdx.x == 0 && threadIdx.x == 0 && first_miss == 0) {
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_ROUTE_ACCESSES]),
                 static_cast<unsigned long long>(plan->n_routes));
             atomicAdd(reinterpret_cast<unsigned long long *>(&transfer_counters[MOE_GROUPED_TRANSFER_UNIQUE_ACCESSES]),
@@ -5160,10 +5166,6 @@ static __global__ void moe_grouped_gather_decode(
                 const uint32_t miss = first_miss + local_miss;
                 const int32_t expert = miss_experts[miss];
                 const int32_t prefetch_rank = prefetch_positions != nullptr ? prefetch_positions[expert] : -1;
-                const bool deferred = prefetch_rank >= 0;
-                if ((miss_filter == 1 && deferred) || (miss_filter == 2 && !deferred)) {
-                    continue;
-                }
                 ++selected_misses;
                 const int32_t slot = miss_slots[miss];
                 if (occupied_slot[slot] != 0) {
@@ -5175,7 +5177,7 @@ static __global__ void moe_grouped_gather_decode(
                     ++vacant_fills;
                 }
                 occupied_slot[slot] = 1;
-                const bool direct_prefetch = prefetch_rank >= 0 && prefetch_completion != nullptr && *prefetch_completion == 1;
+                const bool direct_prefetch = device_prefetch && prefetch_rank >= 0;
                 if ((control != nullptr && miss < control->capacity && moe_prepack_adopted(control)[miss] != nullptr) || direct_prefetch) {
                     if (device_prefetch) {
                         device_prefetch_bytes += words_per_miss * sizeof(uint4);
@@ -5223,10 +5225,6 @@ static __global__ void moe_grouped_gather_decode(
         const uint32_t miss = first_miss + word / words_per_miss;
         const int32_t expert = miss_experts[miss];
         const int32_t prefetch_rank = prefetch_positions != nullptr ? prefetch_positions[expert] : -1;
-        const bool deferred = prefetch_rank >= 0;
-        if ((miss_filter == 1 && deferred) || (miss_filter == 2 && !deferred)) {
-            continue;
-        }
         size_t bank_word = word % words_per_miss;
         for (uint32_t bank = 0; bank < n_banks; ++bank) {
             const auto descriptor = banks[bank];
@@ -5239,7 +5237,7 @@ static __global__ void moe_grouped_gather_decode(
             const uint4 * source = reinterpret_cast<const uint4 *>(descriptor.source + (descriptor.staged ? miss - first_miss : (size_t) expert) * descriptor.expert_stride);
             if (control != nullptr && miss < control->capacity && moe_prepack_adopted(control)[miss] != nullptr) {
                 source = reinterpret_cast<const uint4 *>(moe_prepack_adopted(control)[miss]) + word % words_per_miss - bank_word;
-            } else if (prefetch_rank >= 0 && prefetch_completion != nullptr && *prefetch_completion == 1) {
+            } else if (device_prefetch && prefetch_rank >= 0) {
                 source = reinterpret_cast<const uint4 *>(prefetch_payload + size_t(prefetch_rank) * prefetch_expert_bytes) + word % words_per_miss - bank_word;
             }
             uint4 * destination = reinterpret_cast<uint4 *>(descriptor.data + (size_t) slot * descriptor.expert_stride);
@@ -5252,11 +5250,6 @@ static __global__ void moe_grouped_gather_decode(
         for (size_t index = first; index < total_values; index += stride) {
             const uint32_t miss = first_miss + index / auxiliary_values_per_miss;
             const int32_t expert = miss_experts[miss];
-            const int32_t prefetch_rank = prefetch_positions != nullptr ? prefetch_positions[expert] : -1;
-            const bool deferred = prefetch_rank >= 0;
-            if ((miss_filter == 1 && deferred) || (miss_filter == 2 && !deferred)) {
-                continue;
-            }
             size_t auxiliary_value = index % auxiliary_values_per_miss;
             uint32_t auxiliary = 0;
             while (auxiliary < n_auxiliaries && auxiliary_value >= auxiliaries[auxiliary].n_values) {
@@ -5270,80 +5263,6 @@ static __global__ void moe_grouped_gather_decode(
             descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
                 descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
         }
-    }
-}
-
-template<bool predicted>
-static __global__ void moe_grouped_gather_device_prefetch(
-        const moe_grouped_device_bank * banks,
-        uint32_t n_banks,
-        size_t words_per_miss,
-        const moe_grouped_device_auxiliary * auxiliaries,
-        uint32_t n_auxiliaries,
-        size_t auxiliary_values_per_miss,
-        uint32_t plan_capacity,
-        const moe_grouped_decode_plan * plan,
-        const int32_t * positions,
-        const char * payload,
-        const uint32_t * completion,
-        size_t expert_bytes) {
-    if (plan->status != MOE_GROUPED_PLAN_READY) {
-        return;
-    }
-    const int32_t * miss_experts = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_EXPERTS);
-    const int32_t * miss_slots = moe_grouped_plan_array_ptr(plan, plan_capacity, MOE_GROUPED_PLAN_MISS_SLOTS);
-    const size_t total_words = words_per_miss * plan->n_misses;
-    const size_t first = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t stride = (size_t) gridDim.x * blockDim.x;
-    for (size_t word = first; word < total_words; word += stride) {
-        const uint32_t miss = word / words_per_miss;
-        const int32_t expert = miss_experts[miss];
-        const int32_t position = positions[expert];
-        if ((position >= 0) != predicted) {
-            continue;
-        }
-        size_t bank_word = word % words_per_miss;
-        for (uint32_t bank = 0; bank < n_banks; ++bank) {
-            const auto descriptor = banks[bank];
-            const size_t bank_words = descriptor.expert_stride / sizeof(uint4);
-            if (bank_word >= bank_words) {
-                bank_word -= bank_words;
-                continue;
-            }
-            const int32_t slot = miss_slots[miss];
-            const uint4 * source = reinterpret_cast<const uint4 *>(
-                descriptor.source + (size_t) expert * descriptor.expert_stride);
-            if constexpr (predicted) {
-                if (*completion == 1) {
-                    source = reinterpret_cast<const uint4 *>(payload + size_t(position) * expert_bytes) +
-                        word % words_per_miss - bank_word;
-                }
-            }
-            uint4 * destination = reinterpret_cast<uint4 *>(
-                descriptor.data + (size_t) slot * descriptor.expert_stride);
-            destination[bank_word] = source[bank_word];
-            break;
-        }
-    }
-    const size_t total_values = auxiliary_values_per_miss * plan->n_misses;
-    for (size_t index = first; index < total_values; index += stride) {
-        const uint32_t miss = index / auxiliary_values_per_miss;
-        const int32_t expert = miss_experts[miss];
-        if ((positions[expert] >= 0) != predicted) {
-            continue;
-        }
-        size_t auxiliary_value = index % auxiliary_values_per_miss;
-        uint32_t auxiliary = 0;
-        while (auxiliary < n_auxiliaries && auxiliary_value >= auxiliaries[auxiliary].n_values) {
-            auxiliary_value -= auxiliaries[auxiliary++].n_values;
-        }
-        if (auxiliary == n_auxiliaries) {
-            continue;
-        }
-        const auto descriptor = auxiliaries[auxiliary];
-        const int32_t slot = miss_slots[miss];
-        descriptor.data[(size_t) slot * descriptor.n_values + auxiliary_value] =
-            descriptor.source[(size_t) expert * descriptor.n_values + auxiliary_value];
     }
 }
 
@@ -5374,12 +5293,14 @@ static bool ggml_cuda_moe_cache_handoff_grouped(ggml_cuda_moe_cache * cache, cud
 static bool ggml_cuda_moe_cache_abort_host_staged(ggml_cuda_moe_cache * cache, cudaStream_t compute_stream);
 
 struct ggml_cuda_moe_grouped_context::impl {
-    explicit impl(ggml_backend_dev_t owner, int device) : owner(owner), device(device) {
+    explicit impl(ggml_backend_dev_t owner, int device, uint32_t max_rows) : owner(owner), device(device) {
+        early_max_rows = std::max(1u, max_rows);
         const char * value = getenv("GGML_CUDA_MOE_FREQUENCY");
         frequency_aware = value == nullptr || strcmp(value, "0") != 0;
     }
 
     bool frequency_aware = true;
+    uint32_t early_max_rows = 1;
 
     ~impl() {
         auto * stats = grouped_debug.load(std::memory_order_acquire);
@@ -7727,8 +7648,8 @@ struct ggml_cuda_moe_grouped_context::impl {
     }
 };
 
-ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device) :
-    impl_(std::make_unique<impl>(owner, device)) {
+ggml_cuda_moe_grouped_context::ggml_cuda_moe_grouped_context(ggml_backend_dev_t owner, int device, uint32_t max_rows) :
+    impl_(std::make_unique<impl>(owner, device, max_rows)) {
     auto & telemetry = moe_cache_owner_telemetry_state();
     std::lock_guard<std::mutex> lock(telemetry.mutex);
     telemetry.active.insert(this);
@@ -7906,7 +7827,7 @@ bool ggml_cuda_moe_grouped_context::early_graph_for_test() {
                         moe_early_router_select<1, true, true><<<1, 32, 0, predictor.stream()>>>(
                             nullptr, experts, top_k, selection, prior, experts, selection + 3 * experts,
                             selection + experts, counters, 4096, rows, (const int32_t *) program->ids->data, program->ids->nb[1]);
-                        moe_early_router_compact<<<1, 1, 0, predictor.stream()>>>(
+                        moe_early_router_compact<<<1, WARP_SIZE, 0, predictor.stream()>>>(
                             experts, selection + 2 * experts, selection + experts, prediction_capacity);
                         CUDA_CHECK(cudaGetLastError());
                     };
@@ -8076,7 +7997,7 @@ bool ggml_cuda_moe_grouped_context::early_select_for_test() {
                     CUDA_CHECK(cudaMemset(d_counters, 0, 5 * sizeof(uint64_t)));
                     moe_early_router_select_launch(d_scores, experts, top_k, d_residents,
                         d_prior, capacity, d_predicted + experts, d_positions, d_counters, 4096, nullptr);
-                    moe_early_router_compact<<<1, 1>>>(experts, d_predicted, d_positions, top_k);
+                    moe_early_router_compact<<<1, WARP_SIZE>>>(experts, d_predicted, d_positions, top_k);
                     CUDA_CHECK(cudaGetLastError());
                     CUDA_CHECK(cudaMemcpy(actual.data(), d_predicted, top_k * sizeof(int32_t), cudaMemcpyDeviceToHost));
                     CUDA_CHECK(cudaMemcpy(positions.data(), d_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -8138,7 +8059,7 @@ bool ggml_cuda_moe_grouped_context::early_select_for_test() {
                 CUDA_CHECK(cudaMemset(d_counters, 0, 5 * sizeof(uint64_t)));
                 moe_early_router_select_launch<1, true>(d_scores, experts, top_k, d_residents,
                     d_prior, capacity, d_predicted + experts, d_positions, d_counters, 4096, nullptr, n_rows);
-                moe_early_router_compact<<<1, 1>>>(experts, d_predicted, d_positions, prediction_capacity);
+                moe_early_router_compact<<<1, WARP_SIZE>>>(experts, d_predicted, d_positions, prediction_capacity);
                 CUDA_CHECK(cudaGetLastError());
                 CUDA_CHECK(cudaMemcpy(batch_actual.data(), d_predicted, batch_actual.size() * sizeof(int32_t), cudaMemcpyDeviceToHost));
                 CUDA_CHECK(cudaMemcpy(positions.data(), d_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToHost));
@@ -8153,12 +8074,180 @@ bool ggml_cuda_moe_grouped_context::early_select_for_test() {
                 ++cases;
             }
         }
+        if (experts == 65) {
+            std::fill(positions.begin(), positions.end(), -1);
+            for (const int expert : {1, 31, 32, 64}) {
+                positions[expert] = 0;
+            }
+            CUDA_CHECK(cudaMemcpy(d_positions, positions.data(), experts * sizeof(int32_t), cudaMemcpyHostToDevice));
+            moe_early_router_compact<<<1, WARP_SIZE>>>(experts, d_predicted, d_positions, 3);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(actual.data(), d_predicted, 3 * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(positions.data(), d_positions, experts * sizeof(int32_t), cudaMemcpyDeviceToHost));
+            valid &= actual[0] == 1 && actual[1] == 31 && actual[2] == 32 &&
+                positions[1] == 0 && positions[31] == 1 && positions[32] == 2 && positions[64] == -1;
+            ++cases;
+        }
         CUDA_CHECK(cudaFree(d_scores));
         CUDA_CHECK(cudaFree(d_residents));
         CUDA_CHECK(cudaFree(d_predicted));
         CUDA_CHECK(cudaFree(d_positions));
         CUDA_CHECK(cudaFree(d_counters));
         CUDA_CHECK(cudaFree(d_prior));
+    }
+    {
+        constexpr uint32_t experts = 8;
+        constexpr uint64_t prior_job_cookie = 77;
+        constexpr uint64_t next_job_cookie = 42;
+        constexpr int32_t prior_mailbox[2] = {5, 7};
+        constexpr int32_t next_expert = 3;
+        moe_device_prefetch_lane * d_lanes = nullptr;
+        int32_t * d_experts = nullptr;
+        int32_t * d_predicted = nullptr;
+        int32_t * d_positions = nullptr;
+        uint32_t * d_completion = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t replay = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_lanes, MOE_DEVICE_PREFETCH_LANES * sizeof(*d_lanes)));
+        CUDA_CHECK(cudaMalloc(&d_experts, 2 * MOE_DEVICE_PREFETCH_LANES * sizeof(*d_experts)));
+        CUDA_CHECK(cudaMalloc(&d_predicted, 2 * sizeof(*d_predicted)));
+        CUDA_CHECK(cudaMalloc(&d_positions, experts * sizeof(*d_positions)));
+        CUDA_CHECK(cudaMalloc(&d_completion, MOE_DEVICE_PREFETCH_LANES * sizeof(*d_completion)));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        moe_device_prefetch_publish<<<1, 1, 0, stream>>>(
+            d_lanes, d_experts, d_completion, d_predicted, d_positions, experts, 2, 2, 0, next_job_cookie);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&replay, graph, nullptr, nullptr, 0));
+        for (const uint32_t status : {0u, 1u, 2u}) {
+            moe_device_prefetch_lane lanes[MOE_DEVICE_PREFETCH_LANES] = {};
+            lanes[0].job_cookie = status == 0 ? prior_job_cookie : 0;
+            lanes[0].count = status == 0 ? 2 : 0;
+            int32_t selected[2] = {next_expert, -1};
+            int32_t mailbox[2] = {prior_mailbox[0], prior_mailbox[1]};
+            int32_t positions[experts] = {};
+            std::fill_n(positions, experts, -1);
+            positions[next_expert] = 0;
+            uint32_t completion[MOE_DEVICE_PREFETCH_LANES] = {status, 1};
+            CUDA_CHECK(cudaMemcpy(d_lanes, lanes, sizeof(lanes), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_experts, mailbox, sizeof(mailbox), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_predicted, selected, sizeof(selected), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_positions, positions, sizeof(positions), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_completion, completion, sizeof(completion), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaGraphLaunch(replay, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaMemcpy(lanes, d_lanes, sizeof(lanes), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(mailbox, d_experts, sizeof(mailbox), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(positions, d_positions, sizeof(positions), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(completion, d_completion, sizeof(completion), cudaMemcpyDeviceToHost));
+            if (status == 0) {
+                valid &= lanes[0].job_cookie == prior_job_cookie && lanes[0].count == 2 && completion[0] == 0 &&
+                    mailbox[0] == prior_mailbox[0] && mailbox[1] == prior_mailbox[1] &&
+                    std::all_of(std::begin(positions), std::end(positions), [](int32_t position) { return position == -1; });
+            } else {
+                valid &= lanes[0].job_cookie == next_job_cookie && lanes[0].count == 2 && completion[0] == 0 &&
+                    positions[next_expert] == 0 && mailbox[0] == next_expert && mailbox[1] == -1;
+            }
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(replay));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        CUDA_CHECK(cudaFree(d_completion));
+        CUDA_CHECK(cudaFree(d_positions));
+        CUDA_CHECK(cudaFree(d_predicted));
+        CUDA_CHECK(cudaFree(d_experts));
+        CUDA_CHECK(cudaFree(d_lanes));
+    }
+    {
+        constexpr uint32_t experts = 8;
+        constexpr int32_t predicted_expert = 3;
+        constexpr uint32_t source_word_base = 100;
+        constexpr uint32_t staged_word = 999;
+        struct plan_state {
+            int32_t ids[1];
+            int32_t slot_for_expert[experts];
+            int32_t expert_for_slot[1];
+            uint64_t last_used[1];
+            uint32_t expert_frequency[experts];
+            uint64_t expert_frequency_epoch[experts];
+            uint64_t step;
+        };
+        size_t plan_bytes = 0;
+        GGML_ASSERT(moe_grouped_plan_size(1, experts, &plan_bytes));
+        plan_state state = {};
+        state.ids[0] = predicted_expert;
+        std::fill_n(state.slot_for_expert, experts, -1);
+        state.expert_for_slot[0] = -1;
+        uint4 source[experts] = {};
+        for (uint32_t expert = 0; expert < experts; ++expert) {
+            source[expert].x = source_word_base + expert;
+        }
+        const uint4 payload = {staged_word, 0, 0, 0};
+        plan_state * d_state = nullptr;
+        moe_grouped_decode_plan * d_plan = nullptr;
+        moe_grouped_device_bank * d_bank = nullptr;
+        uint4 * d_source = nullptr;
+        uint4 * d_destination = nullptr;
+        uint4 * d_payload = nullptr;
+        int32_t * d_positions = nullptr;
+        uint32_t * d_completion = nullptr;
+        cudaStream_t stream = nullptr;
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t replay = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_state, sizeof(*d_state)));
+        CUDA_CHECK(cudaMalloc(&d_plan, plan_bytes));
+        CUDA_CHECK(cudaMalloc(&d_bank, sizeof(*d_bank)));
+        CUDA_CHECK(cudaMalloc(&d_source, sizeof(source)));
+        CUDA_CHECK(cudaMalloc(&d_destination, sizeof(uint4)));
+        CUDA_CHECK(cudaMalloc(&d_payload, sizeof(uint4)));
+        CUDA_CHECK(cudaMalloc(&d_positions, experts * sizeof(*d_positions)));
+        CUDA_CHECK(cudaMalloc(&d_completion, sizeof(*d_completion)));
+        const moe_grouped_device_bank bank = {reinterpret_cast<const char *>(d_source),
+            reinterpret_cast<char *>(d_destination), sizeof(uint4), MOE_GROUPED_SOURCE_MAPPED, false};
+        CUDA_CHECK(cudaMemcpy(d_bank, &bank, sizeof(bank), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_source, source, sizeof(source), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_payload, &payload, sizeof(payload), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        moe_grouped_plan_decode<<<1, moe_grouped_plan_threads(1), 0, stream>>>(
+            d_state->ids, 1, 1, 1, experts, 1, 1, d_state->slot_for_expert, d_state->expert_for_slot,
+            d_state->last_used, d_state->expert_frequency, d_state->expert_frequency_epoch,
+            &d_state->step, false, 0, 1, nullptr, d_plan, d_positions, d_completion);
+        moe_device_prefetch_complete<<<1, 1, 0, stream>>>(d_completion, 0, 1);
+        moe_grouped_gather_decode<false><<<1, MOE_GROUPED_TRANSFER_THREADS, 0, stream>>>(
+            d_bank, 1, 1, nullptr, 0, 0, 1, d_plan, nullptr, nullptr, nullptr,
+            nullptr, 0, UINT32_MAX, true, d_positions, reinterpret_cast<const char *>(d_payload), sizeof(uint4));
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&replay, graph, nullptr, nullptr, 0));
+        for (const uint32_t status : {0u, 1u, 2u}) {
+            int32_t positions[experts] = {};
+            std::fill_n(positions, experts, -1);
+            positions[predicted_expert] = 0;
+            CUDA_CHECK(cudaMemcpy(d_state, &state, sizeof(state), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemset(d_plan, 0, plan_bytes));
+            CUDA_CHECK(cudaMemcpy(d_positions, positions, sizeof(positions), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_completion, &status, sizeof(status), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemset(d_destination, 0, sizeof(uint4)));
+            CUDA_CHECK(cudaGraphLaunch(replay, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            uint4 destination = {};
+            CUDA_CHECK(cudaMemcpy(&destination, d_destination, sizeof(destination), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(positions, d_positions, sizeof(positions), cudaMemcpyDeviceToHost));
+            valid &= destination.x == (status == 1 ? staged_word : source_word_base + predicted_expert) &&
+                positions[predicted_expert] == (status == 1 ? 0 : -1);
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(replay));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+        CUDA_CHECK(cudaFree(d_completion));
+        CUDA_CHECK(cudaFree(d_positions));
+        CUDA_CHECK(cudaFree(d_payload));
+        CUDA_CHECK(cudaFree(d_destination));
+        CUDA_CHECK(cudaFree(d_source));
+        CUDA_CHECK(cudaFree(d_bank));
+        CUDA_CHECK(cudaFree(d_plan));
+        CUDA_CHECK(cudaFree(d_state));
     }
     fprintf(stderr, "early-select-test: cases=%d valid=%d\n", cases, valid);
     return valid;
@@ -9833,6 +9922,10 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
         }
         const uint32_t prediction_slots = candidate_k * n_rows;
         const uint32_t prediction_capacity = std::min(resource->device->n_experts, prediction_slots);
+        const uint32_t reserved_rows = std::min(resource->snapshot.n_slots / top_k,
+            std::max(impl_->early_max_rows, n_rows));
+        const uint32_t reserved_capacity = static_cast<uint32_t>(std::min<uint64_t>(resource->device->n_experts,
+            uint64_t(reserved_rows) * candidate_k));
         const bool pageable = pageable_source && resource->device->materialization->control != nullptr &&
             resource->device->materialization->control->capacity >= prediction_capacity;
         if (pageable_source && !pageable) {
@@ -9938,19 +10031,19 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
             continue;
         }
         const size_t expert_bytes = resource->device->words_per_miss * sizeof(uint4);
-        if (expert_bytes > SIZE_MAX / prediction_slots) {
+        if (reserved_capacity == 0 || expert_bytes > SIZE_MAX / reserved_capacity) {
             decline("prediction storage overflow");
             continue;
         }
-        max_rows = std::max(max_rows, n_rows);
+        max_rows = std::max(max_rows, reserved_rows);
         if (pageable) {
-            max_bytes = std::max(max_bytes, expert_bytes * prediction_capacity);
+            max_bytes = std::max(max_bytes, expert_bytes * reserved_capacity);
         } else {
-            max_device_tile_bytes = std::max(max_device_tile_bytes, expert_bytes * prediction_capacity);
+            max_device_tile_bytes = std::max(max_device_tile_bytes, expert_bytes * reserved_capacity);
         }
         max_width = std::max(max_width, (uint32_t) late->ne[0]);
         max_experts = std::max(max_experts, resource->device->n_experts);
-        max_route_capacity = std::max(max_route_capacity, prediction_capacity);
+        max_route_capacity = std::max(max_route_capacity, reserved_capacity);
         max_candidate_capacity = std::max(max_candidate_capacity, candidate_k);
         impl::early_binding binding = {};
         binding.group = group.key.candidate.group_index;
@@ -10358,12 +10451,13 @@ void ggml_cuda_moe_grouped_context::launch_early_router(
                 device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected, early.positions[predictor_lane],
                 early.counters, device.words_per_miss * sizeof(uint4), early.stream, binding.n_rows);
         }
-        moe_early_router_compact<<<1, 1, 0, early.stream>>>(
+        moe_early_router_compact<<<1, WARP_SIZE, 0, early.stream>>>(
             device.n_experts, early.predicted, early.positions[predictor_lane], binding.prediction_capacity);
         const auto & job = *binding.device_job;
         moe_device_prefetch_publish<<<1, 1, 0, early.stream>>>(
             impl_->device_prefetch->device_lanes, impl_->device_prefetch->device_experts,
-            impl_->device_prefetch->copy_done, early.predicted, binding.prediction_capacity,
+            impl_->device_prefetch->copy_done, early.predicted, early.positions[predictor_lane],
+            device.n_experts, binding.prediction_capacity,
             impl_->device_prefetch->route_capacity, job.lane, reinterpret_cast<uintptr_t>(&job));
         CUDA_CHECK(cudaEventRecord(early.done[predictor_lane], early.stream));
         CUDA_CHECK(cudaGetLastError());
@@ -10395,7 +10489,7 @@ void ggml_cuda_moe_grouped_context::launch_early_router(
             device.slot_for_expert, device.plan, resource.snapshot.n_slots, early.selected, early.positions[0],
             early.counters, device.words_per_miss * sizeof(uint4), stream, 1, row == 0);
     }
-    moe_early_router_compact<<<1, 1, 0, stream>>>(
+    moe_early_router_compact<<<1, WARP_SIZE, 0, stream>>>(
         device.n_experts, early.predicted, early.positions[0], binding.prediction_capacity);
     GGML_ASSERT(materialization->control->capacity >= binding.prediction_capacity);
     CUDA_CHECK(cudaMemcpyAsync(moe_prepack_predicted(materialization->control), early.predicted,
@@ -10553,7 +10647,9 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             device.n_experts, resource->snapshot.n_slots, resource->snapshot.n_slots,
             device.slot_for_expert, device.expert_for_slot, device.last_used,
             device.expert_frequency, device.expert_frequency_epoch, device.device_step, impl_->frequency_aware, clock_begin, clock_end,
-            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan);
+            reservation == impl::CLOCK_RESERVATION_DEVICE ? device.device_clock : nullptr, device.plan,
+            device_prefetch_job != nullptr ? impl_->early[0]->positions[device_prefetch_job->lane] : nullptr,
+            device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + device_prefetch_job->lane : nullptr);
         CUDA_CHECK(cudaGetLastError());
         auto * debug = impl_->debug_stats();
         uint64_t * transfer_counters = debug != nullptr && device.occupied_slot != nullptr ?
@@ -10596,21 +10692,20 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
                 device.occupied_slot, device.invalidated_slot,
-                nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr, device_prefetch_job != nullptr ? 1 : 0,
+                nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr,
                 device_prefetch_job != nullptr ? impl_->early[0]->positions[lane] : nullptr,
                 device_prefetch_job != nullptr ? impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes : nullptr,
-                device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + lane : nullptr,
                 device_prefetch_job != nullptr ? device_prefetch_job->expert_bytes : 0);
         } else {
             const uint32_t lane = device_prefetch_job != nullptr ? device_prefetch_job->lane : 0;
             if (device_prefetch_job != nullptr) {
-                moe_grouped_gather_device_prefetch<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
+                moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
-                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan,
-                    impl_->early[0]->positions[lane],
+                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries, device.auxiliary_values_per_miss,
+                    resource->snapshot.n_slots, device.plan, nullptr, nullptr, nullptr,
+                    nullptr, 0, UINT32_MAX, true, impl_->early[0]->positions[lane],
                     impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
-                    impl_->device_prefetch->copy_done + lane, device_prefetch_job->expert_bytes);
+                    device_prefetch_job->expert_bytes);
             } else {
                 moe_grouped_gather_decode<false><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                     device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
@@ -10620,30 +10715,6 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
             }
         }
         CUDA_CHECK(cudaGetLastError());
-        if (device_prefetch_job != nullptr) {
-            const uint32_t lane = device_prefetch_job->lane;
-            moe_device_prefetch_wait(
-                compute_stream, impl_->device_prefetch->copy_done + lane);
-            if (transfer_counters != nullptr) {
-                moe_grouped_gather_decode<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
-                    device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
-                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
-                    device.occupied_slot, device.invalidated_slot,
-                    nullptr, 0, UINT32_MAX, true, 2, impl_->early[0]->positions[lane],
-                    impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
-                    impl_->device_prefetch->copy_done + lane, device_prefetch_job->expert_bytes);
-            } else {
-                moe_grouped_gather_device_prefetch<true><<<transfer_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
-                    device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
-                    device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
-                    device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan,
-                    impl_->early[0]->positions[lane],
-                    impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
-                    impl_->device_prefetch->copy_done + lane, device_prefetch_job->expert_bytes);
-            }
-            CUDA_CHECK(cudaGetLastError());
-        }
         decode->transaction = transaction;
         decode->remapped_ids = moe_grouped_plan_array_ptr(
             device.plan, resource->snapshot.n_slots, MOE_GROUPED_PLAN_REMAPPED_IDS);
@@ -13788,7 +13859,7 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v1(
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     try {
         std::call_once(ctx->moe_grouped_context_once, [&]() {
-            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device);
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device, ctx->moe_early_router_max_rows);
         });
     } catch (...) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
@@ -13807,7 +13878,7 @@ int32_t ggml_backend_cuda_moe_candidate_replace_v2(
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
     try {
         std::call_once(ctx->moe_grouped_context_once, [&]() {
-            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device);
+            ctx->moe_grouped_context = new ggml_cuda_moe_grouped_context(backend->device, ctx->device, ctx->moe_early_router_max_rows);
         });
     } catch (...) {
         return GGML_BACKEND_MOE_CANDIDATE_REPLACE_ERROR;
@@ -13820,6 +13891,17 @@ ggml_cuda_moe_grouped_context * ggml_cuda_moe_grouped_context_for_test(ggml_back
         return nullptr;
     }
     return static_cast<ggml_backend_cuda_context *>(backend->context)->moe_grouped_context;
+}
+
+extern "C"
+void ggml_backend_cuda_moe_early_router_set_max_rows(ggml_backend_t backend, uint32_t max_rows) {
+    if (!ggml_backend_is_cuda(backend) || backend->context == nullptr) {
+        return;
+    }
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    if (ctx->moe_grouped_context == nullptr) {
+        ctx->moe_early_router_max_rows = std::max(1u, max_rows);
+    }
 }
 
 struct ggml_cuda_moe_cache {
