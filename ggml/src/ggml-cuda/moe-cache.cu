@@ -2861,7 +2861,8 @@ static bool moe_staging_size_v1(
     if ((query.family_mask & GGML_BACKEND_MOE_STAGING_FAMILY_V1_GROUPED) != 0) {
         size_t plan_bytes = 0, control_offset = 0, staging_offset = 0, allocation_bytes = 0;
         const uint32_t prediction_capacity =
-            (query.flags & GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL) != 0 ? query.n_experts : 0;
+            (query.flags & GGML_BACKEND_MOE_STAGING_FLAG_V1_PREDICTION_CONTROL) != 0 ?
+                std::max(query.n_experts, query.n_slots) : 0;
         if (!moe_grouped_plan_size(query.n_slots, query.n_experts, &plan_bytes) ||
                 !moe_grouped_staging_layout(plan_bytes, payload, prediction_capacity,
                     control_offset, staging_offset, allocation_bytes)) {
@@ -3752,9 +3753,19 @@ struct moe_grouped_materialization {
             uint32_t capacity,
             uint32_t n_experts,
             uint32_t top_k,
-            std::atomic<uint64_t> * demand_materialized_bytes) :
-        storage(owner, control_bytes + tile_stride, tile_stride, std::min(top_k, capacity), false, false, control_bytes), capacity(capacity), n_experts(n_experts), copies(capacity),
+            std::atomic<uint64_t> * demand_materialized_bytes,
+            uint32_t max_tiles = 0,
+            bool retained = false) :
+        storage(owner, control_bytes + tile_stride, tile_stride, max_tiles != 0 ? max_tiles : std::min(top_k, capacity), false, false, control_bytes), capacity(capacity), n_experts(n_experts), copies(capacity),
         copy_spans(static_cast<size_t>(storage.tiles) * GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS), demand_materialized_bytes(demand_materialized_bytes) {
+        this->retained = retained;
+        if (retained) {
+            slot_for_expert.resize(n_experts, -1);
+            expert_for_slot.resize(storage.tiles, -1);
+            slot_age.resize(storage.tiles);
+            protected_slots.resize(storage.tiles);
+            tile_bytes = tile_stride;
+        }
         for (uint32_t i = 0; i < capacity; ++i) {
             copies[i] = {this, i, {}, false};
         }
@@ -3770,6 +3781,66 @@ struct moe_grouped_materialization {
     size_t prepare_copy(const int32_t * experts, uint32_t first, uint32_t count, size_t & bytes) {
         size_t n_spans = 0;
         bytes = 0;
+        if (retained) {
+            auto ** adopted = moe_prepack_adopted(control);
+            std::fill(protected_slots.begin(), protected_slots.end(), 0);
+            for (uint32_t i = 0; i < count; ++i) {
+                GGML_ASSERT(experts[i] >= 0 && static_cast<uint32_t>(experts[i]) < n_experts);
+                if (adopted[first + i] == nullptr) {
+                    const int32_t slot = slot_for_expert[experts[i]];
+                    if (slot >= 0) {
+                        protected_slots[slot] = 1;
+                    }
+                }
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                if (adopted[first + i] != nullptr) {
+                    continue;
+                }
+                const int32_t expert = experts[i];
+                int32_t slot = slot_for_expert[expert];
+                if (slot >= 0) {
+                    storage.owner->retained_hits.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    uint64_t oldest = UINT64_MAX;
+                    for (uint32_t candidate = 0; candidate < storage.tiles; ++candidate) {
+                        if (!protected_slots[candidate] && (expert_for_slot[candidate] < 0 || slot_age[candidate] < oldest)) {
+                            slot = candidate;
+                            oldest = slot_age[candidate];
+                            if (expert_for_slot[candidate] < 0) {
+                                break;
+                            }
+                        }
+                    }
+                    GGML_ASSERT(slot >= 0);
+                    if (expert_for_slot[slot] >= 0) {
+                        slot_for_expert[expert_for_slot[slot]] = -1;
+                        storage.owner->retained_evictions.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    slot_for_expert[expert] = slot;
+                    expert_for_slot[slot] = expert;
+                    storage.owner->retained_misses.fetch_add(1, std::memory_order_relaxed);
+                    for (size_t bank = 0; bank < sources.size(); ++bank) {
+                        const auto * source = sources[bank];
+                        if (source != nullptr) {
+                            GGML_ASSERT(n_spans < copy_spans.size() && source->expert_stride <= SIZE_MAX - bytes);
+                            copy_spans[n_spans++] = {source, source->data + static_cast<size_t>(expert) * source->expert_stride,
+                                static_cast<char *>(destinations[bank]) + static_cast<size_t>(slot) * tile_bytes,
+                                source->expert_stride, storage.split_payload};
+                            bytes += source->expert_stride;
+                        }
+                    }
+                }
+                protected_slots[slot] = 1;
+                if (++age == 0) {
+                    std::fill(slot_age.begin(), slot_age.end(), 0);
+                    age = 1;
+                }
+                slot_age[slot] = age;
+                adopted[first + i] = static_cast<const char *>(storage.payload_alias) + static_cast<size_t>(slot) * tile_bytes;
+            }
+            return n_spans;
+        }
         for (uint32_t i = 0; i < count; ++i) {
             const int32_t expert = experts[i];
             GGML_ASSERT(expert >= 0 && static_cast<uint32_t>(expert) < n_experts);
@@ -3792,6 +3863,13 @@ struct moe_grouped_materialization {
     moe_host_allocation storage;
     uint32_t capacity;
     uint32_t n_experts;
+    bool retained = false;
+    size_t tile_bytes = 0;
+    uint64_t age = 0;
+    std::vector<int32_t> slot_for_expert;
+    std::vector<int32_t> expert_for_slot;
+    std::vector<uint64_t> slot_age;
+    std::vector<uint8_t> protected_slots;
     std::array<const moe_host_source *, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> sources = {};
     std::array<void *, GGML_BACKEND_MOE_CANDIDATE_MAX_BANKS> destinations = {};
     std::vector<copy> copies;
@@ -5121,6 +5199,8 @@ static __global__ void moe_grouped_gather_decode(
         uint8_t * occupied_slot,
         uint8_t * invalidated_slot,
         const moe_prepack_control * control = nullptr,
+        const char * retained_base = nullptr,
+        size_t retained_bytes = 0,
         uint32_t first_miss = 0,
         uint32_t miss_count = UINT32_MAX,
         bool device_prefetch = false,
@@ -5180,9 +5260,14 @@ static __global__ void moe_grouped_gather_decode(
                 }
                 occupied_slot[slot] = 1;
                 const bool direct_prefetch = prefetch_rank >= 0 && prefetch_completion != nullptr && *prefetch_completion == 1;
-                if ((control != nullptr && miss < control->capacity && moe_prepack_adopted(control)[miss] != nullptr) || direct_prefetch) {
+                const char * adopted = control != nullptr && miss < control->capacity ? moe_prepack_adopted(control)[miss] : nullptr;
+                if (adopted != nullptr || direct_prefetch) {
                     if (device_prefetch) {
                         device_prefetch_bytes += words_per_miss * sizeof(uint4);
+                    } else if (adopted != nullptr && retained_base != nullptr &&
+                            reinterpret_cast<uintptr_t>(adopted) >= reinterpret_cast<uintptr_t>(retained_base) &&
+                            reinterpret_cast<uintptr_t>(adopted) - reinterpret_cast<uintptr_t>(retained_base) < retained_bytes) {
+                        source_bytes[MOE_GROUPED_SOURCE_PAGEABLE_STAGED] += words_per_miss * sizeof(uint4);
                     } else {
                         prepack_bytes += words_per_miss * sizeof(uint4);
                     }
@@ -7189,9 +7274,11 @@ struct ggml_cuda_moe_grouped_context::impl {
         }
 
         size_t staging_bytes = 0;
+        bool all_staged = true;
         for (const auto & bank : snapshot.banks) {
             const auto * source = source_for(bank.tensor);
             if (source == nullptr) {
+                all_staged = false;
                 continue;
             }
             if (result->source_owner != nullptr && result->source_owner != source->owner) {
@@ -7206,8 +7293,12 @@ struct ggml_cuda_moe_grouped_context::impl {
                     return nullptr;
                 }
                 staging_bytes += source->expert_stride;
+            } else {
+                all_staged = false;
             }
         }
+        const bool retained = all_staged && result->source_owner != nullptr &&
+            !result->source_owner->automatic && result->source_owner->retained_extra_slots != 0;
         uint32_t prediction_capacity = 0;
         if (moe_early_router_enabled()) {
             prediction_capacity = n_experts;
@@ -7219,6 +7310,9 @@ struct ggml_cuda_moe_grouped_context::impl {
                 }
             }
         }
+        if (retained) {
+            prediction_capacity = std::max(prediction_capacity, std::max(n_experts, snapshot.n_slots));
+        }
         size_t control_offset = 0, staging_offset = 0, allocation_bytes = 0;
         if (!moe_grouped_staging_layout(result->plan_bytes, staging_bytes, prediction_capacity, control_offset, staging_offset, allocation_bytes)) {
             return nullptr;
@@ -7228,7 +7322,8 @@ struct ggml_cuda_moe_grouped_context::impl {
                 throw std::bad_alloc();
             }
             result->materialization = std::make_unique<moe_grouped_materialization>(result->source_owner,
-                staging_offset, staging_bytes, snapshot.n_slots, n_experts, top_k, &demand_materialized_bytes);
+                staging_offset, staging_bytes, snapshot.n_slots, n_experts, top_k, &demand_materialized_bytes,
+                retained ? std::min(n_experts, 1 + result->source_owner->retained_extra_slots) : 0, retained);
             if (result->materialization->storage.data == nullptr) {
                 return nullptr;
             }
@@ -7260,7 +7355,7 @@ struct ggml_cuda_moe_grouped_context::impl {
                 materialization.sources[i] = source;
                 materialization.destinations[i] = static_cast<char *>(materialization.storage.payload) + next_staging;
                 alias_data = static_cast<const char *>(materialization.storage.payload_alias) + next_staging;
-                next_staging += source->expert_stride * materialization.storage.tiles;
+                next_staging += source->expert_stride * (retained ? 1 : materialization.storage.tiles);
                 device_banks[i].source_path = MOE_GROUPED_SOURCE_PAGEABLE_STAGED;
                 device_banks[i].staged = true;
             } else {
@@ -10582,14 +10677,20 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
                         device.occupied_slot, device.invalidated_slot,
-                        materialization.device_control, miss, tile_capacity);
+                        materialization.device_control,
+                        materialization.retained ? static_cast<const char *>(materialization.storage.payload_alias) : nullptr,
+                        materialization.retained ? materialization.tile_bytes * materialization.storage.tiles : 0,
+                        miss, tile_capacity);
                 } else {
                     moe_grouped_gather_decode<false><<<tile_blocks, MOE_GROUPED_TRANSFER_THREADS, 0, compute_stream>>>(
                         device.device_banks, resource->snapshot.banks.size(), device.words_per_miss,
                         device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                         device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, nullptr,
                         nullptr, nullptr,
-                        materialization.device_control, miss, tile_capacity);
+                        materialization.device_control,
+                        materialization.retained ? static_cast<const char *>(materialization.storage.payload_alias) : nullptr,
+                        materialization.retained ? materialization.tile_bytes * materialization.storage.tiles : 0,
+                        miss, tile_capacity);
                 }
                 CUDA_CHECK(cudaGetLastError());
             }
@@ -10600,7 +10701,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                 device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                 device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
                 device.occupied_slot, device.invalidated_slot,
-                nullptr, 0, UINT32_MAX, device_prefetch_job != nullptr, device_prefetch_job != nullptr ? 1 : 0,
+                nullptr, nullptr, 0, 0, UINT32_MAX, device_prefetch_job != nullptr, device_prefetch_job != nullptr ? 1 : 0,
                 device_prefetch_job != nullptr ? impl_->early[0]->positions[lane] : nullptr,
                 device_prefetch_job != nullptr ? impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes : nullptr,
                 device_prefetch_job != nullptr ? impl_->device_prefetch->copy_done + lane : nullptr,
@@ -10634,7 +10735,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_decod
                     device.device_auxiliaries, resource->snapshot.n_slot_auxiliaries,
                     device.auxiliary_values_per_miss, resource->snapshot.n_slots, device.plan, transfer_counters,
                     device.occupied_slot, device.invalidated_slot,
-                    nullptr, 0, UINT32_MAX, true, 2, impl_->early[0]->positions[lane],
+                    nullptr, nullptr, 0, 0, UINT32_MAX, true, 2, impl_->early[0]->positions[lane],
                     impl_->device_prefetch->payload + size_t(lane) * impl_->device_prefetch->tile_bytes,
                     impl_->device_prefetch->copy_done + lane, device_prefetch_job->expert_bytes);
             } else {
@@ -12177,6 +12278,11 @@ bool ggml_cuda_moe_grouped_context::graph_resource_fingerprint_locked(
         moe_grouped_resource_fingerprint_add(result, device.plan);
         moe_grouped_resource_fingerprint_add(result, device.plan_bytes);
         moe_grouped_resource_fingerprint_add(result, device.device_banks);
+        if (device.materialization != nullptr) {
+            moe_grouped_resource_fingerprint_add(result, device.materialization->storage.payload_alias);
+            moe_grouped_resource_fingerprint_add(result, device.materialization->device_control);
+            moe_grouped_resource_fingerprint_add(result, device.materialization->storage.tiles);
+        }
         moe_grouped_resource_fingerprint_add(result, device.device_auxiliaries);
         moe_grouped_resource_fingerprint_add(result, device.original_auxiliary_bytes);
         moe_grouped_resource_fingerprint_add(result, resource->snapshot.n_original_auxiliaries);
@@ -16177,27 +16283,39 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
         GGML_LOG_ERROR("moe-cache-host: budget cannot pin mandatory auxiliary sources\n");
         return false;
     }
-    size_t direct = 0;
-    bool staged = false;
+    size_t bytes_per_slot = 0;
+    uint32_t max_retained_slots = UINT32_MAX;
     for (uint32_t i = 0; i < groups.size(); ++i) {
         if (groups[i].empty()) {
             continue;
         }
         if (!complete[i]) {
-            GGML_LOG_WARN("moe-cache-host: admission group=%u reason=incomplete_group\n", i);
-            staged = true;
-        } else if (moe_host_register(*owner, groups[i], false, i)) {
-            ++direct;
-        } else {
-            staged = true;
+            GGML_LOG_WARN("moe-cache-host: retention group=%u reason=incomplete_group\n", i);
+            continue;
         }
+        size_t group_bytes = 0;
+        for (const auto * source : groups[i]) {
+            if (source->expert_stride > SIZE_MAX - group_bytes) {
+                return false;
+            }
+            group_bytes += source->expert_stride;
+        }
+        size_t rounded = 0;
+        if (!moe_host_round_size(group_bytes, rounded) || rounded > SIZE_MAX - bytes_per_slot) {
+            return false;
+        }
+        bytes_per_slot += rounded;
+        max_retained_slots = std::min(max_retained_slots,
+            static_cast<uint32_t>(groups[i][0]->size / groups[i][0]->expert_stride) - 1);
     }
-    if (staged) {
+    if (bytes_per_slot != 0) {
+        const size_t available = owner->limit - owner->staging_reserved - owner->source_bytes;
+        owner->retained_extra_slots = static_cast<uint32_t>(std::min<size_t>(max_retained_slots, available / bytes_per_slot));
         owner->copy_worker.start();
     }
     owner->configured = true;
-    GGML_LOG_INFO("moe-cache-host: limit=%zu source=%zu staging_reserved=%zu direct_groups=%zu total_groups=%zu\n",
-        owner->limit, owner->source_bytes, owner->staging_reserved, direct, groups.size());
+    GGML_LOG_INFO("moe-cache-host: limit=%zu source=%zu staging_reserved=%zu retained_extra_slots_per_group=%u total_groups=%zu\n",
+        owner->limit, owner->source_bytes, owner->staging_reserved, owner->retained_extra_slots, groups.size());
     return true;
 }
 

@@ -109,8 +109,11 @@ moe_host_budget::moe_host_budget(size_t limit, bool automatic) : limit(limit), a
 moe_host_budget::~moe_host_budget() {
     copy_worker.stop();
     GGML_ASSERT(staging_bytes == 0 && staging_optional_bytes == 0);
-    GGML_LOG_INFO("moe-cache-host: limit=%zu source=%zu staging_peak=%zu pinned_peak=%zu materialized=%llu helper_jobs=%llu\n",
+    GGML_LOG_INFO("moe-cache-host: limit=%zu source=%zu staging_peak=%zu pinned_peak=%zu materialized=%llu retained_hits=%llu retained_misses=%llu retained_evictions=%llu helper_jobs=%llu\n",
         limit, source_bytes, staging_peak, source_bytes + staging_peak, (unsigned long long) materialized_bytes.load(std::memory_order_relaxed),
+        (unsigned long long) retained_hits.load(std::memory_order_relaxed),
+        (unsigned long long) retained_misses.load(std::memory_order_relaxed),
+        (unsigned long long) retained_evictions.load(std::memory_order_relaxed),
         (unsigned long long) copy_worker.submitted);
     for (const auto & range : registered) {
         CUDA_CHECK(cudaHostUnregister(reinterpret_cast<void *>(range.begin)));
@@ -531,6 +534,18 @@ void ggml_backend_cuda_moe_cached_free_buffer_type(ggml_backend_buffer_type_t bu
     }
 }
 
+extern "C"
+bool ggml_backend_cuda_moe_host_pinned_stats(ggml_backend_buffer_type_t buft, size_t * used, size_t * peak) {
+    auto * owner = moe_host_budget_for(buft);
+    if (owner == nullptr || used == nullptr || peak == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(owner->mutex);
+    *used = owner->source_bytes + owner->staging_bytes;
+    *peak = owner->source_bytes + owner->staging_peak;
+    return true;
+}
+
 bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_source *> & sources, bool require_identity, uint32_t group) {
     if (sources.empty()) {
         return true;
@@ -636,6 +651,17 @@ bool moe_host_register(moe_host_budget & owner, const std::vector<moe_host_sourc
         ++pinned;
     }
     for (size_t i = 0; failure == nullptr && i < sources.size(); ++i) {
+        const uintptr_t begin = reinterpret_cast<uintptr_t>(sources[i]->data);
+        const uintptr_t end = begin + sources[i]->size;
+        const auto contains_source = [begin, end](const moe_host_range & range) {
+            return range.begin <= begin && end <= range.end;
+        };
+        // Grouped gather uses one linear device alias for each source.
+        if (std::none_of(ranges.begin(), ranges.end(), contains_source) &&
+                std::none_of(owner.registered.begin(), owner.registered.end(), contains_source)) {
+            failure = "source_spans_registrations";
+            break;
+        }
         error = cudaHostGetDevicePointer(&aliases[i], const_cast<char *>(sources[i]->data), 0);
         if (error != cudaSuccess || aliases[i] == nullptr) {
             failure = "device_alias_unavailable";

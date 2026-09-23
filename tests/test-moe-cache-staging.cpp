@@ -467,9 +467,12 @@ static void test_grouped_decode_type(
         bool mixed = false) {
     grouped_decode_fixture fixture(device, pinned, grouped_decode_fixture::SOURCE_BYTES, grouped_decode_fixture::N_EXPERTS, host_budget);
     ggml_tensor * registration_prefix = nullptr;
-#ifdef __linux__
     if (pinned && host_budget == 65536) {
+#ifdef __linux__
         const long page = sysconf(_SC_PAGESIZE);
+#else
+        const size_t page = 4096;
+#endif
         CHECK(page > 128);
         const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(fixture.source_buffer));
         fixture.source_offset = 2 * static_cast<size_t>(page) - base % page - 128;
@@ -477,7 +480,6 @@ static void test_grouped_decode_type(
         ggml_set_name(registration_prefix, "test.registration_prefix");
         fixture.source_offset += 64 - ggml_nbytes(registration_prefix);
     }
-#endif
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
     std::array<ggml_backend_moe_candidate_bank_v1, 4> banks = {};
@@ -495,7 +497,7 @@ static void test_grouped_decode_type(
         GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT,
     };
     for (uint32_t bank = 0; bank < n_banks; ++bank) {
-        const int64_t ne0 = type == GGML_TYPE_Q4_K ? 256 : type == GGML_TYPE_Q4_0 ? 32 : 64;
+        const int64_t ne0 = ggml_blck_size(type) > 1 ? ggml_blck_size(type) : 64;
         const int64_t ne1 = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP && bank == 0 ? 2 * ne0 : ne0;
         weights[bank] = fixture.weight(type, ne0, ne1);
         banks[bank].tensor = weights[bank];
@@ -558,19 +560,12 @@ static void test_grouped_decode_type(
         const auto source_snapshot = candidate_snapshot_v2(
             n_slots, source_groups.data(), source_groups.size(), sources.data(), sources.size());
         CHECK(ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_get_type(fixture.source_buffer), &source_snapshot));
-        int read_only_supported = 0;
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11010
-        if (!pinned) {
-            CUDA_OK(cudaDeviceGetAttribute(&read_only_supported, cudaDevAttrHostRegisterReadOnlySupported, device));
-        }
-#endif
         for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
-            const bool budget_admits = mixed ? group_index == 0 : host_budget >= 49152;
-            const bool direct = budget_admits && (pinned || read_only_supported);
             for (uint32_t bank = 0; bank < n_banks; ++bank) {
                 cudaPointerAttributes attributes = {};
                 CUDA_OK(cudaPointerGetAttributes(&attributes, groups[group_index].banks[bank].tensor->data));
-                CHECK(attributes.type == (direct ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
+                const bool prefix_registered = registration_prefix != nullptr && bank == 0;
+                CHECK(attributes.type == (prefix_registered ? cudaMemoryTypeHost : cudaMemoryTypeUnregistered));
             }
         }
     }
@@ -770,6 +765,10 @@ static void test_grouped_decode_type(
         }
         fprintf(stderr, "test-moe-cache: bounded sources allocated=%d budget=%zu mixed=%d registration_boundary=%d grouped/ordinary/split exact OK\n",
             pinned, host_budget, mixed, registration_prefix != nullptr);
+        size_t used = 0;
+        size_t peak = 0;
+        CHECK(ggml_backend_cuda_moe_host_pinned_stats(ggml_backend_buffer_get_type(fixture.source_buffer), &used, &peak));
+        CHECK(used <= host_budget && peak <= host_budget);
     }
     CUDA_OK(cudaStreamDestroy(wrong_stream));
     CUDA_OK(cudaStreamDestroy(stream));
@@ -1254,13 +1253,14 @@ void test_grouped_decode(int device) {
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, true, 12);
     test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false);
     for (bool allocated : {false, true}) {
-        // Three staging families remain live for a pageable group. Keep one
-        // minimum-only case and two cases with enough room for direct sources.
+        // Three staging families remain live for a pageable group.
         for (size_t budget : {size_t{32768}, size_t{49152}, size_t{65536}}) {
             test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, budget);
         }
         test_grouped_decode_type(device, GGML_TYPE_Q4_0, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, allocated, 4, false, 81920, true);
     }
+    test_grouped_decode_type(device, GGML_TYPE_IQ3_XXS, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE,
+        true, 4, false, 512 * 1024);
     for (ggml_type type : {GGML_TYPE_BF16, GGML_TYPE_NVFP4}) {
         for (uint32_t layout : {GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP}) {
             for (uint32_t n_slots : {12u, 48u}) {

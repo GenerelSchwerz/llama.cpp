@@ -76,12 +76,16 @@ struct GGML_CUDA_MOE_HOST_HIDDEN moe_host_budget {
     size_t staging_bytes = 0;
     size_t staging_optional_bytes = 0;
     size_t staging_peak = 0;
+    uint32_t retained_extra_slots = 0;
     bool configured = false;
     std::mutex mutex;
     std::vector<ggml_backend_buffer_t> backing;
     std::vector<moe_host_range> registered;
     std::unordered_map<const ggml_tensor *, moe_host_source> sources;
     std::atomic<uint64_t> materialized_bytes{0};
+    std::atomic<uint64_t> retained_hits{0};
+    std::atomic<uint64_t> retained_misses{0};
+    std::atomic<uint64_t> retained_evictions{0};
     moe_host_copy_worker copy_worker;
 };
 
