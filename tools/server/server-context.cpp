@@ -1028,7 +1028,7 @@ private:
                     ? std::min(params_base.n_batch, params_base.n_ubatch)
                     : params_base.n_batch;
             common_validate_speculative_params(
-                    params_base.speculative, params_base.n_ubatch, target_ubatch_effective);
+                    params_base.speculative, target_ubatch_effective);
         } catch (const std::invalid_argument & e) {
             SRV_ERR("invalid speculative configuration: %s\n", e.what());
             return false;
