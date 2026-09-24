@@ -25,7 +25,6 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
 
 void common_validate_speculative_params(
         const common_params_speculative & params,
-        int32_t target_ubatch_raw,
         int32_t target_ubatch_effective);
 
 // return the max number of draft tokens based on the speculative parameters

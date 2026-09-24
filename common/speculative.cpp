@@ -2614,7 +2614,6 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
 
 void common_validate_speculative_params(
         const common_params_speculative & params,
-        int32_t target_ubatch_raw,
         int32_t target_ubatch_effective) {
     uint32_t model_backed_types = 0;
     uint32_t n_model_backed = 0;
@@ -2640,13 +2639,6 @@ void common_validate_speculative_params(
 
     const bool has_mtp = std::find(
             params.types.begin(), params.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
-
-    if (has_mtp && params.draft.n_ubatch > 0 && target_ubatch_raw > 0 && params.draft.n_ubatch != target_ubatch_raw) {
-        throw std::invalid_argument(string_format(
-                "draft-mtp requires spec-draft-ubatch-size (%d) to match the target ubatch (%d); "
-                "omit the draft override or use the target ubatch",
-                params.draft.n_ubatch, target_ubatch_raw));
-    }
 
     if (params.mtp_rs_planes == 0) {
         return;

@@ -428,9 +428,9 @@ static void test(void) {
         int32_t capped;
     };
     const mtp_parse_case mtp_cases[] = {
-        { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "--ubatch-size", "512", "--spec-draft-ubatch-size", "128" }, true, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "512" }, true, -1, -1, -1 },
-        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, false, -1, -1, -1 },
+        { { "--spec-type", "draft-mtp", "-b", "256", "-ub", "512", "-ubd", "256" }, true, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "512", "-ubd", "512" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "256", "--spec-mtp-rs-planes", "2", "-b", "256", "-ub", "0" }, false, -1, -1, -1 },
         { { "--spec-type", "draft-mtp", "--spec-draft-n-max", "8" }, true, 0, 8, false },
@@ -802,37 +802,29 @@ static void test_mtp_draft_ubatch_validation() {
     common_params_speculative params;
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
 
-    common_validate_speculative_params(params, 512, 512);
+    common_validate_speculative_params(params, 512);
     params.draft.n_ubatch = 512;
-    common_validate_speculative_params(params, 512, 512);
+    common_validate_speculative_params(params, 512);
 
     params.draft.n_ubatch = 128;
-    bool rejected = false;
-    try {
-        common_validate_speculative_params(params, 512, 512);
-    } catch (const std::invalid_argument &) {
-        rejected = true;
-    }
-    assert(rejected);
-
-    common_validate_speculative_params(params, 0, 512);
+    common_validate_speculative_params(params, 512);
 
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
-    common_validate_speculative_params(params, 512, 512);
+    common_validate_speculative_params(params, 512);
 
     params.draft.n_ubatch = 0;
     params.draft.n_max = 8;
     params.mtp_rs_planes = 2;
-    rejected = false;
+    bool rejected = false;
     try {
-        common_validate_speculative_params(params, 512, 512);
+        common_validate_speculative_params(params, 512);
     } catch (const std::invalid_argument &) {
         rejected = true;
     }
     assert(rejected);
 
     params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-    common_validate_speculative_params(params, 512, 512);
+    common_validate_speculative_params(params, 512);
 }
 
 static void test_model_backed_speculative_validation() {
@@ -853,15 +845,15 @@ static void test_model_backed_speculative_validation() {
 
     common_params_speculative params;
     params.types = draftless;
-    common_validate_speculative_params(params, 512, 512);
+    common_validate_speculative_params(params, 512);
 
     for (const common_speculative_type type : model_backed) {
         params.types = draftless;
         params.types.insert(params.types.begin() + 2, type);
-        common_validate_speculative_params(params, 512, 512);
+        common_validate_speculative_params(params, 512);
 
         params.types = { type, type };
-        common_validate_speculative_params(params, 512, 512);
+        common_validate_speculative_params(params, 512);
     }
 
     const size_t n_model_backed = sizeof(model_backed) / sizeof(model_backed[0]);
@@ -874,7 +866,7 @@ static void test_model_backed_speculative_validation() {
             };
             bool rejected = false;
             try {
-                common_validate_speculative_params(params, 512, 512);
+                common_validate_speculative_params(params, 512);
             } catch (const std::invalid_argument &) {
                 rejected = true;
             }
