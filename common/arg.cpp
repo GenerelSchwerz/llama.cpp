@@ -1467,7 +1467,7 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         }
         common_params_kvarn_normalize(ctx_arg.params);
         ctx_arg.params.lr.init();
-        common_validate_speculative_params(ctx_arg.params.speculative, ctx_arg.params.n_ubatch);
+        common_validate_speculative_params(ctx_arg.params.speculative);
         common_validate_reasoning_loop_guard_params(ctx_arg.params.reasoning_loop_guard);
         ctx_arg.params.sampling.reasoning_budget_tracking =
             ctx_arg.params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF;
@@ -4513,8 +4513,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_MTP_RS_PLANES"));
     add_opt(common_arg(
         {"--spec-draft-ubatch-size", "--ubatch-size-draft", "-ubd"}, "N",
-        "physical maximum batch size for the draft context (default: 0, inherit target ubatch); "
-        "draft-mtp requires 0 or the target ubatch to preserve recurrent prompt synchronization",
+        "physical maximum batch size for the draft context (default: 0, inherit target ubatch)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");

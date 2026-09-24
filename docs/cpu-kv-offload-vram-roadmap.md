@@ -191,7 +191,6 @@ churn, and report pinned bytes independently from device VRAM.
 | Forced CPU attention | Rejected: severe decode loss without the required memory outcome. |
 | Broad zero-copy CUDA reads from mapped host KV | Rejected: prompt and decode kernel slowdown. |
 | Lossless Q8 transfer compression | Rejected: insufficient measured redundancy for complexity. |
-| Smaller MTP draft ubatch | Rejected for MTP exactness; retained only as a generic non-MTP control. |
 | Host recurrent checkpoints | Rejected; selected full-geometry GPU replay replaced them. |
 | F16 persistent recurrent S state | Rejected by deterministic PPL increase. |
 | Independently normalized positive staging chunks | Rejected for exact serving; chunk zero only. |

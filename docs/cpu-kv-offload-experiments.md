@@ -1,5 +1,9 @@
 # CPU KV-offload experiments
 
+Current `beellama/main` permits an explicit MTP draft ubatch that differs from
+the target. Experiment 017 and its validator notes record the earlier
+output-exactness policy; the measurements and commands below remain historical.
+
 For the current runnable build, server arguments, exactness oracle, benchmark
 shape, progress mechanism, and required artifacts, use
 [`cpu-kv-offload-current-testing.md`](cpu-kv-offload-current-testing.md). This

@@ -1,5 +1,8 @@
 # RTX 4070 / Qwen3.8 IQ2_M results archive
 
+The MTP draft-ubatch restriction described below was later removed from
+`beellama/main`. The results and labels remain as recorded at the time.
+
 This directory holds the raw artifacts backing Characterizations 020-026 in
 [`cpu-kv-offload-experiments.md`](../cpu-kv-offload-experiments.md): a
 baseline/`draft-mtp`/`draft-dspark` comparison run on a second, weaker

@@ -1,5 +1,8 @@
 # MTP output exactness: retained investigation and reproduction record
 
+Current `beellama/main` permits a different MTP draft ubatch. The matching
+validator described below belonged to the earlier output-exactness policy.
+
 This document records the oracle decision, decision-relevant diagnostics,
 retained implementation, automated harness, reproducible valid results, and
 limitations for making BeeLlama's MTP output independent of target/draft Q8 KV

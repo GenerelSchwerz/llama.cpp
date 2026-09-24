@@ -90,9 +90,9 @@ other unsupported layouts intentionally retain the full plan. The server asks
 CUDA to trim transient-pool mappings only after all slots become idle and only
 when bounded sizing was effective.
 
-MTP must use the target physical ubatch. Omit
-`--spec-draft-ubatch-size`, or set it equal to `--ubatch-size` only when the
-explicit parser path is under test. A different MTP draft ubatch is rejected.
+MTP inherits the target physical ubatch unless `--spec-draft-ubatch-size` is
+set. A different draft ubatch can change later output because it changes prompt
+synchronization chunks.
 
 The published KV base does **not** contain native quantized FlashAttention,
 compact causal masking, or bounded host-KV attention staging. Do not expect

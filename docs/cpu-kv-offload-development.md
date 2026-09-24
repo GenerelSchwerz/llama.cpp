@@ -819,14 +819,16 @@ grew from 299.25 MiB to 598.50, 897.75, and 1,346.62 MiB. On the artificial
 repeated-token sample, depth 5 was fastest at 68.92 t/s; depth 8 fell to 61.60
 t/s as acceptance dropped to 0.632 while using another 450 MiB.
 
-The independent draft-context ubatch control remains available to non-MTP
-model-backed speculation, but its MTP use is rejected. The original 64-token
+The independent draft-context ubatch control is available to MTP and other
+model-backed speculation. The original 64-token
 MTP-5 screen reported identical visible output and draft counts while draft
 ubatch 128 reduced live process VRAM from 14,922 to 14,834 MiB. That gate was
 too short: a later 1,000-token MTP-2 run diverged from inherited-512 clean Bee
 output at generated token 100 for draft ubatches 128 and 32. Trace logs showed
 the first acceptance-cycle regrouping at token 60 after the 149-token prompt
-was synchronized as `128 + 21` rather than one call.
+was synchronized as `128 + 21` rather than one call. A different MTP draft
+ubatch therefore changes the output-stability contract and needs a workload
+check when that matters.
 
 The current fail-closed policy accepts an omitted value or an explicit value
 equal to target ubatch, rejects other values for `draft-mtp` through CLI,

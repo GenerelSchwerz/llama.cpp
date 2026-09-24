@@ -30,7 +30,7 @@ endpoint are outside this delta.
 | `--recurrent-state-offload` / `--no-recurrent-state-offload` | Keeps supported hybrid recurrent R/S state on the accelerator independently of host attention KV. | Off |
 | `--kv-gpu-layers N` | Places the first `N` independently owned target attention-KV layers on the accelerator under host-KV policy. | `0` |
 | `--spec-draft-kv-gpu-layers N` | Overrides target placement for independently owned draft KV. Omission inherits target policy; zero explicitly selects host placement. | Inherit |
-| `--spec-draft-ubatch-size N` | Gives a separate model-backed draft context its own physical ubatch. For MTP it must be omitted/inherited or equal to target ubatch. | Inherit |
+| `--spec-draft-ubatch-size N` | Gives a separate model-backed draft context its own physical ubatch, including MTP. | Inherit |
 | `--spec-mtp-rs-planes N` | Caps total target recurrent planes, including the current plane; zero resolves to full `draft_max + 1`. | Full |
 | `--phase-aware-workspace` / `--no-phase-aware-workspace` | Enables explicit prompt/generation reservation transitions and shared backing for supported sequential target/MTP schedulers. | Off |
 | `--live-context-workspace` / `--no-live-context-workspace` | Bounds supported standard-attention graph reservations by padded live physical KV extent; merged after the core source checkpoint through PR 8. | Off |
@@ -100,13 +100,12 @@ new-row store stage and D2H traffic are separate from the much larger repeated
 history transfer used by CUDA attention. Unsupported store/execution routes
 fail during route construction rather than silently changing quantization.
 
-### Independent draft ubatch with an MTP restriction
+### Independent draft ubatch
 
-Separate model-backed speculative contexts may use an independent physical
-draft ubatch. Integrated MTP cannot: long-output testing showed that changing
-MTP prompt/recurrent chunk geometry can diverge after short screens have
-passed. Complete speculative-mode validation therefore rejects an MTP draft
-ubatch that differs from target ubatch, independent of option parsing order.
+Separate model-backed speculative contexts, including MTP, may use an
+independent physical draft ubatch. MTP prompt synchronization uses that size,
+so changing it can change later output even when short screens agree. Omission
+still inherits the target ubatch.
 
 ### Configurable MTP recurrent planes
 
