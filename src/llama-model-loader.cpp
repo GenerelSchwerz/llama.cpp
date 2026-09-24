@@ -9,12 +9,18 @@
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <future>
 #include <regex>
+
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1665,6 +1671,58 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+static void llama_read_moe_cache_tensor(llama_file & file, void * data, size_t size, size_t offset) {
+#ifdef __linux__
+    if (size >= 64*MiB && !file.has_direct_io()) {
+        static const size_t requested_workers = [] {
+            size_t n = 4;
+            if (const char * value = std::getenv("LLAMA_MOE_CACHE_LOAD_THREADS")) {
+                char * end = nullptr;
+                errno = 0;
+                const long parsed = std::strtol(value, &end, 10);
+                if (errno == 0 && end != value && *end == '\0' && parsed > 0) {
+                    n = std::min<size_t>(parsed, 32);
+                }
+            }
+            return n;
+        }();
+        const size_t n_workers = std::min(requested_workers, size/(32*MiB));
+        if (n_workers > 1) {
+            const int fd = file.file_id();
+            std::vector<std::future<void>> reads;
+            reads.reserve(n_workers);
+            for (size_t i = 0; i < n_workers; ++i) {
+                const size_t first = size/n_workers*i;
+                const size_t last  = i + 1 == n_workers ? size : size/n_workers*(i + 1);
+                reads.emplace_back(std::async(std::launch::async, [=] {
+                    size_t pos = first;
+                    while (pos < last) {
+                        const size_t chunk = std::min(last - pos, 64*MiB);
+                        const ssize_t n = pread(fd, static_cast<uint8_t *>(data) + pos, chunk, offset + pos);
+                        if (n < 0 && errno == EINTR) {
+                            continue;
+                        }
+                        if (n < 0) {
+                            throw std::runtime_error(format("read error: %s", strerror(errno)));
+                        }
+                        if (n == 0) {
+                            throw std::runtime_error("unexpectedly reached end of file");
+                        }
+                        pos += n;
+                    }
+                }));
+            }
+            for (auto & read : reads) {
+                read.get();
+            }
+            return;
+        }
+    }
+#endif
+    file.seek(offset, SEEK_SET);
+    file.read_raw(data, size);
+}
+
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1916,8 +1974,7 @@ bool llama_model_loader::load_all_data(
                         ggml_backend_reg_get_proc_address(reg, GGML_BACKEND_MOE_CACHE_WRITABLE_LOAD_DATA_PROC_NAME)) : nullptr;
                     void * data = writable_load_data != nullptr ? writable_load_data(cur->buffer, cur->data, n_size) : nullptr;
                     if (data != nullptr) {
-                        file->seek(weight->offs, SEEK_SET);
-                        file->read_raw(data, n_size);
+                        llama_read_moe_cache_tensor(*file, data, n_size, weight->offs);
                         if (check_tensors) {
                             validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                                 return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
