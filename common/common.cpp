@@ -1373,6 +1373,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    if (params.decode_overlap && llama_model_n_devices(model) != 1) {
+        cparams.n_rs_seq = params.speculative.need_n_rs_seq();
+    }
+
     // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         llama_adapter_lora_ptr lora;
