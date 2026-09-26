@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="528" viewBox="0 0 1200 528" role="img" aria-labelledby="title desc">
+  <title id="title">How the MoE expert cache uses GPU, RAM, and storage</title>
+  <desc id="desc">A GGUF model file on storage backs expert weights in host memory. On a cache miss, a selected expert moves to a budgeted cache in GPU memory. Cached experts are reused for later tokens. Other GPU model work sits beside the expert cache.</desc>
+  <rect width="1200" height="528" rx="24" fill="#0d1422"/>
+  <text x="48" y="51" fill="#f8fafc" font-family="DejaVu Sans, Arial, sans-serif" font-size="26" font-weight="700">Where the model lives</text>
+  <text x="48" y="78" fill="#aebbd0" font-family="DejaVu Sans, Arial, sans-serif" font-size="16">The expert cache is a GPU tier; the full model does not have to fit in VRAM.</text>
+
+  <rect x="48" y="105" width="1104" height="122" rx="16" fill="#142b48" stroke="#4e9be9" stroke-width="2"/>
+  <rect x="48" y="105" width="12" height="122" rx="6" fill="#58a6ff"/>
+  <text x="82" y="143" fill="#87c5ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">GPU VRAM</text>
+  <text x="82" y="170" fill="#dbeafe" font-family="DejaVu Sans, Arial, sans-serif" font-size="15">Fast compute</text>
+  <rect x="286" y="124" width="418" height="84" rx="11" fill="#245b91"/>
+  <text x="307" y="158" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Expert cache</text>
+  <text x="307" y="184" fill="#e6f4ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Budgeted slots; hits are reused on GPU</text>
+  <rect x="716" y="124" width="416" height="84" rx="11" fill="#1d4269"/>
+  <text x="737" y="158" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Other GPU model work</text>
+  <text x="737" y="184" fill="#d8eaff" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Layers, state, and runtime buffers</text>
+
+  <path d="M 495 279 L 495 241" fill="none" stroke="#f6b36a" stroke-width="3"/>
+  <path d="M 487 250 L 495 238 L 503 250" fill="none" stroke="#f6b36a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="527" y="235" width="179" height="30" rx="15" fill="#0d1422"/>
+  <text x="542" y="256" fill="#f8cb9d" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">on a cache miss</text>
+
+  <rect x="48" y="278" width="1104" height="113" rx="16" fill="#3e291c" stroke="#e89953" stroke-width="2"/>
+  <rect x="48" y="278" width="12" height="113" rx="6" fill="#f4a261"/>
+  <text x="82" y="316" fill="#ffbe86" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">SYSTEM RAM</text>
+  <text x="82" y="343" fill="#ffe7d0" font-family="DejaVu Sans, Arial, sans-serif" font-size="15">Host backing</text>
+  <rect x="286" y="297" width="846" height="75" rx="11" fill="#8b4f23"/>
+  <text x="307" y="328" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Expert weights and mapped pages</text>
+  <text x="307" y="353" fill="#fff0df" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Pinned where possible; pageable staging remains available where supported</text>
+
+  <path d="M 495 438 L 495 404" fill="none" stroke="#b5cc79" stroke-width="3"/>
+  <path d="M 487 413 L 495 401 L 503 413" fill="none" stroke="#b5cc79" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="527" y="395" width="191" height="30" rx="15" fill="#0d1422"/>
+  <text x="542" y="416" fill="#d8e5ad" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">loaded or mapped</text>
+
+  <rect x="48" y="437" width="1104" height="67" rx="16" fill="#29351f" stroke="#9ebd66" stroke-width="2"/>
+  <rect x="48" y="437" width="12" height="67" rx="6" fill="#b3cf7c"/>
+  <text x="82" y="479" fill="#cfe5a3" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">STORAGE</text>
+  <rect x="286" y="451" width="846" height="39" rx="9" fill="#566c35"/>
+  <text x="307" y="477" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">GGUF model file</text>
+</svg>
