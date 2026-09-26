@@ -78,9 +78,14 @@ Use a MiB budget **or** a nonzero slot count. Both are off by default. Eligible 
 
 ## Job Outreach
 
-I'm a recent computer science graduate interested in AI development (especially local AI), low-level programming, and embedded systems. If your team is hiring in these areas, [email me](mailto:rocco.generel@gmail.com). If this fork has been useful, you can [support my work on Ko-fi](https://ko-fi.com/generel).
+I'm a recent computer science graduate interested in AI development (especially local AI), low-level programming, and embedded systems. If your team is hiring in these areas, [email me](mailto:rocco.generel@gmail.com).
+
+If this fork has been useful, you can support my work on Ko-fi.
+
+<a href="https://ko-fi.com/generel"><img src="media/support-me-on-kofi.png" alt="Support me on Ko-fi" width="245"></a>
 
 ## References
 
 - Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml).
 - Code is under the repository's [MIT license](LICENSE); model files have their own licenses.
+- [Ko-fi button artwork](https://more.ko-fi.com/brand-assets) is from Ko-fi's brand kit.
