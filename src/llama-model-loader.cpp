@@ -1404,7 +1404,34 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
-                    if (overrides->buft == ggml_backend_cpu_buffer_type()) {
+                    const size_t index = static_cast<size_t>(overrides - tensor_buft_overrides);
+                    const uint32_t origin = tensor_buft_override_origins != nullptr ?
+                        tensor_buft_override_origins[index] : TENSOR_OVERRIDE_USER;
+                    bool vulkan_resident = false;
+                    if (const char * value = std::getenv("LLAMA_EXPERIMENTAL_MOE_VULKAN_RESIDENT");
+                            value != nullptr && std::strcmp(value, "1") == 0 &&
+                            (origin == TENSOR_OVERRIDE_CACHE_LEGACY || origin == TENSOR_OVERRIDE_CACHE_SELECTOR) &&
+                            buft_list != nullptr && !buft_list->empty()) {
+                        auto * cache_dev = ggml_backend_buft_get_device(overrides->buft);
+                        auto * cache_reg = cache_dev != nullptr ? ggml_backend_dev_backend_reg(cache_dev) : nullptr;
+                        auto is_cache = cache_reg != nullptr ? (ggml_backend_moe_cache_is_buffer_type_t)
+                            ggml_backend_reg_get_proc_address(cache_reg, GGML_BACKEND_MOE_CACHE_IS_BUFFER_TYPE_PROC_NAME) : nullptr;
+                        auto * layer_dev = buft_list->front().first;
+                        auto * layer_reg = layer_dev != nullptr ? ggml_backend_dev_backend_reg(layer_dev) : nullptr;
+                        if (is_cache != nullptr && is_cache(overrides->buft) && layer_reg != nullptr &&
+                                std::strcmp(ggml_backend_reg_name(layer_reg), "Vulkan") == 0) {
+                            buft_list_t resident_bufts = {{layer_dev, ggml_backend_dev_buffer_type(layer_dev)}};
+                            buft = select_weight_buft(hparams, t_meta, op, &resident_bufts);
+                            if (buft == nullptr) {
+                                throw std::runtime_error(format("Vulkan resident expert tensor %s is unsupported on %s",
+                                    tensor_name.c_str(), ggml_backend_dev_name(layer_dev)));
+                            }
+                            vulkan_resident = true;
+                            LLAMA_LOG_INFO("experimental mixed MoE: %s -> %s (%zu MiB, full resident experts)\n",
+                                tensor_name.c_str(), ggml_backend_buft_name(buft), ggml_nbytes(t_meta) / MiB);
+                        }
+                    }
+                    if (!vulkan_resident && overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
                         if (use_mmap) {
@@ -1413,7 +1440,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                                 LLAMA_LOG_WARN("llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance\n");
                             });
                         }
-                    } else {
+                    } else if (!vulkan_resident) {
                         buft = overrides->buft;
                     }
 
@@ -1421,12 +1448,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                             ggml_backend_buft_name(buft));
-                    const size_t index = static_cast<size_t>(overrides - tensor_buft_overrides);
                     if (index > INT32_MAX) {
                         throw std::runtime_error("too many tensor buffer overrides for placement provenance");
                     }
-                    resolution.origin = tensor_buft_override_origins != nullptr ?
-                        tensor_buft_override_origins[index] : TENSOR_OVERRIDE_USER;
+                    resolution.origin = origin;
                     resolution.index = static_cast<int32_t>(index);
                     resolution.pattern = overrides->pattern;
                     resolution.requested_buft = ggml_backend_buft_name(overrides->buft);

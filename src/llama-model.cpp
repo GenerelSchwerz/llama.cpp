@@ -2049,6 +2049,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         if (resolution != ml.tensor_override_resolutions.end() &&
                 (resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_LEGACY ||
                  resolution->second.origin == llama_model_loader::TENSOR_OVERRIDE_CACHE_SELECTOR) &&
+                resolution->second.selected_buft == resolution->second.requested_buft &&
                 resolution->second.selected_buft == resolution->second.resolved_buft) {
             // The shared host buffer identifies its provider, not the layer's execution device.
             ggml_backend_dev_t owner = pimpl->dev_layer.at(tn.bid).dev;
