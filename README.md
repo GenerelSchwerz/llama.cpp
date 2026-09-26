@@ -3,6 +3,9 @@
 <p align="center"><strong>A CUDA expert tier for GGUF mixture-of-experts models.</strong><br>
 Keep frequently used experts on your GPU while other expert weights stay in host memory.</p>
 
+> [!NOTE]
+> **I'm looking for work** in AI development, especially local AI, low-level programming, and high-performance computing (HPC). If you're hiring, [find me on GitHub](https://github.com/GenerelSchwerz). You can also [support my work on Ko-fi](https://ko-fi.com/generel).
+
 > [!TIP]
 > **New here? Start with the [MoE Cache wiki guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/MoE-Cache).** It covers the build, setup, and limits. From there, choose a [hardware guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Hardware-Setup-Guides), follow the [Windows WDDM instructions](https://github.com/GenerelSchwerz/llama.cpp/wiki/Windows-WDDM-Partial-Pinning), or use the [Docker Compose guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Docker-Compose-for-Large-MoE-Models).
 
@@ -75,9 +78,5 @@ Use a MiB budget **or** a nonzero slot count. Both are off by default. Eligible 
 - [Build with CUDA](docs/build.md#cuda) and [use the server](tools/server/README.md).
 - [Multi-GPU behavior](docs/moe-grouped-multigpu.md) - layer-split cache placement and validation. Tensor split with the cache enabled is unsupported.
 - [Benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) - stock versus fork measurements and per-model reproduction records.
-
-## Work with me
-
-I'm looking for a job in GPU inference, systems engineering, or local AI based on the work in this fork. Find me on [GitHub](https://github.com/GenerelSchwerz). If this project helps you, you can [support me on Ko-fi](https://ko-fi.com/generel).
 
 Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml). Code is under the repository's [MIT license](LICENSE); model files have their own licenses.
