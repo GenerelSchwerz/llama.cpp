@@ -1359,6 +1359,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         const auto record_resolution = [&](tensor_override_resolution resolution) {
+            if (flags & TENSOR_DUPLICATED) {
+                return;
+            }
             const auto [it, inserted] = tensor_override_resolutions.emplace(tn.str(), resolution);
             if (!inserted && !(it->second == resolution)) {
                 throw std::runtime_error(format("conflicting placement provenance for tensor %s", tn.str().c_str()));
