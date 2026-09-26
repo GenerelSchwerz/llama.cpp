@@ -1,36 +1,30 @@
-<h1 align="center">llama.cpp / MoE Cache</h1>
+<h1 align="center">MoE Cache for llama.cpp</h1>
 
-<p align="center"><strong>Run MoE models with an expert cache sized for your NVIDIA GPU.</strong><br>
-A maintained <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> fork for models whose expert weights exceed VRAM.</p>
+<p align="center"><strong>A CUDA expert tier for GGUF mixture-of-experts models.</strong><br>
+Keep frequently used experts on your GPU while other expert weights stay in host memory.</p>
 
----
+![Expert weights moving from a GGUF file through host backing into a budgeted CUDA cache](media/moe-cache-memory.svg)
 
-## What does this fork do?
+This maintained [llama.cpp](https://github.com/ggml-org/llama.cpp) fork adds an **opt-in expert cache** for MoE models whose expert weights exceed VRAM. It keeps the familiar llama.cpp server and API. Without a cache flag, normal llama.cpp model placement remains available.
 
-A mixture-of-experts (MoE) model has many expert networks, but calls on only a few at a time. This fork keeps a configurable set of experts on the GPU and brings in the rest from host memory when needed.
+> **NVIDIA CUDA only today.** The MoE cache requires an NVIDIA GPU. Have an AMD GPU or another system with separate RAM and VRAM? Join the [OptLlama Discord](https://discord.gg/ZWD8TbHXxs) to discuss support.
 
-- **Use the VRAM you have.** Set a GPU cache budget instead of trying to fit every expert in VRAM.
-- **Keep the llama.cpp workflow.** Run `llama-server` for a local chat page and OpenAI-compatible API.
-- **Opt in when you need it.** The expert cache is CUDA-only and off by default; other llama.cpp models and backends remain available.
+## Measured results
 
-> Jump to: [Is my PC enough?](#is-my-pc-enough) | [Get started](#get-started) | [How it works](#how-it-works) | [Cache controls](#cache-controls) | [Full docs](#full-documentation)
+Selected single-request decode results from the [full benchmark comparison](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase):
 
----
+| Model | Stock llama.cpp | MoE cache fork | Peak VRAM difference |
+| --- | ---: | ---: | ---: |
+| Qwen3.6 35B | 42.8 tok/s | 111.6 tok/s | -3.2% |
+| Gemma 4 | 34.2 tok/s | 102.2 tok/s | +3.4% |
+| GPT-OSS 20B | 143.9 tok/s | 134.6 tok/s | +0.9% |
+| LFM2.5 Q5 | 274.2 tok/s | 247.2 tok/s | -1.6% |
 
-## Is my PC enough?
+Measured on an RTX 5070 Ti 16 GB with about 62 GiB RAM. Each pair was within 5% peak VRAM. These are historical tested builds, not measurements of the current branch head or predictions for another machine. The [wiki benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) has the tested revisions, quantizations, exact commands, output notes, and other models.
 
-| You need | What to check |
-| --- | --- |
-| **Graphics card** | NVIDIA GPU with a working CUDA driver and enough VRAM for your chosen model placement, context, and at least one expert cache slot. |
-| **System memory** | Enough RAM for the model's host-backed weights and your workload. Quantization makes a large difference. |
-| **Storage** | Space for a MoE model in GGUF format. An SSD helps when model data must be read from disk. |
-| **Build tools** | CMake, a C++ compiler, and the CUDA toolkit. |
+## Run it
 
-There is no single minimum RAM or VRAM figure for every MoE model. Choose a GGUF that fits your machine, then size the cache from the VRAM left after other model and context allocations.
-
-## Get started
-
-**1. Build the `moe-cache` branch with CUDA.**
+Build the `moe-cache` branch with an NVIDIA CUDA toolkit and CMake:
 
 ```sh
 git clone --branch moe-cache https://github.com/GenerelSchwerz/llama.cpp.git
@@ -39,47 +33,38 @@ cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release -j
 ```
 
-**2. Start the server with your GGUF model.**
+Start the server with a MoE GGUF you already have:
 
 ```sh
 ./build/bin/llama-server -m /path/to/model.gguf --moe-expert-cache-mib 4096
 ```
 
-**3. Open the local address printed by the server** to chat, or connect an OpenAI-compatible client to its API.
+Open the local address printed by the server for chat, or connect an OpenAI-compatible client. The `4096` MiB budget is only an example. Leave VRAM for the rest of the model, context, and runtime buffers.
 
-The `4096` MiB cache budget is an example, not a recommended setting for every GPU. If the model does not fit, lower the budget or adjust model placement and context size. See the [CUDA build guide](docs/build.md#cuda) and [server guide](tools/server/README.md) for more options.
+The model, quantization, context, and placement determine the memory required. The cache changes where routed expert weights live; it does not change which experts the model selects.
 
-## How it works
+## Tune the cache
 
-![Diagram of the GGUF file, host-backed expert weights, and a budgeted GPU expert cache](media/moe-cache-memory.svg)
-
-The model selects experts as it runs. A cache hit reuses weights already on the GPU; a miss moves the selected weights from their host backing into the cache. The cache does not change which experts the model selects. Eligible decode workloads can also use the fork's grouped CUDA path automatically.
-
-Cache speed depends on the model, quantization, available VRAM and RAM, storage, and request pattern. The [feature guide](docs/fork-features.md) covers grouped-decode eligibility and fallback behavior.
-
-## Cache controls
-
-| Option | What it does |
+| Flag | Purpose |
 | --- | --- |
-| `--moe-expert-cache-mib MiB` | Set a per-device VRAM budget for cached experts. |
-| `--moe-expert-cache-size N` | Set expert slots per cached tensor instead of a MiB budget. |
-| `--moe-expert-cache-layers N[,N-M,...]` | Cache only selected MoE layers. |
+| `--moe-expert-cache-mib MiB` | Set the expert cache budget per CUDA device. |
+| `--moe-expert-cache-size N` | Choose a slot count per cached tensor instead of a MiB budget. |
+| `--moe-expert-cache-layers N[,N-M,...]` | Limit caching to selected MoE layers. |
 | `--moe-expert-cache-host-pinned-mb N` | Bound host memory registration and staging. |
 
-Use **either** a MiB budget **or** a nonzero slot count. Both are off by default. After a request, check the server log for `moe-cache` hit and miss statistics to confirm that caching ran. A startup flag alone does not prove it was active.
+Use a MiB budget **or** a nonzero slot count. Both are off by default. Eligible decode workloads can use the fork's grouped CUDA path automatically; the [feature guide](docs/fork-features.md) explains when it applies.
 
-## Full documentation
+**Check the result:** after a request, look for `moe-cache` hit and miss statistics in the server log. The command line alone does not prove the cache ran. Performance depends on the model, available memory, storage, and request pattern.
 
-- [Fork feature guide](docs/fork-features.md) - defaults, host memory, speculative drafts, and limitations.
-- [Build guide](docs/build.md) and [server guide](tools/server/README.md) - installation and API usage.
-- [Multi-GPU notes](docs/moe-grouped-multigpu.md) - layer-split cache behavior and validation. Tensor split with the expert cache enabled is unsupported.
+## Guides
 
-## Work with me or support the project
+- [Fork features and limits](docs/fork-features.md) - defaults, host memory, grouped decode, and speculative drafts.
+- [Build with CUDA](docs/build.md#cuda) and [use the server](tools/server/README.md).
+- [Multi-GPU behavior](docs/moe-grouped-multigpu.md) - layer-split cache placement and validation. Tensor split with the cache enabled is unsupported.
+- [Benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) - stock versus fork measurements and per-model reproduction records.
 
-I'm looking for a job in GPU inference, systems engineering, or local AI based on the work in this fork. If that matches your team, find me on [GitHub](https://github.com/GenerelSchwerz).
+## Work with me
 
-If this work helps you, you can [support me on Ko-fi](https://ko-fi.com/generel).
+I'm looking for a job in GPU inference, systems engineering, or local AI based on the work in this fork. Find me on [GitHub](https://github.com/GenerelSchwerz). If this project helps you, you can [support me on Ko-fi](https://ko-fi.com/generel).
 
----
-
-Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml). The code is under the repository's [MIT license](LICENSE); model files have their own licenses.
+Built on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml). Code is under the repository's [MIT license](LICENSE); model files have their own licenses.

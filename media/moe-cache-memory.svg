@@ -1,42 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="528" viewBox="0 0 1200 528" role="img" aria-labelledby="title desc">
-  <title id="title">How the MoE expert cache uses GPU, RAM, and storage</title>
-  <desc id="desc">A GGUF model file on storage backs expert weights in host memory. On a cache miss, a selected expert moves to a budgeted cache in GPU memory. Cached experts are reused for later tokens. Other GPU model work sits beside the expert cache.</desc>
-  <rect width="1200" height="528" rx="24" fill="#0d1422"/>
-  <text x="48" y="51" fill="#f8fafc" font-family="DejaVu Sans, Arial, sans-serif" font-size="26" font-weight="700">Where the model lives</text>
-  <text x="48" y="78" fill="#aebbd0" font-family="DejaVu Sans, Arial, sans-serif" font-size="16">The expert cache is a GPU tier; the full model does not have to fit in VRAM.</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="470" viewBox="0 0 1200 470" role="img" aria-labelledby="title desc">
+  <title id="title">MoE expert weights move from a GGUF file through host memory into a GPU cache</title>
+  <desc id="desc">A left-to-right diagram shows a GGUF file, host-backed expert weights, and budgeted GPU expert slots. Selected experts move to the GPU on a miss and are reused there on a hit. Other CUDA work shares GPU memory.</desc>
+  <rect width="1200" height="470" rx="22" fill="#101521"/>
+  <text x="40" y="52" fill="#f3f6fc" font-family="DejaVu Sans, Arial, sans-serif" font-size="27" font-weight="700">Expert weights, from file to compute</text>
+  <text x="40" y="80" fill="#aeb9cb" font-family="DejaVu Sans, Arial, sans-serif" font-size="16">The cache moves only the selected experts into a budgeted part of GPU memory.</text>
 
-  <rect x="48" y="105" width="1104" height="122" rx="16" fill="#142b48" stroke="#4e9be9" stroke-width="2"/>
-  <rect x="48" y="105" width="12" height="122" rx="6" fill="#58a6ff"/>
-  <text x="82" y="143" fill="#87c5ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">GPU VRAM</text>
-  <text x="82" y="170" fill="#dbeafe" font-family="DejaVu Sans, Arial, sans-serif" font-size="15">Fast compute</text>
-  <rect x="286" y="124" width="418" height="84" rx="11" fill="#245b91"/>
-  <text x="307" y="158" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Expert cache</text>
-  <text x="307" y="184" fill="#e6f4ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Budgeted slots; hits are reused on GPU</text>
-  <rect x="716" y="124" width="416" height="84" rx="11" fill="#1d4269"/>
-  <text x="737" y="158" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Other GPU model work</text>
-  <text x="737" y="184" fill="#d8eaff" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Layers, state, and runtime buffers</text>
+  <rect x="40" y="125" width="300" height="285" rx="18" fill="#202a3b" stroke="#7286a9" stroke-width="2"/>
+  <text x="65" y="161" fill="#a9bad5" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="700">01  MODEL FILE</text>
+  <text x="65" y="207" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="700">GGUF on storage</text>
+  <path d="M 65 229 H 315" stroke="#4b5d77" stroke-width="1"/>
+  <text x="65" y="265" fill="#d8e2f0" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">Model weights start here.</text>
+  <text x="65" y="294" fill="#d8e2f0" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">They can be loaded or</text>
+  <text x="65" y="323" fill="#d8e2f0" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">memory-mapped.</text>
 
-  <path d="M 495 279 L 495 241" fill="none" stroke="#f6b36a" stroke-width="3"/>
-  <path d="M 487 250 L 495 238 L 503 250" fill="none" stroke="#f6b36a" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="527" y="235" width="179" height="30" rx="15" fill="#0d1422"/>
-  <text x="542" y="256" fill="#f8cb9d" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">on a cache miss</text>
+  <path d="M 355 266 H 431" stroke="#8fa5c5" stroke-width="3" fill="none"/>
+  <path d="M 419 257 L 433 266 L 419 275" stroke="#8fa5c5" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="362" y="244" fill="#b8c9e1" font-family="DejaVu Sans, Arial, sans-serif" font-size="13">load / map</text>
 
-  <rect x="48" y="278" width="1104" height="113" rx="16" fill="#3e291c" stroke="#e89953" stroke-width="2"/>
-  <rect x="48" y="278" width="12" height="113" rx="6" fill="#f4a261"/>
-  <text x="82" y="316" fill="#ffbe86" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">SYSTEM RAM</text>
-  <text x="82" y="343" fill="#ffe7d0" font-family="DejaVu Sans, Arial, sans-serif" font-size="15">Host backing</text>
-  <rect x="286" y="297" width="846" height="75" rx="11" fill="#8b4f23"/>
-  <text x="307" y="328" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="18" font-weight="700">Expert weights and mapped pages</text>
-  <text x="307" y="353" fill="#fff0df" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Pinned where possible; pageable staging remains available where supported</text>
+  <rect x="450" y="125" width="300" height="285" rx="18" fill="#17343e" stroke="#52b9bd" stroke-width="2"/>
+  <text x="475" y="161" fill="#8be0dd" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="700">02  HOST BACKING</text>
+  <text x="475" y="207" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="700">Expert weights</text>
+  <path d="M 475 229 H 725" stroke="#40717b" stroke-width="1"/>
+  <text x="475" y="265" fill="#d6f5f1" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">Cold experts remain</text>
+  <text x="475" y="294" fill="#d6f5f1" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">available from RAM or</text>
+  <text x="475" y="323" fill="#d6f5f1" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">mapped file pages.</text>
 
-  <path d="M 495 438 L 495 404" fill="none" stroke="#b5cc79" stroke-width="3"/>
-  <path d="M 487 413 L 495 401 L 503 413" fill="none" stroke="#b5cc79" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="527" y="395" width="191" height="30" rx="15" fill="#0d1422"/>
-  <text x="542" y="416" fill="#d8e5ad" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">loaded or mapped</text>
+  <path d="M 765 266 H 841" stroke="#ad95eb" stroke-width="3" fill="none"/>
+  <path d="M 829 257 L 843 266 L 829 275" stroke="#ad95eb" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <text x="769" y="244" fill="#d0bffd" font-family="DejaVu Sans, Arial, sans-serif" font-size="13">on a miss</text>
 
-  <rect x="48" y="437" width="1104" height="67" rx="16" fill="#29351f" stroke="#9ebd66" stroke-width="2"/>
-  <rect x="48" y="437" width="12" height="67" rx="6" fill="#b3cf7c"/>
-  <text x="82" y="479" fill="#cfe5a3" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">STORAGE</text>
-  <rect x="286" y="451" width="846" height="39" rx="9" fill="#566c35"/>
-  <text x="307" y="477" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17" font-weight="700">GGUF model file</text>
+  <rect x="860" y="125" width="300" height="285" rx="18" fill="#292446" stroke="#a78bfa" stroke-width="2"/>
+  <text x="885" y="161" fill="#cebaff" font-family="DejaVu Sans, Arial, sans-serif" font-size="15" font-weight="700">03  CUDA DEVICE</text>
+  <text x="885" y="207" fill="#ffffff" font-family="DejaVu Sans, Arial, sans-serif" font-size="24" font-weight="700">GPU expert cache</text>
+  <path d="M 885 229 H 1135" stroke="#665689" stroke-width="1"/>
+  <text x="885" y="265" fill="#eee7ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">Budgeted slots reuse</text>
+  <text x="885" y="294" fill="#eee7ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="17">experts on a cache hit.</text>
+  <rect x="885" y="336" width="250" height="45" rx="9" fill="#3b345e"/>
+  <text x="900" y="364" fill="#ded1ff" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Other CUDA work shares VRAM</text>
+
+  <text x="40" y="445" fill="#9aa9c0" font-family="DejaVu Sans, Arial, sans-serif" font-size="14">Actual placement and memory use depend on the model and runtime settings.</text>
 </svg>
