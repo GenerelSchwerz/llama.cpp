@@ -17,10 +17,10 @@ Selected single-request decode results from the [full benchmark comparison](http
 | --- | ---: | ---: | ---: |
 | Qwen3.6 35B | 42.8 tok/s | 111.6 tok/s | -3.2% |
 | Gemma 4 | 34.2 tok/s | 102.2 tok/s | +3.4% |
-| GPT-OSS 20B | 143.9 tok/s | 134.6 tok/s | +0.9% |
-| LFM2.5 Q5 | 274.2 tok/s | 247.2 tok/s | -1.6% |
+| Nemotron 3.5 Lightning | 57.0 tok/s | 114.9 tok/s | +0.1% |
+| Ornith 1.5 | 35.2 tok/s | 97.4 tok/s | -2.3% |
 
-Measured on an RTX 5070 Ti 16 GB with about 62 GiB RAM. Each pair was within 5% peak VRAM. These are historical tested builds, not measurements of the current branch head or predictions for another machine. The [wiki benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) has the tested revisions, quantizations, exact commands, output notes, and other models.
+Measured on an RTX 5070 Ti 16 GB with about 62 GiB RAM. Each pair was within 5% peak VRAM. These are selected historical results, not measurements of the current branch head or predictions for another machine. The [wiki benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) includes regressions, tested revisions, quantizations, exact commands, output notes, and other models.
 
 ## Run it
 
