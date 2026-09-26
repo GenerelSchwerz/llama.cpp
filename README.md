@@ -3,11 +3,22 @@
 <p align="center"><strong>A CUDA expert tier for GGUF mixture-of-experts models.</strong><br>
 Keep frequently used experts on your GPU while other expert weights stay in host memory.</p>
 
+> [!TIP]
+> **New here? Start with the [MoE Cache wiki guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/MoE-Cache).** It covers the build, setup, and limits. From there, choose a [hardware guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Hardware-Setup-Guides), follow the [Windows WDDM instructions](https://github.com/GenerelSchwerz/llama.cpp/wiki/Windows-WDDM-Partial-Pinning), or use the [Docker Compose guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Docker-Compose-for-Large-MoE-Models).
+
 ![Expert weights moving from a GGUF file through host backing into a budgeted CUDA cache](media/moe-cache-memory.svg)
 
 This maintained [llama.cpp](https://github.com/ggml-org/llama.cpp) fork adds an **opt-in expert cache** for MoE models whose expert weights exceed VRAM. It keeps the familiar llama.cpp server and API. Without a cache flag, normal llama.cpp model placement remains available.
 
 > **NVIDIA CUDA only today.** The MoE cache requires an NVIDIA GPU. Have an AMD GPU or another system with separate RAM and VRAM? Join the [OptLlama Discord](https://discord.gg/ZWD8TbHXxs) to discuss support.
+
+## What this branch adds
+
+- **Budgeted expert caching:** choose VRAM per device or a slot count; cold expert weights stay host-backed.
+- **Automatic fast paths:** compatible workloads can use grouped CUDA decode, cached prefill, and expert prefetch.
+- **Memory and drafting controls:** bound host pinning and configure a separately loaded speculative draft model independently.
+
+The [feature guide](docs/fork-features.md) lists eligibility, defaults, and fallback behavior.
 
 ## Measured results
 
@@ -23,6 +34,8 @@ Selected single-request decode results from the [full benchmark comparison](http
 Measured on an RTX 5070 Ti 16 GB with about 62 GiB RAM. Each pair was within 5% peak VRAM. These are selected historical results, not measurements of the current branch head or predictions for another machine. The [wiki benchmark suite](https://github.com/GenerelSchwerz/llama.cpp/wiki/Benchmark-Comparison-Showcase) includes regressions, tested revisions, quantizations, exact commands, output notes, and other models.
 
 ## Run it
+
+This is the shortest source-build path. For a measured setup with model-specific placement, start in the [wiki](https://github.com/GenerelSchwerz/llama.cpp/wiki/MoE-Cache).
 
 Build the `moe-cache` branch with an NVIDIA CUDA toolkit and CMake:
 
