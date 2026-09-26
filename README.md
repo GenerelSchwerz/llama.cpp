@@ -1,130 +1,84 @@
-# llama.cpp
+# llama.cpp with MoE expert caching
 
-## GenerelSchwerz fork
+Run large mixture-of-experts (MoE) models with a GPU cache for the experts they use most. This is a maintained [llama.cpp](https://github.com/ggml-org/llama.cpp) fork focused on running models whose expert weights exceed GPU memory.
 
-This maintained fork adds an opt-in CUDA MoE expert cache, bounded host pinning, and speculative decoding controls. See the [fork feature guide](docs/fork-features.md) for configuration, defaults, limitations, and internal backend integration.
+**CUDA only for the expert cache.** The rest of llama.cpp's models and backends remain available. The cache is off unless you enable it.
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+[Get started](#get-started) · [How it works](#how-it-works) · [Options](#choose-a-cache-budget) · [Documentation](#documentation)
 
-<div align="center">
+## Why use this fork?
 
-<b>LLM inference in C/C++</b>
+A MoE model has many small expert networks but selects only a few for each token. Keeping every expert on the GPU can require more VRAM than a local machine has. This fork keeps a configurable set of experts on the GPU and loads others from host memory when needed.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+| You can | What it means |
+| --- | --- |
+| Set a GPU cache budget | Choose how much VRAM to reserve for routed experts on each CUDA device. |
+| Keep large models usable | Run with expert weights backed by host memory, including memory-mapped GGUF files. You still need enough system memory and storage for the model and workload. |
+| Use familiar llama.cpp tools | Serve a local chat UI and API with `llama-server`, or use the other tools built from this fork. |
+| Start with standard behavior | Omit the cache flag to use the normal llama.cpp path. |
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+Cache performance depends on the model, quantization, available VRAM, host memory, storage, and request pattern. A larger cache can reduce transfers, but its best size is workload specific.
 
-</div>
+## How it works
 
-## Quick start
-
-A few options to get `llama.cpp` installed on your machine:
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```mermaid
+flowchart LR
+    A["GGUF expert weights<br/>host memory or mapped file"] -->|cache miss| B["GPU expert cache<br/>limited by your budget"]
+    B -->|selected experts| C[CUDA inference]
+    C -.->|reuse on later tokens| B
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The model selects experts for each token. Experts already in the GPU cache are reused; missing experts are brought in from their host backing. The cache changes where expert weights are kept, not which experts the model selects. Eligible decode workloads can also use the fork's grouped CUDA path automatically. See the [feature guide](docs/fork-features.md) for eligibility and fallback details.
 
-## Description
+## Get started
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+You need an NVIDIA GPU, a working CUDA toolkit and driver, CMake, and a MoE model in GGUF format. The model's disk, RAM, and VRAM requirements vary. Build this fork from source and supply a compatible model.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+1. Clone and build this fork with CUDA:
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+   ```sh
+   git clone --branch moe-cache https://github.com/GenerelSchwerz/llama.cpp.git
+   cd llama.cpp
+   cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --config Release -j
+   ```
 
-## Supported backends
+2. Start the server with your GGUF model and a GPU cache budget:
 
-| Backend | Target devices |
+   ```sh
+   ./build/bin/llama-server -m /path/to/model.gguf --moe-expert-cache-mib 4096
+   ```
+
+3. Open the local address printed by the server to chat, or connect an OpenAI-compatible client to its API.
+
+`4096` is an example budget in MiB, not a recommended size for every GPU or model. Leave room for non-expert weights, context, and runtime buffers. If the model does not fit, lower the cache budget or adjust model placement and context size. For build variants and server settings, use the [build guide](docs/build.md#cuda) and [server guide](tools/server/README.md).
+
+## Choose a cache budget
+
+| Control | Use it for |
 | --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| `--moe-expert-cache-mib MiB` | Set a VRAM budget per CUDA device. A single value applies to each selected device. |
+| `--moe-expert-cache-size N` | Set the number of expert slots per cached tensor instead of a MiB budget. |
+| `--moe-expert-cache-layers N[,N-M,...]` | Limit caching to selected MoE layers. |
+| `--moe-expert-cache-host-pinned-mb N` | Bound host memory registration and staging. The default tries full pinning, then falls back where needed. |
+
+Use **either** `--moe-expert-cache-mib` **or** a nonzero `--moe-expert-cache-size`. Both cache controls are off by default. For separate speculative draft models, multi-GPU placement, host memory behavior, and exact defaults, see the [feature guide](docs/fork-features.md).
+
+To check that the cache actually ran, make a request and look for `moe-cache` hit/miss statistics in the server log. A startup flag or GPU layer count alone does not establish that the cache was active. Detailed diagnostics are available with `--experimental-logs`.
 
 ## Documentation
 
-#### Tools
+- [Fork features and limitations](docs/fork-features.md) - full cache controls, placement, grouped decode, and speculative draft behavior.
+- [Build llama.cpp](docs/build.md) - CUDA and other backend builds.
+- [Run the server](tools/server/README.md) - chat UI, API, and server options.
+- [Multi-GPU](docs/moe-grouped-multigpu.md) - cache ownership and validation notes. The cache supports layer split; tensor split with the cache enabled is unsupported.
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## Work with me or support the project
 
-#### Development
+I'm looking for a job in GPU inference, systems engineering, or local AI based on the work in this fork. If that matches your team, reach out through my [GitHub profile](https://github.com/GenerelSchwerz).
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
+If this work helps you, you can [support me on Ko-fi](https://ko-fi.com/generel).
 
-## Contributing
+## Credits and license
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+This project builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ggml](https://github.com/ggml-org/ggml). The fork changes and upstream code are available under the repository's [MIT license](LICENSE). Model files have their own licenses.
