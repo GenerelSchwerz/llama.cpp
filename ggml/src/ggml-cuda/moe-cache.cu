@@ -3,6 +3,7 @@
 #include "moe-cache.cuh"
 #include "moe-cache-host.cuh"
 #include "common.cuh"
+#include "convert.cuh"
 #include "mmid.cuh"
 
 #include "ggml-backend-impl.h"
@@ -4840,6 +4841,8 @@ static __global__ void moe_early_hc_mv(const void * weights, const float * input
             if constexpr (type == GGML_TYPE_Q8_0) {
                 const auto & block = ((const block_q8_0 *) weights)[(size_t) row * (width / QK8_0) + i / QK8_0];
                 weight = __half2float(block.d) * block.qs[i % QK8_0];
+            } else if constexpr (type == GGML_TYPE_BF16) {
+                weight = ggml_cuda_cast<float>(((const nv_bfloat16 *) weights)[(size_t) row * width + i]);
             } else {
                 weight = ((const float *) weights)[(size_t) row * width + i];
             }
@@ -4891,6 +4894,8 @@ static void moe_early_hc_project(const ggml_tensor * weights, const float * inpu
     const dim3 grid(blocks, n_rows);
     if (weights->type == GGML_TYPE_Q8_0) {
         moe_early_hc_mv<GGML_TYPE_Q8_0, threads><<<grid, 128, 0, stream>>>(weights->data, input, output, weights->ne[0], weights->ne[1], streams, activation);
+    } else if (weights->type == GGML_TYPE_BF16) {
+        moe_early_hc_mv<GGML_TYPE_BF16, threads><<<grid, 128, 0, stream>>>(weights->data, input, output, weights->ne[0], weights->ne[1], streams, activation);
     } else {
         GGML_ASSERT(weights->type == GGML_TYPE_F32);
         moe_early_hc_mv<GGML_TYPE_F32, threads><<<grid, 128, 0, stream>>>(weights->data, input, output, weights->ne[0], weights->ne[1], streams, activation);
@@ -8310,8 +8315,9 @@ bool ggml_cuda_moe_grouped_context::early_hc_for_test() {
         float * d_low = scratch + 3 * wide, * d_gate = d_low + rank, * d_mixed = d_gate + wide;
         CUDA_CHECK(cudaMemcpy(d_attention, attention.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_ffn, ffn.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
-        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q8_0}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
             std::vector<float> weights(wide * rank);
+            std::vector<ggml_bf16_t> bf16(weights.size());
             std::vector<block_q8_0> quant(weights.size() / QK8_0);
             for (size_t b = 0; b < quant.size(); ++b) {
                 quant[b].d = __float2half(1.0f / 256.0f);
@@ -8321,14 +8327,23 @@ bool ggml_cuda_moe_grouped_context::early_hc_for_test() {
                     weights[b * QK8_0 + i] = v / 256.0f;
                 }
             }
+            if (type == GGML_TYPE_BF16) {
+                ggml_fp32_to_bf16_row_ref(weights.data(), bf16.data(), weights.size());
+                for (size_t i = 0; i < weights.size(); ++i) {
+                    weights[i] = ggml_bf16_to_fp32(bf16[i]);
+                }
+            }
             ggml_tensor down = {}, up = {};
             down.type = up.type = type;
             down.ne[0] = up.ne[1] = wide;
             down.ne[1] = up.ne[0] = rank;
-            const size_t bytes = type == GGML_TYPE_F32 ? weights.size() * sizeof(float) : quant.size() * sizeof(block_q8_0);
+            const size_t bytes = type == GGML_TYPE_F32 ? weights.size() * sizeof(float) :
+                type == GGML_TYPE_BF16 ? bf16.size() * sizeof(ggml_bf16_t) : quant.size() * sizeof(block_q8_0);
+            const void * source = type == GGML_TYPE_F32 ? (const void *) weights.data() :
+                type == GGML_TYPE_BF16 ? (const void *) bf16.data() : (const void *) quant.data();
             CUDA_CHECK(cudaMalloc(&down.data, bytes));
             up.data = down.data;
-            CUDA_CHECK(cudaMemcpy(down.data, type == GGML_TYPE_F32 ? (void *) weights.data() : (void *) quant.data(), bytes, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(down.data, source, bytes, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemcpy(d_input, input.data(), wide * sizeof(float), cudaMemcpyHostToDevice));
             moe_early_hc_translate<<<(wide + 255) / 256, 256>>>(d_input, d_attention, d_ffn, wide);
             moe_early_hc_project<128>(&down, d_input, d_low, streams, 1, nullptr);
@@ -9952,7 +9967,7 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
         if (!pageable_source && !mapped) {
             continue;
         }
-        const uint64_t scaled_candidates = uint64_t(top_k) * (candidate_percent != 0 ? candidate_percent : (mapped ? 100u : 50u));
+        const uint64_t scaled_candidates = uint64_t(top_k) * (candidate_percent != 0 ? candidate_percent : 50u);
         const uint32_t candidate_k = static_cast<uint32_t>(std::min<uint64_t>(resource->device->n_experts,
             scaled_candidates / 100 + (scaled_candidates % 100 != 0)));
         if (candidate_k == 0 || candidate_k > UINT32_MAX / n_rows) {
@@ -10033,17 +10048,18 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
         const ggml_tensor * hc_up = nullptr;
         uint32_t hc_streams = 0;
         const bool plain_selection = router != nullptr && moe_router_plain_selection(ids, router, &router_bias);
+        const auto gpu_hc_weight = [&](const ggml_tensor * t) {
+            return t != nullptr && t->data != nullptr && ggml_n_dims(t) == 2 && ggml_is_contiguous(t) &&
+                (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16 ||
+                 (t->type == GGML_TYPE_Q8_0 && t->ne[0] % QK8_0 == 0)) &&
+                t->buffer != nullptr && t->buffer->buft == ggml_backend_cuda_buffer_type(impl_->device);
+        };
         const bool router_f32 = router != nullptr && gpu_f32(router->src[0]) &&
             (router_bias == nullptr || (gpu_f32(router_bias) && ggml_nelements(router_bias) == resource->device->n_experts));
-        bool hc = !native_only && normalized && plain_selection && router_f32 && router_bias == nullptr &&
+        bool hc = !native_only && normalized && plain_selection && router != nullptr && gpu_hc_weight(router->src[0]) && router_bias == nullptr &&
             input_multiplier == 1.0f && ffn_multiplier == 1.0f &&
             moe_router_hc_pattern(router->src[1], late, router, &hc_down, &hc_up, hc_streams);
         if (hc) {
-            const auto gpu_hc_weight = [&](const ggml_tensor * t) {
-                return t != nullptr && t->data != nullptr && ggml_n_dims(t) == 2 && ggml_is_contiguous(t) &&
-                    (t->type == GGML_TYPE_F32 || (t->type == GGML_TYPE_Q8_0 && t->ne[0] % QK8_0 == 0)) &&
-                    t->buffer != nullptr && t->buffer->buft == ggml_backend_cuda_buffer_type(impl_->device);
-            };
             hc = gpu_hc_weight(hc_down) && gpu_hc_weight(hc_up) &&
                 hc_down->ne[0] == late->ne[0] && hc_up->ne[1] == late->ne[0] && hc_up->ne[0] == hc_down->ne[1];
         }
