@@ -5302,7 +5302,7 @@ static bool moe_grouped_cuda_success(cudaError_t error) {
 
 } // namespace
 
-static bool ggml_cuda_moe_cache_set_metadata(ggml_cuda_moe_cache * cache, const ggml_tensor * tensor);
+static bool ggml_cuda_moe_cache_set_metadata(ggml_cuda_moe_cache * cache, const ggml_tensor * tensor, const moe_host_source * source = nullptr);
 
 static ggml_cuda_moe_cache * ggml_cuda_moe_cache_init_with_pool(
         int device,
@@ -9580,7 +9580,7 @@ ggml_cuda_moe_legacy_cache_lease ggml_cuda_moe_grouped_context::acquire_legacy_c
             prospective = ggml_cuda_moe_cache_init_with_pool(
                 impl_->device, tensor->nb[2], trailing_padding, record->acquisition.n_slots, nullptr, nullptr, false);
         }
-        if (prospective != nullptr && !ggml_cuda_moe_cache_set_metadata(prospective, tensor)) {
+        if (prospective != nullptr && !ggml_cuda_moe_cache_set_metadata(prospective, tensor, impl_->source_for(tensor))) {
             ggml_cuda_moe_cache_free(prospective);
             prospective = nullptr;
         }
@@ -13308,7 +13308,7 @@ ggml_cuda_moe_grouped_decode_result ggml_cuda_moe_grouped_context::prepare_host_
             impl_->device, bank.expert_stride, trailing_padding, resource->snapshot.n_slots, resource->device->bank_data[bank_index], wait_event, false);
         caches_ready = prospective[bank_index] != nullptr;
         if (caches_ready) {
-            caches_ready = ggml_cuda_moe_cache_set_metadata(prospective[bank_index], bank.tensor);
+            caches_ready = ggml_cuda_moe_cache_set_metadata(prospective[bank_index], bank.tensor, impl_->source_for(bank.tensor));
         }
     }
     if (caches_ready) {
@@ -14072,11 +14072,11 @@ struct ggml_cuda_moe_cache {
     moe_cache_reuse_hist phase_expert_reuse_hist[2];
 };
 
-static bool ggml_cuda_moe_cache_set_metadata(ggml_cuda_moe_cache * cache, const ggml_tensor * tensor) {
+static bool ggml_cuda_moe_cache_set_metadata(ggml_cuda_moe_cache * cache, const ggml_tensor * tensor, const moe_host_source * source) {
     cache->tensor_name = tensor->name[0] ? tensor->name : "?";
     cache->tensor_data = tensor->data;
     cache->n_experts = tensor->ne[2];
-    cache->source = moe_host_source_for(tensor);
+    cache->source = source != nullptr ? source : moe_host_source_for(tensor);
     if (cache->source != nullptr) {
         cache->source->owner->retain();
         if (cache->source->device_alias == nullptr) {
