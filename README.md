@@ -4,7 +4,7 @@
 Keep frequently used experts on your GPU while other expert weights stay in host memory.</p>
 
 > [!NOTE]
-> **I'm looking for work** in AI development, especially local AI, low-level programming, and high-performance computing (HPC). If you're hiring, [find me on GitHub](https://github.com/GenerelSchwerz). You can also [support my work on Ko-fi](https://ko-fi.com/generel).
+> **I'm looking for work.** I recently graduated college with a computer science degree and am interested in AI development, especially local AI, low-level programming, and embedded systems. If you're hiring, [email me](mailto:rocco.generel@gmail.com). You can also [support my work on Ko-fi](https://ko-fi.com/generel).
 
 > [!TIP]
 > **New here? Start with the [MoE Cache wiki guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/MoE-Cache).** It covers the build, setup, and limits. From there, choose a [hardware guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Hardware-Setup-Guides), follow the [Windows WDDM instructions](https://github.com/GenerelSchwerz/llama.cpp/wiki/Windows-WDDM-Partial-Pinning), or use the [Docker Compose guide](https://github.com/GenerelSchwerz/llama.cpp/wiki/Docker-Compose-for-Large-MoE-Models).
