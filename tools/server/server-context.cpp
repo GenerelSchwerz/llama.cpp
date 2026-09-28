@@ -47,7 +47,7 @@ static bool server_decode_overlap_sampling(const common_params_sampling & params
             params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
             params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f || params.typ_p != 1.0f ||
             params.top_n_sigma > 0.0f || params.n_probs != 0 ||
-            (!common_grammar_value(params.grammar).empty() && !params.grammar_lazy) || params.reasoning_budget_tokens >= 0) {
+            (!common_grammar_value(params.grammar).empty() && !params.grammar_lazy)) {
         return false;
     }
     for (const auto sampler : params.samplers) {
@@ -4467,7 +4467,7 @@ private:
             common_sampler_accept(slot.smpl.get(), id, true);
 
             if (slot.decode_overlap_enabled && !common_sampler_decode_overlap_safe(slot.smpl.get())) {
-                slot.disable_decode_overlap("grammar constraints");
+                slot.disable_decode_overlap("sampling constraints");
             }
 
             slot.stats.n_gen += 1;

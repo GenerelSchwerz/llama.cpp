@@ -615,7 +615,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
-            GGML_ASSERT(!gsmpl->rbudget && "using reasoning budget in combination with backend sampling is not supported");
+            GGML_ASSERT((!gsmpl->rbudget || common_reasoning_budget_get_state(gsmpl->rbudget) != REASONING_BUDGET_FORCING) &&
+                    "using backend sampling while forcing reasoning tokens is not supported");
 
             for (size_t i = 0; i < cur_p.size; ++i) {
                 if (cur_p.data[i].id == id) {
@@ -727,6 +728,10 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
 }
 
 bool common_sampler_decode_overlap_safe(const struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->rbudget && common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_FORCING) {
+        return false;
+    }
+
     if (!gsmpl || !gsmpl->grmr) {
         return true;
     }
