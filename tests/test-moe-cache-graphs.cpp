@@ -1229,6 +1229,7 @@ static void test_active_grouped_multirow_graph_modes_case(
             candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
                 GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, n_rows, n_rows);
             (void) candidate_certify_graph(*context, candidate.graph);
+            ggml_cuda_graph_capture_state_for_test updated_capture = {};
             for (uint32_t variant : {1u, 2u}) {
                 set_active_grouped_dispatch_logits({&reference, &candidate}, variant);
                 const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
@@ -1236,8 +1237,16 @@ static void test_active_grouped_multirow_graph_modes_case(
                 check_active_grouped_exact_output(expected, actual);
                 ggml_cuda_graph_capture_state_for_test state;
                 CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &state));
-                CHECK(state.instance == captured_instance && state.graph != 0 && state.warmup_complete &&
+                CHECK(state.graph != 0 && state.instance != 0 && state.warmup_complete &&
+                    state.execution_semantic_key == captured_semantic_key &&
                     state.moe_resource_fingerprint == captured_resource_fingerprint);
+                if (variant == 1) {
+                    updated_capture = state;
+                } else {
+                    CHECK(state.graph == updated_capture.graph && state.instance == updated_capture.instance &&
+                        state.execution_semantic_key == updated_capture.execution_semantic_key &&
+                        state.moe_resource_fingerprint == updated_capture.moe_resource_fingerprint);
+                }
             }
         }
     }
@@ -1289,12 +1298,19 @@ static void test_active_grouped_multirow_graph_modes_case(
         const auto stale_inventory = inventory_shape(candidate_prefill.graph);
         CHECK(candidate_prefill.graph->nodes[0] == candidate.graph->nodes[0] &&
             stale_inventory.first == certified_inventory.first && stale_inventory.second + 1 == certified_inventory.second);
+        ggml_cuda_graph_capture_state_for_test retained_before_stale;
+        CHECK(ggml_cuda_graph_capture_state_query_for_test(
+            candidate_backend.get(), candidate.graph, &retained_before_stale));
+        CHECK(retained_before_stale.graph != 0 && retained_before_stale.instance != 0 && retained_before_stale.warmup_complete &&
+            retained_before_stale.execution_semantic_key == captured_semantic_key &&
+            retained_before_stale.moe_resource_fingerprint == captured_resource_fingerprint);
         (void) run_cached_mmid_path_test(
             candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
         CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &invalidated_graph));
-        CHECK(invalidated_graph.graph == captured_graph && invalidated_graph.instance == captured_instance &&
-            invalidated_graph.warmup_complete && invalidated_graph.execution_semantic_key == captured_semantic_key &&
-            invalidated_graph.moe_resource_fingerprint == captured_resource_fingerprint);
+        CHECK(invalidated_graph.graph == retained_before_stale.graph &&
+            invalidated_graph.instance == retained_before_stale.instance && invalidated_graph.warmup_complete &&
+            invalidated_graph.execution_semantic_key == retained_before_stale.execution_semantic_key &&
+            invalidated_graph.moe_resource_fingerprint == retained_before_stale.moe_resource_fingerprint);
 
         recapture_main();
         candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
