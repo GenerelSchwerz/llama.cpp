@@ -523,8 +523,8 @@ void run_layers(const std::vector<int> & devices,
                 (unsigned long long) telemetry.completed,
                 (unsigned long long) active_grouped_legacy_op_count(backends[i]));
         const bool fallback_owner = split_route && (devices.size() == 1 || i == 1);
-        CHECK(telemetry.decode_legacy == (fallback_owner ? 8 : 0));
-        CHECK(telemetry.fallback == telemetry.decode_legacy);
+        CHECK(telemetry.decode_staged == (fallback_owner ? 8 : 0));
+        CHECK(telemetry.fallback == telemetry.decode_staged);
         uint64_t expected_completed = 0;
         for (int layer = 0; layer < 2; ++layer) {
             if ((cached_layers & (1u << layer)) && layer % devices.size() == i &&
@@ -689,7 +689,7 @@ void run_layers(const std::vector<int> & devices,
         const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
         CHECK(telemetry.decode_grouped == 3 && telemetry.ready == 3 && telemetry.submitted == 3 &&
               telemetry.completed == 3);
-        CHECK(telemetry.decode_legacy == 0 && telemetry.fallback == 0 &&
+        CHECK(telemetry.decode_staged == 0 && telemetry.fallback == 0 &&
               active_grouped_legacy_op_count(survivor) == legacy_before);
         CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
         if (getenv("GGML_CUDA_DISABLE_GRAPHS") == nullptr) {

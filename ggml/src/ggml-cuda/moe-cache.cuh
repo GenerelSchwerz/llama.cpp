@@ -233,31 +233,6 @@ private:
     ggml_cuda_moe_legacy_acquisition acquisition_;
 };
 
-class ggml_cuda_moe_grouped_host_staging_lease {
-public:
-    ggml_cuda_moe_grouped_host_staging_lease() noexcept;
-    ~ggml_cuda_moe_grouped_host_staging_lease();
-
-    ggml_cuda_moe_grouped_host_staging_lease(ggml_cuda_moe_grouped_host_staging_lease && other) noexcept;
-    ggml_cuda_moe_grouped_host_staging_lease & operator=(ggml_cuda_moe_grouped_host_staging_lease && other) noexcept;
-
-    ggml_cuda_moe_grouped_host_staging_lease(const ggml_cuda_moe_grouped_host_staging_lease &) = delete;
-    ggml_cuda_moe_grouped_host_staging_lease & operator=(const ggml_cuda_moe_grouped_host_staging_lease &) = delete;
-
-    explicit operator bool() const noexcept;
-    ggml_cuda_moe_cache * get() const noexcept;
-    const ggml_cuda_moe_graph_capability_witness & capability() const noexcept;
-
-private:
-    friend class ggml_cuda_moe_grouped_context;
-
-    ggml_cuda_moe_grouped_context * owner_ = nullptr;
-    ggml_cuda_moe_grouped_transaction transaction_;
-    ggml_cuda_moe_cache * cache_ = nullptr;
-    const ggml_cuda_moe_graph_capability_witness * capability_ = nullptr;
-    uint32_t bank_index_ = UINT32_MAX;
-};
-
 struct ggml_cuda_moe_ids_signature {
     const ggml_tensor * tensor = nullptr;
     const void * data = nullptr;
@@ -303,9 +278,8 @@ struct ggml_cuda_moe_grouped_decode_acquisition {
 };
 
 enum ggml_cuda_moe_group_authority : uint32_t {
-    GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY = 0,
+    GGML_CUDA_MOE_GROUP_AUTHORITY_UNOWNED = 0,
     GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED,
-    GGML_CUDA_MOE_GROUP_AUTHORITY_GROUPED_HOST_STAGED,
 };
 
 enum ggml_cuda_moe_execution_strategy : uint32_t {
@@ -315,9 +289,10 @@ enum ggml_cuda_moe_execution_strategy : uint32_t {
 };
 
 enum ggml_cuda_moe_graph_outcome : uint32_t {
-    GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY = 0,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED = 0,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED,
     GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED,
-    GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY,
+    GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_STAGED,
     GGML_CUDA_MOE_GRAPH_OUTCOME_ERROR,
 };
 
@@ -343,24 +318,26 @@ private:
     uint64_t candidate_generation_ = 0;
     uint64_t authority_epoch_ = 0;
     uint32_t group_index_ = UINT32_MAX;
-    ggml_cuda_moe_group_authority authority_ = GGML_CUDA_MOE_GROUP_AUTHORITY_LEGACY;
+    ggml_cuda_moe_group_authority authority_ = GGML_CUDA_MOE_GROUP_AUTHORITY_UNOWNED;
     uint32_t execution_domain_ = GGML_GRAPH_EXECUTION_DOMAIN_INVALID;
     uint32_t row_semantics_ = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INVALID;
     bool prefill_resident_certified_ = false;
 };
 
 enum ggml_cuda_moe_graph_group_state : uint32_t {
-    GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY = 0,
+    GGML_CUDA_MOE_GRAPH_GROUP_DETACHED_STAGED = 0,
     GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ARMED,
     GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_ACTIVE,
     GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ARMED,
     GGML_CUDA_MOE_GRAPH_GROUP_HOST_STAGED_ACTIVE,
     GGML_CUDA_MOE_GRAPH_GROUP_GROUPED_REPLAY,
+    GGML_CUDA_MOE_GRAPH_GROUP_PREFILL_ARMED,
+    GGML_CUDA_MOE_GRAPH_GROUP_PREFILL_ACTIVE,
     GGML_CUDA_MOE_GRAPH_GROUP_FINISHED,
 };
 
 enum ggml_cuda_moe_graph_dispatch_mode : uint32_t {
-    GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY = 0,
+    GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED = 0,
     GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT,
     GGML_CUDA_MOE_GRAPH_DISPATCH_CAPTURE,
     GGML_CUDA_MOE_GRAPH_DISPATCH_REPLAY,
@@ -416,11 +393,12 @@ struct ggml_cuda_moe_graph_group_dispatch {
     const float * auxiliary_data[3] = {};
     uint32_t auxiliary_roles[3] = {};
     ggml_cuda_moe_stream_t stream = nullptr;
-    uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_WHOLE_LEGACY;
+    uint32_t state = GGML_CUDA_MOE_GRAPH_GROUP_DETACHED_STAGED;
     uint32_t strategy = GGML_CUDA_MOE_EXECUTION_STRATEGY_INVALID;
     uint32_t n_slots = 0;
     uint32_t n_auxiliary_shadows = 0;
     bool defer_completion = false;
+    std::vector<int32_t> prefill_slot_for_expert;
 };
 
 using ggml_cuda_moe_graph_stream_resolver = ggml_cuda_moe_stream_t (*)(void * data, const ggml_tensor * node);
@@ -496,12 +474,16 @@ struct ggml_cuda_moe_grouped_debug_telemetry {
     uint64_t reset_generation_replace = 0;
     uint64_t reset_generation_reject = 0;
     uint64_t reset_clock = 0;
-    uint64_t reset_legacy_handoff = 0;
-    uint64_t reset_host_staged_handoff = 0;
+    uint64_t prefill_grouped       = 0;
+    uint64_t prefill_staged        = 0;
+    uint64_t prefill_bounded_ops   = 0;
+    uint64_t prefill_bounded_waves = 0;
+    uint64_t prefill_bounded_h2d_bytes = 0;
+    uint64_t prefill_staging_bytes = 0;
     uint64_t decode_grouped        = 0;
-    uint64_t decode_legacy         = 0;
+    uint64_t decode_staged         = 0;
     uint64_t decode_grouped_by_domain[4] = {};
-    uint64_t decode_legacy_by_domain[4] = {};
+    uint64_t decode_staged_by_domain[4] = {};
     // Final readers submitted; completed counts successful completion-event recording, not a host wait.
     uint64_t submitted             = 0;
     // Group dispatches begun, before reader submission.
@@ -799,6 +781,10 @@ private:
     uint32_t n_groups_;
     ggml_cuda_moe_graph_dispatch_mode dispatch_mode_;
     bool dispatch_active_;
+    bool staged_operation_active_;
+    uint32_t n_staged_streams_;
+    std::array<ggml_cuda_moe_stream_t, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> staged_streams_;
+    std::array<std::shared_ptr<void>, GGML_BACKEND_MOE_CANDIDATE_MAX_GROUPS> staged_resource_leases_;
 };
 
 bool ggml_cuda_moe_required_grouped_plan_ready(
@@ -865,11 +851,6 @@ public:
             const ggml_cuda_moe_group_call_lease * authority = nullptr,
             ggml_cuda_moe_stream_t compute_stream = nullptr,
             uint32_t top_k = 1);
-    void prefetch_legacy_siblings(
-            const ggml_cuda_moe_legacy_cache_lease & source,
-            const int32_t * expert_ids,
-            int n_expert_ids,
-            bool is_decode);
     void record_legacy_op(
             bool is_decode,
             bool staged,
@@ -939,26 +920,50 @@ public:
     bool begin_graph_dispatch(
             ggml_cuda_moe_graph_execution * execution,
             ggml_cuda_moe_graph_dispatch_mode mode);
+    bool track_staged_stream(ggml_cuda_moe_graph_execution * execution, ggml_cuda_moe_stream_t stream);
+    bool copy_staged_source(
+            const ggml_tensor * tensor,
+            void * destination,
+            const void * source,
+            size_t bytes,
+            ggml_cuda_moe_stream_t stream);
     bool begin_graph_dispatch(ggml_cuda_moe_graph_execution * execution, bool grouped_enabled) {
         return begin_graph_dispatch(execution, grouped_enabled ?
-            GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT : GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY);
+            GGML_CUDA_MOE_GRAPH_DISPATCH_DIRECT : GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED);
     }
     ggml_cuda_moe_grouped_decode_result prepare_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream);
+    ggml_cuda_moe_grouped_decode_result prepare_prefill_group(
+            ggml_cuda_moe_graph_group_dispatch * group,
+            const ggml_cuda_moe_graph_binding & binding,
+            const ggml_tensor * node,
+            ggml_cuda_moe_stream_t stream,
+            const int32_t * unique_experts,
+            uint32_t n_unique_experts);
+    ggml_cuda_moe_grouped_decode_result execute_bounded_prefill_mmq(
+            ggml_backend_cuda_context & context,
+            ggml_cuda_moe_graph_group_dispatch * group,
+            const ggml_cuda_moe_graph_binding & binding,
+            ggml_tensor * node,
+            ggml_cuda_moe_stream_t stream,
+            const int32_t * unique_experts,
+            uint32_t n_unique_experts);
     ggml_cuda_moe_grouped_decode_result prepare_host_staged_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
-            ggml_cuda_moe_stream_t stream);
-    ggml_cuda_moe_grouped_host_staging_lease acquire_grouped_host_staging(
+            ggml_cuda_moe_stream_t stream,
+            const int32_t * unique_experts,
+            uint32_t n_unique_experts);
+    bool finish_graph_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
             ggml_cuda_moe_stream_t stream);
-    bool finish_graph_group(
+    bool finish_prefill_group(
             ggml_cuda_moe_graph_group_dispatch * group,
             const ggml_cuda_moe_graph_binding & binding,
             const ggml_tensor * node,
@@ -999,9 +1004,19 @@ private:
     friend class ggml_cuda_moe_group_call_lease;
     friend class ggml_cuda_moe_legacy_operation_lease;
     friend class ggml_cuda_moe_legacy_cache_lease;
-    friend class ggml_cuda_moe_grouped_host_staging_lease;
     friend bool ggml_cuda_moe_take_split_staging_poison_for_test(ggml_cuda_moe_grouped_context * context);
     friend bool ggml_cuda_moe_take_host_staged_evaluator_failure_for_test(ggml_cuda_moe_grouped_context * context);
+
+    ggml_cuda_moe_grouped_decode_result prepare_residency(
+            const ggml_cuda_moe_complete_group_key & key,
+            const int32_t * ids,
+            uint32_t top_k,
+            uint32_t n_rows,
+            uint32_t row_stride,
+            bool upload_ids,
+            ggml_cuda_moe_stream_t compute_stream,
+            ggml_cuda_moe_grouped_decode_acquisition * acquisition,
+            const ggml_cuda_moe_group_call_lease * authority);
 
     bool set_clock_bound_for_test(const ggml_cuda_moe_grouped_acquisition & acquisition, uint64_t clock_bound);
     bool admission_closed_for_test() const;
@@ -1036,13 +1051,13 @@ private:
             uint64_t * cross_stream_waits,
             uint64_t * pending_declines) const;
     bool set_prefill_resident_budget_for_test(size_t byte_budget);
+    bool set_prefill_staging_lane_bytes_for_test(size_t byte_budget);
     bool set_original_auxiliary_budget_for_test(size_t byte_budget);
     size_t original_auxiliary_bytes_for_test() const;
     void fail_device_resource_allocation_for_test(uint32_t stage);
     bool device_resource_complete_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     bool graph_clock_active_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
     size_t legacy_backing_count_for_test(const ggml_cuda_moe_candidate_group_key & key) const;
-    void fail_borrowed_cache_init_after_probe_for_test();
     void poison_split_staging_for_test(uint32_t calls);
     void fail_host_staged_evaluator_for_test();
     uint32_t split_staging_poison_calls_for_test() const;
@@ -1059,7 +1074,6 @@ private:
     void end_group_call(ggml_cuda_moe_group_call_lease & lease) noexcept;
     void end_legacy_operation(ggml_cuda_moe_legacy_operation_lease & lease) noexcept;
     void release_legacy_cache(ggml_cuda_moe_legacy_cache_lease & lease) noexcept;
-    void release_grouped_host_staging(ggml_cuda_moe_grouped_host_staging_lease & lease) noexcept;
 
     struct impl;
     std::unique_ptr<impl> impl_;

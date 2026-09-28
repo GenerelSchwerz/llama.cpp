@@ -302,12 +302,7 @@ static void test_active_grouped_dispatch_types_case(
         CUDA_OK(cudaStreamCreateWithFlags(&wrong_stream, cudaStreamNonBlocking));
         ggml_cuda_moe_candidate_group_key failure_key;
         CHECK(context->find_down_group_key(first.down, &failure_key));
-        for (ggml_tensor * bank : first.banks) {
-            auto legacy = context->acquire_legacy_cache(bank, nullptr, nullptr, stream);
-            CHECK(legacy && legacy.get() != nullptr);
-        }
-        CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, failure_key) == first.banks.size());
-        CHECK(ggml_cuda_moe_grouped_context_test_access::device_resource_complete(*context, failure_key));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, failure_key) == 0);
 
         std::shared_ptr<ggml_cuda_moe_graph_plan> failure_plan;
         ggml_cuda_moe_graph_execution failure_execution;
@@ -607,7 +602,7 @@ static void test_active_grouped_materialization_case(
     const auto pageable_telemetry =
         ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*pageable_context);
     CHECK(pageable_telemetry.registered == 1 && pageable_telemetry.covered == 1);
-    CHECK(pageable_telemetry.decode_grouped == 6 && pageable_telemetry.decode_legacy == 0);
+    CHECK(pageable_telemetry.decode_grouped == 6 && pageable_telemetry.decode_staged == 0);
     CHECK(pageable_telemetry.ready > 0 && pageable_telemetry.completed == pageable_telemetry.ready);
     CHECK(pageable_telemetry.fallback == 0 && pageable_telemetry.required_unsupported == 0);
     CHECK(pageable_telemetry.h2d_bytes > 0);
@@ -709,7 +704,7 @@ void test_pageable_separate_draft_lifecycle() {
     const auto check_telemetry = [&](ggml_backend_t backend, uint64_t expected, uint64_t host_staged) {
         auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
         const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
-        CHECK(telemetry.decode_grouped == expected && telemetry.decode_legacy == 0);
+        CHECK(telemetry.decode_grouped == expected && telemetry.decode_staged == 0);
         CHECK(telemetry.ready == expected && telemetry.completed == expected);
         CHECK(telemetry.host_staged_calls == host_staged && telemetry.host_staged_ops == 3 * host_staged);
         CHECK(host_staged == expected || telemetry.h2d_bytes > 0);
@@ -834,19 +829,17 @@ static void test_active_grouped_dispatch_staged_legacy() {
     check_active_grouped_exact_output(expected, actual);
     CHECK(active_grouped_legacy_op_count(reference_backend.get()) == reference.banks.size());
     CHECK(active_grouped_legacy_op_count(candidate_backend.get()) == candidate.banks.size());
-    check_active_grouped_legacy_caches(reference_backend.get(), reference, false, false);
-    check_active_grouped_legacy_caches(candidate_backend.get(), candidate, true, false);
+    check_active_grouped_legacy_caches(reference_backend.get(), reference, false);
 
     auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
     ggml_cuda_moe_candidate_group_key key;
     CHECK(context != nullptr && context->find_down_group_key(candidate.down, &key));
-    CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
-    CHECK(ggml_cuda_moe_grouped_context_test_access::device_resource_complete(*context, key));
-    CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, key) == candidate.banks.size());
+    CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*context, key) == 0);
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 0 && telemetry.plan_calls == 0);
     CHECK(telemetry.calls == 0 && telemetry.ready == 0 && telemetry.completed == 0 && telemetry.admitted_banks == 0);
-    CHECK(telemetry.decode_grouped == 0 && telemetry.decode_legacy == 1 && telemetry.fallback == 1);
+    CHECK(telemetry.decode_grouped == 0 && telemetry.decode_staged == 1 && telemetry.fallback == 1);
     CHECK(telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     CHECK(telemetry.h2d_banks == 0 && telemetry.h2d_bytes == 0);
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
@@ -983,12 +976,12 @@ static void test_active_grouped_explicit_empty_case(bool v2) {
     CHECK(context->prepare_graph_execution(
         candidate.graph, 903, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
         coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-    CHECK(execution.size() == 0 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY && !execution.requires_dispatch());
+    CHECK(execution.size() == 0 && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED && !execution.requires_dispatch());
     const ggml_cuda_moe_graph_plan * stable_plan = plan.get();
     CHECK(context->prepare_graph_execution(
         candidate.graph, 904, GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &plan, &execution,
         coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
-    CHECK(plan.get() == stable_plan && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+    CHECK(plan.get() == stable_plan && execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
 
     const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, true);
     const auto first = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
@@ -1369,7 +1362,7 @@ void test_pageable_auxiliaries() {
                     CHECK(capture.instance == 0);
                 }
                 const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
-                CHECK(telemetry.decode_grouped == 6 && telemetry.decode_legacy == 0 && telemetry.completed == 6);
+                CHECK(telemetry.decode_grouped == 6 && telemetry.decode_staged == 0 && telemetry.completed == 6);
                 CHECK(telemetry.host_staged_calls == (host_staged ? 6 : 0));
                 CHECK(telemetry.direct == (capture.capture_available && !host_staged ? 1 : 6));
                 CHECK(telemetry.captures == (capture.capture_available && !host_staged ? 1 : 0));
@@ -1391,6 +1384,8 @@ void test_pageable_auxiliaries() {
                         GGML_CUDA_MOE_GRAPH_PROPERTIES_UNKNOWN, &lease_plan, &lease_execution,
                         coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) != GGML_CUDA_MOE_GRAPH_PREPARE_UNAVAILABLE);
                     CHECK(lease_execution.resolve_streams(candidate_test_graph_stream, lease_stream));
+                    CHECK(context->begin_graph_dispatch(&lease_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED));
+                    CHECK(context->finish_graph_dispatch(&lease_execution));
                     CHECK(context->graph_resource_fingerprint(lease_execution, lease_stream, &old_fingerprint, &leases));
                     CHECK(leases.size() == 1);
                     witness = leases[0];
@@ -1481,7 +1476,7 @@ void test_pageable_auxiliaries() {
         CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
         CHECK(active_grouped_legacy_op_count(backend.get(), true) == 0 && active_grouped_legacy_op_count(backend.get(), false) == 0);
         const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
-        CHECK(telemetry.fallback == 0 && telemetry.decode_legacy == 0 && telemetry.required_unsupported != 0);
+        CHECK(telemetry.fallback == 0 && telemetry.decode_staged == 0 && telemetry.required_unsupported != 0);
         CHECK(replace_active_grouped_nvfp4_dispatch_v2(backend.get(), candidate, 4) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
         CHECK(ggml_cuda_moe_grouped_context_test_access::set_original_auxiliary_budget(*context, 1024));
         (void) candidate_certify_graph(*context, candidate.graph);
@@ -1490,6 +1485,130 @@ void test_pageable_auxiliaries() {
         context->shutdown();
         CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
         fprintf(stderr, "test-moe-cache: pageable auxiliary failure=%u clean required decline/recovery OK\n", failure);
+    }
+    ggml_backend_cuda_moe_set_debug_mm(old_debug);
+}
+
+static void test_pageable_detached_auxiliaries() {
+    const bool old_debug = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    for (bool scale : {false, true}) {
+        constexpr uint32_t rows = 2;
+        constexpr uint32_t slots = 4;
+        ggml_backend_ptr reference_backend(ggml_backend_cuda_init(0));
+        ggml_backend_ptr backend(ggml_backend_cuda_init(0));
+        CHECK(reference_backend && backend);
+        const auto build = [&](ggml_backend_t owner, ggml_backend_buffer_type_t buft) {
+            return build_active_grouped_dispatch_graph_types(owner, buft,
+                {scale ? GGML_TYPE_NVFP4 : GGML_TYPE_Q4_0,
+                 scale ? GGML_TYPE_NVFP4 : GGML_TYPE_Q4_0,
+                 scale ? GGML_TYPE_NVFP4 : GGML_TYPE_Q4_0},
+                GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, false, scale, rows, 8, 2, 256,
+                nullptr, false, !scale, 0, !scale);
+        };
+        auto reference = build(reference_backend.get(), ggml_backend_cuda_buffer_type(0));
+        auto candidate = build(backend.get(), pageable_cached_buffer_type());
+        initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+        const std::vector<ggml_tensor *> auxiliaries = scale ?
+            std::vector<ggml_tensor *>{candidate.gate_scale, candidate.up_scale, candidate.down_scale} : candidate.biases;
+        size_t auxiliary_bytes = 0;
+        for (const auto * tensor : auxiliaries) {
+            cudaPointerAttributes attributes = {};
+            CUDA_OK(cudaPointerGetAttributes(&attributes, tensor->data));
+            CHECK(attributes.type == cudaMemoryTypeUnregistered);
+            auxiliary_bytes += ggml_nbytes(tensor);
+        }
+        if (scale) {
+            CHECK(replace_active_grouped_nvfp4_dispatch_v2(backend.get(), candidate, slots) ==
+                GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+        } else {
+            register_active_grouped_dispatch(
+                backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, slots);
+        }
+        auto * context = ggml_cuda_moe_grouped_context_for_test(backend.get());
+        CHECK(context != nullptr);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::set_original_auxiliary_budget(*context, auxiliary_bytes));
+
+        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SPECULATIVE, rows, 1, 0,
+            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        (void) candidate_certify_graph(*context, candidate.graph);
+        CHECK(ggml_backend_graph_compute(reference_backend.get(), reference.graph) == GGML_STATUS_SUCCESS);
+        CHECK(ggml_backend_graph_compute(backend.get(), candidate.graph) == GGML_STATUS_SUCCESS);
+        check_active_grouped_exact_output(
+            active_grouped_tensor_values(reference.output), active_grouped_tensor_values(candidate.output));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == auxiliary_bytes);
+
+        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_DRAFT,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, rows, 1, 0,
+            GGML_GRAPH_EXECUTION_CERTIFICATE_FLAG_REQUIRED_GROUPED);
+        const auto decode_coverage = candidate_certify_graph(*context, candidate.graph);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> decode_plan;
+        ggml_cuda_moe_graph_execution decode_execution;
+        CHECK(context->prepare_graph_execution(
+            candidate.graph, 1591 + scale, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
+            &decode_plan, &decode_execution, decode_coverage.epoch, decode_coverage.nodes,
+            decode_coverage.mmid_count, decode_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(decode_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_STAGED);
+
+        candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+            GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, rows, 1);
+        std::shared_ptr<ggml_cuda_moe_graph_plan> prefill_plan;
+        ggml_cuda_moe_graph_execution prefill_execution;
+        CHECK(context->prepare_graph_execution(
+            candidate.graph, 1593 + scale, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
+            &prefill_plan, &prefill_execution) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+        CHECK(prefill_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
+        cudaStream_t stream = nullptr;
+        float * copied_device = nullptr;
+        CUDA_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+        CUDA_OK(cudaMalloc(&copied_device, auxiliaries.size() * sizeof(float)));
+        const auto check_detached = [&](ggml_cuda_moe_graph_execution & execution) {
+            CHECK(execution.resolve_streams(candidate_test_graph_stream, stream));
+            CHECK(context->begin_graph_dispatch(&execution, GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED));
+            CHECK(execution.find_authority(candidate.readers[0]) == nullptr);
+            std::vector<float> expected(auxiliaries.size());
+            uint32_t copied = 0;
+            for (int node_index = 0; node_index < candidate.graph->n_nodes; ++node_index) {
+                const auto * node = ggml_graph_node(candidate.graph, node_index);
+                const ggml_tensor * tensor = node->op == GGML_OP_ADD_ID ? node->src[1] :
+                    node->op == GGML_OP_REPEAT && node->src[0] != nullptr && node->src[0]->op == GGML_OP_RESHAPE ?
+                        node->src[0]->src[0] : nullptr;
+                const auto found = std::find(auxiliaries.begin(), auxiliaries.end(), tensor);
+                if (found == auxiliaries.end()) {
+                    continue;
+                }
+                const float * source = nullptr;
+                CHECK(context->original_auxiliary_source(execution, node, stream, &source));
+                CHECK(source != nullptr && source != tensor->data);
+                cudaPointerAttributes attributes = {};
+                CUDA_OK(cudaPointerGetAttributes(&attributes, source));
+                CHECK(attributes.type == cudaMemoryTypeDevice);
+                expected[copied] = active_grouped_tensor_values(tensor)[0];
+                CUDA_OK(cudaMemcpyAsync(
+                    copied_device + copied, source, sizeof(float), cudaMemcpyDeviceToDevice, stream));
+                ++copied;
+            }
+            CHECK(copied == auxiliaries.size());
+            CHECK(context->track_staged_stream(&execution, stream));
+            CHECK(context->finish_graph_dispatch(&execution));
+            std::vector<float> actual(copied);
+            CUDA_OK(cudaMemcpy(actual.data(), copied_device, actual.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            CHECK(memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0);
+        };
+        check_detached(decode_execution);
+        check_detached(prefill_execution);
+        CUDA_OK(cudaFree(copied_device));
+        CUDA_OK(cudaStreamDestroy(stream));
+        const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+        CHECK(telemetry.decode_staged != 0 && telemetry.prefill_staged != 0);
+        CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+        CHECK(active_grouped_legacy_op_count(backend.get(), true) == 0 &&
+            active_grouped_legacy_op_count(backend.get(), false) == 0);
+        context->shutdown();
+        CHECK(ggml_cuda_moe_grouped_context_test_access::original_auxiliary_bytes(*context) == 0);
+        fprintf(stderr, "test-moe-cache: detached pageable auxiliary kind=%s decode/prefill staged exact OK\n",
+            scale ? "scale" : "bias");
     }
     ggml_backend_cuda_moe_set_debug_mm(old_debug);
 }
@@ -2012,7 +2131,7 @@ void test_prefill_resident_biases() {
         candidate.graph, 990, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &prefill_plan, &prefill_execution,
         candidate_coverage.epoch, candidate_coverage.nodes, candidate_coverage.mmid_count,
         candidate_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-    CHECK(prefill_plan->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+    CHECK(prefill_plan->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED);
     CHECK(prefill_plan->has_certified_complete_mmid_inventory());
     CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_add_id_witness_count(*prefill_plan) == candidate.biases.size());
     for (ggml_tensor * reader : candidate.readers) {
@@ -2068,92 +2187,6 @@ void test_prefill_resident_biases() {
             *declined_context, declined_key, declined.biases[i]) == nullptr);
     }
 
-    std::array<const ggml_tensor *, 3> add_nodes = {};
-    for (int32_t node_index = 0; node_index < ggml_graph_n_nodes(candidate.graph); ++node_index) {
-        const ggml_tensor * node = ggml_graph_node(candidate.graph, node_index);
-        if (node->op != GGML_OP_ADD_ID) {
-            continue;
-        }
-        for (uint32_t bias = 0; bias < candidate.biases.size(); ++bias) {
-            if (node->src[1] == candidate.biases[bias]) {
-                CHECK(add_nodes[bias] == nullptr);
-                add_nodes[bias] = node;
-            }
-        }
-    }
-    CHECK(std::all_of(add_nodes.begin(), add_nodes.end(), [](const ggml_tensor * node) { return node != nullptr; }));
-    const uint32_t routed_expert = active_grouped_route(candidate, 0, 0, 0);
-    const size_t first_row_bytes = candidate.biases[0]->ne[0] * sizeof(float);
-    const size_t second_row_bytes = candidate.biases[1]->ne[0] * sizeof(float);
-    std::vector<float> first_expected(candidate.biases[0]->ne[0]);
-    std::vector<float> second_expected(candidate.biases[1]->ne[0]);
-    const auto first_original = active_grouped_tensor_values(candidate.biases[0]);
-    const auto second_original = active_grouped_tensor_values(candidate.biases[1]);
-    memcpy(first_expected.data(), first_original.data() + routed_expert * candidate.biases[0]->ne[0], first_row_bytes);
-    memcpy(second_expected.data(), second_original.data() + routed_expert * candidate.biases[1]->ne[0], second_row_bytes);
-    CHECK(std::any_of(first_expected.begin(), first_expected.end(), [](float value) { return value != 0.0f; }));
-
-    cudaStream_t first_stream = nullptr;
-    cudaStream_t second_stream = nullptr;
-    float * staged = nullptr;
-    float * first_result = nullptr;
-    float * second_result = nullptr;
-    CUDA_OK(cudaStreamCreateWithFlags(&first_stream, cudaStreamNonBlocking));
-    CUDA_OK(cudaStreamCreateWithFlags(&second_stream, cudaStreamNonBlocking));
-    CHECK(first_stream != second_stream);
-    CUDA_OK(cudaMalloc(&staged, first_row_bytes));
-    CUDA_OK(cudaMalloc(&first_result, first_row_bytes));
-    CUDA_OK(cudaMalloc(&second_result, second_row_bytes));
-    uint64_t waits_before = 0;
-    uint64_t declines_before = 0;
-    CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_auxiliary_ordering(
-        *candidate_context, candidate_key, &waits_before, &declines_before));
-    CHECK(candidate_context->begin_graph_dispatch(&prefill_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY));
-    const float * first_source = nullptr;
-    const float * second_source = nullptr;
-    CHECK(candidate_context->prefill_add_id_source(
-        prefill_execution, add_nodes[0], first_stream, &first_source));
-    CHECK(first_source == candidate_residents[0]);
-    CHECK(!candidate_context->prefill_add_id_source(
-        prefill_execution, add_nodes[1], second_stream, &second_source));
-    CHECK(second_source == nullptr);
-    CUDA_OK(cudaMemsetAsync(staged, 0, first_row_bytes, first_stream));
-    host_barrier first_barrier;
-    CUDA_OK(cudaLaunchHostFunc(first_stream, wait_on_host_barrier, &first_barrier));
-    CUDA_OK(cudaMemcpyAsync(staged, first_source + routed_expert * candidate.biases[0]->ne[0],
-        first_row_bytes, cudaMemcpyDeviceToDevice, first_stream));
-    CHECK(candidate_context->finish_prefill_add_id(
-        prefill_execution, add_nodes[0], first_stream, first_source));
-    while (!first_barrier.entered.load(std::memory_order_acquire)) {
-        std::this_thread::yield();
-    }
-    CHECK(candidate_context->prefill_add_id_source(
-        prefill_execution, add_nodes[1], second_stream, &second_source));
-    CHECK(second_source == candidate_residents[1]);
-    CUDA_OK(cudaMemcpyAsync(first_result, staged, first_row_bytes, cudaMemcpyDeviceToDevice, second_stream));
-    CUDA_OK(cudaMemcpyAsync(second_result, second_source + routed_expert * candidate.biases[1]->ne[0],
-        second_row_bytes, cudaMemcpyDeviceToDevice, second_stream));
-    CHECK(candidate_context->finish_prefill_add_id(
-        prefill_execution, add_nodes[1], second_stream, second_source));
-    CHECK(candidate_context->finish_graph_dispatch(&prefill_execution));
-    uint64_t waits_after = 0;
-    uint64_t declines_after = 0;
-    CHECK(ggml_cuda_moe_grouped_context_test_access::prefill_auxiliary_ordering(
-        *candidate_context, candidate_key, &waits_after, &declines_after));
-    CHECK(waits_after == waits_before + 2 && declines_after == declines_before + 1);
-    first_barrier.released.store(true, std::memory_order_release);
-    CUDA_OK(cudaStreamSynchronize(second_stream));
-    CUDA_OK(cudaStreamSynchronize(first_stream));
-    std::vector<float> first_actual(first_expected.size());
-    std::vector<float> second_actual(second_expected.size());
-    CUDA_OK(cudaMemcpy(first_actual.data(), first_result, first_row_bytes, cudaMemcpyDeviceToHost));
-    CUDA_OK(cudaMemcpy(second_actual.data(), second_result, second_row_bytes, cudaMemcpyDeviceToHost));
-    CHECK(first_actual == first_expected && second_actual == second_expected);
-    CUDA_OK(cudaFree(second_result));
-    CUDA_OK(cudaFree(first_result));
-    CUDA_OK(cudaFree(staged));
-    CUDA_OK(cudaStreamDestroy(second_stream));
-    CUDA_OK(cudaStreamDestroy(first_stream));
     check_active_grouped_exact_output(
         expected, run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false));
 
@@ -2241,6 +2274,7 @@ void test_prefill_resident_biases() {
 
 void test_active_grouped_dispatch() {
     test_pageable_auxiliaries();
+    test_pageable_detached_auxiliaries();
     test_prefill_resident_biases();
     test_active_grouped_materialization();
     test_active_grouped_dispatch_case(

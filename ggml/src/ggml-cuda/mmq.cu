@@ -4,6 +4,7 @@
 #include "mmid.cuh"
 
 #include <cstdint>
+#include <new>
 
 template <bool use_x_map>
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -299,6 +300,144 @@ void ggml_cuda_mul_mat_q_mapped(
     ggml_cuda_mul_mat_q_impl(
         ctx, src0, src0_secondary, src1, ids, dst,
         source_map, source_split, source_wait_class, stage_ready);
+}
+
+struct ggml_cuda_mmq_mmid_prepared {
+    explicit ggml_cuda_mmq_mmid_prepared(ggml_cuda_pool & pool) :
+        ids_src1(pool), ids_dst(pool), expert_bounds(pool), src1_q8_1(pool), src1_scale(pool) {
+    }
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1;
+    ggml_cuda_pool_alloc<int32_t> ids_dst;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds;
+    ggml_cuda_pool_alloc<char> src1_q8_1;
+    ggml_cuda_pool_alloc<float> src1_scale;
+    mmq_args args = {};
+    int64_t n_experts = 0;
+};
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst) {
+    if (src0 == nullptr || src1 == nullptr || ids == nullptr || dst == nullptr ||
+            src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32 ||
+            src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4) {
+        return nullptr;
+    }
+
+    GGML_TENSOR_BINARY_OP_LOCALS;
+    if (ne13 != 1 || nb12 % nb11 != 0 || nb2 % nb1 != 0 || ids->nb[0] != ggml_element_size(ids)) {
+        return nullptr;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const bool fallback = ne01 % 128 != 0;
+    const int mmq_max_tile_y = ggml_cuda_mmq_get_J_max(src0->type, fallback, cc);
+    const int64_t n_expert_used = ids->ne[0];
+    const int64_t ne_get_rows = ne12 * n_expert_used;
+    if (mmq_max_tile_y <= 0 || ne1 != n_expert_used || ne_get_rows <= 0 ||
+            static_cast<uint64_t>(ne_get_rows) > SIZE_MAX - static_cast<size_t>(mmq_max_tile_y)) {
+        return nullptr;
+    }
+
+    auto * prepared = new (std::nothrow) ggml_cuda_mmq_mmid_prepared(ctx.pool());
+    if (prepared == nullptr) {
+        return nullptr;
+    }
+    const size_t ne_get_rows_padded = static_cast<size_t>(ne_get_rows) + mmq_max_tile_y;
+    prepared->ids_src1.alloc(ne_get_rows);
+    prepared->ids_dst.alloc(ne_get_rows_padded);
+    prepared->expert_bounds.alloc(ne02 + 1);
+
+    const int si1 = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    ggml_cuda_launch_mm_ids_helper(
+        static_cast<const int32_t *>(ids->data), prepared->ids_src1.get(), prepared->ids_dst.get(),
+        prepared->expert_bounds.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, dedup_bcast, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+        mmq_max_tile_y * sizeof(block_q8_1_mmq);
+    prepared->src1_q8_1.alloc(nbytes_src1_q8_1);
+
+    const float * src1_d = static_cast<const float *>(src1->data);
+    const int64_t s11 = src1->nb[1] / ggml_type_size(src1->type);
+    const int64_t s12_src = src1->nb[2] / ggml_type_size(src1->type);
+    const int64_t s13_src = src1->nb[3] / ggml_type_size(src1->type);
+    const int64_t ne11_flat = ne12 * n_expert_used;
+    if (dedup_bcast) {
+        quantize_scatter_mmq_q8_1_cuda(
+            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+            ne10, s12_src, ne10_padded, ne12, ne11_flat, n_expert_used, ctx.stream());
+    } else {
+        quantize_mmq_q8_1_cuda(
+            src1_d, prepared->ids_src1.get(), prepared->src1_q8_1.get(), src0->type,
+            ne10, s11, s12_src, s13_src, ne10_padded, ne11_flat, 1, 1, ctx.stream());
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    const int64_t ts_src0 = ggml_type_size(src0->type);
+    const int64_t ts_dst = ggml_type_size(dst->type);
+    const int64_t s01 = src0->nb[1] / ts_src0;
+    const int64_t s1 = dst->nb[1] / ts_dst;
+    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s2 = dst->nb[2] / ts_dst;
+    const int64_t s03 = src0->nb[3] / ts_src0;
+    const int64_t s3 = dst->nb[3] / ts_dst;
+    const int64_t s12 = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+    const int64_t s13 = ne12 * s12;
+    int64_t ncols_opt = ne12;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    }
+
+    prepared->args = {
+        static_cast<const char *>(src0->data), src0->type,
+        reinterpret_cast<const int *>(prepared->src1_q8_1.get()),
+        prepared->ids_dst.get(), prepared->expert_bounds.get(), static_cast<float *>(dst->data), nullptr,
+        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne02, ne02, s02, s12, s2,
+        ne03, ne13, s03, s13, s3,
+        ne12, ncols_opt,
+    };
+    prepared->n_experts = ne02;
+    return prepared;
+}
+
+bool ggml_cuda_mmq_mmid_launch_range(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_data,
+        const void * staging_data,
+        const int32_t * source_map,
+        int32_t source_split,
+        int32_t expert_begin,
+        int32_t expert_count) {
+    if (prepared == nullptr || resident_data == nullptr || staging_data == nullptr || source_map == nullptr ||
+            source_split <= 0 || expert_begin < 0 || expert_count <= 0 ||
+            static_cast<int64_t>(expert_begin) + expert_count > prepared->n_experts) {
+        return false;
+    }
+
+    mmq_args args = prepared->args;
+    args.x = static_cast<const char *>(resident_data);
+    args.expert_bounds += expert_begin;
+    args.nchannels_x = expert_count;
+    args.nchannels_y = expert_count;
+    args.x_secondary = static_cast<const char *>(staging_data);
+    args.x_channel_map = source_map + expert_begin;
+    args.x_channel_split = source_split;
+    ggml_cuda_mul_mat_q_switch_type<true>(ctx, args, ctx.stream());
+    return cudaGetLastError() == cudaSuccess;
+}
+
+void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared) {
+    delete prepared;
 }
 
 static bool ggml_cuda_mmq_type_supported(enum ggml_type type) {

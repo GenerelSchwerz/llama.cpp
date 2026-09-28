@@ -133,7 +133,8 @@ const ggml_cuda_moe_graph_coverage_diagnostics & ggml_cuda_moe_graph_plan::cover
 }
 
 ggml_cuda_moe_graph_execution::ggml_cuda_moe_graph_execution() :
-        plan_(nullptr), owner_(nullptr), n_groups_(0), dispatch_mode_(GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY), dispatch_active_(false) {
+        plan_(nullptr), owner_(nullptr), n_groups_(0), dispatch_mode_(GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED), dispatch_active_(false),
+        staged_operation_active_(false), n_staged_streams_(0), staged_streams_{}, staged_resource_leases_{} {
 }
 
 ggml_cuda_moe_graph_execution::~ggml_cuda_moe_graph_execution() {
@@ -148,8 +149,12 @@ void ggml_cuda_moe_graph_execution::reset() {
     plan_ = nullptr;
     owner_ = nullptr;
     n_groups_ = 0;
-    dispatch_mode_ = GGML_CUDA_MOE_GRAPH_DISPATCH_LEGACY;
+    dispatch_mode_ = GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED;
     dispatch_active_ = false;
+    staged_operation_active_ = false;
+    n_staged_streams_ = 0;
+    staged_streams_.fill(nullptr);
+    staged_resource_leases_.fill({});
 }
 
 void ggml_cuda_moe_graph_execution::retain(const std::shared_ptr<const ggml_cuda_moe_graph_plan> & plan) {
@@ -179,8 +184,8 @@ bool ggml_cuda_moe_graph_execution::rejects_cached_mmid(const ggml_tensor * node
     const bool cached = source != nullptr && source->buffer != nullptr &&
         ggml_backend_buft_is_cuda_moe_cached(ggml_backend_buffer_get_type(source->buffer));
     const bool legacy = plan_ != nullptr &&
-        (plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY ||
-            plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+        (plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED ||
+            plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_STAGED);
     return cached && plan_ != nullptr && !legacy &&
         plan_->find(node) == nullptr;
 }
@@ -223,11 +228,14 @@ bool ggml_cuda_moe_graph_execution::resolve_streams(ggml_cuda_moe_graph_stream_r
     for (uint32_t record_index = 0; record_index < n_groups_; ++record_index) {
         auto & dispatch = groups_[record_index];
         dispatch.stream = nullptr;
-        if (plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED) {
+        if (plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+                plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED) {
             continue;
         }
         const auto & record = plan_->groups_[record_index];
-        dispatch.stream = resolver(data, record.ids_root.tensor);
+        const ggml_tensor * stream_root = plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED ?
+            record.authority_node : record.ids_root.tensor;
+        dispatch.stream = resolver(data, stream_root);
         if (dispatch.stream == nullptr) {
             continue;
         }
@@ -252,7 +260,8 @@ bool ggml_cuda_moe_graph_execution::has_stream_grouped_candidate() const {
     }
     for (uint32_t record_index = 0; record_index < n_groups_; ++record_index) {
         const auto & dispatch = groups_[record_index];
-        if (plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && dispatch.stream != nullptr) {
+        if ((plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED ||
+                plan_->outcome_ == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED) && dispatch.stream != nullptr) {
             return true;
         }
     }
@@ -260,7 +269,9 @@ bool ggml_cuda_moe_graph_execution::has_stream_grouped_candidate() const {
 }
 
 bool ggml_cuda_moe_graph_execution::has_coherent_grouped_streams() const {
-    if (plan_ == nullptr || dispatch_active_ || plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED || n_groups_ == 0) {
+    if (plan_ == nullptr || dispatch_active_ ||
+            (plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED &&
+                plan_->outcome_ != GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED) || n_groups_ == 0) {
         return false;
     }
     for (uint32_t record_index = 0; record_index < n_groups_; ++record_index) {
@@ -466,60 +477,4 @@ const ggml_cuda_moe_legacy_acquisition & ggml_cuda_moe_legacy_cache_lease::acqui
 
 ggml_cuda_moe_cache * ggml_cuda_moe_legacy_cache_lease::get() const noexcept {
     return cache_;
-}
-
-ggml_cuda_moe_grouped_host_staging_lease::ggml_cuda_moe_grouped_host_staging_lease() noexcept = default;
-
-ggml_cuda_moe_grouped_host_staging_lease::~ggml_cuda_moe_grouped_host_staging_lease() {
-    if (owner_ != nullptr) {
-        owner_->release_grouped_host_staging(*this);
-    }
-}
-
-ggml_cuda_moe_grouped_host_staging_lease::ggml_cuda_moe_grouped_host_staging_lease(
-        ggml_cuda_moe_grouped_host_staging_lease && other) noexcept :
-        owner_(other.owner_),
-        transaction_(other.transaction_),
-        cache_(other.cache_),
-        capability_(other.capability_),
-        bank_index_(other.bank_index_) {
-    other.owner_ = nullptr;
-    other.transaction_ = {};
-    other.cache_ = nullptr;
-    other.capability_ = nullptr;
-    other.bank_index_ = UINT32_MAX;
-}
-
-ggml_cuda_moe_grouped_host_staging_lease & ggml_cuda_moe_grouped_host_staging_lease::operator=(
-        ggml_cuda_moe_grouped_host_staging_lease && other) noexcept {
-    if (this == &other) {
-        return *this;
-    }
-    if (owner_ != nullptr) {
-        owner_->release_grouped_host_staging(*this);
-    }
-    owner_ = other.owner_;
-    transaction_ = other.transaction_;
-    cache_ = other.cache_;
-    capability_ = other.capability_;
-    bank_index_ = other.bank_index_;
-    other.owner_ = nullptr;
-    other.transaction_ = {};
-    other.cache_ = nullptr;
-    other.capability_ = nullptr;
-    other.bank_index_ = UINT32_MAX;
-    return *this;
-}
-
-ggml_cuda_moe_grouped_host_staging_lease::operator bool() const noexcept {
-    return owner_ != nullptr && cache_ != nullptr && capability_ != nullptr;
-}
-
-ggml_cuda_moe_cache * ggml_cuda_moe_grouped_host_staging_lease::get() const noexcept {
-    return cache_;
-}
-
-const ggml_cuda_moe_graph_capability_witness & ggml_cuda_moe_grouped_host_staging_lease::capability() const noexcept {
-    GGML_ASSERT(capability_ != nullptr);
-    return *capability_;
 }

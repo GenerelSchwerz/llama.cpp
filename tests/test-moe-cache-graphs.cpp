@@ -808,7 +808,7 @@ void test_early_grouped_graphs() {
                     CHECK(context->prepare_graph_execution(candidate.graph, 0, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED,
                         &plan, execution.get(), coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
                         GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-                    CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY);
+                    CHECK(execution->outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_STAGED);
                     fprintf(stderr, "early-grouped-test: layout=%u rows=%u variant=%d baseline legacy fallback, exact output, prediction=unsupported\n",
                         layout, rows, variant);
                     continue;
@@ -1110,8 +1110,14 @@ static void test_active_grouped_multirow_graph_modes_case(
             set_active_grouped_dispatch_logits({&reference, &candidate}, route_variant);
         }
         const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-        const uint64_t clock_pass = transition_executed ? pass - 1 : pass + 1;
-        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes * clock_pass, f3_skipped);
+        ggml_cuda_moe_candidate_group_key clock_key;
+        uint64_t clock_before = 0;
+        CHECK(context->find_down_group_key(candidate.down, &clock_key));
+        if (ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, clock_key)) {
+            CHECK(ggml_cuda_moe_grouped_context_test_access::get_clock_bound(*context, clock_key, &clock_before));
+        }
+        const auto actual = run_active_grouped_dispatch(
+            candidate_backend.get(), candidate, clock_before + n_routes, f3_skipped);
         ++executed_passes;
         check_active_grouped_exact_output(expected, actual);
         if (pass == 0) {
@@ -1162,9 +1168,7 @@ static void test_active_grouped_multirow_graph_modes_case(
                 candidate_backend.get(), reference_backend.get(), candidate_prefill, reference_prefill, prefill_ids);
             CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
             auto lease = context->acquire_legacy_cache(candidate.banks[0]);
-            CHECK(lease && lease.get() != nullptr &&
-                ggml_cuda_moe_cache_slot_ptr(lease.get(), 0) ==
-                    ggml_cuda_moe_grouped_context_test_access::device_bank_data(*context, key, candidate.banks[0]));
+            CHECK(!lease);
             if (capture_available) {
                 ggml_cuda_graph_capture_state_for_test retained_graph;
                 CHECK(ggml_cuda_graph_capture_state_query_for_test(candidate_backend.get(), candidate.graph, &retained_graph));
@@ -1180,7 +1184,12 @@ static void test_active_grouped_multirow_graph_modes_case(
     if (transition_executed && !capture_available) {
         set_active_grouped_dispatch_logits({&reference, &candidate}, 1);
         const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
-        const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, n_routes, f3_skipped);
+        ggml_cuda_moe_candidate_group_key clock_key;
+        uint64_t clock_before = 0;
+        CHECK(context->find_down_group_key(candidate.down, &clock_key));
+        CHECK(ggml_cuda_moe_grouped_context_test_access::get_clock_bound(*context, clock_key, &clock_before));
+        const auto actual = run_active_grouped_dispatch(
+            candidate_backend.get(), candidate, clock_before + n_routes, f3_skipped);
         ++executed_passes;
         check_active_grouped_exact_output(expected, actual);
     }
@@ -1190,17 +1199,19 @@ static void test_active_grouped_multirow_graph_modes_case(
         active_grouped_legacy_op_count(reference_backend.get(), false) ==
             executed_passes * reference.banks.size() + transition_legacy_ops);
     CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) == 0 &&
-        active_grouped_legacy_op_count(candidate_backend.get(), false) == transition_legacy_ops);
+        active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
     const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
     CHECK(telemetry.registered == 1 && telemetry.covered == 1);
     CHECK(executed_passes == (capture_available ? 4u : transition_executed ? 2u : 1u));
     const uint64_t expected_plan_compiles = 1;
     CHECK(telemetry.plan_calls == executed_passes && telemetry.plan_compiles == expected_plan_compiles &&
         telemetry.plan_reuses == executed_passes - expected_plan_compiles);
-    CHECK(telemetry.calls == executed_passes && telemetry.ready == executed_passes && telemetry.completed == executed_passes);
-    CHECK(telemetry.ready_min == executed_passes && telemetry.ready_max == executed_passes);
-    CHECK(telemetry.completed_min == executed_passes && telemetry.completed_max == executed_passes);
-    CHECK(telemetry.admitted_banks == executed_passes * candidate.banks.size());
+    const uint64_t owned_calls = executed_passes + (transition_executed ? 1 : 0);
+    CHECK(telemetry.prefill_grouped == (transition_executed ? 1u : 0u) && telemetry.prefill_staged == 0);
+    CHECK(telemetry.calls == owned_calls && telemetry.ready == owned_calls && telemetry.completed == owned_calls);
+    CHECK(telemetry.ready_min == owned_calls && telemetry.ready_max == owned_calls);
+    CHECK(telemetry.completed_min == owned_calls && telemetry.completed_max == owned_calls);
+    CHECK(telemetry.admitted_banks == owned_calls * candidate.banks.size());
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0);
     CHECK(telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     CHECK(telemetry.populated_slots > 0 && telemetry.populated_slots <= telemetry.slot_capacity &&
@@ -1989,10 +2000,9 @@ static void test_active_grouped_speculative_route_limit_transition(
     CHECK(telemetry.host_staged_calls == (sequential_fits ? 0 : 1) &&
         telemetry.host_staged_ops == (sequential_fits ? 0 : candidate_b1.banks.size()) &&
         telemetry.host_staged_split_ops <= telemetry.host_staged_ops &&
-        telemetry.strategy_switches == (sequential_fits ? 0 : 2) &&
+        telemetry.strategy_switches == 0 &&
         telemetry.required_unsupported == 0);
-    CHECK(telemetry.reset_host_staged_handoff == (sequential_fits ? 0 : 1));
-    CHECK(sequential_fits || telemetry.invalidation_refills != 0);
+    CHECK(telemetry.invalidation_refills == 0);
     CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
     if (domain == GGML_GRAPH_EXECUTION_DOMAIN_DRAFT) {
         const uint64_t legacy_before = active_grouped_legacy_op_count(candidate_backend.get());
@@ -2046,7 +2056,11 @@ static void test_active_grouped_host_staged_failure_cleanup(int device) {
     ggml_backend_synchronize(candidate_backend.get());
     std::vector<float> failed_output(sentinel.size());
     ggml_backend_tensor_get(candidate.output, failed_output.data(), 0, ggml_nbytes(candidate.output));
-    CHECK(failed_output == sentinel && !ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+    CHECK(failed_output == sentinel && ggml_cuda_moe_grouped_context_test_access::has_device_resource(*context, key));
+    ggml_cuda_moe_grouped_acquisition failed_acquisition;
+    ggml_cuda_moe_grouped_resource_info failed_info;
+    CHECK(context->acquire_group_resources(key, &failed_acquisition) &&
+        context->get_group_resources(failed_acquisition, &failed_info) && !failed_info.transaction_active);
     CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) +
         active_grouped_legacy_op_count(candidate_backend.get(), false) == 0);
     const auto failed = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
@@ -2129,13 +2143,59 @@ void test_active_grouped_legacy_phase_telemetry(int device) {
         CHECK(expected == actual);
         check_active_grouped_routes(reference, reference.n_rows, index % 3);
         check_active_grouped_routes(candidate, candidate.n_rows, index % 3);
+        const bool detached_staging = current.is_decode;
         CHECK(active_grouped_legacy_op_count(candidate_backend.get(), true) ==
-            decode_before + (current.is_decode ? candidate.banks.size() : 0));
+            decode_before + (detached_staging && current.is_decode ? candidate.banks.size() : 0));
         CHECK(active_grouped_legacy_op_count(candidate_backend.get(), false) ==
-            prefill_before + (current.is_decode ? 0 : candidate.banks.size()));
+            prefill_before + (detached_staging && !current.is_decode ? candidate.banks.size() : 0));
     }
     ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
-    fprintf(stderr, "test-moe-cache: certified legacy phase telemetry OK\n");
+    fprintf(stderr, "test-moe-cache: certified detached staging telemetry OK\n");
+}
+
+static void test_active_grouped_bounded_prefill_waves(int device) {
+    const bool old_debug_mm = ggml_backend_cuda_moe_get_debug_mm();
+    ggml_backend_cuda_moe_set_debug_mm(true);
+    ggml_backend_ptr reference_backend(ggml_backend_cuda_init(device));
+    ggml_backend_ptr candidate_backend(ggml_backend_cuda_init(device));
+    CHECK(reference_backend != nullptr && candidate_backend != nullptr);
+    auto reference = build_active_grouped_dispatch_graph(
+        reference_backend.get(), ggml_backend_cuda_buffer_type(device), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 128, 128, 8);
+    auto candidate = build_active_grouped_dispatch_graph(
+        candidate_backend.get(), ggml_backend_cuda_moe_cached_buffer_type(), GGML_TYPE_Q4_0,
+        GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, false, 128, 128, 8);
+    initialize_active_grouped_dispatch_graphs({&reference, &candidate});
+    const size_t lane_bytes = 2 * candidate.banks[0]->nb[2];
+    register_active_grouped_dispatch(
+        candidate_backend.get(), candidate, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 8);
+    auto * context = ggml_cuda_moe_grouped_context_for_test(candidate_backend.get());
+    CHECK(context != nullptr);
+    CHECK(ggml_cuda_moe_grouped_context_test_access::set_prefill_staging_lane_bytes(*context, lane_bytes));
+    candidate_stamp_execution(candidate.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL, candidate.n_rows, 1);
+    (void) candidate_certify_graph(*context, candidate.graph);
+    set_active_grouped_dispatch_logits({&reference, &candidate}, 2);
+    const auto expected = run_active_grouped_dispatch(reference_backend.get(), reference, 0, false);
+    const auto actual = run_active_grouped_dispatch(candidate_backend.get(), candidate, 0, false);
+    CHECK(expected.size() == actual.size());
+    double squared_error = 0.0;
+    double squared_expected = 0.0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        CHECK(std::isfinite(actual[i]) && std::isfinite(expected[i]));
+        const double difference = actual[i] - expected[i];
+        squared_error += difference * difference;
+        squared_expected += static_cast<double>(expected[i]) * expected[i];
+    }
+    CHECK(squared_expected > 0.0 && squared_error / squared_expected < 2e-5);
+    const auto telemetry = ggml_cuda_moe_grouped_context_test_access::take_grouped_debug_telemetry(*context);
+    CHECK(telemetry.prefill_grouped == 1 && telemetry.prefill_staged == 0);
+    CHECK(telemetry.prefill_bounded_ops == candidate.banks.size());
+    CHECK(telemetry.prefill_bounded_waves > telemetry.prefill_bounded_ops);
+    CHECK(telemetry.prefill_staging_bytes == 2 * lane_bytes);
+    CHECK(telemetry.fallback == 0 && telemetry.rollback == 0 && telemetry.prepare_error == 0 && telemetry.finish_error == 0);
+    ggml_backend_cuda_moe_set_debug_mm(old_debug_mm);
+    fprintf(stderr, "test-moe-cache: bounded grouped prefill multiwave numerical parity OK\n");
 }
 
 static void test_active_grouped_stream_coherence_fallback(int device) {
@@ -2240,7 +2300,7 @@ static void test_active_grouped_stream_coherence_fallback(int device) {
           fallback_telemetry.plan_compiles + fallback_telemetry.plan_reuses == 1 && fallback_telemetry.calls == 0 &&
           fallback_telemetry.ready == 0 && fallback_telemetry.completed == 0 &&
           fallback_telemetry.admitted_banks == 0 && fallback_telemetry.fallback == 1 &&
-          fallback_telemetry.decode_legacy == 1 && fallback_telemetry.decode_grouped == 0 &&
+          fallback_telemetry.decode_staged == 1 && fallback_telemetry.decode_grouped == 0 &&
           fallback_telemetry.submitted == 0 && fallback_telemetry.rollback == 0 &&
           fallback_telemetry.prepare_error == 0 && fallback_telemetry.finish_error == 0);
     ggml_cuda_graph_capture_state_for_test invalidated = {};
@@ -2329,6 +2389,7 @@ void test_active_grouped_multirow_graph_modes(int device) {
     }
     test_active_grouped_host_staged_failure_cleanup(device);
     test_active_grouped_legacy_phase_telemetry(device);
+    test_active_grouped_bounded_prefill_waves(device);
     test_active_grouped_stream_coherence_fallback(device);
     test_mmid_direct_source_view(device);
 }

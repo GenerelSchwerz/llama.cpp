@@ -1686,5 +1686,26 @@ void ggml_cuda_mul_mat_q_mapped(
         const int32_t * source_map, int32_t source_split,
         const int32_t * source_wait_class = nullptr, const uint32_t * stage_ready = nullptr);
 
+struct ggml_cuda_mmq_mmid_prepared;
+
+ggml_cuda_mmq_mmid_prepared * ggml_cuda_mmq_mmid_prepare(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0,
+        const ggml_tensor * src1,
+        const ggml_tensor * ids,
+        ggml_tensor * dst);
+
+bool ggml_cuda_mmq_mmid_launch_range(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_mmq_mmid_prepared * prepared,
+        const void * resident_data,
+        const void * staging_data,
+        const int32_t * source_map,
+        int32_t source_split,
+        int32_t expert_begin,
+        int32_t expert_count);
+
+void ggml_cuda_mmq_mmid_free(ggml_cuda_mmq_mmid_prepared * prepared);
+
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts, size_t smpbo);

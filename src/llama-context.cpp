@@ -350,7 +350,7 @@ static bool ubatch_has_speculative_independent_rows(const llama_ubatch & ubatch)
         ubatch.n_seqs_unq == ubatch.n_tokens && ubatch.n_seq_tokens == 1;
 }
 
-static bool ubatch_has_speculative_sequential_spans(const llama_ubatch & ubatch) {
+static bool ubatch_has_sequential_spans(const llama_ubatch & ubatch) {
     if (ubatch.n_tokens == 0 || ubatch.pos == nullptr || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr ||
             ubatch.seq_id_unq == nullptr || ubatch.n_seqs_unq == 0 || ubatch.n_seqs_unq > ubatch.n_tokens) {
         return false;
@@ -406,7 +406,7 @@ static bool ubatch_matches_graph_execution_intent(
             ((execution_intent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT &&
                 ubatch_has_speculative_independent_rows(ubatch)) ||
              (execution_intent.row_semantics == GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL &&
-                ubatch_has_speculative_sequential_spans(ubatch)));
+                ubatch_has_sequential_spans(ubatch)));
     }
     return false;
 }
@@ -4329,6 +4329,18 @@ ggml_status llama_context::graph_compute(
             certificate.flags =
                 required_grouped_execution_flags(model.moe_expert_cache_slots(), required_grouped_supported);
         }
+        status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
+    } else if (ubatch != nullptr && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && ubatch_has_sequential_spans(*ubatch)) {
+        ggml_graph_execution_certificate certificate = {};
+        certificate.magic = GGML_GRAPH_EXECUTION_CERTIFICATE_MAGIC;
+        certificate.abi_version = GGML_GRAPH_EXECUTION_CERTIFICATE_VERSION;
+        certificate.struct_size = sizeof(certificate);
+        certificate.domain = GGML_GRAPH_EXECUTION_DOMAIN_MAIN;
+        certificate.row_semantics = GGML_GRAPH_EXECUTION_ROW_SEMANTICS_SEQUENTIAL;
+        certificate.owner_namespace = graph_execution_owner_namespace;
+        certificate.owner_generation = graph_execution_owner_generation;
+        certificate.n_rows = ubatch->n_tokens;
+        certificate.n_sequences = ubatch->n_seqs_unq;
         status = ggml_backend_sched_graph_compute_async_ext(sched.get(), gf, &certificate);
     } else {
         if ((cparams.ctx_type == LLAMA_CONTEXT_TYPE_DRAFT || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) &&

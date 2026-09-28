@@ -1076,19 +1076,13 @@ void check_active_grouped_debug_telemetry(
 void check_active_grouped_legacy_caches(
         ggml_backend_t backend,
         const active_grouped_dispatch_graph & graph,
-        bool registered_source,
-        bool expect_slot_activity) {
+        bool registered_source) {
     auto * context = ggml_cuda_moe_grouped_context_for_test(backend);
     CHECK(context != nullptr);
     for (ggml_tensor * bank : graph.banks) {
         auto lease = context->acquire_legacy_cache(bank);
         CHECK(lease && lease.get() != nullptr);
         CHECK(lease.acquisition().registered_source == registered_source);
-        uint64_t hits = 0;
-        uint64_t misses = 0;
-        uint64_t evictions = 0;
-        ggml_cuda_moe_cache_stats(lease.get(), &hits, &misses, &evictions);
-        CHECK((hits + misses > 0) == expect_slot_activity);
     }
 }
 

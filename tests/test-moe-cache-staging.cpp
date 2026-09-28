@@ -242,141 +242,47 @@ void test_pageable_staging_pipeline(int device) {
 
 void test_owner_legacy_cache(int device) {
     grouped_decode_fixture fixture(device);
-    ggml_tensor * gate_up = fixture.weight(GGML_TYPE_Q4_0, 32, 64);
-    ggml_tensor * down = fixture.weight(GGML_TYPE_Q4_0, 32, 32);
-    ggml_tensor * gate = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
-    ggml_tensor * up = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
-    ggml_tensor * separate_down = fixture.weight(GGML_TYPE_Q4_K, 256, 256);
-    ggml_set_name(gate_up, "test.owner.ffn_gate_up_exps.weight");
-    ggml_set_name(down, "test.owner.ffn_down_exps.weight");
-    ggml_set_name(gate, "test.owner.ffn_gate_exps.weight");
-    ggml_set_name(up, "test.owner.ffn_up_exps.weight");
-    ggml_set_name(separate_down, "test.owner.separate.ffn_down_exps.weight");
-    std::array<ggml_backend_moe_candidate_bank_v1, 2> fused_banks = {{
-        {gate_up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_UP_WEIGHT, 0},
-        {down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
-    }};
-    std::array<ggml_backend_moe_candidate_bank_v1, 3> separate_banks = {{
-        {gate, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT, 0},
-        {up, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT, 0},
-        {separate_down, GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT, 0},
-    }};
-    std::array<ggml_backend_moe_candidate_group_v1, 2> groups = {{
-        {fused_banks.data(), fused_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 0, 0},
-        {separate_banks.data(), separate_banks.size(), GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE, 0, 0},
-    }};
-    const auto snapshot = candidate_snapshot(grouped_decode_fixture::N_SLOTS, groups.data(), groups.size());
+    ggml_tensor * weight = fixture.weight(GGML_TYPE_Q4_0, 32, 64);
+    ggml_set_name(weight, "test.owner.unregistered.weight");
+    const auto snapshot = candidate_snapshot(grouped_decode_fixture::N_SLOTS, nullptr, 0);
 
     ggml_cuda_moe_grouped_context first(ggml_backend_get_device(fixture.backend), device);
     ggml_cuda_moe_grouped_context second(ggml_backend_get_device(fixture.backend), device);
     CHECK(first.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
     CHECK(second.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
 
-    auto first_gate = first.acquire_legacy_cache(gate_up);
-    auto second_gate = second.acquire_legacy_cache(gate_up);
-    CHECK(first_gate && second_gate && first_gate.get() != nullptr && second_gate.get() != nullptr);
-    CHECK(first_gate.get() != second_gate.get());
-    CHECK(ggml_cuda_moe_cache_n_slots(first_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
+    auto first_cache = first.acquire_legacy_cache(weight);
+    auto second_cache = second.acquire_legacy_cache(weight);
+    CHECK(first_cache && second_cache && first_cache.get() != nullptr && second_cache.get() != nullptr);
+    CHECK(first_cache.get() != second_cache.get());
+    CHECK(first_cache.acquisition().registered_source == 0 && second_cache.acquisition().registered_source == 0);
+    CHECK(ggml_cuda_moe_cache_n_slots(first_cache.get()) == (int) grouped_decode_fixture::N_SLOTS);
+
     for (uint32_t expert = 0; expert < grouped_decode_fixture::N_EXPERTS; ++expert) {
-        memset(static_cast<char *>(down->data) + expert * down->nb[2], 1 + expert, down->nb[2]);
+        memset(static_cast<char *>(weight->data) + expert * weight->nb[2], 1 + expert, weight->nb[2]);
     }
+    const void * source = static_cast<const char *>(weight->data) + 3 * weight->nb[2];
+    const int slot = ggml_cuda_moe_cache_acquire(
+        first_cache.get(), source, weight->nb[2], ggml_cuda_moe_cache_copy_stream(first_cache.get()), true, false, false);
+    CHECK(slot >= 0);
+    CUDA_OK(cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(first_cache.get())));
+    std::vector<uint8_t> actual(weight->nb[2]);
+    CUDA_OK(cudaMemcpy(actual.data(), ggml_cuda_moe_cache_slot_ptr(first_cache.get(), slot), actual.size(), cudaMemcpyDeviceToHost));
+    CHECK(std::all_of(actual.begin(), actual.end(), [](uint8_t value) { return value == 4; }));
+    CHECK(ggml_cuda_moe_cache_acquire(
+        first_cache.get(), source, weight->nb[2], ggml_cuda_moe_cache_copy_stream(first_cache.get()), true, false, false) == slot);
 
-    auto first_down = first.acquire_legacy_cache(down);
-    CHECK(first_down && first_down.get() != nullptr && first_down.acquisition().registered_source == 1);
-    const bool overlap = ggml_cuda_moe_cache_can_overlap_staging(first_down.get());
-    cudaStream_t prefetch_compute_stream = nullptr;
-    void * prefetch_staging = nullptr;
-    uint32_t * prefetch_stage_ready = nullptr;
-    host_barrier prefetch_barrier;
-    if (overlap) {
-        CUDA_OK(cudaStreamCreateWithFlags(&prefetch_compute_stream, cudaStreamNonBlocking));
-        CUDA_OK(cudaMalloc(&prefetch_staging, 2 * down->nb[2]));
-        CUDA_OK(cudaMalloc(&prefetch_stage_ready, 3 * sizeof(uint32_t)));
-        CUDA_OK(cudaLaunchHostFunc(ggml_cuda_moe_cache_copy_stream(first_down.get()), wait_on_host_barrier, &prefetch_barrier));
-        while (!prefetch_barrier.entered.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
-        }
-    }
-
-    const int32_t experts[] = {1, 3};
-    first.prefetch_legacy_siblings(first_gate, experts, 2, true);
     uint64_t hits = 0;
     uint64_t misses = 0;
     uint64_t evictions = 0;
-    ggml_cuda_moe_cache_stats(first_down.get(), &hits, &misses, &evictions);
-    CHECK(hits == 0 && misses == 2 && evictions == 0);
-
-    if (overlap) {
-        const int32_t split_experts[] = {1, 3, 0, 2, 4, 5};
-        const void * split_sources[6];
-        for (int i = 0; i < 6; ++i) {
-            split_sources[i] = static_cast<const char *>(down->data) + split_experts[i] * down->nb[2];
-        }
-        int slot_ids[6] = {-1, -1, -1, -1, -1, -1};
-        int32_t wait_classes[6] = {-1, -1, -1, -1, -1, -1};
-        int n_resident = 0;
-        int n_wait_classes = 0;
-        const bool prepared = ggml_cuda_moe_cache_prepare_split_staging(
-            first_down.get(), split_sources, 6, down->nb[2], 0, 1, slot_ids, wait_classes,
-            &n_resident, prefetch_staging, prefetch_stage_ready, 3, &n_wait_classes, prefetch_compute_stream, false);
-        prefetch_barrier.released.store(true, std::memory_order_release);
-        if (prepared) {
-            CHECK(ggml_cuda_moe_cache_finish_split_staging(first_down.get(), prefetch_compute_stream));
-            CHECK(ggml_cuda_moe_cache_release_split_slots(first_down.get(), slot_ids, 6, prefetch_compute_stream));
-        }
-        CUDA_OK(cudaStreamSynchronize(prefetch_compute_stream));
-        CUDA_OK(cudaStreamSynchronize(ggml_cuda_moe_cache_copy_stream(first_down.get())));
-        CHECK(prepared);
-        CHECK(n_resident == 4 && n_wait_classes == 3);
-        CHECK(wait_classes[0] == 1 && wait_classes[1] == 1);
-        CHECK(wait_classes[2] == 1 && wait_classes[3] == 1);
-        CHECK(wait_classes[4] == 2 && wait_classes[5] == 2);
-
-        std::vector<uint8_t> prefetch_readback(down->nb[2]);
-        for (int i = 0; i < n_resident; ++i) {
-            CUDA_OK(cudaMemcpy(prefetch_readback.data(), ggml_cuda_moe_cache_slot_ptr(first_down.get(), slot_ids[i]),
-                down->nb[2], cudaMemcpyDeviceToHost));
-            CHECK(std::all_of(prefetch_readback.begin(), prefetch_readback.end(),
-                [&](uint8_t value) { return value == 1 + split_experts[i]; }));
-        }
-        std::vector<uint8_t> staging_readback(2 * down->nb[2]);
-        CUDA_OK(cudaMemcpy(staging_readback.data(), prefetch_staging, staging_readback.size(), cudaMemcpyDeviceToHost));
-        for (int i = n_resident; i < 6; ++i) {
-            CHECK(std::all_of(
-                staging_readback.begin() + (i - n_resident) * down->nb[2],
-                staging_readback.begin() + (i - n_resident + 1) * down->nb[2],
-                [&](uint8_t value) { return value == 1 + split_experts[i]; }));
-        }
-        CUDA_OK(cudaFree(prefetch_stage_ready));
-        CUDA_OK(cudaFree(prefetch_staging));
-        CUDA_OK(cudaStreamDestroy(prefetch_compute_stream));
-    }
-
-    auto second_up = second.acquire_legacy_cache(up);
-    CHECK(second_up && second_up.get() != nullptr && second_up.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_UP_WEIGHT);
-    second.prefetch_legacy_siblings(second_up, experts, 2, true);
-    auto second_separate_gate = second.acquire_legacy_cache(gate);
-    auto second_separate_down = second.acquire_legacy_cache(separate_down);
-    CHECK(second_separate_gate && second_separate_down);
-    CHECK(second_separate_gate.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_GATE_WEIGHT);
-    CHECK(second_separate_down.acquisition().role == GGML_BACKEND_MOE_CANDIDATE_BANK_ROLE_DOWN_WEIGHT);
-    ggml_cuda_moe_cache_stats(second_separate_gate.get(), &hits, &misses, &evictions);
-    CHECK(hits == 0 && misses == 2 && evictions == 0);
-    ggml_cuda_moe_cache_stats(second_separate_down.get(), &hits, &misses, &evictions);
-    CHECK(hits == 0 && misses == 2 && evictions == 0);
-
-    CHECK(ggml_cuda_moe_cache_n_slots(first_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
-
+    ggml_cuda_moe_cache_stats(first_cache.get(), &hits, &misses, &evictions);
+    CHECK(hits == 1 && misses == 1 && evictions == 0);
+    first_cache = {};
+    CHECK(first.replace(&snapshot) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
+    CHECK(ggml_cuda_moe_cache_n_slots(second_cache.get()) == (int) grouped_decode_fixture::N_SLOTS);
+    second_cache = {};
     ggml_backend_cuda_moe_log_and_reset_stats();
-    ggml_cuda_moe_cache_stats(first_down.get(), &hits, &misses, &evictions);
-    CHECK(hits == 0 && misses == 0 && evictions == 0);
-    first_down = {};
-    first_gate = {};
-    const auto disabled = candidate_snapshot(grouped_decode_fixture::N_SLOTS, nullptr, 0);
-    CHECK(first.replace(&disabled) == GGML_BACKEND_MOE_CANDIDATE_REPLACE_ACCEPTED);
-    CHECK(ggml_cuda_moe_cache_n_slots(second_gate.get()) == (int) grouped_decode_fixture::N_SLOTS);
-    ggml_backend_cuda_moe_log_and_reset_stats();
-    fprintf(stderr, "test-moe-cache: owner-local legacy cache OK\n");
+    fprintf(stderr, "test-moe-cache: owner-local unregistered cache OK\n");
 }
 
 static ggml_cuda_moe_complete_group_key grouped_decode_key(

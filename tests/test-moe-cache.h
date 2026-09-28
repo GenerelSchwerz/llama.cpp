@@ -55,6 +55,9 @@ void test_grouped_layer_placement();
 void test_speculative_required_grouped_backend_capability(int device);
 
 struct ggml_cuda_moe_grouped_context_test_access {
+    static bool set_prefill_staging_lane_bytes(ggml_cuda_moe_grouped_context & context, size_t bytes) {
+        return context.set_prefill_staging_lane_bytes_for_test(bytes);
+    }
     static bool set_original_auxiliary_budget(ggml_cuda_moe_grouped_context & context, size_t bytes) {
         return context.set_original_auxiliary_budget_for_test(bytes);
     }
@@ -184,10 +187,6 @@ struct ggml_cuda_moe_grouped_context_test_access {
             const ggml_cuda_moe_grouped_context & context,
             const ggml_cuda_moe_candidate_group_key & key) {
         return context.legacy_backing_count_for_test(key);
-    }
-
-    static void fail_borrowed_cache_init_after_probe(ggml_cuda_moe_grouped_context & context) {
-        context.fail_borrowed_cache_init_after_probe_for_test();
     }
 
     static void poison_split_staging(ggml_cuda_moe_grouped_context & context, uint32_t calls) {
@@ -642,8 +641,7 @@ void check_active_grouped_debug_telemetry(
 void check_active_grouped_legacy_caches(
         ggml_backend_t backend,
         const active_grouped_dispatch_graph & graph,
-        bool registered_source,
-        bool expect_slot_activity = true);
+        bool registered_source);
 
 void check_active_grouped_contract(
         ggml_backend_t backend,

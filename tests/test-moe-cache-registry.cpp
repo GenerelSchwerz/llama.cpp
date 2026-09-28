@@ -426,7 +426,7 @@ void test_candidate_graph_coverage_ledger() {
     CHECK(plan.coverage_diagnostics().cached_mmid == 3);
     CHECK(plan.coverage_diagnostics().counts[GGML_CUDA_MOE_GRAPH_COVERAGE_REVERSE_MAP_MISS] == 3);
     CHECK(execution.size() == 0);
-    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+    CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
     CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, {0, 0}));
 
     const int64_t ungated_up_ne[] = {64, 32, 4};
@@ -1038,7 +1038,7 @@ void test_graph_execution_certificate_policy() {
         ggml_cuda_moe_graph_plan plan;
         ggml_cuda_moe_graph_execution execution;
         compile(current, graph_uid, plan, execution);
-        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_LEGACY && execution.size() == 1);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_STAGED && execution.size() == 1);
         CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_execution_reason(plan, 0));
     };
 
@@ -1105,7 +1105,20 @@ void test_graph_execution_certificate_policy() {
     invalid.graph->execution_certificate = valid_certificate;
     invalid.graph->execution_certificate.n_rows = 2;
     invalid.graph->execution_certificate.n_sequences = 2;
-    check_execution_legacy(invalid, 1206);
+    {
+        ggml_cuda_moe_graph_plan plan;
+        ggml_cuda_moe_graph_execution execution;
+        compile(invalid, 1206, plan, execution);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_DECODE_GROUPED && execution.size() == 1);
+        CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_eligible_reason(plan, 0));
+    }
+    invalid.graph->execution_certificate.n_sequences = 3;
+    check_execution_legacy(invalid, 1207);
+
+    auto reduced_multirow = make_graph(2, 2);
+    candidate_stamp_execution(reduced_multirow.graph, GGML_GRAPH_EXECUTION_DOMAIN_MAIN,
+        GGML_GRAPH_EXECUTION_ROW_SEMANTICS_INDEPENDENT, 4, 4);
+    check_execution_legacy(reduced_multirow, 1208);
 
     auto parent_case = make_graph(2, 1);
     ggml_cgraph split = ggml_graph_view(parent_case.graph, 0, parent_case.graph->n_nodes);
@@ -1217,7 +1230,7 @@ void test_graph_execution_certificate_policy() {
         ggml_cuda_moe_graph_plan plan;
         ggml_cuda_moe_graph_execution execution;
         compile(isolated, 1231, plan, execution);
-        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY && !execution.find(isolated.down, nullptr));
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED && !execution.find(isolated.down, nullptr));
         CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_prefill_reason(plan, 0));
     }
 
@@ -1514,11 +1527,7 @@ void test_candidate_generic_physical_truth() {
     CHECK(execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
     CHECK(!registry.begin_graph_dispatch(&execution, true));
     CHECK(!ggml_cuda_moe_grouped_context_test_access::has_device_resource(registry, key));
-    CHECK(registry.begin_graph_dispatch(&execution, false));
-    auto q8k_legacy = registry.acquire_legacy_cache(gate_q8k);
-    CHECK(q8k_legacy && q8k_legacy.acquisition().registered_source == 1);
-    q8k_legacy = {};
-    CHECK(registry.finish_graph_dispatch(&execution));
+    CHECK(!registry.begin_graph_dispatch(&execution, false));
 
     ggml_tensor * gate_q4 = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, weight_ne);
     ggml_tensor * up_q4 = fixture.cached_tensor(GGML_TYPE_Q4_K, 3, weight_ne);

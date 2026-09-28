@@ -479,7 +479,7 @@ void test_cached_mmid_prefill_and_overflow() {
         registered_prefill.graph, 801, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &transition_plan, &transition_execution) ==
         GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
     CHECK(transition_execution.size() == 1);
-    CHECK(transition_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+    CHECK(transition_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_has_complete_mmid_inventory(*transition_plan));
     CHECK(!ggml_cuda_moe_grouped_context_test_access::graph_group_has_decode_discovery(*transition_plan, 0));
     const ggml_cuda_moe_graph_plan * uncovered_prefill_plan = transition_plan.get();
@@ -498,7 +498,13 @@ void test_cached_mmid_prefill_and_overflow() {
         prefill_coverage.epoch, prefill_coverage.nodes,
         prefill_coverage.mmid_count, prefill_coverage.mmid_fingerprint) == GGML_CUDA_MOE_GRAPH_PREPARE_REUSED);
     CHECK(transition_plan.get() == covered_prefill_plan);
+    CHECK(transition_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_GROUPED);
     CHECK(ggml_cuda_moe_grouped_context_test_access::graph_has_complete_mmid_inventory(*transition_plan));
+    CHECK(ggml_cuda_moe_grouped_context_test_access::graph_group_has_decode_discovery(*transition_plan, 0));
+    CHECK(transition_context->prepare_graph_execution(
+        registered_prefill.graph, 805, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &transition_plan, &transition_execution) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(transition_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
     CHECK(!ggml_cuda_moe_grouped_context_test_access::graph_group_has_decode_discovery(*transition_plan, 0));
     CHECK(transition_execution.resolve_streams(candidate_test_graph_stream, reinterpret_cast<void *>(uintptr_t{1})));
     CHECK(transition_context->begin_graph_dispatch(&transition_execution, true));
@@ -508,25 +514,9 @@ void test_cached_mmid_prefill_and_overflow() {
     void * first_bank_data = ggml_cuda_moe_grouped_context_test_access::device_bank_data(
         *transition_context, transition_key, grouped.banks[0]);
     CHECK(first_bank_data != nullptr);
-    const uint32_t payload_sentinel = 0x5a17c3e9;
-    uint32_t payload_probe = 0;
-    CUDA_OK(cudaMemcpy(first_bank_data, &payload_sentinel, sizeof(payload_sentinel), cudaMemcpyHostToDevice));
-    ggml_cuda_moe_grouped_context_test_access::fail_borrowed_cache_init_after_probe(*transition_context);
     CHECK(!transition_context->acquire_legacy_cache(grouped.banks[0]));
-    CUDA_OK(cudaMemcpy(&payload_probe, first_bank_data, sizeof(payload_probe), cudaMemcpyDeviceToHost));
-    CHECK(payload_probe == payload_sentinel);
     CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*transition_context, transition_key) == 0);
-    auto first_legacy = transition_context->acquire_legacy_cache(grouped.banks[0]);
-    CHECK(first_legacy && first_legacy.get() != nullptr && first_legacy.acquisition().registered_source == 1 &&
-        first_legacy.acquisition().group_index == transition_key.group_index);
-    CUDA_OK(cudaMemcpy(&payload_probe, first_bank_data, sizeof(payload_probe), cudaMemcpyDeviceToHost));
-    CHECK(payload_probe == payload_sentinel);
-    CHECK(ggml_cuda_moe_cache_slot_ptr(first_legacy.get(), 0) ==
-        ggml_cuda_moe_grouped_context_test_access::device_bank_data(*transition_context, transition_key, grouped.banks[0]));
-    CHECK(ggml_cuda_moe_grouped_context_test_access::legacy_backing_count(*transition_context, transition_key) == 1);
-    const uint64_t legacy_epoch = first_legacy.acquisition().group_authority_epoch;
     CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
-    first_legacy = {};
     CHECK(transition_context->finish_graph_dispatch(&transition_execution));
 
     const auto registered_mapped_first = run_cached_mmid_path_test(
@@ -536,18 +526,41 @@ void test_cached_mmid_prefill_and_overflow() {
     CHECK(registered_mapped_first == registered_mapped_second);
     CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
     auto repeated_legacy = transition_context->acquire_legacy_cache(grouped.banks[0]);
-    CHECK(repeated_legacy && repeated_legacy.acquisition().group_authority_epoch == legacy_epoch);
-    repeated_legacy = {};
+    CHECK(!repeated_legacy);
     (void) run_cached_mmid_path_test(
         transition_backend.get(), reference_backend.get(), registered_prefill, registered_reference, {0, 1, 2, 3, 4, 5});
     CHECK(ggml_cuda_moe_grouped_context_test_access::has_device_resource(*transition_context, transition_key));
-    CHECK(run_active_grouped_dispatch(transition_backend.get(), grouped, 2) == grouped_first);
+    uint64_t pre_decode_clock = 0;
+    CHECK(ggml_cuda_moe_grouped_context_test_access::get_clock_bound(
+        *transition_context, transition_key, &pre_decode_clock));
+    CHECK(run_active_grouped_dispatch(transition_backend.get(), grouped, pre_decode_clock + 2) == grouped_first);
     ggml_cuda_moe_grouped_acquisition regrouped_resource;
     CHECK(transition_context->acquire_group_resources(transition_key, &regrouped_resource));
     CHECK(regrouped_resource.resource_generation == grouped_resource_generation && !grouped_witness.expired());
     uint64_t stable_fingerprint = 0;
     CHECK(transition_context->graph_resource_fingerprint(grouped_execution, transition_stream, &stable_fingerprint));
     CHECK(stable_fingerprint == grouped_fingerprint);
+
+    CHECK(transition_context->prepare_graph_execution(
+        registered_prefill.graph, 806, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &transition_plan, &transition_execution) ==
+        GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
+    CHECK(transition_execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
+    CHECK(transition_execution.resolve_streams(candidate_test_graph_stream, transition_stream));
+    CHECK(transition_context->begin_graph_dispatch(&transition_execution, GGML_CUDA_MOE_GRAPH_DISPATCH_STAGED));
+    std::atomic<bool> replacement_done{false};
+    std::thread replacement([&]() {
+        register_active_grouped_dispatch(
+            transition_backend.get(), grouped, GGML_BACKEND_MOE_CANDIDATE_LAYOUT_FUSED_GATE_UP, 4);
+        replacement_done.store(true, std::memory_order_release);
+    });
+    while (!ggml_cuda_moe_grouped_context_test_access::admission_closed(*transition_context)) {
+        std::this_thread::yield();
+    }
+    CHECK(!replacement_done.load(std::memory_order_acquire));
+    CHECK(transition_context->track_staged_stream(&transition_execution, transition_stream));
+    CHECK(transition_context->finish_graph_dispatch(&transition_execution));
+    replacement.join();
+    CHECK(replacement_done.load(std::memory_order_acquire));
     CUDA_OK(cudaStreamDestroy(transition_stream));
     fprintf(stderr, "test-moe-cache: registered grouped prefill stable backing OK\n");
     fprintf(stderr, "test-moe-cache: cached mapped prefill and overflow OK\n");
@@ -845,7 +858,7 @@ void test_cached_mmid_routed_separate_chain() {
             candidate.graph, 991, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
             coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
 
         cudaStream_t cache_stream = nullptr;
         CUDA_OK(cudaStreamCreateWithFlags(&cache_stream, cudaStreamNonBlocking));
@@ -944,7 +957,7 @@ void test_cached_mmid_routed_separate_chain() {
             candidate.graph, 993, GGML_CUDA_MOE_GRAPH_PROPERTIES_CHANGED, &plan, &execution,
             coverage.epoch, coverage.nodes, coverage.mmid_count, coverage.mmid_fingerprint) ==
             GGML_CUDA_MOE_GRAPH_PREPARE_COMPILED);
-        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_LEGACY);
+        CHECK(execution.outcome() == GGML_CUDA_MOE_GRAPH_OUTCOME_PREFILL_STAGED);
 
         cudaStream_t cache_stream = nullptr;
         CUDA_OK(cudaStreamCreateWithFlags(&cache_stream, cudaStreamNonBlocking));
