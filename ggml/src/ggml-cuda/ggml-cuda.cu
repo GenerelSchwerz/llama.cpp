@@ -2371,6 +2371,7 @@ ggml_backend_cuda_context::ggml_backend_cuda_context(int device) :
 }
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    moe_router_contexts.clear();
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2383,10 +2384,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
-                if (moe_ids_cache != nullptr) {
+                if (moe_ids_cache != nullptr || streams[i][j] == borrowed_stream) {
                     CUDA_CHECK(cudaStreamSynchronize(streams[i][j]));
                 }
-                CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+                if (streams[i][j] != borrowed_stream) {
+                    CUDA_CHECK(cudaStreamDestroy(streams[i][j]));
+                }
             }
             if (cublas_handles[i][j] != nullptr) {
                 CUBLAS_CHECK(cublasDestroy(cublas_handles[i][j]));

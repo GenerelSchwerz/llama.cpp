@@ -10292,6 +10292,7 @@ void ggml_cuda_moe_grouped_context::configure_early_router(
         if (new_context) {
             auto context = std::make_unique<ggml_backend_cuda_context>(impl_->device);
             context->streams[impl_->device][0] = workspace.stream;
+            context->borrowed_stream = workspace.stream;
             workspace.router_context = context.get();
             parent.moe_router_contexts.push_back(std::move(context));
         }
