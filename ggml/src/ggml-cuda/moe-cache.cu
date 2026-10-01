@@ -7378,13 +7378,15 @@ struct ggml_cuda_moe_grouped_context::impl {
                 next_staging += source->expert_stride * materialization.storage.tiles;
                 device_banks[i].source_path = MOE_GROUPED_SOURCE_PAGEABLE_STAGED;
                 device_banks[i].staged = true;
+            } else if (source != nullptr) {
+                alias_data = source->device_alias;
+                device_banks[i].source_path = MOE_GROUPED_SOURCE_DIRECT_REGISTERED;
             } else {
                 if (!device_alias(device, bank.buffer_base, bank.data_offset, bank.source_data,
                         false, false, &alias_data, &host_alias, bank.tensor)) {
                     return nullptr;
                 }
-                device_banks[i].source_path = source != nullptr ? MOE_GROUPED_SOURCE_DIRECT_REGISTERED :
-                    host_alias ? MOE_GROUPED_SOURCE_MAPPED : MOE_GROUPED_SOURCE_DEVICE;
+                device_banks[i].source_path = host_alias ? MOE_GROUPED_SOURCE_MAPPED : MOE_GROUPED_SOURCE_DEVICE;
             }
             if (bank.expert_stride > SIZE_MAX / snapshot.n_slots) {
                 return nullptr;
