@@ -2975,7 +2975,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          check_leaf_nodes = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3008,7 +3009,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || (!check_leaf_nodes && src->op == GGML_OP_NONE) || src == logits_may_alias) {
                     continue;
                 }
 
@@ -3064,7 +3065,7 @@ static int ggml_cuda_match_shared_mmvq_input(const ggml_cgraph * cgraph, int i) 
                 ggml_backend_buffer_is_cuda(weight->buffer);
         }
         if (supported && input->nb[0] == sizeof(float) &&
-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, outputs, count)) {
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, outputs, count, /*is_topk_moe =*/ false, /*check_leaf_nodes =*/ true)) {
             return count;
         }
     }
