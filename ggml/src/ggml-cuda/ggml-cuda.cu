@@ -3044,7 +3044,7 @@ static int ggml_cuda_match_shared_mmvq_input(const ggml_cgraph * cgraph, int i) 
         const ggml_tensor * first = cgraph->nodes[i];
         const ggml_tensor * second = cgraph->nodes[i + count - 1];
         const ggml_tensor * input = first->src[1];
-        if (input != second->src[1] || input->type != GGML_TYPE_F32 || input->ne[1] < 2 || input->ne[2] != 1 || input->ne[3] != 1 ||
+        if (input != second->src[1] || input->type != GGML_TYPE_F32 || input->ne[1] < 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
                 first->src[0]->type != second->src[0]->type) {
             continue;
         }
