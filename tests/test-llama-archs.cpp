@@ -45,6 +45,19 @@
 #    include <sys/wait.h>
 #endif
 
+// These fixtures also test the legacy decode API and malformed batch certificates.
+static void batch_add_compat(llama_batch & batch, llama_token id, llama_pos pos,
+        const std::vector<llama_seq_id> & seq_ids, bool output) {
+    GGML_ASSERT(batch.seq_id[batch.n_tokens]);
+    batch.token[batch.n_tokens] = id;
+    batch.pos[batch.n_tokens] = pos;
+    batch.n_seq_id[batch.n_tokens] = seq_ids.size();
+    for (size_t i = 0; i < seq_ids.size(); ++i) {
+        batch.seq_id[batch.n_tokens][i] = seq_ids[i];
+    }
+    batch.logits[batch.n_tokens++] = output;
+}
+
 static bool arch_matches(const std::string & filter, llm_arch arch) {
     if (filter.empty()) {
         return true;
@@ -121,6 +134,7 @@ static void usage(char ** argv) {
     LOG("  --test-moe-placement    Run MoE placement checks\n");
     LOG("  --test-moe-joint-measurement Run MoE joint measurement checks\n");
     LOG("  --fit-tool <path>        Fit tool for joint measurement checks\n");
+    LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -188,6 +202,7 @@ static gguf_context_ptr get_gguf_ctx(
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
+            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
@@ -201,10 +216,10 @@ static gguf_context_ptr get_gguf_ctx(
         //n_vocab = 4096; // must be >= the hard-coded codec head size (3072)
         n_vocab = 3072; // TODO: should be 4096, but user code cannot get `n_vocab_out` yet [TAG_LLAMA_N_VOCAB_OUT]
     } else if (arch == LLM_ARCH_HRM_TEXT) {
-        n_layer = 8; // 1 layer per stack x 2 h-cycles x (3 l-cycles + 1) cache slots
+        n_layer = 6; // 1 layer per stack x 2 h-cycles x (2 l-cycles + 1) cache slots
     }
 
-    GGML_ASSERT(!mtp || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+    GGML_ASSERT(!mtp || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP);
     const uint32_t n_layer_all = n_layer + (mtp ? 1 : 0);
 
     uint32_t n_head_kv = n_head;
@@ -245,14 +260,19 @@ static gguf_context_ptr get_gguf_ctx(
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
-            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        } else {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
@@ -271,11 +291,13 @@ static gguf_context_ptr get_gguf_ctx(
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_MISTRAL4
-            || arch == LLM_ARCH_HY_V4) {
-        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
+            || arch == LLM_ARCH_GLM5_NEXT
+            || arch == LLM_ARCH_HY_V4
+            || arch == LLM_ARCH_MISTRAL4) {
+        // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
-        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(0) : uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
         if (arch == LLM_ARCH_DOTS3NOTE) {
@@ -335,11 +357,17 @@ static gguf_context_ptr get_gguf_ctx(
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    if (arch == LLM_ARCH_QWEN4EXP) {
+    if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        std::vector<uint32_t> compress_ratios(n_layer_all, 4);
+        if (mtp) {
+            compress_ratios.back() = 0;
+        }
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, compress_ratios);
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
         const uint32_t ple_ngram_size      = 3;
@@ -378,8 +406,16 @@ static gguf_context_ptr get_gguf_ctx(
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
-    ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    // mrope sections count rope pairs; Ling 3.0 VL files carry [t, h, w] sections
+    // summing to n_rot / 2 (n_rot is 64 in this fixture)
+    if (arch == LLM_ARCH_BAILINGMOE3) {
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({8, 12, 12, 0}));
+    } else {
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
+    }
 
     if (arch == LLM_ARCH_HY_V4) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,     uint32_t(4));
@@ -412,10 +448,10 @@ static gguf_context_ptr get_gguf_ctx(
     }
 
     if (arch == LLM_ARCH_HRM_TEXT) {
-        // 8 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
+        // 6 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
         ms.add_kv(LLM_KV_HRM_LAYERS_PER_STACK, uint32_t(1));
         ms.add_kv(LLM_KV_HRM_H_CYCLES,         uint32_t(2));
-        ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(3));
+        ms.add_kv(LLM_KV_HRM_L_CYCLES,         uint32_t(2));
     }
 
     if (arch == LLM_ARCH_MAPLE) {
@@ -673,7 +709,7 @@ static void test_live_context_workspace_reserve(size_t seed, float stdev) {
     for (int32_t chunk = 0; chunk < 9; ++chunk) {
         llama_batch batch = llama_batch_init(ctx_params.n_batch, 0, 1);
         for (int32_t i = 0; i < (int32_t) ctx_params.n_batch; ++i) {
-            common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
+            batch_add_compat(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
             ++pos;
         }
         GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
@@ -689,7 +725,7 @@ static void test_live_context_workspace_reserve(size_t seed, float stdev) {
     llama_memory_seq_add(llama_get_memory(ctx.get()), 0, 512, pos, -512);
 
     llama_batch shifted = llama_batch_init(1, 0, 1);
-    common_batch_add(shifted, tokens[pos], pos - 512, { 0 }, true);
+    batch_add_compat(shifted, tokens[pos], pos - 512, { 0 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), shifted) == 0);
     llama_synchronize(ctx.get());
     llama_batch_free(shifted);
@@ -702,7 +738,7 @@ static void test_live_context_workspace_reserve(size_t seed, float stdev) {
 
     llama_memory_clear(llama_get_memory(ctx.get()), false);
     llama_batch short_batch = llama_batch_init(1, 0, 1);
-    common_batch_add(short_batch, tokens[0], 0, { 0 }, true);
+    batch_add_compat(short_batch, tokens[0], 0, { 0 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), short_batch) == 0);
     llama_synchronize(ctx.get());
     llama_batch_free(short_batch);
@@ -733,7 +769,7 @@ static void test_live_context_workspace_iswa_reserve(size_t seed, float stdev) {
     for (int32_t chunk = 0; chunk < 9; ++chunk) {
         llama_batch batch = llama_batch_init(ctx_params.n_batch, 0, 1);
         for (int32_t i = 0; i < (int32_t) ctx_params.n_batch; ++i) {
-            common_batch_add(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
+            batch_add_compat(batch, tokens[pos], pos, { 0 }, i + 1 == (int32_t) ctx_params.n_batch);
             ++pos;
         }
         GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
@@ -746,7 +782,7 @@ static void test_live_context_workspace_iswa_reserve(size_t seed, float stdev) {
 
     llama_memory_clear(llama_get_memory(ctx.get()), false);
     llama_batch short_batch = llama_batch_init(1, 0, 1);
-    common_batch_add(short_batch, tokens[0], 0, { 0 }, true);
+    batch_add_compat(short_batch, tokens[0], 0, { 0 }, true);
     GGML_ASSERT(llama_decode(ctx.get(), short_batch) == 0);
     llama_synchronize(ctx.get());
     llama_batch_free(short_batch);
@@ -834,7 +870,7 @@ static void test_phase_workspace_runtime_reserve(size_t seed, float stdev) {
     llama_batch batch = llama_batch_init(16, 0, 1);
     const std::vector<llama_token> tokens = get_tokens(16, llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed);
     for (int32_t i = 0; i < 16; ++i) {
-        common_batch_add(batch, tokens[i], i, { 0 }, true);
+        batch_add_compat(batch, tokens[i], i, { 0 }, true);
     }
 
     phase_workspace_fail_alloc = true;
@@ -875,7 +911,7 @@ static void test_phase_workspace_runtime_reserve(size_t seed, float stdev) {
     for (int32_t width = 1; width <= 4; width *= 2) {
         llama_batch declared = llama_batch_init(width, 0, 1);
         for (int32_t i = 0; i < width; ++i) {
-            common_batch_add(declared, tokens[i], pos++, { 0 }, true);
+            batch_add_compat(declared, tokens[i], pos++, { 0 }, true);
         }
         GGML_ASSERT(llama_decode(ctx.get(), declared) == 0);
         llama_synchronize(ctx.get());
@@ -941,7 +977,7 @@ static void test_phase_workspace_late_pipeline_fallback(size_t seed, float stdev
     const std::vector<llama_token> tokens = get_tokens(16,
             llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed);
     for (int32_t i = 0; i < 16; ++i) {
-        common_batch_add(batch, tokens[i], i, { 0 }, i == 15);
+        batch_add_compat(batch, tokens[i], i, { 0 }, i == 15);
     }
     GGML_ASSERT(llama_decode(ctx.get(), batch) == 0);
     llama_synchronize(ctx.get());
@@ -963,7 +999,7 @@ static llama_batch make_mtp_batch(
 
     const std::vector<llama_token> tokens = get_tokens(n_tokens, n_vocab, seed);
     for (int32_t i = 0; i < n_tokens; ++i) {
-        common_batch_add(batch, tokens[i], pos + i, { 0 }, i == n_tokens - 1);
+        batch_add_compat(batch, tokens[i], pos + i, { 0 }, i == n_tokens - 1);
         for (int32_t j = 0; j < n_embd; ++j) {
             batch.embd[(size_t) i * n_embd + j] = (float) ((i + j) % 17) / 17.0f;
         }
@@ -1147,12 +1183,12 @@ static void test_speculative_limits(size_t seed, float stdev) {
             pending_initial[seq_id] = get_mtp_state(spec.get(), seq_id);
         }
 
-        llama_batch verify = llama_batch_init(4, 0, 1);
+        common_batch verify(target_retained.get());
         for (llama_seq_id seq_id = 0; seq_id < 2; ++seq_id) {
-            common_batch_add(verify, 2 + seq_id, 0, { seq_id }, true);
-            common_batch_add(verify, proposals[seq_id][0], 1, { seq_id }, true);
+            verify.add( 2 + seq_id, 0, { seq_id }, true);
+            verify.add( proposals[seq_id][0], 1, { seq_id }, true);
         }
-        GGML_ASSERT(llama_decode(target_retained.get(), verify) == 0);
+        GGML_ASSERT(llama_process(target_retained.get(), LLAMA_PROCESS_TYPE_DECODE, verify.get()) == 0);
         llama_synchronize(target_retained.get());
 
         auto * draft_mem = llama_get_memory(draft_retained.get());
@@ -1280,7 +1316,6 @@ static void test_speculative_limits(size_t seed, float stdev) {
         GGML_ASSERT(!common_speculative_has_deferred_accept(spec.get(), 0));
         GGML_ASSERT(llama_memory_seq_rm(draft_mem, 0, -1, -1));
 
-        llama_batch_free(verify);
     }
 }
 
@@ -1307,7 +1342,7 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     llama_batch target_batch = llama_batch_init(4, 0, 1);
     const std::vector<llama_token> tokens = get_tokens(4, n_vocab, seed);
     for (int32_t i = 0; i < 4; ++i) {
-        common_batch_add(target_batch, tokens[i], i, { 0 }, true);
+        batch_add_compat(target_batch, tokens[i], i, { 0 }, true);
     }
     llama_batch draft_batch = make_mtp_batch(4, n_embd, 0, n_vocab, seed + 1);
 
@@ -1357,10 +1392,10 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     draft_workspace->iface.synchronize = phase_workspace_count_synchronize;
 
     llama_batch target_catchup = llama_batch_init(1, 0, 1);
-    common_batch_add(target_catchup, tokens[0], 4, { 0 }, true);
+    batch_add_compat(target_catchup, tokens[0], 4, { 0 }, true);
     llama_batch draft_catchup = make_mtp_batch(1, n_embd, 4, n_vocab, seed + 2);
     llama_batch target_reacquire = llama_batch_init(1, 0, 1);
-    common_batch_add(target_reacquire, tokens[1], 5, { 0 }, true);
+    batch_add_compat(target_reacquire, tokens[1], 5, { 0 }, true);
     GGML_ASSERT(llama_decode(target.get(), target_catchup) == 0);
     GGML_ASSERT(llama_decode(draft.get(), draft_catchup) == 0);
     GGML_ASSERT(phase_workspace_sync_calls[0] > 0);
@@ -1435,6 +1470,30 @@ static void test_phase_workspace_mtp_lifecycle(size_t seed, float stdev) {
     draft.reset();
 }
 
+static void test_phase_workspace_qwen4exp_mtp_reserve(size_t seed, float stdev) {
+    gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true);
+    llama_model_params model_params = llama_model_default_params();
+    model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = true;
+    ggml_backend_dev_t devices[] = { nullptr };
+    model_params.devices = devices;
+    tensor_data_params tensor_params = { seed, stdev };
+    llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, model_params));
+    GGML_ASSERT(model);
+
+    llama_context_ptr draft = make_phase_workspace_context(model.get(), LLAMA_CONTEXT_TYPE_MTP);
+    GGML_ASSERT(draft);
+    GGML_ASSERT(dynamic_cast<llama_memory_hybrid_idx *>(draft->get_memory()));
+    draft->sched_reserve(4);
+    draft->sched_reserve(0);
+    llama_batch batch = make_mtp_batch(4, llama_model_n_embd_out(model.get()), 0,
+            llama_vocab_n_tokens(llama_model_get_vocab(model.get())), seed + 1);
+    GGML_ASSERT(llama_decode(draft.get(), batch) == 0);
+    llama_synchronize(draft.get());
+    GGML_ASSERT(llama_get_logits_ith(draft.get(), 3));
+    llama_batch_free(batch);
+}
+
 static void test_phase_workspace_mismatched_placement(size_t seed, float stdev) {
     ggml_backend_dev_t gpu = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -1480,7 +1539,7 @@ static void test_phase_workspace_mismatched_placement(size_t seed, float stdev) 
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(target_model.get()));
     const int32_t n_embd = llama_model_n_embd_out(draft_model.get());
     llama_batch target_batch = llama_batch_init(1, 0, 1);
-    common_batch_add(target_batch, get_tokens(1, n_vocab, seed)[0], 0, { 0 }, true);
+    batch_add_compat(target_batch, get_tokens(1, n_vocab, seed)[0], 0, { 0 }, true);
     llama_batch draft_batch = make_mtp_batch(1, n_embd, 0, n_vocab, seed + 1);
     GGML_ASSERT(llama_decode(target.get(), target_batch) == 0);
     GGML_ASSERT(llama_decode(draft.get(), draft_batch) == 0);
@@ -1499,20 +1558,17 @@ static std::vector<float> get_logits(
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
-    llama_batch batch = llama_batch_init(n_ctx, 0, 1);
+    common_batch batch(lctx);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch, tokens[pos], pos, {0}, true);
+        batch.add(tokens[pos], pos, 0, true);
     }
-    batch.n_tokens = n_tokens;
     if (encode) {
-        if (llama_encode(lctx, batch)) {
-            llama_batch_free(batch);
+        if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
             throw std::runtime_error("failed to encode batch");
         }
     }
-    if (llama_decode(lctx, batch)) {
-        llama_batch_free(batch);
+    if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
         throw std::runtime_error("failed to decode batch");
     }
 
@@ -1524,7 +1580,6 @@ static std::vector<float> get_logits(
             ret.push_back(logits_ith[j]);
         }
     }
-    llama_batch_free(batch);
     return ret;
 }
 
@@ -1561,9 +1616,9 @@ static bool test_parallel_seqs(llama_model * model, const std::vector<llama_toke
     llama_batch batch_par = llama_batch_init(2*n_tokens, 0, 1);
     llama_batch batch_b   = llama_batch_init(n_tokens, 0, 1);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        common_batch_add(batch_par, tokens[pos],   pos, {0}, true);
-        common_batch_add(batch_par, tokens_b[pos], pos, {1}, true);
-        common_batch_add(batch_b,   tokens_b[pos], pos, {0}, true);
+        batch_add_compat(batch_par, tokens[pos],   pos, {0}, true);
+        batch_add_compat(batch_par, tokens_b[pos], pos, {1}, true);
+        batch_add_compat(batch_b,   tokens_b[pos], pos, {0}, true);
     }
     bool ok = true;
     if (encode) {
@@ -1593,6 +1648,51 @@ static bool test_parallel_seqs(llama_model * model, const std::vector<llama_toke
 
     // ubatch splits differ from the reference, so use the NMSE limit of the CPU comparison; NaN fails
     return nmse(logits_a, logits_par_a) <= 1e-4 && nmse(logits_b, logits_par_b) <= 1e-4;
+}
+
+static bool check_causal_attn_toggle(
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens) {
+    const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+    const uint32_t n_past   = tokens.size();
+    const uint32_t n_ubatch = llama_n_ubatch(lctx);
+
+    GGML_ASSERT(n_past + n_ubatch/2 + n_ubatch <= llama_n_ctx(lctx));
+
+    llama_set_causal_attn(lctx, false);
+
+    common_batch batch(lctx);
+
+    bool ok = true;
+    uint32_t pos = n_past;
+    for (const uint32_t n_tokens : { n_ubatch/2, n_ubatch }) {
+        batch.clear();
+        for (uint32_t i = 0; i < n_tokens; i++) {
+            batch.add(tokens[i], pos++, 0, true);
+        }
+
+        const int32_t rc = llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        if (rc != 0) {
+            LOG_ERR("%s: n_tokens=%u: llama_process returned %d\n", __func__, n_tokens, rc);
+            ok = false;
+            break;
+        }
+
+        const float * logits = llama_get_logits_ith(lctx, n_tokens - 1);
+        if (logits == nullptr) {
+            LOG_ERR("%s: n_tokens=%u: no logits\n", __func__, n_tokens);
+            ok = false;
+            break;
+        }
+        for (uint32_t j = 0; j < n_vocab; j++) {
+            if (std::isnan(logits[j])) {
+                LOG_ERR("%s: n_tokens=%u: nan logit\n", __func__, n_tokens);
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    return ok;
 }
 
 static bool moe_mandatory(const llm_arch arch) {
@@ -1641,6 +1741,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -3674,7 +3775,7 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
     return ok ? 0 : 1;
 }
 
-static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity) {
+static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -3716,6 +3817,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             const size_t device_count = ggml_backend_dev_count();
             for (size_t i = 0; i < device_count; i++) {
                 ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (target_backend != nullptr && strcmp(target_backend, ggml_backend_dev_name(dev)) != 0) {
+                    continue;
+                }
                 dev_configs.emplace_back(std::vector<ggml_backend_dev_t>{dev}, ggml_backend_dev_description(dev), LLAMA_SPLIT_MODE_LAYER);
                 max_device_label_length = std::max(max_device_label_length, dev_configs.back().label.length());
 
@@ -3726,7 +3830,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             }
         }
 
-        dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        if (target_backend == nullptr) {
+            dev_configs.emplace_back(devices_meta, "Meta", LLAMA_SPLIT_MODE_TENSOR);
+        }
     }
 
     size_t max_arch_name_length = 0;
@@ -3821,6 +3927,12 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                                 status_parallel = "\033[1;31mFAIL\033[0m";
                             }
                         }
+                        if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
+                            if (test_ok) {
+                                status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
+                            }
+                            test_ok = false;
+                        }
                     }
 
                     FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
@@ -3895,6 +4007,7 @@ int main(int argc, char ** argv) {
     bool run_moe_placement = false;
     bool        run_moe_joint_measurement   = false;
     std::string fit_tool;
+    const char * target_backend = nullptr;
 
     int verbosity = LOG_LEVEL_ERROR;
 
@@ -3963,6 +4076,19 @@ int main(int argc, char ** argv) {
                 usage(argv);
                 return 1;
             }
+        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
+            if (i + 1 < argc) {
+                const char * backend_name = argv[++i];
+                ggml_backend_dev_t dev = ggml_backend_dev_by_name(backend_name);
+                if (dev == nullptr) {
+                    LOG_ERR("%s: unknown backend device: %s\n", __func__, backend_name);
+                    return 1;
+                }
+                target_backend = ggml_backend_dev_name(dev);
+            } else {
+                usage(argv);
+                return 1;
+            }
         } else {
             LOG_ERR("%s: unknown argument: %s\n", __func__, argv[i]);
             usage(argv);
@@ -3983,6 +4109,7 @@ int main(int argc, char ** argv) {
         if (test_phase_workspace) {
             test_phase_workspace_runtime_reserve(seed, stdev);
             test_phase_workspace_mtp_lifecycle(seed, stdev);
+            test_phase_workspace_qwen4exp_mtp_reserve(seed, stdev);
             test_phase_workspace_mismatched_placement(seed, stdev);
             test_phase_workspace_late_pipeline_fallback(seed, stdev);
             return 0;
@@ -4010,7 +4137,7 @@ int main(int argc, char ** argv) {
         if (!out.empty()) {
             return save_models(arch_filter, seed, stdev, verbosity, out);
         }
-        return test_backends(arch_filter, seed, stdev, verbosity);
+        return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
     } catch (const std::exception & err) {
         fprintf(stderr, "encountered runtime error: %s\n", err.what());
         return -1;

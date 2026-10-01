@@ -100,7 +100,12 @@ __global__ void topk_moe_cuda(const float *         logits,
                               const topk_moe_config config,
                               volatile int32_t *    published,
                               volatile uint32_t *   published_ready) {
+#if defined(GGML_USE_MUSA)
+    // MUSA: every warp of a partially filled block must reach the barrier below.
+    const int row = MIN(blockIdx.x * blockDim.y + threadIdx.y, n_rows - 1);
+#else
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
+#endif // defined(GGML_USE_MUSA)
     if (row >= n_rows) {
         return;
     }
