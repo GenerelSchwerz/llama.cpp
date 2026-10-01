@@ -3178,6 +3178,41 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     return true;
 }
 
+struct ggml_cuda_rms_norm_silu_match {
+    ggml_tensor * norm;
+    ggml_tensor * mul;
+    ggml_tensor * gate;
+    ggml_tensor * dst;
+    int node_count;
+};
+
+static bool ggml_cuda_match_rms_norm_silu(const ggml_cgraph * cgraph, int i, ggml_cuda_rms_norm_silu_match & match) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+        return false;
+    }
+    ggml_tensor * norm = cgraph->nodes[i];
+    ggml_tensor * mul  = cgraph->nodes[i + 1];
+    ggml_tensor * silu = cgraph->nodes[i + 2];
+    ggml_tensor * dst  = cgraph->nodes[i + 3];
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || norm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            norm->src[0]->type != GGML_TYPE_F32 || silu->src[0]->type != GGML_TYPE_F32 ||
+            norm->view_src || mul->view_src || !ggml_is_contiguous_rows(norm->src[0]) ||
+            !ggml_is_contiguous_rows(silu->src[0]) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(norm, mul) || !ggml_are_same_shape(norm, silu) || !ggml_are_same_shape(norm, dst) ||
+            !((dst->src[0] == mul && dst->src[1] == silu) || (dst->src[0] == silu && dst->src[1] == mul))) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+    ggml_tensor * gate = silu->src[0];
+    if (!weight || weight == norm || weight->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(weight) ||
+            gate == norm || gate == mul || gate->view_src == norm || gate->view_src == mul) {
+        return false;
+    }
+    match = { norm, mul, gate, dst, 4 };
+    return true;
+}
+
 
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
@@ -3462,6 +3497,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                return match.node_count - 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_rms_norm_silu_match match;
+        if (ggml_cuda_match_rms_norm_silu(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_cuda_op_rms_norm_fused(*cuda_ctx, match.norm, match.mul, match.gate, match.dst);
                 return match.node_count - 1;
             }
         }
@@ -4546,6 +4592,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_rms_norm_silu_match norm_match;
+            if (ggml_cuda_match_rms_norm_silu(cgraph, i, norm_match)) {
+                add_alloc_deps(i, i + norm_match.node_count - 1);
+                i += norm_match.node_count - 1;
+                continue;
+            }
+
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
