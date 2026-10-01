@@ -465,6 +465,15 @@ static void ggml_vbuffer_tensor_alloc(struct vbuffer * buf, struct ggml_tensor *
     ggml_backend_tensor_alloc(buf->chunks[buf_addr.chunk], tensor, addr);
 }
 
+static struct vbuffer * ggml_vbuffer_meta_alias(struct vbuffer * buf) {
+    struct vbuffer * alias = (struct vbuffer *) calloc(1, sizeof(struct vbuffer));
+    GGML_ASSERT(alias != NULL);
+    for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
+        alias->chunks[i] = ggml_backend_meta_buffer_alias(buf->chunks[i]);
+    }
+    return alias;
+}
+
 static void ggml_vbuffer_reset(struct vbuffer * buf) {
     for (int i = 0; i < GGML_VBUFFER_MAX_CHUNKS && buf->chunks[i]; ++i) {
         ggml_backend_buffer_reset(buf->chunks[i]);
@@ -532,6 +541,8 @@ enum ggml_gallocr_shared_role {
 struct ggml_gallocr_shared_entry {
     ggml_backend_buffer_type_t buft;
     struct vbuffer * buffer;
+    // a meta buffer maps its tensors for one graph at a time, so the borrower uses an alias of it
+    struct vbuffer * borrower_alias;
     size_t requirements[GGML_GALLOCR_SHARED_ROLE_COUNT][GGML_VBUFFER_MAX_CHUNKS];
 };
 
@@ -648,6 +659,8 @@ static bool ggml_gallocr_resize_shared_entry(
         return true;
     }
 
+    ggml_vbuffer_free(entry->borrower_alias);
+    entry->borrower_alias = NULL;
     ggml_vbuffer_free(entry->buffer);
     entry->buffer = NULL;
     shared->generation++;
@@ -706,8 +719,13 @@ static bool ggml_gallocr_publish_shared_requirements(ggml_gallocr_t galloc) {
     }
 
     for (int i = 0; i < shared->n_entries; ++i) {
-        if (!ggml_gallocr_resize_shared_entry(shared, &shared->entries[i], shrink)) {
+        struct ggml_gallocr_shared_entry * entry = &shared->entries[i];
+        if (!ggml_gallocr_resize_shared_entry(shared, entry, shrink)) {
             return false;
+        }
+        if (shared->active[GGML_GALLOCR_SHARED_ROLE_BORROWER] && entry->buffer != NULL &&
+                entry->borrower_alias == NULL && ggml_backend_buft_is_meta(entry->buft)) {
+            entry->borrower_alias = ggml_vbuffer_meta_alias(entry->buffer);
         }
     }
 
@@ -733,7 +751,11 @@ static struct vbuffer * ggml_gallocr_get_vbuffer(ggml_gallocr_t galloc, int buff
     if (galloc->shared_buffers != NULL) {
         const int entry_id = galloc->shared_entry_ids[buffer_id];
         if (entry_id >= 0) {
-            return galloc->shared_buffers->entries[entry_id].buffer;
+            struct ggml_gallocr_shared_entry * entry = &galloc->shared_buffers->entries[entry_id];
+            if (galloc->shared_role == GGML_GALLOCR_SHARED_ROLE_BORROWER && entry->borrower_alias != NULL) {
+                return entry->borrower_alias;
+            }
+            return entry->buffer;
         }
     }
     return galloc->buffers[buffer_id];
@@ -787,6 +809,7 @@ static void ggml_gallocr_shared_start_shrink(struct ggml_gallocr_shared_buffers 
 
 static void ggml_gallocr_shared_free(struct ggml_gallocr_shared_buffers * shared) {
     for (int i = 0; i < shared->n_entries; ++i) {
+        ggml_vbuffer_free(shared->entries[i].borrower_alias);
         ggml_vbuffer_free(shared->entries[i].buffer);
     }
     free(shared->entries);
@@ -806,6 +829,10 @@ static void ggml_gallocr_detach_shared_buffers(ggml_gallocr_t galloc) {
     shared->shrink_seen[role] = false;
     for (int i = 0; i < shared->n_entries; ++i) {
         memset(shared->entries[i].requirements[role], 0, sizeof(shared->entries[i].requirements[role]));
+        if (role == GGML_GALLOCR_SHARED_ROLE_BORROWER) {
+            ggml_vbuffer_free(shared->entries[i].borrower_alias);
+            shared->entries[i].borrower_alias = NULL;
+        }
     }
 
     shared->refs--;
