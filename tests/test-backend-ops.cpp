@@ -7149,38 +7149,46 @@ struct test_moe_reduce : public test_case {
     }
 };
 
-struct test_mul_mat_shared_input : public test_case {
+struct test_mul_mat_reused_input : public test_case {
     const ggml_type type;
     const int64_t k;
     const int64_t columns;
-    const bool reshape;
     const int input_mode;
     std::vector<ggml_tensor *> outputs;
 
-    test_mul_mat_shared_input(ggml_type type, int64_t k, int64_t columns, bool reshape, int input_mode)
-        : type(type), k(k), columns(columns), reshape(reshape), input_mode(input_mode) {}
+    test_mul_mat_reused_input(ggml_type type, int64_t k, int64_t columns, int input_mode)
+        : type(type), k(k), columns(columns), input_mode(input_mode) {}
 
-    std::string vars() override { return VARS_TO_STR5(type, k, columns, reshape, input_mode); }
-    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_SHARED_INPUT"; }
+    std::string vars() override { return VARS_TO_STR4(type, k, columns, input_mode); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_REUSED_INPUT"; }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
     double max_nmse_err() override { return 5e-4; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        outputs.clear();
         ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (input_mode == 2 ? 32 : 0), columns);
         if (input_mode == 2) {
             input = ggml_view_2d(ctx, input, k, columns, input->nb[1], 0);
         }
-        ggml_tensor * other = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, 64);
-        ggml_tensor * b = ggml_new_tensor_2d(ctx, input_mode == 3 ? GGML_TYPE_Q8_0 : type, k, 96);
-        ggml_tensor * first = ggml_mul_mat(ctx, a, input);
-        ggml_tensor * second = ggml_mul_mat(ctx, b, other);
-        ggml_set_output(first);
-        ggml_set_output(second);
-        outputs = { first, second };
-        ggml_tensor * out = reshape ? ggml_reshape_2d(ctx, first, 64, columns) : first;
-        return ggml_concat(ctx, out, second, 0);
+        ggml_tensor * result = nullptr;
+        for (int i = 0; i < 4; ++i) {
+            ggml_tensor * src = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
+            const ggml_type weight_type = input_mode == 3 && i % 2 ? GGML_TYPE_Q8_0 : type;
+            ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, 64 + 32*i);
+            ggml_tensor * projection = ggml_mul_mat(ctx, weight, src);
+            if (input_mode == 4) {
+                projection = ggml_add(ctx, projection, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64 + 32*i, columns));
+            } else if (input_mode == 5) {
+                ggml_tensor * gate = ggml_new_tensor_2d(ctx, weight_type, k, 64 + 32*i);
+                projection = ggml_swiglu_split(ctx, projection, ggml_mul_mat(ctx, gate, src));
+            }
+            ggml_set_output(projection);
+            outputs.push_back(projection);
+            ggml_tensor * next = ggml_silu(ctx, projection);
+            result = result ? ggml_concat(ctx, result, next, 0) : next;
+        }
+        return result;
     }
 };
 
@@ -10559,18 +10567,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
-        for (int64_t k : { 256, 1024 }) {
-            for (int64_t columns : { 1, 2, 5, 6, 7, 8, 9 }) {
-                for (bool reshape : { false, true }) {
-                    for (int input_mode : { 0, 1, 2, 3 }) {
-                        test_cases.emplace_back(new test_mul_mat_shared_input(type, k, columns, reshape, input_mode));
-                    }
-                }
-            }
-        }
-    }
-
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             for (int n : {1, 16}) {
@@ -11246,6 +11242,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t k : { 256, 1024 }) {
+            for (int64_t columns : { 1, 2, 8, 9 }) {
+                for (int input_mode : { 0, 1, 2, 3, 4, 5 }) {
+                    test_cases.emplace_back(new test_mul_mat_reused_input(type, k, columns, input_mode));
+                }
+            }
+        }
+    }
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
