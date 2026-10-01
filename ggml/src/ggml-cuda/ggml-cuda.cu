@@ -3034,6 +3034,43 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+static int ggml_cuda_match_shared_mmvq_input(const ggml_cgraph * cgraph, int i) {
+    for (int count : { 2, 3 }) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, count == 2 ? GGML_OP_MUL_MAT : GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int outputs[] = { i, i + 1, i + 2 };
+        if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, count)) {
+            continue;
+        }
+        const ggml_tensor * first = cgraph->nodes[i];
+        const ggml_tensor * second = cgraph->nodes[i + count - 1];
+        const ggml_tensor * input = first->src[1];
+        if (input != second->src[1] || input->type != GGML_TYPE_F32 || input->ne[1] < 2 || input->ne[2] != 1 || input->ne[3] != 1 ||
+                first->src[0]->type != second->src[0]->type) {
+            continue;
+        }
+        if (count == 3 && cgraph->nodes[i + 1]->src[0] != first) {
+            continue;
+        }
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        bool supported = cc > GGML_CUDA_CC_PASCAL;
+        for (const ggml_tensor * projection : { first, second }) {
+            const ggml_tensor * weight = projection->src[0];
+            const bool bad_padding_clear = ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight) && weight->view_src;
+            supported = supported && !bad_padding_clear && projection->type == GGML_TYPE_F32 &&
+                ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) &&
+                !ggml_cuda_op_mul_mat_use_fwht(projection) && !projection->view_src &&
+                weight->ne[2] == 1 && weight->ne[3] == 1 && ggml_is_contiguous(weight) && ggml_is_contiguous(projection) &&
+                ggml_backend_buffer_is_cuda(weight->buffer);
+        }
+        if (supported && input->nb[0] == sizeof(float) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, outputs, count)) {
+            return count;
+        }
+    }
+    return 0;
+}
+
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
@@ -4000,6 +4037,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
+
+    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int count = ggml_cuda_match_shared_mmvq_input(cgraph, i);
+        if (count) {
+            ggml_cuda_mul_mat_vec_q_shared(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + count - 1]);
+            return count - 1;
+        }
+    }
 
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {

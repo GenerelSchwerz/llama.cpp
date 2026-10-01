@@ -7149,6 +7149,41 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+struct test_mul_mat_shared_input : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t columns;
+    const bool reshape;
+    const int input_mode;
+    std::vector<ggml_tensor *> outputs;
+
+    test_mul_mat_shared_input(ggml_type type, int64_t k, int64_t columns, bool reshape, int input_mode)
+        : type(type), k(k), columns(columns), reshape(reshape), input_mode(input_mode) {}
+
+    std::string vars() override { return VARS_TO_STR5(type, k, columns, reshape, input_mode); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_SHARED_INPUT"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (input_mode == 2 ? 32 : 0), columns);
+        if (input_mode == 2) {
+            input = ggml_view_2d(ctx, input, k, columns, input->nb[1], 0);
+        }
+        ggml_tensor * other = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type, k, 64);
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, input_mode == 3 ? GGML_TYPE_Q8_0 : type, k, 96);
+        ggml_tensor * first = ggml_mul_mat(ctx, a, input);
+        ggml_tensor * second = ggml_mul_mat(ctx, b, other);
+        ggml_set_output(first);
+        ggml_set_output(second);
+        outputs = { first, second };
+        ggml_tensor * out = reshape ? ggml_reshape_2d(ctx, first, 64, columns) : first;
+        return ggml_concat(ctx, out, second, 0);
+    }
+};
+
 struct test_mul_mat_vec_fusion : public test_case {
     const ggml_type type;
     const ggml_glu_op glu_op;
@@ -10520,6 +10555,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 // test with mul after (ffn_moe_weighted)
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1, true));
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        for (int64_t k : { 256, 1024 }) {
+            for (int64_t columns : { 1, 2, 5, 6, 7, 8, 9 }) {
+                for (bool reshape : { false, true }) {
+                    for (int input_mode : { 0, 1, 2, 3 }) {
+                        test_cases.emplace_back(new test_mul_mat_shared_input(type, k, columns, reshape, input_mode));
+                    }
+                }
             }
         }
     }
