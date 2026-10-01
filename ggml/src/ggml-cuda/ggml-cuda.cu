@@ -2975,7 +2975,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          check_leaf_nodes = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3008,7 +3009,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || (!check_leaf_nodes && src->op == GGML_OP_NONE) || src == logits_may_alias) {
                     continue;
                 }
 
@@ -3032,6 +3033,45 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     }
 
     return is_ok;
+}
+
+static int ggml_cuda_match_shared_mmq_input(const ggml_cgraph * cgraph, int i) {
+    for (int count : { 2, 3 }) {
+        const ggml_op ops[] = { GGML_OP_MUL_MAT, count == 2 ? GGML_OP_MUL_MAT : GGML_OP_RESHAPE, GGML_OP_MUL_MAT };
+        const int outputs[] = { i, i + 1, i + 2 };
+        if (!ggml_can_fuse_subgraph(cgraph, i, count, ops, outputs, count)) {
+            continue;
+        }
+        const ggml_tensor * first = cgraph->nodes[i];
+        const ggml_tensor * second = cgraph->nodes[i + count - 1];
+        const ggml_tensor * input = first->src[1];
+        if (input != second->src[1] || input->type != GGML_TYPE_F32 || input->ne[1] < 1 || input->ne[2] != 1 || input->ne[3] != 1 ||
+                first->src[0]->type != second->src[0]->type) {
+            continue;
+        }
+        if (count == 3 && cgraph->nodes[i + 1]->src[0] != first) {
+            continue;
+        }
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        bool supported = true;
+        for (const ggml_tensor * projection : { first, second }) {
+            const ggml_tensor * weight = projection->src[0];
+            const bool bad_padding_clear = ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_nbytes(weight) != ggml_backend_buffer_get_alloc_size(weight->buffer, weight) && weight->view_src;
+            supported = supported && !bad_padding_clear && projection->type == GGML_TYPE_F32 &&
+                !ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) &&
+                ggml_cuda_should_use_mmq(weight->type, cc, input->ne[1], /*n_experts =*/ 0) &&
+                !ggml_cuda_op_mul_mat_use_fwht(projection) && !projection->view_src &&
+                weight->ne[2] == 1 && weight->ne[3] == 1 && ggml_is_contiguous(weight) && ggml_is_contiguous(projection) &&
+                ggml_backend_buffer_is_cuda(weight->buffer);
+        }
+        if (supported && ggml_cuda_mmq_get_prec_src1(first->src[0], first, cc) == ggml_cuda_mmq_get_prec_src1(second->src[0], second, cc) &&
+                input->nb[0] == sizeof(float) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, count, outputs, count, /*is_topk_moe =*/ false, /*check_leaf_nodes =*/ true)) {
+            return count;
+        }
+    }
+    return 0;
 }
 
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
@@ -4000,6 +4040,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     fused_mul_mat_vec = false;
     fused_node_count  = 0;
+
+    if (cuda_ctx->stream_context().concurrent_events.empty()) {
+        const int count = ggml_cuda_match_shared_mmq_input(cgraph, i);
+        if (count) {
+            ggml_cuda_mul_mat_q_shared(*cuda_ctx, cgraph->nodes[i], cgraph->nodes[i + count - 1]);
+            return count - 1;
+        }
+    }
 
     // mul_mat + scale + optional bias
     for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
