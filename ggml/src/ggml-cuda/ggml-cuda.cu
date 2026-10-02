@@ -3179,6 +3179,121 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+static bool ggml_cuda_match_ssm_conv_qk(const ggml_cgraph * cgraph, int i, bool check_memory = false) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    return false;
+#endif
+    const ggml_op ops[] = { GGML_OP_SSM_CONV, GGML_OP_UNARY, GGML_OP_VIEW, GGML_OP_RMS_NORM,
+                           GGML_OP_SCALE, GGML_OP_VIEW, GGML_OP_RMS_NORM, GGML_OP_SCALE };
+    const int outputs[] = { i + 1, i + 4, i + 7 };
+    if (i + 8 > cgraph->n_nodes || !ggml_can_fuse_subgraph(cgraph, i, 8, ops, outputs, 3)) {
+        return false;
+    }
+    const ggml_tensor * conv = cgraph->nodes[i];
+    const ggml_tensor * silu = cgraph->nodes[i + 1];
+    const ggml_tensor * x = conv->src[0];
+    const ggml_tensor * w = conv->src[1];
+    switch (w->ne[0]) {
+        case 3: case 4: case 5: case 9: case 15: break;
+        default: return false;
+    }
+    const ggml_tensor * q = cgraph->nodes[i + 2];
+    const int64_t d = q->ne[0];
+    const int64_t h = q->ne[1];
+    const int64_t t = silu->ne[1];
+    const int64_t s = silu->ne[2];
+    const int64_t c = silu->ne[0];
+    if (conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
+            x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(conv) || !ggml_is_contiguous(silu) || !ggml_is_contiguous(w) ||
+            x->nb[0] != sizeof(float) || x->nb[1] != x->ne[0]*sizeof(float) ||
+            silu->src[0] != conv || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+            conv->view_src || silu->view_src || (silu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            !ggml_are_same_shape(conv, silu) || d <= 0 || d > 256 || c > INT_MAX || h <= 0 || t <= 0 || t > 65535 || s <= 0 || s > 65535 ||
+            silu->ne[3] != 1 || c % 128 != 0 || c / 128 > 65535 || h > c / (2*d) || 2*d*h >= c ||
+            x->ne[1] != c || x->ne[2] != s || x->ne[3] != 1 || x->ne[0] != t + w->ne[0] - 1 ||
+            w->ne[1] != c || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (t > 32 && (t < 2048 || d < 128 || d > 192)) {
+        return false;
+    }
+    const size_t sequence_bytes = x->nb[1]*c;
+    if (x->nb[2] > INT_MAX || sequence_bytes > INT_MAX || x->nb[2] < sequence_bytes ||
+            x->nb[2] % sizeof(float) != 0 || (size_t) (s - 1) > (INT_MAX - sequence_bytes)/x->nb[2]) {
+        return false;
+    }
+    for (int j : { 2, 5 }) {
+        const ggml_tensor * view = cgraph->nodes[i + j];
+        const ggml_tensor * norm = cgraph->nodes[i + j + 1];
+        const ggml_tensor * scale = cgraph->nodes[i + j + 2];
+        float eps, params[2];
+        memcpy(&eps, norm->op_params, sizeof(eps));
+        memcpy(params, scale->op_params, sizeof(params));
+        if (view->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+                view->src[0] != silu || view->view_src != silu || norm->src[0] != view || scale->src[0] != norm ||
+                !ggml_are_same_shape(view, q) || !ggml_are_same_shape(view, norm) || !ggml_are_same_shape(view, scale) ||
+                view->ne[2] != t || view->ne[3] != s || view->nb[0] != sizeof(float) ||
+                view->nb[1] != d*sizeof(float) || view->nb[2] != silu->nb[1] || view->nb[3] != silu->nb[2] ||
+                view->view_offs != (j == 2 ? 0 : d*h*sizeof(float)) || norm->view_src || scale->view_src ||
+                !ggml_is_contiguous(norm) || !ggml_is_contiguous(scale) || !std::isfinite(eps) || eps < 0.0f ||
+                params[0] != 1.0f/sqrtf(float(d)) || params[1] != 0.0f) {
+            return false;
+        }
+    }
+    // Keep the value slice in the original SiLU tensor.
+    int value_views = 0;
+    for (int j = i + 8; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * view = cgraph->nodes[j];
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if (view->src[k] != silu) {
+                continue;
+            }
+            if (k != 0 || view->op != GGML_OP_VIEW || view->view_src != silu || view->type != GGML_TYPE_F32 ||
+                    view->ne[0] <= 0 || view->ne[1] <= 0 || view->ne[0] > c - 2*d*h ||
+                    view->ne[1] != (c - 2*d*h) / view->ne[0] || (c - 2*d*h) % view->ne[0] != 0 ||
+                    view->ne[2] != t || view->ne[3] != s || view->nb[0] != sizeof(float) ||
+                    view->nb[1] != view->ne[0]*sizeof(float) || view->nb[2] != silu->nb[1] ||
+                    view->nb[3] != silu->nb[2] || view->view_offs != 2*d*h*sizeof(float)) {
+                return false;
+            }
+            ++value_views;
+        }
+    }
+    if (value_views != 1) {
+        return false;
+    }
+    if (!check_memory) {
+        return true;
+    }
+    if (!ggml_cuda_check_fusion_memory_ranges(cgraph, i, 8, outputs, 3)) {
+        return false;
+    }
+    auto overlap = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data;
+        const uintptr_t b0 = (uintptr_t) b->data;
+        return a0 <= b0 ? b0 - a0 < ggml_nbytes(a) : a0 - b0 < ggml_nbytes(b);
+    };
+    for (int j = 0; j < 3; ++j) {
+        const ggml_tensor * out = cgraph->nodes[outputs[j]];
+        if (!out->data || !out->buffer || overlap(out, x) || overlap(out, w)) {
+            return false;
+        }
+        for (int k = 0; k < j; ++k) {
+            if (overlap(out, cgraph->nodes[outputs[k]])) {
+                return false;
+            }
+        }
+        for (int k = 0; k < cgraph->n_leafs; ++k) {
+            const ggml_tensor * leaf = cgraph->leafs[k];
+            if (leaf->data && overlap(out, leaf)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -4175,6 +4290,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    if (node->op == GGML_OP_SSM_CONV && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_match_ssm_conv_qk(cgraph, i, true)) {
+        ggml_cuda_op_ssm_conv_qk(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 3],
+            cgraph->nodes[i + 4], cgraph->nodes[i + 6], cgraph->nodes[i + 7]);
+        return 7;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
         return 2;
@@ -4546,6 +4668,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_SSM_CONV && ggml_cuda_match_ssm_conv_qk(cgraph, i)) {
+                ggml_tensor * last = cgraph->nodes[i + 7];
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[0], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i]->src[1], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 1], last);
+                params->add_alloc_dep(params->user_data, cgraph->nodes[i + 4], last);
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
