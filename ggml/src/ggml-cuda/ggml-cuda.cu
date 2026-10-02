@@ -2975,7 +2975,8 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_count,
                                                  const int *         out_nodes,
                                                  const int           out_count,
-                                                 const bool          is_topk_moe = false) {
+                                                 const bool          is_topk_moe = false,
+                                                 const bool          check_leaf_inputs = false) {
     auto nodes_overlap = [&](const ggml_tensor * a, const ggml_tensor * b) {
         const int64_t a_start = (int64_t) a->data;
         const int64_t a_end   = a_start + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
@@ -3008,7 +3009,7 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
             for (int src_idx = 0; src_idx < GGML_MAX_SRC; ++src_idx) {
                 const ggml_tensor * src = cgraph->nodes[j]->src[src_idx];
 
-                if (!src || src->op == GGML_OP_NONE || src == logits_may_alias) {
+                if (!src || (!check_leaf_inputs && src->op == GGML_OP_NONE) || src == logits_may_alias) {
                     continue;
                 }
 
@@ -3175,6 +3176,43 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     match.weights      = weights;
     match.dst          = cgraph->nodes[output_idx];
     match.node_count   = node_count;
+    return true;
+}
+
+struct ggml_cuda_rms_norm_gated_match {
+    ggml_tensor * norm;
+    ggml_tensor * mul;
+    ggml_tensor * gate;
+    ggml_tensor * dst;
+    int node_count;
+    ggml_unary_op gate_op;
+};
+
+static bool ggml_cuda_match_rms_norm_gated(const ggml_cgraph * cgraph, int i, ggml_cuda_rms_norm_gated_match & match) {
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL }, { i + 3 })) {
+        return false;
+    }
+    ggml_tensor * norm  = cgraph->nodes[i];
+    ggml_tensor * mul   = cgraph->nodes[i + 1];
+    ggml_tensor * unary = cgraph->nodes[i + 2];
+    ggml_tensor * dst   = cgraph->nodes[i + 3];
+    const ggml_unary_op gate_op = ggml_get_unary_op(unary);
+    if ((gate_op != GGML_UNARY_OP_SILU && gate_op != GGML_UNARY_OP_SIGMOID) || norm->type != GGML_TYPE_F32 ||
+            mul->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            norm->src[0]->type != GGML_TYPE_F32 || unary->src[0]->type != GGML_TYPE_F32 ||
+            norm->view_src || mul->view_src || !ggml_is_contiguous_rows(norm->src[0]) ||
+            !ggml_is_contiguous_rows(unary->src[0]) || !ggml_is_contiguous(dst) ||
+            !ggml_are_same_shape(norm, mul) || !ggml_are_same_shape(norm, unary) || !ggml_are_same_shape(norm, dst) ||
+            !((dst->src[0] == mul && dst->src[1] == unary) || (dst->src[0] == unary && dst->src[1] == mul))) {
+        return false;
+    }
+    const ggml_tensor * weight = mul->src[0] == norm ? mul->src[1] : mul->src[1] == norm ? mul->src[0] : nullptr;
+    ggml_tensor * gate = unary->src[0];
+    if (!weight || weight == norm || weight->type != GGML_TYPE_F32 || !ggml_is_contiguous_rows(weight) ||
+            gate == norm || gate == mul || gate->view_src == norm || gate->view_src == mul) {
+        return false;
+    }
+    match = { norm, mul, gate, dst, 4, gate_op };
     return true;
 }
 
@@ -3462,6 +3500,17 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                return match.node_count - 1;
+            }
+        }
+    }
+
+    if (node->op == GGML_OP_RMS_NORM) {
+        ggml_cuda_rms_norm_gated_match match;
+        if (ggml_cuda_match_rms_norm_gated(cgraph, i, match)) {
+            const int output_idx = i + match.node_count - 1;
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1, false, true)) {
+                ggml_cuda_op_rms_norm_fused(*cuda_ctx, match.norm, match.mul, match.gate, match.dst, match.gate_op);
                 return match.node_count - 1;
             }
         }
@@ -4546,6 +4595,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_rms_norm_gated_match norm_match;
+            if (ggml_cuda_match_rms_norm_gated(cgraph, i, norm_match)) {
+                add_alloc_deps(i, i + norm_match.node_count - 1);
+                i += norm_match.node_count - 1;
+                continue;
+            }
+
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

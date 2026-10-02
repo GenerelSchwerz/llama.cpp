@@ -3861,6 +3861,75 @@ struct test_rms_norm_mul_add : public test_case {
     }
 };
 
+struct test_rms_norm_silu : public test_case {
+    const std::array<int64_t, 4> ne;
+    const bool strided;
+    const bool gate_broadcast;
+    const bool keep_norm;
+    const int gate_source;
+    const ggml_unary_op gate_op;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * result = nullptr;
+
+    test_rms_norm_silu(std::array<int64_t, 4> ne, bool strided = false, bool gate_broadcast = false, bool keep_norm = false, int gate_source = 0, ggml_unary_op gate_op = GGML_UNARY_OP_SILU) :
+        ne(ne), strided(strided), gate_broadcast(gate_broadcast), keep_norm(keep_norm), gate_source(gate_source), gate_op(gate_op) {}
+
+    std::string op_desc(ggml_tensor *) override { return gate_op == GGML_UNARY_OP_SIGMOID ? "RMS_NORM_SIGMOID" : "RMS_NORM_SILU"; }
+    std::string vars() override { return VARS_TO_STR6(ne, strided, gate_broadcast, keep_norm, gate_source, gate_op); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return keep_norm ? std::vector<ggml_tensor *>{norm, result} : std::vector<ggml_tensor *>{}; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto storage_ne = ne;
+        if (strided) {
+            storage_ne[1] *= 2;
+        }
+        ggml_tensor * x = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, storage_ne.data());
+        ggml_tensor * gate = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * weight = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, x);
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, weight);
+        }
+        if (strided) {
+            x = ggml_view_4d(ctx, x, ne[0], ne[1], ne[2], ne[3], x->nb[1], x->nb[2], x->nb[3], 0);
+        }
+        if (gate_source == 7) {
+            auto gate_ne = ne;
+            gate_ne[1] *= 2;
+            gate = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, gate_ne.data());
+            gate = ggml_view_4d(ctx, gate, ne[0], ne[1], ne[2], ne[3], 2 * gate->nb[1], gate->nb[2], gate->nb[3], 0);
+            if (mode == MODE_TEST) {
+                ggml_build_forward_expand(gf, gate);
+            }
+        }
+        if (gate_broadcast) {
+            gate = ggml_view_1d(ctx, gate, ne[0], 0);
+        }
+        ggml_tensor * rms = (gate_source == 5 || gate_source == 6) ? ggml_rms_norm_inplace(ctx, x, 1e-6f) : ggml_rms_norm(ctx, x, 1e-6f);
+        norm = ggml_mul(ctx, rms, gate_source == 4 ? rms : weight);
+        if (gate_source == 1) {
+            gate = rms;
+        } else if (gate_source == 2) {
+            gate = norm;
+        } else if (gate_source == 3 || gate_source == 5) {
+            gate = ggml_view_4d(ctx, norm, ne[0], ne[1], ne[2], ne[3], norm->nb[1], norm->nb[2], norm->nb[3], 0);
+        }
+        if (keep_norm) {
+            ggml_set_output(norm);
+        }
+        ggml_tensor * activated = gate_op == GGML_UNARY_OP_SIGMOID ? ggml_sigmoid(ctx, gate) : ggml_silu(ctx, gate);
+        ggml_tensor * out = ggml_mul(ctx, norm, activated);
+        ggml_set_name(out, "rms_norm_gated");
+        if (keep_norm) {
+            result = ggml_add(ctx, out, norm);
+            return result;
+        }
+        return out;
+    }
+};
+
 // GGML_OP_ADD + GGML_OP_ADD (fused residual chain)
 struct test_add_add : public test_case {
     const ggml_type type;
@@ -9986,6 +10055,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
+        }
+    }
+
+    for (ggml_unary_op gate_op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+        for (int64_t n : {1, 63, 128, 1023, 1024, 1536}) {
+            for (bool strided : {false, true}) {
+                for (bool gate_broadcast : {false, true}) {
+                    for (bool keep_norm : {false, true}) {
+                        test_cases.emplace_back(new test_rms_norm_silu({n, 5, 3, 2}, strided, gate_broadcast, keep_norm, 0, gate_op));
+                    }
+                }
+            }
+        }
+
+        for (int gate_source : {1, 2, 3, 4, 5, 6, 7}) {
+            test_cases.emplace_back(new test_rms_norm_silu({128, 5, 3, 2}, false, false, false, gate_source, gate_op));
         }
     }
 
