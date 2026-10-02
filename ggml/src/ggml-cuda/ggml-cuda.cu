@@ -3205,13 +3205,22 @@ static bool ggml_cuda_match_ssm_conv_qk(const ggml_cgraph * cgraph, int i, bool 
     const int64_t c = silu->ne[0];
     if (conv->type != GGML_TYPE_F32 || silu->type != GGML_TYPE_F32 ||
             x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(conv) || !ggml_is_contiguous(silu) || !ggml_is_contiguous(x) || !ggml_is_contiguous(w) ||
+            !ggml_is_contiguous(conv) || !ggml_is_contiguous(silu) || !ggml_is_contiguous(w) ||
+            x->nb[0] != sizeof(float) || x->nb[1] != x->ne[0]*sizeof(float) ||
             silu->src[0] != conv || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
             conv->view_src || silu->view_src || (silu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
-            !ggml_are_same_shape(conv, silu) || d <= 0 || d > 256 || c > INT_MAX || h <= 0 || t <= 0 || t > 32 || s <= 0 || s > 65535 ||
-            silu->ne[3] != 1 || c % 128 != 0 || h > c / (2*d) || 2*d*h >= c ||
+            !ggml_are_same_shape(conv, silu) || d <= 0 || d > 256 || c > INT_MAX || h <= 0 || t <= 0 || t > 65535 || s <= 0 || s > 65535 ||
+            silu->ne[3] != 1 || c % 128 != 0 || c / 128 > 65535 || h > c / (2*d) || 2*d*h >= c ||
             x->ne[1] != c || x->ne[2] != s || x->ne[3] != 1 || x->ne[0] != t + w->ne[0] - 1 ||
             w->ne[1] != c || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (t > 32 && (t < 2048 || d < 128 || d > 192)) {
+        return false;
+    }
+    const size_t sequence_bytes = x->nb[1]*c;
+    if (x->nb[2] > INT_MAX || sequence_bytes > INT_MAX || x->nb[2] < sequence_bytes ||
+            x->nb[2] % sizeof(float) != 0 || (size_t) (s - 1) > (INT_MAX - sequence_bytes)/x->nb[2]) {
         return false;
     }
     for (int j : { 2, 5 }) {
