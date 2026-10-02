@@ -7181,12 +7181,16 @@ struct test_mul_mat_shared_mmq_input : public test_case {
         }
         if (input_mode >= 8) {
             outputs.clear();
+            ggml_tensor * inputs[] = { input, nullptr, nullptr, nullptr };
+            if (input_mode == 14 || input_mode == 15) {
+                for (int i = 1; i < (input_mode == 14 ? 2 : 4); ++i) { inputs[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns); }
+            }
             ggml_tensor * result = nullptr;
-            for (int i = 0; i < 4; ++i) {
-                ggml_tensor * src = input_mode == 10 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
+            for (int i = 0; i < (input_mode == 15 ? 8 : 4); ++i) {
+                ggml_tensor * src = input_mode == 10 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input_mode == 14 ? inputs[i % 2] : input_mode == 15 ? inputs[i % 4] : input;
                 const ggml_type weight_type = input_mode == 12 && i % 2 ? GGML_TYPE_Q8_0 : type;
                 const int64_t rows[] = { 64, 128, 96, 256 };
-                ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, rows[i]);
+                ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, rows[i % 4]);
                 ggml_tensor * projection = ggml_mul_mat(ctx, weight, src);
                 if (input_mode == 9 || input_mode == 13) {
                     ggml_prec_set_src(projection, input_mode == 13 || i == 0 ? GGML_PREC_Q8 : GGML_PREC_Q4, 1);
@@ -11299,6 +11303,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K}) {
+        for (int64_t columns : {9, 32}) {
+            for (int mode : {14, 15}) { test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, columns, false, mode)); }
+        }
+    }
+
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
