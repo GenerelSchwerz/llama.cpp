@@ -1613,7 +1613,12 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+// MMQ can read a full tile past the last routed row.
+static constexpr size_t MMQ_ID_INPUT_GUARD = 128;
+
 struct ggml_cuda_mmq_id_input {
+    const ggml_cuda_mmq_id_input * routes = nullptr;
+    size_t guard = 0;
     ggml_cuda_pool_alloc<int32_t> ids_src1;
     ggml_cuda_pool_alloc<int32_t> ids_dst;
     ggml_cuda_pool_alloc<int32_t> expert_bounds;
@@ -1625,7 +1630,8 @@ struct ggml_cuda_mmq_id_input {
 
 ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
 size_t ggml_cuda_mmq_id_input_size(const ggml_tensor * node, int cc);
-void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node, size_t size, ggml_cuda_mmq_id_input & input);
+void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node, ggml_cuda_mmq_id_input & input, size_t guard = 0);
+void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node, size_t size, ggml_cuda_mmq_id_input & input, const ggml_cuda_mmq_id_input * routes = nullptr);
 
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,

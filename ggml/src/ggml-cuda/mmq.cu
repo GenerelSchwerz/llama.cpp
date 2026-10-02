@@ -143,13 +143,32 @@ size_t ggml_cuda_mmq_id_input_size(const ggml_tensor * node, const int cc) {
         J_max*sizeof(block_q8_1_mmq);
 }
 
+void ggml_cuda_prepare_mmq_id_routes(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
+        ggml_cuda_mmq_id_input & input, size_t guard) {
+    const ggml_tensor * src1 = node->src[1];
+    const ggml_tensor * ids = node->src[2];
+    const int64_t ne11 = src1->ne[1], ne12 = src1->ne[2], ne02 = node->src[0]->ne[2];
+    const int64_t n_expert_used = ids->ne[0], ne_get_rows = ne12*n_expert_used;
+    GGML_ASSERT(node->ne[1] == n_expert_used);
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    input.guard = guard;
+    input.ids_src1.alloc(ne_get_rows);
+    input.ids_dst.alloc(ne_get_rows + guard);
+    input.expert_bounds.alloc(ne02 + 1);
+    const int si1 = ids->nb[1]/ggml_element_size(ids);
+    const int sis1 = src1->nb[2]/src1->nb[1];
+    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, input.ids_src1.ptr, input.ids_dst.ptr, input.expert_bounds.ptr,
+        ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, ctx.stream());
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
-        size_t size, ggml_cuda_mmq_id_input & input) {
+        size_t size, ggml_cuda_mmq_id_input & input, const ggml_cuda_mmq_id_input * routes) {
     const ggml_tensor * src0 = node->src[0];
     const ggml_tensor * src1 = node->src[1];
     const ggml_tensor * ids = node->src[2];
-    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2], ne02 = src0->ne[2];
-    const size_t nb11 = src1->nb[1], nb12 = src1->nb[2];
+    const int64_t ne10 = src1->ne[0], ne11 = src1->ne[1], ne12 = src1->ne[2];
     const size_t ts_src1 = sizeof(float);
     const float * src1_d = (const float *) src1->data;
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -158,30 +177,17 @@ void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_expert_used = ids->ne[0];
-    const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(node->ne[1] == n_expert_used);
 
-    input.ids_src1.alloc(ne_get_rows);
-    input.ids_dst.alloc(ne_get_rows);
-    input.expert_bounds.alloc(ne02 + 1);
-
-    // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
-    // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
+    GGML_ASSERT(!routes || !routes->routes);
+    input.routes = routes;
+    if (!routes) { ggml_cuda_prepare_mmq_id_routes(ctx, node, input); }
+    const auto & mapped = routes ? *routes : input;
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
-
-    {
-        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
-        const int sis1 = nb12 / nb11;
-
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, input.ids_src1.ptr, input.ids_dst.ptr, input.expert_bounds.ptr,
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
-        CUDA_CHECK(cudaGetLastError());
-    }
 
     input.quantized.alloc(size);
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
-        input.scale.alloc(ne12*n_expert_used);
+        input.scale.alloc(ne12*n_expert_used + (routes ? routes->guard : 0));
     }
 
     const int64_t ne11_flat = ne12*n_expert_used;
@@ -197,17 +203,17 @@ void ggml_cuda_prepare_mmq_id_input(ggml_backend_cuda_context & ctx, const ggml_
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
-                quantize_scatter_mmq_fp4_cuda(src1_d, input.ids_src1.ptr, input.quantized.ptr, input.scale.ptr, src0->type, use_aligned_float8, ne10,
+                quantize_scatter_mmq_fp4_cuda(src1_d, mapped.ids_src1.ptr, input.quantized.ptr, input.scale.ptr, src0->type, use_aligned_float8, ne10,
                                         /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
             } else {
-                quantize_mmq_fp4_cuda(src1_d, input.ids_src1.ptr, input.quantized.ptr, input.scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                quantize_mmq_fp4_cuda(src1_d, mapped.ids_src1.ptr, input.quantized.ptr, input.scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, input.ids_src1.ptr, input.quantized.ptr, src0->type, ne10,
+            quantize_scatter_mmq_q8_1_cuda(src1_d, mapped.ids_src1.ptr, input.quantized.ptr, src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, input.ids_src1.ptr, input.quantized.ptr, src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, mapped.ids_src1.ptr, input.quantized.ptr, src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -337,8 +343,9 @@ void ggml_cuda_mul_mat_q(
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    const auto & mapped = input->routes ? *input->routes : *input;
     const mmq_args args = {
-        src0_d, src0->type, (const int *) input->quantized.ptr, input->ids_dst.ptr, input->expert_bounds.ptr, dst_d,
+        src0_d, src0->type, (const int *) input->quantized.ptr, mapped.ids_dst.ptr, mapped.expert_bounds.ptr, dst_d,
         input->scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,

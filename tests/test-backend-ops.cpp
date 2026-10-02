@@ -5395,6 +5395,10 @@ struct test_mul_mat_id_fusion : public test_case {
             b = ggml_view_3d(ctx, b, k, b->ne[1], n, b->nb[1], b->nb[2], 0);
         }
         ggml_set_name(b, "b");
+        ggml_tensor * inputs[] = {b, nullptr, nullptr, nullptr};
+        if (reuse_case == 8) {
+            for (int i = 1; i < 4; ++i) { inputs[i] = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n); }
+        }
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
         ggml_set_name(out, "out");
@@ -5404,7 +5408,7 @@ struct test_mul_mat_id_fusion : public test_case {
 
         for (uint32_t i = 1; i < o; ++i) {
             ggml_tensor * a2 = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
-            ggml_tensor * next_b = b;
+            ggml_tensor * next_b = reuse_case == 8 ? inputs[i % 4] : b;
             ggml_tensor * next_ids = ids;
             if (reuse_case == 2) {
                 next_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -10484,6 +10488,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ3_S, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_F16}) {
         for (int64_t n : {1, 9, 32, 129}) {
             for (bool broadcast : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 2, broadcast, 64, n, 256, 8, false, 8, GGML_PREC_Q8));
                 for (int reuse_case : {1, 2, 3, 4, 5, 6, 7}) {
                     test_cases.emplace_back(new test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 2, broadcast, 64, n, 256, 3, false, reuse_case, GGML_PREC_Q8));
                 }
