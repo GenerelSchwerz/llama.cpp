@@ -7171,9 +7171,15 @@ struct test_mul_mat_reused_input : public test_case {
         if (input_mode == 2) {
             input = ggml_view_2d(ctx, input, k, columns, input->nb[1], 0);
         }
+        std::vector<ggml_tensor *> inputs = { input };
+        if (input_mode >= 6) {
+            for (int i = 1; i < (input_mode == 7 ? 4 : 2); ++i) {
+                inputs.push_back(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns));
+            }
+        }
         ggml_tensor * result = nullptr;
-        for (int i = 0; i < 4; ++i) {
-            ggml_tensor * src = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
+        for (int i = 0; i < (input_mode == 7 ? 8 : 4); ++i) {
+            ggml_tensor * src = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : inputs[i % inputs.size()];
             const ggml_type weight_type = input_mode == 3 && i % 2 ? GGML_TYPE_Q8_0 : type;
             ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, 64 + 32*i);
             ggml_tensor * projection = ggml_mul_mat(ctx, weight, src);
@@ -11246,7 +11252,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
         for (int64_t k : { 256, 1024 }) {
             for (int64_t columns : { 1, 2, 8, 9 }) {
-                for (int input_mode : { 0, 1, 2, 3, 4, 5 }) {
+                for (int input_mode : { 0, 1, 2, 3, 4, 5, 6, 7 }) {
                     test_cases.emplace_back(new test_mul_mat_reused_input(type, k, columns, input_mode));
                 }
             }

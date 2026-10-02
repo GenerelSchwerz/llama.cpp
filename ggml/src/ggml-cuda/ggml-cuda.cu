@@ -43,6 +43,7 @@
 #include "ggml-cuda/pool1d.cuh"
 #include "ggml-cuda/quantize.cuh"
 #include "ggml-cuda/rope.cuh"
+#include "ggml-cuda/reuse.cuh"
 #include "ggml-cuda/roll.cuh"
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
@@ -4273,24 +4274,6 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     ggml_cuda_concurrent_event * concurrent_event           = nullptr;
     bool                         should_launch_concurrent_events = false;
 
-    const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
-        if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
-            concurrent_event = &stream_ctx.concurrent_events[node];
-
-            is_concurrent_event_active = true;
-
-            GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
-
-            cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
-            GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
-            CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
-
-            for (int i = 1; i <= concurrent_event->n_streams; ++i) {
-                cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
-                CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
-            }
-        }
-    };
 
     while (!graph_evaluated_or_captured) {
         // Only perform the graph execution if CUDA graphs are not enabled, or we are capturing the graph.
@@ -4361,25 +4344,63 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
 
             static const bool disable_reuse = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
-            std::unordered_map<const ggml_tensor *, std::vector<int>> mmvq_consumers;
-            std::vector<bool> mmvq_nodes;
-            if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
-                mmvq_nodes.resize(cgraph->n_nodes);
+            std::vector<int> mmvq_keys;
+            std::vector<size_t> mmvq_sizes;
+            if (!disable_reuse) {
+                mmvq_keys.assign(cgraph->n_nodes, -1);
+                mmvq_sizes.resize(cgraph->n_nodes);
                 for (int i = 0; i < cgraph->n_nodes; ++i) {
-                    if (ggml_cuda_can_share_mmvq_input(cgraph->nodes[i], cuda_ctx->device)) {
-                        mmvq_nodes[i] = true;
-                        mmvq_consumers[cgraph->nodes[i]->src[1]].push_back(i);
+                    const ggml_tensor * node = cgraph->nodes[i];
+                    if (ggml_cuda_can_share_mmvq_input(node, cuda_ctx->device)) {
+                        const ggml_tensor * input = node->src[1];
+                        if (input->ne[0] <= 0 || input->ne[0] > INT64_MAX - MATRIX_ROW_PADDING + 1 ||
+                                uint64_t(input->ne[0]) > SIZE_MAX - MATRIX_ROW_PADDING + 1) { continue; }
+                        const size_t blocks = GGML_PAD(size_t(input->ne[0]), MATRIX_ROW_PADDING)/QK8_1;
+                        if (blocks > SIZE_MAX/sizeof(block_q8_1)) { continue; }
+                        const size_t row = blocks*sizeof(block_q8_1);
+                        if (uint64_t(input->ne[1]) > SIZE_MAX/row) { continue; }
+                        mmvq_keys[i] = 0;
+                        mmvq_sizes[i] = size_t(input->ne[1])*row;
                     }
                 }
             }
-            std::unique_ptr<ggml_cuda_pool_alloc<char>> shared_mmvq_input;
-            const ggml_tensor * shared_input = nullptr;
-            int shared_last = -1;
+            ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, mmvq_keys, mmvq_sizes, ggml_cuda_mmvq_input_overwritten);
+            ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> shared_inputs(cuda_ctx->pool(), reuse);
+            const auto prepare_group = [&](int group) {
+                if (shared_inputs[group].get()) { return; }
+                const ggml_tensor * node = cgraph->nodes[reuse.groups[group].node];
+                ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], node->src[1], shared_inputs[group]);
+            };
+            const auto prepare_shared = [&](int i, bool after) {
+                if (reuse.starts.empty()) { return; }
+                for (int group = reuse.starts[i]; group >= 0; group = reuse.groups[group].next) {
+                    if (reuse.groups[group].after == after) {
+                        prepare_group(group);
+                    }
+                }
+            };
+            const auto try_launch_concurrent_event = [&](const ggml_tensor * node) {
+                if (stream_ctx.concurrent_events.find(node) != stream_ctx.concurrent_events.end()) {
+                    const int i = reuse.indices.empty() ? -1 : reuse.indices.at(node);
+                    if (i >= 0) { prepare_shared(i, true); }
+                    concurrent_event = &stream_ctx.concurrent_events[node];
+
+                    is_concurrent_event_active = true;
+
+                    GGML_LOG_DEBUG("Launching %d streams at %s\n", concurrent_event->n_streams, node->name);
+
+                    cudaStream_t main_stream = cuda_ctx->stream();  // this should be stream 0
+                    GGML_ASSERT(cuda_ctx->curr_stream_no == 0);
+                    CUDA_CHECK(cudaEventRecord(concurrent_event->fork_event, main_stream));
+
+                    for (int i = 1; i <= concurrent_event->n_streams; ++i) {
+                        cudaStream_t stream = cuda_ctx->stream(cuda_ctx->device, i);
+                        CUDA_CHECK(cudaStreamWaitEvent(stream, concurrent_event->fork_event));
+                    }
+                }
+            };
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
-                if (i > shared_last) {
-                    shared_mmvq_input.reset();
-                }
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
@@ -4421,30 +4442,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                const bool can_share = !mmvq_nodes.empty() && mmvq_nodes[i];
-                if (can_share) {
-                    const auto & consumers = mmvq_consumers.at(node->src[1]);
-                    if (!shared_mmvq_input) {
-                        const int last = consumers.back();
-                        int safe_last = i;
-                        for (int j = i; j <= last; ++j) {
-                            if (ggml_cuda_mmvq_input_overwritten(cgraph->nodes[j], node->src[1])) {
-                                break;
-                            }
-                            if (mmvq_nodes[j] &&
-                                    cgraph->nodes[j]->src[1] == node->src[1]) {
-                                safe_last = j;
-                            }
-                        }
-                        if (safe_last > i) {
-                            shared_input = node->src[1];
-                            shared_last = safe_last;
-                            shared_mmvq_input = std::make_unique<ggml_cuda_pool_alloc<char>>(cuda_ctx->pool());
-                            ggml_cuda_quantize_mmvq_input(*cuda_ctx, node->src[0], shared_input, *shared_mmvq_input);
-                        }
+                const int group = reuse.nodes.empty() ? -1 : reuse.nodes[i];
+                if (group >= 0 && !shared_inputs[group].get()) {
+                    bool ready = !is_concurrent_event_active;
+                    if (!ready && !reuse.groups[group].after) {
+                        const auto first = concurrent_event->stream_mapping.find(cgraph->nodes[reuse.groups[group].node]);
+                        ready = first != concurrent_event->stream_mapping.end() && first->second == cuda_ctx->curr_stream_no;
                     }
+                    if (ready) { prepare_group(group); }
                 }
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, shared_mmvq_input ? shared_mmvq_input->get() : nullptr);
+                const ggml_tensor * shared_input = group >= 0 ? node->src[1] : nullptr;
+                const char * quantized = group >= 0 ? shared_inputs[group].get() : nullptr;
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4474,8 +4483,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #endif  // NDEBUG
 
                 bool ok;
-                if (shared_mmvq_input && can_share && node->src[1] == shared_input) {
-                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, nullptr, shared_mmvq_input->get());
+                if (quantized) {
+                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, nullptr, quantized);
                     ok = true;
                 } else {
                     ok = ggml_cuda_compute_forward(*cuda_ctx, node);
