@@ -2,6 +2,8 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mmvq.cuh"
+#include "unary.cuh"
 
 #include <cstdint>
 
@@ -313,6 +315,162 @@ void ggml_cuda_mul_mat_q(
         ne12, ncols_opt};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+}
+
+static constexpr size_t MMQ_ID_PAIR_GUARD = 128;
+
+bool ggml_cuda_should_fuse_mmq_id(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int cc, const size_t smpbo) {
+    const ggml_tensor * weight = up->src[0];
+    const ggml_tensor * input  = up->src[1];
+    const ggml_tensor * ids    = up->src[2];
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc) || !ggml_is_quantized(weight->type) ||
+            up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            input->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            gate->src[0]->type != weight->type || !ggml_are_same_layout(weight, gate->src[0]) ||
+            gate->src[1] != input || gate->src[2] != ids ||
+            glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0) {
+        return false;
+    }
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+        case GGML_GLU_OP_REGLU:
+            break;
+        case GGML_GLU_OP_SWIGLU_CLAMP: {
+            const float limit = ggml_get_op_params_f32(glu, 3);
+            if (!std::isfinite(limit) || limit <= 0.0f) {
+                return false;
+            }
+            break;
+        }
+        default:
+            return false;
+    }
+    const ggml_tensor * tensors[] = { weight, gate->src[0], input, ids, up, gate, glu };
+    for (const ggml_tensor * tensor : tensors) {
+        const size_t ts = ggml_type_size(tensor->type);
+        uint64_t extent = 0;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0 || tensor->ne[d] > INT_MAX || tensor->nb[d] == 0 || tensor->nb[d] % ts != 0 || tensor->nb[d]/ts > INT_MAX) {
+                return false;
+            }
+            const uint64_t stride = tensor->nb[d]/ts;
+            const uint64_t count = d == 0 ? (tensor->ne[0]/ggml_blck_size(tensor->type)) : tensor->ne[d];
+            if (count == 0 || (count - 1) > (INT_MAX - extent)/std::max(stride, uint64_t(1))) {
+                return false;
+            }
+            extent += (count - 1)*stride;
+        }
+    }
+    const ggml_prec prec = ggml_cuda_mmq_get_prec_src1(weight, up, cc);
+    if ((weight->type == GGML_TYPE_MXFP4 || weight->type == GGML_TYPE_NVFP4) && prec != GGML_PREC_Q8) {
+        return false;
+    }
+    const int64_t tokens = input->ne[2];
+    const int64_t used   = ids->ne[0];
+    const int64_t experts = weight->ne[2];
+    const size_t ts = ggml_type_size(weight->type);
+    if (weight->ne[0] % MMQ_ITER_K != 0 || weight->ne[3] != 1 || input->ne[3] != 1 ||
+            ids->ne[2] != 1 || ids->ne[3] != 1 || ids->ne[1] != tokens ||
+            input->ne[0] != weight->ne[0] || (input->ne[1] != 1 && input->ne[1] != used) ||
+            used > experts || used >= (1 << 10) || tokens >= (1 << 22) || experts > 65535 ||
+            tokens > INT_MAX/used || weight->ne[1] > INT_MAX/(2*tokens*used) ||
+            weight->ne[1] > SIZE_MAX/sizeof(float)/2/(tokens*used) ||
+            weight->nb[0] != ts || weight->nb[1]/ts < weight->ne[0]/ggml_blck_size(weight->type) ||
+            weight->nb[1]/ts > INT_MAX/weight->ne[1] || weight->nb[2]/ts < (weight->nb[1]/ts)*weight->ne[1] ||
+            input->nb[0] != sizeof(float) || !ggml_cuda_is_aligned(input, 16) ||
+            input->nb[2] % input->nb[1] != 0 || ids->nb[0] != sizeof(int32_t) ||
+            !ggml_is_contiguous(up) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(glu) ||
+            !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
+            up->ne[0] != weight->ne[1] || up->ne[1] != used || up->ne[2] != tokens || up->ne[3] != 1) {
+        return false;
+    }
+    const int64_t rows = tokens*used;
+    const int64_t padded_k = GGML_PAD(input->ne[0], MATRIX_ROW_PADDING);
+    const size_t input_row_size = padded_k*sizeof(block_q8_1_mmq)/QK8_1_MMQ;
+    if (uint64_t(rows) > (SIZE_MAX - MMQ_ID_PAIR_GUARD*sizeof(block_q8_1_mmq))/input_row_size ||
+            uint64_t(rows) > SIZE_MAX/sizeof(int32_t) - MMQ_ID_PAIR_GUARD) {
+        return false;
+    }
+    if (tokens*sizeof(int32_t) > smpbo || rows > INT_MAX/(padded_k/QK8_1_MMQ*sizeof(block_q8_1_mmq)/sizeof(int)) ||
+            tokens <= get_mmvq_mmid_max_batch(weight->type, cc) ||
+            !ggml_cuda_should_use_mmq(weight->type, cc, tokens, experts) ||
+            ggml_cuda_mmq_get_prec_src1(weight, up, cc) != ggml_cuda_mmq_get_prec_src1(gate->src[0], gate, cc)) {
+        return false;
+    }
+    const bool fallback = (2*weight->ne[1]) % 128 != 0;
+    const int J = mmq_get_J(weight->type, fallback, prec, cc, smpbo, tokens);
+    if (J == 0) {
+        return false;
+    }
+    const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(weight->type, J, fallback, cc, prec);
+    if (weight->ne[1] % config.I != 0) {
+        return false;
+    }
+    const int64_t tiles_i = 2*weight->ne[1]/config.I;
+    const int64_t tiles_j = (tokens + J - 1)/J;
+    const int64_t blocks_k = weight->ne[0]/ggml_blck_size(weight->type);
+    const int64_t max_tiles = std::min(int64_t(INT_MAX/100), ((int64_t(1) << 30) - 1)/blocks_k);
+    return tiles_i <= max_tiles/tiles_j/experts;
+}
+
+void ggml_cuda_mul_mat_id_q_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst) {
+    const ggml_tensor * src0 = up->src[0];
+    const ggml_tensor * src1 = up->src[1];
+    const ggml_tensor * ids  = up->src[2];
+    const int64_t rows = src1->ne[2]*ids->ne[0];
+    const int64_t padded_k = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), rows + MMQ_ID_PAIR_GUARD);
+    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), src0->ne[2] + 1);
+    const bool dedup = src1->ne[1] == 1 && ids->ne[0] > 1;
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.ptr, ids_dst.ptr, bounds.ptr,
+        src0->ne[2], src1->ne[2], ids->ne[0], src1->ne[1], ids->nb[1]/sizeof(int32_t), src1->nb[2]/src1->nb[1], dedup, stream);
+    CUDA_CHECK(cudaGetLastError());
+    // Tile loads include unused columns past the last expert.
+    const size_t input_size = rows*padded_k*sizeof(block_q8_1_mmq)/QK8_1_MMQ + MMQ_ID_PAIR_GUARD*sizeof(block_q8_1_mmq);
+    ggml_cuda_pool_alloc<char> input(ctx.pool(), input_size);
+    if (dedup) {
+        quantize_scatter_mmq_q8_1_cuda((const float *) src1->data, ids_src1.ptr, input.ptr, src0->type,
+            src1->ne[0], src1->nb[2]/sizeof(float), padded_k, src1->ne[2], rows, ids->ne[0], stream);
+    } else {
+        quantize_mmq_q8_1_cuda((const float *) src1->data, ids_src1.ptr, input.ptr, src0->type, src1->ne[0],
+            src1->nb[1]/sizeof(float), src1->nb[2]/sizeof(float), src1->nb[3]/sizeof(float), padded_k, rows, 1, 1, stream);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    const size_t ts = ggml_type_size(src0->type);
+    const int64_t bank_rows = src0->ne[1];
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), 2*bank_rows*rows);
+    const mmq_args args = {
+        (const char *) src0->data, src0->type, (const int *) input.ptr, ids_dst.ptr, bounds.ptr, scratch.ptr, nullptr,
+        src0->ne[0], 2*bank_rows, rows, src0->nb[1]/ts, rows, 2*bank_rows,
+        src0->ne[2], src0->ne[2], src0->nb[2]/ts, 0, 0,
+        1, 1, 0, 0, 0, src1->ne[2], src1->ne[2], (const char *) gate->src[0]->data, bank_rows };
+    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, GGML_PREC_Q8);
+    CUDA_CHECK(cudaGetLastError());
+    ggml_tensor up_view = *up;
+    ggml_tensor gate_view = *gate;
+    up_view.buffer = gate_view.buffer = nullptr;
+    up_view.view_src = gate_view.view_src = nullptr;
+    up_view.view_offs = gate_view.view_offs = 0;
+    up_view.data = scratch.ptr;
+    gate_view.data = scratch.ptr + bank_rows;
+    up_view.nb[1] = gate_view.nb[1] = 2*bank_rows*sizeof(float);
+    for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+        up_view.nb[d] = gate_view.nb[d] = up_view.nb[d - 1]*up_view.ne[d - 1];
+    }
+    ggml_tensor glu_view = *dst;
+    glu_view.src[0] = &gate_view;
+    glu_view.src[1] = &up_view;
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_SWIGLU:       ggml_cuda_op_swiglu(ctx, &glu_view); break;
+        case GGML_GLU_OP_GEGLU:        ggml_cuda_op_geglu(ctx, &glu_view); break;
+        case GGML_GLU_OP_REGLU:        ggml_cuda_op_reglu(ctx, &glu_view); break;
+        case GGML_GLU_OP_SWIGLU_CLAMP: ggml_cuda_op_swiglu_clamp(ctx, &glu_view); break;
+        default:                      GGML_ABORT("unsupported paired MMQ GLU");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
