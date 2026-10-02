@@ -7335,6 +7335,48 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_gdn_ab_fusion : test_mul_mat_vec_fusion {
+    const int packed_groups;
+    ggml_tensor * alpha = nullptr;
+    ggml_tensor * beta = nullptr;
+
+    test_gdn_ab_fusion(ggml_type type, int64_t tokens, int packed_groups = 0)
+        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, 16, 256, false, 1, 1, false, false, true, false, {1, 1}),
+          packed_groups(packed_groups) {}
+
+    std::string vars() override { return test_mul_mat_vec_fusion::vars() + "," + VAR_TO_STR(packed_groups); }
+    std::string op_desc(ggml_tensor * out) override { GGML_UNUSED(out); return "GDN_AB_FUSION"; }
+    bool use_weight_context() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { alpha, beta }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        GGML_ASSERT(ctx_weights);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * raw_alpha;
+        ggml_tensor * raw_beta;
+        if (packed_groups) {
+            GGML_ASSERT(n % packed_groups == 0);
+            ggml_tensor * w = ggml_new_tensor_2d(ctx_weights, type, k, 2 * n);
+            ggml_tensor * mixed = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w, x), 2 * n / packed_groups, packed_groups, m, 1);
+            raw_alpha = ggml_cont_3d(ctx, ggml_view_4d(ctx, mixed, n / packed_groups, packed_groups, m, 1,
+                mixed->nb[1], mixed->nb[2], mixed->nb[3], (n / packed_groups) * sizeof(float)), n, m, 1);
+            raw_beta = ggml_view_4d(ctx, mixed, n / packed_groups, packed_groups, m, 1,
+                mixed->nb[1], mixed->nb[2], mixed->nb[3], 0);
+        } else {
+            ggml_tensor * wa = ggml_new_tensor_2d(ctx_weights, type, k, n);
+            ggml_tensor * wb = ggml_new_tensor_2d(ctx_weights, type, k, n);
+            raw_alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wa, x), n, m, 1);
+            raw_beta = ggml_mul_mat(ctx, wb, x);
+        }
+        ggml_tensor * dt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 1, 1);
+        ggml_tensor * scale = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, 1, 1);
+        alpha = ggml_reshape_4d(ctx, ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, raw_alpha, dt)), scale), 1, n, m, 1);
+        raw_beta = packed_groups ? ggml_cont_4d(ctx, raw_beta, 1, n, m, 1) : ggml_reshape_4d(ctx, raw_beta, 1, n, m, 1);
+        beta = ggml_sigmoid(ctx, raw_beta);
+        return ggml_add(ctx, alpha, beta);
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11199,6 +11241,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_BF16, 1));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q4_0, 1));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q8_0, 1));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_BF16, 4));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_F32, 4, 2));
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {

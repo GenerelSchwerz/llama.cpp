@@ -351,7 +351,10 @@ static __global__ void mul_mat_vec_f(
             value += x_bias[tid*stride_col_dst + row];
         }
 
-        if (use_gate) {
+        if (use_gate && fusion.second_output) {
+            fusion.second_output[row] = ggml_cuda_op_sigmoid_single(sumf_gate[tid]);
+            value = ggml_cuda_op_softplus_single(value) * fusion.post_scale[row];
+        } else if (use_gate) {
             float gate_value = sumf_gate[tid];
             if (use_gate_bias) {
                 gate_value += gate_bias[tid*stride_col_dst + row];
@@ -678,6 +681,22 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(fusion->gate_bias->ne[0] == dst->ne[0]);
             GGML_ASSERT(!ids || fusion->gate_bias->ne[1] == src0->ne[2]);
             fusion_local.gate_bias = fusion->gate_bias->data;
+        }
+        if (fusion->second_output) {
+            GGML_ASSERT(!ids && ne1 == 1 && ne2 == 1 && ne3 == 1);
+            GGML_ASSERT(fusion->gate && fusion->x_bias && fusion->post_scale && !fusion->gate_bias);
+            GGML_ASSERT(!fusion->x_scale && !fusion->gate_scale);
+            GGML_ASSERT(ggml_are_same_shape(fusion->gate, src0));
+            GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->x_bias));
+            GGML_ASSERT(ggml_nelements(fusion->x_bias) == ne0);
+            GGML_ASSERT(fusion->post_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->post_scale));
+            GGML_ASSERT(ggml_nelements(fusion->post_scale) == ne0);
+            GGML_ASSERT(fusion->second_output->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->second_output));
+            GGML_ASSERT(ggml_nelements(fusion->second_output) == ne0);
+            fusion_local.post_scale = (const float *) fusion->post_scale->data;
+            fusion_local.second_output = (float *) fusion->second_output->data;
+        } else {
+            GGML_ASSERT(!fusion->post_scale);
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;

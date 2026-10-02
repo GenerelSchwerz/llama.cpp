@@ -1569,6 +1569,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // Apply softplus/scale to the primary dot and sigmoid to the second dot.
+    const ggml_tensor * post_scale = nullptr;
+    ggml_tensor * second_output = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1578,6 +1581,8 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const float * post_scale = nullptr;
+    float * second_output = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
