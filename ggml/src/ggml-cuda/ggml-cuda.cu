@@ -1763,6 +1763,54 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     return true;
 }
 
+static int ggml_cuda_match_mmq_id_pair(const ggml_cgraph * cgraph, const int i, const int device) {
+    int count = 3;
+    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 2 })) {
+        count = 4;
+        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { i + 1, i + 3 })) {
+            return 0;
+        }
+        const ggml_tensor * view = cgraph->nodes[i + 1];
+        const ggml_tensor * root = view->view_src;
+        if (view != cgraph->nodes[i + 2]->src[0] || !root || root->op != GGML_OP_NONE || !root->buffer ||
+                ggml_backend_buffer_get_usage(root->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                (root->flags & GGML_TENSOR_FLAG_PARAM) || (view->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+                ggml_node_get_use_count(cgraph, i + 1) != 1) {
+            return 0;
+        }
+    }
+    const ggml_tensor * glu  = cgraph->nodes[i + count - 1];
+    const ggml_tensor * gate = glu->src[0];
+    const ggml_tensor * up   = glu->src[1];
+    if (!gate || !up || !((gate == cgraph->nodes[i] && up == cgraph->nodes[i + count - 2]) ||
+                          (up == cgraph->nodes[i] && gate == cgraph->nodes[i + count - 2]))) {
+        return 0;
+    }
+    return ggml_cuda_should_fuse_mmq_id(up, gate, glu, ggml_cuda_info().devices[device].cc, ggml_cuda_info().devices[device].smpbo) ? count : 0;
+}
+
+static bool ggml_cuda_mmq_id_pair_memory_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * dst) {
+    const uintptr_t dst_start = (uintptr_t) dst->data;
+    const size_t dst_size = ggml_backend_buffer_get_alloc_size(dst->buffer, dst);
+    if (dst_start > UINTPTR_MAX - dst_size) {
+        return false;
+    }
+    for (const ggml_tensor * src : { up->src[0], gate->src[0], up->src[1], up->src[2] }) {
+        const uintptr_t src_start = (uintptr_t) src->data;
+        const size_t src_size = ggml_backend_buffer_get_alloc_size(src->buffer, src);
+        if (src_start > UINTPTR_MAX - src_size || (dst_start < src_start + src_size && src_start < dst_start + dst_size)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * weight : { up->src[0], gate->src[0] }) {
+        if (ggml_backend_buffer_get_usage(weight->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                ggml_backend_buffer_get_alloc_size(weight->buffer, weight) != ggml_nbytes(weight)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
@@ -3650,6 +3698,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    const int mmq_pair_count = node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()
+            ? ggml_cuda_match_mmq_id_pair(cgraph, i, cuda_ctx->device) : 0;
+    if (mmq_pair_count != 0) {
+        ggml_tensor * glu = cgraph->nodes[i + mmq_pair_count - 1];
+        const int output_idx = i + mmq_pair_count - 1;
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, mmq_pair_count, &output_idx, 1) &&
+                ggml_cuda_mmq_id_pair_memory_ok(glu->src[1], glu->src[0], glu)) {
+            ggml_cuda_mul_mat_id_q_pair(*cuda_ctx, glu->src[1], glu->src[0], glu);
+            return mmq_pair_count - 1;
+        }
+    }
+
     bool fused_mul_mat_vec = false;
     int  fused_node_count  = 0;
 
@@ -4546,6 +4606,14 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT_ID) {
+                const int count = ggml_cuda_match_mmq_id_pair(cgraph, i, cuda_ctx->device);
+                if (count != 0) {
+                    add_alloc_deps(i, i + count - 1);
+                    i += count - 1;
+                    continue;
+                }
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

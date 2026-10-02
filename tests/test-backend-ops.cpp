@@ -7163,12 +7163,13 @@ struct test_mul_mat_vec_fusion : public test_case {
     const bool with_gate;
     const bool with_lane_scale;
     std::array<int64_t, 2> batch_dims;
+    const bool paired_mmq;
 
     test_mul_mat_vec_fusion(ggml_type type, ggml_glu_op op, int64_t m, int64_t n, int64_t k,
                         bool use_id = false, int n_mats = 1, int n_used = 1, bool b = false, bool with_bias = false, bool with_gate = true,
-                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2})
+                        bool with_lane_scale = false, std::array<int64_t, 2> batch_dims = {4, 2}, bool paired_mmq = false)
     : type(type), glu_op(op), m(m), n(n), k(k), use_id(use_id), n_mats(n_mats), n_used(n_used), b(b), with_bias(with_bias),
-        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims) {
+        with_gate(with_gate), with_lane_scale(with_lane_scale), batch_dims(batch_dims), paired_mmq(paired_mmq) {
         if (use_id) {
             GGML_ASSERT(n_used <= n_mats);
         }
@@ -7180,7 +7181,7 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MUL_MAT_VEC_FUSION";
+        return paired_mmq ? "MUL_MAT_ID_PAIR_FUSION" : "MUL_MAT_VEC_FUSION";
     }
 
     bool run_whole_graph() override { return true; }
@@ -11242,6 +11243,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q3_K, GGML_TYPE_IQ2_S }) {
+        for (ggml_glu_op op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_SWIGLU_CLAMP }) {
+            for (int64_t tokens : { 32, 129 }) {
+                for (int64_t rows : { 128, 129 }) {
+                    for (bool broadcast : { false, true }) {
+                        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, op, tokens, rows, 512,
+                            true, 8, 2, broadcast, false, true, false, {1, 1}, true));
+                    }
+                }
+            }
+        }
     }
 
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
