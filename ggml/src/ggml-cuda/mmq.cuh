@@ -1613,11 +1613,22 @@ extern DECL_MMQ_CASE_W4A4(GGML_TYPE_NVFP4);
 
 // -------------------------------------------------------------------------------------------------------------------------
 
+struct ggml_cuda_mmq_input {
+    ggml_cuda_pool_alloc<char> quantized;
+    ggml_cuda_pool_alloc<float> scale;
+
+    explicit ggml_cuda_mmq_input(ggml_cuda_pool & pool) : quantized(pool), scale(pool) {}
+};
+
+size_t ggml_cuda_mmq_input_size(const ggml_tensor * node, int cc);
+
+void ggml_cuda_quantize_mmq_input(ggml_backend_cuda_context & ctx, const ggml_tensor * node,
+        size_t size, ggml_cuda_mmq_input & input);
+
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const ggml_cuda_mmq_input * input = nullptr);
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
 ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggml_tensor * dst, int cc);
-
-void ggml_cuda_mul_mat_q_shared(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * second);

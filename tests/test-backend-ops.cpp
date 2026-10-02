@@ -7175,9 +7175,28 @@ struct test_mul_mat_shared_mmq_input : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (input_mode == 2 ? 32 : 0), columns);
-        if (input_mode == 2) {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k + (input_mode == 2 || input_mode == 11 ? 32 : 0), columns);
+        if (input_mode == 2 || input_mode == 11) {
             input = ggml_view_2d(ctx, input, k, columns, input->nb[1], 0);
+        }
+        if (input_mode >= 8) {
+            outputs.clear();
+            ggml_tensor * result = nullptr;
+            for (int i = 0; i < 4; ++i) {
+                ggml_tensor * src = input_mode == 10 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
+                const ggml_type weight_type = input_mode == 12 && i % 2 ? GGML_TYPE_Q8_0 : type;
+                const int64_t rows[] = { 64, 128, 96, 256 };
+                ggml_tensor * weight = ggml_new_tensor_2d(ctx, weight_type, k, rows[i]);
+                ggml_tensor * projection = ggml_mul_mat(ctx, weight, src);
+                if (input_mode == 9 || input_mode == 13) {
+                    ggml_prec_set_src(projection, input_mode == 13 || i == 0 ? GGML_PREC_Q8 : GGML_PREC_Q4, 1);
+                }
+                ggml_set_output(projection);
+                outputs.push_back(projection);
+                ggml_tensor * next = ggml_silu(ctx, projection);
+                result = result ? ggml_concat(ctx, result, next, 0) : next;
+            }
+            return result;
         }
         ggml_tensor * other = input_mode == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, columns) : input;
         const int64_t m = input_mode == 4 ? 128 : 64;
@@ -11260,6 +11279,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                         test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, k, columns, reshape, mode));
                     }
+                }
+            }
+        }
+    }
+
+    for (ggml_type type : { GGML_TYPE_Q4_0, GGML_TYPE_Q2_K, GGML_TYPE_Q6_K, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4 }) {
+        for (int64_t columns : { 9, 32, 129 }) {
+            test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, columns, false, 8));
+            if (type == GGML_TYPE_Q4_0) {
+                for (int mode : { 10, 11, 12 }) {
+                    test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, columns, false, mode));
+                }
+            }
+            if (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) {
+                for (int mode : { 9, 13 }) {
+                    test_cases.emplace_back(new test_mul_mat_shared_mmq_input(type, 1024, columns, false, mode));
                 }
             }
         }
