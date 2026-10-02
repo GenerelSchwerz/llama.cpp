@@ -74,7 +74,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_silu = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, ggml_unary_op gate_op = GGML_UNARY_OP_COUNT>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -112,14 +112,14 @@ static __global__ void rms_norm_f32(const float * x,
     const int sample    = blockIdx.z;
     const int tid       = threadIdx.x;
 
-    static_assert(!do_silu || (do_multiply && !do_add && !do_scale), "SiLU requires weighted RMS normalization");
+    static_assert(gate_op == GGML_UNARY_OP_COUNT || (do_multiply && !do_add && !do_scale), "Gating requires weighted RMS normalization");
     static_assert(!do_add || do_multiply, "fusing add is not supported without multiplying");
     static_assert(!do_scale || !do_multiply, "fusing scale is not supported with multiplying");
 
     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
 
-    if constexpr (do_silu) {
+    if constexpr (gate_op != GGML_UNARY_OP_COUNT) {
         gate += sample * gate_stride_sample + channel * gate_stride_channel + row * gate_stride_row;
     }
 
@@ -153,9 +153,16 @@ static __global__ void rms_norm_f32(const float * x,
     const float scale = rsqrtf(mean + eps);
 
     for (int col = tid; col < ncols; col += block_size) {
-        if constexpr (do_silu) {
+        if constexpr (gate_op != GGML_UNARY_OP_COUNT) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
-            dst[col] = (scale * x[col] * mul[mul_col]) * ggml_cuda_op_silu_single(gate[col]);
+            float gated;
+            if constexpr (gate_op == GGML_UNARY_OP_SILU) {
+                gated = ggml_cuda_op_silu_single(gate[col]);
+            } else {
+                static_assert(gate_op == GGML_UNARY_OP_SIGMOID, "Unsupported RMS gate");
+                gated = 1.0f / (1.0f + expf(-gate[col]));
+            }
+            dst[col] = (scale * x[col] * mul[mul_col]) * gated;
         } else if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
             const int add_col = fastmodulo(col, add_ncols_packed);
@@ -342,7 +349,7 @@ static void rms_norm_f32_cuda(
     }
 }
 
-template <bool do_silu = false>
+template <ggml_unary_op gate_op = GGML_UNARY_OP_COUNT>
 static void rms_norm_mul_f32_cuda(const float *  x,
                                   const float *  mul,
                                   const float *  add,
@@ -387,7 +394,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         if (ncols < 1024) {
             const dim3 block_dims(256, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<256, true, false, false, do_silu>, launch_params,
+            ggml_cuda_kernel_launch(rms_norm_f32<256, true, false, false, gate_op>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -395,7 +402,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, false, false, do_silu>, launch_params,
+            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, false, false, gate_op>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -550,7 +557,8 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
-void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+template <ggml_unary_op gate_op>
+static void ggml_cuda_op_rms_norm_fused_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
         ggml_tensor * gate, ggml_tensor * gated_dst) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
@@ -604,7 +612,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (gate) {
         GGML_ASSERT(gated_dst && gate->type == GGML_TYPE_F32 && ggml_are_same_shape(gate, dst));
         GGML_ASSERT(ggml_is_contiguous_rows(gate));
-        rms_norm_mul_f32_cuda<true>(src0_d, mul_d, nullptr, dst_d,
+        rms_norm_mul_f32_cuda<gate_op>(src0_d, mul_d, nullptr, dst_d,
                               ne00, ne01, ne02, ne03,
                               /*s00*/ s01, s02, s03,
                               /*mul_s00*/ mul_s01, mul_s02, mul_s03,
@@ -622,6 +630,16 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
                               /*add_s00*/ 0, 0, 0,
                               0, 0, 0, 0,
                               eps, stream);
+    }
+}
+
+void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+        ggml_tensor * gate, ggml_tensor * gated_dst, ggml_unary_op gate_op) {
+    if (gate && gate_op == GGML_UNARY_OP_SIGMOID) {
+        ggml_cuda_op_rms_norm_fused_impl<GGML_UNARY_OP_SIGMOID>(ctx, dst, mul_tensor, gate, gated_dst);
+    } else {
+        GGML_ASSERT(!gate || gate_op == GGML_UNARY_OP_SILU);
+        ggml_cuda_op_rms_norm_fused_impl<GGML_UNARY_OP_SILU>(ctx, dst, mul_tensor, gate, gated_dst);
     }
 }
 
