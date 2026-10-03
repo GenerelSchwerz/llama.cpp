@@ -1396,6 +1396,7 @@ void llm_graph_result::reset() {
 
     inputs.clear();
     inp_token_tensors.clear();
+    inp_mtp_tensors.clear();
     fused_nodes.clear();
     moe_regions.clear();
 
@@ -1508,6 +1509,13 @@ llm_graph_input_i * llm_graph_result::add_input(llm_graph_input_ptr input) {
     if (auto * embd = dynamic_cast<llm_graph_input_embd *>(input.get())) {
         if (embd->tokens) {
             inp_token_tensors.push_back(embd->tokens);
+        }
+    }
+    if (auto * mtp = dynamic_cast<llm_graph_input_embd_h *>(input.get())) {
+        for (auto * tensor : { mtp->tokens, mtp->embd, mtp->h }) {
+            if (tensor && !tensor->view_src) {
+                inp_mtp_tensors.push_back(tensor);
+            }
         }
     }
     inputs.emplace_back(std::move(input));

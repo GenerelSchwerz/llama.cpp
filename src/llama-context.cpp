@@ -2564,7 +2564,32 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+ggml_backend_t llama_context::mtp_input_backend() {
+    if (!cparams.decode_boundary_overlap || cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP ||
+            model.n_devices() != 1 || cparams.pipeline_parallel || cparams.cb_eval || shared_workspace_peer()) {
+        return nullptr;
+    }
+    if (!mtp_staging_checked) {
+        mtp_staging_checked = true;
+        auto * backend = backends.front().get();
+        auto * device = ggml_backend_get_device(backend);
+        if (device && strcmp(ggml_backend_reg_name(ggml_backend_dev_backend_reg(device)), "CUDA") == 0) {
+            ggml_backend_dev_props props;
+            ggml_backend_dev_get_props(device, &props);
+            if (props.caps.async && props.caps.events && ggml_backend_dev_host_buffer_type(device)) {
+                mtp_staging_backend = backend;
+            }
+        }
+    }
+    return mtp_staging_backend;
+}
+
 void llama_context::place_sampled_inputs(llm_graph_result * res) {
+    if (auto * backend = mtp_input_backend()) {
+        for (auto * tensor : res->get_inp_mtp_tensors()) {
+            ggml_backend_sched_set_tensor_backend(sched.get(), tensor, backend);
+        }
+    }
     if (!use_sampled_input) {
         return;
     }
@@ -2589,7 +2614,7 @@ static size_t sampled_input_staging_size(size_t size, const ggml_tensor * tensor
     return size + GGML_PAD(bytes, 64);
 }
 
-void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch) {
+void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch, ggml_backend_t backend, bool skip_token_upload) {
     auto & stage = sampled_staging[sampled_staging_next];
     sampled_staging_next = (sampled_staging_next + 1) % 2;
     if (stage.in_flight) {
@@ -2608,17 +2633,18 @@ void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatc
     const auto & token_tensors = res->get_inp_token_tensors();
     for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
         if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->buffer ||
-                std::find(token_tensors.begin(), token_tensors.end(), tensor) != token_tensors.end()) {
+                (!skip_token_upload && ggml_backend_buffer_is_host(tensor->buffer)) ||
+                (skip_token_upload && std::find(token_tensors.begin(), token_tensors.end(), tensor) != token_tensors.end())) {
             continue;
         }
         GGML_ASSERT(!tensor->view_src && tensor->buffer && tensor->data);
-        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == sampled_input_backend);
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == backend);
         inputs.push_back({tensor, tensor->buffer, tensor->data, size});
         size = sampled_input_staging_size(size, tensor);
     }
 
     if (!stage.buffer || ggml_backend_buffer_get_size(stage.buffer.get()) < size) {
-        auto * device = ggml_backend_get_device(sampled_input_backend);
+        auto * device = ggml_backend_get_device(backend);
         if (!cparams.decode_boundary_overlap) {
             stage.buffer.reset(ggml_backend_buft_alloc_buffer(ggml_backend_dev_host_buffer_type(device), std::max<size_t>(size, 64)));
             if (!stage.buffer) {
@@ -2645,7 +2671,7 @@ void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatc
         }
     }
     if (!stage.uploaded) {
-        stage.uploaded.reset(ggml_backend_event_new(ggml_backend_get_device(sampled_input_backend)));
+        stage.uploaded.reset(ggml_backend_event_new(ggml_backend_get_device(backend)));
         if (!stage.uploaded) {
             throw std::runtime_error("failed to allocate sampled input event");
         }
@@ -2664,16 +2690,16 @@ void llama_context::set_sampled_inputs(llm_graph_result * res, const llama_ubatc
         }
     };
     try {
-        res->set_inputs(&ubatch, true);
+        res->set_inputs(&ubatch, skip_token_upload);
     } catch (...) {
         restore();
         throw;
     }
     restore();
     for (const auto & input : inputs) {
-        ggml_backend_tensor_set_async(sampled_input_backend, input.tensor, base + input.offset, 0, ggml_nbytes(input.tensor));
+        ggml_backend_tensor_set_async(backend, input.tensor, base + input.offset, 0, ggml_nbytes(input.tensor));
     }
-    ggml_backend_event_record(stage.uploaded.get(), sampled_input_backend);
+    ggml_backend_event_record(stage.uploaded.get(), backend);
     stage.in_flight = true;
 }
 
@@ -2779,7 +2805,7 @@ llm_graph_result * llama_context::process_ubatch(
         acquire_shared_workspace();
         if (use_sampled_input) {
             if (use_sampled_input_async) {
-                set_sampled_inputs(res, ubatch);
+                set_sampled_inputs(res, ubatch, sampled_input_backend);
             } else {
                 res->set_inputs(&ubatch, true);
             }
@@ -2802,7 +2828,21 @@ llm_graph_result * llama_context::process_ubatch(
                 }
             }
         } else {
-            res->set_inputs(&ubatch);
+            auto * backend = mtp_input_backend();
+            bool stage_mtp = backend != nullptr;
+            bool has_device_inputs = false;
+            for (auto * tensor = ggml_get_first_tensor(res->get_ctx()); stage_mtp && tensor; tensor = ggml_get_next_tensor(res->get_ctx(), tensor)) {
+                if (!(tensor->flags & GGML_TENSOR_FLAG_INPUT) || !tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer)) {
+                    continue;
+                }
+                stage_mtp = !tensor->view_src && tensor->data && ggml_backend_sched_get_tensor_backend(sched.get(), tensor) == backend;
+                has_device_inputs = true;
+            }
+            if (stage_mtp && has_device_inputs) {
+                set_sampled_inputs(res, ubatch, backend, false);
+            } else {
+                res->set_inputs(&ubatch);
+            }
         }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);

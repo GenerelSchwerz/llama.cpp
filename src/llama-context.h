@@ -336,12 +336,13 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
+    ggml_backend_t mtp_input_backend();
     void place_sampled_inputs(llm_graph_result * res);
     void            refresh_moe_layer_owners();
     void            place_moe_regions(llm_graph_result * res);
     bool            moe_graph_supports_required_grouped(ggml_cgraph * gf) const;
     void finish_compute(int64_t n_tokens, int64_t elapsed_us);
-    void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch);
+    void set_sampled_inputs(llm_graph_result * res, const llama_ubatch & ubatch, ggml_backend_t backend, bool skip_token_upload = true);
     void reset_sched_workspace();
     llama_context * shared_workspace_peer() const;
     void acquire_shared_workspace();
@@ -464,6 +465,8 @@ private:
     std::vector<ggml_tensor *> sampled_input_by_seq;
     std::vector<std::pair<llama_seq_id, llama_pos>> sampled_output_positions;
     ggml_backend_t sampled_input_backend = nullptr;
+    ggml_backend_t mtp_staging_backend = nullptr;
+    bool mtp_staging_checked = false;
     bool use_sampled_input = false;
     bool use_sampled_input_async = false;
     uint64_t compute_sync_generation = 0;
