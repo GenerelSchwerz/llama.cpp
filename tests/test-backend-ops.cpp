@@ -4978,9 +4978,10 @@ struct test_mul_mat : public test_case {
     const bool src_overlap; // a and b are overlapping views of the same tensor
     const int64_t m_v; // rows of a in memory, the batches of a are strided for m_v > m, no view for m_v == 0
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
+    const int norm_mode;
 
     std::string vars() override {
-        return VARS_TO_STR13(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad);
+        return VARS_TO_STR14(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad, norm_mode);
     }
 
     double max_nmse_err() override {
@@ -5011,8 +5012,8 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0, int norm_mode = 0)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), norm_mode(norm_mode) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5084,6 +5085,19 @@ struct test_mul_mat : public test_case {
             }
             ggml_set_name(a, "a");
             ggml_set_name(b, "b");
+        }
+
+        if (norm_mode) {
+            b = ggml_rms_norm(ctx, b, 1e-5f);
+            if (norm_mode == 2 || norm_mode == 3) {
+                b = ggml_mul(ctx, b, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+                if (norm_mode == 3) {
+                    b = ggml_add(ctx, b, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k));
+                }
+            } else if (norm_mode == 4) {
+                b = ggml_scale(ctx, b, 0.75f);
+            }
+            ggml_set_output(b);
         }
 
         ggml_tensor * out = ggml_mul_mat(ctx, a, b);
@@ -9201,6 +9215,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (std::array<int64_t, 2> nr : {std::array<int64_t, 2>{1, 1}, {2, 1}}) {
                 test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, 32, 257, bs, nr, {0, 1, 2, 3}, 0, 3));
             }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int norm_mode : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, 32, 257, {2, 2}, {2, 1}, {0, 1, 2, 3}, 0, 3, false, 0, 0, norm_mode));
         }
     }
 

@@ -3660,6 +3660,87 @@ static void ggml_cuda_prepare_cublas_input(ggml_backend_cuda_context & ctx, cons
 }
 
 // try and fuse nodes and return the number of nodes to skip
+struct ggml_cuda_norm_emit_match {
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * mul = nullptr;
+    ggml_tensor * add = nullptr;
+    ggml_tensor * scale = nullptr;
+    ggml_tensor * dst = nullptr;
+    int last = -1;
+    int f16 = -1;
+    int bf16 = -1;
+};
+
+static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, int i, int device) {
+    ggml_tensor * norm = graph->nodes[i];
+    if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
+            !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
+    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS}, {}) ||
+            ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE}, {})) { return {}; }
+    ggml_cuda_norm_emit_match match;
+    match.norm = match.dst = norm;
+    match.last = i;
+    if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD}, {})) {
+        match.mul = graph->nodes[i + 1]; match.add = match.dst = graph->nodes[i + 2]; match.last = i + 2;
+    } else if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_MUL}, {})) {
+        match.mul = match.dst = graph->nodes[i + 1]; match.last = i + 1;
+    } else if (ggml_cuda_can_fuse(graph, i, {GGML_OP_RMS_NORM, GGML_OP_SCALE}, {})) {
+        match.scale = match.dst = graph->nodes[i + 1]; match.last = i + 1;
+    }
+    const ggml_tensor * weight = match.mul ? (match.mul->src[0] == norm ? match.mul->src[1] : match.mul->src[0]) : nullptr;
+    const ggml_tensor * bias = match.add ? (match.add->src[0] == match.mul ? match.add->src[1] : match.add->src[0]) : nullptr;
+    uintptr_t begin, end;
+    if (!(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_are_same_shape(norm->src[0], norm) || !ggml_are_same_shape(norm, match.dst) ||
+            !ggml_is_contiguous(match.dst) || !ggml_cuda_prepared_range(match.dst, device, begin, end) ||
+            begin % sizeof(float) || (end - begin)/sizeof(float) > INT_MAX) { return {}; }
+    const ggml_tensor * reads[] = {norm->src[0], weight, bias};
+    for (const ggml_tensor * read : reads) {
+        if (!read) { continue; }
+        uintptr_t read_begin, read_end;
+        if (read->type != GGML_TYPE_F32 || read->nb[0] != sizeof(float) || !ggml_cuda_prepared_range(read, device, read_begin, read_end) ||
+                read_begin % sizeof(float) || (read_end - read_begin)/sizeof(float) > INT_MAX ||
+                (begin < read_end && read_begin < end)) { return {}; }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (read->nb[d] % sizeof(float) || read->nb[d]/sizeof(float) > INT64_MAX || read->ne[d] > INT_MAX) { return {}; }
+        }
+    }
+    if (norm->src[0]->ne[2] > 65535 || norm->src[0]->ne[3] > 65535) { return {}; }
+    return match;
+}
+
+static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgraph * graph, int device,
+        const std::vector<int> & keys, ggml_cuda_reuse_plan & reuse) {
+    std::vector<ggml_cuda_norm_emit_match> emits(graph->n_nodes);
+    bool moved = false;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto match = ggml_cuda_match_norm_emit(graph, i, device);
+        if (!match.norm) { continue; }
+        for (size_t g = 0; g < reuse.groups.size(); ++g) {
+            auto & group = reuse.groups[g];
+            const ggml_tensor * input = graph->nodes[group.node]->src[1];
+            const ggml_tensor * root = input->view_src ? input->view_src : input;
+            const int key = keys[group.node];
+            int & target = key == GGML_TYPE_F16 ? match.f16 : match.bf16;
+            if (target >= 0 || (key != GGML_TYPE_F16 && key != GGML_TYPE_BF16) || group.prepare <= match.last ||
+                    root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
+                    input->type != GGML_TYPE_F32 || ggml_nbytes(input) != ggml_nbytes(match.dst)) { continue; }
+            bool immutable = true;
+            for (int j = match.last + 1; j <= group.prepare; ++j) {
+                immutable &= !ggml_cuda_prepared_input_overwritten(graph->nodes[j], input);
+            }
+            if (!immutable) { continue; }
+            target = int(g);
+            group.prepare = i;
+            group.after = true;
+            moved = true;
+        }
+        if (match.f16 >= 0 || match.bf16 >= 0) { emits[i] = match; }
+    }
+    if (moved) { reuse.pack(); }
+    if (reuse.groups.empty()) { return {}; }
+    return emits;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4510,6 +4591,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             }
             ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, input_keys, input_sizes, ggml_cuda_prepared_input_overwritten);
+            std::vector<ggml_cuda_norm_emit_match> norm_emits;
+            if (!disable_reuse && stream_ctx.concurrent_events.empty() && !reuse.groups.empty()) {
+                norm_emits = ggml_cuda_plan_norm_emit(cgraph, cuda_ctx->device, input_keys, reuse);
+            }
             ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> shared_inputs(cuda_ctx->pool(), reuse);
             const auto prepare_group = [&](int group) {
                 if (shared_inputs[group].get()) { return; }
@@ -4589,6 +4674,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 prepare_shared(i, false);
                 if (group >= 0) { prepare_group(group); }
                 const void * prepared_src1 = group >= 0 ? shared_inputs[group].get() : nullptr;
+
+                if (!norm_emits.empty() && norm_emits[i].norm) {
+                    const auto & emit = norm_emits[i];
+                    const auto image = [&](int g) -> void * {
+                        if (g < 0) { return nullptr; }
+                        shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
+                        return shared_inputs[g].get();
+                    };
+                    ggml_cuda_op_rms_norm_emit(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, image(emit.f16), image(emit.bf16));
+                    i = emit.last;
+                    continue;
+                }
 
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
