@@ -2064,16 +2064,30 @@ struct test_unary : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne_a;
     int v; // view (1 : non-contiguous a)
+    const int scale_mode;
+    const bool scale_inplace;
+    ggml_tensor * pre = nullptr;
+    ggml_tensor * unary = nullptr;
+    ggml_tensor * terminal = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override { return scale_mode ? "SCALED_" + std::string(ggml_unary_op_name(op)) : ggml_op_desc(t); }
+    bool run_whole_graph() override { return scale_mode != 0; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (!scale_mode) {
+            return {};
+        }
+        return pre ? std::vector<ggml_tensor *>{pre, unary, terminal} : std::vector<ggml_tensor *>{unary, terminal};
+    }
 
     std::string vars() override {
-        return VARS_TO_STR3(type, ne_a, v);
+        return VARS_TO_STR3(type, ne_a, v) + (scale_mode ? ",scale_mode=" + std::to_string(scale_mode) + ",scale_inplace=" + std::to_string(scale_inplace) : "");
     }
 
     test_unary(ggml_unary_op op,
             ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne_a = {128, 2, 2, 2},
-            int v = 0)
-        : op(op), type(type), ne_a(ne_a), v(v) {}
+            int v = 0, int scale_mode = 0, bool scale_inplace = false)
+        : op(op), type(type), ne_a(ne_a), v(v), scale_mode(scale_mode), scale_inplace(scale_inplace) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const bool grad_supported = op == GGML_UNARY_OP_ABS || op == GGML_UNARY_OP_SGN || op == GGML_UNARY_OP_NEG ||
@@ -2103,10 +2117,14 @@ struct test_unary : public test_case {
             ggml_set_name(a, "a");
         }
 
-        ggml_tensor * out = ggml_unary(ctx, a, op);
-        ggml_set_name(out, "out");
-
-        return out;
+        if (scale_mode & 1) {
+            a = pre = scale_inplace ? ggml_scale_bias_inplace(ctx, a, 0.25f, 0.1234567f) : ggml_scale_bias(ctx, a, 0.25f, 0.1234567f);
+        }
+        unary = scale_inplace ? ggml_unary_inplace(ctx, a, op) : ggml_unary(ctx, a, op);
+        ggml_tensor * result = scale_mode & 2 ? (scale_inplace ? ggml_scale_bias_inplace(ctx, unary, 2.0f, -0.31415f) : ggml_scale_bias(ctx, unary, 2.0f, -0.31415f)) : unary;
+        terminal = result;
+        ggml_set_name(result, "out");
+        return result;
     }
 
     void initialize_tensors(ggml_context * ctx) override {
@@ -9192,6 +9210,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 128, 2, 2, 2 }, v));
                 test_cases.emplace_back(new test_unary((ggml_unary_op) op, type, { 5, 7, 11, 13 }, v));
+            }
+        }
+    }
+
+    for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+        for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_BF16}) {
+            test_cases.emplace_back(new test_unary(op, type, {31, 3, 1, 1}, 0, 3, true));
+            for (int mode : {1, 2, 3}) {
+                test_cases.emplace_back(new test_unary(op, type, {31, 3, 1, 1}, 0, mode));
+                test_cases.emplace_back(new test_unary(op, type, {1025, 2, 2, 1}, 0, mode));
             }
         }
     }
