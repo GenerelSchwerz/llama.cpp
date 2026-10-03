@@ -1563,12 +1563,50 @@ struct ggml_backend_cuda_context {
     }
 };
 
+struct ggml_cuda_gdn_packed_args_host {
+    const ggml_tensor * bias;
+    const ggml_tensor * scale;
+    ggml_tensor * gate;
+    ggml_tensor * beta;
+    int heads_per_group;
+};
+struct ggml_cuda_gdn_packed_args_device {
+    const float * bias;
+    const float * scale;
+    float * beta;
+    uint3 group_width;
+};
+
+static __device__ __forceinline__ uint2 ggml_cuda_gdn_packed_row(uint32_t row, const uint3 group_width) {
+    const uint2 group = fast_div_modulo(row, group_width);
+    const uint32_t lanes = group_width.z / 2;
+    const uint32_t alpha = group.y >= lanes;
+    return make_uint2(group.x*lanes + group.y - (alpha ? lanes : 0), alpha);
+}
+
+static inline ggml_cuda_gdn_packed_args_device ggml_cuda_gdn_packed_args(
+        const ggml_tensor * dst, const ggml_cuda_gdn_packed_args_host & packed) {
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(dst) && dst->ne[0] % 2 == 0);
+    GGML_ASSERT(packed.heads_per_group > 0 && (dst->ne[0] / 2) % packed.heads_per_group == 0);
+    const ggml_tensor * values[] = { packed.bias, packed.scale, packed.gate, packed.beta };
+    for (const ggml_tensor * value : values) {
+        GGML_ASSERT(value && value->type == GGML_TYPE_F32 && ggml_is_contiguous(value));
+    }
+    GGML_ASSERT(ggml_nelements(packed.bias) == dst->ne[0] / 2 && ggml_nelements(packed.scale) == dst->ne[0] / 2);
+    GGML_ASSERT(ggml_nelements(packed.gate) == ggml_nelements(dst) / 2 && ggml_nelements(packed.beta) == ggml_nelements(dst) / 2);
+    return { (const float *) packed.bias->data, (const float *) packed.scale->data, (float *) packed.beta->data, init_fastdiv_values(2*uint64_t(packed.heads_per_group)) };
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
     const ggml_tensor * gate_bias = nullptr;
     const ggml_tensor * x_scale = nullptr;
     const ggml_tensor * gate_scale = nullptr;
+    // Apply softplus/scale to the primary dot and sigmoid to the second dot.
+    const ggml_tensor * post_scale = nullptr;
+    ggml_tensor * second_output = nullptr;
+    const ggml_cuda_gdn_packed_args_host * packed = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1578,8 +1616,12 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    const float * post_scale = nullptr;
+    float * second_output = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    uint32_t x_scale_stride = 0;
+    uint32_t gate_scale_stride = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
