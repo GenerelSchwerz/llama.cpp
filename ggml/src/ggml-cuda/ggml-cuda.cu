@@ -3848,7 +3848,9 @@ static bool ggml_cuda_match_gdn_post(const ggml_cgraph * graph, int i, ggml_cuda
         }
     }
     if (overlap(mul, beta) || overlap(mul, producer) ||
-            (overlap(beta, producer) && beta->data != producer->data)) {
+            (overlap(beta, producer) && beta->data != producer->data) ||
+            (beta_scale && (overlap(mul, beta_input) ||
+                (overlap(beta, beta_input) && beta->data != beta_input->data)))) {
         return false;
     }
     for (const ggml_tensor * read : reads) {
@@ -3900,7 +3902,7 @@ static bool ggml_cuda_match_gdn_post(const ggml_cgraph * graph, int i, ggml_cuda
     return ggml_cuda_gdn_writes_safe(graph, i, last - i + 1, device);
 }
 
-enum class ggml_cuda_gdn_projection { VECTOR, CUBLAS };
+enum class ggml_cuda_gdn_projection { VECTOR, MMF, BF16_ROUNDED, CUBLAS };
 
 struct ggml_cuda_gdn_projection_match {
     const ggml_tensor * beta;
@@ -3911,6 +3913,7 @@ struct ggml_cuda_gdn_projection_match {
     ggml_tensor * gate;
     ggml_tensor * beta_output;
     int count;
+    bool use_mmf;
 };
 
 static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, int device,
@@ -3923,6 +3926,8 @@ static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, in
         return false;
     }
     const bool cublas = kind == ggml_cuda_gdn_projection::CUBLAS;
+    const bool bf16_rounded = kind == ggml_cuda_gdn_projection::BF16_ROUNDED;
+    const bool mmf = kind == ggml_cuda_gdn_projection::MMF;
     const ggml_tensor * alpha = graph->nodes[i];
     const ggml_tensor * alpha_input = alpha;
     const ggml_tensor * alpha_scale = nullptr;
@@ -4035,7 +4040,12 @@ static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, in
     if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
         return false;
     }
-    if (cublas) {
+    // Limit repeated bank scans to two column tiles.
+    if (bf16_rounded && (!fast_bf16_hardware_available(cc) || wa->type != GGML_TYPE_BF16 || x->ne[1] <= 0 || x->ne[1] > 2 * MMVF_MAX_BATCH_SIZE ||
+            wa->ne[0] <= 0 || wa->ne[0] % 2 || wa->nb[0] != sizeof(nv_bfloat16) || x->nb[0] != sizeof(float))) {
+        return false;
+    }
+    if (cublas || bf16_rounded) {
         if (allocated && (!wa->buffer || !wb->buffer)) {
             return false;
         }
@@ -4060,17 +4070,34 @@ static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, in
         }
         const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(cc, wa, x, alpha);
         if ((compute_type != GGML_TYPE_F16 && compute_type != GGML_TYPE_BF16) ||
+                (bf16_rounded && compute_type != GGML_TYPE_BF16) ||
                 compute_type != ggml_cuda_mul_mat_cublas_compute_type(cc, wb, x, beta)) {
             return false;
         }
     } else {
-        if (quantized ? !ggml_cuda_should_use_mmvq(wa->type, cc, x->ne[1]) :
+        if (mmf) {
+            const int warp_size = ggml_cuda_info().devices[device].warp_size;
+            const ggml_tensor * banks[] = { wa, wb };
+            for (const ggml_tensor * bank : banks) {
+                if (ggml_cuda_should_use_mmvf(bank->type, cc, bank->ne, bank->nb, x->ne[1]) ||
+                        !ggml_cuda_should_use_mmf(bank->type, cc, warp_size, bank->ne, bank->nb, x->ne[1], false) ||
+                        bank->nb[1] % (2*sizeof(float)) || bank->ne[1] > INT_MAX/2) {
+                    return false;
+                }
+            }
+            if (x->nb[1] % ((wa->type == GGML_TYPE_F32 ? 2 : 4)*sizeof(float))) {
+                return false;
+            }
+        } else if (quantized ? !ggml_cuda_should_use_mmvq(wa->type, cc, x->ne[1]) :
                 !ggml_cuda_should_use_mmvf(wa->type, cc, wa->ne, wa->nb, x->ne[1])) {
             return false;
         }
+    }
+    if (!cublas) {
         for (int j = 1; j < GGML_MAX_DIMS; ++j) {
             if (x->nb[j] % (quantized ? sizeof(float) : 2 * sizeof(float)) ||
-                    wa->nb[j] % ggml_type_size(wa->type)) {
+                    wa->nb[j] % (bf16_rounded ? 2 * sizeof(nv_bfloat16) : ggml_type_size(wa->type)) ||
+                    (bf16_rounded && (wa->nb[j] / sizeof(nv_bfloat16) > INT_MAX || x->nb[j] / sizeof(float) > INT_MAX))) {
                 return false;
             }
         }
@@ -4088,7 +4115,7 @@ static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, in
         }
     }
     if (match) {
-        *match = { beta, add->src[1], scale, alpha_scale, post.beta_scale, mul, post.beta, count };
+        *match = { beta, add->src[1], scale, alpha_scale, post.beta_scale, mul, post.beta, count, mmf };
     }
     if (!allocated) {
         return true;
@@ -4688,8 +4715,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_cuda_gdn_projection_match projection;
+    bool bf16_rounded = false;
     if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty() &&
-            ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, true, &projection)) {
+            (ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, true, &projection) ||
+             ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::MMF, true, &projection) ||
+             (bf16_rounded = ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::BF16_ROUNDED, true, &projection)))) {
         ggml_cuda_mm_fusion_args_host fusion{};
         fusion.gate = projection.beta->src[0];
         fusion.x_bias = projection.bias;
@@ -4702,8 +4732,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         dst.buffer = projection.gate->buffer;
         if (ggml_is_quantized(node->src[0]->type)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, &fusion);
+        } else if (projection.use_mmf) {
+            ggml_cuda_mul_mat_f(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, nullptr, &fusion);
         } else {
-            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, &fusion);
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, &dst, &fusion, bf16_rounded);
         }
         return projection.count - 1;
     }
@@ -5280,9 +5312,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_cuda_gdn_post_match gdn_post;
     if (node->op == GGML_OP_ADD && cuda_ctx->stream_context().concurrent_events.empty() &&
-            ggml_cuda_match_gdn_post(cgraph, i, gdn_post, cuda_ctx->device)) {
+            (ggml_cuda_match_gdn_post(cgraph, i, gdn_post, cuda_ctx->device) ||
+             ggml_cuda_match_gdn_post(cgraph, i, gdn_post, cuda_ctx->device, false, true))) {
         GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, gdn_post.producer));
-        ggml_cuda_op_gdn_post(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], gdn_post.producer, gdn_post.beta);
+        ggml_tensor * beta_input = gdn_post.producer;
+        if (gdn_post.beta_scale) {
+            beta_input = cgraph->nodes[i + 5];
+            GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, beta_input));
+        }
+        ggml_cuda_op_gdn_post(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], beta_input, gdn_post.beta);
         return gdn_post.count - 1;
     }
 
@@ -5654,7 +5692,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 add_alloc_deps(i, i + packed_projection.count - 1);
             }
             ggml_cuda_gdn_projection_match projection;
-            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, false, &projection)) {
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                    (ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, false, &projection) ||
+                     ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::MMF, false, &projection) ||
+                     ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::BF16_ROUNDED, false, &projection))) {
                 add_alloc_deps(i, i + projection.count - 1);
             }
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
@@ -5667,7 +5708,8 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(packed_post.packed), cgraph->nodes[i + packed_post.count - 1]);
             }
             ggml_cuda_gdn_post_match post;
-            if (cgraph->nodes[i]->op == GGML_OP_ADD && ggml_cuda_match_gdn_post(cgraph, i, post)) {
+            if (cgraph->nodes[i]->op == GGML_OP_ADD &&
+                    (ggml_cuda_match_gdn_post(cgraph, i, post) || ggml_cuda_match_gdn_post(cgraph, i, post, -1, false, true))) {
                 add_alloc_deps(i, i + post.count - 1);
             }
             ggml_cuda_moe_weighted_reduction_match match;
