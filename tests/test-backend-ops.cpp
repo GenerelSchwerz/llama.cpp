@@ -5111,7 +5111,7 @@ struct test_mul_mat : public test_case {
         return out;
     }
 
-    bool run_whole_graph() override { return o > 1; }
+    bool run_whole_graph() override { return o > 1 || norm_mode != 0; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -9221,6 +9221,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int norm_mode : {1, 2, 3, 4}) {
             test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, 32, 257, {2, 2}, {2, 1}, {0, 1, 2, 3}, 0, 3, false, 0, 0, norm_mode));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, 32, 257, {2, 2}, {2, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, norm_mode));
         }
     }
 

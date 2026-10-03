@@ -3709,30 +3709,54 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
 }
 
 static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgraph * graph, int device,
-        const std::vector<int> & keys, ggml_cuda_reuse_plan & reuse) {
+        const std::vector<int> & keys, const std::vector<size_t> & sizes, ggml_cuda_reuse_plan & reuse) {
+    std::unordered_map<const ggml_tensor *, std::vector<int>> readers;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (keys[i] != GGML_TYPE_F16 && keys[i] != GGML_TYPE_BF16) { continue; }
+        const ggml_tensor * input = graph->nodes[i]->src[1];
+        readers[input->view_src ? input->view_src : input].push_back(i);
+    }
+    if (readers.empty()) { return {}; }
     std::vector<ggml_cuda_norm_emit_match> emits(graph->n_nodes);
     bool moved = false;
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_emit(graph, i, device);
         if (!match.norm) { continue; }
+        const auto can_emit = [&](int node, int prepare) {
+            const ggml_tensor * input = graph->nodes[node]->src[1];
+            const ggml_tensor * root = input->view_src ? input->view_src : input;
+            if (prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
+                    input->type != GGML_TYPE_F32 || ggml_nbytes(input) != ggml_nbytes(match.dst)) { return false; }
+            for (int j = match.last + 1; j <= prepare; ++j) {
+                if (ggml_cuda_prepared_input_overwritten(graph->nodes[j], input)) { return false; }
+            }
+            return true;
+        };
         for (size_t g = 0; g < reuse.groups.size(); ++g) {
             auto & group = reuse.groups[g];
-            const ggml_tensor * input = graph->nodes[group.node]->src[1];
-            const ggml_tensor * root = input->view_src ? input->view_src : input;
             const int key = keys[group.node];
             int & target = key == GGML_TYPE_F16 ? match.f16 : match.bf16;
-            if (target >= 0 || (key != GGML_TYPE_F16 && key != GGML_TYPE_BF16) || group.prepare <= match.last ||
-                    root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
-                    input->type != GGML_TYPE_F32 || ggml_nbytes(input) != ggml_nbytes(match.dst)) { continue; }
-            bool immutable = true;
-            for (int j = match.last + 1; j <= group.prepare; ++j) {
-                immutable &= !ggml_cuda_prepared_input_overwritten(graph->nodes[j], input);
-            }
-            if (!immutable) { continue; }
+            if (target >= 0 || (key != GGML_TYPE_F16 && key != GGML_TYPE_BF16) || !can_emit(group.node, group.prepare)) { continue; }
             target = int(g);
             group.prepare = i;
             group.after = true;
             moved = true;
+        }
+        const auto found = readers.find(match.dst);
+        if (found != readers.end()) {
+            for (const int node : found->second) {
+                int & target = keys[node] == GGML_TYPE_F16 ? match.f16 : match.bf16;
+                if (target >= 0 || (!reuse.nodes.empty() && reuse.nodes[node] >= 0) ||
+                        sizes[node] > SIZE_MAX - 255 || !can_emit(node, node)) { continue; }
+                if (reuse.nodes.empty()) {
+                    reuse.nodes.assign(graph->n_nodes, -1);
+                    reuse.starts.assign(graph->n_nodes, -1);
+                }
+                target = int(reuse.groups.size());
+                reuse.groups.push_back({node, i, node, -1, true, GGML_PAD(sizes[node], 256)});
+                reuse.nodes[node] = target;
+                moved = true;
+            }
         }
         if (match.f16 >= 0 || match.bf16 >= 0) { emits[i] = match; }
     }
@@ -4592,8 +4616,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             }
             ggml_cuda_reuse_plan reuse(cgraph, stream_ctx, input_keys, input_sizes, ggml_cuda_prepared_input_overwritten);
             std::vector<ggml_cuda_norm_emit_match> norm_emits;
-            if (!disable_reuse && stream_ctx.concurrent_events.empty() && !reuse.groups.empty()) {
-                norm_emits = ggml_cuda_plan_norm_emit(cgraph, cuda_ctx->device, input_keys, reuse);
+            if (!disable_reuse && stream_ctx.concurrent_events.empty()) {
+                norm_emits = ggml_cuda_plan_norm_emit(cgraph, cuda_ctx->device, input_keys, input_sizes, reuse);
             }
             ggml_cuda_reuse_inputs<ggml_cuda_pool_alloc<char>> shared_inputs(cuda_ctx->pool(), reuse);
             const auto prepare_group = [&](int group) {
