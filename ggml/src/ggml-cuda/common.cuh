@@ -1585,6 +1585,8 @@ struct ggml_cuda_mm_fusion_args_device {
     float * second_output = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    uint32_t x_scale_stride = 0;
+    uint32_t gate_scale_stride = 0;
 };
 
 struct ggml_cuda_kernel_launch_params {
