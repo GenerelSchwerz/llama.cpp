@@ -4012,7 +4012,7 @@ static bool ggml_cuda_match_gdn_projections(const ggml_cgraph * graph, int i, in
         if (!bank_scale) {
             continue;
         }
-        if (cublas || !quantized || bank_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(bank_scale) ||
+        if (cublas || bank_scale->type != GGML_TYPE_F32 || !ggml_is_contiguous(bank_scale) ||
                 (bank_scale->ne[0] != 1 && bank_scale->ne[0] != alpha->ne[0]) || bank_scale->ne[1] != 1 ||
                 bank_scale->ne[2] != 1 || bank_scale->ne[3] != 1 || !ggml_can_repeat(bank_scale, alpha)) {
             return false;

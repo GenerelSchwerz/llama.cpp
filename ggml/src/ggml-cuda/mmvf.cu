@@ -364,6 +364,11 @@ static __global__ void mul_mat_vec_f(
 
 
     if constexpr (has_fusion) {
+        if constexpr (gdn_post_op) {
+            if (fusion.x_scale) {
+                value = __fmul_rn(value, ((const float *) fusion.x_scale)[row * fusion.x_scale_stride]);
+            }
+        }
         if (use_bias) {
             if constexpr (gdn_post_op) {
                 value += x_bias[row];
@@ -373,8 +378,12 @@ static __global__ void mul_mat_vec_f(
         }
 
         if constexpr (gdn_post_op) {
+            float gate_value = sumf_gate[tid];
+            if (fusion.gate_scale) {
+                gate_value = __fmul_rn(gate_value, ((const float *) fusion.gate_scale)[row * fusion.gate_scale_stride]);
+            }
             fusion.second_output[int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst +
-                tid*stride_col_dst + row] = ggml_cuda_op_sigmoid_single(sumf_gate[tid]);
+                tid*stride_col_dst + row] = ggml_cuda_op_sigmoid_single(gate_value);
             value = ggml_cuda_op_softplus_single(value) * fusion.post_scale[row];
         } else if (use_gate) {
             float gate_value = sumf_gate[tid];
@@ -738,7 +747,20 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(ne1 == src1->ne[1] && ne2 == src1->ne[2] && ne3 == src1->ne[3]);
             GGML_ASSERT(ggml_is_contiguous(dst));
             GGML_ASSERT(fusion->gate && fusion->x_bias && fusion->post_scale && !fusion->gate_bias);
-            GGML_ASSERT(!fusion->x_scale && !fusion->gate_scale);
+            if (fusion->x_scale) {
+                GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->x_scale));
+                GGML_ASSERT(fusion->x_scale->ne[0] == 1 || fusion->x_scale->ne[0] == ne0);
+                GGML_ASSERT(fusion->x_scale->ne[1] == 1 && fusion->x_scale->ne[2] == 1 && fusion->x_scale->ne[3] == 1);
+                fusion_local.x_scale = fusion->x_scale->data;
+                fusion_local.x_scale_stride = fusion->x_scale->ne[0] == 1 ? 0 : 1;
+            }
+            if (fusion->gate_scale) {
+                GGML_ASSERT(fusion->gate_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->gate_scale));
+                GGML_ASSERT(fusion->gate_scale->ne[0] == 1 || fusion->gate_scale->ne[0] == ne0);
+                GGML_ASSERT(fusion->gate_scale->ne[1] == 1 && fusion->gate_scale->ne[2] == 1 && fusion->gate_scale->ne[3] == 1);
+                fusion_local.gate_scale = fusion->gate_scale->data;
+                fusion_local.gate_scale_stride = fusion->gate_scale->ne[0] == 1 ? 0 : 1;
+            }
             GGML_ASSERT(ggml_are_same_shape(fusion->gate, src0));
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->x_bias));
             GGML_ASSERT(ggml_nelements(fusion->x_bias) == ne0);
