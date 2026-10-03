@@ -4979,8 +4979,14 @@ struct test_mul_mat : public test_case {
     const int64_t m_v; // rows of a in memory, the batches of a are strided for m_v > m, no view for m_v == 0
     const int64_t pad; // bytes after the m_v rows of each batch of a, so nb[2] of a is not a multiple of nb[1]
 
+    const ggml_unary_op post_op;
+    const bool scaled;
+    std::vector<ggml_tensor *> post_nodes;
+
     std::string vars() override {
-        return VARS_TO_STR13(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad);
+        std::string result = VARS_TO_STR13(type_a, type_b, m, n, k, bs, nr, per, k_v, o, src_overlap, m_v, pad);
+        if (post_op != GGML_UNARY_OP_COUNT) result += ",post_op=" + std::string(ggml_unary_op_name(post_op)) + "," + VAR_TO_STR(scaled);
+        return result;
     }
 
     double max_nmse_err() override {
@@ -5011,8 +5017,9 @@ struct test_mul_mat : public test_case {
             std::array<int64_t, 2> bs = {10, 10},
             std::array<int64_t, 2> nr = {2, 2},
             std::array<int64_t, 4> per = {0, 1, 2, 3},
-            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0)
-        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad) {}
+            int64_t k_v = 0, uint32_t o = 1, bool src_overlap = false, int64_t m_v = 0, int64_t pad = 0,
+            ggml_unary_op post_op = GGML_UNARY_OP_COUNT, bool scaled = false)
+        : type_a(type_a), type_b(type_b), m(m), n(n), k(k), bs(bs), nr(nr), per(per), k_v(k_v), o(o), src_overlap(src_overlap), m_v(m_v), pad(pad), post_op(post_op), scaled(scaled) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
@@ -5094,10 +5101,19 @@ struct test_mul_mat : public test_case {
             out = ggml_add(ctx, out, out2);
         }
 
+        post_nodes.clear();
+        if (post_op != GGML_UNARY_OP_COUNT) {
+            auto retain = [&](ggml_tensor * tensor) { ggml_set_output(tensor); post_nodes.push_back(tensor); return tensor; };
+            retain(out);
+            if (scaled) out = retain(ggml_scale_bias(ctx, out, 0.25f, 0.125f));
+            out = retain(ggml_unary(ctx, out, post_op));
+            if (scaled) out = retain(ggml_scale_bias(ctx, out, 2.0f, -0.0625f));
+        }
         return out;
     }
 
-    bool run_whole_graph() override { return o > 1; }
+    bool run_whole_graph() override { return o > 1 || post_op != GGML_UNARY_OP_COUNT; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return post_nodes; }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -11199,6 +11215,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (ggml_unary_op post_op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+            for (bool scaled : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 7, type == GGML_TYPE_F32 ? 3 : 1, 66,
+                    {2, 1}, {2, 3}, {0, 1, 2, 3}, 72, 1, false, 0, 0, post_op, scaled));
+            }
+        }
+    }
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
