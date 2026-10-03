@@ -3339,6 +3339,7 @@ struct ggml_cuda_gdn_packed_match {
     ggml_tensor * beta;
     int64_t heads_per_group;
     int count;
+    bool use_mmf = false;
 };
 
 static bool ggml_cuda_match_gdn_packed(const ggml_cgraph * graph, int i, ggml_cuda_gdn_packed_match & match, int device = -1) {
@@ -3635,9 +3636,7 @@ static bool ggml_cuda_match_gdn_packed_projection(const ggml_cgraph * graph, int
         }
     }
     if (x->ne[2] > 65535 || x->ne[3] > 65535 || (quantized && x->ne[2] > 65535 / x->ne[3]) ||
-            bank->ne[2] > x->ne[2] || x->ne[2] % bank->ne[2] || bank->ne[3] > x->ne[3] || x->ne[3] % bank->ne[3] ||
-            (quantized ? !ggml_cuda_should_use_mmvq(bank->type, cc, x->ne[1]) :
-                !ggml_cuda_should_use_mmvf(bank->type, cc, bank->ne, bank->nb, x->ne[1]))) {
+            bank->ne[2] > x->ne[2] || x->ne[2] % bank->ne[2] || bank->ne[3] > x->ne[3] || x->ne[3] % bank->ne[3]) {
         return false;
     }
     const size_t alignment = quantized ? (ggml_type_size(bank->type) % sizeof(uint32_t) ?
@@ -3647,7 +3646,15 @@ static bool ggml_cuda_match_gdn_packed_projection(const ggml_cgraph * graph, int
             return false;
         }
     }
+    const bool vector = quantized ? ggml_cuda_should_use_mmvq(bank->type, cc, x->ne[1]) :
+        ggml_cuda_should_use_mmvf(bank->type, cc, bank->ne, bank->nb, x->ne[1]);
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+    const bool mmf = !quantized && !vector && ggml_cuda_should_use_mmf(bank->type, cc, warp_size, bank->ne, bank->nb, x->ne[1], false);
+    if ((!vector && !mmf) || (mmf && (bank->nb[1] % (2 * sizeof(float)) || x->nb[1] % ((bank->type == GGML_TYPE_F32 ? 2 : 4) * sizeof(float))))) {
+        return false;
+    }
     match.count = count;
+    match.use_mmf = mmf;
     if (!allocated) {
         return true;
     }
@@ -4672,6 +4679,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         fusion.packed = &packed;
         if (ggml_is_quantized(node->src[0]->type)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion);
+        } else if (packed_projection.use_mmf) {
+            ggml_cuda_mul_mat_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &packed);
         } else {
             ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion);
         }
