@@ -96,6 +96,9 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 void ggml_cuda_op_gdn_post(ggml_backend_cuda_context & ctx, ggml_tensor * add, ggml_tensor * unary,
         ggml_tensor * mul, ggml_tensor * beta_input, ggml_tensor * beta);
 
+void ggml_cuda_op_gdn_packed_post(ggml_backend_cuda_context & ctx, const ggml_tensor * packed, const ggml_tensor * bias,
+        const ggml_tensor * scale, ggml_tensor * gate, ggml_tensor * beta, int64_t lanes);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {

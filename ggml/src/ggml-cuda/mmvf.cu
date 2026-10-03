@@ -4,7 +4,7 @@
 #include "mmvf.cuh"
 #include "convert.cuh"
 
-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false, bool gdn_post_op = false>
 static __global__ void mul_mat_vec_f(
         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
@@ -86,7 +86,7 @@ static __global__ void mul_mat_vec_f(
         gate_x += int64_t(sample_x)  *stride_sample_x   + channel_x  *stride_channel_x   + row*stride_row;
     }
 
-    if constexpr (has_fusion) {
+    if constexpr (has_fusion && !gdn_post_op) {
         const int channel_bias = ids ? channel_x : channel_dst;
         if (use_bias) {
             x_bias += int64_t(sample_dst)*stride_sample_dst + channel_bias*stride_channel_dst;
@@ -348,11 +348,16 @@ static __global__ void mul_mat_vec_f(
 
     if constexpr (has_fusion) {
         if (use_bias) {
-            value += x_bias[tid*stride_col_dst + row];
+            if constexpr (gdn_post_op) {
+                value += x_bias[row];
+            } else {
+                value += x_bias[tid*stride_col_dst + row];
+            }
         }
 
-        if (use_gate && fusion.second_output) {
-            fusion.second_output[row] = ggml_cuda_op_sigmoid_single(sumf_gate[tid]);
+        if constexpr (gdn_post_op) {
+            fusion.second_output[int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst +
+                tid*stride_col_dst + row] = ggml_cuda_op_sigmoid_single(sumf_gate[tid]);
             value = ggml_cuda_op_softplus_single(value) * fusion.post_scale[row];
         } else if (use_gate) {
             float gate_value = sumf_gate[tid];
@@ -398,6 +403,17 @@ static void mul_mat_vec_f_switch_fusion(
     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, nbytes_shared, stream};
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+    if constexpr (!is_multi_token_id) {
+        if (fusion.second_output) {
+            GGML_ASSERT(has_fusion && !ids);
+            ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, false, true>, launch_params,
+                x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+    GGML_ASSERT(!fusion.second_output);
     if constexpr (ncols_dst == 1) {
         if (has_fusion) {
             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
@@ -665,7 +681,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     if (fusion) {
         GGML_ASSERT( !ids || dst->ne[2] == 1);
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || fusion->second_output);
         if (fusion->x_bias) {
             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
@@ -683,7 +699,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             fusion_local.gate_bias = fusion->gate_bias->data;
         }
         if (fusion->second_output) {
-            GGML_ASSERT(!ids && ne1 == 1 && ne2 == 1 && ne3 == 1);
+            GGML_ASSERT(!ids && ne1 > 0 && ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne1));
+            GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+            GGML_ASSERT(ne1 == src1->ne[1] && ne2 == src1->ne[2] && ne3 == src1->ne[3]);
+            GGML_ASSERT(ggml_is_contiguous(dst));
             GGML_ASSERT(fusion->gate && fusion->x_bias && fusion->post_scale && !fusion->gate_bias);
             GGML_ASSERT(!fusion->x_scale && !fusion->gate_scale);
             GGML_ASSERT(ggml_are_same_shape(fusion->gate, src0));
@@ -692,7 +711,7 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
             GGML_ASSERT(fusion->post_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->post_scale));
             GGML_ASSERT(ggml_nelements(fusion->post_scale) == ne0);
             GGML_ASSERT(fusion->second_output->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->second_output));
-            GGML_ASSERT(ggml_nelements(fusion->second_output) == ne0);
+            GGML_ASSERT(ggml_nelements(fusion->second_output) == ggml_nelements(dst));
             fusion_local.post_scale = (const float *) fusion->post_scale->data;
             fusion_local.second_output = (float *) fusion->second_output->data;
         } else {

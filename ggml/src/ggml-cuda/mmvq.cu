@@ -681,10 +681,18 @@ static __global__ void mul_mat_vec_q(
         if (threadIdx.x < rows_per_cuda_block && threadIdx.y == 0 &&
             (rows_per_cuda_block == 1 || uint32_t(row0 + threadIdx.x) < stride_col_dst)) {
             if (use_bias) {
-                x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
+                if constexpr (gdn_post_op) {
+                    x_bias += row0;
+                } else {
+                    x_bias = x_bias + sample_dst * stride_sample_dst + channel_bias * stride_channel_dst + row0;
+                }
 #pragma unroll
                 for (int j = 0; j < ncols_dst; ++j) {
-                    x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                    if constexpr (gdn_post_op) {
+                        x_biases[j] = x_bias[threadIdx.x];
+                    } else {
+                        x_biases[j] = x_bias[j * stride_col_dst + threadIdx.x];
+                    }
                 }
             }
             if (use_gate_bias) {
@@ -807,7 +815,8 @@ static __global__ void mul_mat_vec_q(
                     }
                     result += x_biases[j];
                     if constexpr (gdn_post_op) {
-                        fusion.second_output[row0 + i] = ggml_cuda_op_sigmoid_single(tmp_gate[j][i]);
+                        fusion.second_output[sample_dst * stride_sample_dst + channel_dst * stride_channel_dst +
+                            j * stride_col_dst + row0 + i] = ggml_cuda_op_sigmoid_single(tmp_gate[j][i]);
                         result = ggml_cuda_op_softplus_single(result) * fusion.post_scale[row0 + i];
                     } else if (use_gate) {
                         float gate_value = tmp_gate[j][i];
@@ -1022,19 +1031,21 @@ static void mul_mat_vec_q_switch_fusion(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+    if constexpr (type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) {
+        if (fusion.second_output) {
+            GGML_ASSERT(has_fusion && !ids);
+            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, true>, launch_params,
+                vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
+            return;
+        }
+    }
+    GGML_ASSERT(!fusion.second_output);
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            if constexpr (type != GGML_TYPE_MXFP4 && type != GGML_TYPE_NVFP4) {
-                if (fusion.second_output) {
-                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, true>, launch_params,
-                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
-                        channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
-                        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
-                    return;
-                }
-            }
-            GGML_ASSERT(!fusion.second_output);
             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -1462,7 +1473,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || fusion->second_output);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1497,8 +1508,10 @@ void ggml_cuda_mul_mat_vec_q(
         }
         if (fusion->second_output) {
             GGML_ASSERT(ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_MXFP4 && src0->type != GGML_TYPE_NVFP4);
-            GGML_ASSERT(!ids && ne1 == 1 && ne2 == 1 && ne3 == 1);
-            GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
+            GGML_ASSERT(!ids && ne1 > 0 && ggml_cuda_should_use_mmvq(src0->type, cc, ne1));
+            GGML_ASSERT(ggml_is_contiguous(dst));
+            GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
+            GGML_ASSERT(ne1 == src1->ne[1] && ne2 == src1->ne[2] && ne3 == src1->ne[3]);
             GGML_ASSERT(fusion->gate && fusion->x_bias && fusion->post_scale && !fusion->gate_bias);
             GGML_ASSERT(!fusion->x_scale && !fusion->gate_scale);
             GGML_ASSERT(ggml_are_same_shape(fusion->gate, src0));
@@ -1507,7 +1520,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->post_scale->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->post_scale));
             GGML_ASSERT(ggml_nelements(fusion->post_scale) == ne0);
             GGML_ASSERT(fusion->second_output->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->second_output));
-            GGML_ASSERT(ggml_nelements(fusion->second_output) == ne0);
+            GGML_ASSERT(ggml_nelements(fusion->second_output) == ggml_nelements(dst));
             fusion_local.post_scale = (const float *) fusion->post_scale->data;
             fusion_local.second_output = (float *) fusion->second_output->data;
         } else {

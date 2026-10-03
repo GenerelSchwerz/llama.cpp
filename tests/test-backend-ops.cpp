@@ -7340,8 +7340,8 @@ struct test_gdn_ab_fusion : test_mul_mat_vec_fusion {
     ggml_tensor * alpha = nullptr;
     ggml_tensor * beta = nullptr;
 
-    test_gdn_ab_fusion(ggml_type type, int64_t tokens, int packed_groups = 0)
-        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, 16, 256, false, 1, 1, false, false, true, false, {1, 1}),
+    test_gdn_ab_fusion(ggml_type type, int64_t tokens, int packed_groups = 0, int64_t heads = 16, int64_t width = 256)
+        : test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, tokens, heads, width, false, 1, 1, false, false, true, false, {1, 1}),
           packed_groups(packed_groups) {}
 
     std::string vars() override { return test_mul_mat_vec_fusion::vars() + "," + VAR_TO_STR(packed_groups); }
@@ -11247,6 +11247,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q8_0, 1));
     test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_BF16, 4));
     test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_F32, 4, 2));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q4_0, 4));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q8_0, 8));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_F32, 3, 0, 48, 2560));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_BF16, 64, 0, 48, 2560));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_F16, 9, 0, 48, 2560));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_F32, 4, 1, 5));
+    test_cases.emplace_back(new test_gdn_ab_fusion(GGML_TYPE_Q4_0, 33, 2, 6));
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {

@@ -762,6 +762,29 @@ void ggml_cuda_op_gdn_post(ggml_backend_cuda_context & ctx, ggml_tensor * add, g
         (const float *) beta_input->data, (float *) mul->data, (float *) beta->data, count);
 }
 
+static __global__ void gdn_packed_post_f32(const float * packed, const float * bias, const float * scale,
+        float * gate, float * beta, int64_t heads, int64_t lanes, int64_t count) {
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x; i < count; i += int64_t(blockDim.x) * gridDim.x) {
+        const int64_t head = i % heads;
+        const int64_t offset = (i / heads) * (2 * heads) + (head / lanes) * (2 * lanes) + head % lanes;
+        const float value = op_softplus(packed[offset + lanes] + bias[head]);
+        const float beta_value = op_sigmoid(packed[offset]);
+        gate[i] = value * scale[head];
+        beta[i] = beta_value;
+    }
+}
+
+void ggml_cuda_op_gdn_packed_post(ggml_backend_cuda_context & ctx, const ggml_tensor * packed, const ggml_tensor * bias,
+        const ggml_tensor * scale, ggml_tensor * gate, ggml_tensor * beta, int64_t lanes) {
+    const int64_t count = ggml_nelements(gate);
+    const dim3 blocks(std::min<int64_t>((count + 255) / 256, 65535));
+    const ggml_cuda_kernel_launch_params params = { blocks, dim3(256, 1, 1), 0, ctx.stream() };
+    ggml_cuda_kernel_launch(gdn_packed_post_f32, params, (const float *) packed->data, (const float *) bias->data,
+        (const float *) scale->data, (float *) gate->data, (float *) beta->data, packed->ne[0] / 2, lanes, count);
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
