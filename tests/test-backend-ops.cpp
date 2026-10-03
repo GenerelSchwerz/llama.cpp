@@ -9196,6 +9196,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (std::array<int64_t, 2> bs : {std::array<int64_t, 2>{1, 1}, {2, 2}}) {
+            for (std::array<int64_t, 2> nr : {std::array<int64_t, 2>{1, 1}, {2, 1}}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 33, 32, 257, bs, nr, {0, 1, 2, 3}, 0, 3));
+            }
+        }
+    }
+
     // fused relu + sqr (squared ReLU)
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         test_cases.emplace_back(new test_relu_sqr(type, { 128, 2, 2, 2 }));
