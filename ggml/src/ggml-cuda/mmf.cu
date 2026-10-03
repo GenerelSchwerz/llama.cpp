@@ -1,6 +1,8 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "mmvf.cuh"
+#include "unary.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -10,7 +12,8 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     }
 }
 
-void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+template <bool two_banks>
+static void ggml_cuda_mul_mat_f_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst, const ggml_tensor * src0_second = nullptr, const ggml_tensor * dst_second = nullptr) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
@@ -99,35 +102,40 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int device    = ggml_cuda_get_device();
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
+    const int64_t nrows_x = two_banks ? 2*ne01 : ne01;
 
     switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
             constexpr int vals_per_T = 1;
-            mul_mat_f_switch_rows_per_block<float>(
-                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
+            mul_mat_f_switch_rows_per_block<float, two_banks>(
+                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, nrows_x, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, (decltype(src0_d)) (two_banks ? src0_second->data : nullptr), two_banks ? ne01 : 0, two_banks ? (float *) dst_second->data : nullptr);
         } break;
         case GGML_TYPE_F16: {
             const half2 * src0_d = (const half2 *) src0->data;
             constexpr int vals_per_T = 2;
-            mul_mat_f_switch_rows_per_block<half2>(
-                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
+            mul_mat_f_switch_rows_per_block<half2, two_banks>(
+                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, nrows_x, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, (decltype(src0_d)) (two_banks ? src0_second->data : nullptr), two_banks ? ne01 : 0, two_banks ? (float *) dst_second->data : nullptr);
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
             constexpr int vals_per_T = 2;
-            mul_mat_f_switch_rows_per_block<nv_bfloat162>(
-                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
+            mul_mat_f_switch_rows_per_block<nv_bfloat162, two_banks>(
+                rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, nrows_x, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, (decltype(src0_d)) (two_banks ? src0_second->data : nullptr), two_banks ? ne01 : 0, two_banks ? (float *) dst_second->data : nullptr);
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));
     }
+}
+
+void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_f_impl<false>(ctx, src0, src1, ids, dst);
 }
 
 bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * src0_ne,
@@ -188,4 +196,89 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
         default:
             return false;
     }
+}
+
+bool ggml_cuda_should_pair_mmf_id(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu, const int device) {
+    if (!up || !gate || !glu || up->op != GGML_OP_MUL_MAT_ID || gate->op != GGML_OP_MUL_MAT_ID || glu->op != GGML_OP_GLU ||
+            !up->src[0] || !gate->src[0] || !up->src[1] || !up->src[2] ||
+            up->src[1] != gate->src[1] || up->src[2] != gate->src[2] ||
+            glu->src[0] != gate || glu->src[1] != up || ggml_get_op_params_i32(glu, 1) != 0 ||
+            memcmp(up->op_params, gate->op_params, sizeof(up->op_params)) != 0 || ggml_get_op_params_i32(up, 3) == GGML_PREC_F32) {
+        return false;
+    }
+    switch (ggml_get_glu_op(glu)) {
+        case GGML_GLU_OP_SWIGLU:
+        case GGML_GLU_OP_GEGLU:
+        case GGML_GLU_OP_REGLU:
+            break;
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            if (!std::isfinite(ggml_get_op_params_f32(glu, 3)) || ggml_get_op_params_f32(glu, 3) <= 0.0f) {
+                return false;
+            }
+            break;
+        default:
+            return false;
+    }
+    const ggml_tensor * weight = up->src[0];
+    const ggml_tensor * input  = up->src[1];
+    const ggml_tensor * ids    = up->src[2];
+    if ((weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_F16 && weight->type != GGML_TYPE_BF16) ||
+            weight->type != gate->src[0]->type || input->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
+            !ggml_are_same_shape(weight, gate->src[0]) || !ggml_are_same_stride(weight, gate->src[0])) {
+        return false;
+    }
+    const ggml_tensor * tensors[] = { weight, gate->src[0], input, ids, up, gate, glu };
+    for (const ggml_tensor * tensor : tensors) {
+        const size_t ts = ggml_type_size(tensor->type);
+        size_t span = ts;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0 || tensor->ne[d] > INT_MAX || tensor->nb[d] == 0 || tensor->nb[d] % ts != 0 || tensor->nb[d]/ts > INT_MAX ||
+                    (size_t) (tensor->ne[d] - 1) > (SIZE_MAX - span)/tensor->nb[d]) {
+                return false;
+            }
+            span += (tensor->ne[d] - 1)*tensor->nb[d];
+        }
+        if (span/ts > INT_MAX) {
+            return false;
+        }
+    }
+    const size_t ts = ggml_type_size(weight->type);
+    const int vals_per_T = weight->type == GGML_TYPE_F32 ? 1 : 2;
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if ((GGML_CUDA_CC_IS_AMD(cc) && input->ne[2] <= MMVF_MAX_BATCH_SIZE) ||
+            !ggml_cuda_should_use_mmf(weight->type, cc, WARP_SIZE, weight->ne, weight->nb, input->ne[2], true) ||
+            !ggml_cuda_should_use_mmf(weight->type, cc, ggml_cuda_info().devices[device].warp_size, weight->ne, weight->nb, input->ne[2], true) ||
+            weight->nb[1] % (2*ts*vals_per_T) != 0 || input->nb[1] % (2*sizeof(float)) != 0 ||
+            input->nb[2] % (2*sizeof(float)*vals_per_T) != 0 || input->nb[2] % input->nb[1] != 0 ||
+            weight->ne[0] != input->ne[0] || weight->ne[3] != 1 || input->ne[3] != 1 ||
+            ids->ne[2] != 1 || ids->ne[3] != 1 || ids->ne[1] != input->ne[2] || ids->ne[0] > weight->ne[2] ||
+            (input->ne[1] != 1 && input->ne[1] != ids->ne[0]) ||
+            input->nb[0] != sizeof(float) || ids->nb[0] != sizeof(int32_t) ||
+            !ggml_is_contiguous(up) || !ggml_is_contiguous(gate) || !ggml_is_contiguous(glu) ||
+            !ggml_are_same_shape(up, gate) || !ggml_are_same_shape(up, glu) ||
+            up->ne[0] != weight->ne[1] || up->ne[1] != ids->ne[0] || up->ne[2] != ids->ne[1] || up->ne[3] != 1 ||
+            weight->ne[2] > 65535 || weight->ne[1] > INT_MAX/2 ||
+            ids->ne[0] > INT_MAX/(2*weight->ne[1]) || input->ne[2] > INT_MAX/(2*weight->ne[1]*ids->ne[0])) {
+        return false;
+    }
+    if (input->ne[2] > 16 && (ids->ne[0] >= (1 << 10) || input->ne[2] >= (1 << 22) ||
+            (size_t) input->ne[2] > ggml_cuda_info().devices[device].smpbo/sizeof(int32_t))) {
+        return false;
+    }
+    const size_t elements = 2*weight->ne[1]*ids->ne[0]*input->ne[2];
+    return elements <= SIZE_MAX/sizeof(float);
+}
+
+void ggml_cuda_mul_mat_id_f_pair(ggml_backend_cuda_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * dst) {
+    ggml_cuda_mul_mat_f_impl<true>(ctx, up->src[0], up->src[1], up->src[2], up, gate->src[0], gate);
+    CUDA_CHECK(cudaGetLastError());
+    switch (ggml_get_glu_op(dst)) {
+        case GGML_GLU_OP_SWIGLU:       ggml_cuda_op_swiglu(ctx, dst); break;
+        case GGML_GLU_OP_GEGLU:        ggml_cuda_op_geglu(ctx, dst); break;
+        case GGML_GLU_OP_REGLU:        ggml_cuda_op_reglu(ctx, dst); break;
+        case GGML_GLU_OP_SWIGLU_CLAMP: ggml_cuda_op_swiglu_clamp(ctx, dst); break;
+        default:                      GGML_ABORT("unsupported paired MMF GLU");
+    }
+    CUDA_CHECK(cudaGetLastError());
 }

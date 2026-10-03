@@ -5423,6 +5423,34 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_id_glu : public test_mul_mat_id_fusion {
+    const ggml_glu_op glu;
+
+    test_mul_mat_id_glu(ggml_type type, int tokens, bool broadcast, ggml_glu_op glu)
+        : test_mul_mat_id_fusion(type, GGML_TYPE_F32, 8, 2, broadcast, 64, tokens, 256), glu(glu) {}
+
+    std::string vars() override {
+        return test_mul_mat_id_fusion::vars() + ",glu=" + ggml_glu_op_name(glu);
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        return 2*test_mul_mat_id_fusion::op_flops(t);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * up = test_mul_mat_id_fusion::build_graph(ctx);
+        ggml_tensor * weights = ggml_dup_tensor(ctx, up->src[0]);
+        ggml_set_name(weights, "gate_weights");
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, weights, up->src[1], up->src[2]);
+        return glu == GGML_GLU_OP_SWIGLU_CLAMP ? ggml_swiglu_clamp(ctx, gate, up, 0.1f) : ggml_glu_split(ctx, gate, up, glu);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_GLU";
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -10449,6 +10477,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int tokens : {1, 8, 17}) {
+            for (bool broadcast : {false, true}) {
+                for (ggml_glu_op glu : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU, GGML_GLU_OP_REGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
+                    test_cases.emplace_back(new test_mul_mat_id_glu(type, tokens, broadcast, glu));
+                }
+            }
+        }
+    }
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
