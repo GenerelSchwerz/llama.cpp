@@ -3551,6 +3551,130 @@ static bool ggml_cuda_match_gdn_packed(const ggml_cgraph * graph, int i, ggml_cu
     return ggml_cuda_gdn_writes_safe(graph, i, cursor - i, device);
 }
 
+static bool ggml_cuda_match_gdn_packed_projection(const ggml_cgraph * graph, int i, int device,
+        ggml_cuda_gdn_packed_match & match, bool allocated = false) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(graph, i, device, match, allocated);
+    return false;
+#else
+    if (i < 0 || i > graph->n_nodes - 3 || graph->nodes[i]->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    const ggml_tensor * raw = graph->nodes[i];
+    int cursor = i + 1;
+    const ggml_tensor * parent = raw;
+    if (graph->nodes[cursor]->op == GGML_OP_RESHAPE) {
+        parent = graph->nodes[cursor++];
+        if (parent->src[0] != raw || parent->view_src != raw || parent->view_offs) {
+            return false;
+        }
+    }
+    const ggml_tensor * view = graph->nodes[cursor++];
+    if (view->op != GGML_OP_VIEW || view->src[0] != parent || view->view_src != raw ||
+            !ggml_cuda_match_gdn_packed(graph, cursor, match, allocated ? device : -1) || match.packed != raw ||
+            graph->nodes[cursor]->src[0] != view || raw->view_src || !(raw->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            !raw->src[0] || !raw->src[1] || ggml_cuda_op_mul_mat_use_fwht(raw)) {
+        return false;
+    }
+    const int count = cursor - i + match.count;
+    ggml_op ops[14];
+    int outputs[4], output_count = 0;
+    if (count > 14) {
+        return false;
+    }
+    for (int j = i; j < i + count; ++j) {
+        const ggml_tensor * value = graph->nodes[j];
+        ops[j - i] = value->op;
+        if (value == match.gate || value == match.beta ||
+                (value->op == GGML_OP_RESHAPE && (value->view_src == match.gate || value->view_src == match.beta))) {
+            if (output_count == 4) {
+                return false;
+            }
+            outputs[output_count++] = j;
+        }
+        if (value == match.bias || value == match.scale) {
+            return false;
+        }
+    }
+    if (!ggml_can_fuse_subgraph(graph, i, count, ops, outputs, output_count)) {
+        return false;
+    }
+    const ggml_tensor * bank = raw->src[0];
+    const ggml_tensor * x = raw->src[1];
+    const bool quantized = ggml_is_quantized(bank->type);
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || bank->op != GGML_OP_NONE || bank->view_src ||
+            (!quantized && bank->type != GGML_TYPE_F32 && bank->type != GGML_TYPE_F16 && bank->type != GGML_TYPE_BF16) ||
+            x->type != GGML_TYPE_F32 || bank->ne[0] != x->ne[0] || bank->ne[1] != raw->ne[0] ||
+            raw->ne[1] != x->ne[1] || raw->ne[2] != x->ne[2] || raw->ne[3] != x->ne[3]) {
+        return false;
+    }
+    const ggml_tensor * inputs[] = { bank, x };
+    for (const ggml_tensor * input : inputs) {
+        const size_t unit = ggml_type_size(input->type);
+        const int64_t block = ggml_blck_size(input->type);
+        uint64_t elements = 1;
+        size_t span = unit;
+        if (input->ne[0] <= 0 || input->ne[0] % block || input->nb[0] != unit) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_DIMS; ++j) {
+            const uint64_t dimension = j == 0 ? input->ne[j] / block : input->ne[j];
+            if (input->ne[j] <= 0 || input->ne[j] > INT_MAX || dimension > uint64_t(INT_MAX) / elements ||
+                    input->nb[j] % unit || input->nb[j] / unit > INT_MAX) {
+                return false;
+            }
+            elements *= dimension;
+            if (dimension > 1 && input->nb[j] > (SIZE_MAX - span) / (dimension - 1)) {
+                return false;
+            }
+            span += (dimension - 1) * input->nb[j];
+        }
+        if (span / unit > INT_MAX) {
+            return false;
+        }
+    }
+    if (x->ne[2] > 65535 || x->ne[3] > 65535 || (quantized && x->ne[2] > 65535 / x->ne[3]) ||
+            bank->ne[2] > x->ne[2] || x->ne[2] % bank->ne[2] || bank->ne[3] > x->ne[3] || x->ne[3] % bank->ne[3] ||
+            (quantized ? !ggml_cuda_should_use_mmvq(bank->type, cc, x->ne[1]) :
+                !ggml_cuda_should_use_mmvf(bank->type, cc, bank->ne, bank->nb, x->ne[1]))) {
+        return false;
+    }
+    const size_t alignment = quantized ? (ggml_type_size(bank->type) % sizeof(uint32_t) ?
+        (ggml_type_size(bank->type) % sizeof(uint16_t) ? 1 : sizeof(uint16_t)) : sizeof(uint32_t)) : 2 * ggml_type_size(bank->type);
+    for (int j = 1; j < GGML_MAX_DIMS; ++j) {
+        if (bank->nb[j] % alignment || x->nb[j] % (quantized ? sizeof(float) : 2 * sizeof(float))) {
+            return false;
+        }
+    }
+    match.count = count;
+    if (!allocated) {
+        return true;
+    }
+    const ggml_tensor * metadata[] = { raw, parent, view };
+    for (const ggml_tensor * value : metadata) {
+        uintptr_t begin, end;
+        if (!value->buffer || value->buffer->buft != ggml_backend_cuda_buffer_type(device) ||
+                !ggml_cuda_gdn_allocation_range(value, begin, end) ||
+                (value->op == GGML_OP_RESHAPE && value->data != raw->data)) {
+            return false;
+        }
+    }
+    for (const ggml_tensor * input : inputs) {
+        uintptr_t begin, end;
+        if (!input->buffer || input->buffer->buft != ggml_backend_cuda_buffer_type(device) ||
+                !ggml_cuda_gdn_allocation_range(input, begin, end) || begin % (input == bank ? alignment : (quantized ? sizeof(float) : 2 * sizeof(float)))) {
+            return false;
+        }
+    }
+    if (quantized && ggml_backend_buffer_get_usage(bank->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+            ggml_backend_buffer_get_alloc_size(bank->buffer, bank) != ggml_nbytes(bank)) {
+        return false;
+    }
+    return ggml_cuda_gdn_writes_safe(graph, i, count, device);
+#endif
+}
+
 struct ggml_cuda_gdn_post_match {
     ggml_tensor * producer;
     ggml_tensor * beta;
@@ -4539,6 +4663,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    ggml_cuda_gdn_packed_match packed_projection;
+    if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_match_gdn_packed_projection(cgraph, i, cuda_ctx->device, packed_projection, true)) {
+        const ggml_cuda_gdn_packed_args_host packed = { packed_projection.bias, packed_projection.scale,
+            packed_projection.gate, packed_projection.beta, int(packed_projection.heads_per_group) };
+        ggml_cuda_mm_fusion_args_host fusion{};
+        fusion.packed = &packed;
+        if (ggml_is_quantized(node->src[0]->type)) {
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion);
+        } else {
+            ggml_cuda_mul_mat_vec_f(*cuda_ctx, node->src[0], node->src[1], nullptr, node, &fusion);
+        }
+        return packed_projection.count - 1;
+    }
+
     ggml_cuda_gdn_projection_match projection;
     if (node->op == GGML_OP_MUL_MAT && cuda_ctx->stream_context().concurrent_events.empty() &&
             ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, true, &projection)) {
@@ -5500,6 +5639,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_cuda_gdn_packed_match packed_projection;
+            if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT &&
+                    ggml_cuda_match_gdn_packed_projection(cgraph, i, cuda_ctx->device, packed_projection)) {
+                add_alloc_deps(i, i + packed_projection.count - 1);
+            }
             ggml_cuda_gdn_projection_match projection;
             if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_cuda_match_gdn_projections(cgraph, i, cuda_ctx->device, ggml_cuda_gdn_projection::VECTOR, false, &projection)) {
                 add_alloc_deps(i, i + projection.count - 1);
