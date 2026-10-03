@@ -16490,7 +16490,7 @@ bool ggml_backend_cuda_moe_cached_configure_sources(ggml_backend_buffer_type_t b
         const auto & record = snapshot->tensors[i];
         const auto * tensor = record.tensor;
         const bool base = moe_candidate_routed_base(record);
-        if (tensor == nullptr || tensor->buffer == nullptr || tensor->buffer->buft != buft) {
+        if (tensor == nullptr || tensor->buffer == nullptr || moe_host_budget_for(tensor->buffer->buft) != owner) {
             if (base && record.group_index < complete.size()) {
                 complete[record.group_index] = false;
             }

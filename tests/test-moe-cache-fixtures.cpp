@@ -239,10 +239,11 @@ std::vector<uint8_t> cached_fusion_test_data(const ggml_tensor * tensor, size_t 
 
 ggml_backend_buffer_type_t pageable_cached_buffer_type() {
     static ggml_backend_buffer_type buft = *ggml_backend_cuda_moe_cached_buffer_type();
-    buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t size) {
+    buft.iface.get_alignment = ggml_backend_cpu_buffer_type()->iface.get_alignment;
+    buft.iface.alloc_buffer = [](ggml_backend_buffer_type_t type, size_t size) {
         auto * buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
         if (buffer != nullptr) {
-            buffer->buft = ggml_backend_cuda_moe_cached_buffer_type();
+            buffer->buft = type;
         }
         return buffer;
     };
@@ -283,8 +284,7 @@ static ggml_backend_buffer_t file_mmap_cached_buffer_type_alloc_buffer(
 }
 
 static size_t file_mmap_cached_buffer_type_get_alignment(ggml_backend_buffer_type_t) {
-    auto * cached = ggml_backend_cuda_moe_cached_buffer_type();
-    return cached->iface.get_alignment(cached);
+    return ggml_backend_buft_get_alignment(ggml_backend_cpu_buffer_type());
 }
 
 static size_t file_mmap_cached_buffer_type_get_alloc_size(

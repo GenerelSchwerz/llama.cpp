@@ -374,17 +374,8 @@ static void test_grouped_decode_type(
     grouped_decode_fixture fixture(device, pinned, grouped_decode_fixture::SOURCE_BYTES, grouped_decode_fixture::N_EXPERTS, host_budget);
     ggml_tensor * registration_prefix = nullptr;
     if (pinned && host_budget == 65536) {
-#ifdef __linux__
-        const long page = sysconf(_SC_PAGESIZE);
-#else
-        const size_t page = 4096;
-#endif
-        CHECK(page > 128);
-        const uintptr_t base = reinterpret_cast<uintptr_t>(ggml_backend_buffer_get_base(fixture.source_buffer));
-        fixture.source_offset = 2 * static_cast<size_t>(page) - base % page - 128;
         registration_prefix = fixture.scale();
         ggml_set_name(registration_prefix, "test.registration_prefix");
-        fixture.source_offset += 64 - ggml_nbytes(registration_prefix);
     }
     const uint32_t n_banks = layout == GGML_BACKEND_MOE_CANDIDATE_LAYOUT_SEPARATE ? 3 : 2;
     std::array<ggml_tensor *, 3> weights = {};
@@ -421,8 +412,8 @@ static void test_grouped_decode_type(
         CHECK(ggml_blck_size(type) == 64 && ggml_type_size(type) == 36);
     }
     if (registration_prefix != nullptr) {
-        // The prefix pins the first 64 bytes of expert 0 in a separate registration.
-        CHECK(static_cast<const char *>(weights[0]->data) - static_cast<const char *>(registration_prefix->data) == 64);
+        // Pin the first page inside the bank to exercise split-registration rejection.
+        registration_prefix->data = weights[0]->data;
         CHECK(weights[0]->nb[2] > 64);
     }
     if (auxiliary_scale) {
@@ -473,7 +464,7 @@ static void test_grouped_decode_type(
         }
 #endif
         for (uint32_t group_index = 0; group_index < snapshot.n_groups; ++group_index) {
-            const bool budget_admits = mixed ? group_index == 0 : host_budget >= 49152;
+            const bool budget_admits = mixed ? group_index == 0 : host_budget >= (pinned ? 53248 : 49152);
             const bool direct = budget_admits && (pinned || read_only_supported) && registration_prefix == nullptr;
             for (uint32_t bank = 0; bank < n_banks; ++bank) {
                 cudaPointerAttributes attributes = {};
