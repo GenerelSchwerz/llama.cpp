@@ -129,6 +129,17 @@ struct ggml_cuda_reuse_plan {
             starts[prepare] = group;
             for (const int member : members) { nodes[member] = group; }
         }
+        pack();
+    }
+
+    void pack() {
+        size = 0;
+        std::fill(starts.begin(), starts.end(), -1);
+        for (size_t i = 0; i < groups.size(); ++i) {
+            auto & group = groups[i];
+            group.next = starts[group.prepare];
+            starts[group.prepare] = int(i);
+        }
         struct slot { size_t size; int last; };
         std::vector<slot> slots;
         std::vector<int> order;
