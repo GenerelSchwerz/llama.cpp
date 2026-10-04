@@ -4215,6 +4215,7 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
 }
 
 struct ggml_cuda_norm_mmq_match {
+    ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
     ggml_tensor * add = nullptr;
@@ -4225,6 +4226,18 @@ struct ggml_cuda_norm_mmq_match {
 };
 
 static ggml_cuda_norm_mmq_match ggml_cuda_match_norm_mmq(ggml_cgraph * graph, int i, int device) {
+    if (graph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
+        const auto match = ggml_cuda_match_norm_emit(graph, i, device);
+        if (!match.post || match.norm->ne[0] % QK8_1) { return {}; }
+        ggml_cuda_norm_mmq_match mmq;
+        mmq.post = match.post;
+        mmq.norm = match.norm;
+        mmq.mul = match.mul;
+        mmq.scale = match.scale;
+        mmq.dst = match.dst;
+        mmq.last = match.last;
+        return mmq;
+    }
     ggml_tensor * norm = graph->nodes[i];
     if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
             !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
@@ -4284,7 +4297,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if (keys[node] < 0 || keys[node] > 3 ||
+            if (keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
                     norm_group_invalid(node) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }
@@ -5415,6 +5428,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 const ggml_tensor * shared_input = q8_group >= 0 ? node->src[1] : nullptr;
                 const char * quantized = q8_group >= 0 ? q8_inputs[q8_group].get() : nullptr;
+                if (!mmq_emits.empty() && mmq_emits[i].post && (q8_emits.empty() || !q8_emits[i].norm)) {
+                    const auto & emit = mmq_emits[i];
+                    const auto * typed = !norm_emits.empty() && norm_emits[i].norm ? &norm_emits[i] : nullptr;
+                    if (!typed || (typed->post == emit.post && typed->norm == emit.norm && typed->dst == emit.dst && typed->last == emit.last)) {
+                        const int g = emit.image;
+                        const int reader = mmq_reuse.groups[g].node;
+                        const ggml_tensor * input = cgraph->nodes[reader]->src[1];
+                        mmq_inputs[g].quantized.alloc(mmq_reuse.groups[g].size);
+                        const auto image = [&](int group) -> void * {
+                            if (group < 0) { return nullptr; }
+                            shared_inputs[group].alloc(input_sizes[reuse.groups[group].node]);
+                            return shared_inputs[group].get();
+                        };
+                        void * f16 = typed ? image(typed->f16) : nullptr;
+                        void * bf16 = typed ? image(typed->bf16) : nullptr;
+                        ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
+                            mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                        i = emit.last;
+                        continue;
+                    }
+                }
+
                 if (!q8_emits.empty() && q8_emits[i].norm &&
                         ((!norm_emits.empty() && norm_emits[i].norm) || q8_emits[i].post)) {
                     const auto & emit = q8_emits[i];

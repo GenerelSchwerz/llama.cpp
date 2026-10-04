@@ -1225,6 +1225,85 @@ void ggml_cuda_op_rms_norm_emit(ggml_backend_cuda_context & ctx, ggml_tensor * n
     else { ggml_cuda_rms_norm_emit<false, false, false>(ctx, norm, mul, add, scale, f16, bf16); }
 }
 
+template <mmq_q8_1_ds_layout Layout, bool Scale>
+struct ggml_cuda_hc_norm_emit_mmq_pair_store {
+    static constexpr int width = 2;
+    block_q8_1_mmq * image;
+    uint3 cols;
+    int64_t padded;
+    int64_t rows;
+    half * f16;
+    nv_bfloat16 * bf16;
+    float scale;
+
+    __device__ __forceinline__ void store(int64_t column, int64_t row, float2 xi) const {
+        constexpr int vals_per_scale = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+        constexpr int vals_per_sum = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+        const unsigned mask = __activemask();
+        float amax = fmaxf(fabsf(xi.x), fabsf(xi.y));
+#pragma unroll
+        for (int offset = vals_per_scale/4; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(mask, amax, offset, WARP_SIZE));
+        }
+        float sum;
+        if constexpr (Layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+            const int pair = threadIdx.x % WARP_SIZE & ~1;
+            const float x = __shfl_sync(mask, xi.x, pair, WARP_SIZE);
+            const float y = __shfl_sync(mask, xi.y, pair, WARP_SIZE);
+            const float z = __shfl_sync(mask, xi.x, pair + 1, WARP_SIZE);
+            const float w = __shfl_sync(mask, xi.y, pair + 1, WARP_SIZE);
+            sum = x + y + z + w;
+#pragma unroll
+            for (int offset = vals_per_sum/4; offset >= 2; offset >>= 1) {
+                sum += __shfl_xor_sync(mask, sum, offset, WARP_SIZE);
+            }
+        }
+        const float d_inv = 127.0f/amax;
+        const float d = 1.0f/d_inv;
+        const int64_t ib = (column/QK8_1_MMQ)*rows + row;
+        const int iqs = column % QK8_1_MMQ;
+        char2 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        ((char2 *) image[ib].qs)[iqs/2] = q;
+        if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            if (iqs % 16 == 0 && iqs < 96) {
+                image[ib].d2s6[2 + iqs/16] = sum;
+                if (iqs % 64 == 0) { image[ib].d2s6[iqs/64] = d; }
+            }
+        } else if (iqs % 32 == 0) {
+            if constexpr (Layout == MMQ_Q8_1_DS_LAYOUT_DS4) { image[ib].ds4[iqs/32] = make_half2(d, sum); }
+            else { image[ib].d4[iqs/32] = d; }
+        }
+    }
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float2 xi) const {
+        if constexpr (Scale) {
+            xi.x = scale * xi.x;
+            xi.y = scale * xi.y;
+        }
+        dst[col] = xi.x;
+        dst[col + 1] = xi.y;
+        const int64_t index = dst - base + col;
+        const uint2 rc = fast_div_modulo(uint32_t(index), cols);
+        store(rc.y, rc.x, xi);
+        constexpr int vals_per_scale = Layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+        if (rc.y >= cols.z - vals_per_scale) {
+            for (int64_t tail = cols.z; tail < padded; tail += vals_per_scale) {
+                store(tail + rc.y % vals_per_scale, rc.x, make_float2(0.0f, 0.0f));
+            }
+        }
+        if (f16) {
+            f16[index] = ggml_cuda_cast<half>(xi.x);
+            f16[index + 1] = ggml_cuda_cast<half>(xi.y);
+        }
+        if (bf16) {
+            bf16[index] = ggml_cuda_cast<nv_bfloat16>(xi.x);
+            bf16[index + 1] = ggml_cuda_cast<nv_bfloat16>(xi.y);
+        }
+    }
+};
+
 struct hc_post_norm_data {
     const float * x;
     const float * residual;
@@ -1327,12 +1406,26 @@ static __device__ __forceinline__ void hc_post_norm_f32_impl(hc_post_norm_data a
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
     const float mean = tmp / a.ncols;
     const float scale = rsqrtf(mean + a.eps);
+    if constexpr (Write::width == 2) {
+        for (int64_t col = 2*threadIdx.x; col < a.ncols; col += 2*block_size) {
+            float x, y;
+            if constexpr (do_multiply) {
+                x = scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])];
+                y = scale * a.post_dst[offset + col + 1] * a.mul[fastmodulo(col + 1, a.mul_ne[0])];
+            } else {
+                x = scale * a.post_dst[offset + col];
+                y = scale * a.post_dst[offset + col + 1];
+            }
+            write(a.dst + offset, a.dst, int(col), make_float2(x, y));
+        }
+    } else {
     for (int col = threadIdx.x; col < a.ncols; col += block_size) {
         if constexpr (do_multiply) {
             write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])]);
         } else {
             write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col]);
         }
+    }
     }
 }
 
@@ -1346,7 +1439,22 @@ static __global__ __launch_bounds__(block_size) void hc_post_norm_emit_q8_f32(hc
     hc_post_norm_f32_impl<block_size, has_comb, do_multiply, layout>(a, ggml_cuda_norm_emit_q8_store{(block_q8_1 *) image, cols, padded, f16, bf16});
 }
 
+template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale, int NormLayout>
+static __global__ __launch_bounds__(Block) void hc_post_norm_emit_mmq_f32(hc_post_norm_data a,
+        half * f16, nv_bfloat16 * bf16, void * image, uint3 cols, int64_t padded, int64_t rows, float scale) {
+    hc_post_norm_f32_impl<Block, Comb, Multiply, NormLayout>(a,
+        ggml_cuda_hc_norm_emit_mmq_pair_store<Layout, Scale>{(block_q8_1_mmq *) image, cols, padded, rows, f16, bf16, scale});
+}
+
+template <mmq_q8_1_ds_layout Layout, int Block, bool Comb, bool Multiply, bool Scale>
+static auto hc_post_norm_emit_mmq_kernel(int layout) {
+    if (layout == 1) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 1>; }
+    if (layout == 2) { return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 2>; }
+    return hc_post_norm_emit_mmq_f32<Layout, Block, Comb, Multiply, Scale, 0>;
+}
+
 struct ggml_cuda_norm_scale_store {
+    static constexpr int width = 1;
     float scale;
     half * f16;
     nv_bfloat16 * bf16;
@@ -1726,6 +1834,65 @@ void ggml_cuda_op_rms_norm_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * no
         case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_rms_norm_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, norm, mul, add, scale, image, cols, padded, rows); break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_rms_norm_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, norm, mul, add, scale, image, cols, padded, rows); break;
         case 3: ggml_cuda_rms_norm_mxfp4_dispatch(ctx, norm, mul, add, scale, image, cols, padded, rows); break;
+        default: GGML_ABORT("unsupported MMQ image layout");
+    }
+}
+
+template <mmq_q8_1_ds_layout Layout>
+static void ggml_cuda_hc_post_norm_emit_mmq_dispatch(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows) {
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * weights = post->src[2];
+    const ggml_tensor * comb = post->src[3];
+    const ggml_tensor * gamma = mul ? mul->src[mul->src[0] == norm ? 1 : 0] : nullptr;
+    GGML_ASSERT(!mul || !scale);
+    hc_post_norm_data a{};
+    a.x = (const float *) x->data;
+    a.residual = (const float *) residual->data;
+    a.post = (const float *) weights->data;
+    a.comb = comb ? (const float *) comb->data : nullptr;
+    a.mul = gamma ? (const float *) gamma->data : nullptr;
+    a.post_dst = (float *) post->data;
+    a.dst = (float *) (scale ? scale : mul ? mul : norm)->data;
+    a.n_embd = x->ne[0];
+    a.hc = residual->ne[1];
+    a.ncols = norm->ne[0];
+    a.embd_ne = init_fastdiv_values(a.n_embd);
+    a.eps = ggml_get_op_params_f32(norm, 0);
+    for (int d = 0; d < 3; ++d) {
+        if (d < 2) {
+            a.sx[d] = x->nb[d]/sizeof(float);
+            a.sp[d] = weights->nb[d]/sizeof(float);
+        }
+        a.sr[d] = residual->nb[d]/sizeof(float);
+        a.sc[d] = comb ? comb->nb[d]/sizeof(float) : 0;
+    }
+    for (int d = 0; d < 4; ++d) {
+        a.sm[d] = gamma ? gamma->nb[d]/sizeof(float) : 0;
+        a.mul_ne[d] = init_fastdiv_values(gamma ? gamma->ne[d] : 1);
+    }
+    const int block_size = a.ncols < 1024 ? 256 : 1024;
+    const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
+    const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), 32*sizeof(float), ctx.stream());
+    const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    if (scale) {
+        auto kernel = block_size == 256
+            ? (comb ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, true>(layout))
+            : (comb ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, true>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, true>(layout));
+        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, ggml_get_op_params_f32(scale, 0));
+    } else {
+        auto kernel = block_size == 256
+            ? (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 256, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 256, false, false, false>(layout)))
+            : (comb ? (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, true, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, true, false, false>(layout)) : (mul ? hc_post_norm_emit_mmq_kernel<Layout, 1024, false, true, false>(layout) : hc_post_norm_emit_mmq_kernel<Layout, 1024, false, false, false>(layout)));
+        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16, image, init_fastdiv_values(cols), padded, rows, 1.0f);
+    }
+}
+
+void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, ggml_tensor * scale, void * f16, void * bf16, void * image, int64_t cols, int64_t padded, int64_t rows, int layout) {
+    switch (layout) {
+        case MMQ_Q8_1_DS_LAYOUT_D4: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D4>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_DS4>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6: ggml_cuda_hc_post_norm_emit_mmq_dispatch<MMQ_Q8_1_DS_LAYOUT_D2S6>(ctx, post, norm, mul, scale, f16, bf16, image, cols, padded, rows); break;
         default: GGML_ABORT("unsupported MMQ image layout");
     }
 }
