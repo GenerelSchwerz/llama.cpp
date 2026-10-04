@@ -3659,8 +3659,132 @@ static void ggml_cuda_prepare_cublas_input(ggml_backend_cuda_context & ctx, cons
     }
 }
 
+struct ggml_cuda_hc_post_norm_match {
+    ggml_tensor * post = nullptr;
+    ggml_tensor * norm = nullptr;
+    ggml_tensor * mul = nullptr;
+    int count = 0;
+};
+
+static ggml_cuda_hc_post_norm_match ggml_cuda_match_hc_post_norm(ggml_cgraph * cgraph, int i) {
+    ggml_cuda_hc_post_norm_match match;
+    if (cgraph->nodes[i]->op != GGML_OP_DSV4_HC_POST || i + 1 >= cgraph->n_nodes) {
+        return match;
+    }
+    ggml_tensor * post = cgraph->nodes[i];
+    int norm_i = i + 1;
+    const bool reshape = cgraph->nodes[norm_i]->op == GGML_OP_RESHAPE;
+    if (reshape) {
+        const ggml_tensor * view = cgraph->nodes[norm_i];
+        if (view->src[0] != post || view->view_src != post || view->view_offs != 0 || !ggml_is_contiguous(view) || ++norm_i >= cgraph->n_nodes) {
+            return match;
+        }
+    }
+    ggml_tensor * norm = cgraph->nodes[norm_i];
+    if (norm->op != GGML_OP_RMS_NORM || norm->src[0] != cgraph->nodes[norm_i - 1]) {
+        return match;
+    }
+    if (ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {}) ||
+            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {}) ||
+            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {}) ||
+            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+        return match;
+    }
+    const bool weighted = ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {});
+    ggml_tensor * mul = weighted ? cgraph->nodes[norm_i + 1] : nullptr;
+    const bool closed = reshape
+        ? (weighted ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 1, i + 3 }) : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RESHAPE, GGML_OP_RMS_NORM }, { i, i + 1, i + 2 }))
+        : (weighted ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM }, { i, i + 1 }));
+    if (closed && ggml_cuda_should_fuse_hc_post_norm(post, norm, mul)) {
+        match.post = post;
+        match.norm = norm;
+        match.mul = mul;
+        match.count = norm_i - i + 1 + int(weighted);
+    }
+    return match;
+}
+
+static bool ggml_cuda_hc_post_norm_memory_ok(const ggml_cgraph * cgraph, int i, const ggml_cuda_hc_post_norm_match & match, int device) {
+    const auto range = [device](const ggml_tensor * tensor, uintptr_t & begin, uintptr_t & end) {
+        if (!tensor || !tensor->buffer || !tensor->data || !ggml_backend_buffer_is_cuda(tensor->buffer)) {
+            return false;
+        }
+        const auto * ctx = (const ggml_backend_cuda_buffer_context *) tensor->buffer->context;
+        if (ctx->device != device) {
+            return false;
+        }
+        begin = (uintptr_t) tensor->data;
+        const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(tensor->buffer);
+        const size_t size = ggml_backend_buffer_get_size(tensor->buffer);
+        const size_t alloc = ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor);
+        if (begin < base || begin - base > size || alloc < ggml_nbytes(tensor) || alloc > size - (begin - base) || begin > UINTPTR_MAX - alloc || begin % sizeof(float) != 0) {
+            return false;
+        }
+        end = begin + alloc;
+        if (tensor->view_src) {
+            const ggml_tensor * root = tensor->view_src;
+            if (root->view_src || root->buffer != tensor->buffer || !root->data || (uintptr_t) root->data < base ||
+                    (uintptr_t) root->data - base > size || ggml_nbytes(root) > size - ((uintptr_t) root->data - base) || tensor->view_offs > ggml_nbytes(root) ||
+                    begin != (uintptr_t) root->data + tensor->view_offs || ggml_nbytes(tensor) > ggml_nbytes(root) - tensor->view_offs) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const ggml_tensor * writes[] = { match.post, match.mul ? match.mul : match.norm };
+    uintptr_t begin[2], end[2];
+    for (int w = 0; w < 2; ++w) {
+        if (!range(writes[w], begin[w], end[w])) {
+            return false;
+        }
+    }
+    for (int j = i + 1; j < i + match.count; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_RESHAPE) {
+            uintptr_t lo, hi;
+            const ggml_tensor * view = cgraph->nodes[j];
+            if (!range(view, lo, hi) || view->buffer != match.post->buffer || lo != begin[0] || ggml_nbytes(view) != ggml_nbytes(match.post)) {
+                return false;
+            }
+        }
+    }
+    const auto overlaps = [](uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t d) { return a < d && c < b; };
+    if (overlaps(begin[0], end[0], begin[1], end[1]) && (begin[0] != begin[1] || end[0] != end[1])) {
+        return false;
+    }
+    for (int j = i; j < i + match.count; ++j) {
+        for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+            if (!src) {
+                continue;
+            }
+            bool internal = false;
+            for (int k = i; k < j; ++k) {
+                internal |= src == cgraph->nodes[k];
+            }
+            if (internal) {
+                continue;
+            }
+            uintptr_t lo, hi;
+            if (!range(src, lo, hi)) {
+                return false;
+            }
+            for (int w = 0; w < 2; ++w) {
+                if (!overlaps(begin[w], end[w], lo, hi)) {
+                    continue;
+                }
+                if (src == match.post->src[1] && !match.post->src[3] &&
+                        ggml_are_same_shape(match.post, src) && ggml_are_same_stride(match.post, src) && begin[w] == lo && end[w] == hi) {
+                    continue;
+                }
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 struct ggml_cuda_norm_emit_match {
+    ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
     ggml_tensor * add = nullptr;
@@ -3672,6 +3796,18 @@ struct ggml_cuda_norm_emit_match {
 };
 
 static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, int i, int device) {
+    if (graph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
+        const auto hc = ggml_cuda_match_hc_post_norm(graph, i);
+        if (!hc.count || !ggml_cuda_hc_post_norm_memory_ok(graph, i, hc, device)) { return {}; }
+        ggml_cuda_norm_emit_match match;
+        match.post = hc.post;
+        match.norm = hc.norm;
+        match.mul = hc.mul;
+        match.dst = hc.mul ? hc.mul : hc.norm;
+        match.last = i + hc.count - 1;
+        if (!(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
+        return match;
+    }
     ggml_tensor * norm = graph->nodes[i];
     if (norm->op != GGML_OP_RMS_NORM || !norm->src[0] || norm->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32 ||
             !(norm->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
@@ -3719,6 +3855,7 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
     if (readers.empty()) { return {}; }
     std::vector<ggml_cuda_norm_emit_match> emits(graph->n_nodes);
     bool moved = false;
+    std::vector<bool> removed(reuse.groups.size(), false);
     for (int i = 0; i < graph->n_nodes; ++i) {
         auto match = ggml_cuda_match_norm_emit(graph, i, device);
         if (!match.norm) { continue; }
@@ -3736,7 +3873,7 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
             auto & group = reuse.groups[g];
             const int key = keys[group.node];
             int & target = key == GGML_TYPE_F16 ? match.f16 : match.bf16;
-            if (target >= 0 || (key != GGML_TYPE_F16 && key != GGML_TYPE_BF16) || !can_emit(group.node, group.prepare)) { continue; }
+            if (removed[g] || target >= 0 || (key != GGML_TYPE_F16 && key != GGML_TYPE_BF16) || !can_emit(group.node, group.prepare)) { continue; }
             target = int(g);
             group.prepare = i;
             group.after = true;
@@ -3746,21 +3883,58 @@ static std::vector<ggml_cuda_norm_emit_match> ggml_cuda_plan_norm_emit(ggml_cgra
         if (found != readers.end()) {
             for (const int node : found->second) {
                 int & target = keys[node] == GGML_TYPE_F16 ? match.f16 : match.bf16;
-                if (target >= 0 || (!reuse.nodes.empty() && reuse.nodes[node] >= 0) ||
-                        sizes[node] > SIZE_MAX - 255 || !can_emit(node, node)) { continue; }
-                if (reuse.nodes.empty()) {
-                    reuse.nodes.assign(graph->n_nodes, -1);
-                    reuse.starts.assign(graph->n_nodes, -1);
+                if (sizes[node] > SIZE_MAX - 255 || !can_emit(node, node)) { continue; }
+                const int previous = reuse.nodes.empty() ? -1 : reuse.nodes[node];
+                if (previous == target && target >= 0) { continue; }
+                if (target >= 0) {
+                    auto & group = reuse.groups[target];
+                    if (sizes[node] != sizes[group.node]) { continue; }
+                    if (previous >= 0) {
+                        const auto & other = reuse.groups[previous];
+                        if (keys[other.node] != keys[group.node] || !can_emit(other.node, other.prepare)) { continue; }
+                        group.last = std::max(group.last, other.last);
+                        group.size = std::max(group.size, other.size);
+                        for (int & member : reuse.nodes) {
+                            if (member == previous) { member = target; }
+                        }
+                        removed[previous] = true;
+                    } else {
+                        reuse.nodes[node] = target;
+                        group.last = std::max(group.last, node);
+                        group.size = std::max(group.size, GGML_PAD(sizes[node], 256));
+                    }
+                } else {
+                    if (previous >= 0) { continue; }
+                    if (reuse.nodes.empty()) {
+                        reuse.nodes.assign(graph->n_nodes, -1);
+                        reuse.starts.assign(graph->n_nodes, -1);
+                    }
+                    target = int(reuse.groups.size());
+                    reuse.groups.push_back({node, i, node, -1, true, GGML_PAD(sizes[node], 256)});
+                    removed.push_back(false);
+                    reuse.nodes[node] = target;
                 }
-                target = int(reuse.groups.size());
-                reuse.groups.push_back({node, i, node, -1, true, GGML_PAD(sizes[node], 256)});
-                reuse.nodes[node] = target;
                 moved = true;
             }
         }
         if (match.f16 >= 0 || match.bf16 >= 0) { emits[i] = match; }
     }
-    if (moved) { reuse.pack(); }
+    if (moved) {
+        std::vector<int> remap(reuse.groups.size(), -1);
+        int next = 0;
+        for (size_t g = 0; g < reuse.groups.size(); ++g) {
+            if (removed[g]) { continue; }
+            remap[g] = next;
+            reuse.groups[next++] = reuse.groups[g];
+        }
+        reuse.groups.resize(next);
+        for (int & group : reuse.nodes) { if (group >= 0) { group = remap[group]; } }
+        for (auto & emit : emits) {
+            if (emit.f16 >= 0) { emit.f16 = remap[emit.f16]; }
+            if (emit.bf16 >= 0) { emit.bf16 = remap[emit.bf16]; }
+        }
+        reuse.pack();
+    }
     if (reuse.groups.empty()) { return {}; }
     return emits;
 }
@@ -4469,6 +4643,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (node->op == GGML_OP_DSV4_HC_POST && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const auto match = ggml_cuda_match_hc_post_norm(cgraph, i);
+        if (match.count != 0 && ggml_cuda_hc_post_norm_memory_ok(cgraph, i, match, cuda_ctx->device)) {
+            ggml_cuda_op_hc_post_norm(*cuda_ctx, match.post, match.norm, match.mul);
+            return match.count - 1;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
         return 4;
@@ -4706,7 +4888,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
                         return shared_inputs[g].get();
                     };
-                    ggml_cuda_op_rms_norm_emit(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, image(emit.f16), image(emit.bf16));
+                    if (emit.post) {
+                        ggml_cuda_op_hc_post_norm_emit(*cuda_ctx, emit.post, emit.norm, emit.mul, image(emit.f16), image(emit.bf16));
+                    } else {
+                        ggml_cuda_op_rms_norm_emit(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, image(emit.f16), image(emit.bf16));
+                    }
                     i = emit.last;
                     continue;
                 }
@@ -4912,6 +5098,24 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
+                const auto match = ggml_cuda_match_hc_post_norm(cgraph, i);
+                if (match.count != 0) {
+                    for (int j = i; j < i + match.count; ++j) {
+                        for (const ggml_tensor * src : cgraph->nodes[j]->src) {
+                            bool internal = false;
+                            for (int k = i; src && k < j; ++k) {
+                                internal |= src == cgraph->nodes[k];
+                            }
+                            if (src && !internal) {
+                                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(src), cgraph->nodes[i + match.count - 1]);
+                            }
+                        }
+                    }
+                    i += match.count - 1;
+                    continue;
+                }
+            }
             ggml_cuda_moe_weighted_reduction_match match;
             if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);

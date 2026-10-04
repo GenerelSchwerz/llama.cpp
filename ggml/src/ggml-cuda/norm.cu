@@ -851,3 +851,233 @@ void ggml_cuda_op_rms_norm_emit(ggml_backend_cuda_context & ctx, ggml_tensor * n
     else if (scale) { ggml_cuda_rms_norm_emit<false, false, true>(ctx, norm, mul, add, scale, f16, bf16); }
     else { ggml_cuda_rms_norm_emit<false, false, false>(ctx, norm, mul, add, scale, f16, bf16); }
 }
+
+struct hc_post_norm_data {
+    const float * x;
+    const float * residual;
+    const float * post;
+    const float * comb;
+    const float * mul;
+    float * post_dst;
+    float * dst;
+    int64_t n_embd;
+    int64_t hc;
+    int ncols;
+    int64_t sx[2];
+    int64_t sr[3];
+    int64_t sp[2];
+    int64_t sc[3];
+    int64_t sm[4];
+    uint3 mul_ne[4];
+    uint3 embd_ne;
+    float eps;
+};
+
+template <int block_size, bool has_comb, bool do_multiply, int layout>
+static __global__ __launch_bounds__(block_size) void hc_post_norm_f32(hc_post_norm_data a) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int64_t offset = ((int64_t(sample)*gridDim.y + channel)*gridDim.x + row)*a.ncols;
+    if constexpr (do_multiply) {
+        a.mul += fastmodulo(sample, a.mul_ne[3])*a.sm[3] + fastmodulo(channel, a.mul_ne[2])*a.sm[2] + fastmodulo(row, a.mul_ne[1])*a.sm[1];
+    }
+    constexpr bool grouped = layout == 1;
+    constexpr bool flat = layout == 2;
+    const int64_t stream = grouped ? (offset / a.n_embd) % a.hc : 0;
+    const int64_t token = grouped || flat ? offset / (a.n_embd*a.hc) : 0;
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        const int64_t ir = offset + col;
+        const int64_t i0 = grouped ? col : flat ? fastmodulo(col, a.embd_ne) : ir % a.n_embd;
+        const int64_t ih = grouped ? stream : flat ? fastdiv(col, a.embd_ne) : (ir / a.n_embd) % a.hc;
+        const int64_t it = grouped || flat ? token : ir / (a.n_embd*a.hc);
+        float value = a.x[i0*a.sx[0] + it*a.sx[1]] * a.post[ih*a.sp[0] + it*a.sp[1]];
+        if constexpr (has_comb) {
+            for (int64_t isrc = 0; isrc < a.hc; ++isrc) {
+                value += a.residual[i0*a.sr[0] + isrc*a.sr[1] + it*a.sr[2]] * a.comb[ih*a.sc[0] + isrc*a.sc[1] + it*a.sc[2]];
+            }
+        } else {
+            value += a.residual[i0*a.sr[0] + ih*a.sr[1] + it*a.sr[2]];
+        }
+        a.post_dst[ir] = value;
+        tmp += value * value;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / a.ncols;
+    const float scale = rsqrtf(mean + a.eps);
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        if constexpr (do_multiply) {
+            a.dst[offset + col] = scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])];
+        } else {
+            a.dst[offset + col] = scale * a.post_dst[offset + col];
+        }
+    }
+}
+
+template <int block_size, bool has_comb, bool do_multiply, int layout, typename Write>
+static __device__ __forceinline__ void hc_post_norm_f32_impl(hc_post_norm_data a, const Write write) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int64_t offset = ((int64_t(sample)*gridDim.y + channel)*gridDim.x + row)*a.ncols;
+    if constexpr (do_multiply) {
+        a.mul += fastmodulo(sample, a.mul_ne[3])*a.sm[3] + fastmodulo(channel, a.mul_ne[2])*a.sm[2] + fastmodulo(row, a.mul_ne[1])*a.sm[1];
+    }
+    constexpr bool grouped = layout == 1;
+    constexpr bool flat = layout == 2;
+    const int64_t stream = grouped ? (offset / a.n_embd) % a.hc : 0;
+    const int64_t token = grouped || flat ? offset / (a.n_embd*a.hc) : 0;
+    ggml_cuda_pdl_sync();
+    float tmp = 0.0f;
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        const int64_t ir = offset + col;
+        const int64_t i0 = grouped ? col : flat ? fastmodulo(col, a.embd_ne) : ir % a.n_embd;
+        const int64_t ih = grouped ? stream : flat ? fastdiv(col, a.embd_ne) : (ir / a.n_embd) % a.hc;
+        const int64_t it = grouped || flat ? token : ir / (a.n_embd*a.hc);
+        float value = a.x[i0*a.sx[0] + it*a.sx[1]] * a.post[ih*a.sp[0] + it*a.sp[1]];
+        if constexpr (has_comb) {
+            for (int64_t isrc = 0; isrc < a.hc; ++isrc) {
+                value += a.residual[i0*a.sr[0] + isrc*a.sr[1] + it*a.sr[2]] * a.comb[ih*a.sc[0] + isrc*a.sc[1] + it*a.sc[2]];
+            }
+        } else {
+            value += a.residual[i0*a.sr[0] + ih*a.sr[1] + it*a.sr[2]];
+        }
+        a.post_dst[ir] = value;
+        tmp += value * value;
+    }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / a.ncols;
+    const float scale = rsqrtf(mean + a.eps);
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        if constexpr (do_multiply) {
+            write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])]);
+        } else {
+            write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col]);
+        }
+    }
+}
+
+template <int block_size, bool has_comb, bool do_multiply, int layout>
+static __global__ __launch_bounds__(block_size) void hc_post_norm_emit_f32(hc_post_norm_data a, half * f16, nv_bfloat16 * bf16) {
+    hc_post_norm_f32_impl<block_size, has_comb, do_multiply, layout>(a, ggml_cuda_norm_emit_store{f16, bf16});
+}
+
+template <int block_size, bool has_comb, bool do_multiply>
+static auto hc_post_norm_kernel(int layout) {
+    if (layout == 1) {
+        return hc_post_norm_f32<block_size, has_comb, do_multiply, 1>;
+    }
+    if (layout == 2) {
+        return hc_post_norm_f32<block_size, has_comb, do_multiply, 2>;
+    }
+    return hc_post_norm_f32<block_size, has_comb, do_multiply, 0>;
+}
+
+template <int block_size, bool has_comb, bool do_multiply>
+static auto hc_post_norm_emit_kernel(int layout) {
+    if (layout == 1) {
+        return hc_post_norm_emit_f32<block_size, has_comb, do_multiply, 1>;
+    }
+    if (layout == 2) {
+        return hc_post_norm_emit_f32<block_size, has_comb, do_multiply, 2>;
+    }
+    return hc_post_norm_emit_f32<block_size, has_comb, do_multiply, 0>;
+}
+
+bool ggml_cuda_should_fuse_hc_post_norm(const ggml_tensor * post, const ggml_tensor * norm, const ggml_tensor * mul) {
+    const ggml_tensor * dst = mul ? mul : norm;
+    if (!post->src[0] || !post->src[1] || !post->src[2] || post->op != GGML_OP_DSV4_HC_POST || norm->op != GGML_OP_RMS_NORM ||
+            post->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(post) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(dst) ||
+            norm->ne[0] > INT_MAX - 1024 || norm->ne[1] > INT_MAX || norm->ne[2] > 65535 || norm->ne[3] > 65535) {
+        return false;
+    }
+    const ggml_tensor * inputs[] = { post->src[0], post->src[1], post->src[2], post->src[3], post, norm, dst, mul ? mul->src[mul->src[0] == norm ? 1 : 0] : nullptr };
+    for (const ggml_tensor * tensor : inputs) {
+        if (!tensor) {
+            continue;
+        }
+        if (tensor->type != GGML_TYPE_F32) {
+            return false;
+        }
+        size_t span = sizeof(float);
+        size_t elements = 1;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (tensor->ne[d] <= 0 || tensor->ne[d] > INT_MAX || tensor->nb[d] % sizeof(float) != 0 ||
+                    elements > INT64_MAX/sizeof(float)/(size_t) tensor->ne[d] ||
+                    (tensor->nb[d] != 0 && (size_t) (tensor->ne[d] - 1) > (SIZE_MAX - span)/tensor->nb[d])) {
+                return false;
+            }
+            elements *= tensor->ne[d];
+            span += (tensor->ne[d] - 1)*tensor->nb[d];
+        }
+        if (span > INT64_MAX) {
+            return false;
+        }
+    }
+    const float eps = ggml_get_op_params_f32(norm, 0);
+    return ggml_nelements(norm) <= INT_MAX && ggml_nelements(post) == ggml_nelements(norm) && ggml_are_same_shape(norm, dst) && std::isfinite(eps) && eps >= 0.0f;
+}
+
+template <bool emit>
+static void ggml_cuda_op_hc_post_norm_impl(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, void * f16, void * bf16) {
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * weights = post->src[2];
+    const ggml_tensor * comb = post->src[3];
+    const ggml_tensor * gamma = mul ? mul->src[mul->src[0] == norm ? 1 : 0] : nullptr;
+    hc_post_norm_data a{};
+    a.x = (const float *) x->data;
+    a.residual = (const float *) residual->data;
+    a.post = (const float *) weights->data;
+    a.comb = comb ? (const float *) comb->data : nullptr;
+    a.mul = gamma ? (const float *) gamma->data : nullptr;
+    a.post_dst = (float *) post->data;
+    a.dst = (float *) (mul ? mul : norm)->data;
+    a.n_embd = x->ne[0];
+    a.hc = residual->ne[1];
+    a.ncols = norm->ne[0];
+    a.embd_ne = init_fastdiv_values(a.n_embd);
+    a.eps = ggml_get_op_params_f32(norm, 0);
+    for (int d = 0; d < 3; ++d) {
+        if (d < 2) {
+            a.sx[d] = x->nb[d]/sizeof(float);
+            a.sp[d] = weights->nb[d]/sizeof(float);
+        }
+        a.sr[d] = residual->nb[d]/sizeof(float);
+        a.sc[d] = comb ? comb->nb[d]/sizeof(float) : 0;
+    }
+    for (int d = 0; d < 4; ++d) {
+        a.sm[d] = gamma ? gamma->nb[d]/sizeof(float) : 0;
+        a.mul_ne[d] = init_fastdiv_values(gamma ? gamma->ne[d] : 1);
+    }
+    const int block_size = a.ncols < 1024 ? 256 : 1024;
+    const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
+    const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), 32*sizeof(float), ctx.stream());
+    const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    if constexpr (emit) {
+        auto kernel = block_size == 256
+            ? (comb ? (mul ? hc_post_norm_emit_kernel<256, true, true>(layout) : hc_post_norm_emit_kernel<256, true, false>(layout)) : (mul ? hc_post_norm_emit_kernel<256, false, true>(layout) : hc_post_norm_emit_kernel<256, false, false>(layout)))
+            : (comb ? (mul ? hc_post_norm_emit_kernel<1024, true, true>(layout) : hc_post_norm_emit_kernel<1024, true, false>(layout)) : (mul ? hc_post_norm_emit_kernel<1024, false, true>(layout) : hc_post_norm_emit_kernel<1024, false, false>(layout)));
+        ggml_cuda_kernel_launch(kernel, launch, a, (half *) f16, (nv_bfloat16 *) bf16);
+    } else {
+        auto kernel = block_size == 256
+            ? (comb ? (mul ? hc_post_norm_kernel<256, true, true>(layout) : hc_post_norm_kernel<256, true, false>(layout)) : (mul ? hc_post_norm_kernel<256, false, true>(layout) : hc_post_norm_kernel<256, false, false>(layout)))
+            : (comb ? (mul ? hc_post_norm_kernel<1024, true, true>(layout) : hc_post_norm_kernel<1024, true, false>(layout)) : (mul ? hc_post_norm_kernel<1024, false, true>(layout) : hc_post_norm_kernel<1024, false, false>(layout)));
+        ggml_cuda_kernel_launch(kernel, launch, a);
+    }
+}
+
+void ggml_cuda_op_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul) {
+    ggml_cuda_op_hc_post_norm_impl<false>(ctx, post, norm, mul, nullptr, nullptr);
+}
+
+void ggml_cuda_op_hc_post_norm_emit(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, void * f16, void * bf16) {
+    ggml_cuda_op_hc_post_norm_impl<true>(ctx, post, norm, mul, f16, bf16);
+}
