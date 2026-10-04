@@ -1099,6 +1099,30 @@ static __global__ __launch_bounds__(block_size) void hc_post_norm_emit_q8_f32(hc
     hc_post_norm_f32_impl<block_size, has_comb, do_multiply, layout>(a, ggml_cuda_norm_emit_q8_store{(block_q8_1 *) image, cols, padded, f16, bf16});
 }
 
+struct ggml_cuda_norm_scale_store {
+    float scale;
+    half * f16;
+    nv_bfloat16 * bf16;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float value) const {
+        value = scale * value;
+        ggml_cuda_norm_emit_store{f16, bf16}(dst, base, col, value);
+    }
+};
+
+template <int Block, bool Comb, int Layout>
+static __global__ __launch_bounds__(Block) void hc_post_norm_scale_f32(hc_post_norm_data a, float scale,
+        half * f16, nv_bfloat16 * bf16) {
+    hc_post_norm_f32_impl<Block, Comb, false, Layout>(a, ggml_cuda_norm_scale_store{scale, f16, bf16});
+}
+
+template <int Block, bool Comb>
+static auto hc_post_norm_scale_kernel(int layout) {
+    if (layout == 1) { return hc_post_norm_scale_f32<Block, Comb, 1>; }
+    if (layout == 2) { return hc_post_norm_scale_f32<Block, Comb, 2>; }
+    return hc_post_norm_scale_f32<Block, Comb, 0>;
+}
+
 template <int block_size, bool has_comb, bool do_multiply>
 static auto hc_post_norm_kernel(int layout) {
     if (layout == 1) {
@@ -1167,8 +1191,15 @@ bool ggml_cuda_should_fuse_hc_post_norm(const ggml_tensor * post, const ggml_ten
     return ggml_nelements(norm) <= INT_MAX && ggml_nelements(post) == ggml_nelements(norm) && ggml_are_same_shape(norm, dst) && std::isfinite(eps) && eps >= 0.0f;
 }
 
-template <bool emit>
-static void ggml_cuda_op_hc_post_norm_impl(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, void * f16, void * bf16) {
+bool ggml_cuda_should_fuse_hc_post_norm_scale(const ggml_tensor * post, const ggml_tensor * norm, const ggml_tensor * scale) {
+    return scale && ggml_cuda_should_fuse_hc_post_norm(post, norm, nullptr) && scale->op == GGML_OP_SCALE &&
+        scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_are_same_shape(norm, scale) &&
+        (norm->flags & GGML_TENSOR_FLAG_COMPUTE) && (scale->flags & GGML_TENSOR_FLAG_COMPUTE);
+}
+
+template <bool emit, bool postop = false>
+static void ggml_cuda_op_hc_post_norm_impl(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, void * f16, void * bf16,
+        ggml_tensor * scale = nullptr) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * residual = post->src[1];
     const ggml_tensor * weights = post->src[2];
@@ -1181,7 +1212,7 @@ static void ggml_cuda_op_hc_post_norm_impl(ggml_backend_cuda_context & ctx, ggml
     a.comb = comb ? (const float *) comb->data : nullptr;
     a.mul = gamma ? (const float *) gamma->data : nullptr;
     a.post_dst = (float *) post->data;
-    a.dst = (float *) (mul ? mul : norm)->data;
+    a.dst = (float *) (postop ? scale : (mul ? mul : norm))->data;
     a.n_embd = x->ne[0];
     a.hc = residual->ne[1];
     a.ncols = norm->ne[0];
@@ -1203,7 +1234,12 @@ static void ggml_cuda_op_hc_post_norm_impl(ggml_backend_cuda_context & ctx, ggml
     const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
     const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), 32*sizeof(float), ctx.stream());
     const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
-    if constexpr (emit) {
+    if constexpr (postop) {
+        auto kernel = block_size == 256
+            ? (comb ? hc_post_norm_scale_kernel<256, true>(layout) : hc_post_norm_scale_kernel<256, false>(layout))
+            : (comb ? hc_post_norm_scale_kernel<1024, true>(layout) : hc_post_norm_scale_kernel<1024, false>(layout));
+        ggml_cuda_kernel_launch(kernel, launch, a, ggml_get_op_params_f32(scale, 0), (half *) f16, (nv_bfloat16 *) bf16);
+    } else if constexpr (emit) {
         auto kernel = block_size == 256
             ? (comb ? (mul ? hc_post_norm_emit_kernel<256, true, true>(layout) : hc_post_norm_emit_kernel<256, true, false>(layout)) : (mul ? hc_post_norm_emit_kernel<256, false, true>(layout) : hc_post_norm_emit_kernel<256, false, false>(layout)))
             : (comb ? (mul ? hc_post_norm_emit_kernel<1024, true, true>(layout) : hc_post_norm_emit_kernel<1024, true, false>(layout)) : (mul ? hc_post_norm_emit_kernel<1024, false, true>(layout) : hc_post_norm_emit_kernel<1024, false, false>(layout)));
@@ -1222,6 +1258,12 @@ void ggml_cuda_op_hc_post_norm(ggml_backend_cuda_context & ctx, ggml_tensor * po
 
 void ggml_cuda_op_hc_post_norm_emit(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, void * f16, void * bf16) {
     ggml_cuda_op_hc_post_norm_impl<true>(ctx, post, norm, mul, f16, bf16);
+}
+
+void ggml_cuda_op_hc_post_norm_scale(ggml_backend_cuda_context & ctx, ggml_tensor * post, ggml_tensor * norm,
+        ggml_tensor * scale, void * f16, void * bf16) {
+    GGML_ASSERT(ggml_cuda_should_fuse_hc_post_norm_scale(post, norm, scale));
+    ggml_cuda_op_hc_post_norm_impl<true, true>(ctx, post, norm, nullptr, f16, bf16, scale);
 }
 
 template <int Block, bool Multiply, bool Add, bool Scale>

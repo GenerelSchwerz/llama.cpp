@@ -3715,6 +3715,7 @@ struct ggml_cuda_hc_post_norm_match {
     ggml_tensor * post = nullptr;
     ggml_tensor * norm = nullptr;
     ggml_tensor * mul = nullptr;
+    ggml_tensor * scale = nullptr;
     int count = 0;
 };
 
@@ -3738,20 +3739,28 @@ static ggml_cuda_hc_post_norm_match ggml_cuda_match_hc_post_norm(ggml_cgraph * c
     }
     if (ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {}) ||
             ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {}) ||
-            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {}) ||
-            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
+            ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
         return match;
     }
+    const bool with_scale = ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {});
     const bool weighted = ggml_cuda_can_fuse(cgraph, norm_i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {});
     ggml_tensor * mul = weighted ? cgraph->nodes[norm_i + 1] : nullptr;
-    const bool closed = reshape
+    ggml_tensor * scale = with_scale ? cgraph->nodes[norm_i + 1] : nullptr;
+    bool closed = reshape
         ? (weighted ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 1, i + 3 }) : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RESHAPE, GGML_OP_RMS_NORM }, { i, i + 1, i + 2 }))
         : (weighted ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 }) : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM }, { i, i + 1 }));
-    if (closed && ggml_cuda_should_fuse_hc_post_norm(post, norm, mul)) {
+    if (scale) {
+        closed = reshape
+            ? ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_SCALE }, { i, i + 1, i + 3 })
+            : ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_SCALE }, { i, i + 2 });
+    }
+    const bool supported = scale ? ggml_cuda_should_fuse_hc_post_norm_scale(post, norm, scale) : ggml_cuda_should_fuse_hc_post_norm(post, norm, mul);
+    if (closed && supported) {
         match.post = post;
         match.norm = norm;
         match.mul = mul;
-        match.count = norm_i - i + 1 + int(weighted);
+        match.scale = scale;
+        match.count = norm_i - i + 1 + int(weighted) + int(with_scale);
     }
     return match;
 }
@@ -3783,7 +3792,7 @@ static bool ggml_cuda_hc_post_norm_memory_ok(const ggml_cgraph * cgraph, int i, 
         }
         return true;
     };
-    const ggml_tensor * writes[] = { match.post, match.mul ? match.mul : match.norm };
+    const ggml_tensor * writes[] = { match.post, match.scale ? match.scale : match.mul ? match.mul : match.norm };
     uintptr_t begin[2], end[2];
     for (int w = 0; w < 2; ++w) {
         if (!range(writes[w], begin[w], end[w])) {
@@ -3855,7 +3864,8 @@ static ggml_cuda_norm_emit_match ggml_cuda_match_norm_emit(ggml_cgraph * graph, 
         match.post = hc.post;
         match.norm = hc.norm;
         match.mul = hc.mul;
-        match.dst = hc.mul ? hc.mul : hc.norm;
+        match.scale = hc.scale;
+        match.dst = hc.scale ? hc.scale : hc.mul ? hc.mul : hc.norm;
         match.last = i + hc.count - 1;
         if (!(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
         return match;
@@ -4010,7 +4020,8 @@ static ggml_cuda_norm_q8_match ggml_cuda_match_norm_q8(ggml_cgraph * graph, int 
         match.post = hc.post;
         match.norm = hc.norm;
         match.mul = hc.mul;
-        match.dst = hc.mul ? hc.mul : hc.norm;
+        match.scale = hc.scale;
+        match.dst = hc.scale ? hc.scale : hc.mul ? hc.mul : hc.norm;
         match.last = i + hc.count - 1;
         if (!(match.norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(match.dst->flags & GGML_TENSOR_FLAG_COMPUTE)) { return {}; }
         return match;
@@ -4863,7 +4874,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_DSV4_HC_POST && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const auto match = ggml_cuda_match_hc_post_norm(cgraph, i);
         if (match.count != 0 && ggml_cuda_hc_post_norm_memory_ok(cgraph, i, match, cuda_ctx->device)) {
-            ggml_cuda_op_hc_post_norm(*cuda_ctx, match.post, match.norm, match.mul);
+            if (match.scale) {
+                ggml_cuda_op_hc_post_norm_scale(*cuda_ctx, match.post, match.norm, match.scale, nullptr, nullptr);
+            } else {
+                ggml_cuda_op_hc_post_norm(*cuda_ctx, match.post, match.norm, match.mul);
+            }
             return match.count - 1;
         }
     }
@@ -5171,8 +5186,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         bf16 = image(typed.bf16);
                     }
                     if (emit.post) {
-                        ggml_cuda_op_hc_post_norm_emit_q8(*cuda_ctx, emit.post, emit.norm, emit.mul, f16, bf16,
-                            q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                        if (emit.scale) {
+                            ggml_cuda_op_dsv4_hc_post(*cuda_ctx, emit.post);
+                            ggml_cuda_op_rms_norm_emit_q8(*cuda_ctx, emit.norm, nullptr, nullptr, emit.scale, f16, bf16,
+                                q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                        } else {
+                            ggml_cuda_op_hc_post_norm_emit_q8(*cuda_ctx, emit.post, emit.norm, emit.mul, f16, bf16,
+                                q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                        }
                     } else {
                         ggml_cuda_op_rms_norm_emit_q8(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, f16, bf16,
                             q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
@@ -5189,7 +5210,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         return shared_inputs[g].get();
                     };
                     if (emit.post) {
-                        ggml_cuda_op_hc_post_norm_emit(*cuda_ctx, emit.post, emit.norm, emit.mul, image(emit.f16), image(emit.bf16));
+                        if (emit.scale) {
+                            ggml_cuda_op_hc_post_norm_scale(*cuda_ctx, emit.post, emit.norm, emit.scale, image(emit.f16), image(emit.bf16));
+                        } else {
+                            ggml_cuda_op_hc_post_norm_emit(*cuda_ctx, emit.post, emit.norm, emit.mul, image(emit.f16), image(emit.bf16));
+                        }
                     } else {
                         ggml_cuda_op_rms_norm_emit(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, image(emit.f16), image(emit.bf16));
                     }
