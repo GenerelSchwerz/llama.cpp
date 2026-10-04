@@ -2911,10 +2911,31 @@ static int test_moe_placement_report(const size_t seed, const float stdev) {
 
     {
         gguf_context_ptr metadata = get_gguf_ctx(LLM_ARCH_QWEN35MOE, true, true, 2, 2, 2);
-        auto params = make_params(nullptr, 0, nullptr, true, 64u * 1024u * 1024u);
+        auto host_buft = ggml_backend_dev_host_buffer_type(cache_dev);
+        check(host_buft != nullptr, "disjoint MTP fixture requires a device host buffer type");
+        if (host_buft == nullptr) {
+            return 1;
+        }
+        const llama_model_layer_range fixture_layers[] = {{0, 2}};
+        llama_model_tensor_buft_override auxiliary_host[] = {
+            {"blk\\.0\\.ffn_down_exps\\.(scale|input_scale)", host_buft},
+            {"blk\\.1\\.ffn_down_exps\\.(scale|input_scale)", host_buft},
+            {"blk\\.2\\.ffn_down_exps\\.(scale|input_scale)", host_buft},
+            {nullptr, nullptr},
+        };
+        auto params = make_params(fixture_layers, 1, auxiliary_host, true, 64u * 1024u * 1024u);
         auto model = load(metadata.get(), params, seed);
         check(model != nullptr, "disjoint MTP fixture failed to load");
         if (model) {
+            for (int layer = 0; layer < 3; ++layer) {
+                for (const char * suffix : {"scale", "input_scale"}) {
+                    const std::string name = "blk." + std::to_string(layer) + ".ffn_down_exps." + suffix;
+                    const auto * tensor = model->get_tensor(name.c_str());
+                    check(tensor != nullptr && tensor->buffer != nullptr &&
+                              ggml_backend_buffer_get_type(tensor->buffer) == host_buft,
+                          "disjoint MTP auxiliary did not use the requested host buffer type");
+                }
+            }
             const auto report = llama_model_moe_placement(model.get());
             bool saw_default = false;
             bool saw_mtp = false;
