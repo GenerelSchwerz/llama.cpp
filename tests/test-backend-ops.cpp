@@ -11225,6 +11225,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K}) {
+        for (ggml_unary_op post_op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 7, type == GGML_TYPE_Q8_0 ? 1 : 3, 1024,
+                {2, 1}, {2, 3}, {0, 1, 2, 3}, 0, 1, false, 0, 0, post_op, true));
+        }
+    }
+
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
             for (bool use_id : {false, true}) {
