@@ -4162,8 +4162,165 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
     return emits;
 }
 
+static bool ggml_cuda_hc_injection_bytes(const ggml_tensor * tensor, size_t & bytes) {
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (tensor->ne[d] <= 0) { return false; }
+    }
+    const size_t block = ggml_blck_size(tensor->type);
+    bytes = ggml_type_size(tensor->type);
+    int first = 0;
+    if (block > 1) {
+        if (!tensor->nb[0] || uint64_t(tensor->ne[0]) > SIZE_MAX/tensor->nb[0] || tensor->ne[0] % block) {
+            return false;
+        }
+        bytes = size_t(tensor->ne[0])*tensor->nb[0]/block;
+        first = 1;
+    }
+    for (int d = first; d < GGML_MAX_DIMS; ++d) {
+        const uint64_t count = tensor->ne[d] - 1;
+        if (count && tensor->nb[d] > (SIZE_MAX - bytes)/count) { return false; }
+        bytes += size_t(count)*tensor->nb[d];
+    }
+    return bytes && bytes == ggml_nbytes(tensor);
+}
+
+static bool ggml_cuda_hc_injection_range(const ggml_tensor * tensor, int device, uintptr_t & begin, uintptr_t & end) {
+    if (!tensor->buffer || !tensor->data || tensor->buffer->buft != ggml_backend_cuda_buffer_type(device)) {
+        return false;
+    }
+    const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(tensor->buffer);
+    const size_t size = ggml_backend_buffer_get_size(tensor->buffer);
+    size_t bytes;
+    if (!ggml_cuda_hc_injection_bytes(tensor, bytes)) { return false; }
+    begin = (uintptr_t) tensor->data;
+    if (begin % sizeof(float)) { return false; }
+    if (begin < base || begin - base > size || bytes > size - (begin - base) || begin > UINTPTR_MAX - bytes) {
+        return false;
+    }
+    if (tensor->view_src) {
+        const ggml_tensor * root = tensor->view_src;
+        const uintptr_t root_begin = (uintptr_t) root->data;
+        size_t root_bytes;
+        if (!ggml_cuda_hc_injection_bytes(root, root_bytes)) { return false; }
+        if (root_begin % sizeof(float) || root->view_src || root->buffer != tensor->buffer || !root->data || root_begin < base || root_begin - base > size ||
+                root_bytes > size - (root_begin - base) || tensor->view_offs > root_bytes || bytes > root_bytes - tensor->view_offs ||
+                root_begin > UINTPTR_MAX - tensor->view_offs || begin != root_begin + tensor->view_offs) {
+            return false;
+        }
+    }
+    end = begin + bytes;
+    return true;
+}
+
+
+struct ggml_cuda_hc_injection_match {
+    ggml_tensor * first = nullptr;
+    ggml_tensor * unary = nullptr;
+    ggml_tensor * last = nullptr;
+    ggml_tensor * post = nullptr;
+    ggml_cuda_hc_post_norm_match hc;
+    int count = 0;
+};
+
+static ggml_cuda_hc_injection_match ggml_cuda_match_hc_injection(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
+    ggml_cuda_hc_injection_match match;
+    ggml_tensor * first = graph->nodes[i];
+    const bool before = first->op == GGML_OP_SCALE;
+    const int u = i + int(before);
+    if (u >= graph->n_nodes || graph->nodes[u]->op != GGML_OP_UNARY) { return match; }
+    ggml_tensor * unary = graph->nodes[u];
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    if (op != GGML_UNARY_OP_SIGMOID && op != GGML_UNARY_OP_SILU) { return match; }
+    const bool after = u + 1 < graph->n_nodes && graph->nodes[u + 1]->op == GGML_OP_SCALE;
+    if (!before && !after) { return match; }
+    const int weight_last = u + int(after);
+    const int post_i = weight_last + 1;
+    if (post_i >= graph->n_nodes) { return match; }
+    ggml_tensor * last = graph->nodes[weight_last];
+    ggml_tensor * post = graph->nodes[post_i];
+    const ggml_tensor * raw = first->src[0];
+    if (!raw || post->op != GGML_OP_DSV4_HC_POST || post->src[2] != last ||
+            (before && unary->src[0] != first) || (after && last->src[0] != unary)) { return match; }
+    for (const ggml_tensor * tensor : {raw, (const ggml_tensor *) first, (const ggml_tensor *) unary, (const ggml_tensor *) last}) {
+        size_t bytes;
+        if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor) || !ggml_are_same_shape(raw, tensor) ||
+                !ggml_cuda_hc_injection_bytes(tensor, bytes) || bytes/sizeof(float) > INT_MAX) { return {}; }
+    }
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * comb = post->src[3];
+    if (!x || !residual || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(post) || !ggml_are_same_shape(post, residual) || x->ne[0] <= 0 || residual->ne[1] <= 0 || x->ne[1] <= 0 ||
+            x->ne[2] != 1 || x->ne[3] != 1 || residual->ne[0] != x->ne[0] || residual->ne[2] != x->ne[1] || residual->ne[3] != 1 ||
+            raw->ne[0] != residual->ne[1] || raw->ne[1] != x->ne[1] || raw->ne[2] != 1 || raw->ne[3] != 1 ||
+            (comb && (comb->type != GGML_TYPE_F32 || comb->ne[0] != residual->ne[1] || comb->ne[1] != residual->ne[1] || comb->ne[2] != x->ne[1] || comb->ne[3] != 1))) { return {}; }
+    size_t bytes;
+    if (!ggml_cuda_hc_injection_bytes(post, bytes) || bytes/sizeof(float) > INT_MAX) { return {}; }
+    auto hc = ggml_cuda_match_hc_post_norm(graph, post_i);
+    if (hc.count && graph->nodes[post_i + hc.count - 1] != (hc.mul ? hc.mul : hc.norm)) { return {}; }
+    if (hc.count && hc.norm->ne[0] != x->ne[0]) {
+        if (comb && bytes/sizeof(float) <= 256) { return {}; }
+        if (hc.norm->ne[0] < x->ne[0] && hc.norm->ne[0] > WARP_SIZE/2 && hc.norm->ne[0] < WARP_SIZE) { return {}; }
+        const int block_size = hc.norm->ne[0] < 1024 ? 256 : 1024;
+        const int64_t nweights = (hc.norm->ne[0] + x->ne[0] - 2)/x->ne[0] + 1;
+        if ((hc.norm->ne[0] < x->ne[0] && hc.norm->ne[0] <= WARP_SIZE/2) || nweights >= block_size) { hc = {}; }
+    }
+    const int end = hc.count ? post_i + hc.count : post_i + 1;
+    const int64_t ncols = hc.count ? hc.norm->ne[0] : 256;
+    const size_t shared = ((hc.count ? 32 : 0) + (ncols + x->ne[0] - 2)/x->ne[0] + 1)*sizeof(float);
+    if (shared > ggml_cuda_info().devices[ctx.device].smpb) { return {}; }
+    std::vector<ggml_op> ops;
+    std::vector<int> outputs;
+    for (int j = i; j < end; ++j) {
+        ops.push_back(graph->nodes[j]->op);
+        if (j <= weight_last || j == post_i || j == end - 1) { outputs.push_back(j); }
+    }
+    if (!ggml_can_fuse_subgraph(graph, i, ops.size(), ops.data(), outputs.data(), outputs.size())) { return {}; }
+    const ggml_tensor * gamma = hc.mul ? hc.mul->src[hc.mul->src[0] == hc.norm ? 1 : 0] : nullptr;
+    const ggml_tensor * reads[] = {raw, x, residual, comb, gamma};
+    for (const ggml_tensor * tensor : reads) {
+        if (!tensor) { continue; }
+        const ggml_tensor * root = tensor->view_src ? tensor->view_src : tensor;
+        size_t span;
+        if (!ggml_cuda_hc_injection_bytes(tensor, span) || span > INT64_MAX) { return {}; }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) { if (tensor->nb[d] % sizeof(float)) { return {}; } }
+        for (int j = i; j < end; ++j) { if (graph->nodes[j] == root) { return {}; } }
+    }
+    if (allocated) {
+        if (hc.count && !ggml_cuda_hc_post_norm_memory_ok(graph, post_i, hc, ctx.device)) { return {}; }
+        std::vector<const ggml_tensor *> writes = {first, unary, last, post};
+        if (hc.count) { writes.push_back(hc.mul ? hc.mul : hc.norm); }
+        std::vector<uintptr_t> wb(writes.size()), we(writes.size());
+        for (size_t j = 0; j < writes.size(); ++j) {
+            if (!ggml_cuda_hc_injection_range(writes[j], ctx.device, wb[j], we[j])) { return {}; }
+            for (size_t k = 0; k < j; ++k) {
+                if (wb[j] < we[k] && wb[k] < we[j] &&
+                        !((j < 3 && k < 3 && wb[j] == wb[k] && we[j] == we[k]) || (j >= 3 && k >= 3 && wb[j] == wb[k] && we[j] == we[k]))) { return {}; }
+            }
+        }
+        for (const ggml_tensor * tensor : reads) {
+            if (!tensor) { continue; }
+            uintptr_t lo, hi;
+            if (!ggml_cuda_hc_injection_range(tensor, ctx.device, lo, hi)) { return {}; }
+            for (size_t j = 0; j < writes.size(); ++j) {
+                if (!(wb[j] < hi && lo < we[j])) { continue; }
+                if (j >= 3 && tensor == residual && !comb && ggml_are_same_shape(writes[j], residual) &&
+                        ggml_are_same_stride(writes[j], residual) && wb[j] == lo && we[j] == hi) { continue; }
+                return {};
+            }
+        }
+    }
+    match.first = first;
+    match.unary = unary;
+    match.last = last;
+    match.post = post;
+    match.hc = hc;
+    match.count = end - i;
+    return match;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
-        const ggml_tensor * shared_input, const char * quantized) {
+        const ggml_tensor * shared_input, const char * quantized, int prepared_hc_post = -1) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -4871,6 +5028,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
+    if (cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const auto injection = ggml_cuda_match_hc_injection(*cuda_ctx, cgraph, i);
+        if (injection.count && (prepared_hc_post < 0 || injection.post != cgraph->nodes[prepared_hc_post] || (!injection.hc.norm && injection.post->src[3]))) {
+            ggml_cuda_op_hc_injection(*cuda_ctx, injection.first, injection.unary, injection.last, injection.post, injection.hc.norm, injection.hc.mul);
+            return injection.count - 1;
+        }
+    }
+
     if (node->op == GGML_OP_DSV4_HC_POST && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const auto match = ggml_cuda_match_hc_post_norm(cgraph, i);
         if (match.count != 0 && ggml_cuda_hc_post_norm_memory_ok(cgraph, i, match, cuda_ctx->device)) {
@@ -5233,7 +5398,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized);
+                int prepared_hc_post = -1;
+                if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY) {
+                    for (int j = i + 1; j < cgraph->n_nodes && j - i <= 3; ++j) {
+                        if ((!norm_emits.empty() && norm_emits[j].post) || (!q8_emits.empty() && q8_emits[j].post)) {
+                            prepared_hc_post = j;
+                            break;
+                        }
+                    }
+                }
+                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized, prepared_hc_post);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -5440,6 +5614,22 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const auto injection = ggml_cuda_match_hc_injection(*cuda_ctx, cgraph, i, false);
+            if (injection.count) {
+                ggml_tensor * terminal = cgraph->nodes[i + injection.count - 1];
+                params->add_alloc_dep(params->user_data, injection.first->src[0], terminal);
+                for (ggml_tensor * tensor : {injection.first, injection.unary, injection.last}) {
+                    if (tensor != terminal) { params->add_alloc_dep(params->user_data, tensor, terminal); }
+                }
+                for (ggml_tensor * tensor : {injection.post->src[0], injection.post->src[1], injection.post->src[3]}) {
+                    if (tensor) { params->add_alloc_dep(params->user_data, tensor, terminal); }
+                }
+                if (injection.hc.mul) {
+                    params->add_alloc_dep(params->user_data, injection.hc.mul->src[injection.hc.mul->src[0] == injection.hc.norm ? 1 : 0], terminal);
+                }
+                i += injection.count - 1;
+                continue;
+            }
             if (cgraph->nodes[i]->op == GGML_OP_DSV4_HC_POST) {
                 const auto match = ggml_cuda_match_hc_post_norm(cgraph, i);
                 if (match.count != 0) {
