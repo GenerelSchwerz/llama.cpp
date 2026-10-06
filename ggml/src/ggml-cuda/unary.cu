@@ -835,3 +835,75 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
         unary_cuda<op_relu_sqr>((const float *)src->data, (float *)sqr_node->data, k, stream);
     }
 }
+
+/* fused scale and activation */
+
+template <float (*op)(float), typename T, bool before, bool after>
+static __global__ void scaled_unary_kernel(const T * x, T * pre_dst, T * unary_dst, T * dst, int k, float scale0, float bias0, float scale1, float bias1) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    ggml_cuda_pdl_sync();
+    float value = ggml_cuda_cast<float>(x[i]);
+    if constexpr (before) {
+        const T pre = ggml_cuda_cast<T>(scale0 * value + bias0);
+        pre_dst[i] = pre;
+        value = ggml_cuda_cast<float>(pre);
+    }
+    const T unary = ggml_cuda_cast<T>(op(value));
+    unary_dst[i] = unary;
+    value = ggml_cuda_cast<float>(unary);
+    if constexpr (after) {
+        value = scale1 * value + bias1;
+    }
+    if constexpr (after) {
+        dst[i] = ggml_cuda_cast<T>(value);
+    }
+}
+
+template <float (*op)(float), typename T>
+static void scaled_unary_cuda(const ggml_tensor * first, const ggml_tensor * unary, const ggml_tensor * last, bool before, bool after, cudaStream_t stream) {
+    const int k = ggml_nelements(last);
+    const float scale0 = before ? ggml_get_op_params_f32(first, 0) : 1.0f;
+    const float bias0  = before ? ggml_get_op_params_f32(first, 1) : 0.0f;
+    const float scale1 = after  ? ggml_get_op_params_f32(last, 0)  : 1.0f;
+    const float bias1  = after  ? ggml_get_op_params_f32(last, 1)  : 0.0f;
+    const ggml_cuda_kernel_launch_params launch((k + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    const T * x = (const T *) first->src[0]->data;
+    T * pre_dst = before ? (T *) first->data : nullptr;
+    T * unary_dst = (T *) unary->data;
+    T * dst = (T *) last->data;
+    if (before && after) {
+        ggml_cuda_kernel_launch(scaled_unary_kernel<op, T, true, true>, launch, x, pre_dst, unary_dst, dst, k, scale0, bias0, scale1, bias1);
+    } else if (before) {
+        ggml_cuda_kernel_launch(scaled_unary_kernel<op, T, true, false>, launch, x, pre_dst, unary_dst, dst, k, scale0, bias0, scale1, bias1);
+    } else {
+        ggml_cuda_kernel_launch(scaled_unary_kernel<op, T, false, true>, launch, x, pre_dst, unary_dst, dst, k, scale0, bias0, scale1, bias1);
+    }
+}
+
+template <float (*op)(float)>
+static void ggml_cuda_op_scaled_unary_impl(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last) {
+    const bool before = first->op == GGML_OP_SCALE;
+    const bool after = last->op == GGML_OP_SCALE;
+    if (first->type == GGML_TYPE_BF16) {
+        scaled_unary_cuda<op, nv_bfloat16>(first, unary, last, before, after, ctx.stream());
+    } else {
+        scaled_unary_cuda<op, float>(first, unary, last, before, after, ctx.stream());
+    }
+}
+
+void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last) {
+    switch (ggml_get_unary_op(unary)) {
+        case GGML_UNARY_OP_SILU:
+            ggml_cuda_op_scaled_unary_impl<op_silu>(ctx, first, unary, last);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            ggml_cuda_op_scaled_unary_impl<op_sigmoid>(ctx, first, unary, last);
+            break;
+        default:
+            GGML_ABORT("Unsupported scaled unary op");
+    }
+}
