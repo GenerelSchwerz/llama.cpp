@@ -4156,19 +4156,20 @@ struct test_mul_mat_unary : public test_case {
     const bool batched;
     const bool affine;
     const bool window;
+    const bool second_post;
     std::vector<ggml_tensor *> stages;
     ggml_tensor * weights = nullptr;
     ggml_tensor * input = nullptr;
 
-    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false, bool window = false)
-        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine), window(window) {}
+    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false, bool window = false, bool second_post = false)
+        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine), window(window), second_post(second_post) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_UNARY";
     }
 
-    std::string vars() override { return VARS_TO_STR7(weight_type, op, before, after, batched, affine, window); }
+    std::string vars() override { return VARS_TO_STR8(weight_type, op, before, after, batched, affine, window, second_post); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
@@ -4194,6 +4195,11 @@ struct test_mul_mat_unary : public test_case {
         out = ggml_unary(ctx, out, op);
         stages.push_back(out);
         if (after) { out = ggml_scale_bias(ctx, out, 1.5f, -0.025f); stages.push_back(out); }
+        if (second_post) {
+            GGML_ASSERT(affine && after);
+            out = ggml_scale_bias(ctx, out, 0.75f, 0.015625f);
+            stages.push_back(out);
+        }
         for (ggml_tensor * stage : stages) { ggml_set_output(stage); }
         ggml_set_name(out, "out");
         return out;
@@ -9356,6 +9362,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, false, false, true, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true, true));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, false, true, false, true));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true, true, true));
         }
     }
 

@@ -328,6 +328,38 @@ static __global__ void affine_unary_window_convert_kernel(affine_unary_args args
     affine_unary_apply(args, value, pos, j);
 }
 
+static __global__ void affine_unary_tail_kernel(affine_unary_args args, void * tail, ggml_type tail_type, float scale, float bias,
+        const void * src, ggml_type src_type, float * raw, int count, int columns, int offset) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= count) { return; }
+    ggml_cuda_pdl_sync();
+    float value = 0.0f;
+    int j = i;
+    if (raw) {
+        const affine_unary_convert_load load{src, src_type, raw};
+        value = load(args.input[0], nullptr, i);
+        const int column = i % columns;
+        if (column < offset || uint32_t(column - offset) >= args.ne[0]) { return; }
+        j = (i/columns)*args.ne[0] + column - offset;
+    }
+    uint32_t remaining = j;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    if (!raw) { value = affine_unary_read(args.input[0], pos); }
+    value = __fmul_rn(value, affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], j, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], j, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], j, value);
+    value = affine_unary_store(args.output[3], args.output_type[3], j, args.scale*value + args.bias);
+    affine_unary_store(tail, tail_type, j, scale*value + bias);
+}
+
 static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
     affine_unary_args args{};
     const ggml_tensor * input[] = { mul->src[0], mul->src[1], add->src[1] };
@@ -356,8 +388,25 @@ static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * 
     return args;
 }
 
-void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
+static void affine_unary_tail_cuda(ggml_backend_cuda_context & ctx, affine_unary_args args, ggml_tensor * tail,
+        const void * src = nullptr, ggml_type src_type = GGML_TYPE_F32, ggml_tensor * mm = nullptr, int offset = 0) {
+    GGML_ASSERT(args.output[3] && tail && (tail->type == GGML_TYPE_F32 || tail->type == GGML_TYPE_BF16));
+    float scale, bias;
+    memcpy(&scale, tail->op_params, sizeof(float));
+    memcpy(&bias, (const char *) tail->op_params + sizeof(float), sizeof(float));
+    const int count = mm ? ggml_nelements(mm) : args.count;
+    const int blocks = (count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_tail_kernel, launch, args, tail->data, tail->type, scale, bias,
+            src, src_type, mm ? (float *) mm->data : nullptr, count, mm ? (int) mm->ne[0] : 0, offset);
+}
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post, ggml_tensor * tail) {
     const auto args = affine_unary_get_args(mul, add, unary, post);
+    if (tail) {
+        affine_unary_tail_cuda(ctx, args, tail);
+        return;
+    }
     const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
     const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
     ggml_cuda_kernel_launch(affine_unary_kernel, launch, args);
@@ -367,6 +416,18 @@ void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_typ
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
     GGML_ASSERT(mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm));
     const auto args = affine_unary_get_args(ops.mul, ops.add, ops.unary, ops.post);
+    if (ops.tail) {
+        const ggml_tensor * input = ops.mul->src[0];
+        GGML_ASSERT(input == mm || (input->op == GGML_OP_VIEW && input->view_src == mm && input->type == GGML_TYPE_F32 &&
+                input->nb[0] == sizeof(float) && input->view_offs % sizeof(float) == 0 && input->ne[0] > 0 && input->ne[0] <= mm->ne[0] &&
+                input->view_offs/sizeof(float) <= uint64_t(mm->ne[0] - input->ne[0])));
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            GGML_ASSERT(input->ne[d] == mm->ne[d] && input->nb[d] == mm->nb[d]);
+        }
+        GGML_ASSERT(ggml_nelements(mm) > 0 && ggml_nelements(mm) <= INT_MAX - CUDA_NEG_BLOCK_SIZE && args.count == ggml_nelements(input));
+        affine_unary_tail_cuda(ctx, args, ops.tail, src, type, mm, input == mm ? 0 : (int) (input->view_offs/sizeof(float)));
+        return;
+    }
     if (ops.mul->src[0] != mm) {
         const ggml_tensor * input = ops.mul->src[0];
         GGML_ASSERT(input->op == GGML_OP_VIEW && input->view_src == mm && input->type == GGML_TYPE_F32 &&
