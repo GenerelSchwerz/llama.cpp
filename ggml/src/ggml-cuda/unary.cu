@@ -388,6 +388,71 @@ static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * 
     return args;
 }
 
+struct mul_add_args {
+    affine_unary_args affine;
+    uint3 ne[GGML_MAX_DIMS];
+    uint3 repeat[3][GGML_MAX_DIMS];
+    uint32_t repeat_mask[3];
+};
+
+static __device__ __forceinline__ float mul_add_read(const affine_unary_tensor & tensor, const uint3 * repeat, const uint32_t * pos, uint32_t repeat_mask) {
+    size_t offset = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint32_t index = repeat_mask & (1u << d) ? fastmodulo(pos[d], repeat[d]) : pos[d];
+        offset += size_t(index)*tensor.nb[d];
+    }
+    const char * ptr = (const char *) tensor.data + offset;
+    if (tensor.type == GGML_TYPE_F16) { return ggml_cuda_cast<float>(*(const half *) ptr); }
+    if (tensor.type == GGML_TYPE_BF16) { return ggml_cuda_cast<float>(*(const nv_bfloat16 *) ptr); }
+    return *(const float *) ptr;
+}
+
+static __global__ void mul_add_kernel(mul_add_args binary, bool product_first) {
+    const affine_unary_args & args = binary.affine;
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) { return; }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        const uint2 part = fast_div_modulo(remaining, binary.ne[d]);
+        remaining = part.x;
+        pos[d] = part.y;
+    }
+    ggml_cuda_pdl_sync();
+    float value = __fmul_rn(mul_add_read(args.input[0], binary.repeat[0], pos, 0), mul_add_read(args.input[1], binary.repeat[1], pos, binary.repeat_mask[1]));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    const float base = mul_add_read(args.input[2], binary.repeat[2], pos, binary.repeat_mask[2]);
+    value = product_first ? __fadd_rn(value, base) : __fadd_rn(base, value);
+    affine_unary_store(args.output[1], args.output_type[1], i, value);
+}
+
+void ggml_cuda_op_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
+    mul_add_args binary{};
+    affine_unary_args & args = binary.affine;
+    const bool product_first = add->src[0] == mul;
+    const ggml_tensor * reads[] = {mul->src[0], mul->src[1], add->src[product_first ? 1 : 0]};
+    for (int j = 0; j < 3; ++j) {
+        args.input[j].data = reads[j]->data;
+        args.input[j].type = reads[j]->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = reads[j]->ne[d];
+            args.input[j].nb[d] = reads[j]->ne[d] == 1 ? 0 : reads[j]->nb[d];
+            binary.repeat[j][d] = init_fastdiv_values(reads[j]->ne[d]);
+            if (reads[j]->ne[d] != 1 && reads[j]->ne[d] != mul->ne[d]) { binary.repeat_mask[j] |= 1u << d; }
+        }
+    }
+    args.output[0] = mul->data;
+    args.output[1] = add->data;
+    args.output_type[0] = mul->type;
+    args.output_type[1] = add->type;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) { binary.ne[d] = init_fastdiv_values(mul->ne[d]); }
+    args.count = ggml_nelements(mul);
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(mul_add_kernel, launch, binary, product_first);
+}
+
 static void affine_unary_tail_cuda(ggml_backend_cuda_context & ctx, affine_unary_args args, ggml_tensor * tail,
         const void * src = nullptr, ggml_type src_type = GGML_TYPE_F32, ggml_tensor * mm = nullptr, int offset = 0) {
     GGML_ASSERT(args.output[3] && tail && (tail->type == GGML_TYPE_F32 || tail->type == GGML_TYPE_BF16));

@@ -3296,14 +3296,23 @@ struct test_bin_bcast : public test_case {
     bool perm1; // permute src1?
     bool src_overlap; // src0 and src1 are overlapping views of the same buffer
     const ggml_type type_b; // type of src1, GGML_TYPE_COUNT -> same as src0
+    const bool add_after;
+    const bool swap_add;
+    std::vector<ggml_tensor *> stages;
 
-    bool run_whole_graph() override { return nf > 1; }
+    bool run_whole_graph() override { return nf > 1 || add_after; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        return add_after ? "MUL_ADD" : test_case::op_desc(t);
+    }
 
     std::string vars() override {
         std::string s = VARS_TO_STR6(type, ne, nr, nf, perm1, src_overlap);
         if (type_b != GGML_TYPE_COUNT) {
             s += "," + VAR_TO_STR(type_b);
         }
+        if (add_after) { s += "," + VARS_TO_STR2(add_after, swap_add); }
         return s;
     }
 
@@ -3316,11 +3325,12 @@ struct test_bin_bcast : public test_case {
             std::array<int, 4> nr = {1, 2, 1, 1},
             int nf = 1,
             bool perm1 = false, bool src_overlap = false,
-            ggml_type type_b = GGML_TYPE_COUNT)
-        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b) {}
+            ggml_type type_b = GGML_TYPE_COUNT, bool add_after = false, bool swap_add = false)
+        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b), add_after(add_after), swap_add(swap_add) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(nf <= 16);
+        stages.clear();
 
         ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0]*nr[0], ne[1]*nr[1], ne[2]*nr[2], ne[3]*nr[3]);
         ggml_set_name(a, "a");
@@ -3361,6 +3371,15 @@ struct test_bin_bcast : public test_case {
             out = op(ctx, out, b[i]);
         }
 
+        if (add_after) {
+            GGML_ASSERT(op == ggml_mul && nf == 1);
+            ggml_set_output(out);
+            stages.push_back(out);
+            ggml_tensor * residual = ggml_new_tensor(ctx, type, 4, out->ne);
+            ggml_set_name(residual, "residual");
+            out = swap_add ? ggml_add(ctx, residual, out) : ggml_add(ctx, out, residual);
+            stages.push_back(out);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -10003,6 +10022,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     {1, 2, 0, 3},   // 3-cycle
                     {0, 2, 1, 3} }) {
                 test_cases.emplace_back(new test_cont(type_dst, ne, false, perm));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (bool permute : {false, true}) {
+            for (bool swap : {false, true}) {
+                test_cases.emplace_back(new test_bin_bcast(ggml_mul, type, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, permute, false, GGML_TYPE_COUNT, true, swap));
+                if (type != GGML_TYPE_F32) {
+                    test_cases.emplace_back(new test_bin_bcast(ggml_mul, type, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, permute, false, GGML_TYPE_F32, true, swap));
+                }
             }
         }
     }
