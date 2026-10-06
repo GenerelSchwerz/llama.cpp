@@ -93,6 +93,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
@@ -121,3 +123,5 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 
     return ggml_cuda_op_silu_single(gate) * up;
 }
+
+void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last);

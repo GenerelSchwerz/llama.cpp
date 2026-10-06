@@ -4319,6 +4319,11 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_hc;
     const int64_t n_tokens;
     const bool    gated;
+    const ggml_type projection_type;
+    const bool computed;
+    ggml_tensor * projection = nullptr;
+    ggml_tensor * projection_weights = nullptr;
+    ggml_tensor * projection_input = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4326,18 +4331,53 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated);
+        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed));
     }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated) {}
+    bool run_whole_graph() override { return projection_type != GGML_TYPE_COUNT; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
+
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        if (!projection) { return; }
+        // signed powers of two keep the projection sums exact in F16
+        for (ggml_tensor * t : {projection_weights, projection_input}) {
+            std::vector<float> data(ggml_nelements(t));
+            for (int64_t row = 0; row < t->ne[1]; ++row) {
+                for (int64_t col = 0; col < t->ne[0]; ++col) {
+                    data[row*t->ne[0] + col] = ((row*13 + col*7) % 11 < 5 ? -1.0f : 1.0f)/32.0f;
+                }
+            }
+            std::vector<uint8_t> bytes(ggml_nbytes(t));
+            ggml_quantize_chunk(t->type, data.data(), bytes.data(), 0, t->ne[1], t->ne[0], nullptr);
+            ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+        }
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        projection = nullptr;
+        projection_weights = nullptr;
+        projection_input = nullptr;
         ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
         ggml_set_name(x, "x");
 
         if (gated) {
-            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            ggml_tensor * gate;
+            if (projection_type != GGML_TYPE_COUNT) {
+                ggml_tensor * weights = ggml_new_tensor_2d(ctx, projection_type, 127, n_embd*n_hc);
+                ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 127, n_tokens);
+                projection_weights = weights;
+                projection_input = input;
+                if (computed) { weights = ggml_cont(ctx, weights); }
+                projection = ggml_mul_mat(ctx, weights, input);
+                ggml_set_output(projection);
+                gate = ggml_reshape_3d(ctx, projection, n_embd, n_hc, n_tokens);
+            } else {
+                gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_hc, n_tokens);
+            }
             ggml_set_name(gate, "gate");
 
             out = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f/n_hc);
@@ -9253,6 +9293,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_pre(4096, 4, 21, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(512, 4, 32, true, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_dsv4_hc_pre(257, 3, 17, true, GGML_TYPE_F16, true));
+    test_cases.emplace_back(new test_dsv4_hc_pre(257, 3, 17, true, GGML_TYPE_BF16));
     for (int64_t n_hc : {1, 2, 3, 5, 8, 65}) {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17));
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
