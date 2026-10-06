@@ -247,7 +247,25 @@ static __device__ __forceinline__ float affine_unary_store(void * dst, ggml_type
     return value;
 }
 
-static __global__ void affine_unary_kernel(affine_unary_args args) {
+struct affine_unary_load {
+    __device__ __forceinline__ float operator()(const affine_unary_tensor & tensor, const uint32_t * pos, int) const {
+        return affine_unary_read(tensor, pos);
+    }
+};
+
+struct affine_unary_convert_load {
+    const void * data;
+    ggml_type type;
+    float * raw;
+    __device__ __forceinline__ float operator()(const affine_unary_tensor &, const uint32_t *, int i) const {
+        const float value = type == GGML_TYPE_F16 ? ggml_cuda_cast<float>(((const half *) data)[i]) : ggml_cuda_cast<float>(((const nv_bfloat16 *) data)[i]);
+        raw[i] = value;
+        return value;
+    }
+};
+
+template <typename Load>
+static __device__ __forceinline__ void affine_unary_impl(affine_unary_args args, Load load) {
     ggml_cuda_pdl_lc();
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
     if (i >= args.count) {
@@ -260,7 +278,7 @@ static __global__ void affine_unary_kernel(affine_unary_args args) {
         remaining /= args.ne[d];
     }
     ggml_cuda_pdl_sync();
-    float value = __fmul_rn(affine_unary_read(args.input[0], pos), affine_unary_read(args.input[1], pos));
+    float value = __fmul_rn(load(args.input[0], pos, i), affine_unary_read(args.input[1], pos));
     value = affine_unary_store(args.output[0], args.output_type[0], i, value);
     value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
     value = affine_unary_store(args.output[1], args.output_type[1], i, value);
@@ -271,7 +289,15 @@ static __global__ void affine_unary_kernel(affine_unary_args args) {
     }
 }
 
-void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
+static __global__ void affine_unary_kernel(affine_unary_args args) {
+    affine_unary_impl(args, affine_unary_load{});
+}
+
+static __global__ void affine_unary_convert_kernel(affine_unary_args args, const void * src, ggml_type type, float * raw) {
+    affine_unary_impl(args, affine_unary_convert_load{src, type, raw});
+}
+
+static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
     affine_unary_args args{};
     const ggml_tensor * input[] = { mul->src[0], mul->src[1], add->src[1] };
     const ggml_tensor * output[] = { mul, add, unary, post };
@@ -296,9 +322,24 @@ void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mu
         memcpy(&args.scale, post->op_params, sizeof(float));
         memcpy(&args.bias, (const char *) post->op_params + sizeof(float), sizeof(float));
     }
+    return args;
+}
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
+    const auto args = affine_unary_get_args(mul, add, unary, post);
     const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
     const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
     ggml_cuda_kernel_launch(affine_unary_kernel, launch, args);
+}
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops) {
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
+    GGML_ASSERT(mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && ops.mul->src[0] == mm);
+    const auto args = affine_unary_get_args(ops.mul, ops.add, ops.unary, ops.post);
+    GGML_ASSERT(args.count == ggml_nelements(mm));
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_convert_kernel, launch, args, src, type, (float *) mm->data);
 }
 
 void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

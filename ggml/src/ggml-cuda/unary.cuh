@@ -133,3 +133,12 @@ struct ggml_cuda_scaled_unary_args {
 };
 
 void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args);
+
+struct ggml_cuda_affine_unary_ops {
+    ggml_tensor * mul;
+    ggml_tensor * add;
+    ggml_tensor * unary;
+    ggml_tensor * post;
+};
+
+void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops);

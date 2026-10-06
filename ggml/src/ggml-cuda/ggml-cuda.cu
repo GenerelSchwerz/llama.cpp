@@ -1412,7 +1412,7 @@ static bool ggml_cuda_cublas_prefer_f32_output(ggml_type type, int cc) {
 }
 
 template<ggml_type compute_type>
-static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const void * prepared_src1 = nullptr, ggml_tensor * hc_dst = nullptr, const ggml_cuda_scaled_unary_args * unary = nullptr) {
+static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const void * prepared_src1 = nullptr, ggml_tensor * hc_dst = nullptr, const ggml_cuda_scaled_unary_args * unary = nullptr, const ggml_cuda_affine_unary_ops * affine = nullptr) {
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -1628,6 +1628,8 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
             ggml_cuda_op_dsv4_hc_pre_convert(ctx, traits::ggml_type_val, dst_temp.get(), dst, hc_dst);
         } else if (unary) {
             ggml_cuda_op_scaled_unary_convert(ctx, traits::ggml_type_val, dst_temp.get(), dst, *unary);
+        } else if (affine) {
+            ggml_cuda_op_affine_unary_convert(ctx, traits::ggml_type_val, dst_temp.get(), dst, *affine);
         } else {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(traits::ggml_type_val);
             to_fp32_cuda(dst_temp.get(), dst_ddf, ne_dst, main_stream);
@@ -1677,17 +1679,17 @@ static ggml_type ggml_cuda_mul_mat_cublas_compute_type(int cc, const ggml_tensor
     return compute_type;
 }
 
-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const void * prepared_src1 = nullptr, ggml_tensor * hc_dst = nullptr, const ggml_cuda_scaled_unary_args * unary = nullptr) {
+static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const void * prepared_src1 = nullptr, ggml_tensor * hc_dst = nullptr, const ggml_cuda_scaled_unary_args * unary = nullptr, const ggml_cuda_affine_unary_ops * affine = nullptr) {
     const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(ggml_cuda_info().devices[ctx.device].cc, src0, src1, dst, true);
     switch (compute_type) {
         case GGML_TYPE_F32:
-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary);
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F32>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary, affine);
             break;
         case GGML_TYPE_BF16:
-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary);
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_BF16>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary, affine);
             break;
         case GGML_TYPE_F16:
-            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary);
+            ggml_cuda_mul_mat_cublas_impl<GGML_TYPE_F16>(ctx, src0, src1, dst, prepared_src1, hc_dst, unary, affine);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -5067,12 +5069,14 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
     const size_t shared = ((hc.count ? 32 : 0) + (ncols + x->ne[0] - 2)/x->ne[0] + 1)*sizeof(float);
     if (shared > ggml_cuda_info().devices[ctx.device].smpb) { return {}; }
     std::vector<ggml_op> ops;
+    std::vector<int> indices;
     std::vector<int> outputs;
     for (int j = i; j < end; ++j) {
         ops.push_back(graph->nodes[j]->op);
+        indices.push_back(j);
         if ((!hc.mul && !hc.scale) || graph->nodes[j] != hc.norm) { outputs.push_back(j); }
     }
-    if (!ggml_can_fuse_subgraph(graph, i, end - i, ops.data(), outputs.data(), outputs.size())) { return {}; }
+    if (!ggml_can_fuse_subgraph_ext(graph, indices.data(), indices.size(), ops.data(), outputs.data(), outputs.size())) { return {}; }
     if (allocated) {
         if (hc.count && !ggml_cuda_hc_post_norm_memory_ok(graph, post_i, hc, ctx.device)) { return {}; }
         std::vector<const ggml_tensor *> reads = {gate_inputs[0], gate_inputs[1], gate_inputs[2], x, residual, post_comb};
@@ -5109,6 +5113,55 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
         }
     }
     return {affine, post, comb, hc, end - i};
+}
+
+struct ggml_cuda_cublas_affine_match {
+    ggml_tensor * mm = nullptr;
+    ggml_cuda_affine_unary_match affine;
+    int count = 0;
+};
+
+static ggml_cuda_cublas_affine_match ggml_cuda_match_cublas_affine(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
+    ggml_tensor * mm = graph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || !mm->src[0] || !mm->src[1] || mm->type != GGML_TYPE_F32 || mm->src[1]->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(mm) || i + 1 >= graph->n_nodes || ggml_cuda_op_mul_mat_use_fwht(mm)) { return {}; }
+    int first = i + 1;
+    while (first < graph->n_nodes && graph->nodes[first]->op == GGML_OP_VIEW) {
+        if (!ggml_cuda_affine_unary_prior_view(graph, i, graph->nodes[first])) { return {}; }
+        uintptr_t begin, end;
+        if (allocated && !ggml_cuda_affine_unary_range(graph->nodes[first], ctx.device, begin, end)) { return {}; }
+        ++first;
+    }
+    if (first >= graph->n_nodes) { return {}; }
+    const auto affine = ggml_cuda_match_affine_unary(ctx, graph, first, allocated);
+    if (!affine.count || affine.mul->src[0] != mm || ggml_cuda_match_hc_affine_injection(ctx, graph, first, false).count) { return {}; }
+    if (ggml_cuda_mul_mat_kernel(mm->src[0], mm->src[1], mm, ctx.device) != GGML_CUDA_MM_CUBLAS) { return {}; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    const ggml_type type = ggml_cuda_mul_mat_cublas_compute_type(cc, mm->src[0], mm->src[1], mm, false);
+    if ((type != GGML_TYPE_F16 && type != GGML_TYPE_BF16) || ggml_cuda_cublas_prefer_f32_output(type, cc)) { return {}; }
+    const int count = first - i + affine.count;
+    std::vector<ggml_op> ops;
+    std::vector<int> outputs;
+    for (int j = i; j < i + count; ++j) { ops.push_back(graph->nodes[j]->op); outputs.push_back(j); }
+    if (!ggml_can_fuse_subgraph_ext(graph, outputs.data(), count, ops.data(), outputs.data(), outputs.size())) { return {}; }
+    if (allocated) {
+        uintptr_t rb[4], re[4], wb[5], we[5];
+        const ggml_tensor * reads[] = {mm->src[0], mm->src[1], affine.mul->src[1], affine.add->src[1]};
+        const ggml_tensor * writes[] = {mm, affine.mul, affine.add, affine.unary, affine.post};
+        for (int j = 0; j < 4; ++j) {
+            if (j < 2 ? !ggml_cuda_hc_up_range(reads[j], ctx.device, rb[j], re[j]) : !ggml_cuda_affine_unary_range(reads[j], ctx.device, rb[j], re[j])) { return {}; }
+        }
+        for (int j = 0; j < 5; ++j) {
+            if (!writes[j]) { continue; }
+            if (!(writes[j]->flags & GGML_TENSOR_FLAG_COMPUTE) || !ggml_cuda_affine_unary_range(writes[j], ctx.device, wb[j], we[j])) { return {}; }
+            for (int k = 0; k < 4; ++k) { if (wb[j] < re[k] && rb[k] < we[j]) { return {}; } }
+            for (int k = 0; k < j; ++k) {
+                if (writes[k] && wb[j] < we[k] && wb[k] < we[j] &&
+                        (wb[j] != wb[k] || we[j] != we[k] || writes[j]->type != writes[k]->type)) { return {}; }
+            }
+        }
+    }
+    return {mm, affine, count};
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
@@ -5902,6 +5955,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
+        const auto match = ggml_cuda_match_cublas_affine(*cuda_ctx, cgraph, i);
+        if (match.count) {
+            const auto & affine = match.affine;
+            const ggml_cuda_affine_unary_ops ops = {affine.mul, affine.add, affine.unary, affine.post};
+            ggml_cuda_mul_mat_cublas(*cuda_ctx, match.mm->src[0], match.mm->src[1], match.mm, prepared_src1, nullptr, nullptr, &ops);
+            return match.count - 1;
+        }
+    }
+
+    if (cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const auto match = ggml_cuda_match_cublas_unary(*cuda_ctx, cgraph, i);
         if (match.count) {
             const ggml_cuda_scaled_unary_args args = {match.unary.first, match.unary.unary, match.unary.last};
@@ -6614,6 +6677,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const auto cublas_affine = ggml_cuda_match_cublas_affine(*cuda_ctx, cgraph, i, false);
+            if (cublas_affine.count) {
+                ggml_tensor * terminal = cublas_affine.affine.post ? cublas_affine.affine.post : cublas_affine.affine.unary;
+                for (ggml_tensor * read : {cublas_affine.mm->src[0], cublas_affine.mm->src[1], cublas_affine.affine.mul->src[1], cublas_affine.affine.add->src[1]}) {
+                    params->add_alloc_dep(params->user_data, read, terminal);
+                }
+            }
             const auto unary = ggml_cuda_match_cublas_unary(*cuda_ctx, cgraph, i, false);
             if (unary.count) {
                 params->add_alloc_dep(params->user_data, unary.mm->src[0], unary.unary.last);
