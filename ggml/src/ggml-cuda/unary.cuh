@@ -125,3 +125,11 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
 }
 
 void ggml_cuda_op_scaled_unary(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last);
+
+struct ggml_cuda_scaled_unary_args {
+    const ggml_tensor * first;
+    const ggml_tensor * unary;
+    const ggml_tensor * last;
+};
+
+void ggml_cuda_op_scaled_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_scaled_unary_args & args);

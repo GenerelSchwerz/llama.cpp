@@ -4148,6 +4148,61 @@ struct test_unary_mul : public test_case {
     }
 };
 
+struct test_mul_mat_unary : public test_case {
+    const ggml_type weight_type;
+    const ggml_unary_op op;
+    const bool before;
+    const bool after;
+    const bool batched;
+    std::vector<ggml_tensor *> stages;
+    ggml_tensor * weights = nullptr;
+    ggml_tensor * input = nullptr;
+
+    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched)
+        : weight_type(weight_type), op(op), before(before), after(after), batched(batched) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_UNARY";
+    }
+
+    std::string vars() override { return VARS_TO_STR5(weight_type, op, before, after, batched); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        weights = ggml_new_tensor_4d(ctx, weight_type, 127, 129, batched ? 2 : 1, 1);
+        input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 127, 17, batched ? 2 : 1, 1);
+        ggml_tensor * out = ggml_mul_mat(ctx, weights, input);
+        stages = {out};
+        if (before) { out = ggml_scale_bias(ctx, out, 0.75f, 0.125f); stages.push_back(out); }
+        out = ggml_unary(ctx, out, op);
+        stages.push_back(out);
+        if (after) { out = ggml_scale_bias(ctx, out, 1.5f, -0.025f); stages.push_back(out); }
+        for (ggml_tensor * stage : stages) { ggml_set_output(stage); }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) { init_tensor_uniform(t); }
+        // Exact projection sums keep the original backend tolerance valid.
+        for (ggml_tensor * t : {weights, input}) {
+            std::vector<float> values(ggml_nelements(t));
+            for (size_t i = 0; i < values.size(); ++i) { values[i] = ((i*13 + i/127)%7 < 3 ? -1.0f : 1.0f)/32.0f; }
+            if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> typed(values.size());
+                ggml_fp32_to_fp16_row(values.data(), typed.data(), typed.size());
+                ggml_backend_tensor_set(t, typed.data(), 0, ggml_nbytes(t));
+            } else if (t->type == GGML_TYPE_BF16) {
+                std::vector<ggml_bf16_t> typed(values.size());
+                ggml_fp32_to_bf16_row(values.data(), typed.data(), typed.size());
+                ggml_backend_tensor_set(t, typed.data(), 0, ggml_nbytes(t));
+            } else { ggml_backend_tensor_set(t, values.data(), 0, ggml_nbytes(t)); }
+        }
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -9275,6 +9330,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 1}));   // ne[2] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
+    }
+
+    for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32}) {
+        for (ggml_unary_op op : {GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID}) {
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, true, true, false));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, false, false));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true));
+        }
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
