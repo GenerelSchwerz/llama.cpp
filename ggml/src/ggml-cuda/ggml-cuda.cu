@@ -3664,11 +3664,13 @@ static ggml_cuda_hc_injection_match ggml_cuda_match_hc_injection(ggml_backend_cu
     size_t bytes;
     if (!ggml_cuda_hc_injection_bytes(post, bytes) || bytes/sizeof(float) > INT_MAX) { return {}; }
     auto hc = ggml_cuda_match_hc_post_norm(graph, post_i);
+    if (hc.count && graph->nodes[post_i + hc.count - 1] != (hc.mul ? hc.mul : hc.norm)) { return {}; }
     if (hc.count && hc.norm->ne[0] != x->ne[0]) {
         if (comb && bytes/sizeof(float) <= 256) { return {}; }
+        if (hc.norm->ne[0] < x->ne[0] && hc.norm->ne[0] > WARP_SIZE/2 && hc.norm->ne[0] < WARP_SIZE) { return {}; }
         const int block_size = hc.norm->ne[0] < 1024 ? 256 : 1024;
         const int64_t nweights = (hc.norm->ne[0] + x->ne[0] - 2)/x->ne[0] + 1;
-        if (nweights >= block_size) { hc = {}; }
+        if ((hc.norm->ne[0] < x->ne[0] && hc.norm->ne[0] <= WARP_SIZE/2) || nweights >= block_size) { hc = {}; }
     }
     const int end = hc.count ? post_i + hc.count : post_i + 1;
     const int64_t ncols = hc.count ? hc.norm->ne[0] : 256;
