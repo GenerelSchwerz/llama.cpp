@@ -199,6 +199,108 @@ void ggml_cuda_op_sigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_sigmoid>(ctx, dst);
 }
 
+struct affine_unary_tensor {
+    const void * data;
+    ggml_type type;
+    uint32_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+};
+
+struct affine_unary_args {
+    affine_unary_tensor input[3];
+    void * output[4];
+    ggml_type output_type[4];
+    uint32_t ne[GGML_MAX_DIMS];
+    int count;
+    ggml_unary_op op;
+    float scale;
+    float bias;
+};
+
+static __device__ __forceinline__ float affine_unary_read(const affine_unary_tensor & tensor, const uint32_t * pos) {
+    size_t offset = 0;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        offset += size_t(pos[d] % tensor.ne[d])*tensor.nb[d];
+    }
+    const char * ptr = (const char *) tensor.data + offset;
+    if (tensor.type == GGML_TYPE_F16) {
+        return ggml_cuda_cast<float>(*(const half *) ptr);
+    }
+    if (tensor.type == GGML_TYPE_BF16) {
+        return ggml_cuda_cast<float>(*(const nv_bfloat16 *) ptr);
+    }
+    return *(const float *) ptr;
+}
+
+static __device__ __forceinline__ float affine_unary_store(void * dst, ggml_type type, int i, float value) {
+    if (type == GGML_TYPE_F16) {
+        const half rounded = ggml_cuda_cast<half>(value);
+        ((half *) dst)[i] = rounded;
+        return ggml_cuda_cast<float>(rounded);
+    }
+    if (type == GGML_TYPE_BF16) {
+        const nv_bfloat16 rounded = ggml_cuda_cast<nv_bfloat16>(value);
+        ((nv_bfloat16 *) dst)[i] = rounded;
+        return ggml_cuda_cast<float>(rounded);
+    }
+    ((float *) dst)[i] = value;
+    return value;
+}
+
+static __global__ void affine_unary_kernel(affine_unary_args args) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.count) {
+        return;
+    }
+    uint32_t remaining = i;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    ggml_cuda_pdl_sync();
+    float value = __fmul_rn(affine_unary_read(args.input[0], pos), affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], i, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], i, value);
+    if (args.output[3]) {
+        affine_unary_store(args.output[3], args.output_type[3], i, args.scale*value + args.bias);
+    }
+}
+
+void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
+    affine_unary_args args{};
+    const ggml_tensor * input[] = { mul->src[0], mul->src[1], add->src[1] };
+    const ggml_tensor * output[] = { mul, add, unary, post };
+    for (int j = 0; j < 3; ++j) {
+        args.input[j].data = input[j]->data;
+        args.input[j].type = input[j]->type;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            args.input[j].ne[d] = input[j]->ne[d];
+            args.input[j].nb[d] = input[j]->nb[d];
+        }
+    }
+    for (int j = 0; j < 4; ++j) {
+        if (output[j]) {
+            args.output[j] = output[j]->data;
+            args.output_type[j] = output[j]->type;
+        }
+        args.ne[j] = mul->ne[j];
+    }
+    args.count = ggml_nelements(mul);
+    args.op = ggml_get_unary_op(unary);
+    if (post) {
+        memcpy(&args.scale, post->op_params, sizeof(float));
+        memcpy(&args.bias, (const char *) post->op_params + sizeof(float), sizeof(float));
+    }
+    const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(affine_unary_kernel, launch, args);
+}
+
 void ggml_cuda_op_hardsigmoid(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_hardsigmoid>(ctx, dst);
 }
