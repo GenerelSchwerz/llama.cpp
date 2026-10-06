@@ -1,5 +1,6 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "convert.cuh"
 
 
 static constexpr int DSV4_HC = 4;
@@ -100,10 +101,26 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
-static __global__ void dsv4_hc_pre_f32(
+struct ggml_cuda_hc_gate_f32 {
+    const float * data;
+    __device__ __forceinline__ float operator()(int64_t i) const { return data[i]; }
+};
+
+template <typename T>
+struct ggml_cuda_hc_gate_convert {
+    const T * data;
+    float * raw;
+    __device__ __forceinline__ float operator()(int64_t i) const {
+        const float value = ggml_cuda_cast<float>(data[i]);
+        raw[i] = value;
+        return value;
+    }
+};
+
+template <bool gated, typename Gate>
+static __device__ __forceinline__ void dsv4_hc_pre_impl(
         const float * x,
-        const float * weights,
+        const Gate weights,
         float * dst,
         int64_t n_embd,
         int64_t hc,
@@ -135,14 +152,48 @@ static __global__ void dsv4_hc_pre_f32(
         const float xv = x[i0*sx0 + ih*sx1 + it*sx2];
         float wv;
         if constexpr (gated) {
-            wv = 1.0f / (1.0f + expf(-weights[i0*sw0 + ih*sw1 + it*sw2]));
+            wv = 1.0f / (1.0f + expf(-weights(i0*sw0 + ih*sw1 + it*sw2)));
         } else {
-            wv = weights[ih*sw0 + it*sw1];
+            wv = weights(ih*sw0 + it*sw1);
         }
         sum += xv * wv;
     }
 
     dst[i0*sd0 + it*sd1] = scale * sum;
+}
+
+template <bool gated>
+static __global__ void dsv4_hc_pre_f32(
+        const float * x,
+        const float * weights,
+        float * dst,
+        int64_t n_embd,
+        int64_t hc,
+        int64_t n_tokens,
+        int64_t sx0,
+        int64_t sx1,
+        int64_t sx2,
+        int64_t sw0,
+        int64_t sw1,
+        int64_t sw2,
+        int64_t sd0,
+        int64_t sd1,
+        float   scale) {
+    dsv4_hc_pre_impl<gated>(
+            x, ggml_cuda_hc_gate_f32{weights}, dst, n_embd, hc, n_tokens,
+            sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale);
+}
+
+template <typename T>
+static __global__ void dsv4_hc_pre_convert(
+        const float * x, const void * weights, float * raw, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens,
+        int64_t sx0, int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd0, int64_t sd1, float scale) {
+    dsv4_hc_pre_impl<true>(
+            x, ggml_cuda_hc_gate_convert<T>{(const T *) weights, raw}, dst, n_embd, hc, n_tokens,
+            sx0, sx1, sx2, sw0, sw1, sw2, sd0, sd1, scale);
 }
 
 template <bool has_comb>
@@ -270,6 +321,33 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
             scale);
+}
+
+void ggml_cuda_op_dsv4_hc_pre_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * weights, ggml_tensor * mm, ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * view = dst->src[1];
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 1) && ggml_is_contiguous(mm) && ggml_is_contiguous(view));
+
+    const int64_t nr = x->ne[0]*x->ne[2];
+    const dim3 block_dims(256, 1, 1);
+    const dim3 grid_dims((nr + block_dims.x - 1)/block_dims.x, 1, 1);
+    const ggml_cuda_kernel_launch_params params(grid_dims, block_dims, 0, ctx.stream());
+    const auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        ggml_cuda_kernel_launch(dsv4_hc_pre_convert<T>, params,
+                (const float *) x->data, weights, (float *) mm->data, (float *) dst->data,
+                x->ne[0], x->ne[1], x->ne[2],
+                x->nb[0]/sizeof(float), x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+                view->nb[0]/sizeof(float), view->nb[1]/sizeof(float), view->nb[2]/sizeof(float),
+                dst->nb[0]/sizeof(float), dst->nb[1]/sizeof(float), ggml_get_op_params_f32(dst, 0));
+    };
+    if (type == GGML_TYPE_F16) {
+        launch(half{});
+    } else {
+        launch(nv_bfloat16{});
+    }
 }
 
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
