@@ -494,6 +494,63 @@ void ggml_cuda_op_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_kernel_launch(repeat_mul_add_kernel, launch, binary, mul->src[0] == repeat ? 0 : 1, add->src[0] == mul);
 }
 
+struct ordered_mul_add_args {
+    const char * input[2];
+    size_t row_stride[2];
+    size_t stream_stride[2];
+    float * products[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    float * sums[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    bool product_first[GGML_CUDA_ORDERED_MUL_ADD_MAX];
+    uint3 columns;
+    uint3 coefficient_rows;
+    int elements;
+    int count;
+};
+
+static __global__ void ordered_mul_add_kernel(ordered_mul_add_args args) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= args.elements) { return; }
+    const uint2 pos = fast_div_modulo(i, args.columns);
+    const size_t x_row = size_t(pos.x)*args.row_stride[0] + size_t(pos.y)*sizeof(float);
+    const size_t w_row = size_t(fastmodulo(pos.x, args.coefficient_rows))*args.row_stride[1];
+    ggml_cuda_pdl_sync();
+    float sum = 0.0f;
+    for (int j = 0; j < args.count; ++j) {
+        const float x = *(const float *) (args.input[0] + x_row + size_t(j)*args.stream_stride[0]);
+        const float w = *(const float *) (args.input[1] + w_row + size_t(j)*args.stream_stride[1]);
+        const float product = __fmul_rn(x, w);
+        args.products[j][i] = product;
+        if (j == 0) { sum = product; }
+        else {
+            sum = args.product_first[j] ? __fadd_rn(product, sum) : __fadd_rn(sum, product);
+            args.sums[j][i] = sum;
+        }
+    }
+}
+
+void ggml_cuda_op_ordered_mul_add(ggml_backend_cuda_context & ctx, ggml_tensor * const * products, ggml_tensor * const * sums, int count) {
+    ordered_mul_add_args args{};
+    for (int k = 0; k < 2; ++k) {
+        const ggml_tensor * first = products[0]->src[k];
+        args.input[k] = (const char *) first->data;
+        args.row_stride[k] = first->nb[1];
+        args.stream_stride[k] = products[1]->src[k]->view_offs - first->view_offs;
+    }
+    for (int j = 0; j < count; ++j) {
+        args.products[j] = (float *) products[j]->data;
+        args.sums[j] = (float *) sums[j]->data;
+        args.product_first[j] = j && sums[j]->src[0] == products[j];
+    }
+    args.columns = init_fastdiv_values(products[0]->ne[0]);
+    args.coefficient_rows = init_fastdiv_values(products[0]->src[1]->ne[1]);
+    args.elements = ggml_nelements(products[0]);
+    args.count = count;
+    const int blocks = (args.elements + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+    const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(ordered_mul_add_kernel, launch, args);
+}
+
 static void affine_unary_tail_cuda(ggml_backend_cuda_context & ctx, affine_unary_args args, ggml_tensor * tail,
         const void * src = nullptr, ggml_type src_type = GGML_TYPE_F32, ggml_tensor * mm = nullptr, int offset = 0) {
     GGML_ASSERT(args.output[3] && tail && (tail->type == GGML_TYPE_F32 || tail->type == GGML_TYPE_BF16));

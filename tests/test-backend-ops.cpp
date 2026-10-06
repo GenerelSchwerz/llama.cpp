@@ -4428,24 +4428,28 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     const bool    gated;
     const ggml_type projection_type;
     const bool computed;
+    const bool ordered;
+    const bool swap_add;
+    std::vector<ggml_tensor *> stages;
     ggml_tensor * projection = nullptr;
     ggml_tensor * projection_weights = nullptr;
     ggml_tensor * projection_input = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "DSV4_HC_PRE";
+        return ordered ? "ORDERED_MUL_ADD" : "DSV4_HC_PRE";
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed));
+        return VARS_TO_STR4(n_embd, n_hc, n_tokens, gated) + (projection_type == GGML_TYPE_COUNT ? "" : "," + VARS_TO_STR2(projection_type, computed)) + (ordered ? "," + VARS_TO_STR2(ordered, swap_add) : "");
     }
 
-    bool run_whole_graph() override { return projection_type != GGML_TYPE_COUNT; }
-    std::vector<ggml_tensor *> fusion_test_nodes() override { return projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
+    bool run_whole_graph() override { return ordered || projection_type != GGML_TYPE_COUNT; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return ordered ? stages : projection ? std::vector<ggml_tensor *>{projection, out} : std::vector<ggml_tensor *>{}; }
+    double max_nmse_err() override { return ordered ? 1e-7 : test_dsv4_hc::max_nmse_err(); }
 
-    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false)
-        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed) {}
+    test_dsv4_hc_pre(int64_t n_embd = 31, int64_t n_hc = 4, int64_t n_tokens = 17, bool gated = false, ggml_type projection_type = GGML_TYPE_COUNT, bool computed = false, bool ordered = false, bool swap_add = false)
+        : n_embd(n_embd), n_hc(n_hc), n_tokens(n_tokens), gated(gated), projection_type(projection_type), computed(computed), ordered(ordered), swap_add(swap_add) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         test_dsv4_hc::initialize_tensors(ctx);
@@ -4492,7 +4496,24 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
             ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_hc, n_tokens);
             ggml_set_name(weights, "weights");
 
-            out = ggml_dsv4_hc_pre(ctx, x, weights);
+            if (ordered) {
+                stages.clear();
+                out = nullptr;
+                for (int64_t stream = 0; stream < n_hc; ++stream) {
+                    ggml_tensor * xv = ggml_view_2d(ctx, x, n_embd, n_tokens, x->nb[2], stream*x->nb[1]);
+                    ggml_tensor * wv = ggml_view_2d(ctx, weights, 1, n_tokens, weights->nb[1], stream*weights->nb[0]);
+                    ggml_tensor * product = ggml_mul(ctx, xv, wv);
+                    ggml_set_output(product);
+                    stages.push_back(product);
+                    if (out) {
+                        out = ggml_add(ctx, swap_add ? product : out, swap_add ? out : product);
+                        ggml_set_output(out);
+                        stages.push_back(out);
+                    } else { out = product; }
+                }
+            } else {
+                out = ggml_dsv4_hc_pre(ctx, x, weights);
+            }
         }
         ggml_set_name(out, "out");
         return out;
@@ -9408,6 +9429,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    for (bool swap_add : {false, true}) {
+        for (int64_t streams : {1, 4, 7, 16, 24, 30}) {
+            test_cases.emplace_back(new test_dsv4_hc_pre(31, streams, 3, false, GGML_TYPE_COUNT, false, true, swap_add));
+        }
+        test_cases.emplace_back(new test_dsv4_hc_pre(512, 4, 32, false, GGML_TYPE_COUNT, false, true, swap_add));
+    }
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
