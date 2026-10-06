@@ -5248,13 +5248,14 @@ struct ggml_cuda_repeat_mul_add_match {
     ggml_tensor * repeat = nullptr;
     ggml_cuda_affine_unary_match binary;
     int count = 0;
+    int mul_i = 0;
 };
 
-static ggml_cuda_repeat_mul_add_match ggml_cuda_match_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
+static ggml_cuda_repeat_mul_add_match ggml_cuda_match_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true, int consumer = -1) {
     ggml_tensor * repeat = graph->nodes[i];
     if (repeat->op != GGML_OP_REPEAT || !repeat->src[0] || repeat->type != repeat->src[0]->type ||
             (repeat->type != GGML_TYPE_F32 && repeat->type != GGML_TYPE_F16)) { return {}; }
-    int m = i + 1;
+    int m = consumer < 0 ? i + 1 : consumer;
     while (m < graph->n_nodes && ggml_cuda_affine_unary_view_op(graph->nodes[m]->op)) {
         uintptr_t begin, end;
         if (!ggml_cuda_affine_unary_prior_view(graph, i, graph->nodes[m], true) ||
@@ -5292,7 +5293,58 @@ static ggml_cuda_repeat_mul_add_match ggml_cuda_match_repeat_mul_add(ggml_backen
             }
         }
     }
-    return {repeat, binary, indices[2] - i + 1};
+    return {repeat, binary, indices[2] - i + 1, m};
+}
+
+
+static ggml_cuda_repeat_mul_add_match ggml_cuda_match_deferred_repeat_mul_add(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
+    ggml_tensor * repeat = graph->nodes[i];
+    if (repeat->op != GGML_OP_REPEAT || !repeat->src[0]) { return {}; }
+    int m = i + 1;
+    bool compute = false;
+    for (; m < graph->n_nodes; ++m) {
+        const ggml_tensor * node = graph->nodes[m];
+        bool used = node->view_src == repeat;
+        for (const ggml_tensor * src : node->src) { used |= src && (src == repeat || src->view_src == repeat); }
+        if (used) { break; }
+        compute |= !ggml_cuda_affine_unary_view_op(node->op);
+    }
+    if (!compute || m == graph->n_nodes) { return {}; }
+    const auto match = ggml_cuda_match_repeat_mul_add(ctx, graph, i, allocated, m);
+    if (!match.count) { return {}; }
+    // Keep earlier producer and unary fusions across the MUL boundary.
+    const ggml_tensor * prior = graph->nodes[m - 1];
+    if (!ggml_cuda_affine_unary_view_op(prior->op) && prior->op != GGML_OP_SCALE && prior->op != GGML_OP_CONT) { return {}; }
+    ggml_cuda_moe_weighted_reduction_match reduction;
+    if (ggml_cuda_match_moe_weighted_reduction(graph, m, reduction)) { return {}; }
+    for (int j = i + 1; j < m; ++j) {
+        const ggml_tensor * node = graph->nodes[j];
+        switch (node->op) {
+            case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
+            case GGML_OP_MUL_MAT: case GGML_OP_SCALE: case GGML_OP_UNARY: case GGML_OP_MUL:
+            case GGML_OP_SUM_ROWS: case GGML_OP_SUB: case GGML_OP_CONT: break;
+            default: return {};
+        }
+    }
+    if (allocated) {
+        const ggml_tensor * input = repeat->src[0]->view_src ? repeat->src[0]->view_src : repeat->src[0];
+        uintptr_t ib, ie, wb, we;
+        if (!ggml_cuda_affine_unary_range(input, ctx.device, ib, ie) || !ggml_cuda_affine_unary_range(repeat, ctx.device, wb, we)) { return {}; }
+        for (const ggml_tensor * write : {repeat, match.binary.mul, match.binary.add}) {
+            uintptr_t begin, end;
+            if (!ggml_cuda_affine_unary_range(write, ctx.device, begin, end) || (begin < ie && ib < end)) { return {}; }
+        }
+        for (int j = i + 1; j < m; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            uintptr_t begin, end;
+            if (!ggml_cuda_affine_unary_range(node, ctx.device, begin, end)) { return {}; }
+            if (!ggml_cuda_affine_unary_view_op(node->op) && ((begin < ie && ib < end) || (begin < we && wb < end))) { return {}; }
+            for (const ggml_tensor * src : node->src) {
+                if (src && (!ggml_cuda_affine_unary_range(src, ctx.device, begin, end) || (begin < we && wb < end))) { return {}; }
+            }
+        }
+    }
+    return match;
 }
 
 struct ggml_cuda_ordered_mul_add_match {
@@ -6474,6 +6526,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
             };
 
+            std::unordered_map<const ggml_tensor *, ggml_cuda_repeat_mul_add_match> repeat_emits;
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -6514,6 +6567,23 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
                     continue;
+                }
+
+                if (!disable_reuse && cuda_ctx->curr_stream_no == 0 && stream_ctx.concurrent_events.empty()) {
+                    if (node->op == GGML_OP_REPEAT) {
+                        const auto deferred = ggml_cuda_match_deferred_repeat_mul_add(*cuda_ctx, cgraph, i);
+                        if (deferred.count) {
+                            repeat_emits.emplace(deferred.binary.mul, deferred);
+                            continue;
+                        }
+                    }
+                    const auto emit = repeat_emits.find(node);
+                    if (emit != repeat_emits.end()) {
+                        const auto & match = emit->second;
+                        ggml_cuda_op_repeat_mul_add(*cuda_ctx, match.repeat, match.binary.mul, match.binary.add);
+                        i += match.binary.count - 1;
+                        continue;
+                    }
                 }
 
                 const int group = reuse.nodes.empty() ? -1 : reuse.nodes[i];
@@ -6934,6 +7004,16 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (hc_up.count) {
                 params->add_alloc_dep(params->user_data, hc_up.mm->src[0], hc_up.dst);
                 params->add_alloc_dep(params->user_data, hc_up.mm->src[1], hc_up.dst);
+            }
+
+            const auto deferred = ggml_cuda_match_deferred_repeat_mul_add(*cuda_ctx, cgraph, i, false);
+            if (deferred.count) {
+                ggml_tensor * read = deferred.repeat->src[0];
+                params->add_alloc_dep(params->user_data, read, deferred.binary.add);
+                if (read->view_src) { params->add_alloc_dep(params->user_data, read->view_src, deferred.binary.add); }
+                params->add_alloc_dep(params->user_data, deferred.repeat, deferred.binary.add);
+                params->add_alloc_dep(params->user_data, deferred.binary.mul->src[0], deferred.binary.add);
+                params->add_alloc_dep(params->user_data, deferred.binary.mul->src[1], deferred.binary.add);
             }
 
             const auto repeated = ggml_cuda_match_repeat_mul_add(*cuda_ctx, cgraph, i, false);

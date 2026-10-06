@@ -3299,13 +3299,14 @@ struct test_bin_bcast : public test_case {
     const bool add_after;
     const bool swap_add;
     const int repeat_input;
+    const bool coefficient_gap;
     std::vector<ggml_tensor *> stages;
 
     bool run_whole_graph() override { return nf > 1 || add_after; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
     std::string op_desc(ggml_tensor * t) override {
-        return repeat_input >= 0 ? "REPEAT_MUL_ADD" : add_after ? "MUL_ADD" : test_case::op_desc(t);
+        return coefficient_gap ? "DEFERRED_REPEAT_MUL_ADD" : repeat_input >= 0 ? "REPEAT_MUL_ADD" : add_after ? "MUL_ADD" : test_case::op_desc(t);
     }
 
     std::string vars() override {
@@ -3315,6 +3316,7 @@ struct test_bin_bcast : public test_case {
         }
         if (add_after) { s += "," + VARS_TO_STR2(add_after, swap_add); }
         if (repeat_input >= 0) { s += "," + VAR_TO_STR(repeat_input); }
+        if (coefficient_gap) { s += "," + VAR_TO_STR(coefficient_gap); }
         return s;
     }
 
@@ -3327,8 +3329,8 @@ struct test_bin_bcast : public test_case {
             std::array<int, 4> nr = {1, 2, 1, 1},
             int nf = 1,
             bool perm1 = false, bool src_overlap = false,
-            ggml_type type_b = GGML_TYPE_COUNT, bool add_after = false, bool swap_add = false, int repeat_input = -1)
-        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b), add_after(add_after), swap_add(swap_add), repeat_input(repeat_input) {}
+            ggml_type type_b = GGML_TYPE_COUNT, bool add_after = false, bool swap_add = false, int repeat_input = -1, bool coefficient_gap = false)
+        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b), add_after(add_after), swap_add(swap_add), repeat_input(repeat_input), coefficient_gap(coefficient_gap) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         GGML_ASSERT(nf <= 16);
@@ -3362,6 +3364,16 @@ struct test_bin_bcast : public test_case {
             stages.push_back(repeated);
             if (repeat_input == 0) a = repeated;
             else b[0] = repeated;
+        }
+
+        if (coefficient_gap) {
+            GGML_ASSERT(repeat_input == 0 && tb == GGML_TYPE_F32 && !perm1 && !src_overlap);
+            b[0] = ggml_scale(ctx, b[0], 0.25f);
+            ggml_set_output(b[0]); stages.push_back(b[0]);
+            b[0] = ggml_sigmoid(ctx, b[0]);
+            ggml_set_output(b[0]); stages.push_back(b[0]);
+            b[0] = ggml_scale(ctx, b[0], 2.0f);
+            ggml_set_output(b[0]); stages.push_back(b[0]);
         }
 
         // The backward pass supports broadcasting only for GGML_ADD:
@@ -3417,6 +3429,9 @@ struct test_bin_bcast : public test_case {
     }
 
     double max_nmse_err() override {
+        if (coefficient_gap) {
+            return 1e-7;
+        }
         if (op == ggml_add && nf > 1) {
             // Fused ADDs can keep FP32 intermediates while the CPU rounds each ADD to FP16/BF16.
             if (type == GGML_TYPE_F16) {
@@ -10088,6 +10103,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool swap : {false, true}) {
+            test_cases.emplace_back(new test_bin_bcast(ggml_mul, type, {7, 2, 3, 2}, {3, 2, 2, 2}, 1, false, false, GGML_TYPE_F32, true, swap, 0, true));
         }
     }
 
