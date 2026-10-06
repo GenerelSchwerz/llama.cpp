@@ -2234,6 +2234,105 @@ static hc_affine_injection_operand ggml_cuda_hc_affine_injection_operand(const g
     return {(const float *) tensor->data, init_fastdiv_values(tensor->ne[0]), init_fastdiv_values(tensor->ne[1]), int64_t(tensor->nb[0]/sizeof(float)), int64_t(tensor->nb[1]/sizeof(float))};
 }
 
+template <int block_size, bool has_comb, bool do_multiply, int layout, typename Gate, typename Write>
+static __device__ __forceinline__ void hc_injection_norm_emit_impl(hc_post_norm_data a, Gate g, const Write write) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int64_t offset = ((int64_t(sample)*gridDim.y + channel)*gridDim.x + row)*a.ncols;
+    constexpr bool grouped = layout == 1;
+    constexpr bool flat = layout == 2;
+    ggml_cuda_pdl_sync();
+    extern __shared__ float s_sum[];
+    float * weights = s_sum + 32;
+    const int64_t gate_first = offset/a.n_embd;
+    float grouped_weight = 0.0f;
+    if constexpr (grouped) {
+        if (threadIdx.x % WARP_SIZE == 0) {
+            grouped_weight = hc_injection_gate(g, gate_first, threadIdx.x == 0);
+        }
+        grouped_weight = __shfl_sync(0xffffffff, grouped_weight, 0, WARP_SIZE);
+    } else {
+        const int64_t gate_count = (offset + a.ncols - 1)/a.n_embd - gate_first + 1;
+        hc_injection_load(g, weights, gate_first, gate_count, offset, a.n_embd);
+    }
+    if constexpr (do_multiply) {
+        a.mul += fastmodulo(sample, a.mul_ne[3])*a.sm[3] + fastmodulo(channel, a.mul_ne[2])*a.sm[2] + fastmodulo(row, a.mul_ne[1])*a.sm[1];
+    }
+    const int64_t stream = grouped ? (offset / a.n_embd) % a.hc : 0;
+    const int64_t token = grouped || flat ? offset / (a.n_embd*a.hc) : 0;
+    float tmp = 0.0f;
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        const int64_t ir = offset + col;
+        const int64_t i0 = grouped ? col : flat ? fastmodulo(col, a.embd_ne) : ir % a.n_embd;
+        const int64_t ih = grouped ? stream : flat ? fastdiv(col, a.embd_ne) : (ir / a.n_embd) % a.hc;
+        const int64_t it = grouped || flat ? token : ir / (a.n_embd*a.hc);
+        const float weight = grouped ? grouped_weight : weights[ih + it*a.hc - gate_first];
+        float value = a.x[i0*a.sx[0] + it*a.sx[1]] * weight;
+        if constexpr (has_comb) {
+            for (int64_t isrc = 0; isrc < a.hc; ++isrc) {
+                value += a.residual[i0*a.sr[0] + isrc*a.sr[1] + it*a.sr[2]] * a.comb[ih*a.sc[0] + isrc*a.sc[1] + it*a.sc[2]];
+            }
+        } else {
+            value += a.residual[i0*a.sr[0] + ih*a.sr[1] + it*a.sr[2]];
+        }
+        a.post_dst[ir] = value;
+        tmp += value * value;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / a.ncols;
+    const float scale = rsqrtf(mean + a.eps);
+    if constexpr (Write::width == 2) {
+        for (int64_t col = 2*threadIdx.x; col < a.ncols; col += 2*block_size) {
+            float x, y;
+            if constexpr (do_multiply) {
+                x = scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])];
+                y = scale * a.post_dst[offset + col + 1] * a.mul[fastmodulo(col + 1, a.mul_ne[0])];
+            } else {
+                x = scale * a.post_dst[offset + col];
+                y = scale * a.post_dst[offset + col + 1];
+            }
+            write(a.dst + offset, a.dst, int(col), make_float2(x, y));
+        }
+    } else {
+        for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+            if constexpr (do_multiply) {
+                write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])]);
+            } else {
+                write(a.dst + offset, a.dst, col, scale * a.post_dst[offset + col]);
+            }
+        }
+    }
+}
+
+
+template <int Block, bool Comb, bool Multiply, int Layout, typename Write>
+static __global__ __launch_bounds__(Block) void hc_affine_injection_emit_f32(hc_post_norm_data a, hc_affine_injection_data g, Write write) {
+    hc_injection_norm_emit_impl<Block, Comb, Multiply, Layout>(a, g, write);
+}
+
+template <int Block, bool Comb, bool Multiply, typename Write>
+static auto hc_affine_injection_emit_kernel(int layout) {
+    if (layout == 1) { return hc_affine_injection_emit_f32<Block, Comb, Multiply, 1, Write>; }
+    if (layout == 2) { return hc_affine_injection_emit_f32<Block, Comb, Multiply, 2, Write>; }
+    return hc_affine_injection_emit_f32<Block, Comb, Multiply, 0, Write>;
+}
+
+template <typename Write>
+static void ggml_cuda_hc_affine_emit_launch(ggml_backend_cuda_context & ctx, hc_post_norm_data a, hc_affine_injection_data g,
+        ggml_tensor * norm, bool comb, bool multiply, const Write write) {
+    const int block_size = a.ncols < 1024 ? 256 : 1024;
+    const size_t shared = (32 + (a.ncols + a.n_embd - 2)/a.n_embd + 1)*sizeof(float);
+    const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
+    const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), shared, ctx.stream());
+    const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    auto kernel = block_size == 256
+        ? (comb ? (multiply ? hc_affine_injection_emit_kernel<256, true, true, Write>(layout) : hc_affine_injection_emit_kernel<256, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<256, false, true, Write>(layout) : hc_affine_injection_emit_kernel<256, false, false, Write>(layout)))
+        : (comb ? (multiply ? hc_affine_injection_emit_kernel<1024, true, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<1024, false, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, false, false, Write>(layout)));
+    ggml_cuda_kernel_launch(kernel, launch, a, g, write);
+}
+
 template <int Block, bool Comb, bool Multiply>
 static auto hc_affine_injection_norm_kernel(int layout) {
     if (layout == 1) { return hc_affine_injection_norm_f32<Block, Comb, Multiply, 1>; }
@@ -2241,7 +2340,7 @@ static auto hc_affine_injection_norm_kernel(int layout) {
     return hc_affine_injection_norm_f32<Block, Comb, Multiply, 0>;
 }
 
-void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul) {
+void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * residual = post->src[1];
     const ggml_tensor * weights = post->src[2];
@@ -2285,6 +2384,24 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
     g.bias1 = g.last ? ggml_get_op_params_f32(last, 1) : 0.0f;
     g.op = ggml_get_unary_op(unary);
     g.values = ggml_nelements(post);
+    if (emit) {
+        GGML_ASSERT(norm);
+        const uint3 cols = init_fastdiv_values(emit->cols);
+        if (emit->mmq) {
+            const auto launch_mmq = [&](auto write) { ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, write); };
+            switch (emit->layout) {
+                case MMQ_Q8_1_DS_LAYOUT_D4: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D4, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;
+                case MMQ_Q8_1_DS_LAYOUT_DS4: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_DS4, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;
+                case MMQ_Q8_1_DS_LAYOUT_D2S6: launch_mmq(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D2S6, false>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) emit->f16, (nv_bfloat16 *) emit->bf16, 1.0f}); break;
+                default: GGML_ABORT("unsupported affine HC image layout");
+            }
+        } else if (emit->q8) {
+            ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, ggml_cuda_norm_emit_q8_store{(block_q8_1 *) emit->q8, cols, emit->padded, (half *) emit->f16, (nv_bfloat16 *) emit->bf16});
+        } else {
+            ggml_cuda_hc_affine_emit_launch(ctx, a, g, norm, comb, mul, ggml_cuda_norm_emit_store{(half *) emit->f16, (nv_bfloat16 *) emit->bf16});
+        }
+        return;
+    }
     if (!norm) {
         const size_t shared = ((256 + a.n_embd - 2)/a.n_embd + 1)*sizeof(float);
         const ggml_cuda_kernel_launch_params launch(dim3((g.values + 255)/256), dim3(256), shared, ctx.stream());

@@ -5059,7 +5059,7 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i,
         const ggml_tensor * shared_input, const char * quantized, int prepared_hc_post = -1,
-        const ggml_cuda_hc_affine_injection_match * affine_match = nullptr) {
+        const ggml_cuda_hc_affine_injection_match * affine_match = nullptr, bool * affine_emit = nullptr) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (disable_fusion) {
@@ -5857,6 +5857,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty()) {
         const auto injection = affine_match ? *affine_match : ggml_cuda_match_hc_affine_injection(*cuda_ctx, cgraph, i);
+        if (injection.count && affine_emit) {
+            *affine_emit = true;
+            return 0;
+        }
         if (injection.count && (prepared_hc_post < 0 || injection.post != cgraph->nodes[prepared_hc_post] || (!injection.hc.norm && injection.post->src[3]))) {
             if (injection.comb) {
                 const bool ok = ggml_cuda_compute_forward(*cuda_ctx, injection.comb);
@@ -6159,9 +6163,51 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 const ggml_tensor * shared_input = q8_group >= 0 ? node->src[1] : nullptr;
                 const char * quantized = q8_group >= 0 ? q8_inputs[q8_group].get() : nullptr;
-                if (!mmq_emits.empty() && mmq_emits[i].post && (q8_emits.empty() || !q8_emits[i].norm)) {
-                    const auto & emit = mmq_emits[i];
-                    const auto * typed = !norm_emits.empty() && norm_emits[i].norm ? &norm_emits[i] : nullptr;
+                int prepared_hc_post = -1;
+                ggml_cuda_hc_affine_injection_match affine_injection;
+                const ggml_cuda_hc_affine_injection_match * affine_match = nullptr;
+                if (node->op == GGML_OP_MUL && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty() &&
+                        (!norm_emits.empty() || !q8_emits.empty() || !mmq_emits.empty())) {
+                    affine_injection = ggml_cuda_match_hc_affine_injection(*cuda_ctx, cgraph, i);
+                    affine_match = &affine_injection;
+                    if (affine_injection.count) {
+                        const int post_i = i + affine_injection.count - (affine_injection.hc.count ? affine_injection.hc.count : 1);
+                        if ((!norm_emits.empty() && norm_emits[post_i].post) || (!q8_emits.empty() && q8_emits[post_i].post) || (!mmq_emits.empty() && mmq_emits[post_i].post)) {
+                            prepared_hc_post = post_i;
+                        }
+                    }
+                }
+                bool affine_emit = false;
+                if (affine_match && affine_injection.hc.norm && prepared_hc_post >= 0) {
+                    const auto fits = [&](const auto & emit) {
+                        return !emit.norm || (emit.post == affine_injection.post && emit.norm == affine_injection.hc.norm &&
+                            emit.mul == affine_injection.hc.mul && !emit.add && !emit.scale &&
+                            emit.dst == (emit.mul ? emit.mul : emit.norm) && emit.last == i + affine_injection.count - 1);
+                    };
+                    if ((norm_emits.empty() || fits(norm_emits[prepared_hc_post])) &&
+                            (q8_emits.empty() || fits(q8_emits[prepared_hc_post])) &&
+                            (mmq_emits.empty() || fits(mmq_emits[prepared_hc_post]))) {
+                        const int skipped = ggml_cuda_try_fuse(cuda_ctx, cgraph, i, shared_input, quantized, prepared_hc_post, affine_match, &affine_emit);
+                        if (skipped) {
+                            i += skipped;
+                            continue;
+                        }
+                        GGML_ASSERT(affine_emit);
+                    }
+                }
+                const int emit_i = affine_emit ? prepared_hc_post : i;
+                const auto launch_affine_emit = [&](const ggml_cuda_hc_affine_emit_data & data) {
+                    if (affine_injection.comb) {
+                        const bool ok = ggml_cuda_compute_forward(*cuda_ctx, affine_injection.comb);
+                        GGML_ASSERT(ok);
+                    }
+                    const auto & affine = affine_injection.affine;
+                    ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary,
+                        affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data);
+                };
+                if (!mmq_emits.empty() && mmq_emits[emit_i].post && (q8_emits.empty() || !q8_emits[emit_i].norm)) {
+                    const auto & emit = mmq_emits[emit_i];
+                    const auto * typed = !norm_emits.empty() && norm_emits[emit_i].norm ? &norm_emits[emit_i] : nullptr;
                     if (!typed || (typed->post == emit.post && typed->norm == emit.norm && typed->dst == emit.dst && typed->last == emit.last)) {
                         const int g = emit.image;
                         const int reader = mmq_reuse.groups[g].node;
@@ -6174,23 +6220,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         };
                         void * f16 = typed ? image(typed->f16) : nullptr;
                         void * bf16 = typed ? image(typed->bf16) : nullptr;
-                        ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
-                            mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                        if (affine_emit) {
+                            launch_affine_emit({f16, bf16, nullptr, mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]});
+                        } else {
+                            ggml_cuda_op_hc_post_norm_emit_mmq(*cuda_ctx, emit.post, emit.norm, emit.mul, emit.scale, f16, bf16,
+                                mmq_inputs[g].quantized.get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], mmq_keys[reader]);
+                        }
                         i = emit.last;
                         continue;
                     }
                 }
 
-                if (!q8_emits.empty() && q8_emits[i].norm &&
-                        ((!norm_emits.empty() && norm_emits[i].norm) || q8_emits[i].post)) {
-                    const auto & emit = q8_emits[i];
+                if (!q8_emits.empty() && q8_emits[emit_i].norm &&
+                        ((!norm_emits.empty() && norm_emits[emit_i].norm) || q8_emits[emit_i].post)) {
+                    const auto & emit = q8_emits[emit_i];
                     const int g = emit.image;
                     const ggml_tensor * input = cgraph->nodes[q8_reuse.groups[g].node]->src[1];
                     q8_inputs[g].alloc(mmvq_sizes[q8_reuse.groups[g].node]);
                     void * f16 = nullptr;
                     void * bf16 = nullptr;
-                    if (!norm_emits.empty() && norm_emits[i].norm) {
-                        const auto & typed = norm_emits[i];
+                    if (!norm_emits.empty() && norm_emits[emit_i].norm) {
+                        const auto & typed = norm_emits[emit_i];
                         GGML_ASSERT(typed.norm == emit.norm && typed.dst == emit.dst && typed.last == emit.last);
                         const auto image = [&](int group) -> void * {
                             if (group < 0) { return nullptr; }
@@ -6206,8 +6256,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_cuda_op_rms_norm_emit_q8(*cuda_ctx, emit.norm, nullptr, nullptr, emit.scale, f16, bf16,
                                 q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
                         } else {
-                            ggml_cuda_op_hc_post_norm_emit_q8(*cuda_ctx, emit.post, emit.norm, emit.mul, f16, bf16,
-                                q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                            if (affine_emit) {
+                                launch_affine_emit({f16, bf16, q8_inputs[g].get(), nullptr, input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING), input->ne[1], 0});
+                            } else {
+                                ggml_cuda_op_hc_post_norm_emit_q8(*cuda_ctx, emit.post, emit.norm, emit.mul, f16, bf16,
+                                    q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
+                            }
                         }
                     } else {
                         ggml_cuda_op_rms_norm_emit_q8(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, f16, bf16,
@@ -6217,8 +6271,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                if (!norm_emits.empty() && norm_emits[i].norm) {
-                    const auto & emit = norm_emits[i];
+                if (!norm_emits.empty() && norm_emits[emit_i].norm) {
+                    const auto & emit = norm_emits[emit_i];
                     const auto image = [&](int g) -> void * {
                         if (g < 0) { return nullptr; }
                         shared_inputs[g].alloc(input_sizes[reuse.groups[g].node]);
@@ -6228,7 +6282,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         if (emit.scale) {
                             ggml_cuda_op_hc_post_norm_scale(*cuda_ctx, emit.post, emit.norm, emit.scale, image(emit.f16), image(emit.bf16));
                         } else {
-                            ggml_cuda_op_hc_post_norm_emit(*cuda_ctx, emit.post, emit.norm, emit.mul, image(emit.f16), image(emit.bf16));
+                            if (affine_emit) {
+                                launch_affine_emit({image(emit.f16), image(emit.bf16)});
+                            } else {
+                                ggml_cuda_op_hc_post_norm_emit(*cuda_ctx, emit.post, emit.norm, emit.mul, image(emit.f16), image(emit.bf16));
+                            }
                         }
                     } else {
                         ggml_cuda_op_rms_norm_emit(*cuda_ctx, emit.norm, emit.mul, emit.add, emit.scale, image(emit.f16), image(emit.bf16));
@@ -6270,25 +6328,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     if (ready) { prepare_mmq_group(mmq_group); }
                 }
-                int prepared_hc_post = -1;
+
                 if (node->op == GGML_OP_SCALE || node->op == GGML_OP_UNARY) {
                     for (int j = i + 1; j < cgraph->n_nodes && j - i <= 3; ++j) {
                         if ((!norm_emits.empty() && norm_emits[j].post) || (!q8_emits.empty() && q8_emits[j].post) || (!mmq_emits.empty() && mmq_emits[j].post)) {
                             prepared_hc_post = j;
                             break;
-                        }
-                    }
-                }
-                ggml_cuda_hc_affine_injection_match affine_injection;
-                const ggml_cuda_hc_affine_injection_match * affine_match = nullptr;
-                if (node->op == GGML_OP_MUL && cuda_ctx->curr_stream_no == 0 && cuda_ctx->stream_context().concurrent_events.empty() &&
-                        (!norm_emits.empty() || !q8_emits.empty() || !mmq_emits.empty())) {
-                    affine_injection = ggml_cuda_match_hc_affine_injection(*cuda_ctx, cgraph, i);
-                    affine_match = &affine_injection;
-                    if (affine_injection.count) {
-                        const int post_i = i + affine_injection.count - (affine_injection.hc.count ? affine_injection.hc.count : 1);
-                        if ((!norm_emits.empty() && norm_emits[post_i].post) || (!q8_emits.empty() && q8_emits[post_i].post) || (!mmq_emits.empty() && mmq_emits[post_i].post)) {
-                            prepared_hc_post = post_i;
                         }
                     }
                 }

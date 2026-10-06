@@ -48,4 +48,15 @@ void ggml_cuda_op_hc_post_norm_emit_mmq(ggml_backend_cuda_context & ctx, ggml_te
 
 void ggml_cuda_op_hc_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul);
 
-void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul);
+struct ggml_cuda_hc_affine_emit_data {
+    void * f16 = nullptr;
+    void * bf16 = nullptr;
+    void * q8 = nullptr;
+    void * mmq = nullptr;
+    int64_t cols = 1;
+    int64_t padded = 0;
+    int64_t rows = 0;
+    int layout = 0;
+};
+
+void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr);
