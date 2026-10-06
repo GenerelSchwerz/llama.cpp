@@ -4155,19 +4155,20 @@ struct test_mul_mat_unary : public test_case {
     const bool after;
     const bool batched;
     const bool affine;
+    const bool window;
     std::vector<ggml_tensor *> stages;
     ggml_tensor * weights = nullptr;
     ggml_tensor * input = nullptr;
 
-    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false)
-        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine) {}
+    test_mul_mat_unary(ggml_type weight_type, ggml_unary_op op, bool before, bool after, bool batched, bool affine = false, bool window = false)
+        : weight_type(weight_type), op(op), before(before), after(after), batched(batched), affine(affine), window(window) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_UNARY";
     }
 
-    std::string vars() override { return VARS_TO_STR6(weight_type, op, before, after, batched, affine); }
+    std::string vars() override { return VARS_TO_STR7(weight_type, op, before, after, batched, affine, window); }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return stages; }
 
@@ -4176,9 +4177,14 @@ struct test_mul_mat_unary : public test_case {
         input = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 127, 17, batched ? 2 : 1, 1);
         ggml_tensor * out = ggml_mul_mat(ctx, weights, input);
         stages = {out};
+        if (window) {
+            GGML_ASSERT(affine);
+            out = ggml_view_4d(ctx, out, 71, out->ne[1], out->ne[2], out->ne[3], out->nb[1], out->nb[2], out->nb[3], 7*sizeof(float));
+            stages.push_back(out);
+        }
         if (affine) {
             ggml_tensor * coefficient = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 129);
+            ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, out->ne[0]);
             out = ggml_mul(ctx, out, coefficient);
             stages.push_back(out);
             out = ggml_add(ctx, out, bias);
@@ -9348,6 +9354,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, false, false, true));
             test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, false, false, true, true));
+            test_cases.emplace_back(new test_mul_mat_unary(type, op, false, true, true, true, true));
         }
     }
 

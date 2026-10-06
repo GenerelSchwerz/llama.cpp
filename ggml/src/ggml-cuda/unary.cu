@@ -264,6 +264,18 @@ struct affine_unary_convert_load {
     }
 };
 
+static __device__ __forceinline__ void affine_unary_apply(affine_unary_args args, float value, const uint32_t * pos, int i) {
+    value = __fmul_rn(value, affine_unary_read(args.input[1], pos));
+    value = affine_unary_store(args.output[0], args.output_type[0], i, value);
+    value = __fadd_rn(value, affine_unary_read(args.input[2], pos));
+    value = affine_unary_store(args.output[1], args.output_type[1], i, value);
+    value = args.op == GGML_UNARY_OP_SIGMOID ? op_sigmoid(value) : op_silu(value);
+    value = affine_unary_store(args.output[2], args.output_type[2], i, value);
+    if (args.output[3]) {
+        affine_unary_store(args.output[3], args.output_type[3], i, args.scale*value + args.bias);
+    }
+}
+
 template <typename Load>
 static __device__ __forceinline__ void affine_unary_impl(affine_unary_args args, Load load) {
     ggml_cuda_pdl_lc();
@@ -295,6 +307,25 @@ static __global__ void affine_unary_kernel(affine_unary_args args) {
 
 static __global__ void affine_unary_convert_kernel(affine_unary_args args, const void * src, ggml_type type, float * raw) {
     affine_unary_impl(args, affine_unary_convert_load{src, type, raw});
+}
+
+static __global__ void affine_unary_window_convert_kernel(affine_unary_args args, const void * src, ggml_type type, float * raw, int count, int columns, int offset) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= count) { return; }
+    ggml_cuda_pdl_sync();
+    const affine_unary_convert_load load{src, type, raw};
+    const float value = load(args.input[0], nullptr, i);
+    const int column = i % columns;
+    if (column < offset || uint32_t(column - offset) >= args.ne[0]) { return; }
+    const int j = (i/columns)*args.ne[0] + column - offset;
+    uint32_t remaining = j;
+    uint32_t pos[GGML_MAX_DIMS];
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        pos[d] = remaining % args.ne[d];
+        remaining /= args.ne[d];
+    }
+    affine_unary_apply(args, value, pos, j);
 }
 
 static affine_unary_args affine_unary_get_args(ggml_tensor * mul, ggml_tensor * add, ggml_tensor * unary, ggml_tensor * post) {
@@ -334,8 +365,23 @@ void ggml_cuda_op_affine_unary(ggml_backend_cuda_context & ctx, ggml_tensor * mu
 
 void ggml_cuda_op_affine_unary_convert(ggml_backend_cuda_context & ctx, ggml_type type, const void * src, ggml_tensor * mm, const ggml_cuda_affine_unary_ops & ops) {
     GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_BF16);
-    GGML_ASSERT(mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm) && ops.mul->src[0] == mm);
+    GGML_ASSERT(mm->type == GGML_TYPE_F32 && ggml_is_contiguous(mm));
     const auto args = affine_unary_get_args(ops.mul, ops.add, ops.unary, ops.post);
+    if (ops.mul->src[0] != mm) {
+        const ggml_tensor * input = ops.mul->src[0];
+        GGML_ASSERT(input->op == GGML_OP_VIEW && input->view_src == mm && input->type == GGML_TYPE_F32 &&
+                input->nb[0] == sizeof(float) && input->view_offs % sizeof(float) == 0 && input->ne[0] <= mm->ne[0] &&
+                input->view_offs/sizeof(float) <= uint64_t(mm->ne[0] - input->ne[0]));
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            GGML_ASSERT(input->ne[d] == mm->ne[d] && input->nb[d] == mm->nb[d]);
+        }
+        GGML_ASSERT(ggml_nelements(mm) > 0 && ggml_nelements(mm) <= INT_MAX - CUDA_NEG_BLOCK_SIZE && args.count == ggml_nelements(input));
+        const int count = ggml_nelements(mm);
+        const int blocks = (count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
+        const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());
+        ggml_cuda_kernel_launch(affine_unary_window_convert_kernel, launch, args, src, type, (float *) mm->data, count, (int) mm->ne[0], (int) (input->view_offs/sizeof(float)));
+        return;
+    }
     GGML_ASSERT(args.count == ggml_nelements(mm));
     const int blocks = (args.count + CUDA_NEG_BLOCK_SIZE - 1)/CUDA_NEG_BLOCK_SIZE;
     const auto launch = ggml_cuda_kernel_launch_params(blocks, CUDA_NEG_BLOCK_SIZE, 0, ctx.stream());

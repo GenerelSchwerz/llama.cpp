@@ -5121,20 +5121,31 @@ struct ggml_cuda_cublas_affine_match {
     int count = 0;
 };
 
+static bool ggml_cuda_cublas_affine_input(const ggml_tensor * mm, const ggml_tensor * input) {
+    if (input == mm) { return true; }
+    if (!input || input->op != GGML_OP_VIEW || input->type != GGML_TYPE_F32 || input->view_src != mm ||
+            input->view_offs % sizeof(float) || input->nb[0] != sizeof(float) || input->ne[0] <= 0 || input->ne[0] > mm->ne[0] ||
+            input->view_offs/sizeof(float) > uint64_t(mm->ne[0] - input->ne[0])) { return false; }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (input->ne[d] != mm->ne[d] || input->nb[d] != mm->nb[d]) { return false; }
+    }
+    return true;
+}
+
 static ggml_cuda_cublas_affine_match ggml_cuda_match_cublas_affine(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, bool allocated = true) {
     ggml_tensor * mm = graph->nodes[i];
     if (mm->op != GGML_OP_MUL_MAT || !mm->src[0] || !mm->src[1] || mm->type != GGML_TYPE_F32 || mm->src[1]->type != GGML_TYPE_F32 ||
-            !ggml_is_contiguous(mm) || i + 1 >= graph->n_nodes || ggml_cuda_op_mul_mat_use_fwht(mm)) { return {}; }
+            !ggml_is_contiguous(mm) || ggml_nelements(mm) <= 0 || ggml_nelements(mm) > INT_MAX - CUDA_NEG_BLOCK_SIZE || i + 1 >= graph->n_nodes || ggml_cuda_op_mul_mat_use_fwht(mm)) { return {}; }
     int first = i + 1;
     while (first < graph->n_nodes && graph->nodes[first]->op == GGML_OP_VIEW) {
-        if (!ggml_cuda_affine_unary_prior_view(graph, i, graph->nodes[first])) { return {}; }
+        if (!ggml_cuda_affine_unary_prior_view(graph, i, graph->nodes[first]) && !ggml_cuda_cublas_affine_input(mm, graph->nodes[first])) { return {}; }
         uintptr_t begin, end;
         if (allocated && !ggml_cuda_affine_unary_range(graph->nodes[first], ctx.device, begin, end)) { return {}; }
         ++first;
     }
     if (first >= graph->n_nodes) { return {}; }
     const auto affine = ggml_cuda_match_affine_unary(ctx, graph, first, allocated);
-    if (!affine.count || affine.mul->src[0] != mm || ggml_cuda_match_hc_affine_injection(ctx, graph, first, false).count) { return {}; }
+    if (!affine.count || !ggml_cuda_cublas_affine_input(mm, affine.mul->src[0]) || ggml_cuda_match_hc_affine_injection(ctx, graph, first, false).count) { return {}; }
     if (ggml_cuda_mul_mat_kernel(mm->src[0], mm->src[1], mm, ctx.device) != GGML_CUDA_MM_CUBLAS) { return {}; }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_type type = ggml_cuda_mul_mat_cublas_compute_type(cc, mm->src[0], mm->src[1], mm, false);
