@@ -59,4 +59,4 @@ struct ggml_cuda_hc_affine_emit_data {
     int layout = 0;
 };
 
-void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr);
+void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit = nullptr, ggml_tensor * scale = nullptr);

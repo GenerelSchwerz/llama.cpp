@@ -5000,7 +5000,7 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
     size_t bytes;
     if (!ggml_cuda_hc_injection_bytes(post, bytes) || bytes/sizeof(float) > INT_MAX) { return {}; }
     auto hc = ggml_cuda_match_hc_post_norm(graph, post_i);
-    if (hc.count && graph->nodes[post_i + hc.count - 1] != (hc.mul ? hc.mul : hc.norm)) { return {}; }
+    if (hc.count && graph->nodes[post_i + hc.count - 1] != (hc.scale ? hc.scale : hc.mul ? hc.mul : hc.norm)) { return {}; }
     if (hc.count && hc.norm->ne[0] != x->ne[0]) {
         if (post_comb && bytes/sizeof(float) <= 256) { return {}; }
         if (hc.norm->ne[0] < x->ne[0] && hc.norm->ne[0] > WARP_SIZE/2 && hc.norm->ne[0] < WARP_SIZE) { return {}; }
@@ -5016,7 +5016,7 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
     std::vector<int> outputs;
     for (int j = i; j < end; ++j) {
         ops.push_back(graph->nodes[j]->op);
-        if (!hc.mul || graph->nodes[j] != hc.norm) { outputs.push_back(j); }
+        if ((!hc.mul && !hc.scale) || graph->nodes[j] != hc.norm) { outputs.push_back(j); }
     }
     if (!ggml_can_fuse_subgraph(graph, i, end - i, ops.data(), outputs.data(), outputs.size())) { return {}; }
     if (allocated) {
@@ -5031,7 +5031,7 @@ static ggml_cuda_hc_affine_injection_match ggml_cuda_match_hc_affine_injection(g
         std::vector<const ggml_tensor *> writes = {affine.mul, affine.add, affine.unary};
         if (affine.post) { writes.push_back(affine.post); }
         writes.push_back(post);
-        if (hc.count) { writes.push_back(hc.mul ? hc.mul : hc.norm); }
+        if (hc.count) { writes.push_back(hc.scale ? hc.scale : hc.mul ? hc.mul : hc.norm); }
         if (comb) { writes.push_back(comb); }
         std::vector<uintptr_t> rb(reads.size()), re(reads.size()), wb(writes.size()), we(writes.size());
         for (size_t j = 0; j < reads.size(); ++j) {
@@ -5867,7 +5867,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 GGML_ASSERT(ok);
             }
             const auto & affine = injection.affine;
-            ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary, injection.post, injection.hc.norm, injection.hc.mul);
+            ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary, injection.post, injection.hc.norm, injection.hc.mul, nullptr, injection.hc.scale);
             return injection.count - 1;
         }
     }
@@ -6181,8 +6181,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (affine_match && affine_injection.hc.norm && prepared_hc_post >= 0) {
                     const auto fits = [&](const auto & emit) {
                         return !emit.norm || (emit.post == affine_injection.post && emit.norm == affine_injection.hc.norm &&
-                            emit.mul == affine_injection.hc.mul && !emit.add && !emit.scale &&
-                            emit.dst == (emit.mul ? emit.mul : emit.norm) && emit.last == i + affine_injection.count - 1);
+                            emit.mul == affine_injection.hc.mul && !emit.add && emit.scale == affine_injection.hc.scale &&
+                            emit.dst == (emit.scale ? emit.scale : emit.mul ? emit.mul : emit.norm) && emit.last == i + affine_injection.count - 1);
                     };
                     if ((norm_emits.empty() || fits(norm_emits[prepared_hc_post])) &&
                             (q8_emits.empty() || fits(q8_emits[prepared_hc_post])) &&
@@ -6203,7 +6203,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     }
                     const auto & affine = affine_injection.affine;
                     ggml_cuda_op_hc_affine_injection(*cuda_ctx, affine.mul, affine.add, affine.unary, affine.post ? affine.post : affine.unary,
-                        affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data);
+                        affine_injection.post, affine_injection.hc.norm, affine_injection.hc.mul, &data, affine_injection.hc.scale);
                 };
                 if (!mmq_emits.empty() && mmq_emits[emit_i].post && (q8_emits.empty() || !q8_emits[emit_i].norm)) {
                     const auto & emit = mmq_emits[emit_i];
@@ -6251,7 +6251,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         bf16 = image(typed.bf16);
                     }
                     if (emit.post) {
-                        if (emit.scale) {
+                        if (emit.scale && !affine_emit) {
                             ggml_cuda_op_dsv4_hc_post(*cuda_ctx, emit.post);
                             ggml_cuda_op_rms_norm_emit_q8(*cuda_ctx, emit.norm, nullptr, nullptr, emit.scale, f16, bf16,
                                 q8_inputs[g].get(), input->ne[0], GGML_PAD(input->ne[0], MATRIX_ROW_PADDING));
@@ -6279,7 +6279,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         return shared_inputs[g].get();
                     };
                     if (emit.post) {
-                        if (emit.scale) {
+                        if (emit.scale && !affine_emit) {
                             ggml_cuda_op_hc_post_norm_scale(*cuda_ctx, emit.post, emit.norm, emit.scale, image(emit.f16), image(emit.bf16));
                         } else {
                             if (affine_emit) {
@@ -6556,7 +6556,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             const auto affine_injection = ggml_cuda_match_hc_affine_injection(*cuda_ctx, cgraph, i, false);
             if (affine_injection.count) {
                 ggml_tensor * terminal = cgraph->nodes[i + affine_injection.count - 1];
-                ggml_tensor * unused_norm = affine_injection.hc.mul ? affine_injection.hc.norm : nullptr;
+                ggml_tensor * unused_norm = affine_injection.hc.mul || affine_injection.hc.scale ? affine_injection.hc.norm : nullptr;
                 for (int j = i; j < i + affine_injection.count - 1; ++j) {
                     if (cgraph->nodes[j] != unused_norm) { params->add_alloc_dep(params->user_data, cgraph->nodes[j], terminal); }
                     for (int k = 0; k < GGML_MAX_SRC; ++k) {

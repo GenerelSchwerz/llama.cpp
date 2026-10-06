@@ -2307,6 +2307,16 @@ static __device__ __forceinline__ void hc_injection_norm_emit_impl(hc_post_norm_
 }
 
 
+struct ggml_cuda_norm_emit_q8_scale_store {
+    static constexpr int width = 1;
+    ggml_cuda_norm_emit_q8_store write;
+    float scale;
+
+    __device__ __forceinline__ void operator()(float * dst, const float * base, int col, float value) const {
+        write(dst, base, col, scale * value);
+    }
+};
+
 template <int Block, bool Comb, bool Multiply, int Layout, typename Write>
 static __global__ __launch_bounds__(Block) void hc_affine_injection_emit_f32(hc_post_norm_data a, hc_affine_injection_data g, Write write) {
     hc_injection_norm_emit_impl<Block, Comb, Multiply, Layout>(a, g, write);
@@ -2319,7 +2329,7 @@ static auto hc_affine_injection_emit_kernel(int layout) {
     return hc_affine_injection_emit_f32<Block, Comb, Multiply, 0, Write>;
 }
 
-template <typename Write>
+template <bool has_multiply = true, typename Write>
 static void ggml_cuda_hc_affine_emit_launch(ggml_backend_cuda_context & ctx, hc_post_norm_data a, hc_affine_injection_data g,
         ggml_tensor * norm, bool comb, bool multiply, const Write write) {
     const int block_size = a.ncols < 1024 ? 256 : 1024;
@@ -2327,10 +2337,17 @@ static void ggml_cuda_hc_affine_emit_launch(ggml_backend_cuda_context & ctx, hc_
     const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
     const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), shared, ctx.stream());
     const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
-    auto kernel = block_size == 256
-        ? (comb ? (multiply ? hc_affine_injection_emit_kernel<256, true, true, Write>(layout) : hc_affine_injection_emit_kernel<256, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<256, false, true, Write>(layout) : hc_affine_injection_emit_kernel<256, false, false, Write>(layout)))
-        : (comb ? (multiply ? hc_affine_injection_emit_kernel<1024, true, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<1024, false, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, false, false, Write>(layout)));
-    ggml_cuda_kernel_launch(kernel, launch, a, g, write);
+    if constexpr (has_multiply) {
+        auto kernel = block_size == 256
+            ? (comb ? (multiply ? hc_affine_injection_emit_kernel<256, true, true, Write>(layout) : hc_affine_injection_emit_kernel<256, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<256, false, true, Write>(layout) : hc_affine_injection_emit_kernel<256, false, false, Write>(layout)))
+            : (comb ? (multiply ? hc_affine_injection_emit_kernel<1024, true, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, true, false, Write>(layout)) : (multiply ? hc_affine_injection_emit_kernel<1024, false, true, Write>(layout) : hc_affine_injection_emit_kernel<1024, false, false, Write>(layout)));
+        ggml_cuda_kernel_launch(kernel, launch, a, g, write);
+    } else {
+        auto kernel = block_size == 256
+            ? (comb ? hc_affine_injection_emit_kernel<256, true, false, Write>(layout) : hc_affine_injection_emit_kernel<256, false, false, Write>(layout))
+            : (comb ? hc_affine_injection_emit_kernel<1024, true, false, Write>(layout) : hc_affine_injection_emit_kernel<1024, false, false, Write>(layout));
+        ggml_cuda_kernel_launch(kernel, launch, a, g, write);
+    }
 }
 
 template <int Block, bool Comb, bool Multiply>
@@ -2340,7 +2357,7 @@ static auto hc_affine_injection_norm_kernel(int layout) {
     return hc_affine_injection_norm_f32<Block, Comb, Multiply, 0>;
 }
 
-void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit) {
+void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul, const ggml_cuda_hc_affine_emit_data * emit, ggml_tensor * scale) {
     const ggml_tensor * x = post->src[0];
     const ggml_tensor * residual = post->src[1];
     const ggml_tensor * weights = post->src[2];
@@ -2353,7 +2370,7 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
     a.comb = comb ? (const float *) comb->data : nullptr;
     a.mul = gamma ? (const float *) gamma->data : nullptr;
     a.post_dst = (float *) post->data;
-    a.dst = norm ? (float *) (mul ? mul : norm)->data : nullptr;
+    a.dst = norm ? (float *) (scale ? scale : mul ? mul : norm)->data : nullptr;
     a.n_embd = x->ne[0];
     a.hc = residual->ne[1];
     a.ncols = norm ? norm->ne[0] : 256;
@@ -2384,6 +2401,28 @@ void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tens
     g.bias1 = g.last ? ggml_get_op_params_f32(last, 1) : 0.0f;
     g.op = ggml_get_unary_op(unary);
     g.values = ggml_nelements(post);
+    if (scale) {
+        GGML_ASSERT(norm && !mul);
+        const float factor = ggml_get_op_params_f32(scale, 0);
+        void * f16 = emit ? emit->f16 : nullptr;
+        void * bf16 = emit ? emit->bf16 : nullptr;
+        if (emit && emit->mmq) {
+            const uint3 cols = init_fastdiv_values(emit->cols);
+            const auto launch = [&](auto write) { ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, write); };
+            switch (emit->layout) {
+                case MMQ_Q8_1_DS_LAYOUT_D4: launch(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D4, true>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor}); break;
+                case MMQ_Q8_1_DS_LAYOUT_DS4: launch(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_DS4, true>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor}); break;
+                case MMQ_Q8_1_DS_LAYOUT_D2S6: launch(ggml_cuda_hc_norm_emit_mmq_pair_store<MMQ_Q8_1_DS_LAYOUT_D2S6, true>{(block_q8_1_mmq *) emit->mmq, cols, emit->padded, emit->rows, (half *) f16, (nv_bfloat16 *) bf16, factor}); break;
+                default: GGML_ABORT("unsupported affine HC image layout");
+            }
+        } else if (emit && emit->q8) {
+            ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, ggml_cuda_norm_emit_q8_scale_store{
+                {(block_q8_1 *) emit->q8, init_fastdiv_values(emit->cols), emit->padded, (half *) f16, (nv_bfloat16 *) bf16}, factor});
+        } else {
+            ggml_cuda_hc_affine_emit_launch<false>(ctx, a, g, norm, comb, false, ggml_cuda_norm_scale_store{factor, (half *) f16, (nv_bfloat16 *) bf16});
+        }
+        return;
+    }
     if (emit) {
         GGML_ASSERT(norm);
         const uint3 cols = init_fastdiv_values(emit->cols);
