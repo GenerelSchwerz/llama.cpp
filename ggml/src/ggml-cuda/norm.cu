@@ -912,12 +912,148 @@ static __device__ __forceinline__ float hc_injection_gate(hc_injection_data g, i
     return value;
 }
 
+struct hc_affine_injection_operand {
+    const float * data;
+    uint3 cols;
+    uint3 rows;
+    int64_t s0;
+    int64_t s1;
+};
+
+struct hc_affine_injection_data {
+    hc_affine_injection_operand input;
+    hc_affine_injection_operand multiplier;
+    hc_affine_injection_operand bias;
+    uint3 streams;
+    float * product;
+    float * added;
+    float * unary;
+    float * last;
+    float scale1;
+    float bias1;
+    ggml_unary_op op;
+    int64_t values;
+};
+
+static __device__ __forceinline__ float hc_affine_injection_read(hc_affine_injection_operand a, uint32_t col, uint32_t row) {
+    return a.data[int64_t(fastmodulo(col, a.cols))*a.s0 + int64_t(fastmodulo(row, a.rows))*a.s1];
+}
+
+static __device__ __forceinline__ float hc_injection_gate(hc_affine_injection_data g, int64_t index, bool store) {
+    const uint32_t col = fastmodulo(uint32_t(index), g.streams);
+    const uint32_t row = fastdiv(uint32_t(index), g.streams);
+    float value = __fmul_rn(hc_affine_injection_read(g.input, col, row), hc_affine_injection_read(g.multiplier, col, row));
+    if (store) { g.product[index] = value; }
+    value = __fadd_rn(value, hc_affine_injection_read(g.bias, col, row));
+    if (store) { g.added[index] = value; }
+    value = g.op == GGML_UNARY_OP_SILU ? ggml_cuda_op_silu_single(value) : 1.0f / (1.0f + expf(-value));
+    if (store) { g.unary[index] = value; }
+    if (g.last) {
+        value = __fmaf_rn(g.scale1, value, g.bias1);
+        if (store) { g.last[index] = value; }
+    }
+    return value;
+}
+
 static __device__ __forceinline__ void hc_injection_load(hc_injection_data g, float * weights, int64_t first, int64_t count, int64_t begin, int64_t n_embd) {
     for (int64_t j = threadIdx.x; j < count; j += blockDim.x) {
         const int64_t scalar = first + j;
         weights[j] = hc_injection_gate(g, scalar, scalar*n_embd >= begin);
     }
     __syncthreads();
+}
+
+template <typename Gate>
+static __device__ __forceinline__ void hc_injection_load(Gate g, float * weights, int64_t first, int64_t count, int64_t begin, int64_t n_embd) {
+    for (int64_t j = threadIdx.x; j < count; j += blockDim.x) {
+        const int64_t scalar = first + j;
+        weights[j] = hc_injection_gate(g, scalar, scalar*n_embd >= begin);
+    }
+    __syncthreads();
+}
+
+template <int block_size, bool has_comb, bool do_multiply, int layout, typename Gate>
+static __device__ __forceinline__ void hc_injection_norm_impl(hc_post_norm_data a, Gate g) {
+    ggml_cuda_pdl_lc();
+    const int row = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample = blockIdx.z;
+    const int64_t offset = ((int64_t(sample)*gridDim.y + channel)*gridDim.x + row)*a.ncols;
+    constexpr bool grouped = layout == 1;
+    constexpr bool flat = layout == 2;
+    ggml_cuda_pdl_sync();
+    extern __shared__ float s_sum[];
+    float * weights = s_sum + 32;
+    const int64_t gate_first = offset/a.n_embd;
+    float grouped_weight = 0.0f;
+    if constexpr (grouped) {
+        if (threadIdx.x % WARP_SIZE == 0) {
+            grouped_weight = hc_injection_gate(g, gate_first, threadIdx.x == 0);
+        }
+        grouped_weight = __shfl_sync(0xffffffff, grouped_weight, 0, WARP_SIZE);
+    } else {
+        const int64_t gate_count = (offset + a.ncols - 1)/a.n_embd - gate_first + 1;
+        hc_injection_load(g, weights, gate_first, gate_count, offset, a.n_embd);
+    }
+    if constexpr (do_multiply) {
+        a.mul += fastmodulo(sample, a.mul_ne[3])*a.sm[3] + fastmodulo(channel, a.mul_ne[2])*a.sm[2] + fastmodulo(row, a.mul_ne[1])*a.sm[1];
+    }
+    const int64_t stream = grouped ? (offset / a.n_embd) % a.hc : 0;
+    const int64_t token = grouped || flat ? offset / (a.n_embd*a.hc) : 0;
+    float tmp = 0.0f;
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        const int64_t ir = offset + col;
+        const int64_t i0 = grouped ? col : flat ? fastmodulo(col, a.embd_ne) : ir % a.n_embd;
+        const int64_t ih = grouped ? stream : flat ? fastdiv(col, a.embd_ne) : (ir / a.n_embd) % a.hc;
+        const int64_t it = grouped || flat ? token : ir / (a.n_embd*a.hc);
+        const float weight = grouped ? grouped_weight : weights[ih + it*a.hc - gate_first];
+        float value = a.x[i0*a.sx[0] + it*a.sx[1]] * weight;
+        if constexpr (has_comb) {
+            for (int64_t isrc = 0; isrc < a.hc; ++isrc) {
+                value += a.residual[i0*a.sr[0] + isrc*a.sr[1] + it*a.sr[2]] * a.comb[ih*a.sc[0] + isrc*a.sc[1] + it*a.sc[2]];
+            }
+        } else {
+            value += a.residual[i0*a.sr[0] + ih*a.sr[1] + it*a.sr[2]];
+        }
+        a.post_dst[ir] = value;
+        tmp += value * value;
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean = tmp / a.ncols;
+    const float scale = rsqrtf(mean + a.eps);
+    for (int col = threadIdx.x; col < a.ncols; col += block_size) {
+        if constexpr (do_multiply) {
+            a.dst[offset + col] = scale * a.post_dst[offset + col] * a.mul[fastmodulo(col, a.mul_ne[0])];
+        } else {
+            a.dst[offset + col] = scale * a.post_dst[offset + col];
+        }
+    }
+}
+
+template <bool has_comb, typename Gate>
+static __device__ __forceinline__ void hc_injection_post_impl(hc_post_norm_data a, Gate g) {
+    ggml_cuda_pdl_lc();
+    const int64_t begin = int64_t(blockIdx.x)*blockDim.x;
+    const int64_t end = begin + int64_t(blockDim.x) < g.values ? begin + int64_t(blockDim.x) : g.values;
+    const int64_t ir = begin + threadIdx.x;
+    ggml_cuda_pdl_sync();
+    extern __shared__ float weights[];
+    const int64_t first = begin/a.n_embd;
+    const int64_t count = (end - 1)/a.n_embd - first + 1;
+    hc_injection_load(g, weights, first, count, begin, a.n_embd);
+    if (ir >= g.values) { return; }
+    const int64_t i0 = ir % a.n_embd;
+    const int64_t ih = (ir/a.n_embd) % a.hc;
+    const int64_t it = ir/(a.n_embd*a.hc);
+    float value = a.x[i0*a.sx[0] + it*a.sx[1]] * weights[ir/a.n_embd - first];
+    if constexpr (has_comb) {
+        for (int64_t isrc = 0; isrc < a.hc; ++isrc) {
+            value += a.residual[i0*a.sr[0] + isrc*a.sr[1] + it*a.sr[2]] * a.comb[ih*a.sc[0] + isrc*a.sc[1] + it*a.sc[2]];
+        }
+    } else {
+        value += a.residual[i0*a.sr[0] + ih*a.sr[1] + it*a.sr[2]];
+    }
+    a.post_dst[ir] = value;
 }
 
 template <int block_size, bool has_comb, bool do_multiply, int layout>
@@ -1004,6 +1140,16 @@ static __global__ void hc_injection_post_f32(hc_post_norm_data a, hc_injection_d
     a.post_dst[ir] = value;
 }
 
+template <int block_size, bool has_comb, bool do_multiply, int layout>
+static __global__ __launch_bounds__(block_size) void hc_affine_injection_norm_f32(hc_post_norm_data a, hc_affine_injection_data g) {
+    hc_injection_norm_impl<block_size, has_comb, do_multiply, layout>(a, g);
+}
+
+template <bool has_comb>
+static __global__ void hc_affine_injection_post_f32(hc_post_norm_data a, hc_affine_injection_data g) {
+    hc_injection_post_impl<has_comb>(a, g);
+}
+
 template <int Block, bool Comb, bool Multiply>
 static auto hc_injection_norm_kernel(int layout) {
     if (layout == 1) { return hc_injection_norm_f32<Block, Comb, Multiply, 1>; }
@@ -1067,5 +1213,77 @@ void ggml_cuda_op_hc_injection(ggml_backend_cuda_context & ctx, ggml_tensor * fi
     auto kernel = block_size == 256
         ? (comb ? (mul ? hc_injection_norm_kernel<256, true, true>(layout) : hc_injection_norm_kernel<256, true, false>(layout)) : (mul ? hc_injection_norm_kernel<256, false, true>(layout) : hc_injection_norm_kernel<256, false, false>(layout)))
         : (comb ? (mul ? hc_injection_norm_kernel<1024, true, true>(layout) : hc_injection_norm_kernel<1024, true, false>(layout)) : (mul ? hc_injection_norm_kernel<1024, false, true>(layout) : hc_injection_norm_kernel<1024, false, false>(layout)));
+    ggml_cuda_kernel_launch(kernel, launch, a, g);
+}
+
+static hc_affine_injection_operand ggml_cuda_hc_affine_injection_operand(const ggml_tensor * tensor) {
+    return {(const float *) tensor->data, init_fastdiv_values(tensor->ne[0]), init_fastdiv_values(tensor->ne[1]), int64_t(tensor->nb[0]/sizeof(float)), int64_t(tensor->nb[1]/sizeof(float))};
+}
+
+template <int Block, bool Comb, bool Multiply>
+static auto hc_affine_injection_norm_kernel(int layout) {
+    if (layout == 1) { return hc_affine_injection_norm_f32<Block, Comb, Multiply, 1>; }
+    if (layout == 2) { return hc_affine_injection_norm_f32<Block, Comb, Multiply, 2>; }
+    return hc_affine_injection_norm_f32<Block, Comb, Multiply, 0>;
+}
+
+void ggml_cuda_op_hc_affine_injection(ggml_backend_cuda_context & ctx, ggml_tensor * first, ggml_tensor * added, ggml_tensor * unary, ggml_tensor * last, ggml_tensor * post, ggml_tensor * norm, ggml_tensor * mul) {
+    const ggml_tensor * x = post->src[0];
+    const ggml_tensor * residual = post->src[1];
+    const ggml_tensor * weights = post->src[2];
+    const ggml_tensor * comb = post->src[3];
+    const ggml_tensor * gamma = mul ? mul->src[mul->src[0] == norm ? 1 : 0] : nullptr;
+    hc_post_norm_data a{};
+    a.x = (const float *) x->data;
+    a.residual = (const float *) residual->data;
+    a.post = (const float *) weights->data;
+    a.comb = comb ? (const float *) comb->data : nullptr;
+    a.mul = gamma ? (const float *) gamma->data : nullptr;
+    a.post_dst = (float *) post->data;
+    a.dst = norm ? (float *) (mul ? mul : norm)->data : nullptr;
+    a.n_embd = x->ne[0];
+    a.hc = residual->ne[1];
+    a.ncols = norm ? norm->ne[0] : 256;
+    a.embd_ne = init_fastdiv_values(a.n_embd);
+    a.eps = norm ? ggml_get_op_params_f32(norm, 0) : 0.0f;
+    for (int d = 0; d < 3; ++d) {
+        if (d < 2) {
+            a.sx[d] = x->nb[d]/sizeof(float);
+            a.sp[d] = weights->nb[d]/sizeof(float);
+        }
+        a.sr[d] = residual->nb[d]/sizeof(float);
+        a.sc[d] = comb ? comb->nb[d]/sizeof(float) : 0;
+    }
+    for (int d = 0; d < 4; ++d) {
+        a.sm[d] = gamma ? gamma->nb[d]/sizeof(float) : 0;
+        a.mul_ne[d] = init_fastdiv_values(gamma ? gamma->ne[d] : 1);
+    }
+    hc_affine_injection_data g{};
+    g.input = ggml_cuda_hc_affine_injection_operand(first->src[0]);
+    g.multiplier = ggml_cuda_hc_affine_injection_operand(first->src[1]);
+    g.bias = ggml_cuda_hc_affine_injection_operand(added->src[1]);
+    g.streams = init_fastdiv_values(residual->ne[1]);
+    g.product = (float *) first->data;
+    g.added = (float *) added->data;
+    g.unary = (float *) unary->data;
+    g.last = last != unary ? (float *) last->data : nullptr;
+    g.scale1 = g.last ? ggml_get_op_params_f32(last, 0) : 1.0f;
+    g.bias1 = g.last ? ggml_get_op_params_f32(last, 1) : 0.0f;
+    g.op = ggml_get_unary_op(unary);
+    g.values = ggml_nelements(post);
+    if (!norm) {
+        const size_t shared = ((256 + a.n_embd - 2)/a.n_embd + 1)*sizeof(float);
+        const ggml_cuda_kernel_launch_params launch(dim3((g.values + 255)/256), dim3(256), shared, ctx.stream());
+        ggml_cuda_kernel_launch(comb ? hc_affine_injection_post_f32<true> : hc_affine_injection_post_f32<false>, launch, a, g);
+        return;
+    }
+    const int block_size = a.ncols < 1024 ? 256 : 1024;
+    const size_t shared = (32 + (a.ncols + a.n_embd - 2)/a.n_embd + 1)*sizeof(float);
+    const dim3 grid(norm->ne[1], norm->ne[2], norm->ne[3]);
+    const ggml_cuda_kernel_launch_params launch(grid, dim3(block_size), shared, ctx.stream());
+    const int layout = a.ncols == a.n_embd ? 1 : a.ncols == a.n_embd*a.hc ? 2 : 0;
+    auto kernel = block_size == 256
+        ? (comb ? (mul ? hc_affine_injection_norm_kernel<256, true, true>(layout) : hc_affine_injection_norm_kernel<256, true, false>(layout)) : (mul ? hc_affine_injection_norm_kernel<256, false, true>(layout) : hc_affine_injection_norm_kernel<256, false, false>(layout)))
+        : (comb ? (mul ? hc_affine_injection_norm_kernel<1024, true, true>(layout) : hc_affine_injection_norm_kernel<1024, true, false>(layout)) : (mul ? hc_affine_injection_norm_kernel<1024, false, true>(layout) : hc_affine_injection_norm_kernel<1024, false, false>(layout)));
     ggml_cuda_kernel_launch(kernel, launch, a, g);
 }
