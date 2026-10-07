@@ -10478,6 +10478,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 65, 17, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 2, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 65, 4, 512, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
 
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 3, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 16, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 64, 3, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 3, 512, {1, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 0, 0, true, false, GGML_TYPE_COUNT, true));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 1, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 16, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 64, 3, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 4, false, 0, 0, true));

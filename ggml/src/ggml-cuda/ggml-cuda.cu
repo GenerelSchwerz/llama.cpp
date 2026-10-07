@@ -5618,7 +5618,6 @@ static bool ggml_cuda_repeat_mm_compatible(ggml_backend_cuda_context & ctx, ggml
     }
     const auto kernel = ggml_cuda_mul_mat_kernel(mm->src[0], repeat, mm, ctx.device);
     const bool quantized = kernel == GGML_CUDA_MM_MMVQ || kernel == GGML_CUDA_MM_MMQ;
-    if (input->ne[1] != repeat->ne[1] && !quantized) { return false; }
     if (kernel != GGML_CUDA_MM_MMVF && kernel != GGML_CUDA_MM_MMF && !quantized) { return false; }
     if (allocated) {
         const ggml_tensor * reads[] = {input, mm->src[0]};
@@ -5681,7 +5680,10 @@ static ggml_cuda_repeat_mm_match ggml_cuda_match_repeat_mm(ggml_backend_cuda_con
 
 static int ggml_cuda_repeat_mm_terminal(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int reader) {
     const ggml_tensor * mm = graph->nodes[reader];
-    if (mm->ne[1] != 1 || ggml_cuda_mul_mat_kernel(mm->src[0], mm->src[1], mm, ctx.device) != GGML_CUDA_MM_MMVF) { return reader; }
+    if (ggml_cuda_mul_mat_kernel(mm->src[0], mm->src[1], mm, ctx.device) != GGML_CUDA_MM_MMVF) { return reader; }
+    const auto hc_up = ggml_cuda_match_hc_up_shape(ctx, graph, reader);
+    if (hc_up.count) { return reader + hc_up.count - 1; }
+    if (mm->ne[1] != 1) { return reader; }
     for (const auto ops : {std::initializer_list<ggml_op>{GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_GLU},
             {GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU}, {GGML_OP_MUL_MAT, GGML_OP_ADD}}) {
         const int last = reader + int(ops.size()) - 1;
@@ -5723,7 +5725,7 @@ static std::vector<int> ggml_cuda_match_repeat_mm_readers(ggml_backend_cuda_cont
         switch (node->op) {
             case GGML_OP_NONE: case GGML_OP_VIEW: case GGML_OP_RESHAPE: case GGML_OP_PERMUTE: case GGML_OP_TRANSPOSE:
             case GGML_OP_MUL_MAT: case GGML_OP_SCALE: case GGML_OP_UNARY: case GGML_OP_MUL: case GGML_OP_ADD:
-            case GGML_OP_SUM_ROWS: case GGML_OP_SUB: case GGML_OP_CONT: case GGML_OP_GLU: break;
+            case GGML_OP_SUM_ROWS: case GGML_OP_SUB: case GGML_OP_CONT: case GGML_OP_GLU: case GGML_OP_DSV4_HC_PRE: break;
             default: return {};
         }
         if (!allocated) { continue; }
@@ -6754,7 +6756,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             if (match.convert) {
                 ggml_cuda_mul_mat_cublas(*cuda_ctx, match.mm->src[0], match.mm->src[1], match.mm, prepared_src1, match.dst);
             } else {
-                ggml_cuda_mul_mat_vec_f_hc_pre(*cuda_ctx, match.mm, match.dst);
+                ggml_tensor mm = *match.mm;
+                mm.src[1] = const_cast<ggml_tensor *>(floating_input(match.mm));
+                ggml_cuda_mul_mat_vec_f_hc_pre(*cuda_ctx, &mm, match.dst);
             }
             return match.count - 1;
         }
