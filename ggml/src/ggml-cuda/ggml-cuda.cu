@@ -5754,11 +5754,20 @@ static std::vector<bool> ggml_cuda_plan_repeat_mm(ggml_backend_cuda_context & ct
         const auto found = indices.find(input);
         if (input->op != GGML_OP_REPEAT || found == indices.end() || found->second >= group.node || group.after || group.prepare != group.node) { continue; }
         const auto readers = ggml_cuda_match_repeat_mm_readers(ctx, graph, found->second);
-        if (readers.empty() || readers.front() != group.node || readers.back() != group.last ||
-                std::any_of(readers.begin(), readers.end(), [&](int reader) { return candidate.nodes[reader] != int(g); })) { continue; }
-        // Reserve the full image before skipping REPEAT, including later fused readers.
-        group.prepare = found->second;
-        repeats[group.prepare] = true;
+        if (readers.empty()) { continue; }
+        std::vector<int> groups;
+        bool valid = true;
+        for (int reader : readers) {
+            const int member = candidate.nodes[reader];
+            if (member < 0) { valid = false; break; }
+            const auto & image = candidate.groups[member];
+            if (graph->nodes[image.node]->src[1] != input || image.after || image.prepare != image.node) { valid = false; break; }
+            if (std::find(groups.begin(), groups.end(), member) == groups.end()) { groups.push_back(member); }
+        }
+        if (!valid) { continue; }
+        // Prepare every original image before skipping its common REPEAT.
+        for (int member : groups) { candidate.groups[member].prepare = found->second; }
+        repeats[found->second] = true;
         moved = true;
     }
     if (moved) {
