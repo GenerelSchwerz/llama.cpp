@@ -3086,6 +3086,15 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+static bool ggml_cuda_input_rows(const ggml_tensor * input, size_t & rows) {
+    rows = 1;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (input->ne[d] <= 0 || uint64_t(input->ne[d]) > SIZE_MAX/rows) { return false; }
+        rows *= input->ne[d];
+    }
+    return true;
+}
+
 static bool ggml_cuda_can_share_mmq_input(const ggml_tensor * node, int device) {
     if (node->op != GGML_OP_MUL_MAT || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || node->view_src ||
             node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
@@ -3095,7 +3104,7 @@ static bool ggml_cuda_can_share_mmq_input(const ggml_tensor * node, int device) 
     const ggml_tensor * input = node->src[1];
     const int cc = ggml_cuda_info().devices[device].cc;
     if (input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) || input->ne[1] < 1 ||
-            input->ne[2] != 1 || input->ne[3] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+            ((input->ne[2] != 1 || input->ne[3] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) && !ggml_is_contiguous(input)) ||
             !ggml_is_contiguous(weight) || ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) ||
             !ggml_cuda_should_use_mmq(weight->type, cc, input->ne[1], /*n_experts =*/ 0) || ggml_cuda_op_mul_mat_use_fwht(node)) {
         return false;
@@ -3558,7 +3567,7 @@ static bool ggml_cuda_can_share_mmvq_input(const ggml_tensor * node, int device)
     const ggml_tensor * input = node->src[1];
     const int cc = ggml_cuda_info().devices[device].cc;
     if (cc <= GGML_CUDA_CC_PASCAL || input->type != GGML_TYPE_F32 || input->nb[0] != sizeof(float) ||
-            input->ne[1] < 1 || input->ne[2] != 1 || input->ne[3] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1 ||
+            input->ne[1] < 1 || ((input->ne[2] != 1 || input->ne[3] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) && !ggml_is_contiguous(input)) ||
             !ggml_is_contiguous(weight) || !ggml_cuda_should_use_mmvq(weight->type, cc, input->ne[1]) ||
             ggml_cuda_op_mul_mat_use_fwht(node)) {
         return false;
@@ -4146,7 +4155,7 @@ static std::vector<ggml_cuda_norm_q8_match> ggml_cuda_plan_norm_q8(ggml_cgraph *
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if (prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
+            if (input->ne[2] != 1 || input->ne[3] != 1 || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }
             if (match.post && input->ne[0] % MATRIX_ROW_PADDING && match.norm->ne[0] >= input->ne[0]) {
@@ -4310,7 +4319,7 @@ static std::vector<ggml_cuda_norm_mmq_match> ggml_cuda_plan_norm_mmq(ggml_cgraph
             const ggml_tensor * input = graph->nodes[node]->src[1];
             const ggml_tensor * root = input->view_src ? input->view_src : input;
             uintptr_t begin, end;
-            if (keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
+            if (input->ne[2] != 1 || input->ne[3] != 1 || keys[node] < 0 || keys[node] > 3 || (match.post && keys[node] > 2) ||
                     norm_group_invalid(node) || prepare <= match.last || root != match.dst || !ggml_is_contiguous(input) || input->data != match.dst->data ||
                     input->type != GGML_TYPE_F32 || input->ne[0] % QK8_1 || ggml_nbytes(input) != ggml_nbytes(match.dst) ||
                     !ggml_cuda_prepared_range(input, device, begin, end)) { return false; }
@@ -6760,9 +6769,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         const size_t blocks = GGML_PAD(size_t(input->ne[0]), MATRIX_ROW_PADDING)/QK8_1;
                         if (blocks > SIZE_MAX/sizeof(block_q8_1)) { continue; }
                         const size_t row = blocks*sizeof(block_q8_1);
-                        if (uint64_t(input->ne[1]) > SIZE_MAX/row) { continue; }
+                        size_t rows;
+                        if (!ggml_cuda_input_rows(input, rows) || rows > SIZE_MAX/row) { continue; }
                         mmvq_keys[i] = 0;
-                        mmvq_sizes[i] = size_t(input->ne[1])*row;
+                        mmvq_sizes[i] = rows*row;
                     }
                 }
             }
@@ -6789,8 +6799,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             std::vector<size_t> mmq_sizes;
             const int mmq_cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
             const auto scale_size = [&](const ggml_tensor * node) {
-                return ggml_cuda_mmq_get_prec_src1(node->src[0], node, mmq_cc) == GGML_PREC_Q4 && node->src[0]->type == GGML_TYPE_NVFP4 ?
-                    GGML_PAD((size_t(node->src[1]->ne[1]) + 128)*sizeof(float), 256) : 0;
+                if (ggml_cuda_mmq_get_prec_src1(node->src[0], node, mmq_cc) != GGML_PREC_Q4 || node->src[0]->type != GGML_TYPE_NVFP4) { return size_t(0); }
+                size_t rows;
+                if (!ggml_cuda_input_rows(node->src[1], rows) || rows > (SIZE_MAX - 255)/sizeof(float) - 128) { return SIZE_MAX; }
+                return GGML_PAD((rows + 128)*sizeof(float), 256);
             };
             if (!disable_reuse) {
                 mmq_keys.assign(cgraph->n_nodes, -1);
@@ -6807,9 +6819,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         const size_t row = blocks*sizeof(block_q8_1_mmq);
                         // The kernel reads a full tile, including columns past the input.
                         const size_t tail = 128*sizeof(block_q8_1_mmq);
-                        if (uint64_t(input->ne[1]) > (SIZE_MAX - tail - 255)/row ||
-                                uint64_t(input->ne[1]) > (SIZE_MAX - 255)/sizeof(float) - 128) { continue; }
-                        const size_t quantized = size_t(input->ne[1])*row + tail;
+                        size_t rows;
+                        if (!ggml_cuda_input_rows(input, rows) || rows > (SIZE_MAX - tail - 255)/row ||
+                                rows > (SIZE_MAX - 255)/sizeof(float) - 128) { continue; }
+                        const size_t quantized = rows*row + tail;
                         if (scale_size(node) > SIZE_MAX - GGML_PAD(quantized, 256)) { continue; }
                         mmq_keys[i] = ggml_cuda_mmq_get_prec_src1(node->src[0], node, mmq_cc) == GGML_PREC_Q4 ?
                             3 + (node->src[0]->type == GGML_TYPE_NVFP4) : int(mmq_get_q8_1_ds_layout(node->src[0]->type));
