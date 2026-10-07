@@ -5239,7 +5239,7 @@ struct test_mul_mat : public test_case {
 
         const int npermuted = (per[0] != 0) + (per[1] != 1) + (per[2] != 2) + (per[3] != 3);
         if (repeat_rhs) {
-            GGML_ASSERT(type_b == GGML_TYPE_F32 && npermuted == 0 && !src_overlap && k_v == 0 && m_v == 0 && pad == 0 && o == 1);
+            GGML_ASSERT(type_b == GGML_TYPE_F32 && npermuted == 0 && !src_overlap && k_v == 0 && m_v == 0 && pad == 0);
             a = ggml_new_tensor_4d(ctx, type_a, k, m, bs[0], bs[1]);
             b = ggml_new_tensor_2d(ctx, type_b, k, n);
             ggml_set_name(a, "a");
@@ -10465,6 +10465,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a8(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
     test_cases.emplace_back(new test_mul_mat_id_w4a4(GGML_TYPE_MXFP4, GGML_TYPE_F32, 8, 2, false, 32, 32, 256));
+
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
+        for (int tokens : {1, 17}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 65, tokens, 512, {3, 2}, {1, 1}, {0, 1, 2, 3}, 0, 2, false, 0, 0, true));
+        }
+    }
 
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         for (int tokens : {1, 17}) {
