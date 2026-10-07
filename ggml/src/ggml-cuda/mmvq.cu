@@ -1429,7 +1429,7 @@ void ggml_cuda_quantize_mmvq_input(ggml_backend_cuda_context & ctx, const ggml_t
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion, const char * quantized) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const char * quantized, const int64_t * quantized_ne) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -1508,6 +1508,13 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
     ggml_tensor packed = *src1;
+    if (quantized_ne) {
+        GGML_ASSERT(quantized && !ids && quantized_ne[0] == ne10);
+        for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+            GGML_ASSERT(quantized_ne[d] == 1 || quantized_ne[d] == src1->ne[d]);
+            packed.ne[d] = quantized_ne[d];
+        }
+    }
     if (!ids && !quantized) {
         for (int d = 1; d < GGML_MAX_DIMS; ++d) {
             if (packed.nb[d] == 0) {
